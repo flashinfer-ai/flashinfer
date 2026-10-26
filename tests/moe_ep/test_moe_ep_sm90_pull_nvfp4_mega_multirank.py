@@ -14,12 +14,13 @@ and SM90 activation helpers; the plain FP32 oracle retains its accuracy gate.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 
 import pytest
 
 
-pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_hopper, pytest.mark.node_exclusive]
+pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_hopper]
 
 WORLD_SIZE = 4
 LOCAL_EXPERTS = 4
@@ -39,7 +40,7 @@ def _gather(tensor):
     return torch.stack(rows)
 
 
-def _raw_weights(rank):
+def _raw_weights(rank, *, hidden_size=HIDDEN, intermediate_size=INTERMEDIATE):
     import torch
 
     from flashinfer.moe_ep import Nvfp4WeightPack
@@ -55,7 +56,7 @@ def _raw_weights(rank):
             device="cuda",
             generator=generator,
         )
-        codes[codes == 8] = 0  # Canonicalize negative zero.
+        codes[:, 0, 0] = 8  # Retain the signed zero produced by NVFP4 quantizers.
         packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
         scales = torch.randint(
             48,
@@ -65,10 +66,15 @@ def _raw_weights(rank):
             device="cuda",
             generator=generator,
         )
+        # Cover the zero, minimum subnormal and maximum finite E4M3 scale
+        # in every expert, while keeping most weights well conditioned.
+        scales[:, 0, 0] = 1
+        scales[:, 0, 1] = 0
+        scales[:, 1, 0] = 126
         return packed, scales
 
-    w13, sf13 = leg(2 * INTERMEDIATE, HIDDEN)
-    w2, sf2 = leg(HIDDEN, INTERMEDIATE)
+    w13, sf13 = leg(2 * intermediate_size, hidden_size)
+    w2, sf2 = leg(hidden_size, intermediate_size)
     expert = torch.arange(LOCAL_EXPERTS, dtype=torch.float32, device="cuda")
     return Nvfp4WeightPack(
         w13=w13,
@@ -80,12 +86,12 @@ def _raw_weights(rank):
     )
 
 
-def _inputs(rank, launch, *, tokens=TOKENS):
+def _inputs(rank, launch, *, tokens=TOKENS, hidden_size=HIDDEN):
     import torch
 
     generator = torch.Generator(device="cuda").manual_seed(2909 + 97 * launch + rank)
     hidden = (
-        0.5 * torch.randn(tokens, HIDDEN, device="cuda", generator=generator)
+        0.5 * torch.randn(tokens, hidden_size, device="cuda", generator=generator)
         + (rank + 1) / 32
     ).to(torch.bfloat16)
     token = torch.arange(tokens, device="cuda").view(-1, 1)
@@ -203,10 +209,26 @@ def _instruction_reference(
     return terms.float().sum(1).reshape(ranks, tokens, width)
 
 
-def _reference(hidden, ids, route_weights, raw, *, instruction_exact=False):
+def _reference(
+    hidden,
+    ids,
+    route_weights,
+    raw,
+    *,
+    hidden_size=HIDDEN,
+    intermediate_size=INTERMEDIATE,
+    instruction_exact=False,
+):
     """Global FP32 GEMMs with the public FP8/BF16 data-format contract."""
     if instruction_exact:
-        return _instruction_reference(hidden, ids, route_weights, raw)
+        return _instruction_reference(
+            hidden,
+            ids,
+            route_weights,
+            raw,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
     import torch
     import torch.nn.functional as functional
 
@@ -224,10 +246,14 @@ def _reference(hidden, ids, route_weights, raw, *, instruction_exact=False):
         1e-30
     )
     x = (hidden / input_scale).to(torch.float8_e4m3fn).float()
-    order = _k64_order(HIDDEN, hidden.device)
+    order = _k64_order(hidden_size, hidden.device)
     group_order = _k64_order(64, hidden.device)
     terms = torch.zeros(
-        hidden.shape[0], WORLD_SIZE, HIDDEN, dtype=torch.bfloat16, device=hidden.device
+        hidden.shape[0],
+        WORLD_SIZE,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=hidden.device,
     )
     for expert in range(WORLD_SIZE * LOCAL_EXPERTS):
         token, slot = (ids == expert).nonzero(as_tuple=True)
@@ -235,16 +261,16 @@ def _reference(hidden, ids, route_weights, raw, *, instruction_exact=False):
         # Both GEMM operands follow pi64. No NV0/NV64 bitwise equality is assumed.
         fc1 = x[token].index_select(1, order) @ w13[expert].index_select(1, order).T
         fc1 *= input_scale[token] * (8 * g13[expert])
-        gate = fc1[:, :INTERMEDIATE].clamp(max=CLAMP)
-        up = fc1[:, INTERMEDIATE:].clamp(-CLAMP, CLAMP)
+        gate = fc1[:, :intermediate_size].clamp(max=CLAMP)
+        up = fc1[:, intermediate_size:].clamp(-CLAMP, CLAMP)
         activated = functional.silu(gate) * up * route_weights[token, slot, None]
-        grouped = activated.reshape(-1, INTERMEDIATE // 64, 64)
+        grouped = activated.reshape(-1, intermediate_size // 64, 64)
         scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
             1e-30
         )
         quantized = (grouped * torch.reciprocal(scale)).to(torch.float8_e4m3fn).float()
-        fc2 = torch.zeros(token.numel(), HIDDEN, device=hidden.device)
-        for block in range(INTERMEDIATE // 64):
+        fc2 = torch.zeros(token.numel(), hidden_size, device=hidden.device)
+        for block in range(intermediate_size // 64):
             a = quantized[:, block].index_select(1, group_order)
             b = w2[expert, :, block * 64 : (block + 1) * 64].index_select(
                 1, group_order
@@ -255,18 +281,56 @@ def _reference(hidden, ids, route_weights, raw, *, instruction_exact=False):
     return terms.float().sum(1).reshape(ranks, tokens, width)
 
 
-def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
+def _require_sm90_ep4():
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < WORLD_SIZE:
         pytest.skip("requires four visible CUDA GPUs")
     if any(torch.cuda.get_device_capability(i) != (9, 0) for i in range(WORLD_SIZE)):
         pytest.skip("requires four SM90 GPUs")
-    if int(os.environ.get("WORLD_SIZE", "1")) != WORLD_SIZE:
-        pytest.skip("requires torchrun --nproc_per_node=4")
+    assert int(os.environ.get("WORLD_SIZE", "1")) == WORLD_SIZE, (
+        "launch this test with torchrun --nproc_per_node=4"
+    )
     pytest.importorskip(
         "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel"
     )
+
+
+def _factory_conversion_knobs():
+    # Factory conversion fields on a small K256 geometry: lane/R32 exercises
+    # PRMT addressing; one dispatch warp makes compact storage effective.
+    return {
+        "mma_tiler_mnk": (256, 16, 256),
+        "cluster_shape_mnk": (1, 1, 1),
+        "group_hint": 132,
+        "num_sched_stages": 1,
+        "pingpong": False,
+        "swap_ab": True,
+        "fp8_accum_mode": "1xacc",
+        "load_balance_mode": "atomic_counter",
+        "token_back_mode": "epi_warps",
+        "dedup_dispatch": False,
+        "active_dispatch_warps": 1,
+        "fc1_store_offload": False,
+        "fc1_early_done_publish": False,
+        "fold_producer_warps": False,
+        "grouped_token_back": False,
+        "combine_format": "bf16",
+        "in_kernel_fc2_reduce": False,
+        "fc2_tail_n8": False,
+        "fc1_ready_mode": "tile",
+        "tail_split_pairs": False,
+        "compact_pull_buffer": True,
+        "nvfp4_lut_replicas": 32,
+        "nvfp4_lut_map": "lane",
+    }
+
+
+@pytest.mark.parametrize("conversion_layout", ["fallback", "factory"])
+def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
+    import torch
+
+    _require_sm90_ep4()
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -276,26 +340,52 @@ def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
         MoEEpTensors,
         Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
+        preprocess_sm90_pull_nvfp4_mega_weights,
     )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     bootstrap = BootstrapConfig(world_size=WORLD_SIZE, rank=rank, device=local_rank)
     ensure_moe_ep_cuda_device(bootstrap)
+    tokens, hidden_size, intermediate_size = TOKENS, HIDDEN, INTERMEDIATE
+    knobs = _factory_conversion_knobs() if conversion_layout == "factory" else None
     config = Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
-        intermediate_size=INTERMEDIATE, top_k=WORLD_SIZE, gate_up_clamp=CLAMP
+        intermediate_size=intermediate_size,
+        top_k=WORLD_SIZE,
+        gate_up_clamp=CLAMP,
+        knobs=knobs,
     )
-    assert config.kperm == 64
-    weights = _raw_weights(rank)
+    assert config.nvfp4_kperm == 64
+    weights = _raw_weights(
+        rank, hidden_size=hidden_size, intermediate_size=intermediate_size
+    )
+    fleet = FleetParams(
+        num_experts=WORLD_SIZE * LOCAL_EXPERTS,
+        max_tokens_per_rank=tokens,
+        token_hidden_size=hidden_size,
+    )
+    prepared = preprocess_sm90_pull_nvfp4_mega_weights(
+        weights,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        nvfp4_kperm=config.nvfp4_kperm,
+    )
+    # Equal tensor shapes cannot distinguish K32 from K64. Validation must
+    # reject a layout-tag mismatch before a layer can launch either GEMM.
+    mismatched = create_mega_kernel(replace(config, nvfp4_kperm=32))
+    mismatched.bind_ep_bootstrap(bootstrap)
+    with pytest.raises(ValueError, match="kperm"):
+        mismatched.validate_transformed_weights(prepared, bootstrap, fleet)
     layer = MoEEpLayer(
         bootstrap=bootstrap,
-        fleet_params=FleetParams(
-            num_experts=WORLD_SIZE * LOCAL_EXPERTS,
-            max_tokens_per_rank=TOKENS,
-            token_hidden_size=HIDDEN,
+        fleet_params=fleet,
+        weights=None,
+        backend=MegaConfig(
+            megakernel=config,
+            preprocess_weights=False,
+            transformed_weights=prepared,
         ),
-        weights=weights,
-        backend=MegaConfig(megakernel=config),
     )
     try:
         raw = tuple(
@@ -311,7 +401,9 @@ def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
         )
         previous_ids = None
         for launch in range(2):
-            hidden, ids, route_weights = _inputs(rank, launch)
+            hidden, ids, route_weights = _inputs(
+                rank, launch, tokens=tokens, hidden_size=hidden_size
+            )
             gathered = tuple(_gather(t) for t in (hidden, ids, route_weights))
             owners = gathered[1] // LOCAL_EXPERTS
             for source in range(WORLD_SIZE):
@@ -339,9 +431,18 @@ def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
             allow_tf32 = torch.backends.cuda.matmul.allow_tf32
             try:
                 torch.backends.cuda.matmul.allow_tf32 = False
-                expected = _reference(*gathered, raw)
+                expected = _reference(
+                    *gathered,
+                    raw,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )
                 instruction_expected = _reference(
-                    *gathered, raw, instruction_exact=True
+                    *gathered,
+                    raw,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    instruction_exact=True,
                 )
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = allow_tf32
@@ -358,4 +459,119 @@ def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
                 rel_l2 = (actual[source].float() - expected[source]).norm() / norm
                 assert rel_l2 < 0.025, (source, launch, rel_l2.item())
     finally:
+        layer.destroy()
+
+
+def test_sm90_nvfp4_cached_fc1_schedule_switch_during_graph_capture(monkeypatch):
+    import torch
+    import torch.distributed as dist
+
+    _require_sm90_ep4()
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
+        ensure_moe_ep_cuda_device,
+        preprocess_sm90_pull_nvfp4_mega_weights,
+    )
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
+        hopper_nvfp4,
+    )
+
+    # Force a small automatic threshold; compiled schedules, workspace and
+    # kernels remain real. The production threshold requires a large model.
+    def select_overlap(*, num_tokens, override, **_kwargs):
+        return num_tokens >= TOKENS if override is None else override
+
+    monkeypatch.setattr(hopper_nvfp4, "resolve_nvfp4_fc1_overlap", select_overlap)
+    rank = int(os.environ["RANK"])
+    bootstrap = BootstrapConfig(
+        world_size=WORLD_SIZE,
+        rank=rank,
+        device=int(os.environ.get("LOCAL_RANK", str(rank))),
+    )
+    ensure_moe_ep_cuda_device(bootstrap)
+    config = Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=INTERMEDIATE,
+        top_k=WORLD_SIZE,
+        gate_up_clamp=CLAMP,
+        knobs=_factory_conversion_knobs(),
+    )
+    prepared = preprocess_sm90_pull_nvfp4_mega_weights(
+        _raw_weights(rank),
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        nvfp4_kperm=config.nvfp4_kperm,
+    )
+    layer = MoEEpLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=WORLD_SIZE * LOCAL_EXPERTS,
+            max_tokens_per_rank=TOKENS,
+            token_hidden_size=HIDDEN,
+        ),
+        weights=None,
+        backend=MegaConfig(
+            megakernel=config,
+            preprocess_weights=False,
+            transformed_weights=prepared,
+        ),
+    )
+    graphs = []
+    captured = None
+    cold_graph = None
+    try:
+        batches = {}
+        for tokens in (TOKENS // 2, TOKENS):
+            hidden, ids, weights = _inputs(rank, 0, tokens=tokens)
+            batches[tokens] = MoEEpTensors(
+                hidden_states=hidden, topk_ids=ids, topk_weights=weights
+            )
+        layer.warmup(batches[TOKENS // 2])
+        frontend = layer._workspace._frontend
+        assert set(frontend._nvfp4_schedule_cache) == {False}
+        # A missing schedule still requires eager compilation on every rank.
+        cold_graph = torch.cuda.CUDAGraph()
+        with (
+            pytest.raises(RuntimeError, match="NVFP4 FC1 schedule change.*cannot run"),
+            torch.cuda.graph(cold_graph),
+        ):
+            layer.forward(batches[TOKENS])
+        cold_graph = None
+        dist.barrier()
+        layer.warmup(batches[TOKENS])
+        assert set(frontend._nvfp4_schedule_cache) == {False, True}
+        expected = {
+            tokens: layer.forward(batch).clone() for tokens, batch in batches.items()
+        }
+        for tokens in (TOKENS, TOKENS // 2):
+            other = TOKENS // 2 if tokens == TOKENS else TOKENS
+            layer.forward(batches[other])
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = layer.forward(batches[tokens])
+            graphs.append(graph)
+            assert frontend._nvfp4_fc1_k256_overlap is (tokens == TOKENS)
+            dist.barrier()
+            for _ in range(2):
+                graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                torch.testing.assert_close(
+                    captured.view(torch.uint8),
+                    expected[tokens].view(torch.uint8),
+                    atol=0,
+                    rtol=0,
+                )
+    finally:
+        torch.cuda.synchronize()
+        captured = None
+        cold_graph = None
+        graph = None
+        graphs.clear()
         layer.destroy()

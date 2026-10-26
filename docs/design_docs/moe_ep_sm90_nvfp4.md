@@ -13,6 +13,13 @@ counterparts. They share dispatch, scheduling, and the kernel entry, with
 format-specific scale layouts, promotion, stage budgets, and FC1 overlap.
 NV tuning and workspace/cache identities remain separate from MX.
 
+This is the CuTe DSL backend of the unified `flashinfer.moe_ep.MoEEpLayer`
+interface. The CUDA implementation introduced in
+[#6343](https://github.com/flashinfer-ai/flashinfer/pull/6343) instead exposes
+the independent `flashinfer.megamoe` API. Use this backend for MoE EP layer,
+workspace and tuning integration; use `flashinfer.megamoe` when calling its
+standalone CUDA kernels and symmetric-buffer API directly.
+
 ## Weight and numerical contract
 
 Canonical FC1 weights have shape `[local_experts, 2 * intermediate, hidden]`
@@ -21,20 +28,28 @@ Canonical FC1 weights have shape `[local_experts, 2 * intermediate, hidden]`
 The prequantized representation has packed E2M1 bytes along K, an E4M3 scale
 per 16 values, and an optional FP32 per-expert global scale. `MoEWeightPack`
 also accepts BF16/FP16/FP32 canonical weights for one-time NVFP4 preparation.
+For a signed E2M1 payload q, K16 scale s and global scale G, the kernel forms
+`RN_E4M3(q*s/8)` and restores `8G` after MMA. This adds E4M3 rounding (and
+possible underflow) to exact NVFP4 dequantization `G*q*s`; it is not an exact
+conversion for every scale. The instruction reference and FP32 accumulation
+reference in the end-to-end test use the promoted operands.
 
-`kperm=64` is the default. Preparation reorders weights inside each K64 block;
+`nvfp4_kperm=64` is the default. Preparation reorders weights inside each K64 block;
 input staging applies the corresponding permutation to natural-order inputs.
-Callers must use the same `kperm` for preprocessing and the backend config.
+The prepared two-leg tuple carries a read-only `nvfp4_kperm` layout tag.
+Backend validation rejects a tag that differs from the config, and rejects
+untagged tuples. Keep the returned container intact with
+`preprocess_weights=False`; rebuilding it as a plain tuple loses the tag.
 This reduces repeated scale/LUT loads, but changes FP8 accumulation order:
-outputs need not be bitwise equal to `kperm=0` or `32`. K64 is not inherently
+outputs need not be bitwise equal to `nvfp4_kperm=0` or `32`. K64 is not inherently
 less accurate than K32. Quantization error depends on the model and inputs;
 assess it against FP32 computation using the effective quantized operands.
 
-`kperm=32` remains available as a byte-identical alternative to K0.
-`kperm=0` uses natural K order. Activations use per-token E4M3 scaling, the
+`nvfp4_kperm=32` remains available as a byte-identical alternative to K0.
+`nvfp4_kperm=0` uses natural K order. Activations use per-token E4M3 scaling, the
 gate/up clamp defaults to 10, accumulation uses `1xacc`, and combine/output
 uses BF16. Preparation, activation staging, and kernel settings form one ABI;
-do not mix transformed layouts from different `kperm` values.
+do not mix transformed layouts from different `nvfp4_kperm` values.
 
 ## Public API
 
@@ -53,7 +68,7 @@ from flashinfer.moe_ep import (
 )
 
 prepared = preprocess_sm90_pull_nvfp4_mega_weights(
-    weights, hidden_size=7168, intermediate_size=3072, kperm=64
+    weights, hidden_size=7168, intermediate_size=3072, nvfp4_kperm=64
 )
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=world_size, rank=rank, process_group=pg),
@@ -63,7 +78,7 @@ layer = MoEEpLayer(
     weights=weights,
     backend=MegaConfig(
         megakernel=Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
-            intermediate_size=3072, top_k=6, kperm=64
+            intermediate_size=3072, top_k=6, nvfp4_kperm=64
         ),
         preprocess_weights=False,
         transformed_weights=prepared,
@@ -84,21 +99,31 @@ end-to-end inference integration.
 
 ## Defaults and autotuning
 
-The built-in default profiles target **NVIDIA H200 (132 SMs), EP4,
-H7168/I3072, 384 experts, top-6, clamp 10, K64, `block_permutation_v1` routing**.
-There is a separate exact-capacity profile for every tokens/rank value:
+The reference defaults were measured on **H200, EP4, H7168/I3072, 384
+experts, top-6, K64, `block_permutation_v1` routing** at these capacities:
 
 ```text
 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768
 ```
 
-The larger buckets have their own profiles; they do not reuse T2048. Other
-hardware, model shapes, routing profiles, or capacities use the legal
-heuristic fallback.
-`knobs=None` selects the matching default or fallback. `knobs="auto"` performs
-a collective bounded search at warmup; a complete `knobs` dictionary selects
-a manual tactic. NV has its own candidate/cache identity and includes LUT
-replication, mapping, and compact pull-buffer choices.
+For the reference model the heuristic rounds capacity up to the next bucket,
+and uses the largest bucket above 32768. Clamp and SM90 product name do not
+gate it. Other model shapes, routing or K layouts use a shape-compatible
+fallback. These are legal starting configurations, not measured performance
+guarantees for other capacities or hardware.
+
+`knobs=None` first reads the separate NV tuning cache, then uses the default
+heuristic on a miss. `knobs="auto"` performs a collective bounded search on
+first compute; every rank must participate. A complete `knobs` dictionary
+selects a manual tactic. NV has its own candidate/cache identity and includes
+LUT replication, mapping and compact pull-buffer choices. Cache provenance
+binds the layout and scheduling policy, while capacity/live-token bucketing
+is handled by the cache itself.
+
+An explicit `token_back_mode` with `knobs=None` is a manual execution request:
+it uses local defaults instead of inheriting a tuned profile. With a complete
+`knobs` dictionary, the explicit token-back mode overrides only that field and
+must fit the selected tactic's resource budget.
 
 `nvfp4_fc1_k256_overlap` accepts `None`, `True`, or `False`. `None` preserves
 the profile's schedule; an explicit value overrides it. The
@@ -135,7 +160,7 @@ MX configuration choice, not a new MX autotuning axis.
 Use `--nv-knobs-json` or `--mx-knobs-json` for a complete tactic. For a paired
 before/after NV comparison, also pass `--nv-reference-knobs-json`: the three
 cases share inputs and prepared weights. A per-capacity JSON can contain
-`{"tactic": {...}, "config": {"kperm": 64,
+`{"tactic": {...}, "config": {"nvfp4_kperm": 64,
 "nvfp4_fc1_k256_overlap": true}}`; multiple capacities use
 `{"per_token": {"512": {"tactic": {...}, "config": {...}}}}`.
 The config object for MX can contain `compact_pull_buffer`.

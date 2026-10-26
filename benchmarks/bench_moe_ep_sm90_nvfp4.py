@@ -386,6 +386,7 @@ def main():
     props = torch.cuda.get_device_properties(device)
     rank_metadata = {
         "rank": rank,
+        "pid": os.getpid(),
         "cpu_affinity": affinity,
         "device": props.name,
         "uuid": str(getattr(props, "uuid", "unavailable")),
@@ -442,20 +443,27 @@ def main():
                         overlap = {"auto": None, "on": True, "off": False}[
                             args.nv_overlap
                         ]
+                        if "kperm" in override:
+                            if "nvfp4_kperm" in override:
+                                raise ValueError(
+                                    "NV profile specifies two K-layout keys"
+                                )
+                            override = dict(override)
+                            override["nvfp4_kperm"] = override.pop("kperm")
                         options = {
-                            "kperm": args.nv_kperm,
+                            "nvfp4_kperm": args.nv_kperm,
                             "nvfp4_fc1_k256_overlap": overlap,
                             **override,
                         }
                         config = NVConfig(**common, **options)
-                        if config.kperm not in prepared_nv:
-                            prepared_nv[config.kperm] = prepare_nv(
+                        if config.nvfp4_kperm not in prepared_nv:
+                            prepared_nv[config.nvfp4_kperm] = prepare_nv(
                                 packs["nv"],
                                 intermediate_size=args.intermediate,
                                 hidden_size=args.hidden,
-                                kperm=config.kperm,
+                                nvfp4_kperm=config.nvfp4_kperm,
                             )
-                        transformed, pack = prepared_nv[config.kperm], packs["nv"]
+                        transformed, pack = prepared_nv[config.nvfp4_kperm], packs["nv"]
                     else:
                         config = MXConfig(
                             **common,
@@ -495,12 +503,40 @@ def main():
                         "initial output is not finite",
                     )
                     references[name] = output.clone()
-                    configurations[name] = {
+                    frontend = layer._staged_workspace._frontend
+                    kernel = frontend._mega.kernel
+                    actual_layout = {
+                        "num_ab_stage": int(kernel.num_ab_stage),
+                        "compact_pull_buffer": bool(
+                            kernel.token_comm.compact_pull_buffer
+                        ),
+                    }
+                    if name.startswith("nv"):
+                        conversion = kernel.nvfp4_conversion
+                        actual_layout.update(
+                            kperm=int(frontend.config.nvfp4_kperm),
+                            fc1_overlap=bool(kernel.nvfp4_fc1_k256_overlap),
+                            lut_replicas=int(conversion.lut_replicas),
+                            lut_map=str(conversion.lut_map),
+                            sf_stages=int(getattr(conversion, "sf_stages", 0)),
+                        )
+                    configuration = {
                         "requested_tactic": knobs,
                         "requested_config": options
                         if name.startswith("nv")
                         else {"compact_pull_buffer": config.compact_pull_buffer},
+                        "effective_tactic": frontend.effective_tactic(),
+                        "actual_layout": actual_layout,
                     }
+                    rank_configurations = [None] * world
+                    dist.all_gather_object(
+                        rank_configurations, configuration, group=host_group
+                    )
+                    if any(item != configuration for item in rank_configurations):
+                        raise RuntimeError(
+                            "ranks resolved different benchmark configurations"
+                        )
+                    configurations[name] = configuration
                 rounds = []
                 bucket = {"rounds": rounds, "configuration": configurations}
                 results["buckets"][str(tokens)] = bucket
@@ -512,7 +548,7 @@ def main():
                     round_result = {"round": round_index, "order": order, "cases": rows}
                     rounds.append(round_result)
                     for name in order:
-                        rows[name] = {"attempts": []}
+                        rows[name] = {"attempts": [], "wall_start_ns": time.time_ns()}
                         measure(
                             torch,
                             dist,
@@ -524,6 +560,7 @@ def main():
                             references[name],
                             rows[name],
                         )
+                        rows[name]["wall_end_ns"] = time.time_ns()
                     ratios = {
                         "nv_over_mx": rows["nv"]["score_us"] / rows["mx"]["score_us"]
                     }

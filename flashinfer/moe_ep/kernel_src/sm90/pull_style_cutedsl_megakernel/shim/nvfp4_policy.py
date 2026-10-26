@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Host-only NVFP4 policy: FC1 K256 schedule selection and conversion layout.
 
-Stdlib only and loadable as a standalone file (the CPU policy test does so):
-no package-relative imports, and no postponed annotations, which a dataclass
-would resolve through ``sys.modules``.
+Stdlib only and loadable as a standalone module: no package-relative imports
+or CUDA initialization.
 """
 
 import dataclasses
@@ -48,7 +47,7 @@ class Nvfp4ConversionLayout:
     The LUT fields change only shared-memory banking and size, never values.
     """
 
-    kperm: int = 0
+    kperm: int = 64
     lut_replicas: int = 8
     lut_map: str = "quad"
 

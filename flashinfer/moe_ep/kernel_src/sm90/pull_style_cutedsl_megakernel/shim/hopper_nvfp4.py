@@ -72,7 +72,6 @@ from .nvfp4_policy import (
     Nvfp4ConversionLayout,
     nvfp4_fc1_auto_shape_eligible,
     resolve_nvfp4_fc1_overlap,
-    split_nvfp4_conversion_tactic,
     validate_nvfp4_fc1_overlap_override,
     validate_nvfp4_kperm,
 )
@@ -84,8 +83,6 @@ _NVFP4_CLUSTER_SHAPE_DEFAULT = (1, 1, 1)
 _NVFP4_GROUP_SIZE = 16
 _NVFP4_FOLD_M = 64
 _NVFP4_FOLD_K = 128
-_NVFP4_GATE_UP_INTERLEAVE = 8
-_NVFP4_EPILOGUE_COMPENSATION = 8
 
 # This tuple is intentionally human-readable and embedded verbatim in every
 # compile key.  Changing preprocessing/layout semantics must create a new
@@ -123,11 +120,10 @@ def _validate_complete_nvfp4_tactic(
 
     if not isinstance(knobs, dict):
         raise ValueError(f"{source} must provide an NVFP4 knob dict.")
-    from .mxfp4_optimization import normalize_mxfp4_optimization_tactic
+    from .nvfp4_tuner import normalize_hopper_nvfp4_tactic
 
     try:
-        core, conversion = split_nvfp4_conversion_tactic(knobs)
-        return dict(normalize_mxfp4_optimization_tactic(core), **conversion)
+        return normalize_hopper_nvfp4_tactic(knobs)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{source}: {exc}") from exc
 
@@ -211,7 +207,6 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):
 
     def __init__(self, config: MegaMoEHopperNvfp4Config) -> None:
         super().__init__(config)
-        self._nvfp4_actual_num_tokens: Optional[int] = None
         self._nvfp4_fc1_k256_overlap = False
         self._nvfp4_device_identity: Optional[tuple] = None
         self._nvfp4_workspace_owner: Optional[_CompiledMega] = None
@@ -274,13 +269,14 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):
             ensure_not_capturing("NVFP4 workspace config change")
             self._release_workspace()
         if enabled != self._nvfp4_fc1_k256_overlap:
-            ensure_not_capturing("NVFP4 FC1 schedule change")
+            compiled = self._nvfp4_schedule_cache.get(enabled)
+            if compiled is None:
+                ensure_not_capturing("NVFP4 FC1 schedule change")
             self._nvfp4_fc1_k256_overlap = enabled
-            # Ranks may cross the threshold independently. Never free/allocate
-            # symmetric memory here; only select a rank-local compiled entry.
-            self._mega = self._nvfp4_schedule_cache.get(enabled)
+            # A warm schedule switch is rank-local and capture-safe. Only a
+            # cache miss requires compilation outside CUDA Graph capture.
+            self._mega = compiled
             self._mega_key = self._mega_compile_key() if self._mega else None
-        self._nvfp4_actual_num_tokens = actual_tokens
 
     def prepare_launch(
         self,
@@ -552,12 +548,9 @@ def _default_nvfp4_profile(
     routing_profile: str,
     nvfp4_kperm: int,
 ):
-    """Use calibrated defaults only for their exact model and device domain."""
+    """Select a reference-model heuristic without querying CUDA state."""
     from .nvfp4_tuner import hopper_nvfp4_default_profile
 
-    if not torch.cuda.is_available():
-        return None
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     return hopper_nvfp4_default_profile(
         num_max_tokens,
         hidden=hidden,
@@ -568,8 +561,6 @@ def _default_nvfp4_profile(
         gate_up_clamp=gate_up_clamp,
         routing_profile=routing_profile,
         kperm=nvfp4_kperm,
-        device_name=properties.name,
-        sm_count=int(properties.multi_processor_count),
     )
 
 
@@ -587,9 +578,9 @@ def resolve_hopper_nvfp4_knobs(
     nvfp4_kperm: int = 64,
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    use_tuning_cache: bool = False,
+    use_tuning_cache: bool = True,
 ) -> Dict[str, Any]:
-    """Resolve initial geometry; NV cache reads require explicit opt-in."""
+    """Read a compatible NV tuning entry, then use the reference heuristic."""
     if type(use_tuning_cache) is not bool:
         raise ValueError("use_tuning_cache must be a bool")
     routing_profile = normalize_sm90_routing_profile(routing_profile)
@@ -621,14 +612,24 @@ def resolve_hopper_nvfp4_knobs(
     if effective_overlap is None and profile is not None:
         effective_overlap = profile["requested_config"]["nvfp4_fc1_k256_overlap"]
 
+    def compatible(tactic: Dict[str, Any]) -> bool:
+        tile = tactic["mma_tiler_mnk"]
+        if hidden % tile[2] or intermediate % tile[2]:
+            return False
+        try:
+            validate_nvfp4_fc1_overlap_override(
+                effective_overlap,
+                mma_tiler_mnk=tuple(tile),
+                fp8_scale_mode="mxfp4_hybrid",
+                pingpong=tactic["pingpong"],
+            )
+        except ValueError:
+            return False
+        return True
+
     if use_tuning_cache:
-        # Only a live NV autotune winner can populate this separate namespace.
         from .knob_cache import lookup_knobs
-        from .nvfp4_tuner import (
-            hopper_nvfp4_cache_provenance_sha256,
-            hopper_nvfp4_candidates,
-            filter_hopper_nvfp4_candidates,
-        )
+        from .nvfp4_tuner import hopper_nvfp4_cache_provenance_sha256
 
         if num_tokens is not None and (
             type(num_tokens) is not int or not 0 <= num_tokens <= num_max_tokens
@@ -664,62 +665,28 @@ def resolve_hopper_nvfp4_knobs(
                 )
             except (TypeError, ValueError):
                 cached = None
-            if cached is not None:
-                properties = (
-                    torch.cuda.get_device_properties(torch.cuda.current_device())
-                    if torch.cuda.is_available()
-                    else None
-                )
-                allowed = hopper_nvfp4_candidates(
-                    num_max_tokens,
-                    hidden=hidden,
-                    intermediate=intermediate,
-                    num_experts=num_total_experts,
-                    world_size=world_size,
-                    routing_profile=routing_profile,
-                    kperm=nvfp4_kperm,
-                )
-                allowed = filter_hopper_nvfp4_candidates(
-                    allowed,
-                    max_tokens=num_max_tokens,
-                    live_tokens=num_tokens,
-                    hidden=hidden,
-                    intermediate=intermediate,
-                    num_experts=num_total_experts,
-                    world_size=world_size,
-                    num_topk=num_topk,
-                    gate_up_clamp=gate_up_clamp,
-                    routing_profile=routing_profile,
-                    kperm=nvfp4_kperm,
-                    overlap=effective_overlap,
-                    device_name=properties.name if properties else None,
-                    sm_count=int(properties.multi_processor_count)
-                    if properties
-                    else None,
-                )
-                if cached in allowed:
-                    return cached
-            # Unknown live context, a neighboring bucket or an unsupported profile
-            # is a cache miss; its timing does not apply to this request.
+            if cached is not None and compatible(cached):
+                return cached
 
-    # Default resolution is independent of timing caches. The H200 table
-    # applies only to its thirteen exact capacity buckets and model domain.
-    if profile is not None:
-        return _validate_complete_nvfp4_tactic(
-            profile["requested_tactic"], source="NVFP4 tuned default"
-        )
     from .mxfp4_tuner import _ordered_base_candidates
 
-    # Prefer the bucket winner when legal; smaller shapes may require the
-    # first legal tactic in the stable manifest union instead.
-    return _validate_complete_nvfp4_tactic(
+    choices = ([] if profile is None else [profile["requested_tactic"]]) + list(
         _ordered_base_candidates(
             num_max_tokens,
             hidden=hidden,
             intermediate=intermediate,
             routing_profile=routing_profile,
-        )[0],
-        source="NVFP4 initial geometry",
+        )
+    )
+    for candidate in choices:
+        candidate = _validate_complete_nvfp4_tactic(
+            candidate, source="NVFP4 initial geometry"
+        )
+        if compatible(candidate):
+            return candidate
+    raise ValueError(
+        "no NVFP4 initial tactic is compatible with the model shape and "
+        "explicit FC1 overlap setting"
     )
 
 
@@ -789,7 +756,11 @@ def _resolve_hopper_nvfp4_mega_moe_config(
             fold_producer_warps,
         )
     )
-    manual_selector = manual_geometry or manual_execution
+    manual_selector = (
+        manual_geometry
+        or manual_execution
+        or (token_back_mode is not None and knobs is None)
+    )
     if manual_selector and knobs is not None:
         raise ValueError(
             "pass either explicit fused geometry/execution axes or knobs=, not both."
@@ -808,7 +779,11 @@ def _resolve_hopper_nvfp4_mega_moe_config(
             swap_ab=True if swap_ab is None else swap_ab,
             pingpong=False if pingpong is None else pingpong,
             mma_tiler_mnk=(
-                _NVFP4_MMA_TILER_DEFAULT
+                (
+                    (128, 32, 256)
+                    if nvfp4_fc1_k256_overlap is True
+                    else _NVFP4_MMA_TILER_DEFAULT
+                )
                 if mma_tiler_mnk is None
                 else tuple(mma_tiler_mnk)
             ),

@@ -17,7 +17,7 @@ the natural layout, kperm64 changes only FP8 accumulation order.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Any, SupportsIndex, Tuple
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
@@ -30,10 +30,42 @@ NVFP4_FOLD_K = 128
 NVFP4_EPILOGUE_COMPENSATION = 8.0
 NVFP4_GATE_UP_INTERLEAVE = 8
 NVFP4_KPERM_CHOICES = (0, 32, 64)
-TransformedMegaWeights = Tuple[
-    Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"],
-    Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"],
-]
+_WeightLeg = Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]
+
+
+class TransformedMegaWeights(Tuple[_WeightLeg, _WeightLeg]):
+    """Two launch-compatible weight legs with their immutable K-layout identity."""
+
+    _nvfp4_kperm: int
+
+    def __new__(
+        cls, w13: _WeightLeg, w2: _WeightLeg, *, nvfp4_kperm: int
+    ) -> "TransformedMegaWeights":
+        result = tuple.__new__(cls, (w13, w2))
+        object.__setattr__(result, "_nvfp4_kperm", validate_nvfp4_kperm(nvfp4_kperm))
+        return result
+
+    @property
+    def nvfp4_kperm(self) -> int:
+        return self._nvfp4_kperm
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("Transformed NVFP4 layout metadata is read-only")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("Transformed NVFP4 layout metadata is read-only")
+
+    def __reduce_ex__(
+        self, protocol: SupportsIndex
+    ) -> Tuple[Any, Tuple[_WeightLeg, _WeightLeg, int]]:
+        return _restore_transformed_mega_weights, (self[0], self[1], self.nvfp4_kperm)
+
+
+def _restore_transformed_mega_weights(
+    w13: _WeightLeg, w2: _WeightLeg, nvfp4_kperm: int
+) -> TransformedMegaWeights:
+    return TransformedMegaWeights(w13, w2, nvfp4_kperm=nvfp4_kperm)
+
 
 # One natural-order K chunk viewed as four factors (sizes, strides 16/8/4/1),
 # and the factor order that iterates it in permuted order: new[p] = old[pi(p)].
@@ -252,12 +284,12 @@ def preprocess_mega_weights(
     kind="fp8_e4m3",
     fp8_scale_mode="mxfp4_hybrid",
     expert_chunk_size: int = 4,
-    kperm: int = 64,
+    nvfp4_kperm: int = 64,
 ) -> TransformedMegaWeights:
     """Raw NVFP4 or BF16 weights to packed SM90 kernel layouts.
 
-    ``kperm`` selects the K-permuted layout described in the module docstring;
-    the kernel and the activation staging must use the same value.
+    ``nvfp4_kperm`` selects the K layout used by input staging and the kernel.
+    The returned two-leg tuple carries this identity for validation before launch.
     """
     import torch
     from flashinfer.fused_moe.prepare import interleave_moe_weights_for_sm90_mixed_gemm
@@ -265,7 +297,7 @@ def preprocess_mega_weights(
 
     if kind != "fp8_e4m3" or fp8_scale_mode != "mxfp4_hybrid":
         raise ValueError("NVFP4 requires FP8 E4M3 per-token activation scaling")
-    kperm = validate_nvfp4_kperm(kperm)
+    kperm = validate_nvfp4_kperm(nvfp4_kperm)
     if (
         hidden_size <= 0
         or intermediate_size <= 0
@@ -362,7 +394,7 @@ def preprocess_mega_weights(
         legs.append(result)
     if legs[0][0].device != legs[1][0].device:
         raise ValueError("both NVFP4 weight legs must share one CUDA device")
-    return legs[0], legs[1]
+    return TransformedMegaWeights(legs[0], legs[1], nvfp4_kperm=kperm)
 
 
 def validate_transformed_mega_weights(
@@ -374,8 +406,23 @@ def validate_transformed_mega_weights(
     fp8_scale_mode="mxfp4_hybrid",
     world_size: int,
     num_experts: int,
+    nvfp4_kperm: int = 64,
 ) -> None:
-    """Validate exact packed-K, transposed-scale and 8G launch contracts."""
+    """Validate layout identity before inspecting the packed-K/scale tensors."""
+    expected_kperm = validate_nvfp4_kperm(nvfp4_kperm)
+    if (
+        not isinstance(transformed_weights, TransformedMegaWeights)
+        or type(getattr(transformed_weights, "nvfp4_kperm", None)) is not int
+    ):
+        raise ValueError(
+            "NVFP4 transformed weights require layout metadata; use "
+            "preprocess_sm90_pull_nvfp4_mega_weights"
+        )
+    if transformed_weights.nvfp4_kperm != expected_kperm:
+        raise ValueError(
+            f"NVFP4 transformed layout nvfp4_kperm={transformed_weights.nvfp4_kperm} "
+            f"does not match configuration nvfp4_kperm={expected_kperm}"
+        )
     import torch
 
     if kind != "fp8_e4m3" or fp8_scale_mode != "mxfp4_hybrid":

@@ -38,68 +38,10 @@ def autotune_hopper_nvfp4_mega_moe(
         normalize_hopper_nvfp4_tactic,
         nvfp4_candidate_sha256,
         hopper_nvfp4_cache_provenance_sha256,
-        filter_hopper_nvfp4_candidates,
     )
 
     cfg = symm_buffer._frontend.config
     require_hopper_mxfp4_fused_tuning_device()
-    from .comm import resolve_gate_up_clamp
-    import torch
-    import torch.distributed as dist
-
-    effective_clamp = resolve_gate_up_clamp(
-        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
-    )
-    if effective_clamp is None:
-        effective_clamp = cfg.gate_up_clamp
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-    context = dict(
-        max_tokens=cfg.num_tokens_per_rank,
-        live_tokens=num_tokens,
-        hidden=cfg.hidden,
-        intermediate=cfg.intermediate,
-        num_experts=cfg.num_total_experts,
-        world_size=cfg.world_size,
-        num_topk=cfg.num_topk,
-        gate_up_clamp=effective_clamp,
-        routing_profile=cfg.routing_profile,
-        kperm=cfg.nvfp4_kperm,
-        overlap=cfg.nvfp4_fc1_k256_overlap,
-        device_name=properties.name,
-        sm_count=int(properties.multi_processor_count),
-    )
-    if num_tokens is not None and (
-        type(num_tokens) is not int or not 0 <= num_tokens <= cfg.num_tokens_per_rank
-    ):
-        raise ValueError("NVFP4 autotune live tokens must be within capacity")
-    if cfg.world_size > 1:
-        if (
-            not dist.is_initialized()
-            or dist.get_world_size(group=process_group) != cfg.world_size
-        ):
-            raise RuntimeError(
-                "NVFP4 autotune requires the matching initialized EP group"
-            )
-        all_contexts: list[Any] = [None] * cfg.world_size
-        dist.all_gather_object(all_contexts, context, group=process_group)
-        stable = (
-            "max_tokens",
-            "hidden",
-            "intermediate",
-            "num_experts",
-            "world_size",
-            "routing_profile",
-            "kperm",
-            "overlap",
-        )
-        if any(any(row[k] != context[k] for k in stable) for row in all_contexts):
-            raise ValueError(
-                "NVFP4 autotune geometry/backend contexts differ across ranks"
-            )
-        if any(row != context for row in all_contexts):
-            # Unknown or unequal live contexts must not create divergent
-            # candidate arrays across ranks.
-            context["live_tokens"] = None
     full = hopper_nvfp4_candidates(
         cfg.num_tokens_per_rank,
         hidden=cfg.hidden,
@@ -109,7 +51,6 @@ def autotune_hopper_nvfp4_mega_moe(
         routing_profile=cfg.routing_profile,
         kperm=cfg.nvfp4_kperm,
     )
-    full = filter_hopper_nvfp4_candidates(full, **context)
     if cfg.nvfp4_fc1_k256_overlap is True:
         full = [c for c in full if c["mma_tiler_mnk"][2] == 256 and not c["pingpong"]]
     selected = (
@@ -126,8 +67,11 @@ def autotune_hopper_nvfp4_mega_moe(
     union_sha = nvfp4_candidate_sha256(selected)
 
     def record(_winner: dict, p50_s: float) -> None:
-        winner = symm_buffer._frontend.effective_tactic()
-        if cfg.rank == 0 and winner in full:
+        requested = normalize_hopper_nvfp4_tactic(_winner)
+        if requested not in selected:
+            raise ValueError("NVFP4 autotune winner is outside the measured candidates")
+        winner = normalize_hopper_nvfp4_tactic(symm_buffer._frontend.effective_tactic())
+        if cfg.rank == 0:
             from .knob_cache import record_knobs
 
             actual = symm_buffer._frontend.config

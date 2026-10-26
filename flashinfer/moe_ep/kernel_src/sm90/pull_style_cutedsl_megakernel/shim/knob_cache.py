@@ -123,6 +123,10 @@ def _is_mxfp4_dtype(dtype: Any) -> bool:
     return isinstance(dtype, str) and dtype.startswith(_MXFP4_DTYPE_PREFIX)
 
 
+def _format_label(dtype: str) -> str:
+    return "NVFP4" if dtype.startswith("sm90_w_nvfp4_") else "MXFP4"
+
+
 def _requires_hardware_provenance(dtype: Any) -> bool:
     # NV uses the same strict hardware axes, with its own format/domain hash.
     # Existing MX keys and matching behavior remain unchanged.
@@ -232,7 +236,7 @@ def _matching_entries(
     if _requires_hardware_provenance(dtype):
         if not _is_valid_tuning_provenance_sha256(tuning_provenance_sha256):
             warnings.warn(
-                "[moe_ep-knob-cache] ignoring MXFP4 cache lookup without a "
+                f"[moe_ep-knob-cache] ignoring {_format_label(dtype)} cache lookup without a "
                 "valid tuning-provenance SHA-256.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -361,7 +365,7 @@ def record_knobs(
     if _requires_hardware_provenance(dtype):
         if not _is_valid_tuning_provenance_sha256(tuning_provenance_sha256):
             warnings.warn(
-                "[moe_ep-knob-cache] refusing to record MXFP4 knobs without a "
+                f"[moe_ep-knob-cache] refusing to record {_format_label(dtype)} knobs without a "
                 "valid tuning-provenance SHA-256.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -373,7 +377,7 @@ def record_knobs(
         )
         if capability is None or resolved_sms is None:
             warnings.warn(
-                "[moe_ep-knob-cache] refusing to record MXFP4 knobs without "
+                f"[moe_ep-knob-cache] refusing to record {_format_label(dtype)} knobs without "
                 "compute-capability and SM-count identity.",
                 RuntimeWarning,
                 stacklevel=2,

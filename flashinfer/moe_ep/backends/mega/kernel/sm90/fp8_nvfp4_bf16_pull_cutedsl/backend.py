@@ -54,15 +54,18 @@ class Sm90PullNvfp4MegaKernelBackend(Sm90PullMxfp4MegaKernelBackend):
     def _knob_resolver_kwargs(self) -> dict[str, Any]:
         k = self._kernel_config
         return {
-            "nvfp4_kperm": k.kperm,
+            "nvfp4_kperm": k.nvfp4_kperm,
             "nvfp4_fc1_k256_overlap": k.nvfp4_fc1_k256_overlap,
         }
 
     def _format_config_kwargs(self) -> dict[str, Any]:
         return self._knob_resolver_kwargs()
 
+    def _validate_transformed_kwargs(self) -> dict[str, Any]:
+        return {"nvfp4_kperm": self._kernel_config.nvfp4_kperm}
+
     def _staging_kwargs(self) -> dict[str, Any]:
-        kperm = self._kernel_config.kperm
+        kperm = self._kernel_config.nvfp4_kperm
         return {
             "write_payload": functools.partial(copy_nvfp4_kperm_hidden, kperm=kperm)
             if kperm
@@ -80,7 +83,7 @@ class Sm90PullNvfp4MegaKernelBackend(Sm90PullMxfp4MegaKernelBackend):
             intermediate_size=k.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             expert_chunk_size=k.preprocess_expert_chunk_size,
-            kperm=k.kperm,
+            nvfp4_kperm=k.nvfp4_kperm,
         )
 
     def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:

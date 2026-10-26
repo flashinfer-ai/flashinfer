@@ -184,6 +184,9 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             expert_chunk_size=k.preprocess_expert_chunk_size,
         )
 
+    def _validate_transformed_kwargs(self) -> dict[str, Any]:
+        return {}
+
     def validate_transformed_weights(
         self,
         transformed_weights: TransformedMegaWeights,
@@ -196,6 +199,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
+            **self._validate_transformed_kwargs(),
         )
 
     def _fused_frontend_config_kwargs(

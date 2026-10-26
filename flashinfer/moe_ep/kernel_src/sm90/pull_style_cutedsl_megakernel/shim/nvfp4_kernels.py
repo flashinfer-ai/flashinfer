@@ -8,7 +8,7 @@ Weight scales, candidate conversion, and LUT allocation specialize the vendor.
 The optional FC1 K256 schedule coalesces fences and overlaps conversion with
 WGMMA; disabling it retains the vendor schedule and communication protocol.
 ``nvfp4_conversion`` selects the K-permuted weight layout and the LUT size and
-banking; its default uses natural K order and an 8-replica table.
+banking; its default uses K64 order and an 8-replica table.
 The MXFP4-prefixed private policy names retain the shared activation ABI.
 """
 
@@ -34,7 +34,6 @@ from .nvfp4_conversion import (
     convert_nvfp4_group,
     MXFP4_FOLD_BLOCK_BYTES,
     MXFP4_K_TILE,
-    convert_packed_a_kblock,
     make_expanded_offset_view,
     make_expanded_offset_view_k256,
     make_offset_smem_layout,
@@ -75,9 +74,10 @@ class Sm90SwapABSwigluNvfp4Fp8Fc12Kernel(Sm90SwapABSwigluMxfp4Fp8Fc12Kernel):
     _make_scale_smem_layout_k256 = staticmethod(make_offset_smem_layout_k256)
     _make_expanded_scale_view = staticmethod(make_expanded_offset_view)
     _make_expanded_scale_view_k256 = staticmethod(make_expanded_offset_view_k256)
-    _convert_packed_a_kblock = staticmethod(convert_packed_a_kblock)
 
     def __init__(self, *args, **kwargs) -> None:
+        if kwargs.get("fp8_scale_mode", "per_tensor") != "mxfp4_hybrid":
+            raise NotImplementedError("NVFP4 requires fp8_scale_mode='mxfp4_hybrid'")
         # Standalone FC12 construction keeps the baseline conversion policy.
         self.nvfp4_fc1_k256_overlap = False
         self.nvfp4_conversion = NVFP4_DEFAULT_CONVERSION
@@ -466,13 +466,6 @@ class Sm90MegaMoESwapABNvfp4Fp8Kernel(
         ):
             raise ValueError("NVFP4 FC1 overlap requires hybrid K256 without pingpong")
         self.nvfp4_fc1_k256_overlap = nvfp4_fc1_k256_overlap
-        if (
-            nvfp4_conversion != NVFP4_DEFAULT_CONVERSION
-            and self.fp8_scale_mode != "mxfp4_hybrid"
-        ):
-            # The per-tensor path converts word by word in natural K order
-            # with the default table.
-            raise ValueError(
-                "NVFP4 conversion layouts require fp8_scale_mode='mxfp4_hybrid'"
-            )
+        if self.fp8_scale_mode != "mxfp4_hybrid":
+            raise NotImplementedError("NVFP4 requires fp8_scale_mode='mxfp4_hybrid'")
         self.nvfp4_conversion = nvfp4_conversion
