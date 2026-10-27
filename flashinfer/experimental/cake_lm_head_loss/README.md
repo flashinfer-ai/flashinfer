@@ -419,8 +419,11 @@ per GEMM --
 number of trailing wide items run as half items) and `"swap_ab"` (the `_swab`
 tile) -- a knob given as `null` pins the default -- and wins over the rule for
 the knobs it names.  An explicit `"split"`, or a `"stages"` other than the
-table ring depth 4, keeps that form and turns the `_swab` rule off;
-`"swap_ab": true` with such a `"stages"` or a nonzero `"split"` raises.
+table ring depth 4, keeps that form and turns the `_swab` rule off.
+`"swap_ab": true` applies to every chunk; it raises with such a `"stages"`,
+with a nonzero `"split"`, on an architecture without the swapped program
+(only SM103 has it), and on a chunk whose dX tile is the 256-column one
+(pin `"tile_n": 512` as well).
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the

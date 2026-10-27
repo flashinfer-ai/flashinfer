@@ -941,11 +941,33 @@ def chunk_variants(
         and int(dx_t["stages"]) != DX_WIDE_TILE_STAGES
     )
     if "swap_ab" in dx_t:
+        # an explicit ``swap_ab=True`` applies to every chunk (as an explicit ``split`` does): a chunk whose resolved
+        # form cannot run the swapped tile is an error here, not a missing stage at bind time
         swab = bool(dx_t["swap_ab"])
+        if swab and arch is not None and arch not in DX_SWAB_ARCHES:
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: {arch} has no swapped dX program (architectures "
+                f"{', '.join(DX_SWAB_ARCHES)})"
+            )
         if swab and stages_off_table:
             raise ValueError(
                 f"gemm_tuning dx swap_ab=True: the swapped dX tile runs the {DX_WIDE_TILE_STAGES}-deep table ring "
                 f"only, got stages={dx_t['stages']}"
+            )
+        if swab and tile is not None and int(tile) != DX_TILE_WIDE:
+            how = (
+                "pinned"
+                if "tile_n" in dx_t
+                else "selected by the tile rule (the wide items do not fill the SM pairs)"
+            )
+            hint = (
+                f"H={int(hidden)} has no wide tile (H % {DX_TILE_WIDE} != 0)"
+                if int(hidden) % DX_TILE_WIDE
+                else f"pin tile_n={DX_TILE_WIDE} as well"
+            )
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: the swapped dX form exists for the {DX_TILE_WIDE}-column tile only, "
+                f"but the chunk of {int(rows_c)} rows resolves tile_n={int(tile)} ({how}); {hint}"
             )
     else:
         swab = (

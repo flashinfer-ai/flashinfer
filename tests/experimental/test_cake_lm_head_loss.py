@@ -2637,6 +2637,51 @@ def test_make_plan_explicit_dx_pins_and_the_swab_rule():
         ).dx_stage_of(0)
 
 
+def test_make_plan_explicit_swap_ab_errors_early():
+    """An explicit ``swap_ab=True`` applies to every chunk: ``make_plan`` raises a ``ValueError`` (not a missing stage at
+    bind time) for a chunk whose dX tile the rule narrows (the message names the chunk's rows and tile and says to pin
+    ``tile_n=512`` as well), for an architecture without the swapped program and for a ring depth other than the
+    table's; with ``tile_n=512`` pinned too, every chunk -- the ragged tail included -- runs the swapped tile."""
+    kw = _plan_kw("sm_103a")
+    problem = _problem(3 * 2048 + 59, 6144, 154880, 2048)  # a ragged 59-row tail
+    ruled = cake_backend.make_plan(problem, **kw)
+    assert ruled.num_chunks == 4 and ruled.last_chunk[1] == 59
+    narrow = [i for i in range(4) if ruled.variants_of(i).dx_tile_n is not None]
+    assert narrow and all(ruled.variants_of(i).dx_tile_n == 256 for i in narrow)
+    rows = ruled.chunks[narrow[0]][1]
+    with pytest.raises(
+        ValueError,
+        match=rf"swap_ab=True: .* chunk of {rows} rows resolves tile_n=256 .*pin tile_n=512 as well",
+    ):
+        cake_backend.make_plan(problem, gemm_tuning={"dx": {"swap_ab": True}}, **kw)
+    for objective in ("ce", "policy"):
+        p = _problem(3 * 2048 + 59, 6144, 154880, 2048, objective)
+        pinned = cake_backend.make_plan(
+            p, gemm_tuning={"dx": {"swap_ab": True, "tile_n": 512}}, **kw
+        )
+        assert all(
+            pinned.variants_of(i).dx_swab and pinned.variants_of(i).dx_tile_n is None
+            for i in range(4)
+        )
+        assert all(pinned.dx_stage_of(i).endswith("_swab") for i in range(4))
+    with pytest.raises(ValueError, match=r"4-deep table ring only, got stages=3"):
+        cake_backend.make_plan(
+            problem,
+            gemm_tuning={"dx": {"swap_ab": True, "tile_n": 512, "stages": 3}},
+            **kw,
+        )
+    kw100 = _plan_kw("sm_100a")
+    for pin in ({"swap_ab": True}, {"swap_ab": True, "tile_n": 512}):
+        with pytest.raises(ValueError, match="sm_100a has no swapped dX program"):
+            cake_backend.make_plan(problem, gemm_tuning={"dx": pin}, **kw100)
+    assert (
+        cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"swap_ab": False}}, **kw100
+        ).variants
+        == cake_backend.make_plan(problem, **kw100).variants
+    )
+
+
 def test_reachable_variants_r6_forms():
     bases = cake_jit.BASE_STAGES
     r103 = cake_backend.reachable_variants(bases, "sm_103a", 4)
@@ -6442,8 +6487,8 @@ def _assert_same_bits(a, b, keys=("loss", "logp", "dX", "dW")):
 
 def test_device_swab_dx_is_bitwise_the_shipped_form(glm_weight):
     """The swapped dX tile (SM103: the rule on whole chunks of a cross-entropy call of >= 3 chunks, or an explicit
-    ``swap_ab=True`` on any chunk and objective) gives the bits of the shipped forms (``swap_ab=False``): loss, logp,
-    dX and dW as integer views."""
+    ``swap_ab=True`` with ``tile_n=512`` on every chunk -- ragged last chunks included -- and objective) gives the bits
+    of the shipped forms (``swap_ab=False``, the rule's tiles): loss, logp, dX and dW as integer views."""
     _require_program(entry="loss")
     module_name, record = cake_backend.record_for(CUDA)
     if record["arch"] not in cake_backend.DX_SWAB_ARCHES:
@@ -6452,6 +6497,8 @@ def test_device_swab_dx_is_bitwise_the_shipped_form(glm_weight):
         cake_jit.registered_stages(module_name)
     )
     off = {"gemm_tuning": {"dx": {"swap_ab": False}}}
+    # an explicit swap_ab applies to every chunk; a chunk the tile rule narrows needs the wide tile pinned as well
+    pinned = {"gemm_tuning": {"dx": {"swap_ab": True, "tile_n": 512}}}
     for T, C, objective, pin in (
         (
             4096,
@@ -6460,8 +6507,9 @@ def test_device_swab_dx_is_bitwise_the_shipped_form(glm_weight):
             {},
         ),  # whole 1024-token chunks (3 whole + a tail when compacted)
         (3 * 4096 + 59, 4096, "ce", {}),
-        (3 * 2048 + 1083, 2048, "ce", {"gemm_tuning": {"dx": {"swap_ab": True}}}),
-        (2 * 2048 + 339, 2048, "policy", {"gemm_tuning": {"dx": {"swap_ab": True}}}),
+        (3 * 2048 + 1083, 2048, "ce", pinned),  # ragged last chunks
+        (2 * 2048 + 339, 2048, "policy", pinned),
+        (3 * 2048 + 59, 2048, "ce", pinned),
     ):
         inp = _device_inputs(T, objective, W=glm_weight)
         for compact in (None, False):
@@ -6470,9 +6518,8 @@ def test_device_swab_dx_is_bitwise_the_shipped_form(glm_weight):
             _assert_same_bits(swab, shipped)
     if generated_program_available(CUDA, entry="logprob"):
         inp = _device_inputs(3 * 2048 + 1083, W=glm_weight)
-        on = {"gemm_tuning": {"dx": {"swap_ab": True}}}
         _assert_same_bits(
-            _run(inp, 2048, entry="logprob", backend="cake", **on),
+            _run(inp, 2048, entry="logprob", backend="cake", **pinned),
             _run(inp, 2048, entry="logprob", backend="cake", **off),
         )
 
