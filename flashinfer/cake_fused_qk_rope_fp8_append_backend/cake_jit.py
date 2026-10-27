@@ -30,8 +30,9 @@ flags, verifying every source digest before the first build.
 A record is one *stage*: a build of the kernel with one set of knobs (the
 launch bound, the scan rounds of the request lookup, the early request guess,
 the page-row prefetch, the fold of the clearing work into the row CTAs, the
-dispatch order of the grid axes, the KV heads per clearing CTA and the width
-of its zero stores); the head configuration, the quantization policy
+dispatch order of the grid axes, the KV heads per clearing CTA, the width of
+its zero stores and whether it reads its request length after the vote); the
+head configuration, the quantization policy
 (dynamic per-token scale or the static ``q_scale_inv``), the norm policy,
 prefill versus decode and the caller-owned K/V route are launch parameters.
 Every stage writes bit-identical outputs; the host picks one per call from
@@ -118,6 +119,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
@@ -168,7 +170,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fp8_e4m3",
         "workspace_rule": None,
     },
-    "fp8_e4m3_early_rt21_fold1": {
+    "fp8_e4m3_early_rt21_fold1_clear_tie1": {
         "arches": [
             "sm_90a",
             "sm_100a",
@@ -223,9 +225,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": True,
         },
-        "kernel": "cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d",
-        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d",
+        "kernel": "cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
         # Decode of at least eight KV heads between one and two waves of row CTAs:
         # the early request guess and the fold of the clearing work into the row
         # CTAs (no clearing CTAs: grid rule ``rows_by_kv_heads``).
@@ -236,7 +239,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d",
+        "library": "cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
         "logical": {
             "cos_sin": "cos_sin",
             "has_out_kv": "has_out_kv",
@@ -269,7 +272,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
             "value_cache": "value_cache",
         },
-        "stage": "fp8_e4m3_early_rt21_fold1",
+        "stage": "fp8_e4m3_early_rt21_fold1_clear_tie1",
         "workspace_rule": None,
     },
     "fp8_e4m3_min_blocks10": {
@@ -327,6 +330,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
@@ -375,7 +379,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fp8_e4m3_min_blocks10",
         "workspace_rule": None,
     },
-    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1": {
+    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1": {
         "arches": [
             "sm_90a",
             "sm_103a",
@@ -429,9 +433,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": True,
         },
-        "kernel": "cake_fused_qk_rope_fp8_append_86aa1f108dbc9a948b6b",
-        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_86aa1f108dbc9a948b6b",
+        "kernel": "cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
         # H100 / H200 decode of at least eight KV heads beyond one wave, and
         # single-KV-head decode with a short page row or the static Q scale; GB300
         # decode or single-KV-head prefill within 48 pages per request and without
@@ -444,7 +449,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_fused_qk_rope_fp8_append_86aa1f108dbc9a948b6b",
+        "library": "cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
         "logical": {
             "cos_sin": "cos_sin",
             "has_out_kv": "has_out_kv",
@@ -477,10 +482,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
             "value_cache": "value_cache",
         },
-        "stage": "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+        "stage": "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
         "workspace_rule": None,
     },
-    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2": {
+    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2_clear_tie1": {
         "arches": [
             "sm_90a",
         ],
@@ -533,9 +538,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 2,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": True,
         },
-        "kernel": "cake_fused_qk_rope_fp8_append_f1cec011b3c0558f8847",
-        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_f1cec011b3c0558f8847",
+        "kernel": "cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
         # H100 / H200 one-wave decode of at least eight KV heads with more row CTAs
         # than SMs: the prefetching guess at nine CTAs per SM with the KV group axis
         # first and the clearing CTAs dispatched before the rows (grid rule
@@ -547,7 +553,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_fused_qk_rope_fp8_append_f1cec011b3c0558f8847",
+        "library": "cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
         "logical": {
             "cos_sin": "cos_sin",
             "has_out_kv": "has_out_kv",
@@ -580,7 +586,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
             "value_cache": "value_cache",
         },
-        "stage": "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2",
+        "stage": "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2_clear_tie1",
         "workspace_rule": None,
     },
     "fp8_e4m3_grid_order2": {
@@ -637,6 +643,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 2,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
@@ -740,6 +747,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 3,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
@@ -789,7 +797,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fp8_e4m3_grid_order3",
         "workspace_rule": None,
     },
-    "fp8_e4m3_early_rt21_page_prefetch1": {
+    "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -843,9 +851,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": True,
         },
-        "kernel": "cake_fused_qk_rope_fp8_append_0c9a871e45a16471fe49",
-        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_0c9a871e45a16471fe49",
+        "kernel": "cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
         # B200 and B300 decode, and single-KV-head prefill, within one wave, 48
         # pages per request and without caller-owned K/V: the early guess with
         # the page-row prefetch.
@@ -856,7 +865,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_fused_qk_rope_fp8_append_0c9a871e45a16471fe49",
+        "library": "cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
         "logical": {
             "cos_sin": "cos_sin",
             "has_out_kv": "has_out_kv",
@@ -889,10 +898,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
             "value_cache": "value_cache",
         },
-        "stage": "fp8_e4m3_early_rt21_page_prefetch1",
+        "stage": "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
         "workspace_rule": None,
     },
-    "fp8_e4m3_scan_rounds3": {
+    "fp8_e4m3_scan_rounds3_clear_tie1": {
         "arches": [
             "sm_90a",
             "sm_100a",
@@ -947,9 +956,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
+            "clear_tie": True,
         },
-        "kernel": "cake_fused_qk_rope_fp8_append_43a1f9e8090956d00bed",
-        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_43a1f9e8090956d00bed",
+        "kernel": "cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
         # Three scan rounds of the request lookup: H100 / H200 single-KV-head decode
         # the prefetch does not serve, one-wave prefill and tiny (64, 8) decode
         # grids; B200 and B300 decode beyond two waves from 97 requests.
@@ -960,7 +970,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_fused_qk_rope_fp8_append_43a1f9e8090956d00bed",
+        "library": "cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
         "logical": {
             "cos_sin": "cos_sin",
             "has_out_kv": "has_out_kv",
@@ -993,7 +1003,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
             "value_cache": "value_cache",
         },
-        "stage": "fp8_e4m3_scan_rounds3",
+        "stage": "fp8_e4m3_scan_rounds3_clear_tie1",
         "workspace_rule": None,
     },
     "fp8_e4m3_clear_heads_per_cta2_zero_store_width256": {
@@ -1049,6 +1059,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 0,
             "clear_heads_per_cta": 2,
             "zero_store_width": 256,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
@@ -1152,6 +1163,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid_order": 3,
             "clear_heads_per_cta": 1,
             "zero_store_width": 256,
+            "clear_tie": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
@@ -1235,6 +1247,7 @@ KNOB_KEYS = (
     "grid_order",
     "clear_heads_per_cta",
     "zero_store_width",
+    "clear_tie",
 )
 # The Cake stage policy: the per-card constants and the rule of this round
 # (``version`` is the policy table's).  ``policy_knobs`` is the executable form.
@@ -1259,33 +1272,34 @@ STAGE_POLICY: dict[str, Any] = {
         "= num_rows == num_requests and not is_prefill; pages_ok = "
         "max_pages_per_request <= prefetch_max_pages; prefetch_ok = pages_ok and "
         "not has_out_kv; order_ok = clear_frac <= order_max_clear_frac; er2pp9 = "
-        "min_blocks=9, early_rt2, page_prefetch; s3 = scan_rounds=3. decode and "
-        "Hkv >= fold_min_kv_heads and fold_waves[0] < waves <= fold_waves[1] -> "
-        "early_rt2, fold. h100: decode and Hkv >= fold_min_kv_heads -> er2pp9 "
-        "beyond one wave, s3 when (num_rows + num_requests) * Hkv <= num_sms, "
-        "else er2pp9 + grid_order=2; decode otherwise -> er2pp9 when prefetch_ok "
-        "and (max_pages_per_request <= prefetch_short_row or quant_policy == "
-        "prefetch_quant_policy) else s3; prefill beyond one wave -> grid_order=3 "
-        "if order_ok else min_blocks=10; one-wave prefill -> s3. u2z = "
-        "clear_heads_per_cta=2, zero_store_width=256; u2z_class = decode and Hkv "
-        "== 1 and u2z_ctas[0] <= (num_rows + num_requests) * Hkv <= u2z_ctas[1]. "
-        "gb300: u2z_class -> u2z; prefetch_ok and (decode or Hkv == 1) -> er2pp9; "
-        "not order_ok -> the default build; is_prefill and Hkv >= "
-        "fold_min_kv_heads and num_requests >= swap_min_requests and num_rows + "
-        "num_requests <= 65535 -> grid_order=2; else grid_order=3. b300 first: "
-        "u2z_class and (not prefetch_ok or max_pages_per_request <= "
-        "prefetch_short_row) -> u2z; is_prefill and Hkv >= fold_min_kv_heads and "
+        "min_blocks=9, early_rt2, page_prefetch, clear_tie; s3 = scan_rounds=3, "
+        "clear_tie. decode and Hkv >= fold_min_kv_heads and fold_waves[0] < waves "
+        "<= fold_waves[1] -> early_rt2, fold, clear_tie. h100: decode and Hkv >= "
+        "fold_min_kv_heads -> er2pp9 beyond one wave, s3 when (num_rows + "
+        "num_requests) * Hkv <= num_sms, else er2pp9 + grid_order=2; decode "
+        "otherwise -> er2pp9 when prefetch_ok and (max_pages_per_request <= "
+        "prefetch_short_row or quant_policy == prefetch_quant_policy) else s3; "
+        "prefill beyond one wave -> grid_order=3 if order_ok else min_blocks=10; "
+        "one-wave prefill -> s3. u2z = clear_heads_per_cta=2, "
+        "zero_store_width=256; u2z_class = decode and Hkv == 1 and u2z_ctas[0] <= "
+        "(num_rows + num_requests) * Hkv <= u2z_ctas[1]. gb300: u2z_class -> u2z; "
+        "prefetch_ok and (decode or Hkv == 1) -> er2pp9; not order_ok -> the "
+        "default build; is_prefill and Hkv >= fold_min_kv_heads and num_requests "
+        ">= swap_min_requests and num_rows + num_requests <= 65535 -> "
+        "grid_order=2; else grid_order=3. b300 first: u2z_class and (not "
+        "prefetch_ok or max_pages_per_request <= prefetch_short_row) -> u2z; "
+        "is_prefill and Hkv >= fold_min_kv_heads and num_requests >= "
+        "swap_min_requests and waves <= 1 and order_ok -> grid_order=2; then the "
+        "shared table. b200 first: is_prefill and Hkv >= fold_min_kv_heads and "
         "num_requests >= swap_min_requests and waves <= 1 and order_ok -> "
-        "grid_order=2; then the shared table. b200 first: is_prefill and Hkv >= "
-        "fold_min_kv_heads and num_requests >= swap_min_requests and waves <= 1 "
-        "and order_ok -> grid_order=2; u2z_class and not prefetch_ok -> "
-        "grid_order=3, zero_store_width=256; then the shared table. shared (b200 "
-        "/ b300): decode and waves > fold_waves[1] -> s3 from "
-        "scan_rounds3_min_requests requests else the default build; prefill and "
-        "waves > 1 -> min_blocks=10; prefetch_ok and (decode or Hkv == 1) -> "
-        "early_rt2, page_prefetch; else the default build"
+        "grid_order=2; u2z_class and not prefetch_ok -> grid_order=3, "
+        "zero_store_width=256; then the shared table. shared (b200 / b300): "
+        "decode and waves > fold_waves[1] -> s3 from scan_rounds3_min_requests "
+        "requests else the default build; prefill and waves > 1 -> min_blocks=10; "
+        "prefetch_ok and (decode or Hkv == 1) -> early_rt2, page_prefetch, "
+        "clear_tie; else the default build"
     ),
-    "version": "round2-v8-2026-10-20T16:45Z",
+    "version": "round3-v9-2026-10-26",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -1402,14 +1416,15 @@ def policy_knobs(
     low, high = constants["fold_waves"]
     many_heads = kv_heads >= int(constants["fold_min_kv_heads"])
     if decode and many_heads and low < waves <= high:
-        return {"early_rt2": True, "fold": True}
+        return {"early_rt2": True, "fold": True, "clear_tie": True}
     if which == "h100":
         er2pp9: dict[str, int | bool] = {
             "min_blocks": 9,
             "early_rt2": True,
             "page_prefetch": True,
+            "clear_tie": True,
         }
-        scan3: dict[str, int | bool] = {"scan_rounds": 3}
+        scan3: dict[str, int | bool] = {"scan_rounds": 3, "clear_tie": True}
         if decode and many_heads:
             if waves > 1.0:
                 return er2pp9
@@ -1438,7 +1453,12 @@ def policy_knobs(
         if u2z_class:
             return u2z
         if prefetch_ok and (decode or kv_heads == 1):
-            return {"min_blocks": 9, "early_rt2": True, "page_prefetch": True}
+            return {
+                "min_blocks": 9,
+                "early_rt2": True,
+                "page_prefetch": True,
+                "clear_tie": True,
+            }
         if not order_ok:
             return {}
         if (
@@ -1479,12 +1499,12 @@ def policy_knobs(
             return {"grid_order": 3, "zero_store_width": 256}
     if decode and waves > high:
         if requests >= int(constants["scan_rounds3_min_requests"]):
-            return {"scan_rounds": 3}
+            return {"scan_rounds": 3, "clear_tie": True}
         return {}
     if prefill and waves > 1.0:
         return {"min_blocks": 10}
     if prefetch_ok and (decode or kv_heads == 1):
-        return {"early_rt2": True, "page_prefetch": True}
+        return {"early_rt2": True, "page_prefetch": True, "clear_tie": True}
     return {}
 
 

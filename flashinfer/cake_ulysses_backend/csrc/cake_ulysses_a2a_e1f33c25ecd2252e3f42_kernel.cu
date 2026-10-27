@@ -49,6 +49,18 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
     uint32_t _relaxed_ld_0;
     asm volatile("ld.relaxed.gpu.u32 %0, [%1];" : "=r"(_relaxed_ld_0) : "l"(signals_self + (324 + bid_1)) : "memory");
     unsigned int epoch = _relaxed_ld_0 + 1;
+    if (bid_1 == 0) {
+        if (tid_0 >= 1) {
+            if (tid_0 < 2) {
+                unsigned int notified = (rank + tid_0) % 2;
+                unsigned int* notified_signals = signals_peers.ptrs[0];
+                if (notified == 1) {
+                    notified_signals = signals_peers.ptrs[1];
+                }
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(notified_signals) + (168 + rank))), "r"(static_cast<unsigned int>(epoch)) : "memory");
+            }
+        }
+    }
     int vector = (int)(block_len % 4 == 0 && (unsigned long long)inp % 16 == 0 && (unsigned long long)out % 16 == 0);
     if ((unsigned long long)out_peers.ptrs[0] % 16 != 0) {
         vector = 0;
@@ -66,14 +78,9 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
     unsigned int sequences_magic = (unsigned int)4294967295 / sequences;
     unsigned int* inp_words = reinterpret_cast<unsigned int*>(inp);
     unsigned int* out_words = reinterpret_cast<unsigned int*>(out);
-    unsigned int other = bid_1 / 149;
-    unsigned int sub = bid_1 - other * 149;
-    unsigned int parts = 149;
-    if (bid_1 >= 0) {
-        other = bid_1 / 148;
-        sub = bid_1 - other * 148;
-        parts = 148;
-    }
+    unsigned int other = 0;
+    unsigned int sub = bid_1;
+    unsigned int parts = 128;
     unsigned int destination = (rank + other + 1) % 2;
     unsigned int quotient = units / parts;
     unsigned int remainder = units % parts;
@@ -95,10 +102,18 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
         }
         out_chunks = count_0;
     }
-    unsigned int quotient_2 = units / 148;
-    unsigned int remainder_3 = units % 148;
-    unsigned int lo_4 = bid_1 * quotient_2 + bid_1 * remainder_3 / 148;
-    unsigned int hi_5 = (bid_1 + 1) * quotient_2 + (bid_1 + 1) * remainder_3 / 148;
+    if (bid_1 >= 128) {
+        out_chunks = 0;
+    }
+    unsigned int quotient_2 = units / 20;
+    unsigned int remainder_3 = units % 20;
+    unsigned int lo_4 = 0;
+    unsigned int hi_5 = 0;
+    if (bid_1 >= 128) {
+        unsigned int local_cta = bid_1 - 128;
+        lo_4 = local_cta * quotient_2 + local_cta * remainder_3 / 20;
+        hi_5 = (local_cta + 1) * quotient_2 + (local_cta + 1) * remainder_3 / 20;
+    }
     unsigned int count_6 = (hi_5 - lo_4 + 7679) / 7680;
     if (count_6 < 2) {
         count_6 = 2;
@@ -110,18 +125,6 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
     if (count_6 > total) {
         total = count_6;
     }
-    if (bid_1 == 0) {
-        if (tid_0 >= 1) {
-            if (tid_0 < 2) {
-                unsigned int notified = (rank + tid_0) % 2;
-                unsigned int* notified_signals = signals_peers.ptrs[0];
-                if (notified == 1) {
-                    notified_signals = signals_peers.ptrs[1];
-                }
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(notified_signals) + (168 + rank))), "r"(static_cast<unsigned int>(epoch)) : "memory");
-            }
-        }
-    }
     float* peer_elements = out_peers.ptrs[0];
     unsigned int* peer_signals = signals_peers.ptrs[0];
     if (destination == 1) {
@@ -131,7 +134,7 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
     unsigned int* peer_words = reinterpret_cast<unsigned int*>(peer_elements);
     unsigned int* landed = peer_signals + (176 + bid_1);
     unsigned int pushes = ((out_chunks) > (1) ? (out_chunks) : (1));
-    if (out_chunks > 0) {
+    if (bid_1 < 128) {
         if (tid_0 == 0) {
             {
             unsigned int _acquire_observed;
@@ -2951,7 +2954,7 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
     if (warp_1 == 15) {
         asm volatile("barrier.sync 1, 512;" ::: "memory");
         if (tid_0 == 480) {
-            if (out_chunks > 0) {
+            if (bid_1 < 128) {
                 asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
             }
         }
@@ -4831,7 +4834,7 @@ kernel_cake_ulysses_a2a_e1f33c25ecd2252e3f42(float* __restrict__ inp, float* out
             }
         }
     }
-    if (out_chunks > 0) {
+    if (bid_1 < 128) {
         if (tid_0 == 480) {
             {
             unsigned int _acquire_observed;

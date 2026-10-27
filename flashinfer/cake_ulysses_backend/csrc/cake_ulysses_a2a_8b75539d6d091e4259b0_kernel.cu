@@ -49,6 +49,24 @@ kernel_cake_ulysses_a2a_8b75539d6d091e4259b0(__nv_bfloat16* __restrict__ inp, __
     uint32_t _relaxed_ld_0;
     asm volatile("ld.relaxed.gpu.u32 %0, [%1];" : "=r"(_relaxed_ld_0) : "l"(signals_self + (324 + bid_1)) : "memory");
     unsigned int epoch = _relaxed_ld_0 + 1;
+    if (bid_1 == 0) {
+        if (tid_0 >= 1) {
+            if (tid_0 < 4) {
+                unsigned int notified = (rank + tid_0) % 4;
+                unsigned int* notified_signals = signals_peers.ptrs[0];
+                if (notified == 1) {
+                    notified_signals = signals_peers.ptrs[1];
+                }
+                if (notified == 2) {
+                    notified_signals = signals_peers.ptrs[2];
+                }
+                if (notified == 3) {
+                    notified_signals = signals_peers.ptrs[3];
+                }
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(notified_signals) + (168 + rank))), "r"(static_cast<unsigned int>(epoch)) : "memory");
+            }
+        }
+    }
     int vector = (int)(block_len % 8 == 0 && (unsigned long long)inp % 16 == 0 && (unsigned long long)out % 16 == 0);
     if ((unsigned long long)out_peers.ptrs[0] % 16 != 0) {
         vector = 0;
@@ -116,24 +134,6 @@ kernel_cake_ulysses_a2a_8b75539d6d091e4259b0(__nv_bfloat16* __restrict__ inp, __
     if (count_6 > total) {
         total = count_6;
     }
-    if (bid_1 == 0) {
-        if (tid_0 >= 1) {
-            if (tid_0 < 4) {
-                unsigned int notified = (rank + tid_0) % 4;
-                unsigned int* notified_signals = signals_peers.ptrs[0];
-                if (notified == 1) {
-                    notified_signals = signals_peers.ptrs[1];
-                }
-                if (notified == 2) {
-                    notified_signals = signals_peers.ptrs[2];
-                }
-                if (notified == 3) {
-                    notified_signals = signals_peers.ptrs[3];
-                }
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(notified_signals) + (168 + rank))), "r"(static_cast<unsigned int>(epoch)) : "memory");
-            }
-        }
-    }
     __nv_bfloat16* peer_elements = out_peers.ptrs[0];
     unsigned int* peer_signals = signals_peers.ptrs[0];
     if (destination == 1) {
@@ -150,17 +150,15 @@ kernel_cake_ulysses_a2a_8b75539d6d091e4259b0(__nv_bfloat16* __restrict__ inp, __
     }
     unsigned int* peer_words = reinterpret_cast<unsigned int*>(peer_elements);
     unsigned int* landed = peer_signals + (176 + bid_1);
-    if (out_chunks > 0) {
-        if (tid_0 == 0) {
-            {
-            unsigned int _acquire_observed;
-            do {
-            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (168 + destination))) : "memory");
-            } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
-            }
+    if (tid_0 == 0) {
+        {
+        unsigned int _acquire_observed;
+        do {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (168 + destination))) : "memory");
+        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (B == 1) {
         #pragma unroll 1
         for (unsigned int k = 0; k < total; k++) {
@@ -2044,14 +2042,12 @@ kernel_cake_ulysses_a2a_8b75539d6d091e4259b0(__nv_bfloat16* __restrict__ inp, __
     }
     __syncthreads();
     if (tid_0 == 0) {
-        if (out_chunks > 0) {
-            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
-            {
-            unsigned int _acquire_observed;
-            do {
-            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
-            } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
-            }
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
+        {
+        unsigned int _acquire_observed;
+        do {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
+        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
         }
     }
     __syncthreads();
