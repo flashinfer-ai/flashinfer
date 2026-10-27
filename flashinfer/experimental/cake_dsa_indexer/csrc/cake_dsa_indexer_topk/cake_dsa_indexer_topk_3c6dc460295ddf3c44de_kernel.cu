@@ -1254,6 +1254,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             int km_j = s_req[rq_j + 2];
                                             int sk_j = s_req[rq_j + 3];
                                             int c_j = s_req[rq_j + 4];
+#if __CUDA_ARCH__ == 1000
+#else
+                                            int c_rank = c_j - sk_j;
+#endif
                                             int k_rem = kw_j;
                                             int kept_above = 0;
                                             unsigned long long prefix = 0;
@@ -1284,7 +1288,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         if (idx_l < c_j - sk_j) {
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pairs[0] + sk_j + idx_l];
 #else
-                                                        if (idx_l < c_j) {
+                                                        if (idx_l < c_rank) {
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pairs[0] + idx_l];
 #endif
                                                         }
@@ -1293,7 +1297,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                 int nbat = (c_j - sk_j + 512 - 1) / 512;
 #else
-                                                int nbat = (c_j + 512 - 1) / 512;
+                                                int nbat = (c_rank + 512 - 1) / 512;
 #endif
                                                 #pragma unroll 1
                                                 for (int g = 0; g < nbat; g += 2) {
@@ -1304,7 +1308,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                             int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_j - sk_j) ? 1 : 0);
 #else
-                                                            int valid_p = ((c_j > (g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1) ? 1 : 0);
+                                                            int valid_p = ((c_rank > (g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1) ? 1 : 0);
 #endif
                                                             unsigned int bits = (unsigned int)(ring[s_st * 8 + u_1] >> 32);
                                                             int kid = (int)(unsigned int)(ring[s_st * 8 + u_1] & 4294967295);
@@ -1331,7 +1335,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             if (idx_l_1 < c_j - sk_j) {
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pairs[0] + sk_j + idx_l_1];
 #else
-                                                            if (idx_l_1 < c_j) {
+                                                            if (idx_l_1 < c_rank) {
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pairs[0] + idx_l_1];
 #endif
                                                             }
@@ -1521,6 +1525,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             int km_j_1 = s_req[rq_j_0 + 2];
                                             int sk_j_1 = s_req[rq_j_0 + 3];
                                             int c_j_1 = s_req[rq_j_0 + 4];
+#if __CUDA_ARCH__ == 1000
+#else
+                                            int c_rank_1 = c_j_1 - sk_j_1;
+#endif
                                             int k_rem_1 = kw_j_1;
                                             int kept_above_1 = 0;
                                             unsigned long long prefix_1 = 0;
@@ -1551,7 +1559,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         if (idx_l_2 < c_j_1 - sk_j_1) {
                                                             ring_1[s_pro_1 * 8 + u_5] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1 + idx_l_2];
 #else
-                                                        if (idx_l_2 < c_j_1) {
+                                                        if (idx_l_2 < c_rank_1) {
                                                             ring_1[s_pro_1 * 8 + u_5] = (unsigned long long)Cand[buf_pairs[1] + idx_l_2];
 #endif
                                                         }
@@ -1560,7 +1568,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                 int nbat_1 = (c_j_1 - sk_j_1 + 512 - 1) / 512;
 #else
-                                                int nbat_1 = (c_j_1 + 512 - 1) / 512;
+                                                int nbat_1 = (c_rank_1 + 512 - 1) / 512;
 #endif
                                                 #pragma unroll 1
                                                 for (int g_1 = 0; g_1 < nbat_1; g_1 += 2) {
@@ -1571,7 +1579,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                             int valid_p_1 = (((g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6 < c_j_1 - sk_j_1) ? 1 : 0);
 #else
-                                                            int valid_p_1 = ((c_j_1 > (g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6) ? 1 : 0);
+                                                            int valid_p_1 = ((c_rank_1 > (g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6) ? 1 : 0);
 #endif
                                                             unsigned int bits_2 = (unsigned int)(ring_1[s_st_1 * 8 + u_6] >> 32);
                                                             int kid_2 = (int)(unsigned int)(ring_1[s_st_1 * 8 + u_6] & 4294967295);
@@ -1598,7 +1606,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             if (idx_l_3 < c_j_1 - sk_j_1) {
                                                                 ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1 + idx_l_3];
 #else
-                                                            if (idx_l_3 < c_j_1) {
+                                                            if (idx_l_3 < c_rank_1) {
                                                                 ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = (unsigned long long)Cand[buf_pairs[1] + idx_l_3];
 #endif
                                                             }
@@ -2016,6 +2024,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             int km_j_2 = s_req[rq_j_1 + 2];
                                             int sk_j_2 = s_req[rq_j_1 + 3];
                                             int c_j_2 = s_req[rq_j_1 + 4];
+#if __CUDA_ARCH__ == 1000
+#else
+                                            int c_rank_2 = c_j_2 - sk_j_2;
+#endif
                                             int k_rem_2 = kw_j_2;
                                             int kept_above_2 = 0;
                                             unsigned long long prefix_2 = 0;
@@ -2046,7 +2058,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         if (idx_l_4 < c_j_2 - sk_j_2) {
                                                             ring_2[s_pro_2 * 8 + u_10] = (unsigned long long)Cand[buf_pairs[0] + sk_j_2 + idx_l_4];
 #else
-                                                        if (idx_l_4 < c_j_2) {
+                                                        if (idx_l_4 < c_rank_2) {
                                                             ring_2[s_pro_2 * 8 + u_10] = (unsigned long long)Cand[buf_pairs[0] + idx_l_4];
 #endif
                                                         }
@@ -2055,7 +2067,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                 int nbat_2 = (c_j_2 - sk_j_2 + 512 - 1) / 512;
 #else
-                                                int nbat_2 = (c_j_2 + 512 - 1) / 512;
+                                                int nbat_2 = (c_rank_2 + 512 - 1) / 512;
 #endif
                                                 #pragma unroll 1
                                                 for (int g_2 = 0; g_2 < nbat_2; g_2 += 2) {
@@ -2066,7 +2078,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                             int valid_p_2 = (((g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11 < c_j_2 - sk_j_2) ? 1 : 0);
 #else
-                                                            int valid_p_2 = ((c_j_2 > (g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11) ? 1 : 0);
+                                                            int valid_p_2 = ((c_rank_2 > (g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11) ? 1 : 0);
 #endif
                                                             unsigned int bits_4 = (unsigned int)(ring_2[s_st_2 * 8 + u_11] >> 32);
                                                             int kid_4 = (int)(unsigned int)(ring_2[s_st_2 * 8 + u_11] & 4294967295);
@@ -2093,7 +2105,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             if (idx_l_5 < c_j_2 - sk_j_2) {
                                                                 ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = (unsigned long long)Cand[buf_pairs[0] + sk_j_2 + idx_l_5];
 #else
-                                                            if (idx_l_5 < c_j_2) {
+                                                            if (idx_l_5 < c_rank_2) {
                                                                 ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = (unsigned long long)Cand[buf_pairs[0] + idx_l_5];
 #endif
                                                             }
@@ -2283,6 +2295,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             int km_j_3 = s_req[rq_j_0_1 + 2];
                                             int sk_j_3 = s_req[rq_j_0_1 + 3];
                                             int c_j_3 = s_req[rq_j_0_1 + 4];
+#if __CUDA_ARCH__ == 1000
+#else
+                                            int c_rank_3 = c_j_3 - sk_j_3;
+#endif
                                             int k_rem_3 = kw_j_3;
                                             int kept_above_3 = 0;
                                             unsigned long long prefix_3 = 0;
@@ -2313,7 +2329,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         if (idx_l_6 < c_j_3 - sk_j_3) {
                                                             ring_3[s_pro_3 * 8 + u_15] = (unsigned long long)Cand[buf_pairs[1] + sk_j_3 + idx_l_6];
 #else
-                                                        if (idx_l_6 < c_j_3) {
+                                                        if (idx_l_6 < c_rank_3) {
                                                             ring_3[s_pro_3 * 8 + u_15] = (unsigned long long)Cand[buf_pairs[1] + idx_l_6];
 #endif
                                                         }
@@ -2322,7 +2338,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                 int nbat_3 = (c_j_3 - sk_j_3 + 512 - 1) / 512;
 #else
-                                                int nbat_3 = (c_j_3 + 512 - 1) / 512;
+                                                int nbat_3 = (c_rank_3 + 512 - 1) / 512;
 #endif
                                                 #pragma unroll 1
                                                 for (int g_3 = 0; g_3 < nbat_3; g_3 += 2) {
@@ -2333,7 +2349,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
                                                             int valid_p_3 = (((g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16 < c_j_3 - sk_j_3) ? 1 : 0);
 #else
-                                                            int valid_p_3 = ((c_j_3 > (g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16) ? 1 : 0);
+                                                            int valid_p_3 = ((c_rank_3 > (g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16) ? 1 : 0);
 #endif
                                                             unsigned int bits_6 = (unsigned int)(ring_3[s_st_3 * 8 + u_16] >> 32);
                                                             int kid_6 = (int)(unsigned int)(ring_3[s_st_3 * 8 + u_16] & 4294967295);
@@ -2360,7 +2376,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             if (idx_l_7 < c_j_3 - sk_j_3) {
                                                                 ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = (unsigned long long)Cand[buf_pairs[1] + sk_j_3 + idx_l_7];
 #else
-                                                            if (idx_l_7 < c_j_3) {
+                                                            if (idx_l_7 < c_rank_3) {
                                                                 ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = (unsigned long long)Cand[buf_pairs[1] + idx_l_7];
 #endif
                                                             }
@@ -3688,39 +3704,56 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     if (need_q == 0) {
                                         if (sample_c_1 != 0) {
                                             if (valid_g[0] != 0) {
+#if TILE_UNROLL == 1
 #if __CUDA_ARCH__ == 1000
                                                 int _max_2 = ((vis_g[0] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[0] - (n_tiles_2_1 - 1) * 128) : (0));
                                                 int n_diag = ((_max_2) < (128) ? (_max_2) : (128));
                                                 int c_far = c_q - n_diag;
                                                 int v_far = vis_g[0] - n_diag;
+#else
+                                                int t_near = (n_s_1 - 1) * stride_2;
+                                                int _max_2 = ((vis_g[0] - t_near * 128) > (0) ? (vis_g[0] - t_near * 128) : (0));
+                                                int n_near = ((_max_2) < (128) ? (_max_2) : (128));
+                                                int c_far = c_q - n_near;
+                                                int v_far = vis_g[0] - n_near;
+#endif
+#else
+#if __CUDA_ARCH__ == 1000
+                                                int _max_2 = ((vis_g[0] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[0] - (n_tiles_2_1 - 1) * 128) : (0));
+                                                int n_diag = ((_max_2) < (128) ? (_max_2) : (128));
+                                                int c_far = c_q - n_diag;
+                                                int v_far = vis_g[0] - n_diag;
+#else
+                                                int t_near = (n_s_1 - 1) * stride_2;
+                                                int _max_3 = ((vis_g[0] - t_near * 128) > (0) ? (vis_g[0] - t_near * 128) : (0));
+                                                int n_near = ((_max_3) < (128) ? (_max_3) : (128));
+                                                int c_far = c_q - n_near;
+                                                int v_far = vis_g[0] - n_near;
+#endif
+#endif
                                                 if (v_far > 0) {
                                                     int r_q = (top_k * c_far + v_far - 1) / v_far;
-#else
-                                                if (vis_g[0] > 0) {
-                                                    int r_q = (top_k * c_q + vis_g[0] - 1) / vis_g[0];
-#endif
                                                     int r_shift = r_q + r_q * sample_shift_permille / 1000 + 24;
-#if __CUDA_ARCH__ == 1000
                                                     if (r_shift < c_far) {
-#else
-                                                    if (r_shift < c_q) {
-#endif
                                                         need_q = 1;
                                                         kw_q = r_shift;
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                                         int _min_3_1 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
                                                         km_q = _min_3_1;
+#if __CUDA_ARCH__ == 1000
                                                         sk_q = n_diag;
 #else
-                                                        int _min_2_1 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
-                                                        km_q = _min_2_1;
+                                                        sk_q = n_near;
 #endif
 #else
+#if __CUDA_ARCH__ == 1000
                                                         int _min_3_1 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
                                                         km_q = _min_3_1;
-#if __CUDA_ARCH__ == 1000
                                                         sk_q = n_diag;
+#else
+                                                        int _min_4 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
+                                                        km_q = _min_4;
+                                                        sk_q = n_near;
 #endif
 #endif
                                                     }
@@ -3741,33 +3774,46 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     if (need_q_2 == 0) {
                                         if (sample_c_1 != 0) {
                                             if (valid_g[1] != 0) {
+#if TILE_UNROLL == 1
 #if __CUDA_ARCH__ == 1000
                                                 int _max_4 = ((vis_g[1] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[1] - (n_tiles_2_1 - 1) * 128) : (0));
                                                 int n_diag_1 = ((_max_4) < (128) ? (_max_4) : (128));
                                                 int c_far_1 = c_q_0 - n_diag_1;
                                                 int v_far_1 = vis_g[1] - n_diag_1;
+#else
+                                                int t_near_1 = (n_s_1 - 1) * stride_2;
+                                                int _max_4 = ((vis_g[1] - t_near_1 * 128) > (0) ? (vis_g[1] - t_near_1 * 128) : (0));
+                                                int n_near_1 = ((_max_4) < (128) ? (_max_4) : (128));
+                                                int c_far_1 = c_q_0 - n_near_1;
+                                                int v_far_1 = vis_g[1] - n_near_1;
+#endif
+#else
+#if __CUDA_ARCH__ == 1000
+                                                int _max_4 = ((vis_g[1] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[1] - (n_tiles_2_1 - 1) * 128) : (0));
+                                                int n_diag_1 = ((_max_4) < (128) ? (_max_4) : (128));
+                                                int c_far_1 = c_q_0 - n_diag_1;
+                                                int v_far_1 = vis_g[1] - n_diag_1;
+#else
+                                                int t_near_1 = (n_s_1 - 1) * stride_2;
+                                                int _max_5 = ((vis_g[1] - t_near_1 * 128) > (0) ? (vis_g[1] - t_near_1 * 128) : (0));
+                                                int n_near_1 = ((_max_5) < (128) ? (_max_5) : (128));
+                                                int c_far_1 = c_q_0 - n_near_1;
+                                                int v_far_1 = vis_g[1] - n_near_1;
+#endif
+#endif
                                                 if (v_far_1 > 0) {
                                                     int r_q_1 = (top_k * c_far_1 + v_far_1 - 1) / v_far_1;
-#else
-                                                if (vis_g[1] > 0) {
-                                                    int r_q_1 = (top_k * c_q_0 + vis_g[1] - 1) / vis_g[1];
-#endif
                                                     int r_shift_1 = r_q_1 + r_q_1 * sample_shift_permille / 1000 + 24;
-#if __CUDA_ARCH__ == 1000
                                                     if (r_shift_1 < c_far_1) {
-#else
-                                                    if (r_shift_1 < c_q_0) {
-#endif
                                                         need_q_2 = 1;
                                                         kw_q_3 = r_shift_1;
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                                         int _min_5 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
                                                         km_q_4 = _min_5;
+#if __CUDA_ARCH__ == 1000
                                                         sk_q_5 = n_diag_1;
 #else
-                                                        int _min_3_1 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
-                                                        km_q_4 = _min_3_1;
+                                                        sk_q_5 = n_near_1;
 #endif
 #else
 #if __CUDA_ARCH__ == 1000
@@ -3775,8 +3821,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         km_q_4 = _min_5;
                                                         sk_q_5 = n_diag_1;
 #else
-                                                        int _min_4 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
-                                                        km_q_4 = _min_4;
+                                                        int _min_6 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
+                                                        km_q_4 = _min_6;
+                                                        sk_q_5 = n_near_1;
 #endif
 #endif
                                                     }
@@ -3826,20 +3873,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             unsigned int hi_g = (unsigned int)s_tau[2 * g_6 * 2 + 1];
                                             unsigned long long tau_new_g = (unsigned long long)hi_g << 32 | (unsigned long long)lo_g;
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                             unsigned long long _max_6 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
                                             tau_g[0] = _max_6;
-#else
-                                            unsigned long long _max_4 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
-                                            tau_g[0] = _max_4;
-#endif
 #else
 #if __CUDA_ARCH__ == 1000
                                             unsigned long long _max_6 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
                                             tau_g[0] = _max_6;
 #else
-                                            unsigned long long _max_5 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
-                                            tau_g[0] = _max_5;
+                                            unsigned long long _max_7 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
+                                            tau_g[0] = _max_7;
 #endif
 #endif
                                         }
@@ -3849,20 +3891,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             unsigned int hi_g_1 = (unsigned int)s_tau[(2 * g_6 + 1) * 2 + 1];
                                             unsigned long long tau_new_g_1 = (unsigned long long)hi_g_1 << 32 | (unsigned long long)lo_g_1;
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                             unsigned long long _max_7 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
                                             tau_g[1] = _max_7;
-#else
-                                            unsigned long long _max_5 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
-                                            tau_g[1] = _max_5;
-#endif
 #else
 #if __CUDA_ARCH__ == 1000
                                             unsigned long long _max_7 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
                                             tau_g[1] = _max_7;
 #else
-                                            unsigned long long _max_6 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
-                                            tau_g[1] = _max_6;
+                                            unsigned long long _max_8 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
+                                            tau_g[1] = _max_8;
 #endif
 #endif
                                         }
@@ -3876,20 +3913,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 int fail_j = 0;
                                 if (valid_g[0] != 0) {
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                     int _min_8 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
                                     if (cnt_g[0] < _min_8) {
-#else
-                                    int _min_6 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
-                                    if (cnt_g[0] < _min_6) {
-#endif
 #else
 #if __CUDA_ARCH__ == 1000
                                     int _min_8 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
                                     if (cnt_g[0] < _min_8) {
 #else
-                                    int _min_7 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
-                                    if (cnt_g[0] < _min_7) {
+                                    int _min_9 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
+                                    if (cnt_g[0] < _min_9) {
 #endif
 #endif
                                         fail_j = 1;
@@ -3899,20 +3931,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 int fail_j_0 = 0;
                                 if (valid_g[1] != 0) {
 #if TILE_UNROLL == 1
-#if __CUDA_ARCH__ == 1000
                                     int _min_9 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
                                     if (cnt_g[1] < _min_9) {
-#else
-                                    int _min_7 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
-                                    if (cnt_g[1] < _min_7) {
-#endif
 #else
 #if __CUDA_ARCH__ == 1000
                                     int _min_9 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
                                     if (cnt_g[1] < _min_9) {
 #else
-                                    int _min_8 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
-                                    if (cnt_g[1] < _min_8) {
+                                    int _min_10 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
+                                    if (cnt_g[1] < _min_10) {
 #endif
 #endif
                                         fail_j_0 = 1;
