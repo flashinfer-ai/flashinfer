@@ -30,8 +30,8 @@ Launch on one node, for example:
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
         --backend nvlink_one_sided --profile kimi_k3 --cft on -b 1 -e 1024 -f 2
 
-    # Compare nvlink_one_sided with and without its Lamport transport for small
-    # steps ("on" also takes the steps CFT would take).
+    # Compare nvlink_one_sided with and without its Lamport transport, which takes
+    # the small steps ahead of CFT ("auto" turns it off under --cft on).
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
         --backend nvlink_one_sided --profile deepseek_v3 --lamport off -b 1 -e 128 -f 2
 
@@ -793,16 +793,19 @@ def parse_args() -> argparse.Namespace:
         "--lamport",
         choices=sorted(_LAMPORT_MODES),
         default="auto",
-        help="Lamport transport of nvlink_one_sided for small steps: auto (where "
-        "supported, for steps without CFT), on (also the steps CFT would take) "
-        "or off.",
+        help="Lamport transport of nvlink_one_sided, which takes the small steps "
+        "ahead of CFT: auto (where supported; off under --cft on), on (not with "
+        "--cft on) or off.",
     )
     parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Run eagerly instead of replaying one CUDA graph.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lamport == "on" and args.cft == "on":
+        parser.error("--lamport on and --cft on both ask for every eligible step")
+    return args
 
 
 def _local_batch_sizes(args: argparse.Namespace) -> List[int]:
