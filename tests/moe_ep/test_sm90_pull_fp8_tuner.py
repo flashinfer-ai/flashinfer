@@ -7,6 +7,7 @@ parity, cache round-trips, and the shim/backend knob wiring contracts.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import warnings
 
@@ -36,6 +37,18 @@ def _pkg():
     return pull_style_cutedsl_megakernel
 
 
+# Small single-rank problem for host-side config construction.
+_CFG_BASE = dict(
+    rank=0,
+    world_size=1,
+    num_tokens_per_rank=64,
+    num_topk=4,
+    num_total_experts=4,
+    hidden=1024,
+    intermediate=512,
+)
+
+
 class TestDefaultKnobs:
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
     @pytest.mark.parametrize("tokens", [8, 100, 2048, 32768, 10**6])
@@ -54,7 +67,7 @@ class TestDefaultKnobs:
         assert knobs["token_back_mode"] == sel.config.token_back_mode
         assert knobs["group_hint"] == sel.config.group_hint
         assert knobs["tail_split_pairs"] == sel.config.tail_split_pairs
-        assert pkg.is_valid(knobs)
+        assert pkg.is_valid(knobs, fp8_scale_mode=scale_mode)
 
 
 class TestEightRankOverrides:
@@ -89,7 +102,7 @@ class TestEightRankOverrides:
         assert knobs["group_hint"] == eight.group_hint
         assert knobs["tail_split_pairs"] == eight.tail_split_pairs
         assert knobs["token_back_mode"] == eight.token_back_mode
-        assert pkg.is_valid(knobs)
+        assert pkg.is_valid(knobs, fp8_scale_mode=scale_mode)
 
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
     def test_eight_rank_default_leads_candidates(self, scale_mode, monkeypatch):
@@ -153,23 +166,106 @@ class TestIsValid:
             apply_routing_weights_before_fc2=False,
         )
 
-    def test_iter_candidates_all_valid(self):
+    def test_blockwise_geometry_rules(self):
         pkg = _pkg()
-        seen = 0
-        for knobs in pkg.iter_candidates():
+        # Blockwise forms one 1x128 FC2-activation scale per task tile, so a
+        # tile must produce 128 channels: native N=256, swap-AB M=256, and
+        # never ping-pong (an N128 / M128 schedule).
+        for knobs in (
+            dict(swap_ab=False, mma_tiler_mnk=(64, 256, 128)),
+            dict(swap_ab=True, mma_tiler_mnk=(256, 8, 128)),
+        ):
+            assert pkg.is_valid(knobs, fp8_scale_mode="blockwise")
+        for knobs in (
+            dict(swap_ab=False, mma_tiler_mnk=(64, 128, 128)),
+            dict(swap_ab=False, pingpong=True, mma_tiler_mnk=(64, 128, 128)),
+            dict(swap_ab=True, mma_tiler_mnk=(128, 32, 128)),
+            dict(swap_ab=True, pingpong=True, mma_tiler_mnk=(128, 32, 128)),
+        ):
+            assert not pkg.is_valid(knobs, fp8_scale_mode="blockwise")
+            # per_tensor keeps the 64-channel tiles.
             assert pkg.is_valid(knobs)
-            seen += 1
-            if seen >= 500:
-                break
-        assert seen > 0
+            # The config enforces the same rule.
+            with pytest.raises(ValueError, match="128 output channels"):
+                pkg.MegaMoEHopperFp8Config(
+                    **_CFG_BASE, fp8_scale_mode="blockwise", **knobs
+                )
+
+    def test_hybrid_configs_keep_1x64_geometry(self):
+        pkg = _pkg()
+        # The fused MXFP4 / NVFP4 x FP8 configs validate through a blockwise
+        # proxy, but their hybrid FC2 activation keeps 1x64 scale blocks, so
+        # the swap-AB M=128 tiles (cooperative and ping-pong) stay legal.
+        for config_cls in (pkg.MegaMoEHopperMxfp4Config, pkg.MegaMoEHopperNvfp4Config):
+            for pingpong in (False, True):
+                config_cls(**_CFG_BASE, pingpong=pingpong, mma_tiler_mnk=(128, 32, 128))
+            # Their kernels never received the deterministic slot path.
+            with pytest.raises(ValueError, match="deterministic"):
+                config_cls(**_CFG_BASE, deterministic=True)
+
+    def test_deterministic_rules(self):
+        pkg = _pkg()
+        ok = dict(swap_ab=True, mma_tiler_mnk=(256, 32, 128))
+        assert pkg.is_valid({**ok, "deterministic": True})
+        pkg.MegaMoEHopperFp8Config(**_CFG_BASE, **ok, deterministic=True)
+        # Deterministic slots replace the atomic dispatch path dedup / grouped
+        # token-back reserve on; the in-kernel reduce sums in arrival order.
+        for extra in (
+            {"dedup_dispatch": True},
+            {"grouped_token_back": True, "token_back_mode": "reuse_dispatch_warps"},
+            {"in_kernel_fc2_reduce": True},
+        ):
+            assert pkg.is_valid({**ok, **extra})
+            assert not pkg.is_valid({**ok, **extra, "deterministic": True})
+            with pytest.raises(ValueError, match="deterministic"):
+                pkg.MegaMoEHopperFp8Config(
+                    **_CFG_BASE, **ok, **extra, deterministic=True
+                )
+
+    @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
+    def test_is_valid_matches_config_geometry(self, scale_mode):
+        pkg = _pkg()
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.tuner import (
+            PERF_KNOBS,
+        )
+
+        # is_valid mirrors the config's geometry validation in both
+        # directions over the whole geometry space.
+        names = (
+            "swap_ab",
+            "pingpong",
+            "mma_tiler_mnk",
+            "cluster_shape_mnk",
+            "fp8_accum_mode",
+            "tail_split_pairs",
+        )
+        accepted_count = 0
+        for values in itertools.product(*(PERF_KNOBS[n] for n in names)):
+            knobs = dict(zip(names, values, strict=True))
+            try:
+                pkg.MegaMoEHopperFp8Config(
+                    **_CFG_BASE, fp8_scale_mode=scale_mode, **knobs
+                )
+                accepted = True
+            except ValueError:
+                accepted = False
+            assert accepted == pkg.is_valid(knobs, fp8_scale_mode=scale_mode), knobs
+            accepted_count += accepted
+        assert accepted_count > 0
+        assert next(pkg.iter_candidates(fp8_scale_mode=scale_mode), None) is not None
 
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
     def test_autotune_candidates(self, scale_mode):
         pkg = _pkg()
         cands = pkg.hopper_fp8_candidates(fp8_scale_mode=scale_mode, max_tokens=2048)
-        # 16 sweep geometries x {epi_warps, reuse_dispatch_warps}.
-        assert len(cands) >= 30
-        assert all(pkg.is_valid(c) for c in cands)
+        # The sweep geometries legal for the scale mode (blockwise keeps the
+        # N256 / M256 tiles) x {epi_warps, reuse_dispatch_warps}.
+        assert len(cands) >= (30 if scale_mode == "per_tensor" else 20)
+        cfg = pkg.MegaMoEHopperFp8Config(
+            **_CFG_BASE, fp8_scale_mode=scale_mode, mma_tiler_mnk=(64, 256, 128)
+        )
+        for c in cands:
+            pkg.with_knobs(cfg, c)
         # heuristic winner leads (ties keep the established default).
         assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=scale_mode)
         # deduplicated.
@@ -270,6 +366,33 @@ class TestKnobCache:
         knobs, source = pkg.resolve_knobs(**self._KEY, max_tokens=4096)
         assert source == "heuristic"
         assert knobs == pkg.default_knobs(4096, fp8_scale_mode="per_tensor")
+
+    def test_resolve_skips_entry_the_kernel_rejects(self, tmp_path, monkeypatch):
+        pkg = _pkg()
+        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "cache.json"))
+        # A blockwise winner recorded before the 1x128 FC2-activation scales:
+        # falls back to the heuristic instead of failing at workspace creation.
+        stale = dict(
+            swap_ab=True,
+            pingpong=True,
+            mma_tiler_mnk=(128, 16, 128),
+            cluster_shape_mnk=(1, 2, 1),
+        )
+        blockwise = {**self._KEY, "fp8_scale_mode": "blockwise"}
+        assert pkg.record_knobs(stale, **blockwise, max_tokens=32) is not None
+        with pytest.warns(UserWarning, match="ignoring cached knobs"):
+            knobs, source = pkg.resolve_knobs(**blockwise, max_tokens=32)
+        assert source == "heuristic"
+        assert knobs == pkg.default_knobs(32, fp8_scale_mode="blockwise")
+        # The same geometry stays a valid per_tensor entry.
+        assert pkg.record_knobs(stale, **self._KEY, max_tokens=32) is not None
+        assert pkg.resolve_knobs(**self._KEY, max_tokens=32) == (stale, "cache")
+        # An entry without geometry keeps the table's, as the shim merges it.
+        partial = {"group_hint": 128}
+        assert pkg.record_knobs(partial, **blockwise, max_tokens=64) is not None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert pkg.resolve_knobs(**blockwise, max_tokens=64) == (partial, "cache")
 
     def test_disabled_cache(self, monkeypatch):
         pkg = _pkg()

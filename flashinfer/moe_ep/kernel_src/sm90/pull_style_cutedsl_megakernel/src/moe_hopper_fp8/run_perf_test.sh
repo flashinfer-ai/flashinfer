@@ -186,6 +186,12 @@ case "$FP8_CLUSTER_SHAPE" in
         ;;
 esac
 
+# Blockwise FP8 quantizes h with one scale per 128 output channels formed
+# from one task tile: no ping-pong geometry (an N128 / M128 schedule).
+if [ "$SCALE_MODE" = "blockwise" ] && [ "$PINGPONG" -eq 1 ]; then
+    echo "ERROR: blockwise FP8 (1x128 h scales) has no ping-pong geometry" >&2
+    exit 2
+fi
 if [ "$SWAP_AB" -eq 1 ]; then
     if [ "$PINGPONG" -eq 1 ]; then
         FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
@@ -224,7 +230,12 @@ else
             exit 2
             ;;
     esac
-    FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    if [ "$SCALE_MODE" = "blockwise" ]; then
+        # 1x128 h scales need 128 output channels per task tile: N=256.
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-256}"
+    else
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    fi
     case "$FP8_NON_SWAP_N" in
         128|256)
             ;;

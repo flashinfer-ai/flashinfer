@@ -212,6 +212,7 @@ def _alloc_symm_buffer(
     *,
     generate_c: bool = False,
     in_kernel_fc2_reduce: bool = False,
+    deterministic: bool = False,
 ):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         get_symm_buffer_for_hopper_bf16_mega_moe,
@@ -229,6 +230,7 @@ def _alloc_symm_buffer(
         gate_up_clamp=problem["gate_up_clamp"],
         generate_c=generate_c,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        deterministic=deterministic,
     )
 
 
@@ -1028,6 +1030,48 @@ def _all_gather_stack(t):
     return torch.stack(gathered)
 
 
+def _generate_c_segments(idx_g, rank, num_local_experts):
+    """Per-local-expert row counts and 128-aligned segment offsets of fc1_c."""
+    expert_start = rank * num_local_experts
+    counts = [
+        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
+    ]
+    offsets = [0]
+    for v in counts:
+        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    return counts, offsets
+
+
+def _check_relaunch_bitwise(launch, outputs, relaunches):
+    """Relaunch ``relaunches`` times and require every output bit-identical.
+
+    ``outputs`` maps a name to ``(tensor, row_mask)``; each tensor is filled
+    with NaN before a relaunch (so a missed write shows up) and compared on
+    the masked rows (all rows when the mask is None).  Collective: every rank
+    relaunches in lockstep.
+    """
+    import torch
+    import torch.distributed as dist
+
+    def bits(t, mask):
+        view = t.view(torch.int16) if t.element_size() == 2 else t.view(torch.int32)
+        return view if mask is None else view[mask]
+
+    ref = {k: bits(t, m).clone() for k, (t, m) in outputs.items()}
+    for _ in range(relaunches):
+        torch.cuda.synchronize()
+        dist.barrier()
+        for t, _mask in outputs.values():
+            t.fill_(float("nan"))
+        torch.cuda.synchronize()
+        dist.barrier()
+        launch()
+        torch.cuda.synchronize()
+        for k, (t, m) in outputs.items():
+            diff = int((bits(t, m) != ref[k]).sum().item())
+            assert diff == 0, f"{k}: {diff} elements differ across relaunches"
+
+
 def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
     """generate_c: compare the kernel's fc1_c pool with the reference gate+up.
 
@@ -1040,12 +1084,7 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
 
     assert fc1_c is not None, "generate_c=True but fc1_c is None"
     expert_start = rank * num_local_experts
-    counts = [
-        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
-    ]
-    offsets = [0]
-    for v in counts:
-        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    counts, offsets = _generate_c_segments(idx_g, rank, num_local_experts)
     assert offsets[-1] <= fc1_c.shape[0], (offsets[-1], fc1_c.shape)
     checked = 0
     for e in range(num_local_experts):
@@ -1081,6 +1120,8 @@ def _run_mega_torch_oracle(
     swap_ab=False,
     generate_c=False,
     relaunch_token_counts: tuple[int, ...] = (),
+    deterministic=False,
+    bitwise_relaunches=0,
 ):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
@@ -1097,6 +1138,9 @@ def _run_mega_torch_oracle(
     kernel, ``fc1_c`` pool) with fresh routing of that many tokens per rank and
     repeats the full check after each launch -- the regression guard for state
     that must not leak between launches (``fc1_c`` pad rows).
+    ``bitwise_relaunches`` relaunches the first launch's staged inputs that
+    many times and requires the output (and the valid ``fc1_c`` rows) to
+    repeat bit for bit.
     """
     import torch
     import torch.distributed as dist
@@ -1128,7 +1172,11 @@ def _run_mega_torch_oracle(
         hidden = problem["hidden"]
 
         symm_buffer = _alloc_symm_buffer(
-            problem, rank, world_size, generate_c=generate_c
+            problem,
+            rank,
+            world_size,
+            generate_c=generate_c,
+            deterministic=deterministic,
         )
         try:
             transformed_l1, transformed_l2 = _preprocess_weights(problem)
@@ -1152,15 +1200,19 @@ def _run_mega_torch_oracle(
                 x_local = symm_buffer.x[:n].clone()
 
                 y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
-                hopper_bf16_mega_moe(
-                    y_kernel,
-                    transformed_l1,
-                    transformed_l2,
-                    symm_buffer,
-                    num_tokens=n,
-                    gate_up_clamp=problem["gate_up_clamp"],
-                    fast_math=problem["fast_math"],
-                )
+
+                def launch():
+                    hopper_bf16_mega_moe(
+                        y_kernel,
+                        transformed_l1,
+                        transformed_l2,
+                        symm_buffer,
+                        num_tokens=n,
+                        gate_up_clamp=problem["gate_up_clamp"],
+                        fast_math=problem["fast_math"],
+                    )
+
+                launch()
                 torch.cuda.synchronize()
                 dist.barrier()
 
@@ -1217,13 +1269,33 @@ def _run_mega_torch_oracle(
                         f"{tag}] fc1_c matches the reference gate+up for "
                         f"{checked} local experts"
                     )
+                return y_kernel, idx_g, launch
 
-            launch_and_check(
+            y0, idx0, launch0 = launch_and_check(
                 problem["hidden_states"],
                 problem["topk_weights"],
                 problem["topk_ids"],
                 f"launch 0 ({problem['num_tokens']} tok)",
             )
+            if bitwise_relaunches:
+                outputs = {"output": (y0, None)}
+                if generate_c:
+                    # Pad rows are never written; compare the expert segments.
+                    counts, offsets = _generate_c_segments(
+                        idx0, rank, problem["num_experts"] // world_size
+                    )
+                    valid = torch.zeros(
+                        symm_buffer.fc1_c.shape[0], dtype=torch.bool, device="cuda"
+                    )
+                    for off, cnt in zip(offsets, counts, strict=False):
+                        valid[off : off + cnt] = True
+                    outputs["fc1_c"] = (symm_buffer.fc1_c, valid)
+                _check_relaunch_bitwise(launch0, outputs, bitwise_relaunches)
+                print(
+                    f"[sm90 bf16 relaunch rank {rank} swap_ab={swap_ab} "
+                    f"deterministic={deterministic}] {sorted(outputs)} "
+                    f"bit-identical over {bitwise_relaunches} relaunches"
+                )
             for i, count in enumerate(relaunch_token_counts, start=1):
                 assert 0 < count <= problem["max_tokens"], count
                 hs, tw, ti = _make_inputs(
@@ -1243,6 +1315,28 @@ def _run_mega_torch_oracle(
             symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_moe_ep_sm90_pull_bf16_mega_multirank_deterministic(swap_ab):
+    """deterministic=True (launch-order-independent dispatch slots) with
+    generate_c: the first launch matches the torch oracle, and relaunches on
+    the same inputs reproduce the output and the fc1_c pool rows bit for bit
+    (the pool row order no longer follows the dispatch arrival order)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        swap_ab=swap_ab,
+        generate_c=True,
+        deterministic=True,
+        bitwise_relaunches=3,
+    )
 
 
 @pytest.mark.gpu_4

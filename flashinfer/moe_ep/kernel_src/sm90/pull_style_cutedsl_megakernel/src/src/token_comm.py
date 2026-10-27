@@ -233,6 +233,7 @@ _MLIR_VALUE_FIELDS = (
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
     "local_rank",
+    "cta_expert_hist",
     # Internode (NCCL GIN) fields; all None on the single-node path, so they
     # drop out of the kernel ABI there.
     "gin_dev_comm",
@@ -325,7 +326,11 @@ class TokenCommArgs:
         gin_payload_flag: cute.Tensor = None,
         gin_token_count: cute.Tensor = None,
         gin_epoch: cute.Tensor = None,
+        # (max_ctas, num_total_experts) Int32 per-CTA routing histogram; only
+        # bound when the dispatch runs with ``deterministic_slots``.
+        cta_expert_hist: cute.Tensor = None,
     ):
+        self.cta_expert_hist = cta_expert_hist
         self.gin_dev_comm = gin_dev_comm
         self.gin_window = gin_window
         self.gin_window_base = gin_window_base
@@ -488,6 +493,10 @@ class TokenInPullTokenBackPush:
         # Internode tail: warps [0, n) (the epilogue warps, idle once the
         # GEMM drains) run the node reduce; 0 keeps it on the dispatch group.
         num_tail_reduce_warps: int = 0,
+        # Launch-order-independent dispatch slots (see
+        # ``_dispatch_prep_deterministic``).  Off by default: the atomic path
+        # is unchanged for every existing kernel.
+        deterministic_slots: bool = False,
     ) -> None:
         self.world_size = world_size
         self.num_tail_reduce_warps = int(num_tail_reduce_warps)
@@ -502,6 +511,15 @@ class TokenInPullTokenBackPush:
         self.num_topk = num_topk
         self.num_experts_per_rank = num_experts_per_rank
         self.num_total_experts = num_total_experts
+        self.deterministic_slots = bool(deterministic_slots)
+        if self.deterministic_slots and (
+            self.enable_nccl_gin or dedup_dispatch or grouped_token_back
+        ):
+            raise ValueError(
+                "deterministic_slots is single-node only and does not combine "
+                "with dedup_dispatch / grouped_token_back (both reserve slots "
+                "on the atomic path)."
+            )
         self.hidden = hidden
         self.fc1_token_dtype = fc1_token_dtype
         self.hidden_bytes = hidden * int(fc1_token_dtype.width) // 8
@@ -608,6 +626,12 @@ class TokenInPullTokenBackPush:
             )
         self.active_dispatch_warps = active_dispatch_warps
         self.active_dispatch_threads = active_dispatch_warps * self.warp_threads
+        # SMEM Int32 slots of the expert-count scratch: one row per active
+        # dispatch warp under deterministic slots (private per-warp cursors),
+        # a single CTA-wide row otherwise.
+        self.smem_expert_count_slots = num_total_experts * (
+            active_dispatch_warps if self.deterministic_slots else 1
+        )
         # SMEM pull-buffer slots.  By default every physical dispatch warp
         # owns a hidden_bytes slot even when it is idle; with
         # compact_pull_buffer only the active warps get a slot (the idle warps
@@ -924,12 +948,14 @@ class TokenInPullTokenBackPush:
         pull_buffer_bytes = self.pull_buffer_bytes()
         num_total_experts = self.num_total_experts
 
+        smem_expert_count_slots = self.smem_expert_count_slots
+
         if self.token_back_standalone:
             @cute.struct
             class TokenCommStorage:
                 pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
                 smem_expert_count: cute.struct.MemRange[
-                    Int32, num_total_experts
+                    Int32, smem_expert_count_slots
                 ]
                 pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, pull_buffer_bytes], 16]
                 tb_pull_mbar: cute.struct.MemRange[Int64, self.num_token_back_warps]
@@ -941,7 +967,7 @@ class TokenInPullTokenBackPush:
         class TokenCommStorage:
             pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
             smem_expert_count: cute.struct.MemRange[
-                Int32, num_total_experts
+                Int32, smem_expert_count_slots
             ]
             pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, pull_buffer_bytes], 16]
 
@@ -1032,6 +1058,261 @@ class TokenInPullTokenBackPush:
 
     @cute.jit
     def dispatch_prep(
+        self,
+        token_comm_storage,
+        topk_idx,
+        expert_send_count,
+        src_token_topk_idx,
+        peer_rank_ptr_mapper,
+        sm_idx,
+        warp_idx,
+        lane_idx,
+        *,
+        local_rank,
+        num_tokens,
+        num_sms,
+        token_rank_mask=None,
+        cta_expert_hist=None,
+        grid_sync_counter=None,
+    ):
+        """Count this rank's routes per expert and publish every route's slot
+        into the owner rank's ``src_token_topk_idx``.
+
+        Two slot-assignment policies (codegen-time switch):
+          * atomic (default): CTA-level gpu-scope atomics reserve a base slot
+            and CTA-local atomics rank the routes -- fast, but the slot order
+            (hence the receiver's pool row order) changes from launch to launch.
+          * ``deterministic_slots``: slot = rank of ``(token, topk)`` among the
+            routes to the same expert, independent of grid size.  Needed when a
+            forward and a backward launch must agree on the pool row order.
+        """
+        if cutlass.const_expr(self.deterministic_slots):
+            self._dispatch_prep_deterministic(
+                token_comm_storage,
+                topk_idx,
+                expert_send_count,
+                src_token_topk_idx,
+                peer_rank_ptr_mapper,
+                cta_expert_hist,
+                grid_sync_counter,
+                sm_idx,
+                warp_idx,
+                lane_idx,
+                local_rank=local_rank,
+                num_tokens=num_tokens,
+                num_sms=num_sms,
+            )
+        else:
+            self._dispatch_prep_atomic(
+                token_comm_storage,
+                topk_idx,
+                expert_send_count,
+                src_token_topk_idx,
+                token_rank_mask,
+                peer_rank_ptr_mapper,
+                sm_idx,
+                warp_idx,
+                lane_idx,
+                local_rank=local_rank,
+                num_tokens=num_tokens,
+                num_sms=num_sms,
+            )
+
+    @cute.jit
+    def _dispatch_prep_deterministic(
+        self,
+        token_comm_storage,
+        topk_idx,
+        expert_send_count,
+        src_token_topk_idx,
+        peer_rank_ptr_mapper,
+        cta_expert_hist,
+        grid_sync_counter,
+        sm_idx,
+        warp_idx,
+        lane_idx,
+        *,
+        local_rank,
+        num_tokens,
+        num_sms,
+    ):
+        """Launch-order-independent slot assignment.
+
+        Tokens are split into contiguous chunks, one per global dispatch warp
+        ``g = cta * W + w`` (multiples of ``tokens_per_warp``), so route order
+        within a warp is ``(token, topk)`` order.  Each warp owns a private
+        SMEM histogram row; equal-expert lanes of one iteration are ranked with
+        ``match.any`` + ``popc`` (no atomics).  The cross-CTA base of an expert
+        is the prefix over the per-CTA totals published in
+        ``cta_expert_hist`` and read back after one software grid sync.  The
+        resulting slot is the rank of ``(token, topk)`` among this rank's
+        routes to the expert, so it does not depend on the grid size, the
+        number of dispatch warps, or arrival order.  CTA 0 also writes the
+        per-expert totals to ``expert_send_count`` in the packed
+        ``(num_ctas << 32) | total`` format the atomic path produces, so
+        ``dispatch_barrier`` is unchanged.
+        """
+        if cutlass.const_expr(cta_expert_hist is None or grid_sync_counter is None):
+            raise ValueError(
+                "deterministic_slots requires cta_expert_hist and grid_sync_counter."
+            )
+        num_experts: cutlass.Constexpr[int] = self.num_total_experts
+        num_warps: cutlass.Constexpr[int] = self.active_dispatch_warps
+        tokens_per_warp: cutlass.Constexpr[int] = 32 // self.num_topk
+        active_lanes: cutlass.Constexpr[int] = tokens_per_warp * self.num_topk
+        global_warps: cutlass.Constexpr[int] = num_sms * num_warps
+
+        thread_idx_in_dispatch = Int32(warp_idx * self.warp_threads + lane_idx)
+        smem_count_ptr = token_comm_storage.smem_expert_count.data_ptr()
+        warp_hist_ptr = smem_count_ptr + warp_idx * Int32(num_experts)
+        lane_mask_lt = (Int32(1) << lane_idx) - Int32(1)
+        n_tokens = Int32(num_tokens)
+
+        # Contiguous chunk of this global warp (multiple of tokens_per_warp).
+        chunk = (
+            (
+                (n_tokens + Int32(global_warps - 1)) // Int32(global_warps)
+                + Int32(tokens_per_warp - 1)
+            )
+            // Int32(tokens_per_warp)
+        ) * Int32(tokens_per_warp)
+        global_warp = sm_idx * Int32(num_warps) + warp_idx
+        t_begin = global_warp * chunk
+        t_end = cutlass.min(t_begin + chunk, n_tokens)
+
+        # 1. Zero every warp's histogram row.
+        i = thread_idx_in_dispatch
+        while i < Int32(num_warps * num_experts):
+            (smem_count_ptr + i).store(Int32(0))
+            i = i + Int32(self.active_dispatch_threads)
+        cute.arch.barrier(
+            barrier_id=self.dispatch_intra_cta_bar_id,
+            number_of_threads=self.active_dispatch_threads,
+        )
+
+        # 2. Per-warp histogram over the warp's chunk (leader lane per group).
+        t = t_begin
+        while t < t_end:
+            token_global = t + lane_idx // self.num_topk
+            expert_id = Int32(-1)
+            if lane_idx < active_lanes and token_global < n_tokens:
+                expert_id = Int32(topk_idx[token_global, lane_idx % self.num_topk])
+            match_mask = Int32(cute.arch.match_sync(0xFFFFFFFF, expert_id, kind="any"))
+            rank_in_group = Int32(cute.arch.popc(match_mask & lane_mask_lt))
+            if expert_id >= Int32(0) and rank_in_group == Int32(0):
+                cnt_ptr = warp_hist_ptr + expert_id
+                cnt_ptr.store(cnt_ptr.load() + Int32(cute.arch.popc(match_mask)))
+            cute.arch.sync_warp()
+            t = t + Int32(tokens_per_warp)
+        cute.arch.barrier(
+            barrier_id=self.dispatch_intra_cta_bar_id,
+            number_of_threads=self.active_dispatch_threads,
+        )
+
+        # 3. CTA totals -> cta_expert_hist[cta, :]; warp rows become the
+        #    exclusive prefix over warps (intra-CTA base).
+        e = thread_idx_in_dispatch
+        while e < Int32(num_experts):
+            running = Int32(0)
+            for w in cutlass.range_constexpr(num_warps):
+                row_ptr = smem_count_ptr + (Int32(w * num_experts) + e)
+                count = row_ptr.load()
+                row_ptr.store(running)
+                running = running + count
+            cta_expert_hist[sm_idx, e] = running
+            e = e + Int32(self.active_dispatch_threads)
+        cute.arch.fence_acq_rel_gpu()
+        software_grid_sync(
+            grid_sync_counter, sm_idx, num_sms, thread_idx_in_dispatch,
+            num_threads=self.active_dispatch_threads,
+        )
+
+        # 4. Cross-CTA base, computed as a distributed scan instead of every
+        #    CTA serially summing all lower CTAs (that walk is O(ctas x
+        #    experts / 32) dependent loads and dominated dispatch at a few
+        #    hundred experts).
+        #    4a. Each (CTA, warp) owns a strided subset of experts and turns
+        #        the column cta_expert_hist[:, e] into its exclusive prefix
+        #        in place with warp scans; the owner also publishes the total.
+        owners: cutlass.Constexpr[int] = num_sms * num_warps
+        owner_rounds: cutlass.Constexpr[int] = (num_experts + owners - 1) // owners
+        owner_id = sm_idx * Int32(num_warps) + warp_idx
+        for j in cutlass.range_constexpr(owner_rounds):
+            e_own = owner_id + Int32(j * owners)
+            if e_own < Int32(num_experts):
+                carry = Int32(0)
+                for c0 in cutlass.range_constexpr(0, num_sms, 32):
+                    s_row = Int32(c0) + lane_idx
+                    v = Int32(0)
+                    if s_row < Int32(num_sms):
+                        v = Int32(cta_expert_hist[s_row, e_own])
+                    x = v
+                    for step in cutlass.range_constexpr(5):
+                        y = Int32(cute.arch.shuffle_sync_up(x, Int32(1 << step), mask_and_clamp=0))
+                        if lane_idx >= Int32(1 << step):
+                            x = x + y
+                    if s_row < Int32(num_sms):
+                        cta_expert_hist[s_row, e_own] = carry + x - v
+                    carry = carry + Int32(cute.arch.shuffle_sync(x, Int32(31)))
+                if lane_idx == Int32(0):
+                    expert_send_count[e_own] = (Int64(num_sms) << Int64(32)) | (
+                        Int64(carry) & Int64(0xFFFFFFFF)
+                    )
+        cute.arch.fence_acq_rel_gpu()
+        software_grid_sync(
+            grid_sync_counter, sm_idx, num_sms, thread_idx_in_dispatch,
+            num_threads=self.active_dispatch_threads,
+        )
+        #    4b. Every warp adds its CTA's exclusive prefix row to its own
+        #        intra-CTA warp base (independent loads, unrolled).
+        lane_rounds: cutlass.Constexpr[int] = (num_experts + 31) // 32
+        for k in cutlass.range_constexpr(lane_rounds):
+            e = lane_idx + Int32(k * 32)
+            if e < Int32(num_experts):
+                row_ptr = warp_hist_ptr + e
+                row_ptr.store(row_ptr.load() + Int32(cta_expert_hist[sm_idx, e]))
+        cute.arch.barrier(
+            barrier_id=self.dispatch_intra_cta_bar_id,
+            number_of_threads=self.active_dispatch_threads,
+        )
+
+        # 5. Publish slots in chunk order; the warp-private cursor advances by
+        #    the group size after every iteration.
+        MAX_SLOT_C: cutlass.Constexpr[int] = num_tokens * self.num_topk
+        t = t_begin
+        while t < t_end:
+            token_global = t + lane_idx // self.num_topk
+            topk_slot = lane_idx % self.num_topk
+            expert_id = Int32(-1)
+            if lane_idx < active_lanes and token_global < n_tokens:
+                expert_id = Int32(topk_idx[token_global, topk_slot])
+            match_mask = Int32(cute.arch.match_sync(0xFFFFFFFF, expert_id, kind="any"))
+            rank_in_group = Int32(cute.arch.popc(match_mask & lane_mask_lt))
+            group_size = Int32(cute.arch.popc(match_mask))
+            if expert_id >= Int32(0):
+                dst_rank = expert_id // Int32(self.num_experts_per_rank)
+                local_expert = expert_id % Int32(self.num_experts_per_rank)
+                slot = (warp_hist_ptr + expert_id).load() + rank_in_group
+                token_topk_word = Int32(token_global * self.num_topk + topk_slot)
+                elem_off = (
+                    (local_expert * Int32(self.world_size) + Int32(local_rank))
+                    * Int32(MAX_SLOT_C)
+                    + slot
+                ) * Int32(4)
+                peer_addr = peer_rank_ptr_mapper.map(
+                    src_token_topk_idx.iterator.toint(),
+                    dst_rank, Int64(elem_off),
+                )
+                stg_b32_raw(peer_addr, token_topk_word)
+            cute.arch.sync_warp()
+            if expert_id >= Int32(0) and rank_in_group == Int32(0):
+                cur_ptr = warp_hist_ptr + expert_id
+                cur_ptr.store(cur_ptr.load() + group_size)
+            cute.arch.sync_warp()
+            t = t + Int32(tokens_per_warp)
+
+    @cute.jit
+    def _dispatch_prep_atomic(
         self,
         token_comm_storage,
         topk_idx,
@@ -3173,7 +3454,6 @@ class TokenInPullTokenBackPush:
                 token_comm_args.topk_idx,
                 token_comm_args.expert_send_count,
                 token_comm_args.src_token_topk_idx,
-                token_comm_args.token_rank_mask,
                 token_comm_args.peer_rank_ptr_mapper,
                 cta_linear_id,
                 local_warp_idx,
@@ -3181,6 +3461,9 @@ class TokenInPullTokenBackPush:
                 local_rank=token_comm_args.local_rank,
                 num_tokens=token_comm_args.input_token_buffer.shape[0],
                 num_sms=token_comm_args.sm_count,
+                token_rank_mask=token_comm_args.token_rank_mask,
+                cta_expert_hist=token_comm_args.cta_expert_hist,
+                grid_sync_counter=token_comm_args.grid_sync_counter,
             )
 
         if iket_active:

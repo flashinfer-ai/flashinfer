@@ -323,6 +323,12 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         expert_source_counts: Optional[cute.Tensor] = None,
         local_source_begin: int = 0,
         local_source_count: int = 0,
+        # Within one expert, iterate the token blocks fastest (default: the
+        # weight blocks fastest).  Token-fast keeps all token blocks of an
+        # expert on the same weight tile at the same time, so a weight tile is
+        # read from DRAM once even when the expert's weights exceed L2.
+        fc1_token_fast: bool = False,
+        fc2_token_fast: bool = False,
     ):
         """Create fused fc12 scheduler params.
 
@@ -380,11 +386,17 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
                 f"and 1 along the weight axis, got cluster_shape_mn={tuple(self.cluster_shape_mn)}"
             )
         self.tail_split_pairs = bool(tail_split_pairs)
+        if tail_split_pairs and (fc1_token_fast or fc2_token_fast):
+            raise ValueError("token-fast tile order is not combined with tail_split_pairs")
+        self.fc1_token_fast = bool(fc1_token_fast)
+        self.fc2_token_fast = bool(fc2_token_fast)
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
         if expert_source_counts is not None and local_source_count <= 0:
             raise ValueError("expert_source_counts needs local_source_count > 0")
+        if expert_source_counts is not None and (fc1_token_fast or fc2_token_fast):
+            raise ValueError("token-fast tile order is not combined with the segment-major order")
         self.expert_source_counts = expert_source_counts
         self.local_source_begin = int(local_source_begin)
         self.local_source_count = int(local_source_count)
@@ -461,6 +473,8 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.tail_split_pairs = self.tail_split_pairs
         result.local_source_begin = self.local_source_begin
         result.local_source_count = self.local_source_count
+        result.fc1_token_fast = self.fc1_token_fast
+        result.fc2_token_fast = self.fc2_token_fast
 
         # Type-discriminated rebind: Python int fields copy from
         # prototype (``self``), Int32 fields consume from ``values``.
@@ -1358,6 +1372,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_intermediate_or_hidden_block_idx = Int32(0)
 
         is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
+        num_token_blocks = state.current_token_block_count
         if cutlass.const_expr(params.segmented):
             # Tile ids count from the segment's first block.
             if is_fc1:
@@ -1370,17 +1385,29 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 )
         if is_fc1:
             num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
-            cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
-            )
+            if const_expr(params.fc1_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
+                )
         else:
             num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
-            # Keep token-block as the slow axis in both phases.
-            cluster_token_block_idx = local_id // num_fc2_hidden_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc2_hidden_blocks
-            )
+            if const_expr(params.fc2_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                # Token-block as the slow axis (default).
+                cluster_token_block_idx = local_id // num_fc2_hidden_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc2_hidden_blocks
+                )
 
         # Cluster → CTA granularity (mirrors MoESchedulerBase._get_work_tile_for_linear_idx)
         cta_token_block_idx = (

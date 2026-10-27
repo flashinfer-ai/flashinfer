@@ -127,6 +127,13 @@ case "$FP8_ACCUM_MODE" in
         exit 2
         ;;
 esac
+# Blockwise FP8 quantizes h with one scale per 128 output channels, formed
+# from one task tile: non-swap needs N=256, swap-AB needs raw M=256 (so no
+# blockwise ping-pong, which is an N128 / M128 schedule).
+if [ "$SCALE_MODE" = "blockwise" ] && [ "$PINGPONG" -eq 1 ]; then
+    echo "ERROR: blockwise FP8 (1x128 h scales) has no ping-pong geometry" >&2
+    exit 2
+fi
 if [ "$SWAP_AB" -eq 1 ]; then
     if [ "$PINGPONG" -eq 1 ]; then
         FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
@@ -166,7 +173,11 @@ else
             exit 2
             ;;
     esac
-    FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    if [ "$SCALE_MODE" = "blockwise" ]; then
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-256}"
+    else
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    fi
     case "$FP8_NON_SWAP_N" in
         128|256)
             ;;
@@ -238,7 +249,8 @@ test_matches_selectors() {
 }
 
 # Each entry: "name | space-separated runner CLI args".
-# All base cases use --mma_tiler_mnk 64,128,128 without --use_2cta_instrs.
+# All base cases list --mma_tiler_mnk 64,128,128 without --use_2cta_instrs;
+# the selected mode tile (SELECTED_TILE_M/N, appended last) overrides it.
 declare -a BASE_TESTS=(
     # ── Balanced routing, e4m3 ──
     "M1_e4m3_static_dynShape_c1     | --kind fp8_e4m3 --tokens_after_topk 2400 --experts 8  --hidden 1792 --intermediate 1536 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --balance_route --load_balance_mode static"
@@ -316,6 +328,15 @@ for entry in "${TILE_SHAPE_CASES[@]}"; do
     tile_n="${tile_n//[[:space:]]/}"
     if [ "$case_swap_ab" -ne "$SWAP_AB" ]; then
         continue
+    fi
+    if [ "$SCALE_MODE" = "blockwise" ]; then
+        # 64-channel task tiles cannot form a 1x128 h scale block.
+        if [ "$case_swap_ab" -eq 0 ] && [ "$tile_n" -ne 256 ]; then
+            continue
+        fi
+        if [ "$case_swap_ab" -eq 1 ] && [ "$tile_m" -ne 256 ]; then
+            continue
+        fi
     fi
     if [ "$PINGPONG" -eq 1 ]; then
         if [ "$case_swap_ab" -eq 0 ] && [ "$tile_n" -ne 128 ]; then

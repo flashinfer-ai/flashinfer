@@ -156,6 +156,12 @@ class MegaMoEHopperBf16Config:
     # 2-CTA token cluster: swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
     # Output-invariant; the heuristic table turns it on per bucket.
     tail_split_pairs: bool = False
+    # Bitwise-reproducible dispatch pool: slots are assigned by (token, topk)
+    # rank instead of arrival-order atomics, so the expert-major pool row
+    # order (and ``fc1_c`` under generate_c) is identical on every launch.
+    # The output is already reproducible without it unless the in-kernel
+    # topk reduce is on, which this rejects.
+    deterministic: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before the BF16 FC1-output store.  False leaves the staged FC2 terms
     # unweighted and applies scores in the standalone TopkReduce; Form B
@@ -213,6 +219,11 @@ class MegaMoEHopperBf16Config:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
             raise ValueError("in_kernel_fc2_reduce requires apply_topk_in_fc1=True.")
+        if self.deterministic and self.in_kernel_fc2_reduce:
+            raise ValueError(
+                "deterministic requires the separate TopkReduce: the in-kernel "
+                "reduce adds the topk terms in arrival order."
+            )
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper BF16 kernel only implements "
@@ -533,6 +544,7 @@ class MegaMoEHopperBf16Frontend:
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
+            c.deterministic,
         )
 
     def _ensure_mega_compiled(self, inputs: MegaMoEHopperBf16Inputs) -> _CompiledMega:
@@ -607,6 +619,7 @@ class MegaMoEHopperBf16Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            deterministic=c.deterministic,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1022,6 +1035,7 @@ def get_symm_buffer_for_hopper_bf16_mega_moe(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
+    deterministic: bool = False,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
@@ -1168,6 +1182,7 @@ def get_symm_buffer_for_hopper_bf16_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
+        deterministic=deterministic,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

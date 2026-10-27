@@ -83,8 +83,9 @@ def hopper_fp8_candidates(
     num_topk: int = 6,
 ) -> List[Dict[str, Any]]:
     """Default candidate knob dicts: heuristic winner first, then every
-    geometry that wins some bucket of the drop's sweep.  The heuristic
-    winner leads so a tie keeps the established default."""
+    geometry that wins some bucket of the drop's sweep and is legal for
+    ``fp8_scale_mode``.  The heuristic winner leads so a tie keeps the
+    established default."""
     out: List[Dict[str, Any]] = []
     seen = set()
 
@@ -94,7 +95,7 @@ def hopper_fp8_candidates(
                 (k, tuple(v) if isinstance(v, tuple) else v) for k, v in knobs.items()
             )
         )
-        if key not in seen and is_valid(knobs):
+        if key not in seen and is_valid(knobs, fp8_scale_mode=fp8_scale_mode):
             seen.add(key)
             out.append(knobs)
 

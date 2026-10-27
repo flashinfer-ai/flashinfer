@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Token-bucket launch heuristics for Hopper FP8 MegaMoE.
 
-The table is derived from four-rank H200 DeepSeek-V4 P03 sweeps (2026-08-19
-geometry, 2026-09-18 tail-split / group_hint / token-back retune).  Each entry
+The table is derived from four-rank H200 DeepSeek-V4 P03 sweeps (geometry
+first, then a tail-split / group_hint / token-back retune).  Each entry
 maximizes the slowest-rank effective TFLOPS over operand order, tile shape,
 CGA shape, legacy/ping-pong scheduling, scheduler group size, tail-split pair
 tasks and fc2 write-back placement.
@@ -107,7 +107,7 @@ def _config(
 
 HEURISTIC_CONFIGS = {
     "per_tensor": {
-        # 8-256 (2026-09-19, 4x H200, two interleaved rounds): group_hint 264
+        # 8-256 (4x H200, two interleaved rounds): group_hint 264
         # keeps FC2 tiles from spinning on fc1_done right behind their FC1
         # tiles (the one-wave default made that spin 25% of the TMA producer):
         # -2/-15/-3/-11/-12/-4%.
@@ -123,13 +123,13 @@ HEURISTIC_CONFIGS = {
                      group_hint=264),
         256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1),
                      group_hint=264),
-        # 512 / 1024 (2026-09-18, 4x H200, two interleaved rounds): group_hint
+        # 512 / 1024 (4x H200, two interleaved rounds): group_hint
         # 264 -3% / -10%; 1024 with tail-split pair tasks on top -15%.
         512: _config(swap_ab=True, pingpong=False, tile=(256, 64, 128), cga=(1, 1, 1),
                      group_hint=264),
         1024: _config(swap_ab=True, pingpong=True, tile=(128, 64, 128), cga=(1, 2, 1),
                       group_hint=264, tail_split_pairs=True),
-        # 2048-32768 (2026-09-18, 4x H200, two interleaved rounds): swap-AB
+        # 2048-32768 (4x H200, two interleaved rounds): swap-AB
         # ping-pong M128N128 cga(1,2,1) with tail-split pair tasks beats the
         # previous entries by 25/25/20% (2048/4096/8192, with group_hint 264)
         # and 9/13% (16384/32768).  Token-back re-measured 2026-09-22 (1830 MHz
@@ -151,10 +151,10 @@ HEURISTIC_CONFIGS = {
                        tail_split_pairs=True, token_back="reuse_dispatch_warps"),
     },
     # per_tensor 8 -> cooperative swap M256N16 and 64 -> basic swap M128N64
-    # (2026-09-02, fold layout): each +3..+4% over the ping-pong twin the
-    # 2026-08-19 table selected, consistent across three interleaved runs on
+    # (fold layout): each +3..+4% over the ping-pong twin the previous
+    # table selected, consistent across three interleaved runs on
     # two H200 nodes.
-    # Swap-AB token tile N=8 (2026-09-10, wgmma m64n8k32, same-node
+    # Swap-AB token tile N=8 (wgmma m64n8k32, same-node
     # interleaved A/B x2 vs the N>=16 rows, 1830 MHz): per_tensor 64 basic
     # M128N8 +13.5% (16 tokens/expert fill two N=8 tiles instead of one N=64
     # tile that is 3/4 padding) and per_tensor 128 ping-pong M128N8 +4.6%.
@@ -166,28 +166,35 @@ HEURISTIC_CONFIGS = {
     # the +-1% run noise); bw128 / bw256 / pt256 (-15..-42%: twice the tile
     # count outweighs the padding win once every N>=16 tile is full).
     # blockwise non-swap 512-32768: cooperative M64N256 (two epilogue WGs on
-    # one tile), 2026-09-02 4x H200 under the fold_producer_warps layout:
+    # one tile), 4x H200 under the fold_producer_warps layout:
     # +11..+30% over both the basic M64N128 tile and its ping-pong twin at the
     # same cluster shape / token-back (geomean +15.8%).  Under the old
     # producer-warpgroup layout the same cooperative tile ran 14% BEHIND
     # basic, which is why it was never selected before; the layout, not the
     # register refit, is what makes the 2-WG modes viable here.
     "blockwise": {
-        # 8-256 (2026-09-19, 4x H200, two interleaved rounds): group_hint 264
+        # 8-256 (4x H200, two interleaved rounds): group_hint 264
         # -2/-1/-17/-4/-3/-20% (see per_tensor); 32 also tail-split -3%.
         8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1),
                    group_hint=264),
         16: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(1, 1, 1),
                     group_hint=264),
-        32: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1),
-                    group_hint=264, tail_split_pairs=True),
+        # 32 / 256 (4x H200 1830 MHz, group_hint 264 everywhere):
+        # the 1x128 h scale block needs 128 output channels per task tile, so
+        # the swap-AB M128 ping-pong rows had to move to M256 cooperative
+        # tiles.  32: M256N8 CGA1x1 1327 / 1329 us vs M256N16 CGA2x1 1334 /
+        # 1341 and M256N8 CGA2x1 1333 / 1320 (old M128N16 pp 1311 / 1322,
+        # ~1% lost).  256: M256N32 CGA2x1 1580 / 1583 us (old M128N32 pp
+        # 1608 / 1609); without the hint M256N32 CGA1x1 was within 0.2%.
+        32: _config(swap_ab=True, pingpong=False, tile=(256, 8, 128), cga=(1, 1, 1),
+                    group_hint=264),
         64: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1),
                     group_hint=264),
         128: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1),
                      group_hint=264),
-        256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1),
+        256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1),
                      group_hint=264),
-        # 512-8192 (2026-09-18, 4x H200, two interleaved rounds): group_hint
+        # 512-8192 (4x H200, two interleaved rounds): group_hint
         # 264 -3% (512); epi_warps + group_hint 264 -21% / -16% (1024 / 2048);
         # epi_warps -3% (4096); tail-split + group_hint 264 + epi_warps -8%
         # (8192).  Swap-AB M128N128 is 5x slower than M64N256 under blockwise.
@@ -197,7 +204,11 @@ HEURISTIC_CONFIGS = {
                       group_hint=264),
         2048: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 2, 1),
                       group_hint=264),
-        4096: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(1, 1, 1)),
+        # 4096 (4x H200 1830 MHz, 1x128 h scales): M64N256 CGA2x1 + group_hint
+        # 264 4090 us vs CGA1x1 5220-5314 (CGA2x2 4249, CGA1x2 4919); tail
+        # split on top 3920 / 3958 us.
+        4096: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
+                      group_hint=264, tail_split_pairs=True),
         8192: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
                       group_hint=264, tail_split_pairs=True),
         16384: _config(
@@ -342,9 +353,15 @@ def resolve_hopper_fp8_config(
 
     resolved_swap_ab = bool(swap_ab)
     resolved_pingpong = bool(pingpong)
+    if scale_mode == "blockwise" and resolved_pingpong:
+        # The 1x128 h scale block needs 128 output channels per task tile;
+        # ping-pong is an N128 / M128 schedule (64 channels).
+        raise ValueError("blockwise FP8 has no ping-pong geometry (1x128 h scales need N256 / M256 tiles)")
     resolved_tile = mma_tiler_mnk or DEFAULT_MMA_TILER_MNK
     if resolved_swap_ab and resolved_tile == DEFAULT_MMA_TILER_MNK:
         resolved_tile = (128, 32, 128) if resolved_pingpong else (256, 32, 128)
+    elif scale_mode == "blockwise" and resolved_tile == DEFAULT_MMA_TILER_MNK:
+        resolved_tile = (64, 256, 128)
     return HopperFp8ConfigSelection(
         config=_apply_tail_split_env_override(
             HopperFp8Config(

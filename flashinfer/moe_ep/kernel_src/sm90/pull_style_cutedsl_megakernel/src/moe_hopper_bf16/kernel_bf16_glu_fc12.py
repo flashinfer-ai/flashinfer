@@ -50,6 +50,10 @@ from moe_nvfp4_swapab.moe_utils import spin_wait
 
 class Sm90SwigluBf16Fc12Kernel:
 
+    # CTA tile M choices.  The forward keeps M=64 (M=128 works but spills in
+    # the Mega kernels); the backward subclass opts into (64, 128).
+    supported_tile_m = NonSwapTileMChoices
+
     _setmaxnreg_min = 24
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
@@ -162,10 +166,10 @@ class Sm90SwigluBf16Fc12Kernel:
                 "limited to independent 1CTA WGMMA; "
                 "use_2cta_instrs must be False."
             )
-        if m not in NonSwapTileMChoices or n not in NonSwapTileNChoices:
+        if m not in self.supported_tile_m or n not in NonSwapTileNChoices:
             raise ValueError(
                 "Sm90SwigluBf16Fc12Kernel in moe_hopper_bf16 only "
-                f"supports mma_tiler M in {NonSwapTileMChoices} and N in "
+                f"supports mma_tiler M in {self.supported_tile_m} and N in "
                 f"{NonSwapTileNChoices} with "
                 "use_2cta_instrs=False; "
                 f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
@@ -471,7 +475,7 @@ class Sm90SwigluBf16Fc12Kernel:
         )
         _epi_common["fc1_store_offload"] = self.fc1_store_offload
         _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
-        self.epilogue = Bf16GluEpilogue(**_epi_common)
+        self.epilogue = self._make_epilogue(_epi_common)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
@@ -517,12 +521,20 @@ class Sm90SwigluBf16Fc12Kernel:
         self.fc2_c_smem_layout_staged = self.epilogue.fc2_staged_smem_layout(
             self.num_c_stage,
         )
-        if self.epilogue.fc2_bytes_per_stage != self.epilogue.bytes_per_stage:
+        # sD (FC2) overlays sC (FC1, allocated at FC1 size).  A smaller FC2
+        # stage (M128: FC1 128x32 vs FC2 64x32) still fits, but its per-WG
+        # stage offsets no longer line up with FC1's, so the two WGs must not
+        # run different phases at once: not allowed with ping-pong.
+        fc1_stage_bytes = self.epilogue.bytes_per_stage
+        fc2_stage_bytes = self.epilogue.fc2_bytes_per_stage
+        if fc2_stage_bytes > fc1_stage_bytes or (
+            fc2_stage_bytes != fc1_stage_bytes and self.pingpong
+        ):
             raise ValueError(
-                "FC1 BF16 M64xN32 and FC2 BF16 M64xN32 epilogue scratch "
-                "stages must have the same byte size for SMEM reuse; got "
-                f"fc1={self.epilogue.bytes_per_stage} B, "
-                f"fc2={self.epilogue.fc2_bytes_per_stage} B."
+                "FC2 epilogue scratch stages must not exceed the FC1 stages they "
+                "overlay (and must match them under ping-pong); got "
+                f"fc1={fc1_stage_bytes} B, fc2={fc2_stage_bytes} B, "
+                f"pingpong={self.pingpong}."
             )
 
         # Read epilogue's autonomous decisions.
@@ -535,6 +547,11 @@ class Sm90SwigluBf16Fc12Kernel:
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
+
+    def _make_epilogue(self, epi_common: dict):
+        """Construct the epilogue object; the backward (dGLU) kernel overrides
+        this to plug in its own epilogue class with the same geometry."""
+        return Bf16GluEpilogue(**epi_common)
 
     def _smem_misc_budget_bytes(self) -> int:
         """Per-CTA SMEM reserved outside the AB-stage pipeline.
@@ -2298,8 +2315,8 @@ class Sm90SwigluBf16Fc12Kernel:
             byte_alignment=128,
             swizzle=c_smem_layout_staged.inner,
         )
-        # FC2 reuses the same WG-private bytes: FC1 BF16 64x32 and FC2 BF16
-        # 64x32 are both 4 KiB per stage, so this adds no dynamic SMEM.
+        # FC2 reuses the same WG-private bytes (FC1 BF16 M64/M128 x32 stages,
+        # FC2 BF16 64x32 stages), so this adds no dynamic SMEM.
         sD = cute.make_tensor(
             cute.recast_ptr(
                 sC.iterator,

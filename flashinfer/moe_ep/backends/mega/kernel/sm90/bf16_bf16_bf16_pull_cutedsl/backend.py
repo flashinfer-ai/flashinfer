@@ -178,6 +178,7 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
             fold_producer_warps=k.fold_producer_warps,
             generate_c=k.generate_c,
             tail_split_pairs=k.tail_split_pairs,
+            deterministic=k.deterministic,
         )
 
     def validate_forward(
@@ -316,5 +317,6 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
             k.fold_producer_warps,
             k.generate_c,
             k.tail_split_pairs,
+            k.deterministic,
             knobs_pool_key(k.knobs),
         )

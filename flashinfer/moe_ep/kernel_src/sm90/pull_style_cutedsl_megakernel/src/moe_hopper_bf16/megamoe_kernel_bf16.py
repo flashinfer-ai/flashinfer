@@ -40,6 +40,12 @@ Following the NVFP4 mega kernel, the combine surface is two orthogonal knobs:
     dispatch modes push with ``cp.reduce.async.bulk...add.noftz.bf16``
     (``token_back_reduce_topk``); no reducer kernel runs.
 
+``deterministic`` (default off) makes every launch reproduce its outputs bit
+for bit: the dispatch assigns pool slots by ``(token, topk)`` rank
+(``deterministic_slots`` of the shared token communication) instead of
+arrival-order atomics, and topk collapses in the separate ``TopkReduce`` (fixed
+k order).  The in-kernel reduce adds in arrival order, so it is rejected.
+
 ``static_expert_shape`` is required because dispatch storage and pool sizes are
 codegen-time quantities.
 """
@@ -52,6 +58,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64, Int32
 
@@ -91,6 +98,10 @@ from moe_nvfp4_swapab.megamoe_kernel import (
 # Int32 slots reserved for the never-dereferenced scale-factor placeholder
 # region (16 bytes, the minimum region alignment used by the layout helper).
 _SfPlaceholderInt32Count = 4
+
+# Upper bound on the persistent grid (CTAs) for the per-CTA routing histogram
+# of the deterministic dispatch; the launch asserts sm_count <= this.
+_MaxDispatchCtas = 1024
 
 
 # =============================================================================
@@ -142,6 +153,12 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # Bitwise-reproducible launches: launch-order-independent dispatch
+        # slots + the separate TopkReduce (see the module docstring).
+        deterministic: bool = False,
+        # Extra keyword arguments forwarded verbatim to the fused-fc12 base
+        # class (used by the backward dGLU wrapper, e.g. ``dfc2_recompute``).
+        **base_kwargs,
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -180,6 +197,12 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
                 "the in-kernel reduce can only atomic-add terms whose topk "
                 "score was already absorbed before fc2."
             )
+        if deterministic and fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "deterministic=True requires the separate TopkReduce: the "
+                "in-kernel reduce (fc2_in_kernel_topk_reduce) adds the topk "
+                "terms in arrival order."
+            )
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -206,11 +229,13 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
             gate_up_clamp=gate_up_clamp,
             generate_c=generate_c,
             tail_split_pairs=tail_split_pairs,
+            **base_kwargs,
         )
 
         self.enable_token_comm = True
         self.fold_producer_warps = _fold
         self.token_back_standalone = token_back_mode == "standalone_warps"
+        self.deterministic = bool(deterministic)
         self._apply_mega_warp_layout()
         # Keep the established swap-AB and non-swap N=256 budgets. Non-swap
         # N=128 has one epilogue warpgroup and can use the architectural
@@ -347,6 +372,7 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
             # idle slots would otherwise cost 3 * hidden_bytes of AB-stage
             # SMEM per CTA under 2-byte tokens.
             compact_pull_buffer=True,
+            deterministic_slots=self.deterministic,
         )
 
         # Region layout (same call drives both get_workspace_sizes() and the
@@ -383,14 +409,14 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
         """SMEM for dispatch pull mbarriers, expert scratch, and token buffer.
 
         Must match ``TokenInPullTokenBackPush.extra_smem_storage_class``:
-        ``pull_mbar[Int64, 4] + smem_expert_count[Int32, num_total_experts]
+        ``pull_mbar[Int64, 4] + smem_expert_count[Int32, token_comm.smem_expert_count_slots]
         + pull_buffer[Uint8, token_comm.pull_buffer_bytes()]`` (one slot per
         *active* dispatch warp, see ``compact_pull_buffer``).
         Standalone token-back adds ``tb_pull_mbar[Int64, 4]`` and
         ``tb_pull_buffer[Uint8, 4 * tb_chunk_bytes]``.
         """
         pull_mbar_bytes = _DispatchWarpCount * 8
-        expert_count_bytes = self.num_total_experts * 4
+        expert_count_bytes = self.token_comm.smem_expert_count_slots * 4
         pull_buffer_bytes = self.token_comm.pull_buffer_bytes()
         total = (
             _round_up(pull_mbar_bytes, 16)
@@ -564,7 +590,55 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
                 )
             )
 
+        specs.append(self._expert_token_sizes_snapshot_spec())
+        if self.deterministic:
+            specs.append(self._cta_expert_hist_spec())
         return specs
+
+    def _expert_token_sizes_snapshot_spec(self) -> _RegionSpec:
+        """Per-expert routed token counts preserved past the kernel tail.
+
+        ``expert_recv_count_sum`` (shared workspace) is re-zeroed by the tail
+        for the next launch; CTA 0 copies its low 32 bits here first so the
+        host can derive the per-expert pool layout (weight-gradient prefix
+        sums) after the launch.  Lives in the data area, outside the
+        zero-prefix that the tail resets.
+        """
+        return _RegionSpec(
+            "expert_token_sizes_snapshot",
+            cutlass.Int32,
+            (self.num_experts_per_rank,),
+            16,
+        )
+
+    # =========================================================================
+    # Public: host-side region lookup
+    # =========================================================================
+
+    def region_view(self, name: str, *, shared: bool = False):
+        """Return ``(byte_offset, nbytes, cute_dtype, shape)`` of a workspace
+        region so a host can view the raw byte buffer after the launch
+        (e.g. ``fc1_output``, ``token_src_metadata``,
+        ``expert_token_sizes_snapshot``; ``shared=True`` selects the symmetric
+        workspace)."""
+        offsets = self._shared_offsets if shared else self._local_offsets
+        by_name = self._shared_region_by_name if shared else self._local_region_by_name
+        if name not in by_name:
+            raise KeyError(f"unknown {'shared' if shared else 'local'} region {name!r}")
+        spec = by_name[name]
+        return offsets[name], spec.nbytes, spec.cute_dtype, tuple(spec.shape)
+
+    def _cta_expert_hist_spec(self) -> _RegionSpec:
+        """Per-CTA routing histogram consumed by the deterministic dispatch
+        (``TokenInPullTokenBackPush._dispatch_prep_deterministic``): row
+        ``cta`` holds this CTA's route count per global expert; every launch
+        rewrites rows ``[0, sm_count)`` so no reset is needed."""
+        return _RegionSpec(
+            "cta_expert_hist",
+            cutlass.Int32,
+            (_MaxDispatchCtas, self.num_total_experts),
+            16,
+        )
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
         world_size = self.world_size
@@ -710,6 +784,18 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
             byte_workspace, offsets[spec.name], dt, sh, st, spec.align,
         )
 
+    @cute.jit
+    def _cta_expert_hist_view(self, local_workspace: cute.Pointer, sm_count):
+        """Typed view of ``cta_expert_hist`` (None unless deterministic)."""
+        if cutlass.const_expr(not self.deterministic):
+            return None
+        if cutlass.const_expr(sm_count > _MaxDispatchCtas):
+            raise ValueError(
+                f"deterministic dispatch supports at most {_MaxDispatchCtas} CTAs, "
+                f"got sm_count={sm_count}."
+            )
+        return self._view_local(local_workspace, "cta_expert_hist")
+
     # =========================================================================
     # __call__
     # =========================================================================
@@ -795,6 +881,7 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
         )
         expert_send_count = self._view_local(local_workspace, "expert_send_count")
         grid_sync_counter = self._view_local(local_workspace, "grid_sync_counter")
+        cta_expert_hist = self._cta_expert_hist_view(local_workspace, sm_count)
         nvlink_barrier_counter = self._view_local(
             local_workspace, "nvlink_barrier_counter",
         )
@@ -920,6 +1007,7 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
             sm_count=sm_count,
+            cta_expert_hist=cta_expert_hist,
         )
 
         _fc12_kwargs = dict(
@@ -1049,6 +1137,38 @@ class Sm90MegaMoEBf16Kernel(Sm90SwigluBf16Fc12Kernel):
         lane_idx,
         tidx,
     ):
+        # Snapshot the dispatch-produced per-expert token counts before the
+        # generic tail zeroes expert_recv_count_sum between its NVLink
+        # barriers.  CTA 0 copies the low 32 bits into the persistent local
+        # region; the tail's first grid sync orders this copy before any
+        # CTA's shared-prefix reset.  The copy is spread over every thread of
+        # the CTA, including warps with no dispatch role that reach this point
+        # early: join the whole CTA first (the tail's own barrier, all
+        # threads) so the dispatch warps have passed dispatch_barrier, after
+        # which expert_recv_count_sum is final.
+        pipeline.NamedBarrier(
+            barrier_id=self.token_comm.kernel_tail_named_barrier_id,
+            num_threads=self.token_comm.kernel_tail_threads,
+        ).arrive_and_wait()
+        cta_linear_id = self.token_comm._cta_linear_id()
+        if cta_linear_id == Int32(0):
+            snapshot_ptr = cute.make_ptr(
+                cutlass.Int32,
+                token_comm_args.local_zero_prefix.iterator.toint()
+                + Int64(self._local_offsets["expert_token_sizes_snapshot"]),
+                AddressSpace.gmem,
+                assumed_align=16,
+            )
+            snapshot = cute.make_tensor(
+                snapshot_ptr, cute.make_layout((self.num_experts_per_rank,)),
+            )
+            block_dim_x, _, _ = cute.arch.block_dim()
+            expert_idx = Int32(tidx)
+            while expert_idx < Int32(self.num_experts_per_rank):
+                packed_count = Int64(token_comm_args.expert_recv_count_sum[expert_idx])
+                snapshot[expert_idx] = Int32(packed_count & Int64(0xFFFFFFFF))
+                expert_idx = expert_idx + block_dim_x
+
         self.token_comm.kernel_tail(
             token_comm_args,
             warp_idx=warp_idx,

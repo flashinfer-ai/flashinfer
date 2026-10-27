@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Shared host-driver scaffolding for the MegaMoE fused fc1+fc2 runners.
 
-This module holds everything the NVFP4 (``moe_nvfp4_swapab/runner_fc12.py``)
-and MXFP8 (``moe_mxfp8_glu/runner_fc12.py``) fused-fc12 runners have in common:
+This module holds the shared scaffolding for the NVFP4, BF16, and FP8
+fused-fc12 runners:
 
   * The three configuration descriptors (:class:`ProblemDesc`,
     :class:`ImplDesc`, :class:`MiscDesc`).  They are quantization-kind
@@ -44,9 +44,6 @@ from moe_nvfp4_swapab.epilogue import (
     EpilogueTokenTile,
     Fc1GateUpInterleave as Nvfp4Fc1GateUpInterleave,
 )
-from moe_mxfp8_glu.epilogue_mxfp8 import (
-    Fc1GateUpInterleave as Mxfp8Fc1GateUpInterleave,
-)
 from common.megamoe_constants import (
     Nvfp4BlockSize,
     Mxfp8BlockSize,
@@ -72,6 +69,10 @@ from common.host_utils import (
     kind_sf_vec_size,
     compare_and_report_mismatches,
 )
+
+
+# Gate/up interleave granularity for the non-NVFP4 runner paths.
+Mxfp8Fc1GateUpInterleave = 32
 
 
 # =============================================================================

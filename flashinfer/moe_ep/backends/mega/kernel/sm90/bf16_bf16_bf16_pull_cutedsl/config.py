@@ -84,3 +84,7 @@ class Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig:
     # follows the heuristic table's per-bucket choice; True/False forces it.
     # Legal only with swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
     tail_split_pairs: bool | None = None
+    # Launch-order-independent dispatch slots: the expert-major pool row
+    # order (and ``fc1_c``) repeats bit for bit across launches.  Rejects
+    # enable_in_kernel_fc2_reduce.
+    deterministic: bool = False

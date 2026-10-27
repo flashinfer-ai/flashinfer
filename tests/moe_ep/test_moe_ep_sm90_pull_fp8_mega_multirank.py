@@ -220,7 +220,13 @@ def _preprocess_weights(problem: dict):
 
 
 def _alloc_symm_buffer(
-    problem: dict, rank: int, world_size: int, *, generate_c: bool = False
+    problem: dict,
+    rank: int,
+    world_size: int,
+    *,
+    generate_c: bool = False,
+    deterministic: bool = False,
+    active_dispatch_warps: int = 1,
 ):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         get_symm_buffer_for_hopper_fp8_mega_moe,
@@ -239,6 +245,8 @@ def _alloc_symm_buffer(
         swap_ab=problem["swap_ab"],
         gate_up_clamp=problem["gate_up_clamp"],
         generate_c=generate_c,
+        deterministic=deterministic,
+        active_dispatch_warps=active_dispatch_warps,
     )
 
 
@@ -1114,14 +1122,12 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_graph_replay(fp8_scale_mode):
         # any cluster split.
         ("blockwise", (256, 8, 128), False, (2, 1, 1)),
         ("blockwise", (256, 8, 128), False, (1, 1, 1)),
-        ("blockwise", (128, 8, 128), True, (1, 2, 1)),
     ],
     ids=[
         "pt_pp_M128N8",
         "pt_coop_M256N8",
         "bw_coop_M256N8",
         "bw_coop_M256N8_cga1",
-        "bw_pp_M128N8",
     ],
 )
 def test_moe_ep_sm90_pull_fp8_mega_layer_swapab_token_tile_8(case):
@@ -1260,6 +1266,48 @@ def _all_gather_stack(t):
     return stacked.view(tc.dtype) if byte_wire else stacked
 
 
+def _generate_c_segments(idx_g, rank, num_local_experts):
+    """Per-local-expert row counts and 128-aligned segment offsets of fc1_c."""
+    expert_start = rank * num_local_experts
+    counts = [
+        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
+    ]
+    offsets = [0]
+    for v in counts:
+        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    return counts, offsets
+
+
+def _check_relaunch_bitwise(launch, outputs, relaunches):
+    """Relaunch ``relaunches`` times and require every output bit-identical.
+
+    ``outputs`` maps a name to ``(tensor, row_mask)``; each tensor is filled
+    with NaN before a relaunch (so a missed write shows up) and compared on
+    the masked rows (all rows when the mask is None).  Collective: every rank
+    relaunches in lockstep.
+    """
+    import torch
+    import torch.distributed as dist
+
+    def bits(t, mask):
+        view = t.view(torch.int16) if t.element_size() == 2 else t.view(torch.int32)
+        return view if mask is None else view[mask]
+
+    ref = {k: bits(t, m).clone() for k, (t, m) in outputs.items()}
+    for _ in range(relaunches):
+        torch.cuda.synchronize()
+        dist.barrier()
+        for t, _mask in outputs.values():
+            t.fill_(float("nan"))
+        torch.cuda.synchronize()
+        dist.barrier()
+        launch()
+        torch.cuda.synchronize()
+        for k, (t, m) in outputs.items():
+            diff = int((bits(t, m) != ref[k]).sum().item())
+            assert diff == 0, f"{k}: {diff} elements differ across relaunches"
+
+
 def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
     """generate_c: compare the kernel's fc1_c pool with the reference gate+up.
 
@@ -1272,12 +1320,7 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
 
     assert fc1_c is not None, "generate_c=True but fc1_c is None"
     expert_start = rank * num_local_experts
-    counts = [
-        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
-    ]
-    offsets = [0]
-    for v in counts:
-        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    counts, offsets = _generate_c_segments(idx_g, rank, num_local_experts)
     assert offsets[-1] <= fc1_c.shape[0], (offsets[-1], fc1_c.shape)
     checked = 0
     for e in range(num_local_experts):
@@ -1300,7 +1343,15 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
 
 
 def _run_mega_torch_oracle(
-    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False
+    rank,
+    world_size,
+    *,
+    fp8_scale_mode,
+    swap_ab=False,
+    generate_c=False,
+    deterministic=False,
+    relaunches=0,
+    active_dispatch_warps=1,
 ):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
@@ -1347,7 +1398,12 @@ def _run_mega_torch_oracle(
         hidden = problem["hidden"]
 
         symm_buffer = _alloc_symm_buffer(
-            problem, rank, world_size, generate_c=generate_c
+            problem,
+            rank,
+            world_size,
+            generate_c=generate_c,
+            deterministic=deterministic,
+            active_dispatch_warps=active_dispatch_warps,
         )
         try:
             stage_mega_moe_inputs(
@@ -1369,15 +1425,19 @@ def _run_mega_torch_oracle(
             transformed_l1, transformed_l2 = _preprocess_weights(problem)
 
             y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
-            hopper_fp8_mega_moe(
-                y_kernel,
-                transformed_l1,
-                transformed_l2,
-                symm_buffer,
-                num_tokens=n,
-                gate_up_clamp=problem["gate_up_clamp"],
-                fast_math=problem["fast_math"],
-            )
+
+            def launch():
+                hopper_fp8_mega_moe(
+                    y_kernel,
+                    transformed_l1,
+                    transformed_l2,
+                    symm_buffer,
+                    num_tokens=n,
+                    gate_up_clamp=problem["gate_up_clamp"],
+                    fast_math=problem["fast_math"],
+                )
+
+            launch()
             torch.cuda.synchronize()
             dist.barrier()
 
@@ -1466,6 +1526,25 @@ def _run_mega_torch_oracle(
                     f"[sm90 fp8 generate_c rank {rank} {fp8_scale_mode} "
                     f"swap_ab={swap_ab}] fc1_c matches the reference gate+up "
                     f"for {checked} local experts"
+                )
+            if relaunches:
+                outputs = {"output": (y_kernel, None)}
+                if generate_c:
+                    # Pad rows are never written; compare the expert segments.
+                    counts, offsets = _generate_c_segments(
+                        idx_g, rank, problem["num_experts"] // world_size
+                    )
+                    valid = torch.zeros(
+                        symm_buffer.fc1_c.shape[0], dtype=torch.bool, device="cuda"
+                    )
+                    for off, cnt in zip(offsets, counts, strict=False):
+                        valid[off : off + cnt] = True
+                    outputs["fc1_c"] = (symm_buffer.fc1_c, valid)
+                _check_relaunch_bitwise(launch, outputs, relaunches)
+                print(
+                    f"[sm90 fp8 relaunch rank {rank} {fp8_scale_mode} "
+                    f"swap_ab={swap_ab} deterministic={deterministic}] "
+                    f"{sorted(outputs)} bit-identical over {relaunches} relaunches"
                 )
             return rank
         finally:
@@ -1575,4 +1654,41 @@ def test_moe_ep_sm90_pull_fp8_mega_multirank_generate_c(fp8_scale_mode, swap_ab)
         fp8_scale_mode=fp8_scale_mode,
         swap_ab=swap_ab,
         generate_c=True,
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,active_dispatch_warps",
+    [
+        ("per_tensor", False, 1),
+        ("per_tensor", True, 1),
+        ("blockwise", False, 1),
+        ("blockwise", True, 1),
+        # Several dispatch warps: per-warp histograms + cross-warp prefix.
+        ("per_tensor", True, 4),
+        ("blockwise", False, 2),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_multirank_deterministic(
+    fp8_scale_mode, swap_ab, active_dispatch_warps
+):
+    """deterministic=True (launch-order-independent dispatch slots) with
+    generate_c: the first launch matches the torch oracle, and relaunches on
+    the same inputs reproduce the output and the fc1_c pool rows bit for bit
+    (the pool row order no longer follows the dispatch arrival order)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        generate_c=True,
+        deterministic=True,
+        relaunches=3,
+        active_dispatch_warps=active_dispatch_warps,
     )

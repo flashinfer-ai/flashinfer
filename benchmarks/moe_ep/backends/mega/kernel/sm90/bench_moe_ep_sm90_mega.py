@@ -120,6 +120,8 @@ FC2_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
 # Shim per-layout default tiles (K fixed at 128 = Fp8DispatchScaleAtomK), and
 # the drop reference CSV each default maps to (see module docstring).
 DEFAULT_TILE = {"non_swap_ab": (64, 128), "swap_ab": (256, 32)}
+# Blockwise forms each 1x128 FC2-activation scale from one N256 task tile.
+DEFAULT_TILE_BLOCKWISE = {**DEFAULT_TILE, "non_swap_ab": (64, 256)}
 REF_DATE = "20260720"  # Vincent's reference run under benchmark_data/<date>/
 
 CSV_FIELDS = (
@@ -430,6 +432,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "tensor (generate_c=True on every point, both layouts); default off",
     )
     p.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help="launch-order-independent dispatch slots (reproducible pool row "
+        "order) on every point; default off",
+    )
+    p.add_argument(
         "--epi-mode",
         choices=["auto", "basic", "pingpong", "cooperative"],
         default="auto",
@@ -693,6 +702,7 @@ _MANUAL_TACTIC_OPTIONS = (
         "--compact-pull-buffer",
         "--no-compact-pull-buffer",
         "--generate-c",
+        "--deterministic",
     }
 )
 
@@ -730,6 +740,7 @@ def _resolve_sweep(
                 "--generate-c",
                 "--compact-pull-buffer",
                 "--no-compact-pull-buffer",
+                "--deterministic",
             }
         )
         if fp8_only:
@@ -821,7 +832,27 @@ def _resolve_sweep(
         )
     scale_mode = args.scale_mode
     scale_modes = ("per_tensor", "blockwise") if scale_mode == "both" else (scale_mode,)
+    epi_mode = getattr(args, "epi_mode", "auto")
+    if (
+        "blockwise" in scale_modes
+        and args.operand_order == "heuristic"
+        and epi_mode in ("basic", "pingpong")
+    ):
+        raise ValueError(
+            f"--epi-mode {epi_mode} runs 128-wide task tiles, which blockwise "
+            "rejects (its 1x128 FC2-activation scales need cooperative N256 / "
+            "M256 tiles); pass --scale-mode per_tensor"
+        )
     if args.knobs is not None:
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            is_valid,
+        )
+
+        for mode in scale_modes:
+            if not is_valid(args.knobs, fp8_scale_mode=mode):
+                raise ValueError(
+                    f"--fp8-knobs-json is not a valid Hopper FP8 {mode} tactic"
+                )
         mma = args.knobs["mma_tiler_mnk"]
         order = "swap_ab" if args.knobs["swap_ab"] else "non_swap_ab"
         return scale_modes, (order,), mma[:2]
@@ -1212,6 +1243,7 @@ def _megakernel_config(
         fold_producer_warps=args.fold_producer_warps,
         knobs=fp8_knobs,
         generate_c=args.generate_c,
+        deterministic=args.deterministic,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -1701,7 +1733,12 @@ def main() -> int:
                 if operand_order == "heuristic":
                     tile = ("auto", "auto")
                 else:
-                    tile = tile_override or DEFAULT_TILE[operand_order]
+                    default_tile = (
+                        DEFAULT_TILE_BLOCKWISE
+                        if scale_mode == "blockwise"
+                        else DEFAULT_TILE
+                    )
+                    tile = tile_override or default_tile[operand_order]
                 for tokens in tokens_list:
                     if rank == 0:
                         print(

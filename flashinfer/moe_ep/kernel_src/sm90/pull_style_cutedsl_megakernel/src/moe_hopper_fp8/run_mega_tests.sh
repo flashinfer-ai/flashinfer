@@ -18,6 +18,10 @@
 # The list keeps one representative for every existing rank/scheduler/
 # expert-shape/route combination, plus topk=13, alignment, and large-shape stress.
 #
+# Launch modes: "single" (MEGA_NO_DIST=1), "multi" (torchrun), and "reject"
+# (MEGA_NO_DIST=1, passes only when the runner rejects the arguments with
+# exit code 2 before any launch).
+#
 # Usage:
 #   bash <abs path>/run_mega_tests.sh --scale-mode per-tensor
 #   bash <abs path>/run_mega_tests.sh --scale-mode blockwise --swapab
@@ -139,6 +143,12 @@ case "$FP8_CLUSTER_SHAPE" in
         exit 2
         ;;
 esac
+# Blockwise FP8 quantizes h with one scale per 128 output channels formed
+# from one task tile: no ping-pong geometry (an N128 / M128 schedule).
+if [ "$SCALE_MODE" = "blockwise" ] && [ "$PINGPONG" -eq 1 ]; then
+    echo "ERROR: blockwise FP8 (1x128 h scales) has no ping-pong geometry" >&2
+    exit 2
+fi
 if [ "$SWAP_AB" -eq 1 ]; then
     if [ "$PINGPONG" -eq 1 ]; then
         FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
@@ -181,7 +191,12 @@ else
             exit 2
             ;;
     esac
-    FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    if [ "$SCALE_MODE" = "blockwise" ]; then
+        # 1x128 h scales need 128 output channels per task tile: N=256.
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-256}"
+    else
+        FP8_NON_SWAP_N="${FP8_NON_SWAP_N:-128}"
+    fi
     case "$FP8_NON_SWAP_N" in
         128|256)
             ;;
@@ -309,6 +324,14 @@ declare -a TESTS=(
     "GC02_mr_balanced_generate_c     | multi  | --kind fp8_e4m3 --num_tokens_per_rank 256  --num_topk 3  --num_total_experts 24  --hidden 1536 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --load_balance_mode atomic_counter --generate_c"
     "GC03_mr_power_law_generate_c    | multi  | --kind fp8_e4m3 --num_tokens_per_rank 832  --num_topk 13 --num_total_experts 104 --hidden 2560 --intermediate 4096 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --route_distribution power_law --generate_c"
 
+    # ── D01..D03: --deterministic — launch-order-independent dispatch slots +
+    # fixed-order TopkReduce; --determinism_iters relaunches and compares the
+    # output, pool metadata and fc1_c bit for bit.  D03 must be rejected at
+    # argument parsing (exit code 2): the in-kernel reduce is not deterministic. ──
+    "D01_mr_deterministic_pl_topk4   | multi  | --kind fp8_e4m3 --num_tokens_per_rank 384  --num_topk 4  --num_total_experts 32  --hidden 2048 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --route_distribution power_law --deterministic --determinism_iters 3"
+    "D02_mr_deterministic_generate_c | multi  | --kind fp8_e4m3 --num_tokens_per_rank 256  --num_topk 3  --num_total_experts 24  --hidden 1536 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --generate_c --deterministic --determinism_iters 3"
+    "D03_reject_det_in_kernel_reduce | reject | --kind fp8_e4m3 --num_tokens_per_rank 192  --num_topk 2  --num_total_experts 8   --hidden 1024 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --deterministic --in_kernel_fc2_reduce"
+
 )
 
 PASS_COUNT=0
@@ -380,6 +403,9 @@ for entry in "${TESTS[@]}"; do
                     echo "[CMD]  torchrun --nproc_per_node=$NPROC $RUNNER $args --fp8_scale_mode $SCALE_MODE --fp8_accum_mode $FP8_ACCUM_MODE ${TILE_ARGS[*]}"
                 fi
                 ;;
+            reject)
+                echo "[CMD]  MEGA_NO_DIST=1 $PYTHON $RUNNER $args --fp8_scale_mode $SCALE_MODE --fp8_accum_mode $FP8_ACCUM_MODE ${TILE_ARGS[*]}  (expect exit code 2)"
+                ;;
             *)
                 echo "[ERROR] unknown launch mode '$launch_mode' for test '$full_name'; skipping" >&2
                 FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -407,6 +433,17 @@ for entry in "${TESTS[@]}"; do
                     timeout 300 torchrun --nproc_per_node="$NPROC" "$RUNNER" $args --fp8_scale_mode "$SCALE_MODE" --fp8_accum_mode "$FP8_ACCUM_MODE" "${TILE_ARGS[@]}"
                 fi
                 rc=$?
+                ;;
+            reject)
+                timeout 300 env MEGA_NO_DIST=1 "$PYTHON" "$RUNNER" $args --fp8_scale_mode "$SCALE_MODE" --fp8_accum_mode "$FP8_ACCUM_MODE" "${TILE_ARGS[@]}"
+                rc=$?
+                if [ "$rc" -eq 2 ]; then
+                    echo "[REJECT] arguments rejected as expected (exit code 2)"
+                    rc=0
+                else
+                    echo "[REJECT] expected exit code 2, got $rc"
+                    rc=1
+                fi
                 ;;
         esac
         if [ "$rc" -eq 124 ]; then

@@ -29,6 +29,7 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from common.megamoe_constants import (
     Fp8E4M3RcpLimit,
     Fp8Fc2ActivationScaleK,
+    fp8_fc2_activation_scale_k,
     Fp8GateUpInterleave,
 )
 
@@ -72,6 +73,11 @@ NonSwapTileNChoices = (128, 256)
 # =============================================================================
 
 class Fp8GluEpilogue:
+    # The FC1 output (h) scale block is formed from the 64-channel slices of
+    # the epilogue warpgroups of one task tile; the backward dGLU epilogue
+    # overrides this (its grad_y1 block lies inside one warpgroup's slice).
+    _h_scale_block_spans_wgs = True
+
 
     def __init__(
         self,
@@ -89,6 +95,7 @@ class Fp8GluEpilogue:
         glu_clamp: Optional[float] = None,
         epilog_sync_bar_id: int = 1,
         fc1_store_sync_bar_id: int = 2,
+        fc1_amax_sync_bar_id: int = 4,
         epilogue_warp_ids: Tuple[int, ...] = (0, 1, 2, 3),
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         fc2_in_kernel_topk_reduce: bool = False,
@@ -118,6 +125,7 @@ class Fp8GluEpilogue:
         self._sf_vec_size = sf_vec_size
         self._epilog_sync_bar_id = epilog_sync_bar_id
         self._fc1_store_sync_bar_id = fc1_store_sync_bar_id
+        self._fc1_amax_sync_bar_id = fc1_amax_sync_bar_id
         self._epilogue_warp_ids = epilogue_warp_ids
         self._pingpong = pingpong
         # generate_c (training forward): also write the raw pre-SwiGLU fc1
@@ -180,6 +188,20 @@ class Fp8GluEpilogue:
                 f"fc1_output_tile_n={self._fc1_output_tile_n}."
             )
         self._fc1_store_n_splits = self._fc1_output_tile_n // Fc1EpilogueStoreTileN
+        # Blockwise h scale block (Fp8Fc2ActivationScaleK channels) must be
+        # formed from the channels of one task tile; it spans this many
+        # epilogue warpgroups (each owns Fc1EpilogueStoreTileN channels).
+        self._fc1_scale_block_wgs = 1
+        if self.fp8_scale_mode == "blockwise" and self._h_scale_block_spans_wgs:
+            if self._fc1_output_tile_n % Fp8Fc2ActivationScaleK != 0:
+                raise ValueError(
+                    "blockwise FP8 FC1 epilogue needs the task tile's output "
+                    f"channels ({self._fc1_output_tile_n}) divisible by the h "
+                    f"scale block {Fp8Fc2ActivationScaleK} (tile N=256)."
+                )
+            self._fc1_scale_block_wgs = (
+                Fp8Fc2ActivationScaleK // Fc1EpilogueStoreTileN
+            )
         if self._fc1_store_n_splits not in (1, 2):
             raise ValueError(
                 "Hopper FP8 split-N FC1 store expects one or two WG-local "
@@ -328,6 +350,7 @@ class Fp8GluEpilogue:
         accumulators: cute.Tensor,
         n_half: cutlass.Constexpr,
         smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         sched_ext,
         gmem_fc1_output: cute.Tensor,
@@ -349,6 +372,7 @@ class Fp8GluEpilogue:
                 accumulators=accumulators,
                 n_half=n_half,
                 smem_fc1_output_buffer=smem_fc1_output_buffer,
+                smem_fc1_amax=smem_fc1_amax,
                 tma_atom_fc1_output=tma_atom_fc1_output,
                 sched_ext=sched_ext,
                 gmem_fc1_output=gmem_fc1_output,
@@ -567,6 +591,21 @@ class Fp8GluEpilogue:
                         g_c, o0, o1, o2, o3, token_tile_base + token_row, col,
                     )
 
+    @property
+    def fc1_amax_smem_layout(self) -> cute.Layout:
+        """Per-row amax exchange between the two epilogue warpgroups of a
+        two-WG h scale block: [WG, M64 fragment, token row]."""
+        if self.fp8_scale_mode == "blockwise" and self._fc1_scale_block_wgs == 2:
+            return cute.make_layout(
+                (2, self._m64_fragment_count, 64),
+                stride=(self._m64_fragment_count * 64, 64, 1),
+            )
+        return cute.make_layout(1)
+
+    @property
+    def fc1_amax_smem_bytes(self) -> int:
+        return cute.size_in_bytes(cutlass.Float32, self.fc1_amax_smem_layout)
+
     @cute.jit
     def _quad_reduce_max(self, val: Float32) -> Float32:
         val = fmax(val, cute.arch.shuffle_sync_bfly(val, offset=1))
@@ -718,6 +757,7 @@ class Fp8GluEpilogue:
         accumulators: cute.Tensor,
         n_half: cutlass.Constexpr,
         smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         sched_ext,
         gmem_fc1_output: cute.Tensor,
@@ -729,7 +769,10 @@ class Fp8GluEpilogue:
         store_stage_idx,
         gmem_fc1_c,
     ) -> None:
-        """FC1 blockwise epilogue: per-token/per-64 scale + FP8 store."""
+        """FC1 blockwise epilogue: one fp32 scale per token row and
+        Fp8Fc2ActivationScaleK output channels + FP8 store.  A block wider
+        than this WG's 64 channels takes its amax from both warpgroups of the
+        cooperative tile (SMEM exchange, named barrier)."""
         # Inner epilogue IKET range for non-swap-AB, DeepGEMM-style blockwise
         # FC1. WGMMA and blockwise accumulator scaling have already finished.
         # This covers gate/up fold, SwiGLU, per-token amax reduction, scale
@@ -761,9 +804,18 @@ class Fp8GluEpilogue:
         lane_group = thread_in_warp // 4
         lane_mod = thread_in_warp % 4
         scale_col_idx = (
-            work_tile_info.tile_n_idx * cutlass.Int32(self._fc1_store_n_splits)
-            + cutlass.Int32(n_half)
+            (
+                work_tile_info.tile_n_idx * cutlass.Int32(self._fc1_store_n_splits)
+                + cutlass.Int32(n_half)
+            )
+            * cutlass.Int32(Fc1EpilogueStoreTileN)
+            // cutlass.Int32(fp8_fc2_activation_scale_k(self.fp8_scale_mode))
         )
+        if cutlass.const_expr(self._fc1_scale_block_wgs == 2):
+            amax_bar = pipeline.NamedBarrier(
+                barrier_id=self._fc1_amax_sync_bar_id,
+                num_threads=2 * EpiWarpCount * WarpThreadCount,
+            )
         global_token_base = (
             work_tile_info.cumulative_data_physical_row
             + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
@@ -839,6 +891,20 @@ class Fp8GluEpilogue:
             )
             row0_absmax = self._quad_reduce_max(row0_absmax)
             row1_absmax = self._quad_reduce_max(row1_absmax)
+            if cutlass.const_expr(self._fc1_scale_block_wgs == 2):
+                # The block spans both warpgroups' 64-channel halves: publish
+                # this half's per-row amax, meet the other WG, fold its value.
+                # Rows are disjoint per quad, so lane 0 of each quad writes.
+                if lane_mod == cutlass.Int32(0):
+                    smem_fc1_amax[n_half, m_sub, token_row0] = row0_absmax
+                    smem_fc1_amax[n_half, m_sub, token_row1] = row1_absmax
+                amax_bar.arrive_and_wait()
+                row0_absmax = fmax(
+                    row0_absmax, smem_fc1_amax[1 - n_half, m_sub, token_row0]
+                )
+                row1_absmax = fmax(
+                    row1_absmax, smem_fc1_amax[1 - n_half, m_sub, token_row1]
+                )
             row0_scale = fmax(
                 row0_absmax * self.fp8_output_rcp_limit, scale_epsilon
             )
@@ -846,21 +912,23 @@ class Fp8GluEpilogue:
                 row1_absmax * self.fp8_output_rcp_limit, scale_epsilon
             )
 
-            if lane_mod == cutlass.Int32(0):
-                if token_row0 < work_tile_info.valid_tokens_in_cta_tile:
-                    stg_fc1_block_scale_row(
-                        gmem_fc1_output_sf,
-                        scale_col_idx,
-                        global_token_base + token_row0,
-                        row0_scale,
-                    )
-                if token_row1 < work_tile_info.valid_tokens_in_cta_tile:
-                    stg_fc1_block_scale_row(
-                        gmem_fc1_output_sf,
-                        scale_col_idx,
-                        global_token_base + token_row1,
-                        row1_scale,
-                    )
+            # One scale per block: warpgroup 0 writes it for a two-WG block.
+            if cutlass.const_expr(self._fc1_scale_block_wgs == 1 or n_half == 0):
+                if lane_mod == cutlass.Int32(0):
+                    if token_row0 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token_row0,
+                            row0_scale,
+                        )
+                    if token_row1 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token_row1,
+                            row1_scale,
+                        )
 
             self._scale_fc1_swiglu_for_fp8_blockwise(
                 swiglu, row0_scale, row1_scale
@@ -1403,6 +1471,7 @@ class Fp8GluEpilogue:
         _iket_active,
         run_wgmma_task_tile: cutlass.Constexpr,
         smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         sched_ext,
         gmem_fc1_output: cute.Tensor,
@@ -1465,6 +1534,7 @@ class Fp8GluEpilogue:
             accumulators=accumulators,
             n_half=n_half,
             smem_fc1_output_buffer=smem_fc1_output_buffer,
+            smem_fc1_amax=smem_fc1_amax,
             tma_atom_fc1_output=tma_atom_fc1_output,
             sched_ext=sched_ext,
             gmem_fc1_output=gmem_fc1_output,
@@ -1737,6 +1807,7 @@ class Fp8GluEpilogue:
         sched_consumer,
         sched_ext,
         smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
         tma_atom_fc1_output: cute.CopyAtom,
         smem_fc2_output_buffer: cute.Tensor,
         tma_atom_fc2_output: cute.CopyAtom,
@@ -1939,6 +2010,7 @@ class Fp8GluEpilogue:
                         k_tile_cnt_fc2=k_tile_cnt_fc2,
                         _iket_active=_iket_active,
                         smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        smem_fc1_amax=smem_fc1_amax,
                         tma_atom_fc1_output=tma_atom_fc1_output,
                         sched_ext=sched_ext,
                         gmem_fc1_output=gmem_fc1_output,
@@ -1995,6 +2067,7 @@ class Fp8GluEpilogue:
                         k_tile_cnt_fc2=k_tile_cnt_fc2,
                         _iket_active=_iket_active,
                         smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        smem_fc1_amax=smem_fc1_amax,
                         tma_atom_fc1_output=tma_atom_fc1_output,
                         sched_ext=sched_ext,
                         gmem_fc1_output=gmem_fc1_output,

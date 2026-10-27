@@ -76,6 +76,17 @@ from moe_hopper_fp8.hopper_moe_utils import (
 # =============================================================================
 
 
+def check_deterministic_config(deterministic: bool, in_kernel_fc2_reduce: bool) -> None:
+    """Reject ``deterministic`` together with the in-kernel topk reduce: the
+    REDG / ``cp.reduce`` adds land in arrival order, so the reduced output is
+    not reproducible.  The separate ``TopkReduce`` sums topk in fixed order."""
+    if deterministic and in_kernel_fc2_reduce:
+        raise ValueError(
+            "deterministic requires the separate TopkReduce; "
+            "turn off in_kernel_fc2_reduce (--in_kernel_fc2_reduce)."
+        )
+
+
 @dataclass
 class ImplDesc(_BaseImplDesc):
     """Hopper FP8 impl descriptor with the swap-AB short-N specializations.
@@ -92,10 +103,16 @@ class ImplDesc(_BaseImplDesc):
     token tile against adjacent weight tiles).  It requires a token-side
     cluster of 2 (swap-AB cga (1,2,1), non-swap cga (2,1,1)) and defaults to
     False so the default build is unchanged.
+
+    ``deterministic`` (MegaMoE, default off) makes launches bitwise
+    reproducible: launch-order-independent dispatch slots and the separate
+    fixed-order ``TopkReduce``.  It cannot be combined with
+    ``in_kernel_fc2_reduce``, whose atomic adds follow arrival order.
     """
 
     generate_c: bool = False
     tail_split_pairs: bool = False
+    deterministic: bool = False
 
     def _validate_mma_cta_mode(self, m: int) -> None:
         if self.use_2cta_instrs:
@@ -105,6 +122,7 @@ class ImplDesc(_BaseImplDesc):
             )
 
     def __post_init__(self) -> None:
+        check_deterministic_config(self.deterministic, self.in_kernel_fc2_reduce)
         m, n, k = self.mma_tiler_mnk
         supported_clusters = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
         if self.cluster_shape_mnk not in supported_clusters:

@@ -29,7 +29,7 @@ import dataclasses
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Tuple  # noqa: F401
+from typing import Any, Callable, ClassVar, Dict, Literal, Optional, Tuple  # noqa: F401
 
 import torch
 
@@ -80,6 +80,7 @@ _E8M0_SCALE_DTYPE = torch.float8_e8m0fnu
 # them fails loudly instead of silently mis-sizing staging buffers.
 _FP8_E8M0_SF_VEC_SIZE = 32  # Fp8E8M0SfVecSize: elements per E8M0 SF byte
 _FP8_BLOCK_SCALE_K = 128  # Fp8BlockScaleK: elements per blockwise FP32 act scale
+_FP8_FC2_ACTIVATION_SCALE_K = 128  # Fp8Fc2ActivationScaleK: h channels per scale
 _FP8_WEIGHT_SCALE_BLOCK_N = 128  # Fp8WeightScaleBlockN
 _FP8_WEIGHT_SCALE_BLOCK_K = 128  # Fp8WeightScaleBlockK
 _FP8_DISPATCH_SCALE_ATOM_K = 128  # Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
@@ -132,6 +133,11 @@ class MegaMoEHopperFp8Config:
     ``2 * intermediate`` (= ``static_expert_shape[1]``, the drop driver's
     ``problem.intermediate``).
     """
+
+    # FC1-output (FC2 activation) channels per blockwise scale block.  The
+    # fused MXFP4 / NVFP4 x FP8 configs run this validation through a
+    # blockwise proxy whose hybrid FC2 activation keeps 1x64 blocks.
+    _fc2_activation_scale_k: ClassVar[int] = _FP8_FC2_ACTIVATION_SCALE_K
 
     rank: int
     world_size: int
@@ -227,6 +233,13 @@ class MegaMoEHopperFp8Config:
     # 1-CTA weight cluster: swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
     # Output-invariant; the heuristic table turns it on per bucket.
     tail_split_pairs: bool = False
+    # Bitwise-reproducible dispatch pool: slots are assigned by (token, topk)
+    # rank instead of arrival-order atomics, so the expert-major pool row
+    # order (and ``fc1_c`` under generate_c) is identical on every launch.
+    # The output is already reproducible without it unless the in-kernel
+    # topk reduce is on, which this rejects.  Single-node only; does not
+    # combine with dedup_dispatch / grouped_token_back.
+    deterministic: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -355,6 +368,18 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 "in_kernel_fc2_reduce requires apply_routing_weights_before_fc2=True."
             )
+        if self.deterministic and self.in_kernel_fc2_reduce:
+            raise ValueError(
+                "deterministic requires the separate TopkReduce: the in-kernel "
+                "reduce adds the topk terms in arrival order."
+            )
+        if self.deterministic and (
+            self.enable_nccl_gin or self.dedup_dispatch or self.grouped_token_back
+        ):
+            raise ValueError(
+                "deterministic is single-node only and does not combine with "
+                "dedup_dispatch / grouped_token_back."
+            )
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper FP8 v1 kernel only implements "
@@ -388,6 +413,18 @@ class MegaMoEHopperFp8Config:
                     "native Hopper FP8 ping-pong requires mma_tiler N=128; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
+        scale_k = self._fc2_activation_scale_k
+        if self.blockwise and ((m if self.swap_ab else n) // 2) % scale_k != 0:
+            # The FC1 epilogue forms each FC2-activation scale block from the
+            # channels of one task tile (tile N / 2 native, M / 2 swap-AB; a
+            # ping-pong warpgroup owns a whole N=128 / M=128 tile).  At 1x128
+            # that leaves N=256 native / M=256 swap-AB without ping-pong.
+            raise ValueError(
+                f"blockwise FP8 needs a multiple of {scale_k} output channels "
+                "per task tile (mma_tiler N / 2 native, M / 2 swap-AB); got "
+                f"mma_tiler_mnk={self.mma_tiler_mnk}, swap_ab={self.swap_ab}, "
+                f"pingpong={self.pingpong}."
+            )
         if self.swap_ab:
             if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
                 raise ValueError(
@@ -770,6 +807,7 @@ class MegaMoEHopperFp8Frontend:
             c.enable_iket,
             c.ranks_per_node,
             c.enable_nccl_gin,
+            c.deterministic,
         )
 
     @staticmethod
@@ -779,6 +817,7 @@ class MegaMoEHopperFp8Frontend:
             Fp8BlockScaleK,
             Fp8DispatchScaleAtomK,
             Fp8E8M0SfVecSize,
+            Fp8Fc2ActivationScaleK,
             Fp8WeightScaleBlockK,
             Fp8WeightScaleBlockN,
         )
@@ -786,6 +825,11 @@ class MegaMoEHopperFp8Frontend:
         mirrored = (
             ("Fp8E8M0SfVecSize", Fp8E8M0SfVecSize, _FP8_E8M0_SF_VEC_SIZE),
             ("Fp8BlockScaleK", Fp8BlockScaleK, _FP8_BLOCK_SCALE_K),
+            (
+                "Fp8Fc2ActivationScaleK",
+                Fp8Fc2ActivationScaleK,
+                _FP8_FC2_ACTIVATION_SCALE_K,
+            ),
             ("Fp8WeightScaleBlockN", Fp8WeightScaleBlockN, _FP8_WEIGHT_SCALE_BLOCK_N),
             ("Fp8WeightScaleBlockK", Fp8WeightScaleBlockK, _FP8_WEIGHT_SCALE_BLOCK_K),
             (
@@ -884,6 +928,7 @@ class MegaMoEHopperFp8Frontend:
             tail_split_pairs=c.tail_split_pairs,
             ranks_per_node=c.ranks_per_node,
             enable_nccl_gin=c.enable_nccl_gin,
+            deterministic=c.deterministic,
         )
 
         return kernel, max_active_clusters
@@ -1519,6 +1564,7 @@ def resolve_hopper_fp8_mega_moe_config(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
+    deterministic: bool = False,
     apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
@@ -1675,6 +1721,7 @@ def resolve_hopper_fp8_mega_moe_config(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
+        deterministic=deterministic,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
@@ -1734,6 +1781,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
+    deterministic: bool = False,
     apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1761,8 +1809,9 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     ``num_max_tokens``) when ALL four are ``None``.  Setting any one of them
     switches to manual mode: unset knobs fall back to the drop driver's
     defaults (``swap_ab=False``, ``pingpong=False``, tiler (64, 128, 128)
-    native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
-    cluster (1, 1, 1)).
+    native ((64, 256, 128) blockwise) / (256, 32, 128) swap-AB / (128, 32,
+    128) swap-AB ping-pong, cluster (1, 1, 1)).  Blockwise needs N=256
+    native / M=256 swap-AB tiles and no ping-pong.
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is
     a deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
@@ -1802,6 +1851,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
+        deterministic=deterministic,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

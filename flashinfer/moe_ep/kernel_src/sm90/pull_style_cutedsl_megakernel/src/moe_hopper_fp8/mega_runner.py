@@ -849,6 +849,82 @@ class MegaMoEFp8Tester(MegaMoETester):
         if failures:
             raise RuntimeError("[generate_c] fc1_c mismatch: " + "; ".join(failures))
 
+    def check_determinism(self, n: int) -> None:
+        """Relaunch the compiled forward ``n`` times on the same inputs and
+        compare bit for bit with the validated launch: the public output
+        always; under ``deterministic`` also the dispatch pool layout
+        (``token_src_metadata``) and the valid rows of ``fc1_c`` (its
+        per-expert padding rows carry no contract).  Under ``deterministic`` any
+        difference raises on every rank; otherwise differences are only
+        reported (the atomic dispatch reorders pool rows, the in-kernel reduce
+        reorders the topk adds)."""
+        dist_on = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        def barrier() -> None:
+            torch.cuda.synchronize()
+            if dist_on:
+                torch.distributed.barrier()
+
+        def bits(t: torch.Tensor) -> torch.Tensor:
+            # Integer view: NaN == NaN, +0 != -0.
+            return t.view({1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()])
+
+        kernel = self._kernel
+        outs = {"output": self.output_activation}
+        if self.impl.deterministic:
+            off = kernel._local_offsets["token_src_metadata"]
+            nbytes = kernel._local_region_by_name["token_src_metadata"].nbytes
+            outs["token_src_metadata"] = self.local_workspace[off : off + nbytes]
+            if self.impl.generate_c and self._c_output is not None:
+                outs["fc1_c"] = self._c_output
+        c_valid = None
+        if "fc1_c" in outs:
+            c_valid = torch.zeros(outs["fc1_c"].shape[0], dtype=torch.bool, device="cuda")
+            for r0, v in zip(self._c_data_physical_offsets, self._c_valid_tokens_per_expert):
+                c_valid[r0 : r0 + v] = True
+
+        def compared(k: str, t: torch.Tensor) -> torch.Tensor:
+            return bits(t)[c_valid] if k == "fc1_c" else bits(t)
+
+        ref_bits = {k: compared(k, v).clone() for k, v in outs.items()}
+        diff_runs = torch.zeros(len(outs), dtype=torch.int64, device="cuda")
+        diff_elems = torch.zeros(len(outs), dtype=torch.int64, device="cuda")
+        for _ in range(n):
+            barrier()
+            # The in-kernel reduce accumulates into the output (and peers
+            # write it), so it restarts from zero; otherwise outputs restart
+            # from NaN so a missed write shows up.
+            if self.impl.in_kernel_fc2_reduce:
+                self.output_activation.zero_()
+            else:
+                self.output_activation.fill_(float("nan"))
+            if "fc1_c" in outs:
+                outs["fc1_c"].fill_(float("nan"))
+            barrier()
+            self._compiled_kernel(**self._runtime_kwargs)
+            torch.cuda.synchronize()
+            for j, (k, v) in enumerate(outs.items()):
+                d = (compared(k, v) != ref_bits[k]).sum()
+                diff_runs[j] += (d > 0).to(torch.int64)
+                diff_elems[j] = torch.maximum(diff_elems[j], d)
+        if dist_on:
+            torch.distributed.all_reduce(diff_runs)
+            torch.distributed.all_reduce(diff_elems, op=torch.distributed.ReduceOp.MAX)
+        world = torch.distributed.get_world_size() if dist_on else 1
+        if self.rank == 0:
+            print(
+                f"[determinism] deterministic={self.impl.deterministic} "
+                f"{n} relaunches x {world} ranks, bitwise: "
+                + ", ".join(
+                    f"{k} {int(diff_runs[j])} rank-runs differ (max {int(diff_elems[j])} elems)"
+                    for j, k in enumerate(outs)
+                ),
+                flush=True,
+            )
+        failed = [k for j, k in enumerate(outs) if int(diff_runs[j]) > 0]
+        if self.impl.deterministic and failed:
+            raise AssertionError(f"[determinism] {failed} differ across relaunches")
+
     def run_kernel(self) -> None:
         """Compile + launch ``Sm90MegaMoEFp8Kernel`` on the current stream.
 
@@ -954,6 +1030,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             flag_batch=self.impl.flag_batch,
             gate_up_clamp=self.problem.gate_up_clamp,
             tail_split_pairs=self.impl.tail_split_pairs,
+            deterministic=self.impl.deterministic,
         )
 
         # -- 2. Workspaces (local cuda + sym-heap) --
@@ -1037,6 +1114,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
         )
+        self._runtime_kwargs = runtime_kwargs
         compile_kwargs = dict(runtime_kwargs)
         compile_kwargs["max_active_clusters"] = max_active_clusters
         if self.misc.enable_iket:
@@ -1217,6 +1295,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
+        "--deterministic", action="store_true", default=False,
+        help="Bitwise-reproducible launches: launch-order-independent "
+             "dispatch slots and the separate fixed-order TopkReduce.  "
+             "Cannot be combined with --in_kernel_fc2_reduce.",
+    )
+    parser.add_argument(
+        "--determinism_iters", type=int, default=0,
+        help="After the validated launch, relaunch N times and compare the "
+             "outputs bit for bit (fails under --deterministic on any "
+             "difference; report-only otherwise).",
+    )
+    parser.add_argument(
         "--in_kernel_fc2_reduce", action="store_true", default=False,
         help="Collapse topk in kernel: epi_warps issues REDG into "
              "output_activation[t, :]; the dispatch token-back modes push "
@@ -1241,6 +1331,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.use_cuda_profiler_api and not args.profile_friendly:
         parser.error("--use_cuda_profiler_api requires --profile_friendly")
+    if args.deterministic and args.in_kernel_fc2_reduce:
+        parser.error(
+            "--deterministic requires the separate TopkReduce; "
+            "drop --in_kernel_fc2_reduce"
+        )
 
     if _NO_DIST:
         torch.cuda.set_device(0)
@@ -1335,6 +1430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         flag_batch=1,
         generate_c=args.generate_c,
         tail_split_pairs=tail_split_pairs,
+        deterministic=args.deterministic,
     )
 
     misc = MiscDesc(
@@ -1365,6 +1461,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     return_code = 0
     try:
         tester.run()
+        if args.determinism_iters > 0:
+            tester.check_determinism(args.determinism_iters)
     except NotImplementedError as exc:
         if rank == 0:
             print(f"[mega_runner_fp8] kernel launch skipped: {exc}")

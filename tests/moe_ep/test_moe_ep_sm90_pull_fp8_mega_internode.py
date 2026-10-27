@@ -429,3 +429,43 @@ def test_moe_ep_sm90_pull_fp8_mega_internode(fp8_scale_mode, swap_ab, token_back
         swap_ab=swap_ab,
         token_back_mode=token_back_mode,
     )
+
+
+@pytest.mark.parametrize(
+    "swap_ab,mma_tiler_mnk", [(True, (256, 32, 128)), (False, (64, 128, 128))]
+)
+def test_moe_ep_sm90_pull_fp8_internode_kernel_layout(
+    monkeypatch, swap_ab, mma_tiler_mnk
+):
+    """Host side, no launch: the internode kernel builds from the shim config,
+    and the per-origin token counts sit in the counter prefix kernel_tail
+    zeroes before the next launch."""
+    from types import SimpleNamespace
+
+    import cutlass.utils as cutlass_utils
+
+    import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
+
+    # The only device query on the build path (occupancy-aware group size).
+    monkeypatch.setattr(
+        cutlass_utils,
+        "HardwareInfo",
+        lambda: SimpleNamespace(get_max_active_clusters=lambda cluster_size: 132),
+    )
+    config = pkg.MegaMoEHopperFp8Config(
+        rank=0,
+        world_size=8,
+        num_tokens_per_rank=64,
+        num_topk=4,
+        num_total_experts=16,
+        hidden=1024,
+        intermediate=512,
+        swap_ab=swap_ab,
+        mma_tiler_mnk=mma_tiler_mnk,
+        ranks_per_node=4,
+        enable_nccl_gin=True,
+    )
+    kernel, _ = pkg.MegaMoEHopperFp8Frontend(config)._build_kernel()
+    names = [spec.name for spec in kernel._local_region_specs]
+    # Data buffers start at l1_token_buffer; everything before it is reset.
+    assert names.index("gin_token_count") < names.index("l1_token_buffer")

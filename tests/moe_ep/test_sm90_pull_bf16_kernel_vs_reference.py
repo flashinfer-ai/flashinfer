@@ -160,6 +160,12 @@ def test_shim_config_validation():
     assert six.resolved_token_back_mode == "reuse_dispatch_warps"
     with pytest.raises(ValueError, match="token_back_mode"):
         pkg.MegaMoEHopperBf16Config(**{**base, "token_back_mode": "bogus"})
+    # deterministic needs the separate TopkReduce.
+    assert pkg.MegaMoEHopperBf16Config(**{**base, "deterministic": True}).deterministic
+    with pytest.raises(ValueError, match="deterministic"):
+        pkg.MegaMoEHopperBf16Config(
+            **{**base, "deterministic": True, "in_kernel_fc2_reduce": True}
+        )
     # Ping-pong geometry constraints.
     with pytest.raises(ValueError, match="ping-pong"):
         pkg.MegaMoEHopperBf16Config(

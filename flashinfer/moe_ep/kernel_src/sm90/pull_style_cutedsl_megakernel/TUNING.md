@@ -113,6 +113,37 @@ placements a tie there.
 |    16384 | non-swap M64N256 CGA1x2            |   reuse    |            |            |    17097.8 |  759.6 |  18637.3 |      696.9 |
 |    32768 | non-swap M64N256 CGA2x1            |   reuse    |            |            |    30479.6 |  852.2 |  33407.6 |      777.5 |
 
+The blockwise table predates the 2026-10-27 kernel-repo sync, which moved
+the FC2-activation scales to 1x128 and the 32 / 256 / 4096 rows to swap-AB
+M256N8 CGA1x1 / swap-AB M256N32 CGA2x1 / non-swap M64N256 CGA2x1 with tail
+split (group hint 264 each); the next paragraph has the same-node deltas.
+
+**Before/after on one node (2026-10-27 session, unlocked 1980 MHz node)** —
+the kernel repo `main` sync (1x128 blockwise FC2-activation scales, so FC2
+promotes once per K tile; the three blockwise rows above) versus the
+pre-sync tree, with a merge-only tree (flashinfer `main` merged, no sync)
+as a third arm, ABC-CBA interleaved, 2 rounds, the pre-sync benchmark
+script for all three, mean of the max-rank time: blockwise geomean
+compute **+4.6%**, e2e **+4.4%** (merge-only -> sync: +4.4% / +4.3%);
+per_tensor +0.2% / +0.1%, every bucket within ±2.1% (pt32768 +2.1%
+compute, noisy; the pt16384 −1.1% compute is already there between the
+pre-sync and merge-only trees).
+Per bucket (compute / e2e): bw4096 **+27.7% / +26.9%**, all of it from the
+new row: in a 2x2 on the same node the old row (cooperative CGA1x1, one-wave
+group) runs 1.5% slower on the synced kernel than on the pre-sync one, and
+the new row 28.5% faster than the old one on the synced kernel; bw8192 **+8.4% / +6.9%**,
+bw256 **+6.8% / +6.2%** (new row replacing ping-pong M128N32), bw2048
++3.9% / +5.2%, bw1024 +3.3% / +3.2%, bw16384 +2.6% / +1.3%, bw32768
++11.3% / +8.7% with ±5% round to round (one GPU of this node idles at
+62 °C against ~30 °C and the long points drift), bw32 −0.5% / −0.5% (the
+ping-pong M128N16 row is illegal at 1x128; cooperative M256N8 ties it),
+the other blockwise buckets within ±0.5% compute.  All 26 points
+reference-checked `pass` in all three trees and both rounds.  This node
+is much slower than the table's on the long points (bw32768 39-44 ms
+against 30.5 ms), so the table stays until a re-sweep on a clock-locked
+node.  Raw rows:
+`benchmark_data/20261027/P1_*.csv` (local archive, not committed).
+
 **Before/after on one node (2026-09-19 session, unlocked 1980 MHz node)** —
 `group_hint` 264 on the 8-256 buckets (kernel team's retune; every bucket
 up to 8192 now carries it) versus the 2026-09-18 table, same node, 2
@@ -211,16 +242,28 @@ now carries the SM100-style tuning stack (`shim/tuner.py`,
 `shim/autotune.py`, `shim/knob_cache.py`): the config's `knobs=` field
 accepts a knob dict, `"auto"` (collective online autotune on first
 compute, winner persisted to the knob cache), or `None` (cache lookup,
-then the heuristic table).  The autotune candidate set is the heuristic
+then the heuristic table; a cached entry the current kernel rejects —
+e.g. a blockwise M128 / ping-pong winner recorded before the 1x128
+FC2-activation scales — is skipped with a warning).  The autotune candidate set is the heuristic
 winner plus every geometry that wins some bucket of the table (19 today
 — tile / cluster / ping-pong together with the row's `group_hint` and
 `tail_split_pairs`, derived programmatically) crossed with both validated
-token-back modes — 38 candidates.
+token-back modes — 38 candidates per_tensor, 24 blockwise (only the
+N256 / M256 non-ping-pong geometries are legal there, see below).
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
   `"blockwise"` (DeepGEMM-style 128-block fp32 scales; requires
-  hidden/intermediate %128).
+  hidden/intermediate %128).  Blockwise quantizes the FC1 output (FC2's A
+  operand) with one fp32 scale per token row and 128 channels
+  (`Fp8Fc2ActivationScaleK`, 64 before the 2026-10-26 sync), so FC2
+  promotes once per K tile like FC1 instead of twice.  The FC1 epilogue
+  forms that block from the channels of one task tile (the two epilogue
+  warpgroups exchange their per-row amax through SMEM and named barrier
+  4), hence blockwise needs N=256 non-swap / M=256 swap-AB tiles and has
+  no ping-pong geometry; the config, `tuner.is_valid` and the kernels
+  reject the rest.  The Hopper MXFP4 / NVFP4 x FP8 backends
+  (`mxfp4_hybrid`) share these code paths and keep the 1x64 h block.
 - `swap_ab` + `pingpong` + `mma_tiler_mnk` + `cluster_shape_mnk` — layout,
   scheduling, tile, and CGA shape.  Leave ALL four `None` to use the drop's
   token-bucket heuristic table (`moe_hopper_fp8/heuristic_config.py`, keyed
@@ -234,12 +277,13 @@ token-back modes — 38 candidates.
   pair tasks, see `tail_split_pairs` / `group_hint` below);
   setting any one switches to
   manual mode with
-  drop-driver defaults for the rest (non-swap (64, 128, 128), swap-AB
-  (256, 32, 128), (128, 32, 128) with ping-pong; cluster (1, 1, 1)).
+  drop-driver defaults for the rest (non-swap (64, 128, 128) — (64, 256,
+  128) under blockwise — swap-AB (256, 32, 128), (128, 32, 128) with
+  ping-pong; cluster (1, 1, 1)).
   Kernel-legal geometry: non-swap M∈{64}, N∈{128,256}; swap-AB M∈{128,256},
   N∈{8,16,32,64,128} (N=8 = wgmma m64n8k32, admitted 2026-09-10 and used by
   the per_tensor 32/64/128 rows; bit-exact for per_tensor
-  ping-pong / cooperative and blockwise ping-pong / cooperative
+  ping-pong / cooperative and blockwise cooperative
   since 2026-09-10 — the blockwise token-scale box (n×4 fp32 = n·16 B) used
   to ride B's cluster-M multicast, whose per-CTA sub-box is n/cluster_m·16 B
   = 64 B at n=8, below TMA's 128 B smem-destination alignment; the kernel now
@@ -250,7 +294,7 @@ token-back modes — 38 candidates.
   N must be a multiple of 16 (`BLOCK_M % 16 == 0` static_assert); its
   `kMinCandidateBlockM = 8` only sizes pool padding.
   Ping-pong needs one physical warpgroup per task tile: N=128 non-swap,
-  M=128 swap-AB.
+  M=128 swap-AB (per_tensor only, see `fp8_scale_mode`).
 - `load_balance_mode` — `"static"` (default, used by the correctness
   tests) or `"atomic_counter"` (the drop's perf-sweep setting; used by the
   benchmark for reference parity).
@@ -324,6 +368,21 @@ token-back modes — 38 candidates.
   one round).  Test
   `test_..._generate_c` (both layouts x both scale modes vs the multi-rank
   torch reference's `return_fc1_gateup`).
+- `deterministic` (default False) — launch-order-independent dispatch
+  slots: a route's pool slot is the rank of its `(token, topk)` among this
+  rank's routes to the expert (per-warp SMEM histograms ranked with
+  `match.any` + `popc`, cross-CTA bases from a per-CTA routing histogram
+  `cta_expert_hist` scanned between two software grid syncs) instead of
+  arrival-order atomics, so the expert-major pool row order — and
+  `fc1_c` under `generate_c` — is identical on every launch.  The output
+  is reproducible without it (each pool row's GEMMs do not depend on its
+  position) as long as the separate TopkReduce sums topk in fixed order;
+  `in_kernel_fc2_reduce` adds in arrival order and is rejected, and so are
+  the internode GIN path (its dispatch reserves slots per rail source) and
+  `dedup_dispatch` / `grouped_token_back` (their slots come from the
+  atomic path).
+  Test `test_..._multirank_deterministic` (relaunches compared bit for bit,
+  both layouts and scale modes); bench `--deterministic`.
 - `compact_pull_buffer` (default True) — size the dispatch pull buffer by
   the *active* dispatch warps (`active_dispatch_warps` x
   `max(hidden_bytes, tb_chunk_bytes)` = 7 KiB at hidden=7168) instead of
@@ -744,6 +803,19 @@ apply here.  Against the FP8 per_tensor table above (a different session
 and node, so a ballpark only), BF16 compute is 1.75-2.0x the FP8 time on
 every bucket: twice the operand bytes and half the WGMMA rate on the
 GEMM-bound tail, twice the dispatch bytes on the latency-bound head.
+
+**2026-10-27 kernel-repo sync (same node as the FP8 2026-10-27 paragraph)** —
+the BF16 table rows did not change; the sync adds the deterministic option
+(off) and the training hooks, including the kernel-tail
+`expert_token_sizes_snapshot` copy that every launch runs (one CTA-wide
+barrier plus CTA 0 copying the per-expert counts).  Merge-only tree versus
+the synced tree, AB-BA, 2 rounds, 8-1024: geomean compute −0.1%, e2e −0.2%,
+every bucket within ±0.5%.  A first session read −0.3% compute / −1% e2e
+there but did not reproduce, and a tree without the snapshot copy measures
+the same as the synced one (−0.2%), so the hooks cost nothing measurable.
+2048-16384 within ±1.2%; 32768 unusable on that node (compute 90-98 ms with
+14% spread).  Raw rows: `benchmark_data/20261027/{B1,B2,A2}_*.csv` (local
+archive, not committed).
 
 ## Humming MXFP4 development and tuning
 
