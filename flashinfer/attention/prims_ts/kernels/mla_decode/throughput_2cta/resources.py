@@ -2204,7 +2204,11 @@ class SmemVResource(HighThroughputMlaResource):
         """Read one warp-uniform SMEM quad and reuse it across FP8 V panels."""
         cfg = self.cfg
         if cutlass.const_expr(cfg.has_nvfp4_kv):
-            publish_nvfp4_v(stage_info.barrier, 4096)
+            # Match this warp's share of the cluster-wide V pipeline credit.
+            publish_nvfp4_v(
+                stage_info.barrier,
+                cfg.tma_copy_v_tile_bytes // cfg.num_mma_ctas // cfg.load_num_warps,
+            )
             return
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_v_warp_id
         cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())

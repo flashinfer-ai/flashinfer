@@ -383,6 +383,13 @@ def make_mla_decode_config(
         and sparse_gather_warps == 1
     ):
         raise ValueError("NVFP4 KV needs sparse E4M3 D512/D576 (internal page size 1)")
+    if has_nvfp4_kv and (
+        mma_qk_tiler_mn != (128, 128) or mma_pv_tiler_mn != (128, 256)
+    ):
+        # The loader converts 64 token rows per CTA and exchanges 256-feature
+        # V halves in fixed SMEM panels. Other tiles need a matching producer
+        # layout, not just different pipeline byte counts.
+        raise ValueError("NVFP4 2CTA requires QK (128, 128) and PV (128, 256) tiles")
     cfg = MlaDecodeConfig()
     cfg.kv_cache_format = kv_cache_format
     cfg.extra_kv_cache_format = extra_kv_cache_format

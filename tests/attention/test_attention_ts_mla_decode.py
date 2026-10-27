@@ -1512,6 +1512,29 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     assert "mask:causal" in defn["tags"]
 
 
+@pytest.mark.parametrize(
+    "qk_tile,pv_tile",
+    [
+        ((128, 256), (128, 256)),
+        ((128, 64), (128, 256)),
+        ((128, 128), (128, 128)),
+        ((64, 128), (64, 256)),
+    ],
+)
+def test_attention_ts_mla_nvfp4_rejects_unsupported_tiles(qk_tile, pv_tile):
+    """Reject tile overrides incompatible with the fixed NVFP4 DSMEM layout."""
+    with pytest.raises(ValueError, match="NVFP4 2CTA requires QK"):
+        make_mla_decode_config(
+            mma_qk_tiler_mn=qk_tile,
+            mma_pv_tiler_mn=pv_tile,
+            rope_dim=0,
+            page_size=1,
+            qkv_dtype="e4m3",
+            kv_cache_format="nvfp4",
+            extra_kv_cache_format="nvfp4",
+        )
+
+
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
     """Skip data work symmetrically while preserving CLC queue progress."""
