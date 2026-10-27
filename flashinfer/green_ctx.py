@@ -165,6 +165,7 @@ def split_device_green_ctx(
         where the last one is the remaining SMs.
 
         The following examples show how the SM count is rounded up to meet the alignment and granularity requirements:
+
         - Requested 7 SMs → Allocated 8 SMs (rounded up to minimum)
         - Requested 10 SMs → Allocated 16 SMs (rounded up to multiple of 8)
         - Requested 16 SMs → Allocated 16 SMs (no rounding needed)
@@ -216,6 +217,7 @@ def split_device_green_ctx_by_sm_count(
 
     Raises:
         RuntimeError: If the requested SM allocation exceeds device capacity:
+
             - When sum(rounded_sm_counts) > total_device_sms
             - When CUDA operations fail due to invalid resource types
             - When the device is not properly initialized
@@ -250,6 +252,7 @@ def split_device_green_ctx_by_sm_count(
         where the last one contains the remaining SMs that were not allocated.
 
         SM count alignment examples for Compute Capability 9.0+:
+
         - Requested 7 SMs → Allocated 8 SMs (rounded up to minimum)
         - Requested 10 SMs → Allocated 16 SMs (rounded up to multiple of 8)
         - Requested 16 SMs → Allocated 16 SMs (no rounding needed)

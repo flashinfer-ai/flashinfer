@@ -54,6 +54,31 @@ def fp8_rowwise_gemm_allreduce(
     ``backend="cake"`` selects the exact source-built SM100 fused kernel for
     four-rank NCCL groups; ``backend="auto"`` selects the same route (no other
     implementation exists). Unsupported inputs raise instead of falling back.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        This rank's contiguous FP8 (e4m3) activation shard of shape
+        ``[M, K_l]``. ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA
+        tensors on one shared device.
+    a_scale : torch.Tensor
+        Contiguous FP32 row scales of shape ``[M]``.
+    w : torch.Tensor
+        This rank's contiguous FP8 (e4m3) weight shard of shape ``[N, K_l]``.
+    w_scale : torch.Tensor
+        Contiguous FP32 column scales of shape ``[N]``.
+    group : torch.distributed.ProcessGroup
+        Four-rank NCCL process group on one SM100 node.
+    backend : str, optional
+        ``"auto"`` and ``"cake"`` both select the Cake backend.
+    out : torch.Tensor, optional
+        Contiguous BF16 output buffer of shape ``[M, N]``. A new tensor is
+        allocated when omitted.
+
+    Returns
+    -------
+    torch.Tensor
+        The reduced BF16 product of shape ``[M, N]`` on every rank.
     """
 
     if backend == "cake":
@@ -95,6 +120,33 @@ def prepare_fp8_rowwise_gemm_allreduce(
     four-rank NCCL groups, torch's default CUDA or NVSHMEM symmetric-memory
     backend). Unsupported inputs raise during preparation instead of falling
     back to another implementation.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Sample contiguous FP8 (e4m3) activation shard of shape ``[M, K_l]``.
+        ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA tensors on one
+        shared device.
+    a_scale : torch.Tensor
+        Sample contiguous FP32 row scales of shape ``[M]``.
+    w : torch.Tensor
+        Sample contiguous FP8 (e4m3) weight shard of shape ``[N, K_l]``.
+    w_scale : torch.Tensor
+        Sample contiguous FP32 column scales of shape ``[N]``.
+    group : torch.distributed.ProcessGroup
+        Four-rank NCCL process group on one SM100 node.
+    backend : str, optional
+        ``"auto"`` and ``"cake"`` both select the Cake backend.
+    max_rows : int, optional
+        Maximum row count accepted by the returned launcher. Must be at least
+        the sample input's row count. Defaults to the sample input's row count
+        and must match on every rank.
+
+    Returns
+    -------
+    Callable
+        A CUDA-graph-capturable launcher with signature
+        ``launcher(a, a_scale, w, w_scale, *, out=None)``.
     """
 
     if backend not in {"auto", "cake"}:

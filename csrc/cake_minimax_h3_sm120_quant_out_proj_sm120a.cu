@@ -952,6 +952,7 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                         : "+f"(accum[124]), "+f"(accum[(124) + 1]), "+f"(accum[(124) + 2]), "+f"(accum[(124) + 3])
                         : "r"(a_frag[12]), "r"(a_frag[(12) + 1]), "r"(a_frag[(12) + 2]), "r"(a_frag[(12) + 3]), "r"(b_frag[14]), "r"(b_frag[(14) + 1]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage) * 8);
@@ -1215,6 +1216,7 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                         : "+f"(accum[124]), "+f"(accum[(124) + 1]), "+f"(accum[(124) + 2]), "+f"(accum[(124) + 3])
                         : "r"(a_frag[12]), "r"(a_frag[(12) + 1]), "r"(a_frag[(12) + 2]), "r"(a_frag[(12) + 3]), "r"(b_frag[14]), "r"(b_frag[(14) + 1]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage) * 8);
@@ -3558,6 +3560,7 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                         : "+f"(accum[124]), "+f"(accum[(124) + 1]), "+f"(accum[(124) + 2]), "+f"(accum[(124) + 3])
                         : "r"(a_frag[12]), "r"(a_frag[(12) + 1]), "r"(a_frag[(12) + 2]), "r"(a_frag[(12) + 3]), "r"(b_frag[14]), "r"(b_frag[(14) + 1]), "r"((uint32_t)(smem_regs_14[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_22[0])), "h"((uint16_t)0), "h"((uint16_t)0));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage) * 8);
@@ -3941,6 +3944,7 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
                         : "+f"(accum[124]), "+f"(accum[(124) + 1]), "+f"(accum[(124) + 2]), "+f"(accum[(124) + 3])
                         : "r"(a_frag[12]), "r"(a_frag[(12) + 1]), "r"(a_frag[(12) + 2]), "r"(a_frag[(12) + 3]), "r"(b_frag[14]), "r"(b_frag[(14) + 1]), "r"((uint32_t)(smem_regs_38[0])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_46[0])), "h"((uint16_t)0), "h"((uint16_t)0));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(ab_empty_addr + (mma_stage) * 8);
@@ -11143,22 +11147,23 @@ using GemmVariant = minimax_h3_sm120::GemmVariant<GemmKernel>;
 // [program][quant (0 = fp8, 1 = nvfp4)].  Program 1 stages the epilogue per MMA warp instead of per CTA, and its
 // NVFP4 kernel reads each activation-scale row once per pair of ring stages (same arithmetic, identical output bits).
 // It measured faster than program 0 on the 188-SM RTX PRO 6000 Blackwell at every tested M (33472 to 109952, both
-// quants) but not on the 170-SM RTX 5090, so it runs on 188-SM devices only.
+// quants), and on the 170-SM RTX 5090 with NVFP4 only, so it runs on 188-SM devices and for NVFP4 on 170-SM devices.
 const GemmVariant kGemmVariants[2][2] = {
     {{h3_out_proj_gemm_fp8_sm120a::kernel_h3_out_proj_gemm_fused, 94208},
      {h3_out_proj_gemm_nvfp4_sm120a::kernel_h3_out_proj_gemm_fused, 94208}},
     {{h3_out_proj_gemm_fp8_warp_epilogue_sm120a::kernel_h3_out_proj_gemm_fused, 94208},
      {h3_out_proj_gemm_nvfp4_warp_epilogue_sm120a::kernel_h3_out_proj_gemm_fused, 94208}},
 };
-constexpr int kWarpEpilogueSms = 188;
+constexpr int kWarpEpilogueSms = 188;       // both quants
+constexpr int kWarpEpilogueNvfp4Sms = 170;  // NVFP4 (quant 1) only
 
-// -1 routes by device; 0 / 1 run that program on every device (set by the test hook below).
+// -1 routes by device and quant; 0 / 1 run that program on every device (set by the test hook below).
 std::atomic<int> g_forced_program{-1};
 
-int ProgramFor(int num_sms) {
+int ProgramFor(int num_sms, int quant) {
   const int forced = g_forced_program.load(std::memory_order_relaxed);
   if (forced >= 0) return forced;
-  return num_sms == kWarpEpilogueSms ? 1 : 0;
+  return (num_sms == kWarpEpilogueSms || (num_sms == kWarpEpilogueNvfp4Sms && quant == 1)) ? 1 : 0;
 }
 
 void CheckTensor(const TensorView& tensor, const char* name, DLDevice device, DLDataType dtype,
@@ -11243,7 +11248,7 @@ struct QuantOutputs {
 void LaunchGemm(int quant, const CommonArgs& args, const CUtensorMap& a_map, const CUtensorMap& b_map,
                 const CUtensorMap& sfa_map, const CUtensorMap& sfb_map, const QuantOutputs& q, float* w_scale,
                 double alpha, const char* what) {
-  const GemmVariant variant = kGemmVariants[ProgramFor(args.num_sms)][quant];
+  const GemmVariant variant = kGemmVariants[ProgramFor(args.num_sms, quant)][quant];
   // Per-M-tile ready counters (rows quantized so far), zeroed per call: a stream-ordered scratch
   // allocation so the public API needs no caller workspace.
   unsigned int* flags = nullptr;
@@ -11361,15 +11366,16 @@ void minimax_h3_sm120_nvfp4_out_proj(TensorView attn_out, TensorView o_weight_q,
              0.0, "MiniMax-H3 NVFP4");
 }
 
-// Test hooks: run program 0 or 1 on every device (-1 restores the routing by device), and report the program a
-// call on device_id runs.
+// Test hooks: run program 0 or 1 on every device (-1 restores the routing by device and quant), and report the
+// program a call of quant (0 = FP8, 1 = NVFP4) on device_id runs.
 void minimax_h3_sm120_out_proj_force_program(int64_t program) {
   TVM_FFI_CHECK(program >= -1 && program <= 1, ValueError) << "program must be -1 (route by device), 0 or 1";
   g_forced_program.store(static_cast<int>(program), std::memory_order_relaxed);
 }
 
-int64_t minimax_h3_sm120_out_proj_program(int64_t device_id) {
-  return ProgramFor(ConfigureKernels(static_cast<int>(device_id)));
+int64_t minimax_h3_sm120_out_proj_program(int64_t device_id, int64_t quant) {
+  TVM_FFI_CHECK(quant == 0 || quant == 1, ValueError) << "quant must be 0 (FP8) or 1 (NVFP4)";
+  return ProgramFor(ConfigureKernels(static_cast<int>(device_id)), static_cast<int>(quant));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(minimax_h3_sm120_fp8_out_proj, minimax_h3_sm120_fp8_out_proj);

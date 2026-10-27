@@ -361,7 +361,7 @@ def test_round_2_cells_take_their_table_program():
             assert plan.threads == cb.PERSISTENT_THREADS and 1 <= plan.grid_x <= max(
                 M, sm_count
             )
-            flags = cb._PERSISTENT_KEY.match(key).group(4)
+            flags = cb._PERSISTENT_KEY.match(key)["bits"]
             if flags[cb._PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
                 assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
                 # the fence-free twin (_crfnone) appends _authored_fences
@@ -381,9 +381,10 @@ def test_round_2_cells_take_their_table_program():
             assert plan.fallback_from is None and plan.threads == cb.PERSISTENT_THREADS
             seen += 1
     # Round 5: a write cell names the dense key of the program whose snapshot-write variant the cell
-    # runs (block K written); the dense cell itself keeps its own program.
-    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+    # runs (block K written), or one key per PDL mode; the dense cell itself keeps its own program.
+    for arch, sm_count, M, K, value in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
         for pdl in (False, True):
+            key = value[int(pdl)] if isinstance(value, (list, tuple)) else value
             plan = cb._plan_route_exact(arch, sm_count, M, K, pdl, block_write_idx=K)
             assert plan.kind == "persistent" and plan.fallback_from is None, (plan, key)
             assert plan.kernel_key == f"{key}_write", (
@@ -410,7 +411,8 @@ def test_round_2_cells_take_their_table_program():
             seen += 1
     # Rounds 6 and 17 add the (256, 4), (256, 7), (1024, 1), (1024, 4) and (1024, 7) write cells
     # (sm_100a: (256, 7), (1024, 1), (1024, 4) and (1024, 7); sm_103a: (256, 4), (256, 7) and
-    # (1024, 7)).
+    # (1024, 7)); round 19 the sm_103a held-release (``_crheld``) K1 cells (1024, 1) at 148 SMs and
+    # (4096, 1) at 152 SMs, one key per PDL mode (off, on).
     assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
         ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 1024, 1, "persistent:k1_nc2_d3_f110000000000000_fm"),
@@ -419,21 +421,44 @@ def test_round_2_cells_take_their_table_program():
         ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
         ("sm_103a", 148, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
         ("sm_103a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
+        (
+            "sm_103a",
+            148,
+            1024,
+            1,
+            [
+                "persistent:k1_nc4_d3_f010000000000010_crheld",
+                "persistent:k1_nc4_d3_f010000000100000_crheld",
+            ],
+        ),
         ("sm_103a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_103a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
         ("sm_103a", 152, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
         ("sm_103a", 152, 256, 7, "persistent:k7_nc4_d2_f110000000000000_fm"),
         ("sm_103a", 152, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
+        (
+            "sm_103a",
+            152,
+            4096,
+            1,
+            [
+                "persistent:k1_nc4_d2_f010000000000010_fm_crheld",
+                "persistent:k1_nc4_d2_f010000000100000_fm_crheld",
+            ],
+        ),
         ("sm_103a", 152, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
     ]
     for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
+        regs = key.endswith("_cr232")
+        threads = 384 if regs else 320
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, M, K, pdl)
             assert (plan.kind, plan.kernel_key, plan.grid_x) == ("pair", key, sm_count)
-            assert plan.threads == cb.PAIR_THREADS == 320 and plan.fallback_from is None
-            assert (
-                plan.schedule_id
-                == f"pair_ws320_nc2_prefix_bf16_add_fastmath_grid{sm_count}"
+            assert plan.threads == threads and plan.fallback_from is None
+            assert plan.schedule_id == (
+                f"pair_ws{threads}_nc2_prefix_bf16_add_fastmath"
+                + ("_consumer_regs232" if regs else "")
+                + f"_grid{sm_count}"
             )
             seen += 1
     for name, write in (
@@ -498,9 +523,10 @@ def test_round_2_cells_take_their_table_program():
     # 768 / 1024 / 1536 / 2048 run the native K5 port (one CTA per SM, one two-architecture program)
     # at the qualified SM counts and both PDL modes; M = 384 on sm_103a keeps its round-2 persistent
     # key at 152 SMs (round 6 gives 148 SMs an nc3 fast-math program) and M = 512 on sm_100a runs the
-    # round-6 early-release program.
+    # round-6 early-release program.  Round 20 moves the M = 192 cells of both architectures to the
+    # ``_cr232`` pair program (``test_consumer_regs_pair_cells_take_the_384_thread_programs``).
     for sm_count in SM_COUNTS:
-        for M in (192, 256, 768):
+        for M in (256, 768):
             for pdl in (False, True):
                 plan = plan_route("sm_103a", sm_count, M, 5, pdl)
                 assert (
@@ -520,7 +546,7 @@ def test_round_2_cells_take_their_table_program():
             if sm_count == 148
             else "persistent:k5_nc4_d2_f111000000000000"
         )
-    for M in (192, 256, 384, 768, 1024, 1536, 2048):
+    for M in (256, 384, 768, 1024, 1536, 2048):
         for pdl in (False, True):
             plan = plan_route("sm_100a", 148, M, 5, pdl)
             assert (plan.kind, plan.kernel_key, plan.grid_x, plan.fallback_from) == (
@@ -556,17 +582,19 @@ def test_round_2_cells_take_their_table_program():
         (12288, 2): "011000000000000",
         (16384, 2): "011000000000000",
     }
+    # Round 20 gives the K3 M2048 cell the packed register carry of its program (``_rcp``).
+    sm100_packed = {(2048, 3)}
     for (M, K), flags in sm100_fence_free.items():
+        packed = (M, K) in sm100_packed
         for pdl in (False, True):
             plan = plan_route("sm_100a", 148, M, K, pdl)
             assert (plan.kind, plan.kernel_key, plan.fallback_from) == (
                 "persistent",
-                f"persistent:k{K}_nc4_d2_f{flags}_crfnone",
+                f"persistent:k{K}_nc4_d2_f{flags}_crfnone" + ("_rcp" if packed else ""),
                 None,
             ), (M, K, pdl, plan)
-            assert (
-                plan.schedule_id
-                == cb._persistent_schedule_id(4, 2, flags) + "_authored_fences"
+            assert plan.schedule_id == cb._persistent_schedule_id(
+                4, 2, flags, True, packed_register_carry=packed
             )
             assert (plan.grid_x, plan.threads) == (
                 cb._grid(M, 148, 4)[0],
@@ -626,14 +654,109 @@ def test_round_2_cells_take_their_table_program():
         for key in sorted(
             {
                 f"persistent:k{K}_nc4_d2_f{flags}_crfnone"
-                for (_, K), flags in sm100_fence_free.items()
+                + ("_rcp" if (M, K) in sm100_packed else "")
+                for (M, K), flags in sm100_fence_free.items()
             }
         ):
             assert key in KERNELS["sm_100a"] and key not in KERNELS["sm_103a"]
             assert MODULES[KERNELS["sm_100a"][key]]["arches"] == ["sm_100a"]
-            assert MODULES[KERNELS["sm_100a"][key]]["schedule_id"].endswith(
-                "_authored_fences"
+            assert (
+                MODULES[KERNELS["sm_100a"][key]]["schedule_id"]
+                .removesuffix("_packed_register_carry")
+                .endswith("_authored_fences")
             )
+
+
+def test_held_release_cells_take_the_held_programs():
+    """Round 19: a ``_crheld`` key spells flag bit 0 as 0 and names the program of the same key
+    with bit 0 set, built without the early consumed release; its schedule label adds
+    ``_held_release``.  The sm_103a (1024, 5) cell runs the held K5 program at both SM counts and
+    PDL modes, and the held K1 write cells keep the label ahead of ``_fastmath`` / ``_write``."""
+    for sm_count in SM_COUNTS:
+        for pdl in (False, True):
+            plan = plan_route("sm_103a", sm_count, 1024, 5, pdl)
+            assert (
+                plan.kernel_key == "persistent:k5_nc4_d3_f001000000000000_fm_crheld"
+            ), (sm_count, pdl, plan)
+            assert plan.schedule_id.endswith("_held_release_fastmath"), plan
+            assert "_early_consume" not in plan.schedule_id, plan
+    for sm_count, M, suffix in ((148, 1024, ""), (152, 4096, "_fastmath")):
+        for pdl in (False, True):
+            plan = plan_route("sm_103a", sm_count, M, 1, pdl, block_write_idx=1)
+            assert plan.kernel_key.endswith("_crheld_write"), (sm_count, pdl, plan)
+            assert plan.schedule_id.endswith(f"_held_release{suffix}_write"), plan
+
+
+def test_packed_register_carry_cells_take_the_packed_programs():
+    """Round 20: a ``_rcp`` key names the K = 3 register-carry program of the same key that keeps
+    each token's bf16 source words in registers instead of TMEM; its schedule label adds
+    ``_packed_register_carry`` ahead of ``_fastmath``.  The sm_100a (256, 3), (1536, 3) and
+    (2048, 3) cells and the sm_103a (256, 3), (512, 3) and (1536, 3) cells run it at both PDL
+    modes (sm_103a at both SM counts)."""
+    cells = [("sm_100a", 148, M) for M in (256, 1536, 2048)] + [
+        ("sm_103a", sm_count, M) for sm_count in SM_COUNTS for M in (256, 512, 1536)
+    ]
+    for arch, sm_count, M in cells:
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, 3, pdl)
+            assert plan.kind == "persistent" and plan.fallback_from is None, plan
+            assert plan.kernel_key.endswith("_rcp"), (arch, sm_count, M, pdl, plan)
+            assert "_packed_register_carry" in plan.schedule_id, plan
+            assert plan.schedule_id.endswith(
+                "_packed_register_carry_fastmath"
+                if "_fm_" in plan.kernel_key
+                else "_packed_register_carry"
+            ), plan
+            assert MODULES[KERNELS[arch][plan.kernel_key]]["schedule_id"] == (
+                plan.schedule_id
+            ), plan
+
+
+def test_a_packed_register_carry_key_never_falls_back_across_the_carry():
+    """A fallback keeps the ``_rcp`` line: an unregistered ``_rcp`` key resolves to a registered
+    ``_rcp`` program or stays exact, and an unregistered key without the suffix never resolves to
+    a ``_rcp`` program."""
+    for arch, table in KERNELS.items():
+        for K in range(MAX_BLOCKS + 1):
+            for packed in (False, True):
+                key = f"persistent:k{K}_nc4_d2_f000000000000001" + (
+                    "_rcp" if packed else ""
+                )
+                assert key not in table
+                plan = cb.RoutePlan(
+                    "persistent", key, 148, cb.PERSISTENT_THREADS, "", "", arch, False
+                )
+                resolved = cb._resolve_registered(plan, 148, 4096)
+                if resolved.kernel_key != key:
+                    assert resolved.kernel_key.endswith("_rcp") == packed, resolved
+                    assert ("_packed_register_carry" in resolved.schedule_id) == packed
+
+
+def test_consumer_regs_pair_cells_take_the_384_thread_programs():
+    """Round 20: a ``_cr232`` pair key is the pair kernel built at ``consumer_regs`` 232 (three
+    whole warpgroups, 384 threads); its schedule label adds ``_consumer_regs232`` ahead of the grid.
+    The sm_100a (192, 4), (192, 5) and (192, 8) cells, the sm_103a (192, 4) and (192, 5) cells at
+    both SM counts and the sm_103a (192, 6) cell at 152 SMs run it at both PDL modes; no cell runs
+    the 320-thread pair program."""
+    cells = (
+        [("sm_100a", 148, K) for K in (4, 5, 8)]
+        + [("sm_103a", sm_count, K) for sm_count in SM_COUNTS for K in (4, 5)]
+        + [("sm_103a", 152, 6)]
+    )
+    for arch, sm_count, K in cells:
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, 192, K, pdl)
+            assert (plan.kind, plan.kernel_key) == (
+                "pair",
+                f"pair:k{K}_nc2_pbf16a_fm_cr232",
+            ), (arch, sm_count, K, pdl, plan)
+            assert plan.threads == cb.PAIR_CONSUMER_REGS_THREADS == 384, plan
+            assert plan.schedule_id == (
+                f"pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs232_grid{sm_count}"
+            ), plan
+            record = MODULES[KERNELS[arch][plan.kernel_key]]
+            assert record["launch"]["block"][0] == 384, record["launch"]
+    assert all(key.endswith("_cr232") for *_, key in _r2_cells("R2_PAIR_CELLS"))
 
 
 @pytest.mark.parametrize("pdl", (False, True))
@@ -719,10 +842,12 @@ def test_write_cell_programs_serve_their_cells_only():
     cell to a depth-2 program that would otherwise be the closest registered variant of every
     unregistered depth-2 K = 4 write key), so pinning a write cell changes no other route."""
     cells = {}
-    for arch, sm_count, M, K, key in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
-        cells[(arch, sm_count, M, K)] = f"{key}_write"
+    for arch, sm_count, M, K, value in _r2_cells("WRITE_PERSISTENT_KEY_CELLS"):
+        for pdl in (False, True):
+            key = value[int(pdl)] if isinstance(value, (list, tuple)) else value
+            cells[(arch, sm_count, M, K, pdl)] = f"{key}_write"
     pinned = {
-        arch: {k for (a, _s, _m, _k), k in cells.items() if a == arch}
+        arch: {k for (a, _s, _m, _k, _p), k in cells.items() if a == arch}
         for arch in ARCHES
     }
     assert all(pinned[arch] for arch in ARCHES)
@@ -734,8 +859,8 @@ def test_write_cell_programs_serve_their_cells_only():
                 for pdl in (False, True):
                     for M in _table_edge_token_counts():
                         plan = plan_route(arch, sm_count, M, K, pdl, block_write_idx=K)
-                        if (arch, sm_count, M, K) in cells:
-                            assert plan.kernel_key == cells[arch, sm_count, M, K]
+                        if (arch, sm_count, M, K, pdl) in cells:
+                            assert plan.kernel_key == cells[arch, sm_count, M, K, pdl]
                             assert plan.fallback_from is None
                             continue
                         assert plan.kernel_key not in pinned[arch], (
@@ -893,8 +1018,12 @@ def test_small_m_table_boundary():
                     cb.DIRECT_THREADS // cluster,
                 )
             at = plan_route(arch, SM_COUNT, max_m, K, False)
-            # the direct kernel is SM-count agnostic and PDL only changes the launch argument
-            assert plan_route(arch, 132, max_m, K, True).kernel_key == at.kernel_key
+            # the direct kernel is SM-count agnostic and PDL only changes the launch argument; a
+            # round-r5 cell at max_m runs the persistent program its SM count's table names
+            sm_count = 132 if at.kind == "small_m" else SM_COUNT
+            assert (
+                plan_route(arch, sm_count, max_m, K, True).kernel_key == at.kernel_key
+            )
             assert plan_route(arch, SM_COUNT, max_m + 1, K, False).kind != "small_m"
 
 
@@ -987,7 +1116,10 @@ def test_registry_records_reference_the_build_manifest():
         )
         assert record["ffi_entry"] == "run" and record["launch"]["use_pdl"] == "runtime"
         fast_math = bool(
-            re.search(r"_fm(_crfnone)?(_write)?(_cta2)?$", record["kernel_key"])
+            re.search(
+                r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?$",
+                record["kernel_key"],
+            )
         )
         fast_math = fast_math or record["kind"] in ("native", "pair")
         for arch in record["arches"]:
@@ -1088,7 +1220,7 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 / round-6 cells, the release bands, the nc / depth edges, the native and
+# the round-2 / round-3 / round-6 / round-20 cells, the release bands, the nc / depth edges, the native and
 # pair cells) and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
@@ -1104,8 +1236,8 @@ _ROUTE_BAND_START_ROWS = {
     ),
     3: (
         1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257,
-        384, 385, 512, 513, 768, 769, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
-        8192, 8193, 12288, 12289, 16384,
+        384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097,
+        6144, 6145, 8192, 8193, 12288, 12289, 16384,
     ),
     4: (
         1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
@@ -1374,6 +1506,7 @@ def test_semantic_variants_take_the_bootstrap(
         (300, 4),
         (1024, 1),
         (1024, 4),
+        (4096, 1),
         (1, 4),
         (4, 7),
         (16, 4),

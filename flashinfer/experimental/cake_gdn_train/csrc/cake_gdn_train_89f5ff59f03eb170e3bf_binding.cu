@@ -36,12 +36,15 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
 
 void Run(TensorView a_m, TensorView a_c, TensorView a_x0, TensorView a_y, TensorView a_chain_start, TensorView a_elem_m, TensorView a_elem_c, TensorView a_elem_y, TensorView a_x0_index, TensorView a_y_final, int64_t a_ncols, int64_t a_transpose_m, int64_t a_write_states, int64_t a_cols_per_cta, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_m.device();
@@ -97,17 +100,17 @@ void Run(TensorView a_m, TensorView a_c, TensorView a_x0, TensorView a_y, Tensor
   check_same_device(a_x0_index, a_m, "x0_index", "m");
   check_contiguous(a_y_final, "y_final");
   check_same_device(a_y_final, a_m, "y_final", "m");
-  TVM_FFI_CHECK((a_cols_per_cta == 16), ValueError)
+  TVM_FFI_CHECK((a_cols_per_cta == 16LL), ValueError)
       << KERNEL_NAME << ": requires (cols_per_cta == 16)";
-  TVM_FFI_CHECK((CMod(a_ncols, 128) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(a_ncols, 128LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(ncols, 128) == 0)";
-  TVM_FFI_CHECK((a_ncols >= 128), ValueError)
+  TVM_FFI_CHECK((a_ncols >= 128LL), ValueError)
       << KERNEL_NAME << ": requires (ncols >= 128)";
-  TVM_FFI_CHECK((a_ncols <= 256), ValueError)
+  TVM_FFI_CHECK((a_ncols <= 256LL), ValueError)
       << KERNEL_NAME << ": requires (ncols <= 256)";
-  TVM_FFI_CHECK((a_transpose_m >= 0), ValueError)
+  TVM_FFI_CHECK((a_transpose_m >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (transpose_m >= 0)";
-  TVM_FFI_CHECK((a_transpose_m <= 1), ValueError)
+  TVM_FFI_CHECK((a_transpose_m <= 1LL), ValueError)
       << KERNEL_NAME << ": requires (transpose_m <= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

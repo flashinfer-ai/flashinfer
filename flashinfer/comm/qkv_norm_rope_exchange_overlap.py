@@ -306,6 +306,8 @@ class QkvNormRopeExchangeOverlap:
         architecture default: ``True`` on SM90, SM100, SM103 and SM107 (the folded producers are delivered
         on every architecture).  Both paths store identical bits.  Must be uniform across the ranks of the group; not accepted with ``backend="nccl"``.
 
+    Notes
+    -----
     The Cake backend selects its producer build per architecture and world size
     (``flashinfer.jit.cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``: SM100 groups of
     8 ranks run the ``bulk_ow256`` build -- wide operand loads and bulk row stores --, SM100 groups of 4 ranks and

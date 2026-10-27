@@ -64,6 +64,36 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+
+
+
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
@@ -82,6 +112,9 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
+    const int mbar_base = smem + 168;
+    #define rms_exchange_addr (mbar_base + 0)
+
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
     const unsigned int clusters_x = gridDim.x / 4;
@@ -98,6 +131,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     const int rms_scalar_addr = smem + 132;
     float* rms_partials = reinterpret_cast<float*>(smem_raw + 136);
     const int rms_partials_addr = smem + 136;
+
+    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
+    // Mbarriers at smem_raw[168..184)
+
+    if (warp == 0) {
+        uint32_t leader = elect_sync();
+        if (leader) {
+            // rms_exchange: 2 barriers, init_count=1
+            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 176, 1);
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
+    }
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -2960,7 +3006,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     int lane_access = cluster_thread;
     int access = cluster_id * 896 + (unsigned int)lane_access;
-    int rms_phase = 0;
+    unsigned int rms_trip = 0;
+    unsigned int rms_exchange_rms_trip = 0;
     int rs_src = cluster_thread % 4;
     int rs_item = cluster_thread / 4;
     int rs_slot_items = tokens * 224;
@@ -3358,6 +3405,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             reinterpret_cast<int4*>(_gst_88)[0] = reinterpret_cast<int4*>(ag_words)[0];
         }
     }
+    unsigned int _phase_rms_exchange = 0;
     #pragma unroll 1
     for (int token_1 = cluster_id; token_1 < tokens; token_1 += (int)num_clusters) {
         long long data_base = (long long)data_epoch * comm_stride_elems;
@@ -3909,35 +3957,48 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_94 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_94, offset);
         square_sum = _warp_reduce_94;
+        int rms_parity = (int)(rms_trip & 1);
         if (lane == 0) {
-            reduce_smem[warp] = square_sum;
+            reduce_smem[rms_parity * 7 + warp] = square_sum;
         }
         __syncthreads();
-        float block_sum = ((tid < 7) ? reduce_smem[lane] : 0.0f);
+        float block_sum = 0.0f;
+        if (tid < 7) {
+            block_sum = reduce_smem[rms_parity * 7 + tid];
+        }
         float _warp_reduce_95 = block_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_95 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_95, offset);
         block_sum = _warp_reduce_95;
-        int slot_base = rms_phase * 4;
+        int slot_base = rms_parity * 4;
         if (tid < 4) {
             uint32_t _cluster_mapa_96;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_96) : "r"(rms_partials_addr), "r"(tid));
+            uint32_t _mbar_peer_97;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_97) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid));
             asm volatile(
-                "st.shared::cluster.f32 [%0], %1;"
-                :: "r"(_cluster_mapa_96 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum) : "memory");
+                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_cluster_mapa_96 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum), "r"(_mbar_peer_97) : "memory");
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        if (tid == 0) {
+            mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 16);
+        }
+        asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(uint32_t(_phase_rms_exchange)), "r"(uint32_t(10000000)) : "memory");
+        asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
         float cluster_sum = 0.0f;
         cluster_sum = cluster_sum + rms_partials[slot_base];
         cluster_sum = cluster_sum + rms_partials[slot_base + 1];
         cluster_sum = cluster_sum + rms_partials[slot_base + 2];
         cluster_sum = cluster_sum + rms_partials[slot_base + 3];
         float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
-        rms_phase = 1 - rms_phase;
+        rms_trip += 1;
+        rms_exchange_rms_trip += 1;
+        if (rms_exchange_rms_trip == 2) { rms_exchange_rms_trip = 0; _phase_rms_exchange ^= 1; }
         float norm_value[8];
         #pragma unroll
         for (int j_107 = 0; j_107 < 8; j_107++) {
@@ -3952,6 +4013,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(norm_out + elem_0_1), "r"(norm_value_bf16[(0) + 0]), "r"(norm_value_bf16[(0) + 1]), "r"(norm_value_bf16[(0) + 2]), "r"(norm_value_bf16[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         access += access_stride;
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     unsigned int clear_words[4];
     #pragma unroll
     for (int word_14 = 0; word_14 < 4; word_14++) {
@@ -3965,8 +4027,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _sysv_wait_p_97 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_sysv_wait_p_97 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_98 = reinterpret_cast<volatile int*>(completion) + (0);
+                while (*_sysv_wait_p_98 != static_cast<int>(num_bids)) {}
             }
             flag_addr[0] = (flag + 1) % 3;
             clear_addr[0] = tokens * 7168 * 2;
@@ -3974,6 +4036,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
 } // extern "C"

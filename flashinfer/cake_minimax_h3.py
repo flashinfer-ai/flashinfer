@@ -232,7 +232,10 @@ class MiniMaxH3Nvfp4PreAttention:
     ``"e4m3"`` writes ``float8_e4m3fn [P, M, 56 / P, 3, 128]`` with one
     per-tensor scale per kind from ``qkv_scales`` (float32 ``[3]``:
     ``out_q = e4m3(value / qkv_scales[kind])``, round to nearest even,
-    saturating at +-448) and no scale tile (``out_sf`` is ``None``).
+    saturating at +-448) and no scale tile (``out_sf`` is ``None``). The
+    ``"nvfp4"`` ``out_sf`` must start at an 8-byte aligned address: the norm
+    stage zeroes its padding rows in 8-byte words, and preparation raises
+    ``ValueError`` otherwise.
 
     The tensors passed to :meth:`run` must be the same objects supplied here.
     Their contents may be updated between launches, including on independent
@@ -390,8 +393,9 @@ class MiniMaxH3Nvfp4PreAttention:
             shape ``[1]``; required for ``"nvfp4"``, ``None`` for ``"e4m3"``.
         out_sf : torch.Tensor, optional
             Caller-owned swizzled-128x4 E4M3 uint8 output scales with shape
-            ``[P, round_up(M * (56 / P) * 3, 128) * 8]``; required for
-            ``"nvfp4"``, ``None`` for ``"e4m3"``.
+            ``[P, round_up(M * (56 / P) * 3, 128) * 8]`` starting at an
+            8-byte aligned address; required for ``"nvfp4"``, ``None`` for
+            ``"e4m3"``.
         qkv_scales : torch.Tensor, optional
             Float32 per-tensor scales of Q, K and V with shape ``[3]`` (every
             entry positive and finite): ``out_q = e4m3(value / qkv_scales

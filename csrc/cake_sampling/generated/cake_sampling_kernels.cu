@@ -32,3 +32,4 @@
 #include "cake_sampling_kernels_part9.cuh"
 #include "cake_sampling_kernels_part10.cuh"
 #include "cake_sampling_kernels_part11.cuh"
+#include "cake_sampling_kernels_part12.cuh"
