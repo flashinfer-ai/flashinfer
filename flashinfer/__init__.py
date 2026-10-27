@@ -37,9 +37,11 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchDecodeWithAttentionSinkWrapper as BatchDecodeWithAttentionSinkWrapper,
     BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import ReplayCoverage as ReplayCoverage
 from .autotune_cache import autotune_v2 as autotune_v2
 from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
@@ -280,6 +282,9 @@ from .cake_causal_conv1d_train import (
 )
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction

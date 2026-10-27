@@ -24,7 +24,8 @@ The path is FlashInfer's per-token NVFP4 quantize + GEMM chain::
 run as two generated Cake programs on the current stream:
 
 * ``quant:...`` -- the per-token quantizer (one CTA per token row, the row
-  held in registers).  Every token row is scaled independently
+  held in registers; short launches of long bf16 rows split each row over a
+  cluster of four CTAs).  Every token row is scaled independently
   (``per_token_scale = amax(row) * global_scale_inv``),
   its 16-element blocks get UE4M3 scale bytes in the swizzled 128x4 layout
   (128-row x 4-column tiles, zero padding rows / columns) and the values are
@@ -67,6 +68,7 @@ import tvm_ffi
 from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
     ARG_PLANS,
+    KERNELS,
     MODULES,
     kernel_definitions,
     kernel_module_name,
@@ -101,6 +103,11 @@ STATIC_K: tuple[int, ...] = (2688, 4096, 7168)
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
+# SM count each architecture's GEMM dispatch was measured on (sm_100a: B200, sm_103a: GB300).
+# A part with another SM count (GB200: sm_100a with 152 SMs, B300: sm_103a with 148) runs the
+# tactic of the measured count where its own tactic selects a kernel the architecture does not
+# register (:func:`gemm_plan`).
+MEASURED_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
 # Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
 # kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
 # clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
@@ -109,6 +116,21 @@ CLUSTER_CAPACITY_BY_SM_COUNT = {
     152: {2: 76, 3: 46, 4: 36, 5: 28, 6: 23, 8: 15},
 }
 SPLITK3_CLUSTER = 3
+# The 16-token tile with three K slices on the 7168-deep narrow rows whose 8-token
+# three-slice grid exceeds the co-resident clusters: (SM count, K, N, FP16 output) ->
+# the token counts that take it.  These are the rows where it measured faster than two
+# slices of the 8-token tile in two sessions.  A measured M = 17 row stands for
+# M = 17..24 and M = 32 for M = 25..32 (the same cluster grids) where both output dtypes
+# agree; otherwise only the measured token count takes it.
+N16_SPLITK3_M: dict[tuple[int, int, int, bool], frozenset[int]] = {
+    (148, 7168, 2112, False): frozenset(range(25, 33)),
+    (148, 7168, 2112, True): frozenset((17, *range(25, 33))),
+    (148, 7168, 1536, False): frozenset((32,)),
+    (152, 7168, 2112, False): frozenset(range(17, 33)),
+    (152, 7168, 2112, True): frozenset(range(17, 33)),
+    (152, 7168, 1536, False): frozenset(range(25, 33)),
+    (152, 7168, 1536, True): frozenset(range(25, 33)),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +238,50 @@ def cta_config(k: int, m: int) -> tuple[int, int]:
 LARGE_ROW_MIN_M = 512
 STORE_HINT_DEFAULT = "NONE"
 STORE_HINT_LARGE_ROW = "L2_EVICT_LAST"
+# Cluster row split: a launch of few long bf16 rows spreads every row over a cluster of
+# QUANT_CLUSTER_SPLIT CTAs (rank r converts the r-th quarter of the row's blocks; the ranks
+# exchange their maxima through distributed shared memory).  Each CTA takes the CTA shape
+# :func:`cta_config` picks for a quarter row.  Largest token count that takes the split per
+# row width (paired sweeps on B200 and GB300: the split beats one CTA per row by 3-26 % at
+# these widths and token counts); every other width, token count and fp16 activations keep
+# one CTA per row.
+QUANT_CLUSTER_SPLIT = 4
+CLUSTER_SPLIT_MAX_M: dict[int, int] = {
+    7168: 1,
+    8192: 32,
+    16384: 32,
+    18432: 32,
+    28672: 32,
+}
+# sm_103a, K = 8192 with the out_scale folded: the split up to 17 tokens (at 32 tokens it
+# ties one CTA per row on GB300).
+CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192 = 17
+# K = 8192, both folds: the token counts that keep one CTA per row on each architecture (in
+# some timing states the split reads 2-4 % slower than one CTA per row there); 1 token keeps
+# the split on both, and on sm_103a so do 17 tokens and up to the limits above.
+CLUSTER_SPLIT_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
+    "sm_100a": (2, 32),
+    "sm_103a": (2, 16),
+}
+# The quantizer alone (the public per-token quantize entries; the quantize + GEMM chain keeps
+# :func:`quant_cluster_split`): per architecture and row width, the token-count ranges
+# ``(low, high, C)`` whose bf16 rows run as clusters of ``C`` CTAs instead.  Paired timings on
+# B200 and GB300 at the SM counts of :data:`MEASURED_SM_COUNT`; other SM counts keep the chain's
+# split.
+QUANT_ALONE_CLUSTER_SPLIT: dict[str, dict[int, tuple[tuple[int, int, int], ...]]] = {
+    "sm_100a": {
+        16384: ((1, 1, 8), (130, 130, 2)),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+    "sm_103a": {
+        16384: ((1, 1, 8),),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+}
+# 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
+CLUSTER_SPLIT_PAD_CHUNKS = 1024
 
 
 def blocks_per_thread_for(k: int, threads: int) -> int:
@@ -251,16 +317,19 @@ def quant_kernel_key(
     fold: bool,
     store_hint: str = STORE_HINT_DEFAULT,
     k_static: Optional[int] = None,
+    cluster_split: int = 1,
 ) -> str:
     """Logical kernel key of one quantizer instance: CTA width, register capacity (blocks per
     thread), launch-bounds occupancy, input dtype, folded scale, the large-row store policy
-    (``_sl``) and, for the small-row tier, the compiled-in row width (``_k<K>``).  ``K`` and
-    the row stride are otherwise kernel arguments, not part of the key."""
+    (``_sl``), the cluster row split (``_cs<C>``) and, for the small-row tier, the compiled-in
+    row width (``_k<K>``).  ``K`` and the row stride are otherwise kernel arguments, not part
+    of the key."""
     dtype = "bf16" if is_bf16 else "f16"
     return (
         f"quant:t{threads}_b{blocks_per_thread}_mb{min_blocks}_{dtype}"
         + ("_fold" if fold else "")
         + ("_sl" if store_hint == STORE_HINT_LARGE_ROW else "")
+        + (f"_cs{cluster_split}" if cluster_split > 1 else "")
         + (f"_k{k_static}" if k_static is not None else "")
     )
 
@@ -284,10 +353,11 @@ class QuantizePlan:
     k_static: Optional[
         int
     ]  # compiled-in row width of the small-row tier (None: runtime geometry)
-    grid: int  # one CTA per padded row
+    grid: int  # CTAs: one per padded row, or (M + padding clusters) x cluster_split
     padded_rows: int
     padded_cols: int
     kernel_key: str
+    cluster_split: int = 1  # CTAs per token row (one cluster of that many CTAs)
 
 
 def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional[int]:
@@ -302,6 +372,35 @@ def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional
     return None
 
 
+def quant_cluster_split(m: int, k: int, is_bf16: bool, fold: bool, arch: str) -> int:
+    """CTAs per token row: :data:`QUANT_CLUSTER_SPLIT` for bf16 rows of a width in
+    :data:`CLUSTER_SPLIT_MAX_M` up to its token count, else 1 (at K = 8192, also 1 for the
+    token counts :data:`CLUSTER_SPLIT_ONE_CTA_M_K8192` gives the architecture)."""
+    if not is_bf16:
+        return 1
+    if int(k) == 8192 and arch in CLUSTER_SPLIT_ONE_CTA_M_K8192:
+        low, high = CLUSTER_SPLIT_ONE_CTA_M_K8192[arch]
+        if low <= int(m) <= high:
+            return 1
+    limit = CLUSTER_SPLIT_MAX_M.get(int(k), 0)
+    if arch == "sm_103a" and int(k) == 8192 and fold:
+        limit = CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192
+    return QUANT_CLUSTER_SPLIT if int(m) <= limit else 1
+
+
+def quant_alone_cluster_split(
+    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+) -> int:
+    """CTAs per token row of the quantizer alone: the range of
+    :data:`QUANT_ALONE_CLUSTER_SPLIT` holding ``M`` at ``K`` on ``arch`` at its measured SM
+    count, else :func:`quant_cluster_split`."""
+    if is_bf16 and MEASURED_SM_COUNT.get(arch) == int(sm_count):
+        for low, high, split in QUANT_ALONE_CLUSTER_SPLIT.get(arch, {}).get(int(k), ()):
+            if low <= int(m) <= high:
+                return split
+    return quant_cluster_split(m, k, is_bf16, fold, arch)
+
+
 def quant_plan(
     m: int,
     k: int,
@@ -310,13 +409,21 @@ def quant_plan(
     arch: str,
     sm_count: int,
     x_row_stride: Optional[int] = None,
+    *,
+    alone: bool = False,
 ) -> QuantizePlan:
     """Resolve the quantizer instance and grid exactly like the Cake production launcher
     (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, the
     static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
     at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
     the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
-    contiguous) only decides between the static-K and the runtime-geometry instance."""
+    contiguous) only decides between the static-K and the runtime-geometry instance;
+    ``alone`` selects the cluster split of the quantizer alone
+    (:func:`quant_alone_cluster_split`) instead of the chain's.
+    A row the cluster split serves (:func:`quant_cluster_split`) runs as a cluster of
+    ``C`` CTAs, each with the CTA shape of a ``C``-th of the row; the grid is one cluster
+    per row, then (``M`` not a multiple of 128) the padding clusters, each CTA zeroing
+    :data:`CLUSTER_SPLIT_PAD_CHUNKS` 16-byte chunks of the last scale tile."""
     m, k = int(m), int(k)
     if m < 1:
         raise ValueError("M must be positive")
@@ -332,6 +439,20 @@ def quant_plan(
     store_hint = default_store_hint(k, threads, min_blocks)
     k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
+    grid = pm
+    split = (
+        quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
+        if alone
+        else quant_cluster_split(m, k, is_bf16, fold, arch)
+    )
+    if split > 1:
+        share = (k // SF_VEC + split - 1) // split * SF_VEC
+        threads, min_blocks = cta_config(share, m)
+        blocks_per_thread = blocks_per_thread_for(share, threads)
+        pad_clusters = (
+            -(-8 * cols // (CLUSTER_SPLIT_PAD_CHUNKS * split)) if m % ROW_TILE else 0
+        )
+        grid = (m + pad_clusters) * split
     return QuantizePlan(
         arch=arch,
         sm_count=int(sm_count),
@@ -344,12 +465,20 @@ def quant_plan(
         min_blocks=min_blocks,
         store_hint=store_hint,
         k_static=k_static,
-        grid=pm,
+        grid=grid,
         padded_rows=pm,
         padded_cols=cols,
         kernel_key=quant_kernel_key(
-            threads, blocks_per_thread, min_blocks, is_bf16, fold, store_hint, k_static
+            threads,
+            blocks_per_thread,
+            min_blocks,
+            is_bf16,
+            fold,
+            store_hint,
+            k_static,
+            split,
         ),
+        cluster_split=split,
     )
 
 
@@ -395,6 +524,22 @@ CLC_MIN_TILES_PER_PAIR = 10
 TWO_CTA_SINGLE_TILE_MAX_W_TILES = 40
 # SM count from which two persistent CTAs per SM win on the 32-token multi-wave swapped rows.
 TWO_CTA_PER_SM_MIN_SMS = 152
+# The architecture whose loader registers the 64-row weight-tile programs (``_w64`` keys):
+# other parts keep 128-row weight tiles on those rows, also with 152 SMs.
+N8_WIDE_W_ROWS_ARCH = "sm_103a"
+# Weight rows per tile of the 8-token swapped-orientation tile on the 152-SM part when
+# more 128-row weight tiles than SMs exist: 64-row tiles at one CTA per SM (twice the
+# tiles, about three waves) instead of 128-row tiles at two CTAs per SM.
+N8_WIDE_W_ROWS = 64
+# Width of the 1-CTA m-orientation tile whose output staging overlays the start of the
+# mainloop ring (``ring_overlay``): one more mainloop stage (7 -> 8); the overlaid
+# stages go back to the next tile's loads once the stores have read them.
+RING_OVERLAY_TILE_N = 64
+# The architecture whose loader registers the overlay programs of the 128-wide 1-CTA m tile
+# (``_ro`` m128 keys): one token tile over more 128-wide weight tiles than SMs takes them
+# (8192x28672 M = 128 on B200: 224 tiles on 148 CTAs; a CTA's later tiles reuse the overlaid
+# stages once the previous tile's stores have read them).
+M128_RING_OVERLAY_ARCH = "sm_100a"
 # 16-token-tile raster groups when the group's fp4 operands (16 token tiles of A plus every
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
@@ -404,30 +549,121 @@ RASTER16_L2_BYTES = 126 << 20
 # rows when ceil(units / pairs) x cost improves by at least TWO_CTA_TILE_MIN_GAIN.
 _TWO_CTA_TILE_WAVE_COST = {128: 0.575, 192: 0.787, 256: 1.0}
 TWO_CTA_TILE_MIN_GAIN = 0.015
+# sm_103a programs with the K = 96 mainloop: on sm_103a the loader routes these keys (the
+# 256-token 2-CTA pair tiles of width 192 / 256 with evict-last operands, static or CLC
+# schedule, no stream-K tail) to programs whose mainloop takes K = 96 MMA steps.  Their
+# measured wave cost of the 192-wide tile relative to the 256-wide one is 0.82 (GB300); on
+# the 152-SM part the width re-pick uses it when the re-picked plan is such a program, and
+# keeps the K = 64 plan otherwise.
+K96_ARCH = "sm_103a"
+K96_WIDTH_SM_COUNT = 152
+K96_KERNEL_KEYS = frozenset(
+    f"gemm:m{tile_n}_2cta_{out}_aL_bL_l2256b{suffix}"
+    for out in ("bf16", "f16")
+    for tile_n, suffix in (
+        (192, ""),
+        (256, ""),
+        (256, "_g8"),
+        (256, "_clc"),
+        (256, "_g8_clc"),
+        (256, "_g16_clc"),
+    )
+)
+_TWO_CTA_TILE_WAVE_COST_K96 = {128: 0.575, 192: 0.82, 256: 1.0}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
+# Entry L2 prefetch of the weight tiles in the quantize + GEMM chain (``ep_stages`` programs,
+# ``_ep4`` keys): the GEMM's idle prefetch warp streams the weight operand and its block scales
+# of the CTA's first tile, for its first CHAIN_EP_STAGES K tiles, into L2 before the grid
+# dependency wait, so they load while the quantizer still runs.  Per architecture, the program
+# families (kernel key without the output dtype) and the token-count range where the chain
+# (:func:`prepare_nvfp4_per_token_chain`) takes them; the GEMM alone takes them only on the
+# cells of GEMM_ALONE_EP_RULES.
+CHAIN_EP_STAGES = 4
+CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {
+        "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
+        "m64_bF_l2256b_ro": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_o2": (1, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 32),
+        "n8_sk2_l2256b": (1, 32),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+    "sm_103a": {
+        "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
+        "m64_bF_l2256b_ro": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_aF_l2256b_o2": (17, 17),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_w64": (1, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 8),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+}
+# Chain cells of the entry L2 prefetch on the SM count of :data:`MEASURED_SM_COUNT` only: per
+# architecture, the program family, the token-count range and the ``(K, N)`` shapes (paired
+# timings on B200); the GEMM alone keeps its program there.
+CHAIN_EP_MEASURED_CELLS: dict[
+    str, dict[str, tuple[int, int, tuple[tuple[int, int], ...]]]
+] = {
+    "sm_100a": {"m128_bF_ro": (128, 128, ((8192, 28672),))},
+}
+# The GEMM alone (``mm_fp4``, and :func:`prepare_mm_fp4_per_token` without a tactic) takes
+# the entry L2 prefetch program on these cells too: per architecture, the program families
+# and the token-count range, each inside a CHAIN_EP_RULES cell, so the chain and the GEMM
+# alone run one program there.
+GEMM_ALONE_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {"m64_bF_l2256b_ro": (128, 128)},
+}
 
 
-def _two_cta_wave_time(m: int, n: int, sm_count: int, tile_n: int) -> float:
+def _two_cta_wave_time(
+    m: int,
+    n: int,
+    sm_count: int,
+    tile_n: int,
+    cost: Optional[dict[int, float]] = None,
+) -> float:
     """Waves of the persistent 2-CTA grid x the measured relative cost of one wave."""
+    cost = _TWO_CTA_TILE_WAVE_COST if cost is None else cost
     pairs = max(1, sm_count // 2)
     units = ((m + 255) // 256) * ((n + tile_n - 1) // tile_n)
-    return -(-units // pairs) * _TWO_CTA_TILE_WAVE_COST[tile_n]
+    return -(-units // pairs) * cost[tile_n]
 
 
-def _two_cta_tile_n(m: int, n: int, sm_count: int, tile_n: int) -> int:
+def _two_cta_tile_n(
+    m: int,
+    n: int,
+    sm_count: int,
+    tile_n: int,
+    cost: Optional[dict[int, float]] = None,
+) -> int:
     """Re-pick the 2-CTA tile width from the measured wave model on multi-wave rows
-    (port of ``_two_cta_tile_n``)."""
+    (port of ``_two_cta_tile_n``); ``cost`` replaces the wave-cost table."""
     if tile_n not in _TWO_CTA_TILE_WAVE_COST:
         return tile_n
     pairs = max(1, sm_count // 2)
     if ((m + 255) // 256) * ((n + tile_n - 1) // tile_n) <= pairs:
         return tile_n
-    base = _two_cta_wave_time(m, n, sm_count, tile_n)
+    base = _two_cta_wave_time(m, n, sm_count, tile_n, cost)
     best_n, best_t = tile_n, base
     for cand in (256, 192, 128):
-        t = _two_cta_wave_time(m, n, sm_count, cand)
+        t = _two_cta_wave_time(m, n, sm_count, cand, cost)
         if t < best_t:
             best_n, best_t = cand, t
     return best_n if best_t <= base * (1.0 - TWO_CTA_TILE_MIN_GAIN) else tile_n
@@ -458,11 +694,23 @@ def _score_m_tactic(
     return score
 
 
-def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
+def default_tactic(
+    m: int,
+    n: int,
+    k: int,
+    sm_count: int,
+    *,
+    out_f16: bool = False,
+    two_cta_wave_cost: Optional[dict[int, float]] = None,
+    n8_wide_w_rows: bool = True,
+    m128_ring_overlay: bool = False,
+) -> dict[str, Any]:
     """Untuned GEMM tactic (port of ``default_tactic`` of the Cake GEMM launcher).
 
     ``M <= 32`` (``N % 8 == 0``) takes the swapped orientation with 8 / 16 / 32
-    tokens per tile and cluster split-K while the tile grid leaves most SMs idle;
+    tokens per tile and cluster split-K while the tile grid leaves most SMs idle (three
+    K slices of the 8-token tile when the cluster grid is co-resident, else of the
+    16-token tile on the :data:`N16_SPLITK3_M` rows of the output dtype ``out_f16``);
     otherwise the tile the scorer picks for the ``M`` bucket (next power of two):
     1-CTA 128 x {64, 128, 192, 256} or 2-CTA 256 x {64, 128, 192, 256}, the 2-CTA width
     re-picked on multi-wave rows by the measured wave model (``_two_cta_tile_n``).  2-CTA
@@ -471,14 +719,23 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     dimension has at most 32 tiles and the grid needs more than one wave, and the
     cluster-launch-control scheduler when the persistent pairs average at least
     :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Unsplit deep-K swapped-orientation rows whose
-    weight tiles fill at most half the SMs take cluster split-K 2.  Single-token-tile
-    rows (``M <= 128``) override the scorer three times: a 2-CTA 256x64 pair over at
-    most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight tiles (the pair loads
-    the 128 real token rows once), the 128-wide two-wave tile on the 148-SM part when
-    more 128-wide weight tiles than SMs exist, and no 256 B L2 promotion on the
-    152-SM part when one wave of 128-wide tiles covers the row.  The swapped
-    orientation never splits the wide-``N`` rows (the persistent kernel is faster
-    unsplit there), unlike the CuTe-DSL rule it otherwise mirrors.
+    weight tiles fill at most half the SMs take cluster split-K 2; the 8-token tile
+    on the 152-SM part with more weight tiles than SMs takes :data:`N8_WIDE_W_ROWS`-row
+    weight tiles at one CTA per SM; the :data:`RING_OVERLAY_TILE_N`-wide 1-CTA m tile
+    stages its output over the start of the mainloop ring (``ring_overlay``).
+    Single-token-tile rows (``M <= 128``) override the scorer three times: a 2-CTA
+    256x64 pair over at most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight
+    tiles (the pair loads the 128 real token rows once), the 128-wide two-wave tile on
+    the 148-SM part when more 128-wide weight tiles than SMs exist, and no 256 B L2
+    promotion on the 152-SM part when one wave of 128-wide tiles covers the row.  The
+    swapped orientation never splits the wide-``N`` rows (the persistent kernel is
+    faster unsplit there), unlike the CuTe-DSL rule it otherwise mirrors.
+    ``two_cta_wave_cost`` replaces the wave-cost table of the 2-CTA width re-pick
+    (:func:`gemm_plan` passes the K = 96 table on sm_103a).  ``n8_wide_w_rows`` allows
+    the 64-row weight tiles (:func:`gemm_plan` passes it on :data:`N8_WIDE_W_ROWS_ARCH`
+    only).  ``m128_ring_overlay`` allows the overlay on the 128-wide 1-CTA m tile of one
+    token tile when its tiles outnumber the SMs (:func:`gemm_plan` passes it on
+    :data:`M128_RING_OVERLAY_ARCH` only).
     """
     if 1 <= m <= N_ORIENTATION_MAX_M and n % 8 == 0:
         tile_n = 8 if m <= 8 else 16 if m <= 16 else 32
@@ -490,17 +747,20 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             tile_n, split_k = 8, 2
             # Three K slices when every cluster of the launch is co-resident (7168x1536 M = 17:
             # 36 clusters, +6 % on both parts); 48 or more clusters of 3 need a second cluster
-            # wave (-27..-30 %) and keep two slices.
+            # wave (-27..-30 %) and keep two slices, except on the N16_SPLITK3_M rows,
+            # where the 16-token tile halves the token tiles of the three-slice grid.
             capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(
                 SPLITK3_CLUSTER
             )
             token_tiles = (m + tile_n - 1) // tile_n
-            if (
-                capacity is not None
-                and n_tiles * token_tiles <= capacity
-                and k // K_TILE >= SPLITK3_CLUSTER
-            ):
-                split_k = SPLITK3_CLUSTER
+            if capacity is not None and k // K_TILE >= SPLITK3_CLUSTER:
+                if n_tiles * token_tiles <= capacity:
+                    split_k = SPLITK3_CLUSTER
+                elif (
+                    m in N16_SPLITK3_M.get((sm_count, k, n, bool(out_f16)), ())
+                    and n_tiles * ((m + 15) // 16) <= capacity
+                ):
+                    tile_n, split_k = 16, SPLITK3_CLUSTER
         # Even K slices for split-K 2 / 4; the three-way split uses the kernel's owner-remainder partition.
         if (
             split_k > 1
@@ -527,9 +787,13 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         }
         if n_tiles > sm_count:
             # More weight tiles than SMs: the shallow K tile, and two CTAs per SM on the
-            # 8-token tile or on the 152-SM part (the 32-token tile on 148 SMs prefers one).
+            # 8-token tile or on the 152-SM part (the 32-token tile on 148 SMs prefers
+            # one); the 8-token tile on the 152-SM part takes 64-row weight tiles at one
+            # CTA per SM where their programs are registered (``n8_wide_w_rows``).
             tactic["deep_k"] = False
-            if tile_n == 8 or sm_count >= TWO_CTA_PER_SM_MIN_SMS:
+            if tile_n == 8 and sm_count >= TWO_CTA_PER_SM_MIN_SMS and n8_wide_w_rows:
+                tactic["w_rows"] = N8_WIDE_W_ROWS
+            elif tile_n == 8 or sm_count >= TWO_CTA_PER_SM_MIN_SMS:
                 tactic["blocks_per_sm"] = 2
         elif deep_k:
             # Single-wave deep-K rows run three mainloop stages.
@@ -554,7 +818,7 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     assert best is not None
     _, tile_m, tile_n = best
     if tile_m == 256:
-        tile_n = _two_cta_tile_n(m, n, sm_count, tile_n)
+        tile_n = _two_cta_tile_n(m, n, sm_count, tile_n, two_cta_wave_cost)
     tactic = {
         "tile_n": tile_n,
         "deep_k": False,
@@ -615,6 +879,22 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     tok_tiles = (m + tile_m - 1) // tile_m
     if tok_tiles <= 2:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
+    if tile_m == BLOCK_M and tile_n == RING_OVERLAY_TILE_N:
+        # The 64-wide 1-CTA tile: the output staging overlays the mainloop ring, 8
+        # stages instead of 7 (18432x7168 and 28672x8192 M = 128: 2-3 % faster on both
+        # parts).
+        tactic["ring_overlay"] = True
+    if (
+        m128_ring_overlay
+        and m <= BLOCK_M
+        and tile_m == BLOCK_M
+        and tile_n == 128
+        and (n + tile_n - 1) // tile_n > sm_count
+    ):
+        # One token tile over more 128-wide weight tiles than SMs: 6 mainloop stages instead
+        # of 5, the overlaid stages handed back per tile by the epilogue (the program of the
+        # single-token-tile 128-wide rows, no L2 promotion).
+        tactic["ring_overlay"] = True
     if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
         tactic["half_m"] = True
     if (
@@ -689,6 +969,16 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append(f"s{int(tactic['num_stages'])}")
     if int(tactic.get("blocks_per_sm", 1)) > 1:
         parts.append(f"o{int(tactic['blocks_per_sm'])}")
+    if int(tactic.get("w_rows", BLOCK_M)) != BLOCK_M:
+        parts.append(f"w{int(tactic['w_rows'])}")
+    if tactic.get("ring_overlay"):
+        parts.append("ro")
+    if int(tactic.get("ep_stages", 0)):
+        parts.append(f"ep{int(tactic['ep_stages'])}")
+    if tactic.get("fold"):
+        parts.append("fold")
+    if tactic.get("b2"):
+        parts.append("b2" + str(tactic["b2"]))
     return "gemm:" + "_".join(parts)
 
 
@@ -788,20 +1078,53 @@ KNOWN_TACTIC_KEYS = frozenset(
     {
         "a_hint",
         "alpha_n",
+        "b2",
         "b_hint",
         "blocks_per_sm",
         "deep_k",
+        "ep_stages",
+        "fold",
         "half_m",
         "l2_promo",
         "num_stages",
         "raster_group",
+        "ring_overlay",
         "sched",
         "sk_split",
         "split_k",
         "stream_k",
         "tile_n",
         "two_cta",
+        "w_rows",
     }
+)
+
+
+# The token-remainder fold (``fold`` tactics, ``_fold`` keys): the 1-CTA 128-wide m
+# tile whose remainder token rows (at most 8 past its 128-row tile) ride on its
+# weight-tile stages as a swapped-role 128 x 8 MMA instead of a second token tile.
+# Without an explicit tactic, :func:`gemm_plan` takes it for 128 < M <= 136 on these
+# (arch, K, N) cells at the architecture's :data:`MEASURED_SM_COUNT`.
+FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+FOLD_TACTIC = {
+    "tile_n": 128,
+    "deep_k": False,
+    "alpha_n": False,
+    "a_hint": None,
+    "b_hint": "evict_first",
+    "l2_promo": None,
+    "fold": True,
+}
+
+# The 2-CTA token-remainder fold (``b2="fold"`` tactics, ``_b2fold`` keys): the static
+# 2-CTA pair program with 256-wide weight tiles whose remainder token rows (at most 16
+# past its 256-row pair tile) ride on its weight-tile stages as a swapped-role
+# 256 x 16 pair MMA instead of a second token tile.  Without an explicit tactic,
+# :func:`gemm_plan` takes it for 256 < M <= 272 on these (arch, K, N) cells at the
+# architecture's :data:`MEASURED_SM_COUNT` when the default plan is that program.
+B2_FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+B2_FOLD_BASE_KEYS = frozenset(
+    {"gemm:m256_2cta_bf16_bF_l2256b", "gemm:m256_2cta_f16_bF_l2256b"}
 )
 
 
@@ -815,12 +1138,84 @@ def gemm_plan(
     *,
     tactic: Optional[dict[str, Any]] = None,
 ) -> GemmPlan:
-    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``."""
+    """Resolve tactic, tile geometry and grid exactly like the Cake ``launch_gemm``.
+
+    Without an explicit ``tactic``, on an SM count other than ``arch``'s
+    :data:`MEASURED_SM_COUNT` a default tactic whose kernel ``arch`` does not
+    register falls back to the tactic of the measured SM count, planned (grid and
+    stream-K tail) for ``sm_count``.  Without an explicit ``tactic``, 128 < M <= 136
+    on a :data:`FOLD_CELLS` cell at ``arch``'s measured SM count takes the
+    token-remainder fold (:data:`FOLD_TACTIC`), and 256 < M <= 272 on a
+    :data:`B2_FOLD_CELLS` cell at that SM count, whose default plan is a
+    :data:`B2_FOLD_BASE_KEYS` program, takes its 2-CTA fold (``b2="fold"``)."""
+    if (
+        tactic is None
+        and 128 < int(m) <= 136
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in FOLD_CELLS
+    ):
+        tactic = dict(FOLD_TACTIC)
+    plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic)
+    if (
+        tactic is None
+        and 256 < int(m) <= 272
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in B2_FOLD_CELLS
+        and plan.kernel_key in B2_FOLD_BASE_KEYS
+    ):
+        plan = _gemm_plan(
+            m, n, k, out_f16, arch, sm_count, tactic={**plan.tactic, "b2": "fold"}
+        )
+    measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
+    if (
+        tactic is not None
+        or int(sm_count) == measured
+        or plan.kernel_key in KERNELS.get(arch, {})
+    ):
+        return plan
+    reference = _gemm_plan(m, n, k, out_f16, arch, measured)
+    fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
+    return fallback if fallback.kernel_key in KERNELS.get(arch, {}) else plan
+
+
+def _gemm_plan(
+    m: int,
+    n: int,
+    k: int,
+    out_f16: bool,
+    arch: str,
+    sm_count: int,
+    *,
+    tactic: Optional[dict[str, Any]] = None,
+) -> GemmPlan:
+    """The plan of ``tactic`` (default: :func:`default_tactic`) on ``sm_count`` SMs."""
     m, n, k = int(m), int(n), int(k)
     if m < 1 or n < 1:
         raise ValueError("M and N must be positive")
     if tactic is None:
-        tactic = default_tactic(m, n, k, int(sm_count))
+        tactic = default_tactic(
+            m,
+            n,
+            k,
+            int(sm_count),
+            out_f16=bool(out_f16),
+            n8_wide_w_rows=arch == N8_WIDE_W_ROWS_ARCH,
+            m128_ring_overlay=arch == M128_RING_OVERLAY_ARCH,
+        )
+        if arch == K96_ARCH and int(sm_count) == K96_WIDTH_SM_COUNT:
+            # The 2-CTA width re-pick of the K = 96 programs (K96_KERNEL_KEYS).
+            k96 = default_tactic(
+                m,
+                n,
+                k,
+                int(sm_count),
+                out_f16=bool(out_f16),
+                two_cta_wave_cost=_TWO_CTA_TILE_WAVE_COST_K96,
+            )
+            if k96 != tactic:
+                plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=k96)
+                if plan.kernel_key in K96_KERNEL_KEYS:
+                    return plan
     else:
         unknown = sorted(set(tactic) - KNOWN_TACTIC_KEYS)
         if unknown:
@@ -847,6 +1242,21 @@ def gemm_plan(
     blocks_per_sm = int(tactic.get("blocks_per_sm", 1))
     if blocks_per_sm != 1 and (two_cta or split_k > 1):
         raise ValueError("blocks_per_sm is a knob of the 1-CTA persistent program")
+    w_rows = int(tactic.get("w_rows", BLOCK_M))
+    if w_rows not in (N8_WIDE_W_ROWS, BLOCK_M):
+        raise ValueError(f"w_rows must be {N8_WIDE_W_ROWS} or {BLOCK_M}, got {w_rows}")
+    if w_rows != BLOCK_M and (not alpha_n or two_cta or split_k > 1):
+        raise ValueError("w_rows is a knob of the 1-CTA swapped orientation")
+    if w_rows != BLOCK_M and blocks_per_sm != 1:
+        raise ValueError("64-row weight tiles run at one CTA per SM")
+    if tactic.get("ring_overlay") and (
+        alpha_n or two_cta or split_k > 1 or blocks_per_sm != 1
+    ):
+        raise ValueError("ring_overlay is a knob of the 1-CTA m orientation")
+    if int(tactic.get("ep_stages", 0)) and (two_cta or (split_k > 1 and not alpha_n)):
+        raise ValueError(
+            "ep_stages is a knob of the 1-CTA program and the swapped-orientation split-K program"
+        )
     half_m = bool(tactic.get("half_m", False))
     if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
         raise ValueError(
@@ -863,8 +1273,48 @@ def gemm_plan(
         if alpha_n
         else ((BLOCK_M if half_m else 2 * BLOCK_M) if two_cta else BLOCK_M)
     )
-    w_tile = BLOCK_M if alpha_n else tile_n
+    w_tile = w_rows if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
+    if tactic.get("fold"):
+        if (
+            alpha_n
+            or two_cta
+            or split_k > 1
+            or deep_k
+            or tile_n != 128
+            or blocks_per_sm != 1
+            or tactic.get("ring_overlay")
+            or int(tactic.get("ep_stages", 0)) not in (0, CHAIN_EP_STAGES)
+            or not 128 < m <= 136
+        ):
+            raise ValueError(
+                "fold is a knob of the 1-CTA 128-wide m tile for 128 < M <= 136"
+            )
+        # One token tile: its 128 rows and the remainder rows the fold carries.
+        tok_tiles = 1
+    if tactic.get("b2") is not None:
+        if (
+            tactic["b2"] != "fold"
+            or alpha_n
+            or not two_cta
+            or tile_n != 256
+            or deep_k
+            or half_m
+            or stream_k
+            or str(tactic.get("sched", "static")) != "static"
+            or tactic.get("raster_group")
+            or tactic.get("num_stages") is not None
+            or tactic.get("b_hint") != "evict_first"
+            or tactic.get("a_hint")
+            or tactic.get("l2_promo") != "l2_256b"
+            or not 256 < m <= 272
+        ):
+            raise ValueError(
+                'b2="fold" is a knob of the static 2-CTA pair program with 256-wide'
+                " weight tiles (b_hint evict_first, l2_promo l2_256b) for 256 < M <= 272"
+            )
+        # One pair token tile: its 256 rows and the remainder rows the fold carries.
+        tok_tiles = 1
     w_tiles = (n + w_tile - 1) // w_tile
     num_tiles = tok_tiles * w_tiles
     sched = str(tactic.get("sched", "static"))
@@ -1127,13 +1577,29 @@ def prepare_nvfp4_per_token_quantize(
     *,
     out_scale: Optional[torch.Tensor] = None,
 ) -> NVFP4PerTokenQuantizeRunner:
-    """Validate the binding, select the quantizer instance and bind the launch.
+    """Validate the binding, select the quantizer-alone instance
+    (``quant_plan(..., alone=True)``) and bind the launch.
 
     ``global_scale_inv`` is the one-element float32 inverse base scale
     (typically ``1 / (448 * 6)``); ``out_scale`` an optional one-element
     float32 tensor the returned per-token scale is multiplied by (the packed
     data is unchanged).  The JIT module of the instance is built and loaded
     here, so prepare outside CUDA Graph capture."""
+    return _prepare_quantize(
+        x, global_scale_inv, outputs, out_scale=out_scale, alone=True
+    )
+
+
+def _prepare_quantize(
+    x: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    outputs: PerTokenQuantizeOutputs,
+    *,
+    out_scale: Optional[torch.Tensor],
+    alone: bool,
+) -> NVFP4PerTokenQuantizeRunner:
+    """:func:`prepare_nvfp4_per_token_quantize` with the cluster split of the quantizer
+    alone (``alone``) or of the quantize + GEMM chain."""
     m, k = validate_quantize_inputs(x, outputs)
     device = x.device
     arch = _device_arch(device)
@@ -1141,7 +1607,14 @@ def prepare_nvfp4_per_token_quantize(
     fold = out_scale is not None
     scale_arg = _scalar_f32(out_scale, "out_scale", device) if fold else gs_inv
     plan = quant_plan(
-        m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device), row_stride_of(x)
+        m,
+        k,
+        x.dtype == torch.bfloat16,
+        fold,
+        arch,
+        _sm_count(device),
+        row_stride_of(x),
+        alone=alone,
     )
     kwargs = _quant_kwargs(plan, x, outputs, gs_inv, scale_arg)
     with torch.cuda.device(_device_index(device)):
@@ -1178,7 +1651,9 @@ def _quant_prepared(
     (``x_row_stride`` selects the static-K or the runtime-geometry instance)."""
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
-    plan = quant_plan(m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride)
+    plan = quant_plan(
+        m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride, alone=True
+    )
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1321,8 +1796,9 @@ def prepare_mm_fp4_per_token(
     ``a_sf`` / ``b_sf`` their swizzled 128x4 E4M3 block scales
     (``padded_rows(M | N) x padded_sf_cols(K)`` bytes, uint8 or float8_e4m3fn),
     ``alpha [M]`` the FP32 per-token scale and ``out [M, N]`` a contiguous bf16 /
-    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`.  The JIT module is
-    built and loaded here, so prepare outside CUDA Graph capture."""
+    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`; without it the GEMM runs the
+    program of :func:`gemm_alone_tactic` on the cells of :data:`GEMM_ALONE_EP_RULES`.  The
+    JIT module is built and loaded here, so prepare outside CUDA Graph capture."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():
@@ -1352,9 +1828,10 @@ def prepare_mm_fp4_per_token(
     a_flat = _flat_u8_scales(a_sf, "a_sf", pm, cols)
     b_flat = _flat_u8_scales(b_sf, "b_sf", pn, cols)
     arch = _device_arch(device)
-    plan = gemm_plan(
-        m, n, k, out.dtype == torch.float16, arch, _sm_count(device), tactic=tactic
-    )
+    out_f16 = out.dtype == torch.float16
+    plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=tactic)
+    if tactic is None and (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     kwargs = _gemm_kwargs(plan, a_fp4, a_flat, b_fp4, b_flat, alpha, out)
     with torch.cuda.device(_device_index(device)):
         launch = _bind(arch, plan.kernel_key, kwargs)
@@ -1426,6 +1903,8 @@ def _gemm_prepared(
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
     plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device))
+    if (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1496,6 +1975,49 @@ def mm_fp4_per_token(
 # ---------------------------------------------------------------------------
 
 
+def _entry_prefetch_tactic(
+    plan: GemmPlan, rules: dict[str, dict[str, tuple[int, int]]]
+) -> Optional[dict[str, Any]]:
+    """``plan``'s tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
+    when its program family (kernel key without the output dtype) and token count lie in a
+    cell of ``rules`` on its architecture (for the chain, also of
+    :data:`CHAIN_EP_MEASURED_CELLS`) and that program is registered, else ``None``."""
+    family = "_".join(
+        part
+        for part in plan.kernel_key.removeprefix("gemm:").split("_")
+        if part not in ("bf16", "f16")
+    )
+    cell = rules.get(plan.arch, {}).get(family)
+    if (cell is None or not cell[0] <= plan.M <= cell[1]) and rules is CHAIN_EP_RULES:
+        measured = CHAIN_EP_MEASURED_CELLS.get(plan.arch, {}).get(family)
+        if (
+            measured is not None
+            and MEASURED_SM_COUNT.get(plan.arch) == plan.sm_count
+            and (plan.K, plan.N) in measured[2]
+        ):
+            cell = measured[:2]
+    if cell is None or not cell[0] <= plan.M <= cell[1]:
+        return None
+    tactic = {**plan.tactic, "ep_stages": CHAIN_EP_STAGES}
+    if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
+        return None
+    return tactic
+
+
+def gemm_alone_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The tactic the GEMM alone takes when no tactic is passed and the default-tactic plan
+    is ``plan``: the entry L2 prefetch program on the cells of :data:`GEMM_ALONE_EP_RULES`,
+    else ``None`` (the plan's own program)."""
+    return _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES)
+
+
+def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The GEMM tactic of the quantize + GEMM chain whose default-tactic GEMM plan is
+    ``plan``: the entry L2 prefetch program on the cells of :data:`CHAIN_EP_RULES`, else
+    ``None`` (the program the GEMM alone runs)."""
+    return _entry_prefetch_tactic(plan, CHAIN_EP_RULES)
+
+
 @dataclass(frozen=True)
 class NVFP4PerTokenChainRunner:
     """Quantizer followed by the GEMM: one ``launch()`` runs both generated programs
@@ -1539,11 +2061,28 @@ def prepare_nvfp4_per_token_chain(
 ) -> NVFP4PerTokenChainRunner:
     """Bind ``out = mm_fp4(quantize(x), b, ...)`` with the per-token scale (times
     ``out_scale`` when given) as the GEMM alpha; ``workspace`` holds the quantized
-    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``)."""
-    quantize = prepare_nvfp4_per_token_quantize(
-        x, global_scale_inv, workspace, out_scale=out_scale
+    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``).  The GEMM
+    runs the program of :func:`chain_gemm_tactic` (the entry L2 prefetch of the weight
+    tiles on the cells of :data:`CHAIN_EP_RULES`), else the one ``mm_fp4`` runs."""
+    quantize = _prepare_quantize(
+        x, global_scale_inv, workspace, out_scale=out_scale, alone=False
+    )
+    device = workspace.fp4.device
+    plan = gemm_plan(
+        int(workspace.fp4.shape[0]),
+        int(b_fp4.shape[0]),
+        2 * int(workspace.fp4.shape[1]),
+        out.dtype == torch.float16,
+        _device_arch(device),
+        _sm_count(device),
     )
     gemm = prepare_mm_fp4_per_token(
-        workspace.fp4, workspace.sf, b_fp4, b_sf, workspace.scale, out
+        workspace.fp4,
+        workspace.sf,
+        b_fp4,
+        b_sf,
+        workspace.scale,
+        out,
+        tactic=chain_gemm_tactic(plan),
     )
     return NVFP4PerTokenChainRunner(quantize, gemm)

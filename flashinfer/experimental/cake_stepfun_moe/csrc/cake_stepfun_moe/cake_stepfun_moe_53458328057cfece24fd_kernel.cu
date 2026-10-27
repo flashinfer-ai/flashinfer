@@ -52,7 +52,7 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
     int* idx_smem = reinterpret_cast<int*>(smem_static_raw + 256);
     const int idx_smem_addr = (int)(unsigned long long)__cvta_generic_to_shared(idx_smem);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     long long token_idx = (long long)bid;
     long long num_elems_in_padded_col = (long long)hidden_dim_padded / 8;
     long long num_elems_in_col = (long long)hidden_dim / 8;
@@ -139,9 +139,9 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
                     if (permuted[ki_3] != -1) {
                         #pragma unroll
                         for (int j = 0; j < 8; j++) {
-                            float _fma_0;
-                            asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(scale_f32[ki_3]), "f"(input_elems[ki_3 * 8 + j]), "f"(thread_output[j]));
-                            thread_output[j] = _fma_0;
+                            float _fma_3;
+                            asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(scale_f32[ki_3]), "f"(input_elems[ki_3 * 8 + j]), "f"(thread_output[j]));
+                            thread_output[j] = _fma_3;
                         }
                     }
                 }
@@ -152,10 +152,7 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
                 _pk[1] = __floats2bfloat162_rn(thread_output[0 + 2], thread_output[0 + 3]);
                 _pk[2] = __floats2bfloat162_rn(thread_output[0 + 4], thread_output[0 + 5]);
                 _pk[3] = __floats2bfloat162_rn(thread_output[0 + 6], thread_output[0 + 7]);
-                uint4 _st_v4_0 = *reinterpret_cast<uint4*>(&_pk[0]);
-                asm volatile(
-                    "st.global.L1::no_allocate.v4.b32 [%0], {%1, %2, %3, %4};"
-                    :: "l"(&((__nv_bfloat16*)(out_ptr + (offset + (long long)elem_index * 8)))[0]), "r"(_st_v4_0.x), "r"(_st_v4_0.y), "r"(_st_v4_0.z), "r"(_st_v4_0.w) : "memory");
+                asm volatile("st.global.L1::no_allocate.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"((out_ptr + (offset + (long long)elem_index * 8))), "r"(reinterpret_cast<const unsigned*>(_pk)[0]), "r"(reinterpret_cast<const unsigned*>(_pk)[1]), "r"(reinterpret_cast<const unsigned*>(_pk)[2]), "r"(reinterpret_cast<const unsigned*>(_pk)[3]) : "memory");
             }
         }
     } else {
@@ -173,12 +170,12 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
                     if (permuted_1[ki_5] != -1) {
                         long long elem_1 = (long long)permuted_1[ki_5] * num_elems_in_padded_col + (long long)elem_index_1;
                         {
-                            const uint4* _vptr_3 = reinterpret_cast<const uint4*>(in_ptr + (elem_1 * 8) + 0);
-                            uint4 _vld_3[1];
+                            const uint4* _vptr_4 = reinterpret_cast<const uint4*>(in_ptr + (elem_1 * 8) + 0);
+                            uint4 _vld_4[1];
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
-                                _vld_3[_blk] = _vptr_3[_blk];
-                                uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
+                                _vld_4[_blk] = _vptr_4[_blk];
+                                uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
                                     asm volatile(
@@ -187,7 +184,7 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
                                         "and.b32 %1, %2, 0xffff0000;\n\t"
                                         "}\n"
                                         : "=f"((&input_elems_1[ki_5 * 8 + _blk * 8 + _pair * 2])[0]), "=f"((&input_elems_1[ki_5 * 8 + _blk * 8 + _pair * 2])[1])
-                                        : "r"(_vpairs_3[_pair]));
+                                        : "r"(_vpairs_4[_pair]));
                                 }
                             }
                         }
@@ -203,9 +200,9 @@ kernel_cake_stepfun_moe_53458328057cfece24fd(__nv_bfloat16* __restrict__ in_ptr,
                     if (permuted_1[ki_7] != -1) {
                         #pragma unroll
                         for (int j_1 = 0; j_1 < 8; j_1++) {
-                            float _fma_1;
-                            asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(scale_f32_1[ki_7]), "f"(input_elems_1[ki_7 * 8 + j_1]), "f"(thread_output_1[j_1]));
-                            thread_output_1[j_1] = _fma_1;
+                            float _fma_5;
+                            asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(scale_f32_1[ki_7]), "f"(input_elems_1[ki_7 * 8 + j_1]), "f"(thread_output_1[j_1]));
+                            thread_output_1[j_1] = _fma_5;
                         }
                     }
                 }

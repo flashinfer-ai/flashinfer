@@ -114,6 +114,7 @@ def host(
         stats_log2,
         stream,
         sinks_ptr=sinks_ptr if cutlass.const_expr(has_sink) else None,
+        prefetch_group=(2 if splits <= 2 else 4 if splits <= 4 else 8 if splits <= 8 else 0),
     )
 
 

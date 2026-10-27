@@ -258,24 +258,37 @@ def _bf16_ulp_error(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (out.to(F64) - ref64).abs() / _bf16_ulp_spacing(ref64)
 
 
-def _sinkhorn(logits: torch.Tensor) -> torch.Tensor:
-    C = torch.softmax(logits, dim=-1) + HC_EPS
-    C = C / (C.sum(dim=1, keepdim=True) + HC_EPS)
+def _sinkhorn(logits: torch.Tensor, hc_eps: float = HC_EPS) -> torch.Tensor:
+    C = torch.softmax(logits, dim=-1) + hc_eps
+    C = C / (C.sum(dim=1, keepdim=True) + hc_eps)
     for _ in range(SINKHORN_ITERS - 1):
-        C = C / (C.sum(dim=2, keepdim=True) + HC_EPS)
-        C = C / (C.sum(dim=1, keepdim=True) + HC_EPS)
+        C = C / (C.sum(dim=2, keepdim=True) + hc_eps)
+        C = C / (C.sum(dim=1, keepdim=True) + hc_eps)
     return C
 
 
-def _coefficients(z, scale, base):
+def _coefficients(z, scale, base, hc_eps: float = HC_EPS):
     T = z.shape[0]
-    pre = torch.sigmoid(z[:, 0:4] * scale[0] + base[0:4]) + HC_EPS
+    pre = torch.sigmoid(z[:, 0:4] * scale[0] + base[0:4]) + hc_eps
     post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
-    C = _sinkhorn((z[:, 8:] * scale[2] + base[8:]).reshape(T, STREAMS, STREAMS))
+    C = _sinkhorn((z[:, 8:] * scale[2] + base[8:]).reshape(T, STREAMS, STREAMS), hc_eps)
     return pre, post, C
 
 
-def _block(X, fn, scale, base, B, dY, dU, *, dtype, want_contrib: bool) -> dict:
+def _block(
+    X,
+    fn,
+    scale,
+    base,
+    B,
+    dY,
+    dU,
+    *,
+    dtype,
+    want_contrib: bool,
+    rms_eps: float = RMS_EPS,
+    hc_eps: float = HC_EPS,
+) -> dict:
     """One row block of the reference: the forward in ``dtype``, the backward by autograd of the FP arithmetic."""
     T = X.shape[0]
     with torch.enable_grad():
@@ -285,9 +298,9 @@ def _block(X, fn, scale, base, B, dY, dU, *, dtype, want_contrib: bool) -> dict:
         based = base.detach().to(dtype).requires_grad_(True)
         Bd = B.detach().to(dtype).requires_grad_(True)
         u = Xd.reshape(T, N)
-        r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + RMS_EPS)
+        r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         z = (u * r) @ fnd.T
-        pre, post, C = _coefficients(z, scaled, based)
+        pre, post, C = _coefficients(z, scaled, based, hc_eps)
         U_pre = (pre.unsqueeze(-1) * Xd).sum(dim=1)
         Y_pre = post.unsqueeze(-1) * Bd.unsqueeze(1) + torch.einsum(
             "tij,tid->tjd", C, Xd
@@ -347,15 +360,17 @@ def _oracle(
     block_tokens: int | None = BLOCK_TOKENS,
     want_contrib: bool = False,
 ) -> dict:
-    """The reference of one input set: FP64 in row blocks (the oracle) or IEEE FP32 in one block (the comparator)."""
+    """The reference of one input set: FP64 in row blocks (the oracle) or IEEE FP32 in one block (the comparator).
+    The epsilons of the case (``i["rms_eps"]`` / ``i["hc_eps"]``, default the model constants) enter the arithmetic."""
     T = i["X"].shape[0]
     if dtype == F32:
         _set_ieee_fp32()
     bt = T if not block_tokens else max(1, min(block_tokens, T))
+    eps = {"rms_eps": i.get("rms_eps", RMS_EPS), "hc_eps": i.get("hc_eps", HC_EPS)}
     blocks = [
         _block(
             i["X"][lo : lo + bt], i["fn"], i["scale"], i["base"], i["B"][lo : lo + bt], i["dY"][lo : lo + bt],
-            i["dU"][lo : lo + bt], dtype=dtype, want_contrib=want_contrib,
+            i["dU"][lo : lo + bt], dtype=dtype, want_contrib=want_contrib, **eps,
         )
         for lo in range(0, T, bt)
     ]  # fmt: skip
@@ -427,8 +442,12 @@ def _make_inputs(
 
 
 def _run(i: dict, *, fwd_ws=None, bwd_ws=None) -> dict:
-    """The package end to end: forward prepare / finish, backward prepare / finish on the inputs of a case."""
-    U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws)
+    """The package end to end: forward prepare / finish, backward prepare / finish on the inputs of a case (with the
+    case's epsilons when it carries non-default ones)."""
+    eps = {k: i[k] for k in ("rms_eps", "hc_eps") if k in i}
+    U, stats = forward_prepare(
+        i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws, **eps
+    )
     Y = forward_finish(i["X"], i["B"], stats)
     dB, gstats = backward_prepare(i["dY"], i["B"], i["X"], stats)
     dX, dfn, dscale, dbase = backward_finish(
@@ -442,6 +461,7 @@ def _run(i: dict, *, fwd_ws=None, bwd_ws=None) -> dict:
         stats,
         gstats,
         workspace=bwd_ws,
+        **eps,
     )
     return {
         "U": U,
@@ -786,12 +806,21 @@ def _assert_tail_gradients(res: dict, ref: dict, label: str) -> None:
 
 
 def _check_case(
-    T: int, *, mode: str = "unit", fn_scale: float = 1.0, zero_rows=(), seed: int = SEED
+    T: int,
+    *,
+    mode: str = "unit",
+    fn_scale: float = 1.0,
+    zero_rows=(),
+    seed: int = SEED,
+    rms_eps: float = RMS_EPS,
+    hc_eps: float = HC_EPS,
 ) -> dict:
     label = (
         f"T={T} mode={mode}"
         + (f" fn_scale={fn_scale:g}" if fn_scale != 1.0 else "")
         + (f" zero_rows={tuple(zero_rows)}" if zero_rows else "")
+        + (f" rms_eps={rms_eps:g}" if rms_eps != RMS_EPS else "")
+        + (f" hc_eps={hc_eps:g}" if hc_eps != HC_EPS else "")
     )
     # The FP32 regime of the draw: the fn x 1e3 inputs (comparator-relative clauses only), the saturated tails (the tail
     # clause) or the contract's unit / cancellation inputs (the absolute bars; see _assert_fp32).
@@ -800,6 +829,7 @@ def _check_case(
     )
     floor = regime == "large_logits"
     i = _make_inputs(T, mode=mode, seed=seed, fn_scale=fn_scale, zero_rows=zero_rows)
+    i["rms_eps"], i["hc_eps"] = rms_eps, hc_eps
     res = _run(i)
     ref = _oracle(i, want_contrib=(mode == "cancel"))
     comp = _oracle(i, dtype=F32, block_tokens=None)
@@ -1019,6 +1049,93 @@ def test_checkpoint_replay_is_bitwise(T: int) -> None:
         )
 
 
+def _live_bytes() -> int | None:
+    """Bytes the live CUDA tensors asked the caching allocator for (its ``requested_bytes``), not the bytes of the
+    blocks they occupy (``torch.cuda.memory_allocated``): a tensor placed in a reused free block up to 1 MiB larger
+    than itself (the allocator does not split a large block for a remainder of at most 1 MiB) would otherwise count
+    that slack as memory kept alive, as the flashinfer-ci nightly did on torch 2.15 (186880 B on B200, 1047040 B on
+    R200) for the checkpointed output below.  ``None`` under another allocator backend (``cudaMallocAsync`` keeps
+    no ``requested_bytes``), where the retention check is skipped and the gradient checks still run."""
+    torch.cuda.synchronize()
+    if torch.cuda.get_allocator_backend() != "native":
+        return None
+    return int(torch.cuda.memory_stats()["requested_bytes.all.current"])
+
+
+def _assert_nothing_kept(before: int | None, Y: torch.Tensor, what: str) -> None:
+    if before is None:
+        return
+    kept = _live_bytes() - before - Y.untyped_storage().nbytes()
+    assert kept == 0, f"{kept} bytes kept alive after a checkpointed {what}"
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
+    """A non-reentrant ``torch.utils.checkpoint`` around prepare / finish keeps no tensor of the layer alive after
+    the forward (``stats`` and the inputs travel through the saved tensors; the handle holds no branch output), and
+    the checkpointed backward is bitwise the plain one."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 41)
+
+    def connection(X, fn, scale, base):
+        U, handle = pkg.cake_mhc_train_prepare(
+            X, fn, scale, base, save_stats=save_stats
+        )
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def leaves() -> list:
+        return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+    plain = leaves()
+    (connection(*plain).float() * i["dY"].float()).sum().backward()
+
+    checkpointed = leaves()
+    before = _live_bytes()
+    Y = checkpoint(connection, *checkpointed, use_reentrant=False)
+    _assert_nothing_kept(before, Y, "forward")
+    (Y.float() * i["dY"].float()).sum().backward()
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), "checkpointing changed a gradient bit"
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -> None:
+    """A non-reentrant ``torch.utils.checkpoint`` region that starts after ``cake_mhc_train_prepare`` (the branch and
+    the finish inside it, the prepare outside) keeps nothing beyond its output after the forward; its backward reruns
+    the finish on a handle that already released the statistics, which the finish forward replays bitwise, so the
+    gradients equal the plain run bit for bit."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 42)
+
+    def finish(X, U, handle):
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def leaves() -> list:
+        return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+    plain = leaves()
+    U, handle = pkg.cake_mhc_train_prepare(*plain, save_stats=save_stats)
+    (finish(plain[0], U, handle).float() * i["dY"].float()).sum().backward()
+
+    checkpointed = leaves()
+    U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
+    stats = handle.stats  # pinned: save_stats=False releases it in the finish forward
+    before = _live_bytes()
+    Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=False)
+    _assert_nothing_kept(before, Y, "finish")
+    assert handle.stats is None, "the handle kept the statistics after the forward"
+    del stats
+    (Y.float() * i["dY"].float()).sum().backward()
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), "checkpointed finish: gradient bit changed"
+
+
 @pytest.mark.parametrize("T", (1000,))
 def test_accumulate_four_times(T: int) -> None:
     """Four consecutive ``accumulate=True`` passes on four input sets against the FP64 sum of the four gradients plus
@@ -1155,6 +1272,42 @@ def test_changing_rows_in_one_process_does_not_rebuild() -> None:
     )
 
 
+_EPS_CASES = ((2e-5, 2e-6), (1e-6, 1e-5), (1e-5, 4e-6))
+
+
+@pytest.mark.parametrize("T", (64, 2049))
+@pytest.mark.parametrize("rms_eps,hc_eps", _EPS_CASES)
+def test_non_default_eps_match_fp64(T: int, rms_eps: float, hc_eps: float) -> None:
+    """``rms_eps`` / ``hc_eps`` are launch arguments: the forward and backward at other values meet the same FP64
+    bars as the defaults (the oracle is evaluated at the same values), and the statistics actually move."""
+    out = _check_case(T, rms_eps=rms_eps, hc_eps=hc_eps)
+    default = _run(_make_inputs(T))
+    assert not torch.equal(out["result"]["stats"], default["stats"]), (
+        f"stats unchanged by rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+    )
+
+
+def test_changing_eps_in_one_process_does_not_rebuild() -> None:
+    """A different epsilon is a launch argument of the already compiled programs: no module is rebuilt or reloaded
+    when the epsilons change between calls, and the outputs follow the FP64 oracle at each value."""
+    _check_case(64)
+    loaded_before = loader.load.cache_info().misses
+    for rms_eps, hc_eps in _EPS_CASES + ((RMS_EPS, HC_EPS),):
+        i = _make_inputs(255, seed=SEED + 3)
+        i["rms_eps"], i["hc_eps"] = rms_eps, hc_eps
+        res = _run(i)
+        ref = _oracle(i)
+        _assert_bf16(
+            res["dX"], ref["dX32"], f"dX rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+        )
+        _assert_fp32(
+            res["dfn"], ref["dfn"], None, f"dfn rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+        )
+    assert loader.load.cache_info().misses == loaded_before, (
+        "a changed epsilon rebuilt or reloaded a module"
+    )
+
+
 @pytest.mark.parametrize("T", (7, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_autograd_end_to_end(T: int, save_stats: bool) -> None:
@@ -1288,9 +1441,30 @@ def test_argument_validation() -> None:
         forward_prepare(padded, fn, scale, base)
     with pytest.raises(ValueError):
         forward_prepare(X.cpu(), fn.cpu(), scale.cpu(), base.cpu())
-    for kwargs in ({"rms_eps": 1e-6}, {"hc_eps": 1e-5}, {"sinkhorn_iters": 19}):
+    # The epsilons are launch arguments of the compiled programs (any finite positive value runs); the Sinkhorn
+    # iteration count is a compile-time constant keyed by the delivered programs (only the shipped counts run).
+    for kwargs in (
+        {"rms_eps": 1e-6},
+        {"hc_eps": 1e-5},
+        {"rms_eps": 2e-5, "hc_eps": 2e-6},
+    ):
+        forward_prepare(X, fn, scale, base, **kwargs)
+    for kwargs in (
+        {"rms_eps": 0.0},
+        {"rms_eps": -1e-5},
+        {"hc_eps": float("nan")},
+        {"hc_eps": float("inf")},
+    ):
+        with pytest.raises(ValueError):
+            forward_prepare(X, fn, scale, base, **kwargs)
+    for kwargs in (
+        {"sinkhorn_iters": 19},
+        {"sinkhorn_iters": 21},
+        {"sinkhorn_iters": 20.5},
+    ):
         with pytest.raises(NotImplementedError):
             forward_prepare(X, fn, scale, base, **kwargs)
+    assert pkg.SHIPPED_SINKHORN_ITERS == (SINKHORN_ITERS,)
     U, stats = forward_prepare(X, fn, scale, base)
     with pytest.raises(ValueError):
         forward_finish(X, i["B"][:, : HIDDEN // 2], stats)

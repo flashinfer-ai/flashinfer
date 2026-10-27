@@ -26,7 +26,8 @@ _EXPECTED_COUNTS = {"g": (46, 0), "beta": (36, 10)}
 
 
 def _bf16_modules_with_token_strides():
-    for name, record in cake_kda_tf32.MODULES.items():
+    for name in cake_kda_tf32._MODULE_ROWS:
+        record = cake_kda_tf32.MODULES[name]
         plan = record["arg_plan"]
         if record["cache_name"].startswith("cake_kda_bf16_") and all(
             ["parameter", f"{operand}_token_stride"] in plan

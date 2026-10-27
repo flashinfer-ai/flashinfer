@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,9 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bfloat16* __restrict__ z, long long* __restrict__ labels, float* __restrict__ infer_logp, float* __restrict__ loss_weights, float* __restrict__ d_in, float* __restrict__ lse, float* __restrict__ logp, float* __restrict__ d, float* __restrict__ term, int rows_c, int row0, int V, int num_tiles, int mode, float loss_div)
 {
     const int tid = threadIdx.x;
@@ -67,7 +68,7 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int r = bid * 8 + warp;
     int lane_0 = lane;
     int active = ((r < rows_c) ? 1 : 0);
@@ -76,7 +77,7 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
     long long lbl = labels[t];
     long long v64 = (long long)V;
     unsigned long long stat_row = (unsigned long long)r_safe * (unsigned long long)num_tiles * 2;
-    float m = -3.4028234663852886e+38f;
+    float m = -3.4028235e+38f;
     #pragma unroll 4
     for (int i = lane_0; i < num_tiles; i += 32) {
         float _vec_load_0[2];
@@ -85,14 +86,12 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
             _vec_load_0[0] = _v2_0.x;
             _vec_load_0[0 + 1] = _v2_0.y;
         }
-        float _fmax_0 = fmaxf(m, _vec_load_0[0]);
-        m = _fmax_0;
+        m = fmaxf(m, _vec_load_0[0]);
     }
-    float _warp_reduce_0 = m;
+    float row_max = m;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_0 = fmaxf(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-    float row_max = _warp_reduce_0;
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xFFFFFFFF, row_max, offset));
     float s = 0.0f;
     #pragma unroll 4
     for (int i_1 = lane_0; i_1 < num_tiles; i_1 += 32) {
@@ -102,16 +101,15 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
             _vec_load_1[0] = _v2_1.x;
             _vec_load_1[0 + 1] = _v2_1.y;
         }
-        float _exp_0 = expf(_vec_load_1[0] - row_max);
-        s += _vec_load_1[1] * _exp_0;
+        float _exp_2 = expf(_vec_load_1[0] - row_max);
+        s = __fmaf_rn(_vec_load_1[1], _exp_2, s);
     }
-    float _warp_reduce_1 = s;
+    float row_sum = s;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-    float row_sum = _warp_reduce_1;
-    float _log_0 = logf(row_sum);
-    float lse_v = row_max + _log_0;
+        row_sum += __shfl_xor_sync(0xFFFFFFFF, row_sum, offset);
+    float _log_3 = logf(row_sum);
+    float lse_v = row_max + _log_3;
     long long zero64 = (long long)0;
     long long last64 = v64 - (long long)1;
     long long lbl_lo = ((lbl >= 0) ? lbl : zero64);
@@ -119,8 +117,8 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
     unsigned long long z_off = (unsigned long long)r_safe * (unsigned long long)V + (unsigned long long)lbl_idx;
     float _vec_load_2[1];
     {
-        __nv_bfloat16 _bf16_2 = *reinterpret_cast<const __nv_bfloat16*>(z + z_off + 0);
-        _vec_load_2[0] = __bfloat162float(_bf16_2);
+        __nv_bfloat16 _bf16_4 = *reinterpret_cast<const __nv_bfloat16*>(z + z_off + 0);
+        _vec_load_2[0] = __bfloat162float(_bf16_4);
     }
     float zy = _vec_load_2[0];
     float logp_v = ((lbl >= 0) ? zy - lse_v : 0.0f);
@@ -132,8 +130,7 @@ kernel_cake_lm_head_loss_61ea8de378a85bd5c55c(float* __restrict__ stats, __nv_bf
     }
     if (mode == 1) {
         float w = loss_weights[t];
-        float _exp_1 = expf(logp_v - infer_logp[t]);
-        float ratio = _exp_1;
+        float ratio = expf(logp_v - infer_logp[t]);
         float clipped = ((ratio < 2.0f) ? ratio : 2.0f);
         term_v = ((lbl >= 0) ? w * clipped : 0.0f);
         float d_grad = ((ratio <= 2.0f) ? (-w) * ratio : 0.0f);

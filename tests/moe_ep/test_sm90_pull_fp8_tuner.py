@@ -98,9 +98,10 @@ class TestIsValid:
         assert not pkg.is_valid(
             {**swap, "cluster_shape_mnk": (2, 1, 1), "tail_split_pairs": True}
         )
-        # ikr requires apply_topk_in_fc1.
+        # IKR requires routing weights before FC2.
         assert not pkg.is_valid(
-            {**ok, "in_kernel_fc2_reduce": True}, apply_topk_in_fc1=False
+            {**ok, "in_kernel_fc2_reduce": True},
+            apply_routing_weights_before_fc2=False,
         )
 
     def test_iter_candidates_all_valid(self):
@@ -228,6 +229,8 @@ class TestKnobCache:
         assert pkg.lookup_knobs(**self._KEY, max_tokens=8) is None
 
     def test_sm100_entries_never_cross_match(self, tmp_path, monkeypatch):
+        from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
         pkg = _pkg()
         path = tmp_path / "cache.json"
         monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
@@ -235,7 +238,7 @@ class TestKnobCache:
         path.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": KNOB_CACHE_VERSION,
                     "entries": [
                         dict(
                             device="test-gpu",

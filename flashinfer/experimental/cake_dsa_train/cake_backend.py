@@ -28,9 +28,10 @@ limitations under the License.
 #   BF16 or, with ``dkv_fp32=True``, FP32 outputs) -- or, with a caller-owned
 #   ``dkv_acc``, adds them into that packed FP32 buffer (``+=``, optional
 #   destination-row map ``dkv_dst_map``) and returns ``None`` for both.
-# * Strided inputs are consumed in place: the query operands reach the kernels
-#   through TMA descriptors encoded from the tensor's own head and token
-#   strides, the key operands by row stride (see ``_check_head_tensor`` /
+# * Strided inputs are consumed in place: the query operands and ``dout``
+#   reach the kernels through TMA descriptors encoded from the tensor's own
+#   head and token strides (the delta stage takes the same strides as
+#   scalars), the key operands by row stride (see ``_check_head_tensor`` /
 #   ``_check_key_tensor``).
 # * Without ``topk_length`` the forward kernel derives each row's length (last
 #   valid slot + 1) itself while it runs and skips the trailing invalid key
@@ -63,7 +64,7 @@ import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, TypeVar, overload
+from typing import Any, Callable, Optional, TypeVar, Union, overload
 
 import torch
 import tvm_ffi
@@ -382,7 +383,6 @@ def key_pass_dq_mode(index: int, passes: int) -> int:
 # (``False``) it (``None``, the default, = the rule).  Without the natural
 # stages every ``dkv_acc`` call takes the cast's accumulate path.  Both paths
 # add the same FP32 contributions into the same rows (another summation order).
-DIRECT_STAGES = ("bwd_main_natural", "bwd_main_pass_natural")
 DKV_DIRECT_POLICY_FIELDS = ("min_keys_per_query",)
 
 
@@ -625,6 +625,28 @@ def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
         )
 
 
+def _dout_admissible(dout: torch.Tensor) -> bool:
+    """Whether the backward kernels can read ``dout`` in place (:func:`_check_head_tensor` as a predicate)."""
+    try:
+        _check_head_tensor(dout, "dout", D_LATENT)
+    except ValueError:
+        return False
+    return True
+
+
+def _dout_stride_constants(dout: Optional[torch.Tensor]) -> dict[str, int]:
+    """The delta stage's ``dout`` operands: its token / head strides in elements and the element offset of the
+    pointer the launcher passes (the validated view itself, 16-byte aligned: offset 0).  Both strides are multiples
+    of 8 (validated) and must fit the kernel's int32 arguments (a head-major view's head stride is ``T * 512``)."""
+    if dout is None:
+        return {}
+    return dict(
+        dout_token_stride=_check_int32("the dout token stride", dout.stride(0)),
+        dout_head_stride=_check_int32("the dout head stride", dout.stride(1)),
+        dout_offset=0,
+    )
+
+
 def validate_dsa_train_inputs(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
@@ -648,7 +670,13 @@ def validate_dsa_train_inputs(
     rejected unless ``allow_empty_queries``: the launch grids clamp to one CTA
     that would read a query row that does not exist, so only the eager entry
     points, which return empty outputs for ``T == 0`` without launching,
-    accept it.
+    accept it.  ``dout`` follows the layout rules of ``q_latent``
+    (:func:`_check_head_tensor`: unit channel stride, token and head strides
+    positive multiples of 8 elements, head stride >= 512, 16-byte base): a
+    dense array or a strided view such as the head-major ``[512, T * 512, 1]``
+    layout is consumed in place (the main stage reads it through a
+    stride-carrying tensor map, the delta stage through the strides it
+    receives).
     """
     _check_head_tensor(q_latent, "q_latent", D_LATENT)
     _check_head_tensor(q_rope, "q_rope", D_ROPE)
@@ -688,10 +716,6 @@ def validate_dsa_train_inputs(
         _check_head_tensor(dout, "dout", D_LATENT)
         if int(dout.shape[0]) != num_queries:
             raise ValueError("dout must have T rows")
-        if not dout.is_contiguous():
-            # bwd_delta reads dout as a dense [T * 64, 512] array (the main stage reads it
-            # through a stride-carrying tensor map); the eager entry copies a strided dout.
-            raise ValueError("dout must be contiguous")
     return num_queries, num_kv, topk
 
 
@@ -711,7 +735,11 @@ def validate_dsa_nope_inputs(
     stride); ``indices``: int32 ``[T, K_slots]`` global key rows with contiguous rows (any row stride; ``-1`` or
     ``>= S`` invalid), any ``K_slots >= 1`` -- no width alignment is required (rows whose stride and start are
     multiples of eight elements take the kernels' vector index path, the others the scalar path);
-    ``topk_length``: contiguous int32 ``[T]`` or ``None``; ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
+    ``topk_length``: contiguous int32 ``[T]`` or ``None`` (the kernel-level entries read the rows as given; without
+    it the public autograd entries compact rows with ``-1`` holes through the index-preparation stage first at or
+    above :data:`NOPE_CONVERT_SLOT_LIMIT` slots and read them as given below it; with it the varlen entry runs the
+    stage at every size and the flat entry reads rows and lengths as given, see :func:`nope_compact_indices`);
+    ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
     the same layout rules as ``q_latent`` (:func:`_check_head_tensor`: unit channel stride, token and head strides
     positive multiples of 8 elements, head stride >= 512, 16-byte base) -- a dense array or a strided view such as
     the head-major ``[512, T * 512, 1]`` layout is consumed in place (the main stage reads it through a
@@ -831,10 +859,63 @@ def _check_dkv_acc(
                 f"dkv_dst_map values must lie in [0, {num_rows}) (the rows of dkv_acc); "
                 f"got min {int(dkv_dst_map.min())}, max {int(dkv_dst_map.max())}"
             )
+    return _dkv_acc_operand(dkv_acc), row_stride
+
+
+def _dkv_acc_operand(dkv_acc: torch.Tensor) -> torch.Tensor:
+    """The raw-pointer operand of a validated accumulator (:func:`_check_dkv_acc`): the tensor itself when
+    contiguous, else the flat stride-1 alias over the rows it spans."""
     if dkv_acc.is_contiguous():
-        return dkv_acc, row_stride
+        return dkv_acc
+    row_stride = int(dkv_acc.stride(0))
     span = (int(dkv_acc.shape[0]) - 1) * row_stride + int(dkv_acc.shape[1])
-    return dkv_acc.as_strided((span,), (1,), dkv_acc.storage_offset()), row_stride
+    return dkv_acc.as_strided((span,), (1,), dkv_acc.storage_offset())
+
+
+# The autograd entries take ``dkv_acc`` as a tensor or as a zero-argument callable that produces it at backward
+# time (``DkvAccSource``): under activation checkpointing a tensor passed at forward time exists for every layer
+# at once, a deferred accumulator only while its backward runs.
+DkvAccSource = Union[
+    torch.Tensor,
+    Callable[[], Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]],
+]
+
+
+def _resolve_dkv_acc(
+    dkv_acc: Optional[DkvAccSource], dkv_dst_map: Optional[torch.Tensor]
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(dkv_acc, dkv_dst_map)`` as tensors: a tensor ``dkv_acc`` passes through; a callable is called now (at
+    backward time) and returns the accumulator or an ``(accumulator, dkv_dst_map)`` pair -- a pair's map must not be
+    given twice.  Validation (:func:`_check_dkv_acc`) is the caller's."""
+    if dkv_acc is None or isinstance(dkv_acc, torch.Tensor):
+        return dkv_acc, dkv_dst_map
+    if not callable(dkv_acc):
+        raise TypeError(
+            "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+        )
+    produced = dkv_acc()
+    if isinstance(produced, tuple):
+        if len(produced) != 2:
+            raise ValueError(
+                "a dkv_acc callable returns the accumulator or an (accumulator, dkv_dst_map) pair"
+            )
+        produced, companion = produced
+        if companion is not None:
+            if dkv_dst_map is not None:
+                raise ValueError(
+                    "dkv_dst_map was given both as an argument and by the dkv_acc callable"
+                )
+            dkv_dst_map = companion
+    if not isinstance(produced, torch.Tensor):
+        raise ValueError("the dkv_acc callable must return a float32 tensor")
+    return produced, dkv_dst_map
+
+
+def _saved_optional(t: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+    """``t`` for ``ctx.save_for_backward``, or a zero-size placeholder on ``like``'s device when absent: the saved
+    list keeps one fixed length and order (non-reentrant checkpointing matches recomputed saved tensors by
+    position), and the presence flags travel separately."""
+    return t if t is not None else like.new_empty(0)
 
 
 # ---------------------------------------------------------------------------
@@ -1112,8 +1193,10 @@ def offset_gather_kv_indices(
     causal: bool = False,
     out: Optional[torch.Tensor] = None,
     return_topk_length: bool = False,
+    compact: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
 ):
-    """Turn per-document key indices into global key rows.
+    """Turn per-document key indices into global key rows (the torch twin of the index-preparation stage).
 
     ``gather_kv_indices [T, topk]`` holds, for query row ``t`` of document
     ``d``, key positions relative to the document's first key
@@ -1128,18 +1211,31 @@ def offset_gather_kv_indices(
     dropped.  The result addresses the packed ``kv_*`` tensors; invalid slots
     become ``-1``.  A zero-length query segment contributes no rows.
 
-    This glue counts in the step time of the varlen entry and is launch-bound
-    (a ``[T, topk]`` pass is 5-10 us of GPU time against ~10 us of dispatch),
-    so it runs with as few launches as the rule allows: a handful of ``[T]``
+    This is the reference formulation the tests hold the index-preparation
+    stage to, and the fallback of the rope varlen entry where the stage is not
+    available (host tensors, a device the NoPE record does not serve); the
+    varlen entries themselves launch the stage.  It is launch-bound (a
+    ``[T, topk]`` pass is 5-10 us of GPU time against ~10 us of dispatch), so
+    it runs with as few launches as the rule allows: a handful of ``[T]``
     int32 ops for the per-row document data, then two compares into one bool
     mask (``0 <= idx`` and ``idx <= bound`` -- the bound is the row's own key
     position with ``causal``, itself ``< seqlen_k``, and ``seqlen_k - 1``
     otherwise) and one ``where`` over ``idx + key_base``.  With
     ``return_topk_length=True`` the per-row ``topk_length`` (last valid slot
-    + 1; bitwise what :func:`derive_topk_length` computes from the result) is
+    + 1 of the result row under the rule ``0 <= idx < num_kv``, 0 if none) is
     derived from the same mask with one ``where`` and one ``amax`` and the
     function returns ``(indices, topk_length)``.  Runs on device without a
     host synchronization, in int32 throughout.
+
+    ``compact=True`` (the stage's ``compact = 1`` mode) is the stable compaction
+    of the same rows: every row holds its valid globalized keys first, in
+    ascending slot order, then ``-1``, and the returned ``topk_length`` is the
+    valid count (a stable ``argsort`` of the validity mask over the default
+    result).  Rows whose valid slots already come first are byte-identical to
+    the default form, and the count equals their last valid slot + 1.  A
+    caller ``topk_length`` (int32 ``[T]``; the stage's ``length_in``) is a
+    position cut applied before compaction: slots at positions ``>=
+    topk_length[t]`` are invalid regardless of content.
 
     Caller-owned invariants of the prefix sums (checked by
     :func:`validate_cu_seqlens`, which the NoPE varlen entries run by default;
@@ -1175,6 +1271,22 @@ def offset_gather_kv_indices(
     # [T, topk] passes: two int32 compares into one bool mask, one add, one where
     valid = local >= 0
     valid &= local <= bound[:, None]
+    if topk_length is not None:
+        if topk_length.shape != (total_q,) or topk_length.dtype != torch.int32:
+            raise ValueError("topk_length must be an int32 [T] tensor")
+        valid &= _slot_positions(topk, device) <= topk_length[:, None]
+    if compact:
+        # valid slots first in ascending slot order (a stable sort of the validity mask), -1 after
+        order = torch.argsort((~valid).to(torch.int8), dim=-1, stable=True)
+        globalized = torch.where(valid, local + key_base[:, None], -1)
+        result = (
+            globalized.gather(-1, order)
+            if out is None
+            else torch.gather(globalized, -1, order, out=out)
+        )
+        if not return_topk_length:
+            return result
+        return result, valid.sum(dim=-1, dtype=torch.int32)
     if out is None:
         result = torch.where(valid, local + key_base[:, None], -1)
     else:
@@ -1260,27 +1372,6 @@ def _slot_positions(topk: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(1, int(topk) + 1, device=device, dtype=torch.int32)
         _SLOT_POSITIONS[key] = pos
     return pos
-
-
-def derive_topk_length(indices: torch.Tensor, num_kv: int) -> torch.Tensor:
-    """``[T]`` int32: position of the last valid slot + 1 per row (0 for a fully masked row).
-
-    The public entries' default when the caller passes no ``topk_length``: a slot
-    is valid iff ``0 <= idx < num_kv`` (``idx == clamp(idx, 0, num_kv - 1)`` for
-    int32 ``idx``), every slot past the last valid one is invalid, so the kernels
-    may skip the trailing invalid key blocks while the masking semantics -- and
-    the results -- stay those of the full row.  Four small launches (clamp, eq,
-    where, amax) on device, no host synchronization.
-    """
-    if indices.ndim != 2 or indices.dtype != torch.int32:
-        raise ValueError("indices must be an int32 [T, topk] tensor")
-    T, topk = indices.shape
-    S = int(num_kv)
-    if S < 1:
-        return torch.zeros((T,), dtype=torch.int32, device=indices.device)
-    pos = _slot_positions(topk, indices.device)
-    valid = indices == indices.clamp(0, S - 1)
-    return torch.where(valid, pos, 0).amax(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1638,6 +1729,9 @@ def _plan(
         sm_scale=scale,
         scale_log2=scale * LOG2E,
         num_rows=T * NUM_HEADS,  # bwd_delta: (token, head) rows
+        # bwd_delta: dout's token / head strides and the pointer's element offset (the strided delta kernel reads
+        # a head-major or any other admissible view in place; with contiguous strides it is bitwise the dense form)
+        **_dout_stride_constants(dout),
         latent_groups=S * D_LATENT // 32,  # bwd_cast: permuted 32-element groups
         rope_groups=S * D_ROPE // 32,
         out_f32=scalars["out_f32"],
@@ -2640,9 +2734,14 @@ def backward(
     force / disable the direct path of a ``dkv_acc`` binding) and
     ``check_dst_map`` (default ``False``; ``True`` validates the values of
     ``dkv_dst_map`` on every call, one device synchronization) as in
-    :func:`prepare_dsa_train`.  A strided ``dout`` is copied once (the delta
-    stage reads it densely); a call without query rows returns empty ``dq`` and
-    zero ``dkv`` gradients without launching.
+    :func:`prepare_dsa_train`.  An admissible strided ``dout`` (the head-major
+    ``[512, T * 512, 1]`` view an output projection hands back, or any view
+    under the layout rules of ``q_latent``) is read in place by the delta stage
+    (token / head strides) and the main stage (stride-carrying tensor map); a
+    view the TMA descriptor cannot address (base not 16-byte aligned, strides
+    not multiples of 8 elements, channel stride != 1) is copied once.  A call
+    without query rows returns empty ``dq`` and zero ``dkv`` gradients without
+    launching.
     """
     if dkv_acc is not None and dkv_fp32:
         raise ValueError(
@@ -2650,7 +2749,7 @@ def backward(
         )
     if dkv_dst_map is not None and dkv_acc is None:
         raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
-    if not dout.is_contiguous():
+    if not _dout_admissible(dout):
         dout = dout.contiguous()
     if _no_query_rows(q_latent):
         return _empty_backward(
@@ -2731,10 +2830,17 @@ def backward(
 class DSASparseAttentionFunction(torch.autograd.Function):
     """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward.
 
-    ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients into the
-    caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``.  ``dkv_direct`` (default
-    ``None``: the record's size rule; ``True`` / ``False`` force / disable the direct path) and ``check_dst_map``
-    (default ``False``; ``True`` validates the map's values in the backward) are handed to :func:`backward`.
+    Every tensor the forward produces or consumes for the backward goes through ``ctx.save_for_backward`` (nine
+    tensors in a fixed order, a zero-size placeholder for an absent ``topk_length``): under non-reentrant
+    activation checkpointing they are released after the forward and recomputed, and nothing else of size is kept
+    on ``ctx``.  ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients
+    into the caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``; ``dkv_acc`` is a
+    tensor (caller-owned: validated here and kept on ``ctx`` as before, free to be zeroed in place between the
+    forward and the backward) or a zero-argument callable producing it (or an ``(accumulator, dkv_dst_map)`` pair)
+    at backward time, so the accumulator need not exist at forward time (:data:`DkvAccSource`; a callable's result
+    is validated in the backward).  ``dkv_direct`` (default ``None``: the record's size rule; ``True`` /
+    ``False`` force / disable the direct path) and ``check_dst_map`` (default ``False``; ``True`` validates the
+    map's values in the backward) are handed to :func:`backward`.
     """
 
     @staticmethod
@@ -2772,15 +2878,35 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         ctx.key_passes = key_passes
         ctx.num_segments = int(num_segments)
         ctx.has_topk_length = topk_length is not None
-        # The packed accumulator is mutated in place by the backward (+=), so it is kept on ctx rather than saved: a
-        # saved tensor's version check would reject that mutation when the graph is retained for another backward.
-        ctx.dkv_acc = dkv_acc
-        ctx.dkv_dst_map = dkv_dst_map
         ctx.dkv_direct = dkv_direct
         ctx.check_dst_map = check_dst_map
-        saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo]
-        saved.append(topk_length if topk_length is not None else indices.new_empty(0))
-        ctx.save_for_backward(*saved)
+        if dkv_dst_map is not None and dkv_acc is None:
+            raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
+        # A tensor accumulator is validated now and kept on ``ctx`` as before (caller-owned, outside the saved list:
+        # the checkpoint frame holds the Function's inputs anyway, and no version counter is involved).  A callable
+        # (no tensor yet) is kept as the zero-size state it is and resolved in the backward; ``check_dst_map`` then
+        # synchronizes there.
+        acc_tensor = dkv_acc if isinstance(dkv_acc, torch.Tensor) else None
+        if acc_tensor is not None:
+            _check_dkv_acc(acc_tensor, dkv_dst_map, int(kv_latent.shape[0]))
+        elif dkv_acc is not None and not callable(dkv_acc):
+            raise TypeError(
+                "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+            )
+        ctx.dkv_acc = acc_tensor
+        ctx.dkv_dst_map = dkv_dst_map
+        ctx.dkv_acc_source = None if acc_tensor is not None else dkv_acc
+        ctx.save_for_backward(
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            lse,
+            o_lo,
+            _saved_optional(topk_length, indices),
+        )
         return out, lse
 
     @staticmethod
@@ -2791,8 +2917,20 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             )
         if dout is None:  # out unused downstream
             return (None,) * 14
-        q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
-            ctx.saved_tensors
+        (
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            lse,
+            o_lo,
+            topk_length,
+        ) = ctx.saved_tensors
+        dkv_acc, dkv_dst_map = _resolve_dkv_acc(
+            ctx.dkv_acc if ctx.dkv_acc is not None else ctx.dkv_acc_source,
+            ctx.dkv_dst_map,
         )
         dq_latent, dq_rope, dkv_latent, dk_rope = backward(
             q_latent,
@@ -2807,8 +2945,8 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
             key_passes=ctx.key_passes,
-            dkv_acc=ctx.dkv_acc,
-            dkv_dst_map=ctx.dkv_dst_map,
+            dkv_acc=dkv_acc,
+            dkv_dst_map=dkv_dst_map,
             num_segments=ctx.num_segments,
             dkv_direct=ctx.dkv_direct,
             check_dst_map=ctx.check_dst_map,
@@ -2828,7 +2966,7 @@ def dsa_sparse_attention(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     dkv_direct: Optional[bool] = None,
@@ -2843,7 +2981,15 @@ def dsa_sparse_attention(
     FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
     rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
     key row, default identity) are handed to the backward; with ``dkv_acc``
-    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``dkv_direct``
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``dkv_acc`` may
+    also be a zero-argument callable that the backward calls for the
+    accumulator -- or for an ``(accumulator, dkv_dst_map)`` pair -- so that it
+    need not exist at forward time (:data:`DkvAccSource`; under activation
+    checkpointing a tensor passed at forward time is alive for every layer at
+    once, a deferred one only during its backward).  Every tensor this call
+    produces for the backward is saved through ``ctx.save_for_backward``; a
+    tensor ``dkv_acc`` stays caller-owned on the node: a checkpointed forward
+    retains nothing of this call.  ``dkv_direct``
     (default ``None``: the record's size rule; ``True`` / ``False`` force /
     disable the direct accumulation of a ``dkv_acc`` binding) and
     ``check_dst_map`` (default ``False``; ``True`` validates the values of
@@ -2852,8 +2998,8 @@ def dsa_sparse_attention(
     is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
     a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
     backward's whole-row key-range passes apply to one-segment rows only.
-    Without ``topk_length`` the per-row lengths (last valid slot + 1, what
-    :func:`derive_topk_length` computes) are derived once per step by the
+    Without ``topk_length`` the per-row lengths (last valid slot + 1 under
+    the rule ``0 <= idx < num_kv``, 0 if none) are derived once per step by the
     forward kernel itself while it runs -- no separate launch -- into a fresh
     ``[T]`` tensor that is saved for the backward, so both kernels skip the
     trailing invalid key blocks of short rows; the results are those of the
@@ -2902,39 +3048,68 @@ def dsa_sparse_attention_varlen(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
 ):
-    """Packed multi-document form: per-document key indices are offset by
-    ``cu_seqlens_k`` on device (this glue counts in the step time), then the flat
-    kernels run over the packed rows.  Query and key segment lengths may differ
-    (the query segment is the tail of its key prefix); with ``causal=True`` the
+    """Packed multi-document form: per-document key indices are turned into
+    global key rows on device in one launch of the NoPE record's
+    index-preparation stage (:func:`_rope_varlen_index_mode`; the torch twin
+    ``offset_gather_kv_indices(..., compact=True)`` where the stage is not
+    available: host tensors, a device the record does not serve, a
+    non-contiguous prefix sum -- both routes agree bitwise), then the flat
+    kernels run over the packed rows.  Each row is compacted: its valid keys
+    come first in ascending slot order, then ``-1``, and the row's length is
+    its valid count, so rows with ``-1`` holes cost their valid slots in the
+    forward and the backward.  Query and key segment lengths may differ (the
+    query segment is the tail of its key prefix); with ``causal=True`` the
     offsetting also drops selected keys after the query's own position
-    ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`); the
-    default ``causal=False`` keeps the index rows as is (the behaviour of the
-    first release).  Without an explicit ``topk_length`` the per-row lengths
-    come out of the same glue pass (no separate derivation).
-    ``max_seqlen_q/k`` are accepted for signature parity and not used on the
-    host.  ``dkv_acc`` / ``dkv_dst_map`` / ``dkv_direct`` (default ``None``) /
-    ``check_dst_map`` (default ``False``) as in :func:`dsa_sparse_attention`.
-    The segment count ``len(cu_seqlens_k) - 1`` (host metadata, no device
-    sync) is passed on as ``num_segments``: with more than one segment the
-    backward plans the single-pass stage unless ``key_passes`` overrides."""
+    ``(seqlen_k - seqlen_q) + local_q``; the default ``causal=False`` keeps the
+    index rows as is (the behaviour of the first release).  A caller
+    ``topk_length`` is a position cut applied before compaction (slots at
+    positions ``>= topk_length[t]`` are invalid regardless of content); the
+    kernels then read the compacted rows and their counts.  ``max_seqlen_q/k``
+    are accepted for signature parity and not used on the host.  ``dkv_acc`` /
+    ``dkv_dst_map`` / ``dkv_direct`` (default ``None``) / ``check_dst_map``
+    (default ``False``) as in :func:`dsa_sparse_attention`.  The segment count
+    ``len(cu_seqlens_k) - 1`` (host metadata, no device sync) is passed on as
+    ``num_segments``: with more than one segment the backward plans the
+    single-pass stage unless ``key_passes`` overrides.  The autograd function
+    saves the compacted rows and counts for the backward."""
     del max_seqlen_q, max_seqlen_k
-    if topk_length is None:
-        # one glue pass: global rows and the per-row lengths from the same validity mask
-        indices, topk_length = offset_gather_kv_indices(
+    num_queries = int(q_latent.shape[0])
+    if (
+        _rope_varlen_index_mode(
+            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, num_queries
+        )
+        == "index_prep"
+    ):
+        arch = _nope_arch(gather_kv_indices)
+        topk = int(gather_kv_indices.shape[1])
+        device = gather_kv_indices.device
+        indices = _alloc((num_queries, topk), torch.int32, device)
+        lengths = _alloc((num_queries,), torch.int32, device)
+        _launch_index_prep(
+            arch,
+            gather_kv_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            out=indices,
+            topk_length=lengths,
+            compact=True,
+            length_in=topk_length,
+        )
+    else:
+        indices, lengths = offset_gather_kv_indices(
             gather_kv_indices,
             cu_seqlens_q,
             cu_seqlens_k,
             causal=causal,
             return_topk_length=True,
-        )
-    else:
-        indices = offset_gather_kv_indices(
-            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
+            compact=True,
+            topk_length=topk_length,
         )
     return dsa_sparse_attention(
         q_latent,
@@ -2942,7 +3117,7 @@ def dsa_sparse_attention_varlen(
         kv_latent,
         k_rope,
         indices,
-        topk_length=topk_length,
+        topk_length=lengths,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
         key_passes=key_passes,
@@ -2980,6 +3155,14 @@ def dsa_sparse_attention_varlen(
 # main stage reads it through a stride-carrying tensor map and the delta stage
 # through the token / head strides and element offset the launcher passes, so no
 # host copy is made.
+#
+# Index rows with ``-1`` holes: the kernels work up to the last valid slot of a
+# row (or its ``topk_length``), so the public autograd entries compact every
+# row on device through the index-preparation stage before the forward (stable:
+# valid keys first in ascending slot order, then ``-1``; the length becomes the
+# valid count) -- the varlen entry in its document mode, the flat entry without
+# caller lengths in the stage's flat mode.  The kernel-level entries and the
+# prepared runner read rows as given; ``nope_compact_indices`` is their recipe.
 
 
 def _main_accumulator_constants_nope(
@@ -3138,15 +3321,7 @@ def _plan_nope(
         num_rows=T * NUM_HEADS,  # delta: (token, head) rows
         # delta: dout's token / head strides in elements and the element offset of the pointer the launcher
         # passes (the validated view itself, 16-byte aligned: offset 0); both strides are multiples of 8
-        **(
-            dict(
-                dout_token_stride=int(dout.stride(0)),
-                dout_head_stride=int(dout.stride(1)),
-                dout_offset=0,
-            )
-            if dout is not None
-            else {}
-        ),
+        **_dout_stride_constants(dout),
         latent_groups=S * D_LATENT // 32,  # cast: permuted 32-element groups
         rope_groups=0,  # cast: no rope part
         out_f32=scalars["out_f32"],
@@ -3315,9 +3490,14 @@ def _bound_values_nope(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
     # the converting forward's pointer operands under ``convert = 0``: the index operand stands as ``indices_out``
-    # and a per-device int32 constant as the prefix sums (valid pointers the kernel never reads)
+    # -- as the contiguous span of its storage when the rows are a strided view (a column slice of a wider
+    # buffer): the binding takes contiguous pointer operands and the kernel never reads it -- and a per-device
+    # int32 constant as the prefix sums (valid pointers the kernel never reads)
     inert_cu = _inert_cu_seqlens(t["indices"].device)
-    values.update(indices_out=indices, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
+    indices_out = (
+        indices if indices.is_contiguous() else _index_storage_alias(t["indices"])[0]
+    )
+    values.update(indices_out=indices_out, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
     if plan.backward:
         dst_map = (
             t["dkv_dst_map"] if t.get("dkv_dst_map") is not None else t["topk_length"]
@@ -3987,17 +4167,30 @@ def backward_nope(
 
 
 class DSASparseAttentionNopeFunction(torch.autograd.Function):
-    """Autograd wrapper of the NoPE program: saves ``q_latent``, ``kv_latent``, ``out`` and ``lse`` for the backward
-    and settles the rest of it at forward time (:class:`_NopeBackwardPrep`).
+    """Autograd wrapper of the NoPE program: saves every tensor the backward reads and settles the rest of it at
+    forward time (:class:`_NopeBackwardPrep`).
 
     Twelve forward inputs ``(q_latent, kv_latent, indices, topk_length, softmax_scale, key_passes, dkv_acc,
-    dkv_dst_map, num_segments, derive_topk_length, dkv_direct, check_dst_map)``; returns ``(out, lse)``.  The
-    backward returns ``(dq, dkv)`` for ``q_latent`` / ``kv_latent`` (``dkv`` is ``None`` when it went into
-    ``dkv_acc``) and no gradient for the ten other inputs.  The FP32 ``dkv`` of :func:`backward_nope` reaches a
-    BF16 ``kv_latent`` leaf as BF16: the autograd engine casts a gradient to the leaf's dtype.  The FP32 contract
-    therefore holds through ``dkv_acc`` (kept on ctx and validated when the forward binds it -- ``check_dst_map=True``
-    synchronizes there -- not saved: the backward mutates it in place), the eager
-    :func:`backward_nope` and the prepared runner.
+    dkv_dst_map, num_segments, derive_topk_length, dkv_direct, check_dst_map)``; returns ``(out, lse)``.  With
+    ``derive_topk_length`` (the public entry's call without caller lengths; ``topk_length`` is then ``None``) the
+    route follows the table size (:func:`nope_flat_index_mode`): below :data:`NOPE_CONVERT_SLOT_LIMIT` slots one
+    launch of the forward over the caller's rows as given, deriving each row's length (the last valid slot + 1)
+    into a fresh ``[T]`` vector, and the backward reads the caller's ``indices`` tensor with that vector -- the
+    rows are then a saved tensor, so autograd rejects an in-place edit of ``indices`` between the forward and the
+    backward (the stage route saves a fresh buffer and does not); at or above the limit the forward compacts the
+    rows through the index-preparation stage's flat mode (:func:`_flat_forward_nope`) and the backward reads the
+    compacted rows and their counts.  Otherwise the caller's rows and lengths reach both kernels as given
+    (:func:`forward_nope`).  The backward returns ``(dq, dkv)`` for ``q_latent`` / ``kv_latent``
+    (``dkv`` is ``None`` when it went into ``dkv_acc``) and no gradient for the ten other inputs.  The FP32
+    ``dkv`` of :func:`backward_nope` reaches a BF16 ``kv_latent`` leaf as BF16: the autograd engine casts a
+    gradient to the leaf's dtype.  The FP32 contract
+    therefore holds through ``dkv_acc`` -- a tensor (validated when the forward binds it; ``check_dst_map=True``
+    synchronizes there) or a zero-argument callable producing the accumulator, or an ``(accumulator,
+    dkv_dst_map)`` pair, at backward time (:data:`DkvAccSource`; validated then) -- the eager :func:`backward_nope`
+    and the prepared runner.  Seven tensors are saved in a fixed order (``q_latent, kv_latent, out, lse, o_lo,
+    indices, topk_length`` -- a zero-size placeholder when the lengths are absent): under non-reentrant
+    activation checkpointing they are released after the forward and recomputed, and the ``ctx`` keeps nothing
+    else of size; a tensor ``dkv_acc`` / ``dkv_dst_map`` is caller-owned and stays on the node (the prep).
     """
 
     @staticmethod
@@ -4016,16 +4209,40 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
         dkv_direct=None,
         check_dst_map=False,
     ):
-        out, lse, o_lo = forward_nope(
-            q_latent,
-            kv_latent,
-            indices,
-            topk_length=topk_length,
-            softmax_scale=softmax_scale,
-            derive_topk_length=derive_topk_length,
-        )
+        num_rows = int(q_latent.shape[0])
+        if derive_topk_length and topk_length is None and num_rows > 0:
+            small = (
+                indices.dim() == 2
+                and nope_flat_index_mode(num_rows, int(indices.shape[1])) == "mask"
+            )
+            if small:
+                # the small-table route: one launch over the caller's rows as given; the forward derives each
+                # row's length (last valid slot + 1) into the fresh vector the backward reads with those rows
+                topk_length = _alloc((num_rows,), torch.int32, q_latent.device)
+                out, lse, o_lo = forward_nope(
+                    q_latent,
+                    kv_latent,
+                    indices,
+                    topk_length=topk_length,
+                    softmax_scale=softmax_scale,
+                    derive_topk_length=True,
+                )
+            else:
+                out, lse, o_lo, indices, topk_length = _flat_forward_nope(
+                    q_latent, kv_latent, indices, softmax_scale
+                )
+        else:
+            out, lse, o_lo = forward_nope(
+                q_latent,
+                kv_latent,
+                indices,
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+                derive_topk_length=derive_topk_length,
+            )
         ctx.set_materialize_grads(False)
         ctx.nope_prep = _NopeBackwardPrep(
+            ctx,
             q_latent,
             kv_latent,
             indices,
@@ -4041,7 +4258,6 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
-        ctx.save_for_backward(q_latent, kv_latent, out, lse)
         return out, lse
 
     @staticmethod
@@ -4058,28 +4274,33 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
 class _NopeBackwardPrep:
     """What the NoPE autograd wrappers settle at forward time for their backward, so that the backward's host work
     before its first launch is the completion of the binding key with ``dout``'s geometry, the cache lookup, the
-    two fresh allocations and the binding of the launch values: the key without ``dout``, the backward's operands
-    that autograd does not save (the index rows, ``o_lo``, the lengths, the cast's placeholders), the caller's
-    accumulator (validated once here, :func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) and the options.
-    The autograd-saved ``q_latent`` / ``kv_latent`` / ``out`` / ``lse`` join at backward time."""
+    two fresh allocations and the binding of the launch values: the options, the geometry key without ``dout`` and
+    without the accumulator, and the presence flag of the lengths.  It holds no produced tensor: the saved outputs,
+    the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order (seven
+    tensors), so that under activation checkpointing nothing of size outlives the forward.  The caller-owned
+    accumulator stays here as before -- a tensor ``dkv_acc`` (validated here, :func:`_check_dkv_acc`;
+    ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map`` in ``operands`` -- or as the
+    zero-argument callable a deferred accumulator comes from, resolved and validated in the backward
+    (:data:`DkvAccSource`)."""
 
     __slots__ = (
-        "indices",
-        "o_lo",
-        "topk_length",
         "softmax_scale",
         "key_passes",
         "num_segments",
+        "dkv_direct",
+        "check_dst_map",
+        "has_topk_length",
         "dkv_acc",
         "dkv_dst_map",
-        "dkv_direct",
+        "dkv_acc_source",
         "operands",
         "key_head",
-        "key_tail",
+        "key_mid",
     )
 
     def __init__(
         self,
+        ctx,
         q_latent,
         kv_latent,
         indices,
@@ -4097,32 +4318,31 @@ class _NopeBackwardPrep:
     ):
         if dkv_dst_map is not None and dkv_acc is None:
             raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
-        self.indices, self.o_lo, self.topk_length = indices, o_lo, topk_length
         self.softmax_scale = float(softmax_scale)
         self.key_passes, self.num_segments = key_passes, int(num_segments)
-        self.dkv_acc, self.dkv_dst_map, self.dkv_direct = (
-            dkv_acc,
-            dkv_dst_map,
-            dkv_direct,
-        )
-        inert_f32, inert_bf16 = _inert_placeholders(q_latent.device)
-        operands = dict(
-            indices=indices, o_lo=o_lo, inert_f32=inert_f32, inert_bf16=inert_bf16
-        )
-        if topk_length is not None:
-            operands["topk_length"] = topk_length
-        if dkv_acc is not None:
-            operands["dkv_acc"], _row_stride = _check_dkv_acc(
-                dkv_acc,
+        self.dkv_direct, self.check_dst_map = dkv_direct, bool(check_dst_map)
+        acc_tensor = dkv_acc if isinstance(dkv_acc, torch.Tensor) else None
+        self.operands = {}
+        if acc_tensor is not None:
+            # caller-owned: validated (and its map's values checked) now, the pointer operand bound now
+            self.operands["dkv_acc"], _row_stride = _check_dkv_acc(
+                acc_tensor,
                 dkv_dst_map,
                 int(kv_latent.shape[0]),
                 check_dst_map=check_dst_map,
                 min_cols=D_LATENT,
             )
             if dkv_dst_map is not None:
-                operands["dkv_dst_map"] = dkv_dst_map
-        self.operands = operands
-        # the backward key with dout's slot (index 7) left open: completed per backward call
+                self.operands["dkv_dst_map"] = dkv_dst_map
+        elif dkv_acc is not None and not callable(dkv_acc):
+            raise TypeError(
+                "dkv_acc must be a float32 tensor or a zero-argument callable returning it"
+            )
+        self.dkv_acc, self.dkv_dst_map = acc_tensor, dkv_dst_map
+        self.dkv_acc_source = None if acc_tensor is not None else dkv_acc
+        self.has_topk_length = topk_length is not None
+        # the backward key with dout's slot (index 7) and the accumulator's geometry (indices 12, 13) left open:
+        # completed per backward call
         key = backward_binding_key_nope(
             q_latent,
             kv_latent,
@@ -4135,65 +4355,103 @@ class _NopeBackwardPrep:
             self.softmax_scale,
             key_passes,
             self.num_segments,
-            dkv_acc,
-            dkv_dst_map,
+            None,
+            None,
             dkv_direct,
         )
-        self.key_head, self.key_tail = key[:7], key[8:]
+        self.key_head, self.key_mid = key[:7], key[8:12]
+        ctx.save_for_backward(
+            q_latent,
+            kv_latent,
+            out,
+            lse,
+            o_lo,
+            indices,
+            _saved_optional(topk_length, indices),
+        )
 
-    def backward(
-        self, q_latent, kv_latent, out, lse, dout
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def backward(self, saved, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q_latent, kv_latent, out, lse, o_lo, indices, topk_length = saved
+        topk_length = topk_length if self.has_topk_length else None
+        dkv_acc, dst_map = _resolve_dkv_acc(
+            self.dkv_acc if self.dkv_acc is not None else self.dkv_acc_source,
+            self.dkv_dst_map,
+        )
         if _no_query_rows(q_latent):
             return backward_nope(
                 q_latent,
                 kv_latent,
-                self.indices,
+                indices,
                 out,
-                self.o_lo,
+                o_lo,
                 lse,
                 dout,
-                topk_length=self.topk_length,
+                topk_length=topk_length,
                 softmax_scale=self.softmax_scale,
                 key_passes=self.key_passes,
-                dkv_acc=self.dkv_acc,
-                dkv_dst_map=self.dkv_dst_map,
+                dkv_acc=dkv_acc,
+                dkv_dst_map=dst_map,
                 num_segments=self.num_segments,
                 dkv_direct=self.dkv_direct,
             )
-        key = self.key_head + (_geometry(dout),) + self.key_tail
+        key = (
+            self.key_head
+            + (_geometry(dout),)
+            + self.key_mid
+            + (_geometry(dkv_acc), _geometry(dst_map), self.dkv_direct)
+        )
         binding = _binding(
             key,
             lambda: _plan_nope(
                 q_latent,
                 kv_latent,
-                self.indices,
-                topk_length=self.topk_length,
+                indices,
+                topk_length=topk_length,
                 dout=dout,
                 softmax_scale=self.softmax_scale,
-                outputs=dict(out=out, lse=lse, o_lo=self.o_lo),
+                outputs=dict(out=out, lse=lse, o_lo=o_lo),
                 backward=True,
                 key_passes=self.key_passes,
-                dkv_acc=self.dkv_acc,
-                dkv_dst_map=self.dkv_dst_map,
+                dkv_acc=dkv_acc,
+                dkv_dst_map=dst_map,
                 num_segments=self.num_segments,
                 dkv_direct=self.dkv_direct,
             ),
             _NopeBinding,
         )
+        inert_f32, inert_bf16 = _inert_placeholders(q_latent.device)
         operands = dict(
-            self.operands, q_latent=q_latent, kv_latent=kv_latent, out=out, lse=lse
+            q_latent=q_latent,
+            kv_latent=kv_latent,
+            indices=indices,
+            out=out,
+            lse=lse,
+            o_lo=o_lo,
+            topk_length=topk_length if topk_length is not None else binding.topk_length,
+            inert_f32=inert_f32,
+            inert_bf16=inert_bf16,
         )
-        if self.topk_length is None:
-            operands["topk_length"] = binding.topk_length
+        if self.dkv_acc is not None:
+            # the tensor accumulator: validated and bound at forward time
+            operands.update(self.operands)
+        elif dkv_acc is not None:
+            # a callable's result is validated here, including the map's values when asked for
+            operands["dkv_acc"], _row_stride = _check_dkv_acc(
+                dkv_acc,
+                dst_map,
+                int(kv_latent.shape[0]),
+                check_dst_map=self.check_dst_map,
+                min_cols=D_LATENT,
+            )
+            if dst_map is not None:
+                operands["dkv_dst_map"] = dst_map
         return binding.launch_backward(operands, dout)
 
 
 def _nope_backward_from_ctx(ctx, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """``(dq, dkv)`` of the NoPE autograd wrappers: the backward the forward settled (:class:`_NopeBackwardPrep`)
-    over the autograd-saved tensors."""
-    q_latent, kv_latent, out, lse = ctx.saved_tensors
-    return ctx.nope_prep.backward(q_latent, kv_latent, out, lse, dout)
+    over the saved tensors."""
+    return ctx.nope_prep.backward(ctx.saved_tensors, dout)
 
 
 def dsa_sparse_attention_nope(
@@ -4205,7 +4463,7 @@ def dsa_sparse_attention_nope(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     num_segments: int = 1,
     dkv_direct: Optional[bool] = None,
@@ -4217,18 +4475,31 @@ def dsa_sparse_attention_nope(
     leaf through the view).  ``softmax_scale`` defaults to 1/16.  Without ``dkv_acc`` the ``kv_latent`` gradient
     of the autograd call is the FP32 ``dkv`` of :func:`backward_nope` cast by the autograd engine to the leaf's
     dtype (BF16 for a BF16 leaf); with ``dkv_acc`` the FP32 ``dK + dV`` is accumulated into it and the
-    ``kv_latent`` gradient is ``None``.  ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct``,
-    ``check_dst_map`` and the row-length handling as in :func:`dsa_sparse_attention`.
+    ``kv_latent`` gradient is ``None``.  ``dkv_acc`` is a tensor or a zero-argument callable producing it (or an
+    ``(accumulator, dkv_dst_map)`` pair) at backward time (:data:`DkvAccSource`), so the accumulator need not exist
+    at forward time; every tensor this call produces for the backward is saved through ``ctx.save_for_backward``
+    (a tensor ``dkv_acc`` stays caller-owned on the node) and a checkpointed forward retains nothing of this call.
+    ``key_passes``, ``dkv_dst_map``, ``num_segments``, ``dkv_direct`` and
+    ``check_dst_map`` as in :func:`dsa_sparse_attention`.  Without ``topk_length`` the route follows the table
+    size (:func:`nope_flat_index_mode`).  Below :data:`NOPE_CONVERT_SLOT_LIMIT` slots the forward kernel alone
+    reads the index rows (any row stride) as given and derives each row's length -- the last valid slot + 1 --
+    while it runs, into a ``[T]`` vector the backward reads with the caller's rows: one launch, a ``-1`` anywhere
+    stays a masked slot at its position, and the caller's ``indices`` tensor is a saved tensor until the backward
+    (autograd rejects an in-place edit of it in between).  At or above the limit the rows are compacted on device
+    in one launch of the index-preparation stage right before the forward kernel: each row's valid keys (``0 <=
+    idx < S``) first in ascending slot order, then ``-1``, with the valid count as the row's length -- into a fresh
+    ``[T, K_slots]`` buffer and a ``[T]`` vector that the backward reads, so rows with ``-1`` holes cost their
+    valid slots in both kernels and the caller's tensor is left untouched.  Hole-free rows give the same bytes on
+    either route.  With ``topk_length`` the rows and lengths reach the kernels as given (slots ``>=
+    topk_length[t]`` invalid; work up to the last valid slot): callers with holes and lengths compact first with
+    :func:`nope_compact_indices`.
     """
     kv_latent = _kv_latent_rows(kv_latent)
     if softmax_scale is None:
         softmax_scale = NOPE_SOFTMAX_SCALE
-    derive = False
-    if topk_length is None and q_latent.shape[0] > 0:
-        topk_length = torch.empty(
-            (int(q_latent.shape[0]),), dtype=torch.int32, device=q_latent.device
-        )
-        derive = True
+    # without caller lengths the Function derives them (derive_topk_length): in-kernel below the slot limit, as
+    # the counts of the flat stage at or above it
+    derive = topk_length is None and q_latent.shape[0] > 0
     out, lse = DSASparseAttentionNopeFunction.apply(
         q_latent,
         kv_latent,
@@ -4251,15 +4522,26 @@ def dsa_sparse_attention_nope(
 # ---------------------------------------------------------------------------
 
 # The NoPE record's index-preparation stage (``"index_prep"``, first in the record's stage list: it runs before
-# ``nope_fwd``): one warp per index row, INDEX_PREP_ROWS_PER_CTA rows per 128-thread CTA.  Its torch formulation,
-# ``offset_gather_kv_indices``, stays the rope varlen entry's glue and the reference the tests hold the stage to.
+# ``nope_fwd``): one warp per index row, INDEX_PREP_ROWS_PER_CTA rows per 128-thread CTA.  Under ``compact = 1`` it
+# writes every row stably compacted (valid globalized keys first in ascending slot order, then ``-1``) and the
+# valid count as the row's length, after the position cut of an optional ``length_in`` vector; ``compact = 0`` is
+# the position-preserving rewrite with last valid slot + 1.  Its torch formulation, ``offset_gather_kv_indices``
+# (``compact=True`` for the compacting mode), is the reference the tests hold the stage to and the rope varlen
+# entry's fallback where the stage is not available.  The rope varlen entry launches the stage at every size; the
+# NoPE entries launch it at or above :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths -- the varlen
+# entry also with caller lengths at every size, the flat entry with caller lengths never (the forward alone over
+# the rows and lengths as given) -- and take the one-launch position-preserving forward below it
+# (:func:`nope_varlen_index_mode`, :func:`nope_flat_index_mode`).
 NOPE_INDEX_PREP_STAGE = "index_prep"
 INDEX_PREP_ROWS_PER_CTA = 4
 # Launch arguments a forward program that converts the per-document rows itself appends to its argument list
 # (``cake_launch.STAGE_ARGS["nope_fwd"]``), in this order: the prefix sums, the global-row output the backward
-# consumes, the document count and its search depth, the causal flag, and ``convert`` (0: global rows in, the
-# per-document operands never read; 1: per-document rows in, the lengths derived in-kernel).  The packed entry then
-# needs no index-preparation launch.
+# consumes, the document count and its search depth, the causal flag, and ``convert`` -- 0: global rows in, the
+# per-document operands never read; :data:`NOPE_CONVERT_COMPACT` (1): per-document rows in, written to
+# ``indices_out`` stably compacted (valid global keys first, then ``-1``) with the valid count as the length;
+# :data:`NOPE_CONVERT_MASK` (2): per-document rows in, written to ``indices_out`` position-preserving (the global
+# key or ``-1`` at the slot it came from) with the last valid slot + 1 as the length.  Both non-zero values derive
+# the lengths in-kernel; the packed entry then needs no index-preparation launch.
 NOPE_FWD_CONVERT_ARGS = (
     "cu_seqlens_q",
     "cu_seqlens_k",
@@ -4269,9 +4551,21 @@ NOPE_FWD_CONVERT_ARGS = (
     "causal",
     "convert",
 )
-# Index tables (``T x K_slots``) below this many slots take the converting forward: one launch, so no host gap
-# between a preparation launch and the forward.  At or above it the preparation stage runs first and the forward
-# takes its rows: on large tables the preparation kernel converts faster than the forward's own producer path.
+NOPE_CONVERT_COMPACT = 1
+NOPE_CONVERT_MASK = 2
+# Index tables (``T x K_slots``) with fewer slots than this take the one-launch position-preserving forward: the
+# rows reach the kernel as given (a ``-1`` anywhere stays a masked slot at its position) and the forward derives
+# each row's length -- the last valid slot + 1 -- itself, so no host gap separates a preparation launch from the
+# forward.  At or above the limit the compacting preparation stage runs first (valid keys first, the count as the
+# length) and the forward follows over its rows back to back; on the varlen entry a caller ``topk_length`` takes
+# the stage at every size (the cut it applies before compacting), on the flat entry it skips the stage (rows and
+# lengths as given).  The rule reads the table size alone -- the host cannot see holes
+# without a device sync -- so a small table with holes pays the position-preserving cost of its holes (bounded by
+# its size); hole-free rows give the same bytes on either route.  The value is a measured crossover: the largest
+# measured table at which the one-launch forward stays within 0.95x of the stage route on the eager forward and
+# within 1.02x on the GPU-busy step, plus one, rounded up to the next power of two when the next measured table
+# also stays within 1.02x on the GPU-busy step.  Measured on GB200 and GB300 (CUDA 13.4): tables up to 1024 x 512
+# qualify and the two one-million-slot tables (4096 x 256, 1024 x 1024) meet the step gate, so the limit is 1 << 20.
 NOPE_CONVERT_SLOT_LIMIT = 1 << 20
 _INT32_MAX = 2**31 - 1
 
@@ -4296,6 +4590,36 @@ def nope_index_prep_available(device: Optional[torch.device] = None) -> bool:
     return NOPE_INDEX_PREP_STAGE in record
 
 
+def _rope_varlen_index_mode(
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_queries: int,
+) -> str:
+    """The rope varlen entry's index route: ``"index_prep"`` -- one launch of the NoPE record's index-preparation
+    stage -- when the rows are int32 CUDA ``[T, K_slots]`` with ``T >= 1`` on a device the record serves with the
+    stage and the prefix sums are contiguous int32 ``[num_docs + 1]`` tensors of one length (the stage's binding
+    takes contiguous pointer operands); ``"torch"`` otherwise -- the twin ``offset_gather_kv_indices(...,
+    compact=True)``, which accepts host tensors, ``T == 0`` and strided prefix sums and agrees with the stage
+    bitwise.  Not :func:`varlen_index_mode`: its ``"kernel"`` branch is the NoPE forward's own conversion, which the
+    frozen rope forward does not have."""
+    if not gather_kv_indices.is_cuda or int(num_queries) < 1:
+        return "torch"
+    try:
+        _check_gather_kv_indices(
+            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, int(num_queries)
+        )
+    except ValueError:
+        return "torch"
+    if int(gather_kv_indices.shape[1]) < 1 or any(
+        cu.device != gather_kv_indices.device for cu in (cu_seqlens_q, cu_seqlens_k)
+    ):
+        return "torch"
+    if not nope_index_prep_available(gather_kv_indices.device):
+        return "torch"
+    return "index_prep"
+
+
 def nope_fwd_converts_indices() -> bool:
     """Whether the registered NoPE forward program converts per-document index rows itself: its launch argument
     list carries :data:`NOPE_FWD_CONVERT_ARGS`."""
@@ -4315,18 +4639,35 @@ def _nope_arch(tensor: torch.Tensor) -> str:
     return arch_for(tensor.device)
 
 
+def _small_index_table(num_queries: int, topk: int) -> bool:
+    """Whether a ``[num_queries, topk]`` index table is below :data:`NOPE_CONVERT_SLOT_LIMIT` slots."""
+    return int(num_queries) * int(topk) < NOPE_CONVERT_SLOT_LIMIT
+
+
 def nope_varlen_index_mode(
     num_queries: int, topk: int, *, caller_lengths: bool = False
 ) -> str:
     """The packed entry's index route for a ``[num_queries, topk]`` per-document index table, from its size alone
-    (no device or registry access): ``"kernel"`` -- the forward converts the rows itself, one launch -- below
-    :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths; ``"index_prep"`` -- one launch of the
-    index-preparation stage, then the forward over its rows -- at or above it, and always with a caller-given
-    ``topk_length`` (the converting forward derives the lengths itself)."""
+    (no device or registry access): ``"mask"`` -- the forward alone, in one launch, globalizes the rows
+    position-preserving (the global key or ``-1`` at the slot it came from) into the rows the backward reads and
+    derives each row's length as the last valid slot + 1 -- below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without a
+    caller ``topk_length``; ``"index_prep"`` -- one launch of the index-preparation stage, which compacts the rows
+    (valid keys first, the count as the length), then the forward over its rows -- at or above the limit and always
+    with caller lengths (the cut the stage applies before compacting; the one-launch forward takes no cut).  The
+    compacting one-launch mode ``"kernel"`` is never selected by size: callers name it explicitly."""
     if caller_lengths:
         return "index_prep"
-    small = int(num_queries) * int(topk) < NOPE_CONVERT_SLOT_LIMIT
-    return "kernel" if small else "index_prep"
+    return "mask" if _small_index_table(num_queries, topk) else "index_prep"
+
+
+def nope_flat_index_mode(num_queries: int, topk: int) -> str:
+    """The flat autograd entry's index route without caller lengths for a ``[num_queries, topk]`` table of global
+    rows, the same size rule as :func:`nope_varlen_index_mode`: ``"mask"`` -- one launch of the forward over the
+    caller's rows as given, deriving each row's length (the last valid slot + 1) into a fresh vector the backward
+    reads with those rows -- below :data:`NOPE_CONVERT_SLOT_LIMIT` slots; ``"index_prep"`` -- the stage's flat mode
+    compacts the rows into a fresh buffer with the valid counts, then the forward follows over them -- at or above
+    it.  With caller lengths the flat entry launches the forward alone over the rows and lengths as given."""
+    return "mask" if _small_index_table(num_queries, topk) else "index_prep"
 
 
 def varlen_index_mode(
@@ -4335,10 +4676,10 @@ def varlen_index_mode(
     """The route :func:`nope_varlen_index_mode` selects for ``gather_kv_indices`` (``[T, K_slots]`` on a served
     device), restricted to what the registered program offers: a program without the converting forward
     (:func:`nope_fwd_converts_indices`) takes ``"index_prep"`` at every size, one without the index-preparation
-    stage takes ``"kernel"`` (never with caller lengths).  Raises ``NotImplementedError`` for a host tensor, a
-    device the NoPE record does not serve, or a program with neither.  The torch formulation
-    :func:`offset_gather_kv_indices` is the rope entry's glue and the tests' reference, not a runtime mode of the
-    NoPE entries."""
+    stage takes ``"mask"`` at every size (never with caller lengths: only the stage applies a caller cut).  Raises
+    ``NotImplementedError`` for a host tensor, a device the NoPE record does not serve, or a program with neither.
+    The torch formulation :func:`offset_gather_kv_indices` is the tests' reference and the rope entry's fallback,
+    not a runtime mode of the NoPE entries."""
     _nope_arch(gather_kv_indices)
     if gather_kv_indices.dim() != 2:
         raise ValueError("gather_kv_indices must be [T, K_slots]")
@@ -4346,12 +4687,12 @@ def varlen_index_mode(
     preferred = nope_varlen_index_mode(num_rows, topk, caller_lengths=caller_lengths)
     converts = nope_fwd_converts_indices()
     record = cake_jit.record(cake_jit.NOPE_PROGRAM)
-    if preferred == "kernel" and converts:
-        return "kernel"
+    if preferred == "mask" and converts:
+        return "mask"
     if NOPE_INDEX_PREP_STAGE in record:
         return "index_prep"
     if converts and not caller_lengths:
-        return "kernel"
+        return "mask"
     if converts:
         raise NotImplementedError(
             "a caller-given topk_length with the converting NoPE forward needs the index-preparation stage "
@@ -4410,23 +4751,58 @@ def _check_gather_kv_indices(
         )
 
 
+def _check_index_rows(
+    indices: torch.Tensor, name: str, topk_length: Optional[torch.Tensor] = None
+) -> tuple[int, int]:
+    """Structure of a global index operand the flat stage reads: int32 ``[T, K_slots]`` with contiguous rows (any
+    row stride), ``K_slots >= 1``; an optional contiguous int32 ``[T]`` cut.  Returns ``(T, K_slots)``."""
+    if indices.ndim != 2 or indices.dtype != torch.int32:
+        raise ValueError(f"{name} must be an int32 [T, K_slots] tensor")
+    num_rows, topk = (int(d) for d in indices.shape)
+    if topk <= 0:
+        raise ValueError(f"{name} must have at least one slot per row (K_slots >= 1)")
+    if indices.stride(1) != 1 or (num_rows > 1 and indices.stride(0) < topk):
+        raise ValueError(f"{name} rows must be contiguous (any row stride)")
+    if topk_length is not None and (
+        topk_length.shape != (num_rows,)
+        or topk_length.dtype != torch.int32
+        or not topk_length.is_contiguous()
+    ):
+        raise ValueError("topk_length must be a contiguous int32 [T] tensor")
+    return num_rows, topk
+
+
 def _index_prep_launch(
     arch: str,
     gather_kv_indices: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
     *,
     causal: bool,
     out: torch.Tensor,
     topk_length: torch.Tensor,
+    compact: bool = False,
+    length_in: Optional[torch.Tensor] = None,
+    flat: bool = False,
+    num_kv: Optional[int] = None,
 ) -> _Launch:
     """The bound launch (not yet issued; the caller provides the FFI stream context) of one index-preparation
-    stage call over the per-document rows ``gather_kv_indices`` (int32
-    ``[T, K_slots]``, ``T >= 1``, any row stride, on a device the stage serves) with the prefix sums: the global
-    key rows (invalid slots ``-1``) go to the caller's contiguous int32 ``out [T, K_slots]``, the row lengths (last
-    valid slot + 1) to the caller's int32 ``topk_length [T]``.  Row ``t`` belongs to the last document ``n`` with
-    ``cu_seqlens_q[n] <= t``; a slot is valid iff ``0 <= idx <= bound`` with the query's own key position as the
-    bound under ``causal`` and ``seqlen_k - 1`` otherwise, and maps to ``idx + cu_seqlens_k[n]``."""
+    stage call over the index rows ``gather_kv_indices`` (int32 ``[T, K_slots]``, ``T >= 1``, any row stride, on a
+    device the stage serves): the global key rows (invalid slots ``-1``) go to the caller's contiguous int32
+    ``out [T, K_slots]``, the row lengths to the caller's int32 ``topk_length [T]``.
+
+    Modes.  Document mode (``flat=False``): row ``t`` belongs to the last document ``n`` with ``cu_seqlens_q[n] <=
+    t``; a slot is valid iff ``0 <= idx <= bound`` with the query's own key position as the bound under ``causal``
+    and ``seqlen_k - 1`` otherwise, and maps to ``idx + cu_seqlens_k[n]``.  Flat mode (``flat=True``, ``has_docs =
+    0``): the rows are global already, a slot is valid iff ``0 <= idx <= num_kv - 1``, the prefix sums are never
+    read (the per-device inert constant stands in for them; ``causal`` is ignored).  ``compact=False``: the
+    position-preserving rewrite, ``topk_length`` = last valid slot + 1 (bitwise :func:`offset_gather_kv_indices`).
+    ``compact=True``: stable compaction -- the valid globalized keys first in ascending slot order, then ``-1`` to
+    the end of the row -- and ``topk_length`` = the valid count (bitwise ``offset_gather_kv_indices(...,
+    compact=True)``); a valid-first row is a byte-identical fixed point.  ``length_in`` (contiguous int32 ``[T]``,
+    with ``compact`` only) is a position cut applied before compaction: slots at positions ``>= length_in[t]`` are
+    invalid; without it the kernel receives the ``topk_length`` output pointer as the placeholder it never reads
+    (``has_length_in = 0``)."""
     num_rows, topk = (int(d) for d in gather_kv_indices.shape)
     alias, offset, stride = _index_storage_alias(gather_kv_indices)
     for name, value in (
@@ -4435,7 +4811,23 @@ def _index_prep_launch(
         ("the index row stride", stride),
     ):
         _check_int32(name, value)
-    num_docs = int(cu_seqlens_q.numel()) - 1
+    if length_in is not None and not compact:
+        raise ValueError("length_in is a cut before compaction: it needs compact=True")
+    if flat:
+        if num_kv is None:
+            raise ValueError("the flat index-preparation mode needs num_kv")
+        inert = _inert_cu_seqlens(gather_kv_indices.device)
+        cu_seqlens_q = cu_seqlens_k = inert
+        num_docs, search_iters, causal_flag = 1, 1, 0
+        has_docs, flat_bound = 0, _check_int32("S", int(num_kv)) - 1
+    else:
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise ValueError(
+                "the document index-preparation mode needs both prefix sums"
+            )
+        num_docs = int(cu_seqlens_q.numel()) - 1
+        search_iters, causal_flag = index_prep_search_iters(num_docs), int(bool(causal))
+        has_docs, flat_bound = 1, 0
     values = dict(
         indices=alias,
         cu_seqlens_q=cu_seqlens_q,
@@ -4447,11 +4839,14 @@ def _index_prep_launch(
         idx_stride=stride,
         indices_offset=offset,
         num_docs=num_docs,
-        search_iters=index_prep_search_iters(num_docs),
-        causal=int(bool(causal)),
-        has_docs=1,
-        flat_bound=0,
+        search_iters=search_iters,
+        causal=causal_flag,
+        has_docs=has_docs,
+        flat_bound=flat_bound,
         write_out=1,
+        compact=int(bool(compact)),
+        length_in=length_in if length_in is not None else topk_length,
+        has_length_in=int(length_in is not None),
     )
     # the grid is the stage's own rule (one CTA per four rows), given explicitly
     entry = _stage_entry(
@@ -4467,12 +4862,16 @@ def _index_prep_launch(
 def _launch_index_prep(
     arch: str,
     gather_kv_indices: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
     *,
     causal: bool,
     out: torch.Tensor,
     topk_length: torch.Tensor,
+    compact: bool = False,
+    length_in: Optional[torch.Tensor] = None,
+    flat: bool = False,
+    num_kv: Optional[int] = None,
 ) -> None:
     """:func:`_index_prep_launch` issued inside the FFI stream context of the index rows' device."""
     launch = _index_prep_launch(
@@ -4483,9 +4882,21 @@ def _launch_index_prep(
         causal=causal,
         out=out,
         topk_length=topk_length,
+        compact=compact,
+        length_in=length_in,
+        flat=flat,
+        num_kv=num_kv,
     )
     with _ffi_stream_context(_device_index(gather_kv_indices.device)):
         launch()
+
+
+def _require_index_prep_stage() -> None:
+    if NOPE_INDEX_PREP_STAGE not in cake_jit.record(cake_jit.NOPE_PROGRAM):
+        raise NotImplementedError(
+            f"the registered NoPE DSA training program {cake_jit.NOPE_PROGRAM!r} has no "
+            f"index-preparation stage {NOPE_INDEX_PREP_STAGE!r}"
+        )
 
 
 def nope_globalize_indices(
@@ -4494,12 +4905,19 @@ def nope_globalize_indices(
     cu_seqlens_k: torch.Tensor,
     *,
     causal: bool = False,
+    compact: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(indices, topk_length)`` of per-document index rows in one launch of the index-preparation stage: the
     global key rows of ``gather_kv_indices`` (int32 ``[T, K_slots]``, any row stride; invalid slots ``-1``) under
     the rule of :func:`offset_gather_kv_indices` -- the query segment is the tail of its key prefix, ``causal``
-    drops keys after the query's own position -- and the per-row ``topk_length`` (last valid slot + 1).  Pure
-    integer work: bitwise what ``offset_gather_kv_indices(..., causal=causal, return_topk_length=True)`` returns.
+    drops keys after the query's own position -- and the per-row ``topk_length``.  Pure integer work.  By default
+    (``compact=False``) the rows keep their slot positions and the length is the last valid slot + 1: bitwise what
+    ``offset_gather_kv_indices(..., causal=causal, return_topk_length=True)`` returns.  ``compact=True`` compacts
+    every row stably (valid keys first in ascending slot order, then ``-1``) and returns the valid counts, after the
+    position cut of an optional caller ``topk_length`` (contiguous int32 ``[T]``; slots at positions ``>=
+    topk_length[t]`` are invalid): bitwise ``offset_gather_kv_indices(..., causal=causal, compact=True,
+    topk_length=topk_length, return_topk_length=True)``.  The public varlen entries take the compacting form.
     ``T == 0`` returns empty results without a launch; otherwise the device must be served by the NoPE record with
     the stage (``NotImplementedError``).  The prefix sums are checked for structure here (contiguous int32
     ``[num_docs + 1]``) and for their values by :func:`validate_cu_seqlens`; a violation that passes is not
@@ -4507,17 +4925,23 @@ def nope_globalize_indices(
     """
     _check_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k)
     num_rows, topk = (int(d) for d in gather_kv_indices.shape)
+    if topk_length is not None and not compact:
+        raise ValueError(
+            "topk_length is a cut before compaction: it needs compact=True"
+        )
+    if topk_length is not None and (
+        topk_length.shape != (num_rows,)
+        or topk_length.dtype != torch.int32
+        or not topk_length.is_contiguous()
+    ):
+        raise ValueError("topk_length must be a contiguous int32 [T] tensor")
     device = gather_kv_indices.device
     if num_rows == 0:
         return _alloc((0, topk), torch.int32, device), _alloc((0,), torch.int32, device)
     arch = _nope_arch(gather_kv_indices)
-    if NOPE_INDEX_PREP_STAGE not in cake_jit.record(cake_jit.NOPE_PROGRAM):
-        raise NotImplementedError(
-            f"the registered NoPE DSA training program {cake_jit.NOPE_PROGRAM!r} has no "
-            f"index-preparation stage {NOPE_INDEX_PREP_STAGE!r}"
-        )
+    _require_index_prep_stage()
     out = _alloc((num_rows, topk), torch.int32, device)
-    topk_length = _alloc((num_rows,), torch.int32, device)
+    lengths = _alloc((num_rows,), torch.int32, device)
     _launch_index_prep(
         arch,
         gather_kv_indices,
@@ -4525,9 +4949,65 @@ def nope_globalize_indices(
         cu_seqlens_k,
         causal=causal,
         out=out,
-        topk_length=topk_length,
+        topk_length=lengths,
+        compact=compact,
+        length_in=topk_length,
     )
-    return out, topk_length
+    return out, lengths
+
+
+def nope_compact_indices(
+    indices: torch.Tensor,
+    num_kv: int,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    counts: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(rows, counts)``: global index rows stably compacted in one launch of the index-preparation stage's flat
+    mode -- the recipe for the kernel-level entries (:func:`forward_nope` / :func:`backward_nope`,
+    :func:`prepare_dsa_nope_train`) and the flat autograd entry with caller lengths, which consume rows as given.
+
+    ``indices``: int32 ``[T, K_slots]`` global key rows (any row stride, read in place; ``-1`` or ``>= num_kv``
+    invalid).  Row ``t`` of ``rows`` (contiguous int32 ``[T, K_slots]``) holds the valid keys of the input row in
+    ascending slot order, then ``-1``; ``counts[t]`` (int32 ``[T]``) is their number, the ``topk_length`` to pass
+    with the rows.  A caller ``topk_length`` (contiguous int32 ``[T]``) is a position cut applied first: slots at
+    positions ``>= topk_length[t]`` are invalid.  Valid-first rows come back byte-identical with ``counts`` = last
+    valid slot + 1.  ``out`` / ``counts`` receive the results in place when given (contiguous, the right shape and
+    dtype); otherwise fresh tensors are allocated before the launch.  Nothing synchronizes with the device and the
+    launch is a plain stage launch, so a capturing caller passes its own buffers.  ``T == 0`` returns (the) empty
+    results without a launch; otherwise the device must be served by the NoPE record with the stage
+    (``NotImplementedError``).  Bitwise ``offset_gather_kv_indices(indices, [0, T], [0, num_kv], compact=True,
+    topk_length=topk_length, return_topk_length=True)``.
+    """
+    num_rows, topk = _check_index_rows(indices, "indices", topk_length)
+    if int(num_kv) < 1:
+        raise ValueError("num_kv must hold at least one key row (S > 0)")
+    _check_output(out, "out", (num_rows, topk), torch.int32)
+    _check_output(counts, "counts", (num_rows,), torch.int32)
+    device = indices.device
+    if out is None:
+        out = _alloc((num_rows, topk), torch.int32, device)
+    if counts is None:
+        counts = _alloc((num_rows,), torch.int32, device)
+    if num_rows == 0:
+        return out, counts
+    arch = _nope_arch(indices)
+    _require_index_prep_stage()
+    _launch_index_prep(
+        arch,
+        indices,
+        None,
+        None,
+        causal=False,
+        out=out,
+        topk_length=counts,
+        compact=True,
+        length_in=topk_length,
+        flat=True,
+        num_kv=int(num_kv),
+    )
+    return out, counts
 
 
 def _packed_forward_nope(
@@ -4542,11 +5022,18 @@ def _packed_forward_nope(
     mode,
 ):
     """The packed forward over per-document index rows, ``(out, lse, o_lo, indices, lengths)``: the plan, the
-    outputs and the launch values are settled before the first launch; ``mode == "index_prep"`` issues the
-    preparation launch into the fresh ``indices`` / ``lengths`` and then the forward from pre-converted operands
-    (:meth:`_NopeBinding.prebound_forward`) with nothing else in between, ``mode == "kernel"`` lets the forward
-    convert the rows itself (``convert = 1``, the lengths derived) in its single launch.  ``indices`` (global key
-    rows) and ``lengths`` are what the backward reads."""
+    outputs and the launch values are settled before the first launch.  ``mode == "index_prep"`` issues the
+    preparation launch (``compact = 1``: every row stably compacted -- its valid globalized keys first in ascending
+    slot order, then ``-1`` -- after the position cut of a caller ``topk_length`` passed as ``length_in``) into the
+    fresh ``indices`` / ``lengths`` (the valid counts) and then the forward from pre-converted operands
+    (:meth:`_NopeBinding.prebound_forward`) with nothing else in between; the forward reads the stage's rows and
+    counts whether or not the caller gave lengths.  ``mode == "mask"`` lets the forward convert the rows itself in
+    its single launch (``convert = NOPE_CONVERT_MASK``): its scan lanes write the position-preserving global rows
+    to ``indices`` -- the global key or ``-1`` at the slot it came from, so a hole stays a masked slot -- and the
+    last valid slot + 1 to ``lengths``; no caller cut.  ``mode == "kernel"`` is the compacting single launch
+    (``convert = NOPE_CONVERT_COMPACT``): the scan lanes write the same stable compaction and valid counts as the
+    stage (bitwise); no caller cut, never selected by size.  ``indices`` (global key rows in the order the forward
+    processed them) and ``lengths`` are what the backward reads on every route."""
     arch = _nope_arch(gather_kv_indices)
     num_rows, topk = int(q_latent.shape[0]), int(gather_kv_indices.shape[1])
     device = q_latent.device
@@ -4556,14 +5043,15 @@ def _packed_forward_nope(
     )  # the global key rows: the backward's operand
     derived = _alloc(
         (num_rows,), torch.int32, device
-    )  # the row lengths the preparation writes
-    lengths = derived if topk_length is None else topk_length
-    if mode == "kernel":
+    )  # the row lengths the conversion writes (valid counts, or last valid + 1 in mask mode)
+    if mode in ("mask", "kernel"):
         # the forward reads the per-document rows (any row stride) and writes the global rows and the row
-        # lengths itself (``convert = 1`` derives the lengths: the entry selects this mode without caller lengths)
+        # lengths itself (a non-zero ``convert`` derives the lengths: the entry selects these modes without
+        # caller lengths)
         if topk_length is not None:
             raise ValueError(
-                "the converting NoPE forward derives the row lengths itself: no caller topk_length in kernel mode"
+                "the converting NoPE forward derives the row lengths itself: no caller topk_length in "
+                f"{mode} mode"
             )
         num_docs = int(cu_seqlens_q.numel()) - 1
         plan_indices, derive = gather_kv_indices, True
@@ -4574,10 +5062,21 @@ def _packed_forward_nope(
             num_docs=num_docs,
             search_iters=index_prep_search_iters(num_docs),
             causal=int(bool(causal)),
-            convert=1,
+            convert=NOPE_CONVERT_MASK if mode == "mask" else NOPE_CONVERT_COMPACT,
         )
-    else:
+    elif mode == "index_prep":
         plan_indices, derive, extra = indices, False, None
+        if topk_length is not None and (
+            topk_length.shape != (num_rows,)
+            or topk_length.dtype != torch.int32
+            or not topk_length.is_contiguous()
+        ):
+            raise ValueError("topk_length must be a contiguous int32 [T] tensor")
+    else:
+        raise ValueError(
+            f"unknown NoPE index mode {mode!r}: expected 'mask', 'index_prep' or 'kernel'"
+        )
+    lengths = derived
     key = forward_binding_key_nope(
         q_latent, kv_latent, plan_indices, lengths, scale, derive
     )
@@ -4597,7 +5096,7 @@ def _packed_forward_nope(
         ),
         _NopeBinding,
     )
-    if mode == "kernel":
+    if extra is not None:  # the one-launch modes
         (out, lse, o_lo), launch = binding.prepared_forward(
             q_latent, kv_latent, plan_indices, lengths, extra
         )
@@ -4617,6 +5116,8 @@ def _packed_forward_nope(
         causal=causal,
         out=indices,
         topk_length=derived,
+        compact=True,
+        length_in=topk_length,
     )
     with _ffi_stream_context(_device_index(device)):
         prep()
@@ -4625,18 +5126,85 @@ def _packed_forward_nope(
     return out, lse, o_lo, indices, lengths
 
 
+def _flat_forward_nope(q_latent, kv_latent, indices, softmax_scale):
+    """The flat autograd entry's forward without caller lengths, ``(out, lse, o_lo, indices_c, counts)``: the
+    stage branch of :func:`_packed_forward_nope` in the stage's flat mode -- one launch compacts the caller's global
+    rows (any row stride, read in place) stably into the fresh contiguous ``indices_c [T, K_slots]`` with the valid
+    counts in ``counts [T]``, then the pre-bound forward follows over them with nothing in between; the backward
+    reads the same two tensors.  Rows with ``-1`` holes therefore cost their valid slots in both kernels; valid-first
+    rows are byte-identical to the input with ``counts`` = last valid slot + 1.  Both buffers are allocated before
+    the first launch and nothing synchronizes with the device.  The forward plan is that of a kernel-level call over
+    contiguous rows with lengths (``has_topk_length = 1, derive_length = 0``): the same geometry shares the binding,
+    since neither the key nor the plan depends on tensor contents."""
+    arch = _nope_arch(indices)
+    _require_index_prep_stage()
+    num_rows, topk = _check_index_rows(indices, "indices")
+    if num_rows != int(q_latent.shape[0]):
+        raise ValueError("indices must be an int32 [T, K_slots] tensor")
+    device = q_latent.device
+    scale = float(softmax_scale)
+    indices_c = _alloc((num_rows, topk), torch.int32, device)
+    counts = _alloc((num_rows,), torch.int32, device)
+    key = forward_binding_key_nope(q_latent, kv_latent, indices_c, counts, scale, False)
+    binding = _binding(
+        key,
+        lambda: _plan_nope(
+            q_latent,
+            kv_latent,
+            indices_c,
+            topk_length=counts,
+            dout=None,
+            softmax_scale=scale,
+            outputs={},
+            backward=False,
+            key_passes=None,
+            derive_topk_length=False,
+        ),
+        _NopeBinding,
+    )
+    (out, lse, o_lo), launches = binding.prebound_forward(
+        q_latent, kv_latent, indices_c, counts
+    )
+    prep = _index_prep_launch(
+        arch,
+        indices,
+        None,
+        None,
+        causal=False,
+        out=indices_c,
+        topk_length=counts,
+        compact=True,
+        flat=True,
+        num_kv=int(kv_latent.shape[0]),
+    )
+    with _ffi_stream_context(_device_index(device)):
+        prep()
+        for launch in launches:
+            launch()
+    return out, lse, o_lo, indices_c, counts
+
+
 class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
     """Autograd wrapper of the packed NoPE form with on-device index preparation.
 
     Fifteen forward inputs ``(q_latent, kv_latent, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal,
     topk_length, softmax_scale, key_passes, dkv_acc, dkv_dst_map, num_segments, dkv_direct, check_dst_map,
     mode)``; returns ``(out, lse)``.  The forward turns the per-document rows into global key rows on device --
-    ``mode == "index_prep"``: one launch of the index-preparation stage into a fresh ``indices [T, K_slots]`` and
-    the row lengths; ``mode == "kernel"``: the forward kernel reads the per-document rows and writes the global
-    rows to ``indices_out`` itself -- and the forward kernel follows with no host work in between: the plan
-    lookup, the output allocation and the forward's launch values are prepared before the first launch, and
-    nothing on the path synchronizes with the device.  The backward is that of
-    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths.
+    ``mode == "mask"`` (below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths): the forward kernel
+    alone, in one launch, writes the position-preserving global rows (the global key or ``-1`` at the slot it
+    came from) to a fresh ``indices [T, K_slots]`` and the last valid slot + 1 to the lengths; ``mode ==
+    "index_prep"``: one launch of the index-preparation stage into the fresh ``indices`` and the row lengths,
+    every row stably compacted (valid keys first, then ``-1``; the length is the valid count) after the position
+    cut of a caller ``topk_length``, then the forward kernel with no host work in between; ``mode == "kernel"``
+    (explicit only): the forward kernel writes the same compacted rows and counts as the stage itself.  On every
+    route the plan lookup, the output allocation and the forward's launch values are prepared before the first
+    launch, and nothing on the path synchronizes with the device.  The backward is that of
+    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths -- the rows in the order the
+    forward processed them, so forward and backward see the same slots (the stage's rows and counts on the
+    ``"index_prep"`` route, also with caller lengths): every produced
+    operand of the backward goes through ``ctx.save_for_backward`` and a tensor ``dkv_acc`` stays caller-owned on
+    the node, so a checkpointed forward retains nothing; ``dkv_acc`` may be a callable resolved at backward time
+    (:data:`DkvAccSource`).
     """
 
     @staticmethod
@@ -4672,6 +5240,7 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
         scale = float(softmax_scale)
         ctx.set_materialize_grads(False)
         ctx.nope_prep = _NopeBackwardPrep(
+            ctx,
             q_latent,
             kv_latent,
             indices,
@@ -4687,7 +5256,6 @@ class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
             dkv_direct,
             check_dst_map,
         )
-        ctx.save_for_backward(q_latent, kv_latent, out, lse)
         return out, lse
 
     @staticmethod
@@ -4715,17 +5283,25 @@ def dsa_sparse_attention_nope_varlen(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
-    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_acc: Optional[DkvAccSource] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
     check_cu_seqlens: bool = False,
 ):
-    """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device --
-    the forward kernel itself below :data:`NOPE_CONVERT_SLOT_LIMIT` slots (``T x K_slots``), else one launch of
-    the record's index-preparation stage right before it (:func:`nope_varlen_index_mode`; a caller-given
-    ``topk_length`` always takes the preparation launch); bitwise the :func:`offset_gather_kv_indices`
-    rule -- then the flat kernels run over the packed rows.  Query and key
+    """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device and
+    the flat kernels run over the packed rows.  The route follows the table size (:func:`nope_varlen_index_mode`).
+    Below :data:`NOPE_CONVERT_SLOT_LIMIT` slots, without caller lengths, the forward kernel alone converts the
+    rows in its single launch, position-preserving: the global key or ``-1`` at the slot it came from -- bitwise
+    ``offset_gather_kv_indices(...)`` -- and each row's length is its last valid slot + 1, so a ``-1`` before the
+    last valid key stays a masked slot the kernels process (small tables pay that for their holes).  At or above
+    the limit, and always with a caller ``topk_length``, one launch of the record's index-preparation stage runs
+    right before the forward kernel and compacts each row stably: its valid keys come first in ascending slot
+    order, then ``-1``, and the row's length is its valid count -- bitwise ``offset_gather_kv_indices(...,
+    compact=True)`` -- so rows with ``-1`` holes cost their valid slots in the forward and the backward.  Rows whose
+    valid slots already come first give the same bytes on both routes.  A caller ``topk_length`` is a position cut
+    applied before compaction (slots at positions ``>= topk_length[t]`` are invalid regardless of content); the
+    kernels then read the compacted rows and their counts.  Query and key
     segment lengths may differ (the query segment is the tail of its key prefix); ``causal=True`` also drops
     selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.  ``max_seqlen_q/k`` are
     accepted for signature parity and not used on the host.  The segment count ``len(cu_seqlens_k) - 1`` is passed
@@ -4803,7 +5379,10 @@ def forward_nope_varlen(
     """Kernel-level packed NoPE forward without autograd: the validation and the index route of
     :func:`dsa_sparse_attention_nope_varlen` (:func:`nope_varlen_index_mode`), returning
     ``(out, lse, o_lo, indices, topk_length)`` -- the forward outputs plus the global key rows and row lengths the
-    forward produced, which the kernel-level backward consumes::
+    forward read: below :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths the position-preserving rows
+    (the global key or ``-1`` at the slot it came from) and the last valid slot + 1 per row, written by the
+    forward itself; on the stage route the stably compacted rows (valid keys first, then ``-1``) and their valid
+    counts, after the cut of a caller ``topk_length``; the pair the kernel-level backward consumes::
 
         dq, _ = backward_nope(q_latent, kv_latent, indices, out, o_lo, lse, dout, topk_length=topk_length,
                               softmax_scale=softmax_scale, dkv_acc=dkv_acc,

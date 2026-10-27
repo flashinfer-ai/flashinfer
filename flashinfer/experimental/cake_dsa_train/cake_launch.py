@@ -18,6 +18,7 @@ limitations under the License.
 # program; do not edit by hand.  ``LAUNCH[stage](run, values, grid)`` calls the
 # binding entry ``run`` with ``values[<kernel argument>]`` in positional order;
 # ``GRID[stage](num_queries, num_kv, topk)`` is the launch grid.
+# Hand fold until the next export: identical launcher / grid copies alias one function.
 
 from __future__ import annotations
 
@@ -60,6 +61,9 @@ def bwd_delta(run, values, grid):
         values["o_lo"],
         values["delta"],
         values["num_rows"],
+        values["dout_token_stride"],
+        values["dout_head_stride"],
+        values["dout_offset"],
         grid[0],
         grid[1],
         grid[2],
@@ -114,58 +118,6 @@ def bwd_main(run, values, grid):
     )
 
 
-def bwd_main_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def bwd_main_natural(run, values, grid):
-    run(
-        values["q_latent"],
-        values["q_rope"],
-        values["dout"],
-        values["dq_latent"],
-        values["dq_rope"],
-        values["kv_latent"],
-        values["k_rope"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkr_f32"],
-        values["dkv_stride"],
-        values["dkr_stride"],
-        values["dkr_col0"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def bwd_main_natural_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
 def bwd_compact(run, values, grid):
     run(
         values["indices"],
@@ -189,102 +141,6 @@ def bwd_compact(run, values, grid):
 
 def bwd_compact_grid(num_queries, num_kv, topk):
     return (max(1, -(-(num_queries) // 4)), 1, 1)
-
-
-def bwd_main_pass(run, values, grid):
-    run(
-        values["q_latent"],
-        values["q_rope"],
-        values["dout"],
-        values["dq_latent"],
-        values["dq_rope"],
-        values["kv_latent"],
-        values["k_rope"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkr_f32"],
-        values["dkv_stride"],
-        values["dkr_stride"],
-        values["dkr_col0"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def bwd_main_pass_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def bwd_main_pass_natural(run, values, grid):
-    run(
-        values["q_latent"],
-        values["q_rope"],
-        values["dout"],
-        values["dq_latent"],
-        values["dq_rope"],
-        values["kv_latent"],
-        values["k_rope"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkr_f32"],
-        values["dkv_stride"],
-        values["dkr_stride"],
-        values["dkr_col0"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def bwd_main_pass_natural_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
 
 
 def bwd_cast(run, values, grid):
@@ -330,14 +186,13 @@ def index_prep(run, values, grid):
         values["has_docs"],
         values["flat_bound"],
         values["write_out"],
+        values["compact"],
+        values["length_in"],
+        values["has_length_in"],
         grid[0],
         grid[1],
         grid[2],
     )
-
-
-def index_prep_grid(num_queries, num_kv, topk):
-    return (max(1, -(-(num_queries) // 4)), 1, 1)
 
 
 def nope_fwd(run, values, grid):
@@ -368,30 +223,6 @@ def nope_fwd(run, values, grid):
         grid[1],
         grid[2],
     )
-
-
-def nope_fwd_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def nope_bwd_delta(run, values, grid):
-    run(
-        values["dout"],
-        values["out"],
-        values["o_lo"],
-        values["delta"],
-        values["num_rows"],
-        values["dout_token_stride"],
-        values["dout_head_stride"],
-        values["dout_offset"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_delta_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries * 8), 1, 1)
 
 
 def nope_bwd_main(run, values, grid):
@@ -426,183 +257,6 @@ def nope_bwd_main(run, values, grid):
         values["dq_partial"],
         values["key_scratch"],
         values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_main_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def nope_bwd_main_natural(run, values, grid):
-    run(
-        values["q_latent"],
-        values["dout"],
-        values["dq_latent"],
-        values["kv_latent"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkv_stride"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_main_natural_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def nope_bwd_compact(run, values, grid):
-    run(
-        values["indices"],
-        values["topk_length"],
-        values["key_scratch"],
-        values["pass_counts"],
-        values["num_tokens"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["pass_lo"],
-        values["pass_hi"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_compact_grid(num_queries, num_kv, topk):
-    return (max(1, -(-(num_queries) // 4)), 1, 1)
-
-
-def nope_bwd_main_pass(run, values, grid):
-    run(
-        values["q_latent"],
-        values["dout"],
-        values["dq_latent"],
-        values["kv_latent"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkv_stride"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_main_pass_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def nope_bwd_main_pass_natural(run, values, grid):
-    run(
-        values["q_latent"],
-        values["dout"],
-        values["dq_latent"],
-        values["kv_latent"],
-        values["lse"],
-        values["delta"],
-        values["out"],
-        values["o_lo"],
-        values["indices"],
-        values["topk_length"],
-        values["dkv_f32"],
-        values["dkv_stride"],
-        values["dkv_dst_map"],
-        values["dkv_has_map"],
-        values["num_queries"],
-        values["num_kv"],
-        values["topk"],
-        values["idx_stride"],
-        values["indices_offset"],
-        values["has_topk_length"],
-        values["token_base"],
-        values["token_step"],
-        values["scale_log2"],
-        values["sm_scale"],
-        values["pass_lo"],
-        values["pass_hi"],
-        values["dq_mode"],
-        values["dq_partial"],
-        values["key_scratch"],
-        values["pass_counts"],
-        grid[0],
-        grid[1],
-        grid[2],
-    )
-
-
-def nope_bwd_main_pass_natural_grid(num_queries, num_kv, topk):
-    return (max(1, num_queries), 1, 1)
-
-
-def nope_bwd_cast(run, values, grid):
-    run(
-        values["src_latent"],
-        values["src_rope"],
-        values["dst_latent"],
-        values["dst_rope"],
-        values["dst_latent_f32"],
-        values["dst_rope_f32"],
-        values["latent_groups"],
-        values["rope_groups"],
-        values["out_f32"],
-        values["dst_packed"],
-        values["dst_row_stride"],
-        values["dst_map"],
-        values["has_dst_map"],
-        values["accumulate"],
         grid[0],
         grid[1],
         grid[2],
@@ -644,6 +298,9 @@ STAGE_ARGS: dict[str, list[str]] = {
         "o_lo",
         "delta",
         "num_rows",
+        "dout_token_stride",
+        "dout_head_stride",
+        "dout_offset",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -865,6 +522,9 @@ STAGE_ARGS: dict[str, list[str]] = {
         "has_docs",
         "flat_bound",
         "write_out",
+        "compact",
+        "length_in",
+        "has_length_in",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -1091,37 +751,37 @@ LAUNCH = {
     "fwd": fwd,
     "bwd_delta": bwd_delta,
     "bwd_main": bwd_main,
-    "bwd_main_natural": bwd_main_natural,
+    "bwd_main_natural": bwd_main,
     "bwd_compact": bwd_compact,
-    "bwd_main_pass": bwd_main_pass,
-    "bwd_main_pass_natural": bwd_main_pass_natural,
+    "bwd_main_pass": bwd_main,
+    "bwd_main_pass_natural": bwd_main,
     "bwd_cast": bwd_cast,
     "index_prep": index_prep,
     "nope_fwd": nope_fwd,
-    "nope_bwd_delta": nope_bwd_delta,
+    "nope_bwd_delta": bwd_delta,
     "nope_bwd_main": nope_bwd_main,
-    "nope_bwd_main_natural": nope_bwd_main_natural,
-    "nope_bwd_compact": nope_bwd_compact,
-    "nope_bwd_main_pass": nope_bwd_main_pass,
-    "nope_bwd_main_pass_natural": nope_bwd_main_pass_natural,
-    "nope_bwd_cast": nope_bwd_cast,
+    "nope_bwd_main_natural": nope_bwd_main,
+    "nope_bwd_compact": bwd_compact,
+    "nope_bwd_main_pass": nope_bwd_main,
+    "nope_bwd_main_pass_natural": nope_bwd_main,
+    "nope_bwd_cast": bwd_cast,
 }
 GRID = {
     "fwd": fwd_grid,
     "bwd_delta": bwd_delta_grid,
-    "bwd_main": bwd_main_grid,
-    "bwd_main_natural": bwd_main_natural_grid,
+    "bwd_main": fwd_grid,
+    "bwd_main_natural": fwd_grid,
     "bwd_compact": bwd_compact_grid,
-    "bwd_main_pass": bwd_main_pass_grid,
-    "bwd_main_pass_natural": bwd_main_pass_natural_grid,
+    "bwd_main_pass": fwd_grid,
+    "bwd_main_pass_natural": fwd_grid,
     "bwd_cast": bwd_cast_grid,
-    "index_prep": index_prep_grid,
-    "nope_fwd": nope_fwd_grid,
-    "nope_bwd_delta": nope_bwd_delta_grid,
-    "nope_bwd_main": nope_bwd_main_grid,
-    "nope_bwd_main_natural": nope_bwd_main_natural_grid,
-    "nope_bwd_compact": nope_bwd_compact_grid,
-    "nope_bwd_main_pass": nope_bwd_main_pass_grid,
-    "nope_bwd_main_pass_natural": nope_bwd_main_pass_natural_grid,
+    "index_prep": bwd_compact_grid,
+    "nope_fwd": fwd_grid,
+    "nope_bwd_delta": bwd_delta_grid,
+    "nope_bwd_main": fwd_grid,
+    "nope_bwd_main_natural": fwd_grid,
+    "nope_bwd_compact": bwd_compact_grid,
+    "nope_bwd_main_pass": fwd_grid,
+    "nope_bwd_main_pass_natural": fwd_grid,
     "nope_bwd_cast": nope_bwd_cast_grid,
 }

@@ -85,7 +85,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "dkv_direct": {"min_keys_per_query": 4},
         "fwd": {
-            "module": "cake_dsa_h64_train_c949a885132a772bdb53",
             "library": "cake_dsa_h64_train_c949a885132a772bdb53",
             "ffi_entry": "run",
             "launch": {
@@ -93,12 +92,11 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 231680,
-                "use_pdl": False,
+                "use_pdl": True,
             },
         },
         "bwd_delta": {
-            "module": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
-            "library": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
+            "library": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],
@@ -109,7 +107,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main": {
-            "module": "cake_dsa_h64_train_e29d165e3abca62c430b",
             "library": "cake_dsa_h64_train_e29d165e3abca62c430b",
             "ffi_entry": "run",
             "launch": {
@@ -121,8 +118,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main_natural": {
-            "module": "cake_dsa_h64_train_726ceb6d3890375e922d",
-            "library": "cake_dsa_h64_train_726ceb6d3890375e922d",
+            "library": "cake_dsa_h64_train_e29d165e3abca62c430b_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -133,7 +129,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_compact": {
-            "module": "cake_dsa_h64_train_19c560118a407f5473fe",
             "library": "cake_dsa_h64_train_19c560118a407f5473fe",
             "ffi_entry": "run",
             "launch": {
@@ -145,7 +140,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main_pass": {
-            "module": "cake_dsa_h64_train_d6a7bc0b3aa5b7084667",
             "library": "cake_dsa_h64_train_d6a7bc0b3aa5b7084667",
             "ffi_entry": "run",
             "launch": {
@@ -157,8 +151,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_main_pass_natural": {
-            "module": "cake_dsa_h64_train_76061910b68bb0506c5e",
-            "library": "cake_dsa_h64_train_76061910b68bb0506c5e",
+            "library": "cake_dsa_h64_train_d6a7bc0b3aa5b7084667_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -169,7 +162,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "bwd_cast": {
-            "module": "cake_dsa_h64_train_c96be96662a6d97e0b53",
             "library": "cake_dsa_h64_train_c96be96662a6d97e0b53",
             "ffi_entry": "run",
             "launch": {
@@ -193,9 +185,11 @@ MODULES: dict[str, dict[str, Any]] = {
     # at least one key per query (``min_keys_per_query`` 1).  The compaction and
     # cast stages are rope-independent kernels shared with the RoPE program
     # (same libraries, same launch geometry; the cast runs over the one 512-wide
-    # accumulator, 16 groups per key); the delta stage is the strided form of
-    # the shared delta kernel (256 threads: it reads ``dout`` through its token
-    # and head strides, so a head-major gradient view is consumed in place);
+    # accumulator, 16 groups per key); the delta stage is the strided delta
+    # kernel, shared with the RoPE record like compact and cast (both records'
+    # ``bwd_delta`` / ``nope_bwd_delta`` name one library; 256 threads: it
+    # reads ``dout`` through its token and head strides, so a head-major
+    # gradient view is consumed in place by both programs);
     # the forward (320 threads, 222,464 B dynamic shared memory) and the four
     # main backward forms (640 threads, 214,208 B; permuted / natural-layout
     # accumulation, single-pass / key-range-pass) are the NoPE kernels.  Stage
@@ -225,7 +219,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "dkv_direct": {"min_keys_per_query": 1},
         "index_prep": {
-            "module": "cake_dsa_h64_nope_train_db791110b21a91be1388",
             "library": "cake_dsa_h64_nope_train_db791110b21a91be1388",
             "ffi_entry": "run",
             "launch": {
@@ -237,7 +230,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_fwd": {
-            "module": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
             "library": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
             "ffi_entry": "run",
             "launch": {
@@ -245,11 +237,10 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 223488,
-                "use_pdl": False,
+                "use_pdl": True,
             },
         },
         "nope_bwd_delta": {
-            "module": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
             "library": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
             "ffi_entry": "run",
             "launch": {
@@ -261,7 +252,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main": {
-            "module": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f",
             "library": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f",
             "ffi_entry": "run",
             "launch": {
@@ -273,8 +263,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main_natural": {
-            "module": "cake_dsa_h64_nope_train_4ef6557b664950985182",
-            "library": "cake_dsa_h64_nope_train_4ef6557b664950985182",
+            "library": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -285,7 +274,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_compact": {
-            "module": "cake_dsa_h64_train_19c560118a407f5473fe",
             "library": "cake_dsa_h64_train_19c560118a407f5473fe",
             "ffi_entry": "run",
             "launch": {
@@ -297,7 +285,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main_pass": {
-            "module": "cake_dsa_h64_nope_train_90ab03044736858291f5",
             "library": "cake_dsa_h64_nope_train_90ab03044736858291f5",
             "ffi_entry": "run",
             "launch": {
@@ -309,8 +296,7 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_main_pass_natural": {
-            "module": "cake_dsa_h64_nope_train_bf83fa2a070687feb74c",
-            "library": "cake_dsa_h64_nope_train_bf83fa2a070687feb74c",
+            "library": "cake_dsa_h64_nope_train_90ab03044736858291f5_dkv_natural1",
             "ffi_entry": "run",
             "launch": {
                 "block": [640, 1, 1],
@@ -321,7 +307,6 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_cast": {
-            "module": "cake_dsa_h64_train_c96be96662a6d97e0b53",
             "library": "cake_dsa_h64_train_c96be96662a6d97e0b53",
             "ffi_entry": "run",
             "launch": {
@@ -349,13 +334,11 @@ STAGES = (
     "bwd_cast",
 )
 FORWARD_STAGES = ("fwd",)
-BACKWARD_STAGES = STAGES[1:]
 # The NoPE program names its stages ``nope_<stage>`` (globally unique: the
 # generated launch tables are keyed by stage name across both programs).
 STAGE_PREFIX = {PROGRAM: "", NOPE_PROGRAM: "nope_"}
 NOPE_STAGES = tuple(f"{STAGE_PREFIX[NOPE_PROGRAM]}{stage}" for stage in STAGES)
 NOPE_FORWARD_STAGES = NOPE_STAGES[:1]
-NOPE_BACKWARD_STAGES = NOPE_STAGES[1:]
 STAGES_OF = {PROGRAM: STAGES, NOPE_PROGRAM: NOPE_STAGES}
 
 
@@ -374,13 +357,7 @@ def record(program: str = PROGRAM) -> dict[str, Any]:
     """The registered record of ``program`` (the RoPE program by default)."""
     if program not in PROGRAMS:
         raise ValueError(f"unknown program {program!r}; registered: {PROGRAMS}")
-    try:
-        return MODULES[program]
-    except KeyError:
-        raise NotImplementedError(
-            f"the generated DSA sparse-attention training program {program!r} is not "
-            "registered in this checkout (see flashinfer-ai/flashinfer#5657)"
-        ) from None
+    return MODULES[program]
 
 
 def registered_stages(program: str = PROGRAM) -> tuple[str, ...]:
@@ -417,9 +394,3 @@ def load_cake_dsa_train_module(stage: str, arch: str, program: str = PROGRAM):
     """The loaded library of ``stage`` of ``program`` on ``arch``: prebuilt from ``aot/``
     when the package ships it, otherwise JIT-built by FlashInfer from ``build.json``."""
     return cake_build.load_library(library_name(stage, arch, program))
-
-
-def specs_for_arch(arch: str) -> list[Any]:
-    """JIT specs of every ``arch`` library without a prebuilt file, for
-    ``flashinfer.jit.build_jit_specs``."""
-    return cake_build.jit_specs(arch)

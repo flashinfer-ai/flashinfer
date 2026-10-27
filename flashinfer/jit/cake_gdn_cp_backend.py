@@ -782,6 +782,27 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_gdn_cp_ce1c179ef0e27da84479": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_ce1c179ef0e27da84479_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_ce1c179ef0e27da84479_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "K"],
+            ["buffer", "beta"],
+            ["buffer", "t"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "num_k_heads"],
+            ["parameter", "num_sab_heads"],
+            ["parameter", "total_t_blocks"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_d5827d0f1ecedc535e35": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_d5827d0f1ecedc535e35_kernel.cu",
@@ -801,7 +822,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_dc9fd29403170907f3a6": {
         "sources": [
@@ -1020,7 +1041,7 @@ KERNELS: dict[str, Any] = {
         "state_scatter_fp16_int64": "cake_gdn_cp_bbdd97c3096cd360b467",
         "state_scatter_fp32": "cake_gdn_cp_2eb4e3c69f8d5339cba3",
         "state_scatter_fp32_int64": "cake_gdn_cp_91580fabfb9eae4b9cb6",
-        "t_precompute": "cake_gdn_cp_d5827d0f1ecedc535e35",
+        "t_precompute": "cake_gdn_cp_ce1c179ef0e27da84479",
         "t_precompute_bf16": "cake_gdn_cp_306612b8c71d26cd1d83",
     },
 }

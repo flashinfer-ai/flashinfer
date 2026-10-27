@@ -135,7 +135,8 @@ def test_fold_table_routes_fused_m128_modules_onto_shared_bodies():
         for name, enabled in members.items():
             assert set(enabled) <= set(flags), name
             assert folded[name]["sources"] == [body_path], name
-    for name, record in cake_kda_tf32.MODULES.items():
+    for name in cake_kda_tf32._MODULE_ROWS:
+        record = cake_kda_tf32.MODULES[name]
         if name in folded or name in cake_kda_tf32._TF32_FOLD_OF:
             continue
         directory, digest = cake_kda_tf32._MODULE_ROWS[name][:2]

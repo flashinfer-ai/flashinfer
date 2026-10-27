@@ -1426,12 +1426,14 @@ class TestMoERunnerSupport:
         )
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
-        assert CuteDslRunner.supported_activation_classes == (
-            SwiGLU,
-            GeGLUTanh,
-            ReLU2,
-            SiTU,
-        )
+        cute_dsl = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+        cute_dsl_mxfp8_act = (SwiGLU, GeGLUTanh, ReLU2)
+        assert CuteDslRunner.supported_activation_classes_by_quant == {
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): cute_dsl,
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.NVFP4, QuantFormat.BF16): cute_dsl,
+        }
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
             (QuantFormat.NVFP4, QuantFormat.NVFP4): (
                 SwiGLU,
@@ -2805,6 +2807,15 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         quant=quant,
         **shape,
     )
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+        config = dataclasses.replace(
+            config,
+            finalize=dataclasses.replace(config.finalize, use_fused_finalize=False),
+        )
+    elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        pass
+    else:
+        raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
     config = dataclasses.replace(
         config,
         backend=BackendOptions(candidates=(CuteDslConfig(),)),
@@ -2813,52 +2824,107 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
     runner = layer.runners[0]
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
-    reference = _compute_ref(act_pack, tensors, shape, activation)
-    passed, pct, atol = check_accuracy(actual, reference)
-    assert passed, (
-        f"{activation!r}: {pct * 100:.2f}% within tolerance "
-        f"(atol={atol:.4f}) vs flat reference"
-    )
-
-    # Use a tighter percentage bound to distinguish activation formulas while
-    # tolerating FP4 quantization outliers.
-    def _agreement(a: torch.Tensor, b: torch.Tensor) -> float:
-        a, b = a.float(), b.float()
-        atol = 0.05 + 0.5 * b.std().item()
-        close = (a - b).abs() < atol + 0.1 * b.abs()
-        return close.float().mean().item()
-
-    # Do not let the percentage allowance absorb non-finite values.
-    for name, tensor in (("output", actual), ("reference", reference)):
-        assert torch.isfinite(tensor).all(), (
-            f"{activation!r}: {name} contains non-finite values "
-            f"({(~torch.isfinite(tensor)).sum().item()} of {tensor.numel()})."
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+        from tests.test_helpers.w4a16_reference import (
+            assert_w4a16_bits,
+            split_w4a16_reference_from_tensors,
         )
-    agreement = _agreement(actual, reference)
-    assert agreement >= 0.97, (
-        f"{activation!r}: only {agreement * 100:.2f}% of elements agree with the "
-        f"flat reference under the discriminating bound."
-    )
 
-    # Verify that the tighter bound rejects a wrong formula with matching
-    # gated/non-gated geometry.
-    control = {
-        ActivationType.Swiglu: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
-        ActivationType.Situ: SiTU(gate_scale=0.25, linear_scale=0.5),
-        ActivationType.GegluTanh: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
-    }.get(activation.type)
-    control_reference = (
-        # Use plain ReLU as the non-gated control for ReLU2.
-        _compute_ref(act_pack, tensors, shape, activation, wrong_formula=True)
-        if control is None
-        else _compute_ref(act_pack, tensors, shape, control)
-    )
-    control_agreement = _agreement(actual, control_reference)
-    assert control_agreement < 0.97, (
-        f"{activation!r}: output also agreed with a deliberately wrong reference "
-        f"at {control_agreement * 100:.2f}%; the bound cannot detect a "
-        f"wrong-formula regression."
-    )
+        def exact_reference(value, wrong_formula=False):
+            activation_options = {"activation_type": value.type}
+            if isinstance(value, SwiGLU):
+                activation_options.update(
+                    swiglu_alpha=value.alpha,
+                    swiglu_beta=value.beta,
+                    swiglu_limit=value.limit,
+                )
+            elif isinstance(value, SiTU):
+                activation_options.update(
+                    situ_beta=value.gate_scale,
+                    situ_linear_beta=value.linear_scale,
+                )
+            elif isinstance(value, (GeGLUTanh, ReLU2)):
+                pass
+            else:
+                raise ValueError(f"Unsupported test activation {value!r}")
+            return split_w4a16_reference_from_tensors(
+                tensors,
+                token_selected_experts=act_pack.topk_ids,
+                token_final_scales=act_pack.topk_weights,
+                local_expert_offset=config.experts.local_expert_offset,
+                wrong_formula=wrong_formula,
+                **activation_options,
+            )
+
+        reference = exact_reference(activation)
+        assert_w4a16_bits(actual, reference)
+        # The same packed inputs must distinguish the intended formula from
+        # a counterfactual with matching gated/non-gated geometry.
+        if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
+            control_reference = exact_reference(SwiGLU(alpha=0.25, beta=2.0, limit=0.5))
+        elif activation.type == ActivationType.Situ:
+            control_reference = exact_reference(SiTU(gate_scale=0.25, linear_scale=0.5))
+        elif activation.type == ActivationType.Relu2:
+            control_reference = exact_reference(activation, wrong_formula=True)
+        else:
+            raise ValueError(f"Unsupported test activation {activation!r}")
+        assert torch.isfinite(control_reference).all()
+        assert not torch.equal(
+            actual.view(torch.int16), control_reference.view(torch.int16)
+        ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
+    elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        reference = _compute_ref(act_pack, tensors, shape, activation)
+        passed, pct, atol = check_accuracy(actual, reference)
+        assert passed, (
+            f"{activation!r}: {pct * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}) vs flat reference"
+        )
+
+        # Use a tighter percentage bound to distinguish activation formulas while
+        # tolerating FP4 quantization outliers.
+        def _agreement(a: torch.Tensor, b: torch.Tensor) -> float:
+            a, b = a.float(), b.float()
+            atol = 0.05 + 0.5 * b.std().item()
+            close = (a - b).abs() < atol + 0.1 * b.abs()
+            return close.float().mean().item()
+
+        # Do not let the percentage allowance absorb non-finite values.
+        for name, tensor in (("output", actual), ("reference", reference)):
+            assert torch.isfinite(tensor).all(), (
+                f"{activation!r}: {name} contains non-finite values "
+                f"({(~torch.isfinite(tensor)).sum().item()} of {tensor.numel()})."
+            )
+        agreement = _agreement(actual, reference)
+        assert agreement >= 0.97, (
+            f"{activation!r}: only {agreement * 100:.2f}% of elements agree with the "
+            f"flat reference under the discriminating bound."
+        )
+
+        # Verify that the tighter bound rejects a wrong formula with matching
+        # gated/non-gated geometry.
+        if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
+            control_reference = _compute_ref(
+                act_pack, tensors, shape, SwiGLU(alpha=0.25, beta=2.0, limit=0.5)
+            )
+        elif activation.type == ActivationType.Situ:
+            control_reference = _compute_ref(
+                act_pack, tensors, shape, SiTU(gate_scale=0.25, linear_scale=0.5)
+            )
+        elif activation.type == ActivationType.Relu2:
+            control_reference = _compute_ref(
+                act_pack, tensors, shape, activation, wrong_formula=True
+            )
+        else:
+            raise ValueError(f"Unsupported test activation {activation!r}")
+        control_agreement = _agreement(actual, control_reference)
+        assert control_agreement < 0.97, (
+            f"{activation!r}: output also agreed with a deliberately wrong reference "
+            f"at {control_agreement * 100:.2f}%; the bound cannot detect a "
+            f"wrong-formula regression."
+        )
+
+    else:
+        raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
 
 
 # ---------------------------------------------------------------------------
