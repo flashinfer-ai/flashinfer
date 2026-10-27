@@ -17,6 +17,7 @@ but none of the sentinel is a misconfigured helper (the sentinel kernel's name c
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 
 import pytest
@@ -76,6 +77,16 @@ def between_sentinels(names: list[str]) -> list[str] | None:
     return names[leading[-1] + 1 : marks[-1]]
 
 
+def warn_lost_records(attempt: int, attempts: int, names: list[str]) -> None:
+    """Report a profiler session that lost its sentinel records (the nightly's warnings summary counts them)."""
+    warnings.warn(
+        f"{LOST_RECORDS}: profiler session {attempt}/{attempts} lost its sentinel records "
+        f"({len(names)} CUDA records captured); profiling again",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def skip_lost_records(attempts: int) -> None:
     pytest.skip(
         f"{LOST_RECORDS}: torch.profiler returned no CUDA record of the sentinel kernel in {attempts} "
@@ -99,7 +110,7 @@ def cuda_kernel_names(
     after ``attempts`` such sessions the test is skipped (``LOST_RECORDS``).
     """
     exclude = tuple(exclude)
-    for _ in range(attempts):
+    for attempt in range(1, attempts + 1):
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
@@ -112,8 +123,10 @@ def cuda_kernel_names(
             fn()
             launch_sentinel()
             torch.cuda.synchronize()
-        inner = between_sentinels(cuda_event_names(profile))
+        names = cuda_event_names(profile)
+        inner = between_sentinels(names)
         if inner is not None:
             return [name for name in inner if not name.startswith(exclude)]
+        warn_lost_records(attempt, attempts, names)
     skip_lost_records(attempts)
     raise AssertionError("unreachable")  # pragma: no cover

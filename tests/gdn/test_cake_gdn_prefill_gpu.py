@@ -824,7 +824,7 @@ def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
     synchronization that drains the trailing one runs outside the window.
     """
 
-    for _ in range(attempts):
+    for attempt in range(1, attempts + 1):
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -863,9 +863,11 @@ def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
             else:
                 device.append(event)
         device.sort(key=lambda event: event.time_range.start)
-        inner = cake_profiler.between_sentinels([event.name for event in device])
+        device_names = [event.name for event in device]
+        inner = cake_profiler.between_sentinels(device_names)
         if inner is not None:
             return names + inner
+        cake_profiler.warn_lost_records(attempt, attempts, device_names)
     cake_profiler.skip_lost_records(attempts)
 
 
