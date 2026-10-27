@@ -76,8 +76,8 @@ When you start CI on a PR, pass a test target: `@flashinfer-bot run tests/<dir-o
 no target starts the full suite, which is expensive — reserve it for a final pre-merge check
 of a cross-cutting change. The PR template has an optional "suggested CI test targets" field;
 treat it as a starting point, not an obligation on either side — derive the scope from the
-diff (the touched test files, or the `tests/<area>/` directories covering touched source)
-rather than defaulting to a full run.
+diff (the touched test files, or the test directories covering touched source, as real paths
+relative to the repo root such as `tests/gemm/`) rather than defaulting to a full run.
 
 ## Non-focus
 

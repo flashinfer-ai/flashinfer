@@ -138,13 +138,13 @@ Starting CI applies to the commit that is current at that moment. Pushing new co
 
 It is what applies the `run-ci` label that starts CI, not the label sitting on the PR, so the label stays behind after a run and adding it a second time does nothing. `@flashinfer-bot run` handles this for you by removing the label before re-adding it. If you would rather use the label directly, remove `run-ci` and add it again. Any other label leaves a running CI alone.
 
-| Command | Who can use | Description |
-|---------|-------------|-------------|
-| `@flashinfer-bot run tests/<dir-or-file> [tests/...]` | Can label the PR, or `ci-users` | **Preferred.** Start CI on the PR's current commit, scoped to one or more paths under `tests/` (whitespace-separated; files or directories, no `::` selectors). Invalid targets are rejected and do not start a run. |
-| `@flashinfer-bot run` | Can label the PR, or `ci-users` | Start the **full** suite on the PR's current commit. Expensive — for cross-cutting changes or a final pre-merge check |
-| `@flashinfer-bot rerun` | Can label the PR, or `ci-users` | Cancel and rerun all workflows |
-| `@flashinfer-bot rerun failed` | Can label the PR, or `ci-users` | Rerun only failed/cancelled jobs |
-| `@flashinfer-bot stop` | Can label the PR, or `ci-users` | Cancel all in-progress workflows |
+| Command | Description |
+|---------|-------------|
+| `@flashinfer-bot run tests/<dir-or-file> [tests/...]` | **Preferred.** Start CI on the PR's current commit, scoped to one or more paths under `tests/` (whitespace-separated; files or directories, no `::` selectors). Invalid targets are rejected and do not start a run. |
+| `@flashinfer-bot run` | Start the **full** suite on the PR's current commit. Expensive — for cross-cutting changes or a final pre-merge check |
+| `@flashinfer-bot rerun` | Cancel and rerun all workflows |
+| `@flashinfer-bot rerun failed` | Rerun only failed/cancelled jobs |
+| `@flashinfer-bot stop` | Cancel all in-progress workflows |
 
 > **Note:** Draft PRs work the same way. They never run CI on their own, but anyone who can use the commands above can start a run on one when you need it.
 
