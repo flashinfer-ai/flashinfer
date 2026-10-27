@@ -1369,12 +1369,24 @@ def test_trtllm_gen_lse_kernel_reads_softmax_stats_coherently():
         ).stdout
         for path in spec.get_library_paths()
     )
+    _check_lse_kernel_sass(sass)
+
+
+def _check_lse_kernel_sass(sass):
+    # A multi-arch build also holds SASS for other targets, and below SM90 the kernel has no PDL
+    # wait: check the SM10x code only.
+    parts = re.split(r"\n\s*code for (sm_\w+)", sass)
+    sm10x = "".join(
+        body
+        for arch, body in zip(parts[1::2], parts[2::2], strict=True)
+        if arch.startswith("sm_10")
+    )
     kernels = [
         body
-        for body in re.split(r"\n\s*Function : ", sass)
+        for body in re.split(r"\n\s*Function : ", sm10x)
         if body.startswith("_ZN10flashinfer22ComputeLSEFromMDKernel")
     ]
-    assert kernels, "ComputeLSEFromMDKernel not found in the fmha_gen module"
+    assert kernels, "ComputeLSEFromMDKernel not found in the SM10x code of fmha_gen"
     for body in kernels:
         instructions = re.findall(r"/\*[0-9a-f]{4,}\*/\s+([^;]+);", body)
         loads = [i for i, ins in enumerate(instructions) if re.search(r"\bLDG\b", ins)]
