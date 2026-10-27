@@ -112,7 +112,7 @@ def resolve_mxfp4_optimizations(
         token_back_by_dispatch=token_back_by_dispatch,
         fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
         dedup_dispatch=dedup_dispatch,
-        paired_stores=local_optimizations and tile[2] == 256,
+        paired_stores=local_optimizations and tile[2] in (128, 256),
         skip_zero_counts=skip_zero_counts,
     )
     tail_supported = peer_layout

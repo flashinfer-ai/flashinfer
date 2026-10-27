@@ -163,6 +163,10 @@ not picked them up):
   omits these fields at their defaults, so existing candidate sets and cache
   provenance keep their identity. Explicit frontend/backend values override
   the tactic, as `token_back_mode` does. The drop tree has none of this.
+- Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
+  H2560/I640/E512/top10/EP2 in October): `src/moe_hopper_fp8/mxfp4_policy.py` resolves
+  `paired_stores` for tile K 128 as well as 256. Output-invariant; K256
+  tiles are unchanged. Not in the drop tree.
 
 ## Layout
 
