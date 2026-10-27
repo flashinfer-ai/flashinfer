@@ -43,6 +43,8 @@ FNP_ROWS = 32
 # layout of the hidden-4096 route is a program of its own, storing the BF16 output and its quantization.
 FP8_LAYOUTS = ("col", "extra")
 QUANT_LAYOUTS = ("fp8_group128", "nvfp4")
+# The architectures whose exported programs include the quantized variants' tail forms (mhc_infer_variant_program).
+VARIANT_TAIL_ARCHES = ("sm_107a",)
 FP8_GROUP = 128
 FP4_GROUP = 16
 
@@ -514,6 +516,234 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "use_pdl": False,
         },
     },
+    "cake_mega_mhc_ed3f407e5a68eb65478e": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ed3f407e5a68eb65478e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ed3f407e5a68eb65478e_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_ed3f407e5a68eb65478e",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_892d774130f06423fd7c": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_892d774130f06423fd7c_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_892d774130f06423fd7c_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_892d774130f06423fd7c",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 217088,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_5018692c75652529e6fd": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5018692c75652529e6fd_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5018692c75652529e6fd_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_5018692c75652529e6fd",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp4"],
+            ["buffer", "y_fp4_sf"],
+            ["buffer", "fp4_global_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_12e5bcc41e7940e7d511": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_12e5bcc41e7940e7d511_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_12e5bcc41e7940e7d511_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_12e5bcc41e7940e7d511",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp4"],
+            ["buffer", "y_fp4_sf"],
+            ["buffer", "fp4_global_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 217088,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
 }
 ROUTES: list[dict[str, Any]] = [
     {
@@ -677,6 +907,7 @@ ROUTES: list[dict[str, Any]] = [
     {
         "hidden": 4096,
         "num_splits": "runtime",
+        "regime": "bf16",
         "shifted": False,
         "shared_sf": False,
         "sf_layout": "fp8_group128",
@@ -686,10 +917,51 @@ ROUTES: list[dict[str, Any]] = [
     {
         "hidden": 4096,
         "num_splits": "runtime",
+        "regime": "bf16",
         "shifted": False,
         "shared_sf": False,
         "sf_layout": "nvfp4",
         "program": "cake_mega_mhc_1c61fed11caf93d1b762",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe_wsmem",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "program": "cake_mega_mhc_5018692c75652529e6fd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe_wsmem",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
         "defines": {},
     },
 ]
@@ -896,6 +1168,41 @@ def mhc_infer_variant_num_splits(
         if (m_blocks * splits + grid - 1) // grid >= VARIANT_PLAIN_MIN_WAVES:
             return VARIANT_WSMEM_REGIME_SPLITS
     return splits
+
+
+def mhc_infer_variant_program(
+    num_tokens: int,
+    num_sms: int,
+    sf_layout: str,
+    deterministic: bool = False,
+    tail_variants: bool = False,
+) -> str:
+    """The program of a quantized-output variant's launch (``sf_layout`` ``"fp8_group128"`` / ``"nvfp4"``) at its split
+    count (:func:`mhc_infer_variant_num_splits`). ``"bf16"`` (the plain variant program) unless the arch ships the
+    variants' tail forms: ``tail_variants`` is the caller's statement of the programs it has (the sm_107a
+    ``mhc_infer_step`` entries with ``sf_layout`` and ``tail_pipe`` [+ ``weight_smem``]), never inferred from the SM
+    count. Then the production program's form (:func:`mhc_infer_tail_program`: ``"tailpipe"`` / ``"tailpipe_wsmem"``,
+    ``"bf16"`` at 32 and 64 splits: T < 385 on 208 SMs), except where the plain program stays: where the production
+    program is ``"tailpipe"`` and all tasks fit one wave of the grid, ``"fp8_group128"`` at fewer than 16 splits
+    (T = 833..1280 on 208 SMs) and ``"nvfp4"`` at 16 splits or more (T = 385..832 on 208 SMs), and both layouts in
+    deterministic mode below the tailpipe_wsmem regime; in those ranges the tail form measured slower than the plain
+    program at some counts. A tail form reorders loads, not arithmetic: at the same split count it writes bitwise the
+    plain variant's outputs, so the choice never changes a launch's outputs."""
+    if not tail_variants:
+        return "bf16"
+    program = mhc_infer_tail_program(num_tokens, num_sms, deterministic)
+    if program != "tailpipe":
+        return program
+    if deterministic:
+        return "bf16"
+    splits = mhc_infer_num_splits(num_tokens, num_sms, deterministic)
+    m_blocks = (num_tokens + 63) // 64
+    grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+    if m_blocks * splits <= grid and (
+        splits < 16 if sf_layout == "fp8_group128" else splits >= 16
+    ):
+        return "bf16"
+    return program
 
 
 def split_fn(fn, out=None):
@@ -1332,9 +1639,12 @@ class MegaMHCPlan:
             # production count elsewhere; the regime names the BF16-output program.
             if sf_layout in QUANT_LAYOUTS:
                 splits = mhc_infer_variant_num_splits(tokens, sms, deterministic)
+                regime = mhc_infer_variant_program(
+                    tokens, sms, sf_layout, deterministic, arch in VARIANT_TAIL_ARCHES
+                )
             else:
                 splits = mhc_infer_num_splits(tokens, sms, deterministic)
-            regime = mhc_infer_tail_program(tokens, sms, deterministic)
+                regime = mhc_infer_tail_program(tokens, sms, deterministic)
         program, defines = select_program(
             hidden, splits, shifted, shared_sf, sf_layout, arch, regime=regime
         )

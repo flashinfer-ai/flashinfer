@@ -243,9 +243,6 @@ kernel_cake_blackwell_bf16_fp4_af124eba68ad18229e9e(const __grid_constant__ CUte
         }
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // === Task calls (declaration order) ===
     int off_n = blockIdx.x * 64;
     if (warp == 0) {
@@ -309,6 +306,8 @@ kernel_cake_blackwell_bf16_fp4_af124eba68ad18229e9e(const __grid_constant__ CUte
                    "r"(full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
         }
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     unsigned int a_frag[4];
     unsigned int b_frag[2];
     unsigned int xa0[4];
