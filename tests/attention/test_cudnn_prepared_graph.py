@@ -43,6 +43,63 @@ def _reference(q, k, v, q_lens, kv_lens, scale):
     return torch.cat(outputs), torch.cat(stats)
 
 
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_first_ragged_auto_plan_preserves_captured_prefixes(
+    monkeypatch, backend, graph_mode
+):
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    # Exercise auto resolving to cuDNN without pinning the selection heuristics.
+    monkeypatch.setattr(
+        flashinfer.prefill, "determine_attention_backend", lambda *a, **kw: "cudnn"
+    )
+    torch.manual_seed(53)
+    q = torch.randn(20, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(42, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, 3, 20], dtype=torch.int32)
+    kv = torch.tensor([0, 9, 42], dtype=torch.int32)
+    buffers = (
+        dict(qo_indptr_buf=qo.cuda(), kv_indptr_buf=kv.cuda()) if graph_mode else {}
+    )
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        backend=backend,
+        use_cuda_graph=graph_mode,
+        **buffers,
+    )
+
+    def plan():
+        wrapper.plan(qo, kv, 4, 2, 128, q_data_type=q.dtype)
+
+    plan()
+    assert wrapper._backend == "cudnn"
+    ref, ref_lse = _reference(q, k, v, [3, 17], [9, 33], 128**-0.5)
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+    prefixes = (wrapper._qo_indptr_buf.data_ptr(), wrapper._kv_indptr_buf.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, out=out, lse=lse, return_lse=True)
+    plan()
+    # Capture stores these addresses. Check their stability before freed storage
+    # can be reused, making the old-code failure deterministic and safe.
+    assert prefixes == (
+        wrapper._qo_indptr_buf.data_ptr(),
+        wrapper._kv_indptr_buf.data_ptr(),
+    )
+    rebound, rebound_lse = wrapper.run(q.clone(), k.clone(), -v, return_lse=True)
+    torch.testing.assert_close(rebound.float(), -ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(rebound_lse, ref_lse, atol=1e-3, rtol=1e-3)
+    v.mul_(0.5)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref * 0.5, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize(
     "require_ordered", [False, True], ids=["compatible", "ordered"]
 )

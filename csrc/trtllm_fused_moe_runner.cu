@@ -749,10 +749,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
     // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
     // compile-time e4m3Max, so they cannot desync.
-    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
-    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
-    auto const recipe =
-        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
+    auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(args.nvfp4_4over6_code);
     auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
     auto sfLayout = QuantizationSFLayout::LINEAR;
     switch (sfLayoutB) {

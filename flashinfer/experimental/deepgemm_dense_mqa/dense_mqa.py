@@ -28,19 +28,39 @@ chain ``q1:short``, the warp-scan classes ``q128:short`` / ``le32:short`` and
 the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
-bound the two-launch route of the same query count serves the call.
+bound the two-launch route of the same query count serves the call. The FP4
+single-launch programs carry a first-tile L2 prefetch of the CTA's first KV tile
+and the block's Q / scale / weight boxes (identical logits and schedule words) on
+the forms the per-architecture policy list ``policy.fp4.first_tile_prefetch_forms``
+names: ``q1`` (``fp4:q1:short``; both architectures), ``le32`` (``fp4:le32:short``;
+sm_103a only -- one route, the route record binds the prefetch program on sm_103a
+and the plain warp-scan program on sm_100a) and ``qle1024``: where it is listed
+(both architectures) the FP4 ``le1024`` class ships two programs,
+``fp4:qle1024:short`` for ``Q <= policy.fp4.first_tile_prefetch_max_queries_scan1024``
+(the CTA-scan text with the prefetch) and ``fp4:le1024:short`` above that query
+count.
 
 64-head routes are ONE logits launch each: the grid-stride production text
 (the ``q1`` and ``<tier>`` routes, no metadata buffer), its one-split text
 (the ``:short`` routes: ``K <= policy.dense_short.max_kv`` and at least two
-query blocks) or -- where the catalog carries ``policy.dense_kvsplit`` -- the
+query blocks), its tile-schedule-words text (the ``:ts`` routes: the per-arch
+production text whose load_q lane publishes each Q block's window words through
+the Q stage, no metadata buffer; not a ``:short`` shape,
+``policy.dense_ts.min_kv_exclusive < K <= dense_ts.max_kv``,
+``Q <= dense_ts.max_queries`` and at least ``dense_ts.min_q_blocks`` query
+blocks) or -- where the catalog carries ``policy.dense_kvsplit`` -- the
 production text under its in-kernel KV-split plan (the ``:kvsplit`` routes:
 ``K > dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
-catalogued SM count ``dense_kvsplit.sm_count[arch]``; the plan text of the
+catalogued SM count ``dense_kvsplit.sm_count[arch]``, or -- where
+``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+``sm_count[arch] <= ceil(Q / 2) <= dense_kvsplit.max_q_blocks``, the ``qle2048``
+plan's whole-grid band; the plan text of the
 query count -- ``q1`` / ``qle128`` / ``qle2048`` -- recomputes the tiered
 schedule in every CTA and writes it into the plan's own ``metadata`` buffer,
 launch grid = the SM count).  The KV-split gate is the only SM-count dependent
-rule and is applied at the catalogued count, not the device's.
+rule and is applied at the catalogued count, not the device's; it is consulted
+before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
+``:ts`` gate is named by its KV-split plan.
 """
 
 from __future__ import annotations
@@ -50,7 +70,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v11"
+CATALOG_SCHEMA = "dense_mqa.v13"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -272,6 +292,18 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
                 return f"{prefix}:q1"
             scan = _fused_scan_class(queries, keys, fp4)
             if scan:
+                # the le1024 class is served by its first-tile-prefetch program at and below the
+                # policy's query bound and by the plain CTA-scan program above it (one class, one
+                # K bound, two programs) on the architectures whose
+                # ``policy.fp4.first_tile_prefetch_forms`` list ``qle1024``; the le32 class is one
+                # route whose program the route record binds per architecture
+                split = "qle1024" in fp4["first_tile_prefetch_forms"][arch]
+                if (
+                    scan == 1024
+                    and split
+                    and queries <= int(fp4["first_tile_prefetch_max_queries_scan1024"])
+                ):
+                    return f"{prefix}:qle1024:short"
                 return f"{prefix}:le{scan}:short"
         return (
             f"{prefix}:q1"
@@ -279,7 +311,8 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
             else f"{prefix}:{metadata_tier(queries, num_heads)}"
         )
     if num_heads != NUM_HEADS:
-        # the in-kernel KV-split plan of a gated 64-head call (K > dense_kvsplit.min_kv: disjoint from the one-split rule)
+        # the in-kernel KV-split plan of a gated 64-head call (K > dense_kvsplit.min_kv: disjoint from the one-split
+        # rule; consulted before the ``:ts`` shape gate, whose 256 < K <= 2048 band it overlaps below the SM count)
         plan = h64_kvsplit_plan(queries, keys, num_heads, arch=arch)
         if plan == "q1":
             return f"{prefix}:q1:kvsplit"
@@ -317,6 +350,8 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
                 )
     if num_heads != NUM_HEADS and h64_short_shape(queries, keys, num_heads):
         return f"{prefix}:{kind}:short"
+    if num_heads != NUM_HEADS and h64_ts_shape(queries, keys, num_heads):
+        return f"{prefix}:{kind}:ts"
     return f"{prefix}:{kind}:{metadata_tier(queries, num_heads)}"
 
 
@@ -359,9 +394,12 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     kind, ``fp8:{full,partial}:le{32,768}:short``, ``Q = 128`` belongs to the Q128
     rule only; ``qle``: the fused tiered text), the first whose own bound admits
     the call, then the metadata + indexer pair. FP4: ``fp4:q1:short``
-    (``K <= fp4.fused_q1_max_kv``), the scan class (``fp4:le{32,1024}:short``),
-    then the pair. A scan class is the smallest ``fused_scan_ceilings`` entry
-    covering ``ceil(Q / 4)`` and is served only while
+    (``K <= fp4.fused_q1_max_kv``), the scan class (``fp4:le32:short``; the
+    1024-block class as ``fp4:qle1024:short`` for
+    ``Q <= fp4.first_tile_prefetch_max_queries_scan1024`` -- the CTA-scan program
+    with the first-tile L2 prefetch -- and ``fp4:le1024:short`` above that query
+    count), then the pair. A scan class is the smallest ``fused_scan_ceilings``
+    entry covering ``ceil(Q / 4)`` and is served only while
     ``K <= fused_scan<ceiling>_max_kv`` of that class (:func:`_fused_scan_class`).
     The logical name needs one rule: every architecture must share the tier's
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
@@ -408,6 +446,21 @@ def h64_short_shape(queries, keys, num_heads=64):
     return keys <= int(short["max_kv"]) and blocks >= int(short["min_q_blocks"])
 
 
+def h64_ts_shape(queries, keys, num_heads=64):
+    """Shape-only gate of the 64-head ``:ts`` tile-schedule-words routes (``policy.dense_ts``): not a ``:short``
+    shape, ``min_kv_exclusive < K <= max_kv``, ``Q <= max_queries`` and at least ``min_q_blocks`` query blocks.
+    False when the catalog has no ``dense_ts`` policy."""
+    ts = _catalog()["policy"].get("dense_ts")
+    if ts is None or h64_short_shape(queries, keys, num_heads):
+        return False
+    blocks = (queries + block_q(num_heads) - 1) // block_q(num_heads)
+    return (
+        int(ts["min_kv_exclusive"]) < keys <= int(ts["max_kv"])
+        and queries <= int(ts["max_queries"])
+        and blocks >= int(ts["min_q_blocks"])
+    )
+
+
 def _h64_tier_fallback(
     precision, queries, num_heads, route, arch=None, *, shipped=True
 ):
@@ -421,8 +474,8 @@ def _h64_grid_stride_route(
     precision, queries, num_heads, kind, arch=None, *, shipped=True
 ):
     """The grid-stride tier route of ``kind`` (``full`` / ``partial``) a withheld or uncatalogued 64-head ``:short`` /
-    ``:kvsplit`` call is served by: among the tier of the query count (:func:`metadata_tier`) and the wider tiers up
-    to ``:any``, the first route the catalog carries and ``arch`` admits, else the first the catalog carries (the
+    ``:ts`` / ``:kvsplit`` call is served by: among the tier of the query count (:func:`metadata_tier`) and the wider
+    tiers up to ``:any``, the first route the catalog carries and ``arch`` admits, else the first the catalog carries (the
     caller's admission check then refuses the call) -- a fallback always names a program the catalog ships, never a
     tier it leaves unshipped.  ``shipped=False`` returns the query count's tier route regardless (the export's own
     resolution).  ``arch=None`` requires the architectures to agree on the admission of every tier consulted."""
@@ -456,9 +509,11 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
     count of ``arch`` (``dense_kvsplit.sm_count[arch]``; no device query -- a device whose SM count differs from its
     architecture's entry is routed as the catalogue says, the program takes the launch grid at runtime): the plan
     text (``q1`` / ``qle128`` / ``qle2048``, the inclusive query bands ``dense_kvsplit.plans``) when
-    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, else ``None`` (the grid-stride route).
-    ``None`` as well for 32 heads, when the catalog has no ``dense_kvsplit`` policy, or when the catalogued SM count
-    exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
+    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, or -- the whole-grid band, where
+    ``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+    ``sm_count <= ceil(Q / block_q) <= dense_kvsplit.max_q_blocks`` (the ``qle2048`` plan: the same program at grid =
+    the SM count); else ``None`` (the grid-stride route).  ``None`` as well for 32 heads, when the catalog has no
+    ``dense_kvsplit`` policy, or when the catalogued SM count exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
     gate = _catalog()["policy"].get("dense_kvsplit")
     if gate is None or num_heads == NUM_HEADS:
         return None
@@ -470,8 +525,19 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
         return None
     bq = block_q(num_heads)
     blocks = (queries + bq - 1) // bq
-    if blocks >= sm_count or keys <= int(gate["min_kv"]):
+    if keys <= int(gate["min_kv"]):
         return None
+    if blocks >= sm_count:
+        # the whole-grid band of the qle2048 plan (per architecture; its KV bound is the ``:ts`` routes' bound, so the
+        # ``:ts`` gate keeps 256 < K <= fullgrid_min_kv at these block counts)
+        fullgrid = gate["fullgrid"]
+        enabled = fullgrid[arch] if isinstance(fullgrid, dict) else bool(fullgrid)
+        if not (
+            enabled
+            and blocks <= int(gate["max_q_blocks"])
+            and keys > int(gate["fullgrid_min_kv"])
+        ):
+            return None
     for plan, (low, high) in gate["plans"].items():
         if int(low) <= queries <= int(high):
             return plan
@@ -506,14 +572,14 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
     """The route the runtime serves for a problem on ``arch``: :func:`_route_name_on` under the architecture's own rule --
     (i) its single-launch precedence (``policy.single_launch_precedence[arch]``) and its own
     ``policy.fused_qle2048_max_kv[arch]`` (a 32-head call whose K exceeds the device's bound is served by the next family
-    in the tier's order or by the two-launch tier route of its query count) -- and (ii) a 64-head ``:short`` route the
-    catalog does not carry or ``arch`` withholds (``policy.dense_admission``) is served by the tier route of the same
-    query count -- the production program the tier table admits -- never by the stock kernel
-    (``policy.dense_short.fallback == "tier"``), and (iii) a 64-head ``:kvsplit`` route the catalog does not carry or
-    ``arch`` withholds is served by the grid-stride ``q1`` / tier route of the same query count
-    (``policy.dense_kvsplit.fallback == "tier"``). ``arch=None`` is accepted only where the architectures agree (on the
+    in the tier's order or by the two-launch tier route of its query count) -- and (ii) a 64-head ``:short`` / ``:ts``
+    route the catalog does not carry or ``arch`` withholds (``policy.dense_admission``) is served by the tier route of
+    the same query count -- the production program the tier table admits -- never by the stock kernel
+    (``policy.dense_short.fallback == policy.dense_ts.fallback == "tier"``), and (iii) a 64-head ``:kvsplit`` route
+    the catalog does not carry or ``arch`` withholds is served by the grid-stride ``q1`` / tier route of the same query
+    count (``policy.dense_kvsplit.fallback == "tier"``). ``arch=None`` is accepted only where the architectures agree (on the
     fused Q <= 2048 bound for ``keys``, on the tier's precedence, on the KV-split gate at their catalogued SM counts and
-    on the short / KV-split route's admission; ``ValueError`` otherwise, as :func:`_admitted`)."""
+    on the short / ts / KV-split route's admission; ``ValueError`` otherwise, as :func:`_admitted`)."""
     arches = sorted(_catalog()["arches"])
     if arch is None:
         verdicts = {
@@ -530,7 +596,7 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
         if arch not in arches:
             raise ValueError(f"arch must be one of {arches}, got {arch!r}")
         route = _route_name_on(precision, queries, keys, num_heads, arch)
-    if num_heads != NUM_HEADS and route.endswith(":short"):
+    if num_heads != NUM_HEADS and route.endswith((":short", ":ts")):
         if route not in _catalog()["routes"] or not _admitted(route, arch):
             return _h64_tier_fallback(precision, queries, num_heads, route, arch)
     if num_heads != NUM_HEADS and route.endswith(":kvsplit"):
@@ -541,11 +607,11 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
 
 def _export_route(precision, queries, keys, num_heads=NUM_HEADS):
     """The route the export resolves for a point (admission is routing policy, not a precondition of the
-    program): :func:`route_name`, or the grid-stride route when a 64-head ``:short`` / ``:kvsplit`` route has no catalog
-    record."""
+    program): :func:`route_name`, or the grid-stride route when a 64-head ``:short`` / ``:ts`` / ``:kvsplit`` route has
+    no catalog record."""
     route = route_name(precision, queries, keys, num_heads)
     if num_heads != NUM_HEADS and route not in _catalog()["routes"]:
-        if route.endswith(":short"):
+        if route.endswith((":short", ":ts")):
             return _h64_tier_fallback(
                 precision, queries, num_heads, route, shipped=False
             )
@@ -664,7 +730,8 @@ def h64_admission(arch):
     """``policy.dense_admission`` of one architecture: ``{"admitted_routes": [...], "withheld_routes": [...],
     "reason": str | None}`` -- the 64-head routes served on ``arch`` (every query count of those tiers), the
     routes the producer measured and did not admit there (a withheld TIER route keeps the engine's stock
-    kernel; a withheld ``:short`` route is served by its tier route, see :func:`served_route`; ``reason`` says
+    kernel; a withheld ``:short`` / ``:ts`` route is served by its tier route and a withheld ``:kvsplit`` route by the
+    grid-stride ``q1`` / tier route, see :func:`served_route`; ``reason`` says
     why), two disjoint lists. Empty / ``None`` when the catalog has no 64-head family. Host-only."""
     record = _catalog()["policy"].get("dense_admission")
     arches = (

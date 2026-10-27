@@ -426,7 +426,26 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
-def test_sccache_setup_uses_server_side_compilation(tmp_path):
+def _sccache_free_env():
+    """Return os.environ without the sccache state of an enclosing CI lane.
+
+    The GPU lanes run pytest under scripts/run_with_test_sccache.sh, which
+    exports the real cache prefix, stats directory, launchers and AWS keys.
+    Shell tests that inherit them write into the lane's stats directory (and,
+    with a real sccache on PATH, could reach its server).
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("SCCACHE_", "AWS_", "FLASHINFER_SCCACHE_"))
+        and name not in ("FLASHINFER_NVCC_LAUNCHER", "FLASHINFER_CXX_LAUNCHER")
+    }
+
+
+def test_sccache_setup_uses_server_side_compilation(tmp_path, monkeypatch):
+    # Simulate running inside a wrapped GPU lane; the test must not touch it.
+    lane_stats_dir = tmp_path / "lane-stats"
+    monkeypatch.setenv("SCCACHE_STATS_DIR", str(lane_stats_dir))
     common_script = (
         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
     )
@@ -453,7 +472,162 @@ test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
 test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
 """
 
-    subprocess.run(["bash", "-c", script], check=True)
+    subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
+
+    assert not lane_stats_dir.exists()
+
+
+def _write_test_sccache_fakes(
+    tmp_path, sccache_version, *, serve_archive=False, start_server_fails=False
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sccache_log = tmp_path / "sccache.log"
+    sccache = fake_bin / "sccache"
+    start_server_status = 1 if start_server_fails else 0
+    sccache.write_text(
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{sccache_log}"\n'
+        f'if [ "$1" = --version ]; then echo "sccache {sccache_version}"; fi\n'
+        'if [ "$1" = --show-stats ]; then echo "Cache hits 1"; fi\n'
+        f'if [ "$1" = --start-server ]; then exit {start_server_status}; fi\n'
+    )
+    # Downloads fail by default so a version mismatch takes the fail-open path
+    # offline. serve_archive instead "downloads" an archive whose published
+    # checksum does not match, which must stop the install before extraction.
+    curl = fake_bin / "curl"
+    if serve_archive:
+        curl.write_text(
+            "#!/bin/bash\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in -o) out=$2; shift 2 ;; *) url=$1; shift ;; esac\n'
+            "done\n"
+            'case "$url" in\n'
+            '  *.sha256) echo "0000000000000000000000000000000000000000000000000000000000000000  x" > "$out" ;;\n'
+            '  *) echo "not the published archive" > "$out" ;;\n'
+            "esac\n"
+        )
+    else:
+        curl.write_text("#!/bin/bash\nexit 22\n")
+    tar_log = tmp_path / "tar.log"
+    tar = fake_bin / "tar"
+    tar.write_text(f'#!/bin/bash\necho "$*" >> "{tar_log}"\n')
+    # Pin a supported architecture so every host reaches the checksum check.
+    uname = fake_bin / "uname"
+    uname.write_text("#!/bin/bash\necho x86_64\n")
+    cuda_bin = tmp_path / "cuda" / "bin"
+    cuda_bin.mkdir(parents=True)
+    nvcc = cuda_bin / "nvcc"
+    nvcc.write_text(
+        "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
+    )
+    for executable in (sccache, curl, tar, uname, nvcc):
+        executable.chmod(0o755)
+    child = tmp_path / "lane.sh"
+    child.write_text(
+        "#!/bin/bash\n"
+        'echo "nvcc_launcher=${FLASHINFER_NVCC_LAUNCHER:-}"\n'
+        'echo "cxx_launcher=${FLASHINFER_CXX_LAUNCHER:-}"\n'
+        'echo "prefix=${SCCACHE_S3_KEY_PREFIX:-}"\n'
+        'echo "basedirs=${SCCACHE_BASEDIRS:-}"\n'
+        'echo "args=$*"\n'
+        "exit 7\n"
+    )
+    child.chmod(0o755)
+    env = {
+        **_sccache_free_env(),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CUDA_HOME": str(tmp_path / "cuda"),
+        "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "home"),
+        "SCCACHE_STATS_DIR": str(tmp_path / "stats"),
+    }
+    return child, sccache_log, tar_log, env
+
+
+def _run_with_test_sccache(tmp_path, child, env):
+    wrapper = (
+        Path(__file__).resolve().parents[2] / "scripts" / "run_with_test_sccache.sh"
+    )
+    return subprocess.run(
+        ["bash", str(wrapper), str(child), "--workers-per-gpu", "2"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_ran_uncached(result):
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "running without the compiler cache" in result.stdout
+    assert "nvcc_launcher=\n" in result.stdout
+    assert "cxx_launcher=\n" in result.stdout
+    assert "args=--workers-per-gpu 2\n" in result.stdout
+
+
+def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    assert result.returncode == 7, result.stdout + result.stderr
+    lines = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    assert lines["nvcc_launcher"] == "sccache"
+    assert lines["cxx_launcher"] == "sccache"
+    assert lines["prefix"] == "cuda129-x86_64"
+    jit_root = (tmp_path / "home" / ".cache" / "flashinfer").resolve()
+    assert lines["basedirs"] == f"{tmp_path.resolve()}:{jit_root}"
+    assert lines["args"] == "--workers-per-gpu 2"
+    calls = sccache_log.read_text().splitlines()
+    assert "--start-server" in calls
+    assert "--stop-server" in calls
+    assert (tmp_path / "stats" / "sccache-stats.txt").read_text() == "Cache hits 1\n"
+
+
+def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
+    child, sccache_log, tar_log, env = _write_test_sccache_fakes(
+        tmp_path, "0.0.0", serve_archive=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    # A failed `sha256sum -c` must stop the install before extraction.
+    assert not tar_log.exists()
+    assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+    (tmp_path / "cuda" / "bin" / "nvcc").unlink()
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(
+        tmp_path, "0.18.0", start_server_fails=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "--start-server" in sccache_log.read_text().splitlines()
+    assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
 
 
 @pytest.mark.parametrize(

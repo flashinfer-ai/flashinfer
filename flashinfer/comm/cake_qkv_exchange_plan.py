@@ -35,6 +35,7 @@ H_local, D]`` planes for Q, K, V) or ``"fused"`` (one ``[B, S_global, H_local,
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -84,8 +85,9 @@ NT_OUTER_A_BYTES_MAX = 32 << 20
 GROUP_A_SLICE_BYTES_MAX = 16 << 20
 # 2-CTA pair tiles: every ``block_n = 256`` row and every row with at least
 # ``PAIR_MIN_M`` producer rows pairs on the architectures that build the pair
-# producer; pair rows with ``M >= PAIR_MIN_M`` are grouped with at least
-# ``PAIR_MIN_GROUPS`` token-tile groups per rank.
+# producer, unless the pair-tile gate selects the single-CTA producer for that
+# row (``pair_off_large_m``); pair rows with ``M >= PAIR_MIN_M`` are grouped
+# with at least ``PAIR_MIN_GROUPS`` token-tile groups per rank.
 PAIR_BN = 256
 PAIR_MIN_M = 4096
 PAIR_MIN_GROUPS = 4
@@ -124,43 +126,71 @@ RESERVED_SMS = 2
 # ``per_dest_large_m``: a call with ``rows >= T`` launches the producer once per
 # destination run of its tile table (the first launch carries the folded
 # rendezvous, the later ones are the plain producer, stream-ordered behind it)
-# instead of one persistent grid.  ``0`` = the gate never fires.  Every gate is
-# inclusive at its threshold and changes neither the tile table nor the stored
-# bits.  Measured per architecture: SM100 / SM103 ship the small-row word gate
-# and the per-destination launch gate, SM90 ships the small-row word gate and the
-# large-row reserved-SM gate, SM107 ships none;
-# ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake backend) overrides a
-# session's gates in either direction.
+# instead of one persistent grid; ``pair_off_large_m``: a ``block_n = 256`` call
+# with ``rows >= T`` runs the single-CTA producer instead of the 2-CTA pair tile
+# (the pair policy's tile order and ``group_m`` are kept; ``SHAPE_GATE_BN`` names
+# the tile width the gate needs, so ``gate_rows`` takes the call's ``bn`` while
+# the gate is on; a 128-column call never fires it).  ``0`` = the gate never
+# fires; ``SHAPE_GATE_ALL_ROWS`` (spelled ``all`` in the environment variable and
+# in ``describe()``) = the small-row word gate fires on every row count.  Every
+# gate is inclusive at its threshold; the first three change neither the tile
+# table nor the stored bits, the pair-tile gate changes the producer program of
+# the rows it selects and needs that program delivered.  Measured per
+# architecture (``SHAPE_GATE_DEFAULT_BY_ARCH``): SM100 / SM103 ship the small-row
+# word gate and the per-destination launch gate, SM90 ships the small-row word
+# gate and the large-row reserved-SM gate, SM107 ships none; one (architecture,
+# world size) cell differs from those tables (``SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``,
+# merged by ``default_shape_gates``): a group of 8 ranks on SM90 ships the
+# small-row word gate for every row.  Elsewhere the pair-tile gate ships nowhere
+# (an opt-in on the pair architectures; SM90 builds no pair tile and refuses
+# it); ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the
+# Cake backend) overrides a session's gates in either direction.
 SHAPE_GATE_NAMES: tuple[str, ...] = (
     "words_capacity_small_m",
     "reserved_sms_large_m",
     "per_dest_large_m",
+    "pair_off_large_m",
 )
+SHAPE_GATE_BN: dict[str, int] = {"pair_off_large_m": PAIR_BN}
 SHAPE_GATE_OFF = 0
+# The "every row" threshold of the small-row word gate (``rows <= SHAPE_GATE_ALL_ROWS`` holds for every row count a
+# session can allocate); a large-row gate never takes it (``0`` is its "never fires" spelling).
+SHAPE_GATE_ALL_ROWS = 2**31 - 1
+SHAPE_GATE_ALL_ROWS_NAMES: tuple[str, ...] = ("words_capacity_small_m",)
 SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
-    # SM90: the small-row word gate (4096) and the large-row reserved-SM gate (16384) on every group size; the
-    # per-destination launch gate off.
+    # SM90: the small-row word gate (4096; every row for a group of 8 ranks, see SHAPE_GATE_DEFAULT_BY_ARCH_WORLD)
+    # and the large-row reserved-SM gate (16384) on every group size; the per-destination launch gate off.
     "sm_90a": {
         "words_capacity_small_m": 4096,
         "reserved_sms_large_m": 16384,
         "per_dest_large_m": SHAPE_GATE_OFF,
+        "pair_off_large_m": SHAPE_GATE_OFF,
     },
     "sm_100a": {
         "words_capacity_small_m": 4096,
         "reserved_sms_large_m": SHAPE_GATE_OFF,
         "per_dest_large_m": 16384,
+        "pair_off_large_m": SHAPE_GATE_OFF,
     },
     "sm_103a": {
         "words_capacity_small_m": 4096,
         "reserved_sms_large_m": SHAPE_GATE_OFF,
         "per_dest_large_m": 16384,
+        "pair_off_large_m": SHAPE_GATE_OFF,
     },
     # SM107: no gate ships (none was measured there); every call takes the ungated host plan.
     "sm_107a": {
         "words_capacity_small_m": SHAPE_GATE_OFF,
         "reserved_sms_large_m": SHAPE_GATE_OFF,
         "per_dest_large_m": SHAPE_GATE_OFF,
+        "pair_off_large_m": SHAPE_GATE_OFF,
     },
+}
+# The (architecture, world size) cells whose shipped gates differ from ``SHAPE_GATE_DEFAULT_BY_ARCH``; only differing
+# cells are listed (a redundant cell is refused below), every other cell is the per-architecture table.
+SHAPE_GATE_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], dict[str, int]] = {
+    # SM90, 8 ranks: one readiness word per destination for every row count.
+    ("sm_90a", 8): {"words_capacity_small_m": SHAPE_GATE_ALL_ROWS},
 }
 
 
@@ -675,13 +705,26 @@ def plan_for(
     pair_available: bool = True,
     words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
     group_m_scale: Optional[int] = None,
+    pair: Optional[bool] = None,
 ) -> tuple[Policy, TilePlan]:
     """Policy and tile plan of one row for one rank (``group_m_scale`` ``None`` = the architecture's default for
-    the geometry's world size)."""
+    the geometry's world size).  ``pair`` overrides the policy's pair tile (``False`` = the single-CTA producer with
+    the policy's tile order and ``group_m``, what a fired ``pair_off_large_m`` gate selects); ``None`` keeps it."""
 
     policy = plan_policy(
         geometry, arch=arch, pair_available=pair_available, group_m_scale=group_m_scale
     )
+    if pair is not None and bool(pair) != policy.pair:
+        policy = dataclasses.replace(
+            policy,
+            pair=bool(pair),
+            reasons=(
+                *policy.reasons,
+                f"pair override {policy.pair} -> {bool(pair)} (row-count gate): the "
+                f"{'pair' if pair else 'single-CTA'} producer with order {policy.order}"
+                f" / group_m {policy.group_m}",
+            ),
+        )
     plan = chunk_plan(
         geometry,
         layout,
@@ -731,20 +774,45 @@ def default_group_m_scale(arch: str, world_size: int) -> int:
         ) from None
 
 
-def default_shape_gates(arch: str) -> dict[str, int]:
-    """The shipped row-count gates of ``arch`` (:data:`SHAPE_GATE_DEFAULT_BY_ARCH`; a copy); an unknown architecture
-    is an error."""
+def default_shape_gates(arch: str, *, world_size: int) -> dict[str, int]:
+    """The shipped row-count gates of ``arch`` for a group of ``world_size`` ranks
+    (:data:`SHAPE_GATE_DEFAULT_BY_ARCH` with the :data:`SHAPE_GATE_DEFAULT_BY_ARCH_WORLD` cell on top; a copy); an
+    unknown architecture or world size is an error.  ``world_size`` is a required keyword: no caller gets the
+    per-architecture table alone."""
 
     try:
-        return dict(SHAPE_GATE_DEFAULT_BY_ARCH[arch])
+        base = SHAPE_GATE_DEFAULT_BY_ARCH[arch]
     except KeyError:
         raise ValueError(
             f"no shape gates for architecture {arch!r}; known: {tuple(SHAPE_GATE_DEFAULT_BY_ARCH)}"
         ) from None
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size not in SUPPORTED_WORLD_SIZES
+    ):
+        raise ValueError(
+            f"no shape gates for architecture {arch!r} at world_size={world_size!r}; known: "
+            f"{SUPPORTED_WORLD_SIZES}"
+        )
+    return {**base, **SHAPE_GATE_DEFAULT_BY_ARCH_WORLD.get((arch, world_size), {})}
+
+
+def shape_gate_spelling(value: Any) -> Any:
+    """How a gate threshold reads in ``describe()``: ``"all"`` for :data:`SHAPE_GATE_ALL_ROWS`, else the value."""
+
+    return "all" if value == SHAPE_GATE_ALL_ROWS else value
+
+
+def spell_shape_gates(gates: Mapping[str, Any]) -> dict[str, Any]:
+    """A gate table with every threshold spelled as ``describe()`` reports it (:func:`shape_gate_spelling`)."""
+
+    return {name: shape_gate_spelling(value) for name, value in gates.items()}
 
 
 def check_shape_gates(gates: Mapping[str, Any]) -> dict[str, int]:
-    """Validate a gate table: exactly :data:`SHAPE_GATE_NAMES`, each an int ``>= 0`` (``0`` = off)."""
+    """Validate a gate table: exactly :data:`SHAPE_GATE_NAMES`, each an int ``>= 0`` (``0`` = off) or, for the
+    small-row word gate only, ``"all"`` / :data:`SHAPE_GATE_ALL_ROWS` (every row).  Returns the int table."""
 
     if set(gates) != set(SHAPE_GATE_NAMES):
         raise ValueError(
@@ -753,12 +821,50 @@ def check_shape_gates(gates: Mapping[str, Any]) -> dict[str, int]:
     checked: dict[str, int] = {}
     for name in SHAPE_GATE_NAMES:
         value = gates[name]
+        if isinstance(value, str) and value.lower() == "all":
+            value = SHAPE_GATE_ALL_ROWS
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(
                 f"shape gate {name} must be an int >= 0 (0 = off), got {value!r}"
             )
+        if value > SHAPE_GATE_ALL_ROWS:
+            raise ValueError(
+                f"shape gate {name}={value} is above SHAPE_GATE_ALL_ROWS ({SHAPE_GATE_ALL_ROWS}): "
+                "no row count reaches it, so it would be a second spelling of 'all' (every "
+                f"row; {SHAPE_GATE_ALL_ROWS_NAMES}) or of 0 (a large-row gate that never fires)"
+            )
+        if value == SHAPE_GATE_ALL_ROWS and name not in SHAPE_GATE_ALL_ROWS_NAMES:
+            raise ValueError(
+                f"shape gate {name}: 'all' (every row) is a small-row gate spelling "
+                f"({SHAPE_GATE_ALL_ROWS_NAMES}); a large-row gate that never fires is 0"
+            )
         checked[name] = int(value)
     return checked
+
+
+def _check_shape_gate_override_table() -> None:
+    """Import-time check of :data:`SHAPE_GATE_DEFAULT_BY_ARCH_WORLD`: known cells, valid thresholds, each differing
+    from the per-architecture table (one canonical form), the pair-tile gate on the pair architectures only."""
+
+    for (arch, world_size), cell in SHAPE_GATE_DEFAULT_BY_ARCH_WORLD.items():
+        base = SHAPE_GATE_DEFAULT_BY_ARCH[arch]
+        if world_size not in SUPPORTED_WORLD_SIZES or not cell:
+            raise ValueError(
+                f"SHAPE_GATE_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        merged = check_shape_gates({**base, **cell})
+        for name, value in cell.items():
+            if merged[name] == base[name]:
+                raise ValueError(
+                    f"SHAPE_GATE_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}][{name!r}] equals the {arch} default"
+                )
+            if name in SHAPE_GATE_BN and value and arch not in PAIR_ARCHES:
+                raise ValueError(
+                    f"SHAPE_GATE_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}][{name!r}]: {arch} builds no pair tile"
+                )
+
+
+_check_shape_gate_override_table()
 
 
 @dataclass(frozen=True)
@@ -766,13 +872,17 @@ class ShapeGateVerdict:
     """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
     ``words_capacity_per_dest`` is ``1`` when the small-row gate fired, else ``None`` (the session's capacity
     stands); ``reserved_sms`` is ``0`` when the large-row reserved-SM gate fired, else ``None`` (``RESERVED_SMS``
-    stands); ``producer_launches`` is ``"per_dest"`` or ``"persistent"``."""
+    stands); ``producer_launches`` is ``"per_dest"`` or ``"persistent"``; ``pair`` is ``False`` when the pair-tile
+    gate fired (the single-CTA producer), else ``None`` (the policy's tile stands); ``bn`` is the tile width the
+    verdict was read against (``None`` when the caller gave none)."""
 
     rows: int
     gates: dict[str, int]
     words_capacity_per_dest: Optional[int]
     producer_launches: str
     reserved_sms: Optional[int] = None
+    pair: Optional[bool] = None
+    bn: Optional[int] = None
 
     @property
     def fired(self) -> tuple[str, ...]:
@@ -785,34 +895,57 @@ class ShapeGateVerdict:
             fired.append("reserved_sms_large_m")
         if self.producer_launches == "per_dest":
             fired.append("per_dest_large_m")
+        if self.pair is not None:
+            fired.append("pair_off_large_m")
         return tuple(fired)
 
     def summary(self) -> dict[str, Any]:
         return {
             "rows": self.rows,
-            "gates": dict(self.gates),
+            "bn": self.bn,
+            "gates": spell_shape_gates(self.gates),
             "fired": list(self.fired),
             "words_capacity_per_dest": self.words_capacity_per_dest,
             "reserved_sms": self.reserved_sms,
             "producer_launches": self.producer_launches,
+            "pair": self.pair,
         }
 
 
-def gate_rows(gates: Mapping[str, Any], rows: int) -> ShapeGateVerdict:
-    """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires)."""
+def gate_rows(
+    gates: Mapping[str, Any], rows: int, *, bn: Optional[int] = None
+) -> ShapeGateVerdict:
+    """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires).
+    ``bn`` is the call's tile width (:func:`block_n_for`), required while a gate of :data:`SHAPE_GATE_BN` is on:
+    the pair-tile gate fires on ``bn == PAIR_BN`` calls only."""
 
     checked = check_shape_gates(gates)
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
         raise ValueError(f"rows must be a positive int, got {rows!r}")
+    if bn is not None and (
+        isinstance(bn, bool) or not isinstance(bn, int) or bn not in BLOCK_N_CHOICES
+    ):
+        raise ValueError(f"bn must be one of {BLOCK_N_CHOICES}, got {bn!r}")
     small = checked["words_capacity_small_m"]
     reserved = checked["reserved_sms_large_m"]
     large = checked["per_dest_large_m"]
+    pair_off = checked["pair_off_large_m"]
+    if pair_off and bn is None:
+        raise ValueError(
+            f"pair_off_large_m={pair_off} fires on bn == {SHAPE_GATE_BN['pair_off_large_m']} "
+            "calls only; pass the call's tile width (bn=block_n_for(geometry))"
+        )
+    pair_fires = (
+        bool(pair_off) and bn == SHAPE_GATE_BN["pair_off_large_m"] and rows >= pair_off
+    )
     return ShapeGateVerdict(
         rows=int(rows),
         gates=checked,
         words_capacity_per_dest=1 if small and rows <= small else None,
         producer_launches="per_dest" if large and rows >= large else "persistent",
         reserved_sms=0 if reserved and rows >= reserved else None,
+        pair=False if pair_fires else None,
+        bn=bn,
     )
 
 
@@ -856,7 +989,11 @@ __all__ = [
     "PAIR_MIN_GROUPS",
     "PAIR_MIN_M",
     "RESERVED_SMS",
+    "SHAPE_GATE_ALL_ROWS",
+    "SHAPE_GATE_ALL_ROWS_NAMES",
+    "SHAPE_GATE_BN",
     "SHAPE_GATE_DEFAULT_BY_ARCH",
+    "SHAPE_GATE_DEFAULT_BY_ARCH_WORLD",
     "SHAPE_GATE_NAMES",
     "SHAPE_GATE_OFF",
     "SUPPORTED_WORLD_SIZES",
@@ -879,5 +1016,7 @@ __all__ = [
     "plan_for",
     "plan_policy",
     "producer_grid",
+    "shape_gate_spelling",
+    "spell_shape_gates",
     "words_capacity_for_rows",
 ]

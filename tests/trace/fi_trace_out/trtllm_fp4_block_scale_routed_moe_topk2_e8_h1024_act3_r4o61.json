@@ -1,0 +1,249 @@
+{
+  "name": "trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_r4o61",
+  "description": "TRT-LLM NvFP4 block-scale MoE with precomputed topk_ids.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.core.trtllm_fp4_block_scale_routed_moe",
+    "status:experimental",
+    "backend:trtllm",
+    "quantization:nvfp4"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "num_experts": {
+      "type": "var",
+      "description": "Total number of experts (passed as kwarg)."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1024
+    },
+    "intermediate_size": {
+      "type": "var",
+      "description": "MoE intermediate layer size (passed as kwarg)."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "2 * intermediate_size."
+    },
+    "num_packed_hidden": {
+      "type": "const",
+      "value": 512
+    },
+    "num_fp4_hidden_blocks": {
+      "type": "var",
+      "description": "NvFP4 block count along hidden_size."
+    },
+    "num_packed_intermediate": {
+      "type": "const",
+      "value": 256
+    },
+    "num_fp4_intermediate_blocks": {
+      "type": "const",
+      "value": 32
+    },
+    "activation_type": {
+      "type": "const",
+      "value": 3,
+      "description": "Fused activation type; 10 selects SiTU."
+    },
+    "nvfp4_4over6": {
+      "type": "const",
+      "value": 1,
+      "description": "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); absent when the call left nvfp4_4over6 unset."
+    }
+  },
+  "inputs": {
+    "gemm1_bias": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "FC1 bias (float32). Optional."
+    },
+    "gemm2_bias": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "FC2 bias (float32). Optional."
+    },
+    "output1_scale_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC1 activation (float32). Optional."
+    },
+    "output1_scale_gate_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC1 gate (float32). Optional."
+    },
+    "output2_scale_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert output scale for FC2 (float32). Optional."
+    },
+    "per_token_scale": {
+      "shape": [
+        "seq_len"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "FC1 token dequantization scales applied before StepFun clipping."
+    },
+    "topk_ids": {
+      "shape": [
+        "seq_len",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "Precomputed top-k."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Optional routing bias."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "NvFP4-packed hidden states."
+    },
+    "hidden_states_scale": {
+      "shape": [
+        "seq_len",
+        "num_fp4_hidden_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true,
+      "description": "NvFP4 hidden_states scale."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "FC1 NvFP4 weights."
+    },
+    "gemm1_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "num_fp4_hidden_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "FC1 NvFP4 scale."
+    },
+    "gemm1_alpha": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert SiTU alpha or SwiGLU alpha."
+    },
+    "gemm1_beta": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert SiTU beta or SwiGLU beta."
+    },
+    "gemm1_clamp_limit": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-expert gated-activation clamp limit."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "num_packed_intermediate"
+      ],
+      "dtype": "uint8",
+      "description": "FC2 NvFP4 weights."
+    },
+    "gemm2_weights_scale": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "num_fp4_intermediate_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "FC2 NvFP4 scale."
+    },
+    "num_experts": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "activation_type": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Fused activation type; 10 selects SiTU."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "MoE output."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\ndef _unswizzle_batched_sf_128x4(\n    sf: torch.Tensor, batch: int, rows: int, cols: int\n) -> torch.Tensor:\n    \"\"\"Recover batched linear scale grids from concatenated 128x4 buffers.\"\"\"\n    padded_rows = (rows + 127) // 128 * 128\n    padded_cols = (cols + 3) // 4 * 4\n    v = sf.reshape(\n        batch,\n        padded_rows // 128,\n        padded_cols // 4,\n        32,\n        4,\n        4,\n    )\n    return v.permute(0, 1, 4, 3, 2, 5).reshape(batch, padded_rows, padded_cols)[\n        :, :rows, :cols\n    ]\n\ndef _trtllm_unshuffle_weight(weight, gated):\n    \"\"\"Restore MajorK rows shuffled for the TRTLLM 128-row epilogue.\"\"\"\n    rows = torch.arange(weight.shape[1], device=weight.device)\n    shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4\n    weight = weight.float().index_select(1, shuffled_rows)\n    if gated:\n        experts, num_rows, hidden = weight.shape\n        weight = (\n            weight.reshape(experts, num_rows // 2, 2, hidden)\n            .transpose(1, 2)\n            .reshape(experts, num_rows, hidden)\n        )\n    return weight\n\n@torch.no_grad()\ndef _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:\n    \"\"\"Unpack a uint8 tensor of packed e2m1fn FP4 values into float32.\n\n    Each byte stores two 4-bit values (low nibble = first element along the\n    last axis). The returned tensor has twice the last-dim size of *packed*.\n    \"\"\"\n    # Keep the LUT local so serialized trace references remain standalone.\n    lut = torch.tensor(\n        [\n            0.0,\n            0.5,\n            1.0,\n            1.5,\n            2.0,\n            3.0,\n            4.0,\n            6.0,\n            -0.0,\n            -0.5,\n            -1.0,\n            -1.5,\n            -2.0,\n            -3.0,\n            -4.0,\n            -6.0,\n        ],\n        dtype=torch.float32,\n        device=packed.device,\n    )\n    p = packed.view(torch.uint8).to(torch.int64)\n    lo = lut[p & 0x0F]\n    hi = lut[(p >> 4) & 0x0F]\n    stacked = torch.stack([lo, hi], dim=-1)  # pairs along a new last axis\n    return stacked.reshape(*packed.shape[:-1], packed.shape[-1] * 2)\n\n@torch.no_grad()\ndef _ue8m0_to_float32(scales: torch.Tensor) -> torch.Tensor:\n    \"\"\"Decode UE8M0 (uint8, unsigned exponent-only) scales to float32.\"\"\"\n    e = scales.view(torch.uint8).to(torch.int64)\n    return torch.pow(torch.tensor(2.0, device=scales.device), (e - 127).float())\n\n@torch.no_grad()\ndef _decode_block_scales(scales: torch.Tensor, is_ue8m0: bool) -> torch.Tensor:\n    \"\"\"Decode block scales: UE8M0 for MX formats, float8_e4m3fn otherwise.\"\"\"\n    if is_ue8m0:\n        return _ue8m0_to_float32(scales)\n    # fp8_e4m3fn (or already float): plain cast.\n    return scales.to(torch.float32)\n\n@torch.no_grad()\ndef _dequantize_fp4_tensor(\n    packed: torch.Tensor,\n    scales: torch.Tensor,\n    is_ue8m0_scales: bool,\n) -> torch.Tensor:\n    \"\"\"Unpack an FP4 tensor and apply its per-block scales along the last dim.\n\n    The packed tensor has half the logical last-dim size of the output; the\n    scale tensor has last-dim size = (output last dim) / block_size.\n    block_size is inferred from the shape ratio.\n    \"\"\"\n    unpacked = _unpack_fp4_e2m1(packed)  # float32, last dim = packed.last * 2\n    block_size = unpacked.shape[-1] // scales.shape[-1]\n    decoded_scales = _decode_block_scales(scales, is_ue8m0_scales)\n    expanded = decoded_scales.repeat_interleave(block_size, dim=-1)\n    return unpacked * expanded\n\n@torch.no_grad()\ndef _dequantize_fp4_hidden_states(\n    hidden_states: torch.Tensor,\n    hidden_states_scale,\n    is_weights_mxfp4: bool,\n) -> torch.Tensor:\n    \"\"\"Dequantize hidden_states to float32.\n\n    Three cases by dtype:\n      * bfloat16 \u2014 pass-through (no scale).\n      * float8_e4m3fn \u2014 MXFP8 activation with UE8M0 per-32 scales.\n      * uint8 \u2014 NvFP4/MXFP4 packed activation with per-block scales (fp8_e4m3fn\n        for NvFP4, UE8M0 for MXFP4; here both are treated as fp8_e4m3fn since\n        the runtime FP4 path uses fp8_e4m3fn scales for activations).\n    \"\"\"\n    if hidden_states.dtype == torch.bfloat16:\n        return hidden_states.to(torch.float32)\n    if hidden_states.dtype == torch.float8_e4m3fn:\n        # MXFP8 hidden states: UE8M0 scales, block size 32.\n        scales = _ue8m0_to_float32(hidden_states_scale)\n        block_size = hidden_states.shape[-1] // scales.shape[-1]\n        expanded = scales.repeat_interleave(block_size, dim=-1)\n        return hidden_states.to(torch.float32) * expanded\n    # uint8-packed FP4. For NvFP4 activation + NvFP4 weights the scales are\n    # fp8_e4m3fn; for MXFP4 weights (and bf16-packed-as-fp4 corner cases) they\n    # are UE8M0. Use the weight mode as the tiebreaker since activation scale\n    # format tracks weight format in the trtllm-gen kernel.\n    return _dequantize_fp4_tensor(\n        hidden_states, hidden_states_scale, is_ue8m0_scales=is_weights_mxfp4\n    )\n\n@torch.no_grad()\ndef _fp4_moe_run_experts(\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    gemm1_bias,\n    gemm2_bias,\n    weights,\n    topk_idx,\n    local_expert_offset,\n    E_global,\n    activation_type=3,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    output1_scale_scalar=None,\n    output1_scale_gate_scalar=None,\n    output2_scale_scalar=None,\n    per_token_scale=None,\n    **_unused,\n):\n    \"\"\"FP4 dequantize + gated activation + GEMM for all routing types.\n\n    ``weights``   : [T, TOP_K] float32 \u2014 per-token expert weights (normalised)\n    ``topk_idx``  : [T, TOP_K] int64   \u2014 selected global expert indices\n\n    Detects MXFP4 vs NvFP4 weight format from whether gemm1_weights_scale is\n    fp8_e4m3fn (NvFP4) or uint8 (UE8M0, MXFP4). Block size is inferred from\n    the ratio of unpacked K to scale K.\n    \"\"\"\n    is_mxfp4 = gemm1_weights_scale.dtype == torch.uint8\n    device = gemm1_weights.device\n\n    if int(activation_type) == 7:\n        experts, rows, packed_hidden = gemm1_weights.shape\n        gemm1_weights_scale = _unswizzle_batched_sf_128x4(\n            gemm1_weights_scale, experts, rows, packed_hidden * 2 // 16\n        )\n        experts, rows, packed_intermediate = gemm2_weights.shape\n        gemm2_weights_scale = _unswizzle_batched_sf_128x4(\n            gemm2_weights_scale, experts, rows, packed_intermediate * 2 // 16\n        )\n\n    # Dequantize both expert-weight tensors in one shot.\n    W1 = _dequantize_fp4_tensor(\n        gemm1_weights, gemm1_weights_scale, is_ue8m0_scales=is_mxfp4\n    )  # [E_local, 2*I, H]\n    W2 = _dequantize_fp4_tensor(\n        gemm2_weights, gemm2_weights_scale, is_ue8m0_scales=is_mxfp4\n    )  # [E_local, H, I]\n\n    if int(activation_type) == 7:\n        W1 = _trtllm_unshuffle_weight(W1, gated=True)\n        W2 = _trtllm_unshuffle_weight(W2, gated=False)\n        if gemm1_bias is not None:\n            gemm1_bias = _trtllm_unshuffle_weight(\n                gemm1_bias.unsqueeze(-1), True\n            ).squeeze(-1)\n        if gemm2_bias is not None:\n            gemm2_bias = _trtllm_unshuffle_weight(\n                gemm2_bias.unsqueeze(-1), False\n            ).squeeze(-1)\n\n    E_local, gemm1_out_size, H = W1.shape\n    I = gemm1_out_size // 2\n    if gemm1_out_size != 2 * I:\n        raise ValueError(\n            f\"gemm1 output size {gemm1_out_size} is not 2*intermediate_size; \"\n            \"FP4 MoE requires SwiGLU (gate + up).\"\n        )\n\n    A = _dequantize_fp4_hidden_states(hidden_states, hidden_states_scale, is_mxfp4)\n    T = A.shape[0]\n    output = torch.zeros((T, H), dtype=torch.float32, device=device)\n    local_start = int(local_expert_offset)\n    activation_type = int(activation_type)\n    swiglu, step, situ = 3, 7, 10\n    if activation_type not in (swiglu, step, situ):\n        raise ValueError(\n            \"FP4 MoE trace reference supports activation_type 3 (SwiGLU), \"\n            f\"7 (SwiGLUStep), and 10 (SiTU), got {activation_type}\"\n        )\n    if activation_type == step and (is_mxfp4 or hidden_states.dtype != torch.uint8):\n        raise ValueError(\"FP4 SwiGLUStep requires NVFP4 activations and weights\")\n    if activation_type == step and (gemm1_alpha is not None or gemm1_beta is not None):\n        raise ValueError(\"SwiGLUStep accepts gemm1_clamp_limit only\")\n    if activation_type == situ:\n        for name, param in (\n            (\"gemm1_alpha\", gemm1_alpha),\n            (\"gemm1_beta\", gemm1_beta),\n            (\"gemm1_clamp_limit\", gemm1_clamp_limit),\n        ):\n            if param is None:\n                continue\n            if param.shape != (E_local,):\n                raise ValueError(\n                    f\"{name} must have shape [{E_local}], got {tuple(param.shape)}\"\n                )\n            if param.dtype != torch.float32:\n                raise ValueError(f\"{name} must have dtype float32, got {param.dtype}\")\n            if param.device != device:\n                raise ValueError(f\"{name} must be on {device}, got {param.device}\")\n            if not torch.isfinite(param).all() or not (param > 0).all():\n                raise ValueError(f\"{name} must contain only finite positive values\")\n\n    for le in range(E_local):\n        ge = local_start + le\n        if ge < 0 or ge >= E_global:\n            continue\n        sel_mask = (topk_idx == ge).any(dim=1)\n        if not sel_mask.any():\n            continue\n        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)\n        A_e = A.index_select(0, token_idx)  # [N, H]\n        G1 = A_e.matmul(W1[le].t())  # [N, 2*I]\n        if activation_type == step and per_token_scale is not None:\n            G1 = G1 * per_token_scale.index_select(0, token_idx).reshape(-1, 1).float()\n        if gemm1_bias is not None:\n            G1 = G1 + gemm1_bias[le].to(torch.float32)\n        # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.\n        x0, x1 = G1[:, :I], G1[:, I:]\n        if activation_type == step:\n            gate_scale = (\n                1.0\n                if output1_scale_gate_scalar is None\n                else output1_scale_gate_scalar[le]\n            )\n            up_scale = 1.0 if output1_scale_scalar is None else output1_scale_scalar[le]\n            raw_limit = (\n                7.0 / gate_scale if gemm1_clamp_limit is None else gemm1_clamp_limit[le]\n            )\n            up = torch.clamp(x0, min=-raw_limit, max=raw_limit) * up_scale\n            gate = torch.clamp(\n                torch.nn.functional.silu(x1 * gate_scale), max=raw_limit * gate_scale\n            )\n            activated = up * gate\n        elif activation_type == situ:\n            alpha = (\n                torch.tensor(1.0, dtype=torch.float32, device=device)\n                if gemm1_alpha is None\n                else gemm1_alpha[le]\n            )\n            beta = (\n                torch.tensor(1.0, dtype=torch.float32, device=device)\n                if gemm1_beta is None\n                else gemm1_beta[le]\n            )\n            if gemm1_clamp_limit is not None:\n                limit = gemm1_clamp_limit[le]\n                x0 = torch.clamp(x0, min=-limit, max=limit)\n                x1 = torch.clamp(x1, max=limit)\n            activated = (\n                beta\n                * torch.tanh(x0 / beta)\n                * alpha\n                * torch.tanh(x1 / alpha)\n                * torch.sigmoid(x1)\n            )\n        else:\n            activated = x1 * torch.sigmoid(x1) * x0\n        O = activated.matmul(W2[le].t())  # [N, H]\n        if gemm2_bias is not None:\n            O = O + gemm2_bias[le].to(torch.float32)\n        if activation_type == step and output2_scale_scalar is not None:\n            O = O * output2_scale_scalar[le]\n        # Fold per-token expert weight.\n        w_tok = weights.index_select(0, token_idx)\n        match = (topk_idx.index_select(0, token_idx) == ge).float()\n        w_e = (w_tok * match).sum(dim=1)\n        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))\n\n    return output.to(torch.bfloat16)\n\ndef _step_decode_precomputed_routing(topk_ids):\n    if isinstance(topk_ids, (tuple, list)):\n        ids, weights = topk_ids\n        return ids.to(torch.int64), weights.to(torch.float32)\n    packed = topk_ids.to(torch.int32)\n    ids = torch.bitwise_right_shift(packed, 16).to(torch.int64)\n    weights = packed.to(torch.int16).view(torch.bfloat16).to(torch.float32)\n    return ids, weights\n\n# ----- reference -----\n@torch.no_grad()\ndef _trtllm_fp4_block_scale_routed_moe_reference(\n    topk_ids,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm1_bias,\n    gemm2_weights,\n    gemm2_weights_scale,\n    gemm2_bias,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    activation_type=3,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    **activation_kwargs,\n):\n    \"\"\"Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids).\"\"\"\n    topk_idx = topk_ids\n    if int(activation_type) == 7:\n        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)\n    T = topk_idx.shape[0]\n    TOP_K = int(top_k)\n    scale = float(routed_scaling_factor or 1.0)\n    if int(activation_type) != 7:\n        w_topk = torch.full(\n            (T, TOP_K),\n            scale / TOP_K,\n            dtype=torch.float32,\n            device=hidden_states.device,\n        )\n    return _fp4_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        gemm1_bias,\n        gemm2_bias,\n        w_topk,\n        topk_idx.to(torch.int64),\n        local_expert_offset,\n        int(num_experts),\n        activation_type=activation_type,\n        gemm1_alpha=gemm1_alpha,\n        gemm1_beta=gemm1_beta,\n        gemm1_clamp_limit=gemm1_clamp_limit,\n        **activation_kwargs,\n    )\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

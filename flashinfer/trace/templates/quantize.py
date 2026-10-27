@@ -1094,6 +1094,185 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
 )
 
 
+# ── SiLU+mul + masked MXFP8 experts quantization (SM100+) ────────────────────
+
+
+@torch.no_grad()
+def _quantize_mxfp8_round_up_scale(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize ``[M, K]``; each UE8M0 block scale is ``amax / 448`` rounded up.
+
+    Scale bytes 0 and 254 get a zero output scale; 254 marks a block with an
+    infinity. Returns ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
+    """
+    m, k = x.shape
+    blocks = x.to(torch.float32).reshape(m, k // 32, 32)
+    is_nan = blocks.isnan()
+    block_scale = torch.where(is_nan, 0.0, blocks.abs()).amax(dim=-1) / 448.0
+    scale_bits = block_scale.contiguous().view(torch.int32)
+    exp = (scale_bits >> 23) & 0xFF
+    mantissa = scale_bits & 0x7FFFFF
+    exp = torch.where(exp == 0, 0, (exp + (mantissa != 0).to(exp.dtype)).clamp(max=254))
+    sf = torch.where(is_nan.all(dim=-1), 255, exp).to(torch.uint8)
+    inv_scale = torch.ldexp(torch.ones_like(block_scale), 127 - sf.to(torch.int32))
+    inv_scale.masked_fill_((sf == 0) | (sf == 254), 0)
+    scaled = blocks * inv_scale.unsqueeze(-1)
+    x_q = scaled.masked_fill(scaled.isnan(), float("nan")).to(torch.float8_e4m3fn)
+    return x_q.reshape(m, k), sf
+
+
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_reference(
+    a: torch.Tensor, mask: torch.Tensor, **_unused
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
+
+    Matches the kernel bit for bit on bf16 inputs, except that NaN and
+    infinities become NaN here and 448 in the kernel; on fp16 inputs a value
+    can also differ by one E4M3 step.
+
+    Returns ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0
+    bytes) for every row, without the K padding, scale swizzle or grouped GEMM
+    permutation; only the first ``min(mask[i], M)`` rows of expert ``i`` match
+    the kernel.
+    """
+    b, m, k_doubled = a.shape
+    k = k_doubled // 2
+    gate = a[..., :k].to(torch.float32)
+    up = a[..., k:].to(torch.float32)
+    y = (gate * torch.sigmoid(gate) * up).to(a.dtype)
+    x_q, sf = _quantize_mxfp8_round_up_scale(y.reshape(b * m, k))
+    return x_q.reshape(b, m, k), sf.reshape(b, m, k // 32)
+
+
+# Inline dependencies so the serialized reference is self-contained.
+_bind_trace_reference_dependencies(
+    _silu_and_mul_mxfp8_experts_quantize_reference,
+    _quantize_mxfp8_round_up_scale,
+)
+
+
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_check(
+    reference_outputs, actual_outputs, *, mask=None, **_unused
+) -> bool:
+    """Compare the valid rows bit for bit in the reference's plain layout.
+
+    Undoes the grouped GEMM permutation, K padding and scale swizzle of the
+    actual outputs, then compares the first ``min(mask[i], M)`` rows of each
+    expert ``i``, or every row without ``mask``. Where the reference value is
+    NaN, the actual value must be +-448.
+    """
+    q_ref, sf_ref = reference_outputs
+    q, sf = actual_outputs
+    b, m, k = q_ref.shape
+    if q.dim() != 3 or q.shape[0] != m or q.shape[1] < k or q.shape[2] != b:
+        return False
+    if sf.dim() != 6 or sf.shape[5] != b:
+        return False
+    q = q.permute(2, 0, 1)[:, :, :k]
+    rm, rk = sf.shape[2], sf.shape[4]
+    sf = sf.permute(5, 2, 1, 0, 4, 3).reshape(b, rm * 128, rk * 4)[:, :m, : k // 32]
+    num_rows = torch.full((b,), m) if mask is None else mask.clamp(0, m)
+    valid = torch.arange(m, device=q.device) < num_rows.to(q.device).unsqueeze(1)
+    q, q_ref = q[valid].view(torch.uint8), q_ref[valid]
+    is_nan = q_ref.float().isnan()
+    q_ref = q_ref.view(torch.uint8)
+    return (
+        torch.equal(q[~is_nan], q_ref[~is_nan])
+        and bool(((q[is_nan] & 0x7F) == 0x7E).all())
+        and torch.equal(sf[valid], sf_ref[valid])
+    )
+
+
+def _silu_and_mul_mxfp8_experts_quantize_init(
+    *,
+    B,
+    M,
+    K_doubled=4096,
+    padded_K=0,
+    rm=0,
+    rk=0,
+    m32=32,
+    m4=4,
+    k4=4,
+    device="cuda",
+    seed=0,
+):
+    """Build inputs for ``flashinfer.silu_and_mul_mxfp8_experts_quantize``.
+
+    Every expert uses the full ``M`` valid rows (``mask = M``) so the trace
+    exercises the dense path with no uninitialized output rows; callers may
+    shrink ``mask`` afterwards.
+    """
+    del padded_K, rm, rk, m32, m4, k4  # output-only / derived axes
+    torch.manual_seed(seed)
+    a = torch.randn(B, M, K_doubled, dtype=torch.bfloat16, device=device)
+    mask = torch.full((B,), M, dtype=torch.int32, device=device)
+    return {"a": a, "mask": mask}
+
+
+silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
+    op_type="activation_quantize",
+    name_prefix="silu_and_mul_mxfp8_experts_quantize",
+    description=(
+        "Fused SiLU+mul + masked MXFP8 quantization between the two masked "
+        "grouped GEMMs of MoE experts (SM100+): [B, M, 2K] bf16/fp16 -> "
+        "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
+        "grouped GEMM. K is padded up to a multiple of 128."
+    ),
+    axes={
+        "B": Var(description="Number of experts."),
+        "M": Var(description="Row capacity per expert."),
+        "K_doubled": Const(
+            abbrev="k", description="2 * K, gate then up columns (K divisible by 32)."
+        ),
+        "padded_K": Var(description="K rounded up to a multiple of 128."),
+        "rm": Var(description="padded_M // 128 (row scale tiles)."),
+        "rk": Var(description="padded_K // 128 (column scale tiles)."),
+        "m32": Var(description="MXFP8 scale swizzle dim (32)."),
+        "m4": Var(description="MXFP8 scale swizzle dim (4)."),
+        "k4": Var(description="MXFP8 scale swizzle dim (4)."),
+    },
+    inputs={
+        "a": Tensor(
+            ["B", "M", "K_doubled"],
+            description="Gate values followed by up values, fp16/bf16.",
+        ),
+        "mask": Tensor(
+            ["B"],
+            dtype="int32",
+            description="Valid rows per expert (int32).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "padded_K", "B"],
+            dtype="float8_e4m3fn",
+            description="Quantized activations, permuted for the grouped GEMM.",
+        ),
+        "sf": Tensor(
+            ["m32", "m4", "rm", "k4", "rk", "B"],
+            dtype="uint8",
+            description="UE8M0 swizzled block scales (1 byte per 32-element block).",
+        ),
+    },
+    constraints=[
+        "padded_K == ((K_doubled // 2 + 127) // 128) * 128",
+        "rm == (M + 127) // 128",
+        "rk == padded_K // 128",
+        "m32 == 32",
+        "m4 == 4",
+        "k4 == 4",
+    ],
+    tags=["status:verified", "fused", "quantization:mxfp8", "moe"],
+    reference=_silu_and_mul_mxfp8_experts_quantize_reference,
+    check=_silu_and_mul_mxfp8_experts_quantize_check,
+    init=_silu_and_mul_mxfp8_experts_quantize_init,
+)
+
+
 class _Dsv41CacheFormat:
     """Static facts of one DeepSeek-V4.1 paged cache ABI (shared by pack / append traces)."""
 
