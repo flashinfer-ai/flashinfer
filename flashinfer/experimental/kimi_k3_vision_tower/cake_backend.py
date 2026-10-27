@@ -2784,7 +2784,11 @@ class KimiK3VisionTowerRunner:
     belongs to the caller).  Prepare a new runner when ``grid_thws``, the layer
     count or a tensor binding (``pixel_values``, ``out``, weights) changes;
     values may change freely.  ``stages`` exposes one launch per stage (layer
-    stages use layer 0) for per-operator tests and timing.
+    stages use layer 0) for per-operator tests and timing.  When ``launch()``
+    raises between two launches (an interrupt or an error on the host), it
+    first enqueues the zeroing of a counter-gated plan's ready counters on the
+    same stream, after the launches already enqueued, so the next forward
+    starts from clear counters.
     """
 
     plan: VisionTowerPlan
@@ -2799,8 +2803,15 @@ class KimiK3VisionTowerRunner:
 
     def launch(self) -> torch.Tensor:
         with tvm_ffi.use_torch_stream():
-            for item in self.launches:
-                item.entry(*item.arguments)
+            try:
+                for item in self.launches:
+                    item.entry(*item.arguments)
+            except BaseException:
+                # A forward cut short leaves the counts of the producer twins it enqueued, and the next forward's
+                # consumers would pass their waits before their producers store; the last FC1 never ran to clear them.
+                if self.plan.ready_counters:
+                    self.plan.workspace["ready_counters"].zero_()
+                raise
         return self.out
 
     __call__ = launch

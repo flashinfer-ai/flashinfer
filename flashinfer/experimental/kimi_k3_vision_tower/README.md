@@ -137,7 +137,10 @@ partial workspace of a split plan) and binds the 27 x 5 + 5 launches (27 x 6
 + 5 on an SM100 split plan: the attention merge follows every attention
 launch);
 `launch()` performs no
-allocation and no host synchronization. Pass a cached
+allocation and no host synchronization; when it raises between two launches
+(an interrupt or an error on the host), it first enqueues the zeroing of the
+ready counters of a counter-gated plan on the same stream, so the next forward
+starts from clear counters. Pass a cached
 `build_kimi_k3_vision_plan(...)` / `pos_emb_rows(...)` to skip the derivation.
 Per-stage launches for tests and profiling: `runner.stages[name]()`
 (`layer_attention` runs the attention kernel and, on an SM100 split plan, its

@@ -1757,6 +1757,99 @@ def test_ready_counters_match_the_base_launches():
     assert torch.equal(out, flipped) and cleared()
 
 
+class _Interrupt(BaseException):
+    """A host-side abort between two launches (like KeyboardInterrupt, not an Exception)."""
+
+
+def test_ready_counters_clear_after_an_interrupted_forward():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): a forward cut short on the host (an entry that
+    raises between two launches: after layer 0's out-proj, after layer 1's FC0, and before the last FC1, which clears
+    the counters) leaves the counters zero once the stream drains, and the next forward with new pixel values equals
+    the plan's base launches bitwise, eager and through CUDA-graph replay after replays of the same graph."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=11)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    aborted = pixels.clone()
+    pixels.mul_(-1.0)
+    following = pixels.clone()
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+
+    def at(stage, layer):
+        return next(
+            index
+            for index, item in enumerate(runner.launches)
+            if item.stage == stage and item.layer == layer
+        )
+
+    cuts = (
+        at("layer_out_proj", 0) + 1,
+        at("layer_norm_fc0_gelu", 1) + 1,
+        at("layer_fc1_last", layers - 1),
+    )
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def interrupt(cut):
+        launches = list(runner.launches)
+        launches.insert(cut, dataclasses.replace(launches[cut], entry=stop))
+        pixels.copy_(aborted)
+        with pytest.raises(_Interrupt):
+            dataclasses.replace(runner, launches=tuple(launches)).launch()
+        torch.cuda.synchronize()
+        assert cleared()
+        pixels.copy_(following)
+        out.fill_(float("nan"))
+
+    for cut in cuts:
+        interrupt(cut)
+        runner.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for cut in cuts:
+        for _ in range(2):
+            graph.replay()
+        interrupt(cut)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+
+
 def test_one_shot_api():
     _require_program()
     from flashinfer.kimi_k3_vision import kimi_k3_vision_tower
