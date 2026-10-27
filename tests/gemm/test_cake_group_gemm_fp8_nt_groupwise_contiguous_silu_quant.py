@@ -23,6 +23,8 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
     SMALL_M_MAX,
+    TINY_MIXED_MAX_K,
+    TINY_MIXED_MAX_UNITS,
     act_items,
     fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
@@ -42,6 +44,19 @@ GROUP_SIZE = 128
 EPS = 1e-10
 # FP8 outputs: dequantized 0.1/0.1 per element against the chain; scales exact.
 ATOL = RTOL = 0.1
+
+
+def _small_m_route(n2, k, group_blocks):
+    """Route of a known small-M routing: the mixed schedule for a tiny routing (no
+    pair tile, at most TINY_MIXED_MAX_UNITS odd-tail units, K <= TINY_MIXED_MAX_K),
+    else the GEMM + act route."""
+    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+    tiny = (
+        pair_tiles == 0
+        and 0 < odd_units <= TINY_MIXED_MAX_UNITS
+        and k <= TINY_MIXED_MAX_K
+    )
+    return FUSED_MIXED_ROUTE if tiny else ACT_ROUTE
 
 
 @pytest.fixture(autouse=True)
@@ -347,7 +362,7 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
     assert prepared.num_kernels == (1 if prepared.route == FUSED_MIXED_ROUTE else 2)
     if m < SMALL_M_MAX:
-        assert prepared.route == ACT_ROUTE
+        assert prepared.route == _small_m_route(n2, k, routing_blocks(group_counts))
     if prepared.route in ACT_ROUTES:
         assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
         assert prepared.gemm_backend == (
@@ -462,7 +477,7 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
     assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
     if m < SMALL_M_MAX:
-        assert route == ACT_ROUTE
+        assert route == _small_m_route(n2, k, blocks)
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
@@ -475,9 +490,15 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
-        tail = tail_launch_grid(m, n2, sm_count=sm_count)
-        assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
+        # with the routing known the tail grid covers the odd-tail units (at least
+        # one CTA); without it, every block
+        odd_units = fused_tile_counts(n2, blocks)[1]
+        tail = tail_launch_grid(m, n2, sm_count=sm_count, odd_units=odd_units)
+        assert prepared.tail_grid == tail
+        assert tail[0] == max(1, min(odd_units, sm_count))
         assert set(prepared.stage_grids) == {"pair", "tail"}
+        if unvalidated.route == FUSED_ROUTE:
+            assert unvalidated.tail_grid == tail_launch_grid(m, n2, sm_count=sm_count)
     elif route == FUSED_MIXED_ROUTE:
         pair_tiles, odd_units = fused_tile_counts(n2, blocks)
         clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
@@ -643,6 +664,85 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     # ... and matches the chain where the chain can run
     ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+@pytest.mark.parametrize(
+    "group_counts,n2,k,expected_route",
+    [
+        pytest.param([256, 256], 256, 512, ACT_ROUTE, id="act_cute_gemm"),
+        pytest.param([128, 128, 100], 256, 1024, ACT_ROUTE, id="act_cake_gemm"),
+        pytest.param([128], 256, 512, FUSED_MIXED_ROUTE, id="tiny_mixed"),
+        pytest.param([256] * 8 + [128], 256, 512, FUSED_ROUTE, id="pair_tail"),
+    ],
+)
+def test_launch_on_non_current_device(group_counts, n2, k, expected_route):
+    """launch() enters no device or stream context: with cuda:0 current, a launch of
+    a cuda:1 problem runs on cuda:1's current stream (eager, on a side stream and
+    under a graph capture) and writes the same bits as a launch under
+    ``torch.cuda.device(1)``."""
+    dev1 = torch.device("cuda", 1)
+    if torch.cuda.get_device_capability(dev1) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("cuda:1 is not an SM100a / SM103a device")
+    with torch.cuda.device(0):
+        a, b, a_scale, b_scale, m_indices = _make_inputs(
+            group_counts, n2, k, seed=669, device=dev1
+        )
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+        )
+        assert prepared.route == expected_route
+        out_q, out_s = prepared.out_q, prepared.out_s
+
+        def poison():
+            out_q.view(torch.uint8).fill_(0xFF)
+            out_s.fill_(float("nan"))
+            torch.cuda.synchronize(dev1)
+
+        def assert_same_bits(ref_q, ref_s):
+            assert torch.equal(out_q.view(torch.uint8), ref_q.view(torch.uint8))
+            assert torch.equal(out_s.view(torch.int32), ref_s.view(torch.int32))
+
+        with torch.cuda.device(1):
+            prepared.launch()
+            torch.cuda.synchronize()
+            g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+            _assert_quantizes_reference(out_q, out_s, g, u)
+        ref_q, ref_s = out_q.clone(), out_s.clone()
+
+        # eager, cuda:0 current
+        poison()
+        prepared.launch()
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+
+        # side stream of cuda:1 made current there, cuda:0 current again
+        poison()
+        side = torch.cuda.Stream(device=dev1)
+        side.wait_stream(torch.cuda.current_stream(dev1))
+        with torch.cuda.stream(side):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        side.synchronize()
+        assert_same_bits(ref_q, ref_s)
+
+        # graph capture on cuda:1 with cuda:0 current during the launch
+        graph = torch.cuda.CUDAGraph()
+        capture = torch.cuda.Stream(device=dev1)
+        with torch.cuda.graph(graph, stream=capture):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        poison()
+        graph.replay()
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+        del graph
 
 
 def _random_aligned_counts(rng, groups, max_blocks):
