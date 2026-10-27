@@ -5421,6 +5421,9 @@ class _TrtllmRunnerBase(MoERunner):
     _num_weight_rows: int
     _intermediate_size: int
     device: torch.device
+    # Whether packed FP4 weights may also come BlockMajorK,
+    # ``[experts, K_bytes / block, Mn, block]`` with 64- or 128-byte blocks.
+    accepts_block_major_k_fp4_weights: ClassVar[bool] = False
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -5544,12 +5547,22 @@ class _TrtllmRunnerBase(MoERunner):
                 self._intermediate_size // 2,
             ),
         }
-        for name, expected in expected_weights.items():
+        for name, (num_experts, mn, k_bytes) in expected_weights.items():
             tensor = view[name]
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
+            shape = tuple(tensor.shape)
+            expected: tuple[int, ...] = (num_experts, mn, k_bytes)
+            if self.accepts_block_major_k_fp4_weights and tensor.dim() == 4:
+                block = shape[-1]
+                if block not in (64, 128) or k_bytes % block != 0:
+                    raise ValueError(
+                        f"{name} BlockMajorK blocks must be 64 or 128 bytes "
+                        f"dividing {k_bytes}, got {tensor.dtype} {shape}."
+                    )
+                expected = (num_experts, k_bytes // block, mn, block)
+            if tensor.dtype != torch.uint8 or shape != expected:
                 raise ValueError(
                     f"{name} must be packed uint8 with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                    f"{tensor.dtype} {shape}."
                 )
 
         for name, expected in (
@@ -7426,11 +7439,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
     batched path. Weight and activation layouts match the corresponding
     TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
-    shuffled with epilogue tile 64.
+    shuffled with epilogue tile 64, and the BlockMajorK MXFP4×MXFP8 weights
+    of ``PrimsTsConfig.prepare_weights``. FP4 weights are accepted in either
+    layout.
     """
 
     backend_key = "prims_ts"
     supports_per_token_scale = True
+    accepts_block_major_k_fp4_weights = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -7585,10 +7601,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
-    def _weight_layout(self) -> int:
+    def _weight_layout(self, view: Optional[dict] = None) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return int(WeightLayout.BlockMajorK)
+        # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
+        # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
+        is_fp4 = self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+        if is_fp4 and view is not None and view["gemm1_weights"].dim() == 4:
             return int(WeightLayout.BlockMajorK)
         return int(WeightLayout.MajorK)
 
@@ -7665,7 +7686,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         # launch state of the call being tuned or launched, never from a
         # previous pack.
         if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
+            from flashinfer.tllm_enums import WeightLayout
+
             self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            # The weight layout follows the view, so the tactics are enumerated
+            # and launched for the weights of this call.
+            self._inner.weight_layout = WeightLayout(
+                launch_state.static_kwargs["weight_layout"]
+            )
 
     def forward(
         self,
@@ -7895,7 +7923,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
             use_shuffled_weight=True,
-            weight_layout=self._weight_layout(),
+            weight_layout=self._weight_layout(v),
             do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             activation_type=self._activation_type,
