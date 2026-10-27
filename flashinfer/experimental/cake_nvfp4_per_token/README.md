@@ -80,7 +80,13 @@ shape whose instance is not registered runs the nearest registered one-CTA-per-r
 of the same activation dtype and folded scale whose CTA holds the row (a compiled-in row
 width only for contiguous rows of that width), and records the replaced key the same way.
 fp16 activations without such a program (row widths other than 7168, a folded output
-scale, row-strided rows) raise `NotImplementedError` naming the missing kernel.
+scale, row-strided rows) raise `NotImplementedError` naming the missing kernel.  A GEMM
+plan whose program's TMA boxes exceed the operands (its host binding would refuse the
+shape: the 64-row output box of the half-M 2-CTA pair at 33-63 tokens, the 64-column
+output box of the swapped orientation at `N` < 64) runs the nearest registered program
+whose boxes fit and records the replaced key in `unfit_key`.  Every GEMM program stores
+the output through a box at least 32 columns wide, so `N` in {8, 16, 24} raises
+`ValueError` at prepare.
 
 Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; GEMM
 `|out - ref| <= 1e-2 + 1e-2 |ref| + half an output ulp` against the FP32 dequantized

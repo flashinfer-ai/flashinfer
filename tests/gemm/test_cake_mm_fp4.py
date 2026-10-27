@@ -743,7 +743,7 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
                 key = plan.kernel_key
                 assert key in registered, (m, n, k, out_f16, key)
                 assert plan.sm_count == sm_count
-                if sm_count == measured:
+                if sm_count == measured or plan.unfit_key is not None:
                     continue
                 own = cb.default_tactic(
                     m,
@@ -808,10 +808,16 @@ def test_every_default_plan_runs_a_registered_program(arch, sm_count):
     for k, n in (*VALIDATED_GEMM_FAMILIES, VALIDATED_OFF_MATRIX_FAMILY):
         for m in (*range(1, 16385, 29), *_EDGE_M):
             for out_f16 in (False, True):
-                own = cb._gemm_plan(m, n, k, out_f16, arch, sm_count)
+                own = _route(m, n, k, out_f16, arch, sm_count, nearest=False)
                 plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
                 assert plan.kernel_key in registered, (m, n, k, out_f16, own.kernel_key)
                 assert plan.sm_count == sm_count
+                assert cb._tma_boxes_fit(plan), (m, n, k, out_f16, plan.kernel_key)
+                if plan.unfit_key is not None:
+                    # the registered program's TMA boxes do not fit (tested below)
+                    route = _route(m, n, k, out_f16, arch, sm_count)
+                    assert plan.unfit_key == route.kernel_key, (m, n, k, out_f16)
+                    continue
                 if own.kernel_key in registered:
                     assert plan.unregistered_key is None
                     assert (plan.kernel_key, plan.grid) == (own.kernel_key, own.grid)
@@ -853,6 +859,168 @@ def test_off_matrix_rows_run_the_nearest_registered_program():
     own = cb._gemm_plan(2049, 8192, 8192, False, "sm_100a", 148)
     plan = cb.gemm_plan(2049, 8192, 8192, False, "sm_100a", 148, tactic=own.tactic)
     assert plan.kernel_key == own.kernel_key and plan.unregistered_key is None
+
+
+def _route(m, n, k, out_f16, arch, sm_count, nearest=True):
+    """:func:`gemm_plan` without the TMA box check (the program the shape names, whether
+    or not its host binding accepts the shape) and, with ``nearest=False``, without the
+    nearest-registered-program fallback (the default plan, registered or not)."""
+    saved = cb._tma_fitting_plan, cb._nearest_registered_plan
+    cb._tma_fitting_plan = lambda plan: plan
+    if not nearest:
+        cb._nearest_registered_plan = lambda plan: plan
+    try:
+        return cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+    finally:
+        cb._tma_fitting_plan, cb._nearest_registered_plan = saved
+
+
+def _binding_boxes(arch, key):
+    """``{descriptor: (box, checked dims)}`` of the TMA descriptors the generated host
+    binding of ``key``'s program on ``arch`` encodes (read from its source)."""
+    import re
+    from pathlib import Path
+
+    from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import MODULES
+
+    root = Path(cb.__file__).resolve().parent / "csrc"
+    text = (root / MODULES[KERNELS[arch][key]]["sources"][1]).read_text()
+    common = root / "cake_nvfp4_per_token" / "cake_nvfp4_per_token_host_common.cuh"
+    encoder = r"CUtensorMap EncodeTma_(\w+)\(const TensorView& t\) \{(.*?)\n\}"
+    bodies = dict(re.findall(encoder, text, re.S))
+    for name, variant in re.findall(r"#define CAKE_TMA_(\w+) (\d+)", text):
+        variant_re = rf"#(?:el)?if CAKE_TMA_{name} == {variant}\n.*?{encoder}"
+        found = re.search(variant_re, common.read_text(), re.S)
+        bodies[found[1]] = found[2]
+    boxes = {}
+    for name, body in bodies.items():
+        box = re.search(r"box_dim\[\d\] = \{(.*?)\};", body)[1]
+        oob = re.search(r"allow_oob_box\[\d\] = \{(.*?)\};", body)
+        if oob:  # a box may exceed the axes listed as out-of-bounds tiles
+            flags = [v.strip() for v in oob[1].split(",")]
+            dims = tuple(i for i, v in enumerate(flags) if v == "false")
+        else:
+            dims = tuple(
+                int(i) for i in re.findall(r"box_dim\[(\d)\] <= global_dim", body)
+            )
+        boxes[name] = (tuple(int(v) for v in re.findall(r"(\d+)u", box)), dims)
+    return boxes
+
+
+def _binding_accepts(boxes, plan):
+    """The binding's box checks against the operand extents of ``plan``'s launch
+    (``cake_backend._gemm_kwargs``), in the descriptors' global-dimension order."""
+    m, n, k = plan.M, plan.N, plan.K
+    rows_a, rows_b = (n, m) if plan.alpha_n else (m, n)
+    cols = cb.padded_sf_cols(k) // 4
+    atoms_a, atoms_b = (cb.padded_rows(r) // cb.ROW_TILE for r in (rows_a, rows_b))
+    extents = {
+        "A": (128, rows_a, k // 256),
+        "B": (128, rows_b, k // 256),
+        "SFA": (128, cols, atoms_a),
+        "SFB": (128, cols, atoms_b),
+        "out": (n, m),
+    }
+    if plan.alpha_n and int(plan.tactic["tile_n"]) < 32:
+        extents["SFB"] = (32, cols, 4, atoms_b)  # eight-row scale groups
+    return all(
+        box[i] <= extents[name][i] for name, (box, dims) in boxes.items() for i in dims
+    )
+
+
+_GEMM_DESCRIPTORS = {"A", "B", "SFA", "SFB", "out"}
+
+
+@pytest.mark.parametrize("arch", cb.ARCHES)
+def test_tma_box_rule_matches_the_host_bindings(arch):
+    # Each generated host binding refuses an operand smaller than one of its TMA boxes in
+    # a dimension it checks (ValueError at prepare).  The planner's rule agrees with the
+    # boxes of every registered GEMM program the fallback can select (a key of the
+    # tactic form, encoding the five descriptors of the launch).
+    checked = 0
+    for key in KERNELS[arch]:
+        parsed = cb._tactic_of_key(key) if key.startswith("gemm:") else None
+        if parsed is None:
+            continue
+        tactic, out_f16 = parsed
+        boxes = _binding_boxes(arch, key)
+        assert set(boxes) == _GEMM_DESCRIPTORS, (key, sorted(boxes))
+        for n in (8, 24, 32, 56, 64, 128, 136, 1536):
+            for m in (1, 8, 32, 33, 63, 64, 127, 128, 129, 1024):
+                sm_count = cb.MEASURED_SM_COUNT[arch]
+                try:
+                    plan = cb._gemm_plan(
+                        m, n, 7168, out_f16, arch, sm_count, tactic=tactic
+                    )
+                except ValueError:
+                    continue  # the swapped orientation holds M <= 32 only
+                if plan.kernel_key != key:
+                    continue
+                checked += 1
+                fits = cb._tma_boxes_fit(plan)
+                assert fits == _binding_accepts(boxes, plan), (key, m, n, fits)
+    assert checked
+
+
+@pytest.mark.parametrize("sm_count", (148, 152))
+@pytest.mark.parametrize("arch", cb.ARCHES)
+def test_plans_whose_tma_boxes_do_not_fit_run_a_program_that_fits(arch, sm_count):
+    # Narrow outputs and few tokens can name a registered program whose TMA boxes exceed
+    # the operands (the 64-column output box of the swapped orientation for N < 64, the
+    # 2-CTA output box rows for M < 128 / 64, the two-atom weight scale box of the wider
+    # 2-CTA pairs for N <= 128).  Such a plan runs the nearest registered program whose
+    # boxes fit; every other plan is unchanged.  No program fits N < 32 (each output box
+    # is at least 32 columns wide): those plans stay as they are.
+    registered = KERNELS[arch]
+    refit = 0
+    for n in (8, 16, 24, 32, 40, 48, 56, 64, 72, 96, 120, 128, 136, 192, 256, 1536):
+        for m in (*range(1, 65), 96, 127, 128, 129, 192, 256, 512, 1024, 4096, 16384):
+            for out_f16 in (False, True):
+                route = _route(m, n, 7168, out_f16, arch, sm_count)
+                plan = cb.gemm_plan(m, n, 7168, out_f16, arch, sm_count)
+                if cb._tma_boxes_fit(route) or n < 32:
+                    assert plan == route and plan.unfit_key is None, (m, n, out_f16)
+                if cb._tma_boxes_fit(route):
+                    continue
+                # the binding of the program the plan replaces does refuse the shape
+                boxes = _binding_boxes(arch, route.kernel_key)
+                if set(boxes) == _GEMM_DESCRIPTORS:
+                    assert not _binding_accepts(boxes, route), (m, n, route.kernel_key)
+                if n < 32:
+                    continue
+                refit += 1
+                assert plan.kernel_key in registered and cb._tma_boxes_fit(plan)
+                assert plan.unfit_key == route.kernel_key, (m, n, out_f16)
+                assert plan.unregistered_key == route.unregistered_key
+    assert refit
+
+
+def test_rows_whose_tma_boxes_do_not_fit_run_the_one_cta_m64_program():
+    # The half-M 2-CTA pair stores 64-row output boxes and checks them against M: the
+    # validated 7168 x 1536 / 7168 x 2112 rows of 33-63 tokens run the 1-CTA 64-wide
+    # program instead.  The swapped orientation stores 64-column output boxes: N = 32-56
+    # rows of up to 32 tokens run the same program (directly when their own swapped
+    # program is not registered either).  An output narrower than 32 columns keeps its
+    # plan (no registered program fits).
+    rows = (
+        (33, 1536, False, "gemm:m64_2cta_hm_bf16_bF_l2256b"),
+        (63, 2112, True, "gemm:m64_2cta_hm_f16_bF_l2256b"),
+        (48, 96, False, "gemm:m64_2cta_hm_bf16_bF_l2256b"),
+        (1, 32, False, "gemm:n8_"),
+        (16, 40, True, "gemm:n"),
+        (32, 56, False, "gemm:n"),
+    )
+    for arch in cb.ARCHES:
+        for sm_count in (148, 152):
+            for m, n, out_f16, replaced in rows:
+                plan = cb.gemm_plan(m, n, 7168, out_f16, arch, sm_count)
+                key = "gemm:m64_f16_bF_l2256b" if out_f16 else "gemm:m64_bf16_bF_l2256b"
+                assert plan.kernel_key == key, (arch, sm_count, m, n, plan.kernel_key)
+                assert plan.sm_count == sm_count and cb._tma_boxes_fit(plan)
+                own = plan.unfit_key or plan.unregistered_key
+                assert own.startswith(replaced), (arch, sm_count, m, n, own)
+            plan = cb.gemm_plan(40, 24, 7168, False, arch, sm_count)
+            assert plan.unfit_key is None and not cb._tma_boxes_fit(plan)
 
 
 # ---------------------------------------------------------------------------
@@ -1228,6 +1396,64 @@ def test_off_matrix_rows_run_a_registered_program(m, n, k, out_dtype, chain):
         runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
         key = runner.plan.kernel_key
     assert key in KERNELS[cb._device_arch(device)]
+    runner()
+    torch.cuda.synchronize()
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+    if not chain:
+        public = mm_fp4(
+            a_fp4,
+            w_fp4.T,
+            a_sf,
+            w_sf.T,
+            alpha,
+            out_dtype,
+            None,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cake",
+            use_nvfp4=True,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(public, out)
+
+
+@pytest.mark.parametrize("chain", [False, True])
+@pytest.mark.parametrize(
+    "m,n,out_dtype",
+    [
+        (33, 2112, torch.bfloat16),  # validated family, half-M pair box rows > M
+        (40, 1536, torch.float16),
+        (63, 1536, torch.bfloat16),
+        (48, 96, torch.float16),
+        (1, 32, torch.bfloat16),  # swapped orientation, 64-column output box > N
+        (16, 40, torch.float16),
+        (32, 56, torch.bfloat16),
+    ],
+)
+def test_rows_whose_tma_boxes_do_not_fit_match_the_reference(m, n, out_dtype, chain):
+    # These rows name a registered program whose host binding refuses the shape; they
+    # run the 1-CTA 64-wide program (alone and in the quantize + GEMM chain).
+    device = _require_program()
+    k = 7168
+    x, _, a_fp4, a_sf, alpha, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=500 + m
+    )
+    w_u8 = w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    if chain:
+        ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+        runner = cb.prepare_nvfp4_per_token_chain(
+            x, gs_inv, w_u8, w_sf, out, ws, out_scale=w_scale
+        )
+        a_fp4, a_sf, alpha = ws.fp4, ws.sf, ws.scale
+        key = runner.kernels[1]
+    else:
+        a_u8 = a_fp4.view(torch.uint8)
+        runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+        key = runner.plan.kernel_key
+        assert runner.plan.unfit_key or runner.plan.unregistered_key
+    assert key.startswith("gemm:m64_") and "2cta" not in key, key
     runner()
     torch.cuda.synchronize()
     ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]

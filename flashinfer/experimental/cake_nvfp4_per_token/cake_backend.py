@@ -1083,6 +1083,10 @@ class GemmPlan:
     # The key of the default tactic when ``arch`` does not register it and the plan runs
     # the nearest registered program instead (None: the plan runs its own program).
     unregistered_key: Optional[str] = None
+    # The key of the registered program the default tactic resolves to when that program's
+    # TMA boxes do not fit the operands (:func:`_tma_boxes_fit`) and the plan runs the
+    # nearest registered program whose boxes fit instead (None: no such replacement).
+    unfit_key: Optional[str] = None
 
     @property
     def alpha_n(self) -> bool:
@@ -1244,13 +1248,15 @@ def gemm_plan(
             m, n, k, out_f16, arch, sm_count, tactic={**plan.tactic, "b2": "fold"}
         )
     measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
-    if tactic is not None or plan.kernel_key in KERNELS.get(arch, {}):
+    if tactic is not None:
         return plan
+    if plan.kernel_key in KERNELS.get(arch, {}):
+        return _tma_fitting_plan(plan)  # unless the binding refuses the shape
     if int(sm_count) != measured:
         reference = _gemm_plan(m, n, k, out_f16, arch, measured)
         fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
         if fallback.kernel_key in KERNELS.get(arch, {}):
-            return fallback
+            return _tma_fitting_plan(fallback)
         # Outside the registered matrix on the measured part too: the program the
         # measured part runs (:func:`_nearest_registered_plan`), when this grid reaches it.
         nearest = _nearest_registered_plan(reference)
@@ -1535,13 +1541,44 @@ def _knob_distance(a: dict[str, Any], b: dict[str, Any]) -> int:
     return distance
 
 
+def _tma_boxes_fit(plan: GemmPlan) -> bool:
+    """True when the host binding of ``plan``'s program accepts its operands: each
+    program stores the output through a TMA box 32 weight columns wide (64 in the
+    swapped orientation), the 2-CTA programs also check the box's token rows (128;
+    half-M pair: 64) and the 2-CTA programs wider than 128 columns load the weight
+    block scales in two-atom boxes (``N`` beyond one 128-row scale atom)."""
+    m, n, tactic = plan.M, plan.N, plan.tactic
+    if n < (64 if tactic["alpha_n"] else 32):
+        return False
+    if not tactic.get("two_cta"):
+        return True
+    if m < (BLOCK_M // 2 if tactic.get("half_m") else BLOCK_M):
+        return False
+    return int(tactic["tile_n"]) <= ROW_TILE or padded_rows(n) >= 2 * ROW_TILE
+
+
+def _tma_fitting_plan(plan: GemmPlan) -> GemmPlan:
+    """``plan`` of a registered program, or, when that program's host binding would
+    refuse the shape (a TMA box larger than its operand, :func:`_tma_boxes_fit`), the
+    plan of the nearest registered program whose boxes fit, which records ``plan``'s key
+    in ``unfit_key``; ``plan`` itself when no registered program fits (an output
+    narrower than 32 columns)."""
+    if _tma_boxes_fit(plan):
+        return plan
+    nearest = _nearest_registered_plan(plan)
+    if not _tma_boxes_fit(nearest):
+        return plan
+    return replace(nearest, unregistered_key=None, unfit_key=plan.kernel_key)
+
+
 def _nearest_registered_plan(plan: GemmPlan) -> GemmPlan:
     """The plan, for ``plan``'s shape and SM count, of the registered program of its
-    output dtype nearest to ``plan``'s unregistered tactic: the same orientation and CTA
-    group first, then the closest tile width, then the fewest differing knobs
-    (:func:`_knob_distance`), then the key; programs with the entry prefetch are not
-    candidates.  The result records ``plan``'s key in ``unregistered_key``; ``plan``
-    itself when no registered program runs the shape."""
+    output dtype nearest to ``plan``'s tactic: one whose TMA boxes fit the operands
+    (:func:`_tma_boxes_fit`) first, then the same orientation and CTA group, then the
+    closest tile width, then the fewest differing knobs (:func:`_knob_distance`), then
+    the key; programs with the entry prefetch are not candidates.  The result records
+    ``plan``'s key in ``unregistered_key``; ``plan`` itself when no registered program
+    runs the shape."""
     want = plan.tactic
     best: Optional[tuple[tuple[Any, ...], GemmPlan]] = None
     for key in KERNELS.get(plan.arch, {}):
@@ -1564,6 +1601,7 @@ def _nearest_registered_plan(plan: GemmPlan) -> GemmPlan:
             continue  # e.g. a stream-K slice count this grid does not reach
         have = candidate.tactic
         cost = (
+            not _tma_boxes_fit(candidate),
             have["alpha_n"] != want["alpha_n"],
             bool(have.get("two_cta")) != bool(want.get("two_cta")),
             abs(math.log2(int(have["tile_n"]) / int(want["tile_n"]))),
