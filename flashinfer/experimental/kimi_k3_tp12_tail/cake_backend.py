@@ -85,14 +85,16 @@ limitations under the License.
 # (``M <= 8``) needs its whole grid resident at once on every rank:
 # ``M + 80`` SMs on the 640-column ranks and ``M + 64`` on the 512-column
 # ranks.  Under a green context or MPS partition with fewer SMs the launch
-# raises instead of spinning, so give every rank at least 88 SMs.  Do not
-# overlap two ``M <= 8`` calls, or one and another cooperative peer-waiting
-# kernel, on one GPU, even with separate workspaces: the two grids do not
-# fit together, and an admission order that differs between ranks
-# deadlocks the group.  A co-runner that never frees the grid's SMs on one
-# rank stalls every rank; the kernels' waits are unbounded and the caller's
-# watchdog is the deadline.  The persistent tails map token ``t`` to CTA
-# ``t mod P`` on every rank, so ``P`` is the group's smallest SM count.
+# raises a RuntimeError (and leaves no CUDA error behind) instead of
+# spinning, and a CUDA Graph capture on such a partition fails, so give
+# every rank at least 88 SMs.  Do not overlap two ``M <= 8`` calls, or one
+# and another cooperative peer-waiting kernel, on one GPU, even with
+# separate workspaces: the two grids do not fit together, and an admission
+# order that differs between ranks deadlocks the group.  A co-runner that
+# never frees the grid's SMs on one rank stalls every rank; the kernels'
+# waits are unbounded and the caller's watchdog is the deadline.  The
+# persistent tails map token ``t`` to CTA ``t mod P`` on every rank, so
+# ``P`` is the group's smallest SM count.
 #
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
@@ -103,7 +105,9 @@ limitations under the License.
 
 from __future__ import annotations
 
+import ctypes
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -595,6 +599,9 @@ class KimiK3Tp12TailRunner:
         if self.workspace is not None:
             self.workspace.order_after_previous_stream()
         with tvm_ffi.use_torch_stream():
+            if self.k3 is None:
+                _launch_one_launch_program(self.k1, self.num_tokens, self.rank)
+                return self.out
             self.k1()
             if self.cublas:
                 torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
@@ -603,6 +610,41 @@ class KimiK3Tp12TailRunner:
         return self.out
 
     __call__ = launch
+
+
+def _clear_cuda_last_error() -> None:
+    """Reset the CUDA runtime's last error (``cudaGetLastError``).
+
+    The generated bindings and torch share the process's ``libcudart``, so the call goes to that library, loaded
+    already (``RTLD_NOLOAD``); ``cuda.bindings.runtime`` keeps a runtime state of its own and does not reset it.
+    """
+    major = (torch.version.cuda or "").split(".")[0]
+    try:
+        cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    except OSError:
+        return
+    cudart.cudaGetLastError.restype = ctypes.c_int
+    cudart.cudaGetLastError()
+
+
+def _launch_one_launch_program(launch: _Launch, num_tokens: int, rank: int) -> None:
+    """Launch the one-launch program; a refused cooperative launch raises a RuntimeError and leaves no CUDA error.
+
+    The driver refuses the cooperative launch when the grid cannot be resident at once, for example on a green
+    context or MPS partition with fewer SMs than the grid.  Nothing runs, but the refusal stays as the runtime's last
+    error, which the next launch check that reads it (torch's, for example) would raise; it is cleared here.
+    """
+    try:
+        launch()
+    except Exception as err:
+        if "cooperative launch" not in str(err):
+            raise
+        _clear_cuda_last_error()
+        raise RuntimeError(
+            f"kimi_k3_tp12_tail: the one-launch program ({launch.key}, {num_tokens} tokens) needs "
+            f"{k123_grid(num_tokens, rank)[0]} SMs resident at once on rank {rank}; the current stream's SMs cannot "
+            "hold its grid, so the cooperative launch was refused and nothing ran"
+        ) from None
 
 
 def _check(

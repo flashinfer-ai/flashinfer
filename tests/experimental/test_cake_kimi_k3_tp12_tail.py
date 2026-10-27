@@ -241,6 +241,32 @@ def test_sm_count_is_the_group_minimum():
         cb.group_sm_count(_FakeCommBackend([152] * 11 + [0]), 152)
 
 
+def test_refused_cooperative_launch_raises_cleanly(monkeypatch):
+    """A refused cooperative launch of the one-launch program raises a RuntimeError that names the SM need, after
+    the runtime's last error is cleared; other launch errors pass through unchanged (CPU only)."""
+    cleared = []
+    monkeypatch.setattr(cb, "_clear_cuda_last_error", lambda: cleared.append(True))
+
+    def launch_of(message):
+        def entry():
+            raise RuntimeError(f"cudaLaunchKernelExC failed: {message}")
+
+        return cb._Launch(
+            stage="k1", key="k123:c4", module="m", kwargs={}, entry=entry, arguments=()
+        )
+
+    need = f"needs {cb.k123_grid(1, 0)[0]} SMs resident at once"
+    with pytest.raises(RuntimeError, match=need) as info:
+        cb._launch_one_launch_program(
+            launch_of("too many blocks in cooperative launch"), 1, 0
+        )
+    assert cleared == [True]
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    with pytest.raises(RuntimeError, match="invalid argument"):
+        cb._launch_one_launch_program(launch_of("invalid argument"), 1, 0)
+    assert cleared == [True]
+
+
 class _LaunchKwargsWorkspace:
     """A host-only stand-in for ``KimiK3Tp12TailWorkspace``: every buffer-set accessor the launch-argument
     builders use, with placeholder values (the arguments are never launched)."""
@@ -335,6 +361,26 @@ def _single_gpu_platform() -> str:
     if torch.cuda.get_device_capability(0) not in cb.SUPPORTED_COMPUTE_CAPABILITIES:
         return "generated kernels target Blackwell SM100 / SM103"
     return ""
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_clear_cuda_last_error_reaches_the_runtime_torch_reads():
+    """The clear resets the last error of the libcudart that torch's launch checks read: an error planted there by
+    a failing runtime call no longer surfaces in the next torch op (one GPU)."""
+    import ctypes
+
+    torch.ones(1, device="cuda").sum().item()
+    major = torch.version.cuda.split(".")[0]
+    cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    cudart.cudaFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    cudart.cudaFuncSetAttribute.restype = ctypes.c_int
+    cudart.cudaPeekAtLastError.restype = ctypes.c_int
+    # a null function: cudaErrorInvalidDeviceFunction, which is not sticky
+    assert cudart.cudaFuncSetAttribute(None, 8, 0) != 0
+    assert cudart.cudaPeekAtLastError() != 0
+    cb._clear_cuda_last_error()
+    assert cudart.cudaPeekAtLastError() == 0
+    assert (torch.ones(1024, device="cuda") + 1).sum().item() == 2048
 
 
 @pytest.mark.skipif(bool(_single_gpu_platform()), reason=_single_gpu_platform() or "")
@@ -570,6 +616,58 @@ def test_alternating_streams_are_ordered_on_twelve_ranks(twelve_rank_group):
             for i in range(STREAM_CALLS):
                 assert torch.equal(copies[i], first), f"M={M}: call {i} differs"
             assert _rank_invariant(first, world), f"M={M}: output differs between ranks"
+        dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        workspace.destroy()
+
+
+@pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
+def test_partition_below_the_grid_refuses_cleanly_on_twelve_ranks(twelve_rank_group):
+    """On a green-context stream with fewer SMs than the one-launch program's grid, every rank's call raises a
+    RuntimeError before any device work and leaves no CUDA error behind; the same runner then runs on the full
+    device with its earlier result."""
+    import torch.distributed as dist
+
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+    from flashinfer.kimi_k3_tp12_tail import (
+        create_kimi_k3_tp12_tail_workspace,
+        prepare_kimi_k3_tp12_tail,
+    )
+
+    rank, world, device = twelve_rank_group
+    assert world == cb.WORLD_SIZE
+    if not cb.generated_program_available(device):
+        pytest.skip("no generated program registered for this architecture")
+    workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
+    try:
+        streams, resources = split_device_green_ctx_by_sm_count(device, [32])
+        partition_sms = int(resources[0].sm.smCount)
+        for M in (1, 8):
+            assert partition_sms < cb.k123_grid(M, rank)[0]
+            inp = make_inputs(M, rank, device)
+            runner = prepare_kimi_k3_tp12_tail(
+                inp["routed"],
+                inp["shared"],
+                inp["norm_w"],
+                inp["up_w"],
+                inp["out"],
+                workspace=workspace,
+            )
+            runner()
+            torch.cuda.synchronize()
+            first = inp["out"].clone()
+            with (
+                torch.cuda.stream(streams[0]),
+                pytest.raises(RuntimeError, match="cooperative launch was refused"),
+            ):
+                runner()
+            # no stale error: the next torch op launches and checks cleanly
+            assert (torch.ones(1024, device=device) + 1).sum().item() == 2048
+            inp["out"].fill_(float("nan"))
+            runner()
+            torch.cuda.synchronize()
+            assert torch.equal(inp["out"], first), f"M={M}: full-device call differs"
         dist.barrier()
     finally:
         torch.cuda.synchronize()
