@@ -559,9 +559,10 @@ quantize_with_block_size_tma(
               reinterpret_cast<uint64_t*>(out)[threadOutOffset] = 0ull;
             }
 
-            // Set SF padding to 0
+            // Set SF padding to 0. The last row tile can extend past the padded SF rows,
+            // which have no slot in the scale-factor buffer.
             if (threadRowIdxGlobal >= numRows || tidx.colIdx >= numCols) {
-              if (sf_out != nullptr) {
+              if (sf_out != nullptr && threadRowIdxGlobal < numPaddedRowsForSf) {
                 sf_out[0] = 0x00;
               }
             } else {
