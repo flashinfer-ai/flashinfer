@@ -446,7 +446,6 @@ kernel_cake_batch_deepgemm_fp8_5c3089a67f23fe866223(const __grid_constant__ CUte
             unsigned int max_scheduler_iters_1 = (max_total_tiles_1 + num_bids_u_1 - 1) / num_bids_u_1;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_scale_ready = 0;
-            unsigned int _phase_tma_full = 0;
             if (cta_rank == 0) {
                 #pragma unroll 1
                 for (int current_iter_1 = 0; current_iter_1 < max_scheduler_iters_1; current_iter_1++) {
@@ -499,7 +498,7 @@ kernel_cake_batch_deepgemm_fp8_5c3089a67f23fe866223(const __grid_constant__ CUte
                         tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfa0 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfa0_addr) >> 4) + (tma_stage_1) * 4032 + 32)), _elected_0);
                         tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_tmem_sfa1, make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (tma_stage_1) * 4032)), _elected_0);
                         tcgen05_cp_32x128b_warpx4_cta2_leader((tmem_tmem_sfa1 + 4), make_sf_cp_desc_lo_sbo128((((smem_sfa1_addr) >> 4) + (tma_stage_1) * 4032 + 32)), _elected_0);
-                        mbarrier_wait_hint(tma_full_addr + (tma_stage_1) * 8, _phase_tma_full, 10000000);
+                        mbarrier_wait_hint(tma_full_addr + (tma_stage_1) * 8, _phase_scale_ready, 10000000);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         uint32_t _elected_1 = elect_sync();
                         int _smem_desc_lo_2 = (((smem_b_addr) >> 4) & 0x3FFF) + (tma_stage_1) * 4032;
@@ -534,7 +533,7 @@ kernel_cake_batch_deepgemm_fp8_5c3089a67f23fe866223(const __grid_constant__ CUte
                         }
                         elect_commit_cg2_multicast(tma_free_addr + (tma_stage_1) * 8, (uint16_t)(3));
                         tma_stage_1 += 1;
-                        if (tma_stage_1 == 3) { tma_stage_1 = 0; _phase_scale_ready ^= 1; _phase_tma_full ^= 1; }
+                        if (tma_stage_1 == 3) { tma_stage_1 = 0; _phase_scale_ready ^= 1; }
                     }
                     elect_commit_cg2_multicast(mainloop_done_addr + (epi_stage_1) * 8, (uint16_t)(3));
                     epi_stage_1 += 1;

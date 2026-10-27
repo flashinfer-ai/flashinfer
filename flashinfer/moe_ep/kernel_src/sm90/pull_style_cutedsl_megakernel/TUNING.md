@@ -1093,3 +1093,12 @@ tactics. Do not treat one cache-or-heuristic run as that full campaign.
 For controlled comparisons, hold shape, routing, data, timed regions and
 complete tactics fixed, then run the six formal processes independently of
 selection. Record source identity and actual clocks with the samples.
+
+
+## NVFP4
+
+The K16/E4M3 NVFP4 specialization lives under `shim/`, with a
+separate backend and compilation identity. Its implementation, numerical
+contract and validation commands are documented in
+[moe_ep_sm90_nvfp4.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4.md).
+Current MXFP4 measurements in this document are not NVFP4 measurements.

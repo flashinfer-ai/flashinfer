@@ -14,6 +14,7 @@ cross-rank reduction together.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from datetime import timedelta
 
@@ -301,6 +302,11 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = layer.forward(t, graph_state=state)
+        with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
+            layer.forward(
+                dataclasses.replace(t, runtime_max_tokens_per_rank=num_tokens),
+                graph_state=state,
+            )
         for _ in range(3):
             load_next_step()
             graph.replay()
@@ -310,6 +316,92 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
                 _identity_round_trip_reference(
                     t.hidden_states, t.topk_ids, world_size, 4
                 ),
+            )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_split_layer_dispatches_runtime_max_tokens_per_rank(backend):
+    """MoEEpTensors.runtime_max_tokens_per_rank sizes the layer's dispatch.
+
+    Ranks hold different token counts below the capacity; the dispatch
+    reserves only the busiest rank's count per source rank and the round
+    trip stays exact.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        IdentityConfig,
+        MoEEpConfigError,
+        MoEEpLayer,
+        MoEEpTensors,
+        SplitConfig,
+        dummy_moe_weights,
+    )
+
+    rank, world_size = _init_dist()
+    config = _backend_config(backend)
+    capacity, hidden, top_k = 32, 1024, 2
+    num_experts = 4 * world_size
+    counts = [3 + 2 * r for r in range(world_size)]
+    runtime_max = max(counts)
+    num_tokens = counts[rank]
+    generator = torch.Generator().manual_seed(21 + rank)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, top_k, generator)
+
+    layer = MoEEpLayer(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=hidden,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        dummy_moe_weights(num_local_experts=4, hidden=hidden),
+        backend=SplitConfig(comm=config, kernel=IdentityConfig()),
+    )
+    try:
+        comm = layer._ensure_communication(top_k)
+        dispatch = comm.dispatch
+        tokens_per_rank = []
+
+        def recording_dispatch(*args, **kwargs):
+            result = dispatch(*args, **kwargs)
+            tokens_per_rank.append(result.tokens_per_rank)
+            return result
+
+        comm.dispatch = recording_dispatch
+        out = layer(
+            MoEEpTensors(
+                hidden_states=x,
+                topk_ids=topk_ids.long(),
+                topk_weights=topk_weights,
+                runtime_max_tokens_per_rank=runtime_max,
+            )
+        )
+        assert tokens_per_rank == [runtime_max]
+        torch.testing.assert_close(
+            out.float(), _identity_round_trip_reference(x, topk_ids, world_size, 4)
+        )
+        with pytest.raises(MoEEpConfigError, match="runtime_max_tokens_per_rank"):
+            layer(
+                MoEEpTensors(
+                    hidden_states=x,
+                    topk_ids=topk_ids.long(),
+                    topk_weights=topk_weights,
+                    runtime_max_tokens_per_rank=num_tokens - 1,
+                )
             )
     finally:
         torch.cuda.synchronize()
@@ -361,7 +453,7 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask():
             x,
             topk_ids,
             topk_weights,
-            max_tokens_per_rank=int(step_max),
+            runtime_max_tokens_per_rank=int(step_max),
             eplb_local_stats=stats_base + 1000 * rank,
             active_rank_mask=mask,
         )
@@ -475,7 +567,7 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         replay_and_check(graph, out)
 
         memory = comm._state["mnnvl_mem"]
-        cft_enabled = getattr(comm, "cft_enabled", None)
+        cft_enabled = getattr(comm, "_cft_enabled", None)
         comm.checkpoint_prepare()
         comm.checkpoint_prepare()
         assert not MnnvlMemory.allocated_map[memory.ptr].mapped
@@ -484,7 +576,7 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         comm.checkpoint_restore(fresh_backend)
         assert MnnvlMemory.allocated_map[memory.ptr].mapped
         if backend == "nvlink_one_sided":
-            assert comm.cft_enabled == cft_enabled
+            assert comm._cft_enabled == cft_enabled
 
         for _ in range(2):
             replay_and_check(graph, out)
