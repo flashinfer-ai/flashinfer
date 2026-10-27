@@ -52,8 +52,16 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.cute_dsl import is_cute_dsl_available
-from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    env_flag_enabled,
+    resolve_nvfp4_4over6,
+)
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.cute_dsl_moe_reference import (
+    assert_cute_dsl_moe_bits,
+    cute_dsl_moe_reference,
+)
 from tests.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     split_w4a16_reference_from_tensors,
@@ -272,6 +280,90 @@ def _assert_moe_quant_mode_reference(actual, expected, quant_mode):
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
+def _assert_moe_accuracy(
+    actual,
+    tensors,
+    quant_mode,
+    use_fused_finalize,
+    reference_inputs,
+    num_experts,
+    activation_type=ActivationType.Swiglu,
+    local_expert_offset=0,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+    swiglu_limit=None,
+):
+    activation_kwargs = dict(
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+    )
+    if quant_mode == "w4a4" and not use_fused_finalize and not is_sm107():
+        # Decode the packed operands actually consumed by the kernel. The
+        # factory's *_bf16 tensors are the original, unquantized weights.
+        expected = cute_dsl_moe_reference(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            per_token_scale=tensors["x_per_token_scale"],
+            local_expert_offset=local_expert_offset,
+            nvfp4_4over6_config=(
+                resolve_nvfp4_4over6()
+                if tensors["x_per_token_scale"] is not None
+                else None
+            ),
+            disable_fp4_quant_fast_math=env_flag_enabled(
+                "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+            ),
+            **activation_kwargs,
+        )
+        assert_cute_dsl_moe_bits(actual, expected)
+    elif quant_mode == "w4a16" and not use_fused_finalize:
+        expected = split_w4a16_reference_from_tensors(
+            tensors,
+            local_expert_offset=local_expert_offset,
+            **{
+                key: value
+                for key, value in activation_kwargs.items()
+                if value is not None
+            },
+        )
+        assert_w4a16_bits(actual, expected)
+    elif quant_mode == "w4a4" and (use_fused_finalize or is_sm107()):
+        # Atomic fused finalize and Rubin retain their mathematical reference.
+        # Rubin's supported unfused path is outside the SM100 exact contract.
+        expected = compute_reference_moe_fp4(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=tensors["x"].shape[0],
+            num_experts=num_experts,
+            top_k=tensors["token_selected_experts"].shape[1],
+            hidden_size=tensors["w2_weight"].shape[1],
+            intermediate_size=tensors["w2_weight"].shape[2] * 2,
+            num_local_experts=tensors["w1_weight"].shape[0],
+            local_expert_offset=local_expert_offset,
+            **activation_kwargs,
+            **reference_inputs,
+        )
+        passed, percent_within, atol = check_accuracy(actual, expected)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+    elif quant_mode == "w4a16" and use_fused_finalize:
+        raise ValueError("Fused W4A16 finalization is outside the exact test contract")
+    else:
+        raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+
+
 def test_geglu_tanh_activation_is_supported():
     activation_type, gated = normalize_cute_dsl_moe_activation_type(
         ActivationType.GegluTanh
@@ -412,7 +504,7 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_n):
     expected = torch.full_like(
         output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
     )
-    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
+    assert_cute_dsl_moe_bits(output[:num_tokens], expected)
 
 
 @cute_dsl_available
@@ -2157,6 +2249,28 @@ class TestCuteDslFusedMoeFunctional:
                 True,
                 id="relu2-per-token",
             ),
+            pytest.param(
+                "w4a16",
+                ActivationType.Swiglu,
+                128,
+                1,
+                256,
+                512,
+                256,
+                False,
+                id="w4a16-swiglu",
+            ),
+            pytest.param(
+                "w4a16",
+                ActivationType.Relu2,
+                515,
+                8,
+                1024,
+                2048,
+                384,
+                False,
+                id="w4a16-relu2",
+            ),
         ],
     )
     def test_deterministic_finalize_numerical_accuracy(
@@ -2293,21 +2407,15 @@ class TestCuteDslFusedMoeFunctional:
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
-        ref_output = _compute_moe_quant_mode_reference(
+        _assert_moe_accuracy(
+            result,
             tensors,
             quant_mode,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+            use_fused_finalize,
+            reference_inputs,
+            num_experts,
             activation_type=activation_type,
-            **reference_inputs,
         )
-
-        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -2762,20 +2870,14 @@ class TestCuteDslMoEWrapper:
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
-        ref_output = _compute_moe_quant_mode_reference(
+        _assert_moe_accuracy(
+            result,
             tensors,
             quant_mode,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            **reference_inputs,
+            use_fused_finalize,
+            reference_inputs,
+            num_experts,
         )
-
-        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_wrapper_swiglu_oai_accuracy(self, quant_mode: str):
@@ -2965,24 +3067,17 @@ class TestCuteDslMoEWrapper:
                 raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
         # Verify accuracy
-        ref_output = _compute_moe_quant_mode_reference(
+        _assert_moe_accuracy(
+            results[0],
             tensors,
             quant_mode,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation_type=ActivationType.Swiglu,
+            use_fused_finalize,
+            reference_inputs,
+            num_experts,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
-            **reference_inputs,
         )
-
-        _assert_moe_quant_mode_reference(results[0], ref_output, quant_mode)
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     @pytest.mark.parametrize(
@@ -3487,22 +3582,15 @@ class TestExpertParallelism:
         assert not torch.isinf(result).any()
 
         # Numerical accuracy verification
-        ref_output = _compute_moe_quant_mode_reference(
+        _assert_moe_accuracy(
+            result,
             tensors,
             quant_mode,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_local_experts=num_local_experts,
+            use_fused_finalize,
+            reference_inputs,
+            num_experts,
             local_expert_offset=local_expert_offset,
-            **reference_inputs,
         )
-
-        _assert_moe_quant_mode_reference(result, ref_output, quant_mode)
 
 
 # =============================================================================
@@ -5260,13 +5348,23 @@ def test_cute_dsl_pinned_4over6_requires_w4a4_per_token():
 @sm100_required
 @cute_dsl_available
 @pytest.mark.parametrize(
+    "use_fused_finalize,disable_fp4_quant_fast_math",
+    [
+        pytest.param(True, False, id="fused"),
+        pytest.param(False, False, id="unfused-fast"),
+        pytest.param(False, True, id="unfused-strict"),
+    ],
+)
+@pytest.mark.parametrize(
     "recipe",
     [
         pytest.param(NVFP44Over6Config(), id="e4m3_max448"),
         pytest.param(NVFP44Over6Config(e4m3_max=256), id="e4m3_max256"),
     ],
 )
-def test_cute_dsl_pinned_recipe_matches_env(recipe):
+def test_cute_dsl_pinned_recipe_matches_env(
+    recipe, use_fused_finalize, disable_fp4_quant_fast_math, monkeypatch
+):
     """``nvfp4_4over6=`` selects, bit for bit, the per-token GEMM2-input
     quantizer the environment selects, through both public entry points."""
     from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
@@ -5275,6 +5373,10 @@ def test_cute_dsl_pinned_recipe_matches_env(recipe):
     )
     from .utils import env_var, nvfp4_4over6_env
 
+    monkeypatch.setenv(
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+        "1" if disable_fp4_quant_fast_math else "0",
+    )
     num_tokens, hidden_size, intermediate_size = 64, 256, 512
     num_experts, top_k = 8, 2
     e4m3_use_256 = "1" if recipe.e4m3_max == 256 else "0"
@@ -5317,14 +5419,34 @@ def test_cute_dsl_pinned_recipe_matches_env(recipe):
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         quant_mode="w4a4",
+        use_fused_finalize=use_fused_finalize,
     )
 
     def run(**extra):
         functional = cute_dsl_fused_moe(
-            **common, num_experts=num_experts, top_k=top_k, **extra
+            **common,
+            num_experts=num_experts,
+            top_k=top_k,
+            use_fused_finalize=use_fused_finalize,
+            **extra,
         )
         wrapped = wrapper.run(**common, **extra)
         torch.cuda.synchronize()
+        if not use_fused_finalize:
+            effective_recipe = (
+                resolve_nvfp4_4over6(extra["nvfp4_4over6"])
+                if "nvfp4_4over6" in extra
+                else resolve_nvfp4_4over6()
+            )
+            expected = cute_dsl_moe_reference(
+                **common,
+                nvfp4_4over6_config=effective_recipe,
+                disable_fp4_quant_fast_math=env_flag_enabled(
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+                ),
+            )
+            assert_cute_dsl_moe_bits(functional, expected)
+            assert_cute_dsl_moe_bits(wrapped, expected)
         return functional.clone(), wrapped.clone()
 
     with (
@@ -5374,8 +5496,10 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
     x_sf = x_sf.view(torch.uint8).reshape(tokens, hidden // 32)
     if quant_mode == "w4a8":
         weight_format = QuantFormat.MXFP4
+        reference_weight_dtype = "float4_e2m1fn"
     elif quant_mode == "mxfp8":
         weight_format = QuantFormat.MXFP8
+        reference_weight_dtype = "float8_e4m3fn"
     else:
         raise ValueError(quant_mode)
     weights = CuteDslConfig.prepare_weights(
@@ -5410,7 +5534,7 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
-    expected = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
+    functional = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
     wrapper = CuteDslMoEWrapper(
         **config,
         hidden_size=hidden,
@@ -5419,19 +5543,23 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
         autotune_use_cuda_graph=True,
     )
     actual = wrapper.run(**inputs, tactic=tactic)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    reference_kwargs = dict(
+        a_dtype="float8_e4m3fn",
+        b_dtype=reference_weight_dtype,
+        sf_vec_size=32,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    reference = cute_dsl_moe_reference(**inputs, **reference_kwargs)
+    assert_cute_dsl_moe_bits(functional, reference)
+    assert_cute_dsl_moe_bits(actual, reference)
+    assert_cute_dsl_moe_bits(actual, functional)
     assert wrapper._runner.use_cuda_graph
 
     if situ_beta is not None:
-        from flashinfer.trace.templates.moe import _cute_dsl_fused_moe_reference
-
-        reference = _cute_dsl_fused_moe_reference(**inputs, **config)
-        swiglu_reference = _cute_dsl_fused_moe_reference(
-            **inputs, **dict(config, situ_beta=None, situ_linear_beta=None)
-        )
-        passed, percent_within, atol = check_accuracy(actual, reference)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        swiglu_reference = cute_dsl_moe_reference(
+            **inputs,
+            **dict(reference_kwargs, situ_beta=None, situ_linear_beta=None),
         )
         situ_error = torch.mean(torch.abs(actual.float() - reference.float()))
         swiglu_error = torch.mean(torch.abs(actual.float() - swiglu_reference.float()))
@@ -5442,3 +5570,115 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
         wrapper.run(**invalid, tactic=tactic)
     with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
         cute_dsl_fused_moe(**invalid, **config, tactic=tactic)
+
+
+@cute_dsl_available
+@sm100_required
+@pytest.mark.skipif(
+    is_sm107(), reason="block-scaled bit-exact reference targets SM100/SM103"
+)
+@pytest.mark.parametrize(
+    "format_name,k",
+    [
+        pytest.param("nvfp4", 384, id="nvfp4-k-tail"),
+        pytest.param("nvfp4", 1024, id="nvfp4-wide-scales"),
+        pytest.param("mxfp8", 1024, id="mxfp8-wide-scales"),
+        pytest.param("mxfp8_mxfp4", 256, id="mixed-complementary-scales"),
+    ],
+)
+def test_split_blockscaled_gemm_exact(format_name, k):
+    """Qualify the arithmetic oracle with scale ranges ordinary BF16 MMA loses."""
+    from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+        blockscaled_contiguous_grouped_gemm_finalize_fusion as gemm,
+    )
+    from tests.test_helpers.cute_dsl_moe_reference import blockscaled_matmul
+
+    torch.manual_seed(518)
+    tokens, tile, channels = 17, 32, 128
+    if format_name == "nvfp4":
+        block = 16
+        a_dtype = b_dtype = "float4_e2m1fn"
+        format_a = format_b = "e2m1"
+        sf_dtype, scale_format = "float8_e4m3fn", "ue4m3"
+        out_dtype = "float32"
+        a = torch.randint(0, 256, (tile, k // 2), device="cuda", dtype=torch.uint8)
+        b = torch.randint(
+            0, 256, (1, channels, k // 2), device="cuda", dtype=torch.uint8
+        )
+        sa = torch.randint(
+            1, 126, (1, 128, k // block), device="cuda", dtype=torch.uint8
+        )
+        sb = torch.randint(
+            1, 126, (1, channels, k // block), device="cuda", dtype=torch.uint8
+        )
+    elif format_name in ("mxfp8", "mxfp8_mxfp4"):
+        block = 32
+        a_dtype, format_a = "float8_e4m3fn", "e4m3"
+        sf_dtype, scale_format = "float8_e8m0fnu", "ue8m0"
+        a = (torch.randn((tile, k), device="cuda") * 4).to(torch.float8_e4m3fn)
+        if format_name == "mxfp8":
+            b_dtype, format_b, out_dtype = "float8_e4m3fn", "e4m3", "float32"
+            b = (torch.randn((1, channels, k), device="cuda") * 4).to(
+                torch.float8_e4m3fn
+            )
+            sa = torch.randint(
+                111, 144, (1, 128, k // block), device="cuda", dtype=torch.uint8
+            )
+            sb = torch.randint(
+                111, 144, (1, channels, k // block), device="cuda", dtype=torch.uint8
+            )
+        else:
+            b_dtype, format_b, out_dtype = "float4_e2m1fn", "e2m1", "bfloat16"
+            b = torch.randint(
+                0, 256, (1, channels, k // 2), device="cuda", dtype=torch.uint8
+            )
+            # E8M0 254/0 multiply to one: the native answer is finite, even
+            # though decoding either operand separately to BF16 can overflow.
+            sa = torch.full((1, 128, k // block), 254, device="cuda", dtype=torch.uint8)
+            sb = torch.zeros(
+                (1, channels, k // block), device="cuda", dtype=torch.uint8
+            )
+    else:
+        raise ValueError(f"Unsupported exact GEMM test format: {format_name}")
+
+    def prepared_scales(scales):
+        physical = (
+            scales.reshape(1, 1, 4, 32, k // block // 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .contiguous()
+        )
+        return physical.permute(3, 4, 1, 5, 2, 0)
+
+    actual = gemm(
+        a=a,
+        b=b,
+        a_scale=prepared_scales(sa),
+        b_scale=prepared_scales(sb),
+        alpha=torch.ones(1, device="cuda"),
+        tile_idx_to_expert_idx=torch.zeros(1, device="cuda", dtype=torch.int32),
+        num_non_exiting_tiles=torch.ones(1, device="cuda", dtype=torch.int32),
+        tile_idx_to_mn_limit=torch.tensor([tokens], device="cuda", dtype=torch.int32),
+        permuted_idx_to_expanded_idx=torch.arange(
+            tile, device="cuda", dtype=torch.int32
+        ),
+        token_final_scales=torch.ones((tokens, 1), device="cuda"),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        sf_vec_size=block,
+        mma_tiler_mn=(128, tile),
+        cluster_shape_mn=(1, 1),
+        enable_pdl=False,
+        use_fused_finalize=False,
+    )
+    expected = (
+        blockscaled_matmul(
+            b[0], a[:tokens], sb[0], sa[0, :tokens], format_b, format_a, scale_format
+        )
+        .T.contiguous()
+        .to(actual.dtype)
+    )
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    bits = torch.int32 if actual.dtype == torch.float32 else torch.int16
+    torch.testing.assert_close(actual.view(bits), expected.view(bits), rtol=0, atol=0)
