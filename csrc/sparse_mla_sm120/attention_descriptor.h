@@ -105,7 +105,7 @@ class AttentionPlanObj : public ffi::ModuleObj {
             {"tokens", plan.metadata.tokens},
             {"row_stride_bytes", plan.metadata.row_stride_bytes}};
       });
-    return ffi::Function(nullptr);
+    return std::nullopt;
   }
 };
 
