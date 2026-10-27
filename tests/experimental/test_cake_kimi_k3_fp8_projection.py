@@ -1727,13 +1727,12 @@ def test_decode_config_round6_continuation_rules(arch):
     ) == (2, 4)
     assert cb.gemm_block_k(256, 144, 6, arch) == 128
     assert cb.gemm_stages_ts_slots(16384, 24, 2, arch) == (2, 4)
-    # round 11 C18 (CAKE-985 T7 pass 3): the sm_103a 96,1,512 cell (tp1:f_b:512, gemm_bn 192, 256-K) carries the stage / slot pair
-    # too (GB300 S5 v2 step d6567748; program gemm_tstore_n192_s2_ts4); the sm_100a cell keeps gemm_bn 192 + gemm_bk 128
-    assert (
-        cb.gemm_stages_ts_slots(512, 96, 1, arch)
-        == {"sm_100a": (3, 1), "sm_103a": (2, 4)}[arch]
-    )
-    assert cb.gemm_block_k(512, 96, 1, arch) == {"sm_100a": 128, "sm_103a": 256}[arch]
+    # round 11 C18: the sm_103a 96,1,512 cell (tp1:f_b:512, gemm_bn 192, 256-K) carried the stage / slot pair
+    # too (GB300 S5 v2 step d6567748; program gemm_tstore_n192_s2_ts4); the sm_100a cell keeps gemm_bn 192 + gemm_bk 128.  Round 12
+    # D: the sm_103a cell moved to the 192-wide 128-K grid-stride form (ROUTE_TWINS names its ``_ts3_tde`` twin), so both GPUs
+    # launch the cell at gemm_bk 128 with the default stage / slot pair.
+    assert cb.gemm_stages_ts_slots(512, 96, 1, arch) == (3, 1)
+    assert cb.gemm_block_k(512, 96, 1, arch) == 128
     # round 11 C25 (CAKE-985 T7, FIN tip 8): the 12,1,16384 cell (tp8:f_b:16384, 256-K, gemm_stages 2 / gemm_ts_slots 4 since
     # round 9) adopted gemm_bn 192 on BOTH GPUs once the FIN tip-7 fix C24 (TMA-store staging-slot wait covers the 192-wide
     # drain) made the n192 x s2_ts4 composition exact: S5 v2 on the fixed tree, node alone, bit-exact -- B200 step ee27c6e0
@@ -1804,7 +1803,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # 224-wide tile) and the sm_103a pf-2 256-wide cells.  Round 12: sm_100a 56,6,512 launches the 224-wide ``_gs`` form.
     # Round 12 batch 4 (lever ARS): the sm_100a 192,2,1024 / 192,2,4096 / 192,2,16384 cells (tp1:kv_b) launch the A-resident
     # form of the 256-wide ``_gs`` program (``gemm_ars`` 1 next to ``gemm_gs`` 1; the 192,2,2048 cell takes it for M > 1280 only,
-    # through ``DECODE_TABLE_M_RANGES``).
+    # through ``DECODE_TABLE_M_RANGES``).  Round 12 D: the sm_103a 96,1,512 cell (tp1:f_b:512) takes the 192-wide ``_gs`` form and
+    # its ``_ts3_tde`` twin.
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
@@ -1825,6 +1825,7 @@ def test_decode_config_round6_continuation_rules(arch):
             },
             "sm_103a": {
                 "96,1,2048",
+                "96,1,512",
                 "12,1,4096",
                 "24,2,1024",
                 "24,2,2048",

@@ -1211,12 +1211,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": True,
             "dpf": 1,
         },
-        "96,1,512": {
-            "route": "gemm",
-            "gemm_bn": 192,
-            "gemm_stages": 2,
-            "gemm_ts_slots": 4,
-        },
+        "96,1,512": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1},
         "96,1,1024": {
             "route": "gemm",
             "gemm_pf": 4,
@@ -1802,6 +1797,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "56,48,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,1,512": {
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
         },
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
