@@ -2155,14 +2155,15 @@ def test_decode_config_round6_continuation_rules(arch):
         + "_skf"
     )
     assert {"gemm_tstore_skf", n192_skf} <= required
-    # Round 12 batch 4 (lever RSKF): the sm_100a ``gemm_rstaged_skf`` rows (tp8:in_proj_qkvgfab: the 50,28,4096
-    # cell outside its 3329..3584 range and the 1281..2048 range of 50,28,2048) launch the staged-register fix-up program;
-    # no other register-epilogue program has the form.
+    # Round 12 batch 4 (lever RSKF): the ``gemm_rstaged_skf`` rows (tp8:in_proj_qkvgfab: on sm_100a the
+    # 50,28,4096 cell outside its 3329..3584 range and the 1281..2048 range of 50,28,2048, on sm_103a the 1537..2048
+    # range of 50,28,2048, round 12 E) launch the staged-register fix-up program; no other register-epilogue program has
+    # the form.
     assert {
         k
         for k in required
         if k.startswith(("gemm_rstaged", "gemm_n192", "gemm_pf")) and k.endswith("_skf")
-    } == {"sm_100a": {"gemm_rstaged_k128_skf"}, "sm_103a": set()}[arch]
+    } == {"gemm_rstaged_k128_skf"}
 
 
 def test_decode_module_stage_clamp():
