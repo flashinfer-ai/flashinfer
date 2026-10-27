@@ -125,7 +125,8 @@ def run(q, k, v, **kwargs):
         v[None],
         g[None],
         beta[None],
-        scale=kwargs["scale"],
+        # The public API treats both None and zero as the default scale.
+        scale=None if kwargs["scale"] == 0.0 else kwargs["scale"],
         initial_state=initial,
         output_final_state=kwargs["output_final_state"] or final is not None,
         use_qk_l2norm_in_kernel=kwargs["use_qk_l2norm_in_kernel"],

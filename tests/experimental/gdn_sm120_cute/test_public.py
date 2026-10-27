@@ -54,12 +54,13 @@ def inputs(lengths=(64, 96), dtype=torch.bfloat16, index_dtype=torch.int32):
 @pytest.mark.parametrize("lengths", [(64, 96), (65, 95)])
 @pytest.mark.parametrize("use_cp", ["auto", False, True])
 @pytest.mark.parametrize("preallocated", [False, True])
+@pytest.mark.parametrize("scale", [None, 0.0, 0.25])
 @torch.inference_mode()
-def test_public_forward(lengths, use_cp, preallocated, monkeypatch):
+def test_public_forward(lengths, use_cp, preallocated, scale, monkeypatch):
     from flashinfer.experimental.gdn_sm120_cute import _api
 
     args, kwargs = inputs(lengths)
-    kwargs["use_cp"] = use_cp
+    kwargs.update(use_cp=use_cp, scale=scale)
     expected = fi.chunk_gated_delta_rule(*args, backend="flashinfer", **kwargs)
     calls = []
     original = _api.chunk_gated_delta_rule
