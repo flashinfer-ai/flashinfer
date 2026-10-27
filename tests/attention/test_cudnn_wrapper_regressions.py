@@ -916,13 +916,11 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
     if backend == "auto":
         if (
             not prefill._cudnn_supports_paged_auto()
-            or torch.cuda.get_device_capability() != (10, 0)
+            or torch.cuda.get_device_capability() not in {(10, 0), (10, 7)}
         ):
-            pytest.skip("requires the qualified SM100 paged-auto runtime")
+            pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
         # Exercise bounded declarations without depending on a heuristic winner.
-        monkeypatch.setattr(
-            flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
-        )
+        monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: True)
     # A previous test's cached graph must not bypass this provider control.
     monkeypatch.setattr(
         prefill,
