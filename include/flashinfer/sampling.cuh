@@ -738,6 +738,17 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
   }
 }
 
+// Equal values resolve to the larger position, as they did when each vocabulary tile was
+// reduced separately: CUB folds left to right, DataAndIndex::operator+ keeps the right
+// operand on a tie, and later tiles replaced earlier ones. Deciding ties by position makes
+// the result independent of reduction order, so each thread keeps a single candidate.
+struct LogitsArgMaxOp {
+  template <typename T>
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return (a.data > b.data || (a.data == b.data && a.index > b.index)) ? a : b;
+  }
+};
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -752,13 +763,15 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLog
   uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
-                                         REDUCE_ALGORITHM>::TempStorage;
+  // Positions are 32-bit whatever IdType is. Slots past d keep their position, so a row
+  // that is -inf everywhere still resolves to the last slot; the output maps a padded slot to 0.
+  using Candidate = DataAndIndex<DType, uint32_t>;
+  using SharedMem = typename BlockReduce<Candidate, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage;
   extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling_logit[];
   auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
 
   vec_t<DType, VEC_SIZE> logits_vec;
-  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  Candidate max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -768,23 +781,18 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLog
     vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
         philox_seed, philox_offset,
         static_cast<uint64_t>(bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE));
-    DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       const uint32_t token_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-      const bool valid = token_idx < d;
-      cur_data[j].data =
-          valid ? logits_vec[j] + gumbel_noise[j] : -cuda::std::numeric_limits<DType>::infinity();
-      cur_data[j].index = valid ? token_idx : 0;
+      const DType value = token_idx < d ? logits_vec[j] + gumbel_noise[j]
+                                        : -cuda::std::numeric_limits<DType>::infinity();
+      max_data = LogitsArgMaxOp()(max_data, Candidate{value, token_idx});
     }
-
-    max_data +=
-        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
-            .template Sum<VEC_SIZE>(cur_data);
-    __syncthreads();
   }
+  max_data = BlockReduce<Candidate, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
+                 .Reduce(max_data, LogitsArgMaxOp());
   if (tx == 0) {
-    output[bx] = max_data.index;
+    output[bx] = max_data.index < d ? max_data.index : 0;
   }
 }
 
@@ -1511,7 +1519,7 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
     void* args[] = {&logits,   &output,     &indices,    &d,           &seed_arr,
                     &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
     const uint32_t smem_size = sizeof(
-        typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
+        typename BlockReduce<DataAndIndex<T, uint32_t>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
