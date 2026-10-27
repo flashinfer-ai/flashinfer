@@ -231,7 +231,7 @@ jobs:
           RUN_H100=true
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$H100_ON_PRS" != "true" ]; then
             RUN_H100=false
-            echo "::notice title=H100 lane disabled on PRs::H100 tests run only in the scheduled main runs until runner capacity is restored" >&2
+            echo "::notice title=H100 lane disabled on PRs::H100 tests run only in scheduled main runs and manual workflow_dispatch runs until runner capacity is restored" >&2
           fi
           echo "h100_disabled=$([ "$RUN_H100" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
           # A targeted run on a lane never tests more than that lane's bare run: H100
@@ -982,7 +982,7 @@ jobs:
           # The H100 lane is temporarily off on PRs (see Build Test Matrix). A scope
           # only H100 covered now schedules nothing and passes, so say so here.
           if [ "$H100_DISABLED" == "true" ]; then
-            echo "> **H100 lane temporarily disabled on PRs** — H100 tests run only in the scheduled main runs." >> $GITHUB_STEP_SUMMARY
+            echo "> **H100 lane temporarily disabled on PRs** — H100 tests run only in scheduled main runs and manual workflow_dispatch runs." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
