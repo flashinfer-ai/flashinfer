@@ -134,49 +134,47 @@ post-map (at least 99.5 % bit-identical; the kernel's fused multiply-adds round 
 
 ## Measurements
 
-FlashInfer main (0.7.2) with these seven kernels on 8 NVIDIA GB300 GPUs (two trays, MNNVL),
-CUDA 13.0, torch 2.13.0+cu130. The unfused pair is FlashInfer main's MNNVL one-shot all-reduce
-followed by the serving stack's TileLang mHC post-map / pre-norm kernel. Each variant is a CUDA
-graph of 90 back-to-back boundaries with distinct operand sets (larger than L2); microseconds per
-boundary, maximum over the 8 ranks, with the two graphs replayed alternately in one process
-(per-rank median of 120 alternating pairs). "Sequential" times each graph on its own (median of 30
-replays).
+FlashInfer main (0.7.2) with these seven kernels on 8 GPUs in one MNNVL domain (two 4-GPU trays):
+NVIDIA GB300 (SM103) and NVIDIA GB200 (SM100), CUDA 13.0, torch 2.13.0+cu130. The unfused pair
+is FlashInfer main's MNNVL one-shot all-reduce followed by the serving stack's TileLang mHC
+post-map / pre-norm kernel. Each variant is a CUDA graph of 90 back-to-back boundaries with
+distinct operand sets (larger than L2); microseconds per boundary, maximum over the 8 ranks, with
+the two graphs replayed alternately in one process (per-rank median of 120 alternating pairs).
 
-| tokens | unfused pair (us) | fused (us) | speedup | sequential speedup |
-|---|---|---|---|---|
-| 1 | 10.91 | 5.40 | 2.02x | 2.11x |
-| 2 | 11.88 | 6.17 | 1.93x | 2.02x |
-| 4 | 11.82 | 5.83 | 2.03x | 2.04x |
-| 8 | 12.31 | 7.05 | 1.75x | 1.74x |
-| 16 | 12.84 | 7.75 | 1.66x | 1.72x |
-| 24 | 14.09 | 9.26 | 1.52x | 1.48x |
-| 32 | 14.32 | 9.66 | 1.48x | 1.46x |
+| tokens | GB300 unfused (us) | GB300 fused (us) | GB300 speedup | GB200 unfused (us) | GB200 fused (us) | GB200 speedup |
+|---|---|---|---|---|---|---|
+| 1 | 11.75 | 5.90 | 1.99x | 11.78 | 5.83 | 2.02x |
+| 2 | 12.18 | 6.05 | 2.01x | 12.15 | 6.01 | 2.02x |
+| 4 | 11.64 | 5.65 | 2.06x | 12.13 | 5.91 | 2.05x |
+| 8 | 12.07 | 6.80 | 1.77x | 12.42 | 7.10 | 1.75x |
+| 16 | 12.91 | 7.82 | 1.65x | 13.29 | 8.02 | 1.66x |
+| 24 | 13.76 | 8.95 | 1.54x | 14.02 | 8.99 | 1.56x |
+| 32 | 13.96 | 9.20 | 1.52x | 14.46 | 9.61 | 1.50x |
 
-The fused kernel is faster at every token count from 1 to 32: 1.48x to 2.05x (1.44x to 2.11x
-sequential), 4.7 to 7.7 us saved per boundary; 1.86x (1.91x sequential) weighted by
-GLM-5.3-Flash's decode token-count mix.
+The fused kernel is faster at every token count from 1 to 32 on both: 1.52x to 2.06x on GB300 and
+1.50x to 2.05x on GB200, 4.7 to 8.0 us saved per boundary; 1.88x (GB300) and 1.89x (GB200)
+weighted by GLM-5.3-Flash's decode token-count mix. Timing each graph on its own gives 1.45x to
+2.08x.
 
 End to end, GLM-5.3-Flash NVFP4 on vLLM with TP8 across two GB300 trays (multi-turn replay),
-against vLLM with stock FlashInfer main: mean inter-token latency -9.9 % at concurrency 1 (4.401
-to 3.964 ms) and -10.4 % at concurrency 8 (5.636 to 5.052 ms); median decode step 0.43 to 0.50 ms
-shorter. At concurrency 8 the mean time to first token rose 6.4 % through a few outlier requests
-in the tail; its median and p90 are not worse, and the cause is not isolated.
+against vLLM with stock FlashInfer main: mean inter-token latency -9.3 % at concurrency 1 (4.386
+to 3.977 ms) and -7.4 % at concurrency 8 (5.636 to 5.221 ms), output throughput +4.7 % and +0.1 %.
+The median decode step is 0.31 to 0.51 ms shorter at every decode batch size from 1 to 8 tokens.
 
-Accuracy, against the same build with the unfused path: GSM8K (all 1319 test questions, greedy)
+Accuracy, against the same build with the unfused path (measured on an earlier revision of this
+change whose seven kernels compile to the same SASS): GSM8K (all 1319 test questions, greedy)
 1288 vs 1287 correct (McNemar p = 1.00). The fused run reached the 8192-token cap on 4 questions,
 the unfused run on none (Fisher p = 0.12). Teacher-forced perplexity is identical, but prefill
 does not use this kernel.
 
-These numbers were measured on an earlier revision of this change whose seven kernels compile to
-the same SASS as this module.
-
 ## Validation status
 
 - Builds with CUDA 13.0 and 13.1 for `sm_100a` and `sm_103a`.
-- GB300 (SM103): the same kernels (identical SASS) passed an earlier version of the 8-rank tests in
-  `tests/experimental/test_allreduce_mhc_post_prenorm.py` on every rank of two GB300 trays,
-  including CUDA-graph capture and replay and interleaving with the stock all-reduce.
-- SM100: built, not yet run on hardware.
+- GB300 (SM103) and GB200 (SM100), two 4-GPU trays each: every test in
+  `tests/experimental/test_allreduce_mhc_post_prenorm.py` passes on all 8 ranks, including
+  CUDA-graph capture and replay, interleaving with the stock all-reduce, in-place residual
+  updates, strided operands, and a rank taking the composable path while the others run the
+  fused kernel.
 
 ## Graduation
 
