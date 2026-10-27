@@ -806,10 +806,10 @@ def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
 # ``(0 + P0) + P1``, so the outputs are bitwise those of ``front_split_plan``.  Its CTAs wait for words other CTAs
 # release, so it launches cooperatively: every CTA of its grid resident at once.  Taken on the parts where it measured
 # faster: the TP8 rows of 16 row tiles (T = 1793-2048) with G = 8 on 152-SM parts (GB200 and GB300), and the TP8 rows of
-# 8 row tiles (T = 897-1024) with G = 4 on sm_103a 152-SM parts (GB300).  148-SM parts (B200, B300) keep the
-# trailing-wave plan on every row.  The plan travels in the stream-K arguments: ``num_items`` = clusters,
-# ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and ``sk_max_seg`` = 2 * t0 + fold_all,
-# t0 the trailing-wave plan's whole tiles.
+# 8 row tiles (T = 769-1024) with G = 4 on sm_103a 152-SM parts (GB300); ``m_tiles_for`` rounds the row-tile count up to
+# an even count.  148-SM parts (B200, B300) keep the trailing-wave plan on every row.  The plan travels in the stream-K
+# arguments: ``num_items`` = clusters, ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and
+# ``sk_max_seg`` = 2 * t0 + fold_all, t0 the trailing-wave plan's whole tiles.
 FRONT_FOLD_I_LOCAL = SHARED_INTERMEDIATE // 8  # TP8 only
 #: Pair rows per lane (G) by (row tiles, architecture, SM count): the fold form serves these parts only.
 FRONT_FOLD_LANE_ROWS_BY_PART = {
