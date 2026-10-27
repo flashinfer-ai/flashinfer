@@ -25,12 +25,28 @@ import pytest
 _REPO_ROOT = Path(__file__).parents[1]
 
 
+# def _run_isolated(code: str) -> None:
+#     env = os.environ.copy()
+#     env["PYTHONPATH"] = os.pathsep.join(
+#         filter(None, (str(_REPO_ROOT), env.get("PYTHONPATH")))
+#     )
+#     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 def _run_isolated(code: str) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(_REPO_ROOT), env.get("PYTHONPATH")))
     )
-    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Isolated code failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
 
 def test_flashinfer_import_and_availability_probe_do_not_import_task_scheduling():
