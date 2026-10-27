@@ -31,6 +31,7 @@ pytestmark = pytest.mark.gpu_exclusive
 
 @pytest.fixture(autouse=True)
 def release_test_memory():
+    """Release cached GPU allocations between large-correction cases."""
     yield
     gc.collect()
     if torch.cuda.is_available():
@@ -58,6 +59,7 @@ def release_test_memory():
 def test_large_correction_matches_independent_heads(
     seq_len, batch, causal, dtype, return_lse
 ):
+    """Compare large correction strides against an overflow-free per-head oracle."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
