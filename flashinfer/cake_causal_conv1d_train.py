@@ -53,6 +53,18 @@ cooperative: the backward keeps its speed while kernels of other streams
 wait for.  Nothing is saved from the forward but ``x``, ``w``, ``b`` and
 ``cu_seqlens``.
 
+The forward is one ordinary launch: the co-resident CTAs of each channel tile
+take the tile's tokens in chunks from int32 counters on the device (the CTAs
+that finish first take the tail), so ``y`` is the same bits whatever CTA
+computes a chunk.  The counters live in a forward workspace of
+``cake_causal_conv1d_train_forward_workspace_bytes(S, C, device)`` bytes that is
+zero before its first launch and that every launch leaves zero, so one buffer
+serves every later forward call of one stream, CUDA Graph replays included.  A
+caller may own it (``workspace=``); otherwise the package keeps one zeroed
+buffer per (device, current stream), and a call inside a CUDA Graph capture
+allocates a zeroed buffer of its own.  Two launches that may run at once need
+two buffers.
+
 Inputs and outputs are contiguous (``C`` a multiple of 8); ``dweight`` and
 ``dbias`` are FP32 or BF16 (the parameter's dtype when not preallocated).
 ``S``, ``C`` and the document count are runtime scalars: they may change
@@ -92,6 +104,11 @@ Usage::
     ws = cake_causal_conv1d_train_backward_workspace(S, C, x.device)
     dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
 
+    # caller-owned forward workspace (zeroed int32 token-chunk counters, left zero
+    # by every launch: keep one per stream and reuse it for every later call)
+    fws = cake_causal_conv1d_train_forward_workspace(S, C, x.device)
+    y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens, workspace=fws)
+
     # context-parallel training: this rank's fragments of the packed batch, with the
     # history rows of the preceding fragments exchanged through the KCP context
     # (FP32 taps, no bias)
@@ -112,6 +129,8 @@ from .cake_causal_conv1d_train_backend import (  # noqa: F401
     CakeCausalConv1dFunction,
     cake_causal_conv1d_train_backward_workspace,
     cake_causal_conv1d_train_backward_workspace_bytes,
+    cake_causal_conv1d_train_forward_workspace,
+    cake_causal_conv1d_train_forward_workspace_bytes,
     is_cake_causal_conv1d_train_supported,
 )
 
@@ -129,6 +148,7 @@ def cake_causal_conv1d_train_forward(
     *,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
 
@@ -151,6 +171,16 @@ def cake_causal_conv1d_train_forward(
         taps; its dtype is independent of ``weight``'s.
     out : torch.Tensor, optional
         Preallocated BF16 output of ``x``'s shape, contiguous.
+    workspace : torch.Tensor, optional
+        Caller-owned ``int32`` buffer from
+        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
+        counters: zero before its first launch, left zero by every launch, so
+        one buffer serves every later call of one stream, CUDA Graph replays
+        included; two launches that may run at once need two buffers).  Its
+        size (:func:`cake_causal_conv1d_train_forward_workspace_bytes`) is the
+        most over every forward route.  When omitted the package uses a zeroed
+        buffer it keeps per (device, current stream), or a zeroed buffer of the
+        call's own inside a CUDA Graph capture.
 
     Returns
     -------
@@ -161,7 +191,7 @@ def cake_causal_conv1d_train_forward(
     """
 
     return _backend.cake_causal_conv1d_train_forward(
-        x, weight, cu_seqlens, bias=bias, out=out
+        x, weight, cu_seqlens, bias=bias, out=out, workspace=workspace
     )
 
 
@@ -335,5 +365,7 @@ __all__ = [
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",
     "cake_causal_conv1d_train_forward",
+    "cake_causal_conv1d_train_forward_workspace",
+    "cake_causal_conv1d_train_forward_workspace_bytes",
     "is_cake_causal_conv1d_train_supported",
 ]

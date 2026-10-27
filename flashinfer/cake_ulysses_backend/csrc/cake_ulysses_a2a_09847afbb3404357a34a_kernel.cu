@@ -190,17 +190,15 @@ kernel_cake_ulysses_a2a_09847afbb3404357a34a(__half* __restrict__ inp, __half* o
     }
     unsigned int* peer_words = reinterpret_cast<unsigned int*>(peer_elements);
     unsigned int* landed = peer_signals + (176 + bid_1);
-    if (out_chunks > 0) {
-        if (tid_0 == 0) {
-            {
-            unsigned int _acquire_observed;
-            do {
-            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (168 + destination))) : "memory");
-            } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
-            }
+    if (tid_0 == 0) {
+        {
+        unsigned int _acquire_observed;
+        do {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (168 + destination))) : "memory");
+        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (B == 1) {
         #pragma unroll 1
         for (unsigned int k = 0; k < total; k++) {
@@ -2084,14 +2082,12 @@ kernel_cake_ulysses_a2a_09847afbb3404357a34a(__half* __restrict__ inp, __half* o
     }
     __syncthreads();
     if (tid_0 == 0) {
-        if (out_chunks > 0) {
-            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
-            {
-            unsigned int _acquire_observed;
-            do {
-            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
-            } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
-            }
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
+        {
+        unsigned int _acquire_observed;
+        do {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
+        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
         }
     }
     __syncthreads();

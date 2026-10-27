@@ -284,7 +284,7 @@ def build_thd_meta_o_descs_kernel(
     are normalized by subtracting their first entry. This preserves sliced
     prefixes without host validation or device-to-host reads.
 
-    Split callers may rank by KV traversal length for bottom-right attention
+    Forward callers may rank by KV traversal length for bottom-right attention
     without a sliding window. Top-left and windowed work retain Q ordering:
     their actual traversal is not described by the full KV length.
     """
@@ -321,7 +321,7 @@ def build_thd_meta_o_descs_kernel(
                     emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
             nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     cute.arch.barrier()
-    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv and splits > 1)
+    write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads), rank_by_kv=rank_by_kv)
     # Live unit total + claim counter for the persistent scheduler. The host
     # cannot know Sigma_b ceil(s_b/tile)*QH without a D2H (issue #552), so the
     # kernel reads its own bound from here. The counter starts at n_clusters:

@@ -1100,22 +1100,34 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_mapa_0) : "r"(mail_dst), "r"(0));
-            uint32_t _mapa_1;
-            asm volatile(
+            uint32_t _mbar_peer_0;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_1) : "r"(mail_bar_addr), "r"(0));
+                : "=r"(_mbar_peer_0) : "r"(mail_bar_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mbar_peer_0) : "memory");
+            uint32_t _mbar_peer_1;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_1) : "r"(mail_bar_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mbar_peer_1) : "memory");
+            uint32_t _mbar_peer_2;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_2) : "r"(mail_bar_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0 + 1024), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0 + 1024), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mbar_peer_2) : "memory");
+            uint32_t _mbar_peer_3;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_3) : "r"(mail_bar_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0 + 1536), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0 + 1536), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mbar_peer_3) : "memory");
         } else {
             mbarrier_wait_cluster_hint(mail_bar_addr, 0, 10000000);
             float part_0[16];
@@ -1210,10 +1222,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
             if (row0 < M) {
                 long long base0 = (long long)row0 * (long long)N + (long long)col;
                 float _scaled_0[2];
-                const float2 _scale2_0 = {alpha_value, alpha_value};
+                const float2 _scale2_4 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(acc)[_ls], _scale2_0);
+                    reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(acc)[_ls], _scale2_4);
                 unsigned int _packed_0[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1222,10 +1234,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + base0)[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
                 float _scaled_1[2];
-                const float2 _scale2_1 = {alpha_value, alpha_value};
+                const float2 _scale2_5 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 4))[_ls], _scale2_1);
+                    reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 4))[_ls], _scale2_5);
                 unsigned int _packed_1[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1234,10 +1246,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + (base0 + 16))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
                 float _scaled_2[2];
-                const float2 _scale2_2 = {alpha_value, alpha_value};
+                const float2 _scale2_6 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 8))[_ls], _scale2_2);
+                    reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 8))[_ls], _scale2_6);
                 unsigned int _packed_2[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1246,10 +1258,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + (base0 + 32))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
                 float _scaled_3[2];
-                const float2 _scale2_3 = {alpha_value, alpha_value};
+                const float2 _scale2_7 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 12))[_ls], _scale2_3);
+                    reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 12))[_ls], _scale2_7);
                 unsigned int _packed_3[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1261,10 +1273,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
             if (row1 < M) {
                 long long base1 = (long long)row1 * (long long)N + (long long)col;
                 float _scaled_4[2];
-                const float2 _scale2_4 = {alpha_value, alpha_value};
+                const float2 _scale2_8 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 2))[_ls], _scale2_4);
+                    reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 2))[_ls], _scale2_8);
                 unsigned int _packed_4[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1273,10 +1285,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + base1)[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
                 float _scaled_5[2];
-                const float2 _scale2_5 = {alpha_value, alpha_value};
+                const float2 _scale2_9 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 6))[_ls], _scale2_5);
+                    reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 6))[_ls], _scale2_9);
                 unsigned int _packed_5[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1285,10 +1297,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + (base1 + 16))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
                 float _scaled_6[2];
-                const float2 _scale2_6 = {alpha_value, alpha_value};
+                const float2 _scale2_10 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 10))[_ls], _scale2_6);
+                    reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 10))[_ls], _scale2_10);
                 unsigned int _packed_6[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -1297,10 +1309,10 @@ kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5(const __grid_constant__ CUte
                 }
                 reinterpret_cast<unsigned*>(C + (base1 + 32))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
                 float _scaled_7[2];
-                const float2 _scale2_7 = {alpha_value, alpha_value};
+                const float2 _scale2_11 = {alpha_value, alpha_value};
                 #pragma unroll
                 for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 14))[_ls], _scale2_7);
+                    reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((acc + 14))[_ls], _scale2_11);
                 unsigned int _packed_7[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {

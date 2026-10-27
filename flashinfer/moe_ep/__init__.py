@@ -95,6 +95,9 @@ from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm103.bf16_nvfp4_bf16_cake import (
+    Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig,
+)
 from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
     CakePrequantizedMoEWeightsWithSharedExpert,
     Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
@@ -337,6 +340,7 @@ __all__ = [
     "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig",
     "Nvfp4WeightPack",
+    "Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig",
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
