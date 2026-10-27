@@ -604,6 +604,33 @@ class TestPrimsTsUnifiedGpu:
         for key, tensor in prims_bf16.items():
             torch.testing.assert_close(tensor, trtllm_bf16[key])
 
+        mxfp4 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        mx_w1 = torch.randn(4, 512, 256, device=device, dtype=torch.bfloat16)
+        mx_w2 = torch.randn(4, 256, 256, device=device, dtype=torch.bfloat16)
+        mx_kwargs = dict(
+            quant=mxfp4,
+            num_local_experts=4,
+            hidden_size=256,
+            intermediate_size=256,
+            activation=SwiGLU(),
+            device=device,
+        )
+        prims_mx = PrimsTsConfig.prepare_weights(mx_w1, mx_w2, **mx_kwargs)
+        trtllm_mx = TrtllmFp4Config.prepare_weights(mx_w1, mx_w2, **mx_kwargs)
+        assert prims_mx.keys() == trtllm_mx.keys()
+        for key, tensor in prims_mx.items():
+            other = trtllm_mx[key]
+            if key in ("gemm1_weights", "gemm2_weights"):
+                # BlockMajorK [experts, K_bytes / 64, Mn, 64] of the MajorK weights.
+                num_experts, mn, k_bytes = other.shape
+                assert tensor.shape == (num_experts, k_bytes // 64, mn, 64)
+                tensor = tensor.permute(0, 2, 1, 3).reshape(other.shape)
+            # UE8M0 scales are stored as float8_e4m3fn; compare the bytes.
+            assert torch.equal(
+                tensor.contiguous().view(torch.uint8),
+                other.contiguous().view(torch.uint8),
+            )
+
     @pytest.mark.parametrize(
         "quant",
         (
@@ -831,6 +858,9 @@ class TestPrimsTsUnifiedGpu:
             assert prims_view.keys() == trtllm_view.keys()
             for key, tensor in prims_view.items():
                 other = trtllm_view[key]
+                if tensor.ndim == 4 and other.ndim == 3:
+                    # BlockMajorK MXFP4 weights, [experts, K_bytes / block, Mn, block].
+                    tensor = tensor.permute(0, 2, 1, 3).reshape(other.shape)
                 assert tensor.dtype == other.dtype and tensor.shape == other.shape
                 # MXFP4 stores UE8M0 bytes in float8_e4m3fn. assert_close
                 # rejects those encodings even when the bytes match. 0-dim
@@ -869,3 +899,11 @@ class TestPrimsTsUnifiedGpu:
             dataclasses.replace(config, backend=BackendOptions((trtllm_config,)))
         )(act, trtllm_weights)
         _nvfp4_check(prims_out, trtllm_out.float(), f"prims_ts {quant.pair} vs trtllm")
+        if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            # Prims-TS also takes the MajorK weights of the TRT-LLM view.
+            major_k_weights = MoEWeightPack()
+            major_k_weights.prepare_for("prims_ts", trtllm_view)
+            major_k_out = MoELayer(
+                dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
+            )(act, major_k_weights)
+            assert torch.equal(major_k_out, prims_out)
