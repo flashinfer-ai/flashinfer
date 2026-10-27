@@ -922,14 +922,15 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # with the reference's output bits.  They keep the reference's four K chains, the
 # K16 order within a chain and its +0 start, and sum the chains and the bias in the
 # reference's order, so a routed call returns exactly what the reference returns.
-# Seven tiles, each with and without the bias and with and without programmatic
+# Eight tiles, each with and without the bias and with and without programmatic
 # dependent launch, as (output features, batch rows) per CTA.  The three narrow
 # tiles differ only in their loops: PACKED_NARROW unrolls them by two rounds, faster
 # on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
 # PACKED_NARROW_FULL_STAGES also issues a full stage's MMAs without a per-step K
 # test, faster on sm_103a.  PACKED_M64_N16 and PACKED_M64_N4 put sixteen output
 # features in each chain's block of an M=64 MMA, on 16 or 4 batch rows (faster on
-# sm_107a).
+# sm_107a).  PACKED_BOX8 is PACKED on 8 batch rows: its activation box is 8 rows
+# tall, so a batch of 8 loads no rows past its end (faster on sm_107a).
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
     "PACKED_NARROW_U4": (8, 2),
@@ -937,6 +938,7 @@ _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_M64_N16": (16, 16),
     "PACKED_M64_N4": (16, 4),
     "PACKED": (32, 16),
+    "PACKED_BOX8": (32, 8),
     "ACCUMULATORS": (32, 64),
 }
 _NARROW_TILES = ("PACKED_NARROW", "PACKED_NARROW_U4", "PACKED_NARROW_FULL_STAGES")
@@ -1000,7 +1002,9 @@ class _Tcgen05Window(NamedTuple):
 # 21 of these rows from an input of 2048, and 22 or 23 rows from about 120 KiB of
 # activations (PACKED measured faster on every such shape, ACCUMULATORS slower than
 # the reference on some; below 120 KiB, 22 and 23 rows stay on ACCUMULATORS, which
-# measured faster than the reference there and close to PACKED).
+# measured faster than the reference there and close to PACKED).  PACKED_BOX8
+# serves the 8 rows of PACKED's sm_107a window from an input of 3072 (measured
+# faster than PACKED there).
 _LARGE_WEIGHT = 6_000_000
 
 
@@ -1157,6 +1161,7 @@ _SM107 = (
     _Tcgen05Window("PACKED_M64_N16", 16, 16, False, 2048, 3072, 2048, 10240),
     _Tcgen05Window("PACKED_M64_N16", 11, 16, False, 2048, 3072, 6144, 10240),
     _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 2048, 3072, 8192, 10240),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 3584, 4096, 3072, 6144),
     _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
     *_SM107_SMALL_ACTIVATIONS,
