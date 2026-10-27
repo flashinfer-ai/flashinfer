@@ -480,8 +480,26 @@ def test_replayssm_verify_validation(invalid):
         cache["replayssm_rawv"] = cache["replayssm_rawv"].float()
     if invalid == "strides":
         cache["replayssm_g"] = cache["replayssm_g"].transpose(1, 2)
-    with pytest.raises((AssertionError, ValueError)):
+    # The generic ssm_state_indices validation rejects the frozen-checkpoint
+    # request before the ReplaySSM checks run.
+    error = AssertionError if invalid == "scatter" else ValueError
+    with pytest.raises(error):
         gated_delta_rule_mtp(**args, cache_replayssm=invalid != "disabled", **cache)
+
+
+# B * HV <= 128 selects the inline MTP kernel and larger batches the warp
+# kernel; both must take the linear softplus branch without evaluating exp.
+@pytest.mark.parametrize("batch", [2, 17], ids=["inline", "warp"])
+def test_mtp_softplus_overflow(batch):
+    args, _ = _inputs(batch, 4)
+    args["a"][:, 0].fill_(100.0)
+    expected, _, _, _ = _reference(args)
+    output, _ = gated_delta_rule_mtp(**args)
+    live = args["initial_state_indices"] >= 0
+    assert torch.isfinite(output[live]).all()
+    torch.testing.assert_close(
+        output[live].double(), expected[live], atol=1e-4, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("backend", ["auto", "simt"])

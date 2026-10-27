@@ -1661,26 +1661,30 @@ def gated_delta_rule_mtp(
         target = gdn_device_target(q.device)
         if target.major != 10 and (target.major, target.minor) != (12, 0):
             raise ValueError("ReplaySSM caching requires SM100/SM103 or SM120")
-        assert disable_state_update, (
-            "ReplaySSM verify must leave the checkpoint frozen "
-            "(disable_state_update=True)"
-        )
-        assert intermediate_states_buffer is None, (
-            "ReplaySSM replaces full intermediate-state snapshots"
-        )
-        assert ssm_state_indices is None, (
-            "ReplaySSM and per-token state scatter are mutually exclusive"
-        )
-        assert pool_size > 0, "ReplaySSM requires at least one checkpoint slot"
-        assert k.shape == q.shape and v.shape[:2] == (B, T), (
-            "ReplaySSM Q/K/V shapes must agree"
-        )
-        assert a.shape == b.shape == (B, T, HV), "ReplaySSM a/b must be [B,T,HV]"
-        assert A_log.shape == dt_bias.shape == (HV,), (
-            "ReplaySSM gate parameters must be [HV]"
-        )
-        assert all(
-            t.device == q.device
+        # These checks raise instead of asserting so they survive ``python -O``:
+        # a verify that updates state would overwrite the checkpoint the
+        # following ReplaySSM commit replays from, corrupting it silently.
+        if not disable_state_update:
+            raise ValueError(
+                "ReplaySSM verify must leave the checkpoint frozen "
+                "(disable_state_update=True)"
+            )
+        if intermediate_states_buffer is not None:
+            raise ValueError("ReplaySSM replaces full intermediate-state snapshots")
+        if ssm_state_indices is not None:
+            raise ValueError(
+                "ReplaySSM and per-token state scatter are mutually exclusive"
+            )
+        if pool_size <= 0:
+            raise ValueError("ReplaySSM requires at least one checkpoint slot")
+        if k.shape != q.shape or v.shape[:2] != (B, T):
+            raise ValueError("ReplaySSM Q/K/V shapes must agree")
+        if a.shape != (B, T, HV) or b.shape != (B, T, HV):
+            raise ValueError("ReplaySSM a/b must be [B,T,HV]")
+        if A_log.shape != (HV,) or dt_bias.shape != (HV,):
+            raise ValueError("ReplaySSM gate parameters must be [HV]")
+        if any(
+            t.device != q.device
             for t in (
                 k,
                 v,
@@ -1692,14 +1696,18 @@ def gated_delta_rule_mtp(
                 initial_state_indices,
                 output,
             )
-        ), "ReplaySSM tensors must be on the query device"
-        assert K == V == 128, "ReplaySSM requires K=V=128"
-        assert H > 0 and HV > 0 and HV % H == 0, "ReplaySSM requires HV divisible by H"
-        assert initial_state_indices.shape == (B,), "initial_state_indices must be [B]"
-        assert T >= 3, f"ReplaySSM caching requires T >= 3, got T={T}"
-        assert all(t is not None for t in replayssm_buffers), (
-            "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
-        )
+        ):
+            raise ValueError("ReplaySSM tensors must be on the query device")
+        if K != 128 or V != 128:
+            raise ValueError("ReplaySSM requires K=V=128")
+        if H <= 0 or HV <= 0 or HV % H != 0:
+            raise ValueError("ReplaySSM requires HV divisible by H")
+        if initial_state_indices.shape != (B,):
+            raise ValueError("initial_state_indices must be [B]")
+        if T < 3:
+            raise ValueError(f"ReplaySSM caching requires T >= 3, got T={T}")
+        if any(t is None for t in replayssm_buffers):
+            raise ValueError("cache_replayssm=True requires replayssm_rawv/rawk/g/beta")
         expected_replayssm = (
             ((pool_size, HV, T, V), torch.bfloat16, "replayssm_rawv"),
             ((pool_size, H, T, K), torch.bfloat16, "replayssm_rawk"),
@@ -1710,18 +1718,20 @@ def gated_delta_rule_mtp(
             replayssm_buffers, expected_replayssm, strict=True
         ):
             assert tensor is not None
-            assert tensor.shape == shape, (
-                f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
-            )
-            assert tensor.dtype == dtype, (
-                f"{name} must have dtype {dtype}, got {tensor.dtype}"
-            )
-            assert tensor.device == q.device, (
-                f"{name} device {tensor.device} != q device {q.device}"
-            )
-            assert tensor.is_contiguous(), (
-                f"{name} must be a contiguous per-layer ReplaySSM view"
-            )
+            if tensor.shape != shape:
+                raise ValueError(
+                    f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != dtype:
+                raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+            if tensor.device != q.device:
+                raise ValueError(
+                    f"{name} device {tensor.device} != q device {q.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be a contiguous per-layer ReplaySSM view"
+                )
         # Contiguous views may still start at an unaligned storage offset.
         for name, tensor in (
             ("q", q),
@@ -1742,10 +1752,8 @@ def gated_delta_rule_mtp(
         ):
             if tensor is not None and tensor.data_ptr() % 16:
                 raise ValueError(f"{name} must have a 16-byte aligned base address")
-    else:
-        assert all(t is None for t in replayssm_buffers), (
-            "replayssm_* buffers require cache_replayssm=True"
-        )
+    elif any(t is not None for t in replayssm_buffers):
+        raise ValueError("replayssm_* buffers require cache_replayssm=True")
 
     # Execute kernel
     run_mtp_decode(
