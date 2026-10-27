@@ -1816,6 +1816,7 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
+@flashinfer_api
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
