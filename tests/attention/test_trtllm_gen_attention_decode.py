@@ -2,6 +2,7 @@ import inspect
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from typing import Union
@@ -1340,6 +1341,50 @@ def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
         return_lse=return_lse,
         provide_lse=provide_lse,
     )
+
+
+def test_trtllm_gen_lse_kernel_reads_softmax_stats_coherently():
+    """ComputeLSEFromMDKernel (lse.cuh) reads the softmax stats written by the kernel before it.
+
+    Under PDL that kernel can still be running when this one starts, and only memory accesses after
+    griddepcontrol.wait (SASS ACQBULK) are ordered after it. A non-coherent load (SASS LDG...CONSTANT,
+    PTX ld.global.nc, which a read-only __restrict__ pointer can compile to) is outside the PTX memory
+    model, so it is not ordered by the wait. Inspects the SASS of the loaded fmha_gen module: every
+    global load comes after the wait, and none is non-coherent.
+    """
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("trtllm-gen fmha requires SM10x")
+    cuobjdump = shutil.which("cuobjdump") or os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "cuobjdump"
+    )
+    if not os.path.exists(cuobjdump):
+        pytest.skip("cuobjdump is not available")
+    from flashinfer.jit.attention.modules import gen_trtllm_gen_fmha_module
+
+    spec = gen_trtllm_gen_fmha_module()
+    spec.build_and_load()
+    sass = "".join(
+        subprocess.run(
+            [cuobjdump, "-sass", str(path)], capture_output=True, text=True, check=True
+        ).stdout
+        for path in spec.get_library_paths()
+    )
+    kernels = [
+        body
+        for body in re.split(r"\n\s*Function : ", sass)
+        if body.startswith("_ZN10flashinfer22ComputeLSEFromMDKernel")
+    ]
+    assert kernels, "ComputeLSEFromMDKernel not found in the fmha_gen module"
+    for body in kernels:
+        instructions = re.findall(r"/\*[0-9a-f]{4,}\*/\s+([^;]+);", body)
+        loads = [i for i, ins in enumerate(instructions) if re.search(r"\bLDG\b", ins)]
+        waits = [i for i, ins in enumerate(instructions) if "ACQBULK" in ins]
+        assert loads and waits, instructions
+        assert waits[0] < loads[0], "a global load precedes griddepcontrol.wait"
+        non_coherent = [
+            instructions[i] for i in loads if ".CONSTANT" in instructions[i]
+        ]
+        assert not non_coherent, f"non-coherent loads after the wait: {non_coherent}"
 
 
 # device_scale=True exercises the precedence branch where a tensor ``bmm1_scale``
