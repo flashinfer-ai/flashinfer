@@ -58,11 +58,16 @@ without it (``fwd_nosave``) the internal-row forms run.  Backward: GLM prep, [in
 checkpoint-replay path: before the prep where the intra program writes the
 tables the prep reads, after it otherwise], [WY], [the state recurrence
 recompute], [dA / dv],
-the adjoint state recurrence, the fused dq / dk / dg, GLM intra, the gate
-epilogue.  The bracketed launches depend on the path and the row: from a
-version-2 (tape) saved set there is no recurrence recompute; from a version-3
-set carrying the segment-boundary states the segmented recompute is pass 2
-alone; the serial recompute of the 64-column form from 64 heads forms the WY
+the adjoint state recurrence, the fused dq / dk / dg, GLM intra and, on
+``sm_100a`` / ``sm_107a``, the gate epilogue (the GLM intra program of ``sm_103a``
+writes the gate gradients itself).  The bracketed launches depend on the path
+and the row: from a version-2 (tape) saved set there is no recurrence
+recompute; from a version-4 set carrying the segment-boundary states the
+segmented recompute is pass 2 alone; the rows whose version-4 set carries the
+WY representation (the paired serial 16-head rows of ``sm_100a``, the
+segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head)
+chains) launch no WY program; the serial recompute of the 64-column form from
+64 heads forms the WY
 representation itself (no WY launch) and leaves the transposed ``w`` tile the
 matching adjoint recurrence reads; the saved-state pass 2 of the segmented
 rows with at most 32 (document, head) chains does the same; the serial adjoint
@@ -76,13 +81,16 @@ token rows and the user's ``dout``, the replay path's programs the internal
 rows the replay recomputes (``aqk_int`` / ``akk_int`` / ``do_int``).  The two
 state recurrences (``fwdh`` / ``fwdh_p3``, ``dhu``) run as the serial walk over
 each document's chunk chain (four CTAs of 32 value columns when that one-wave
-form fits the device, else two of 64) for more than eight heads, and as the
-segmented three passes for at most eight heads (:func:`cake_jit.segment_plan`):
+form fits the device, else two of 64) for more than eight heads -- except the
+16-head rows of ``sm_103a`` / ``sm_107a``, which take the segmented route too --
+and as the segmented three passes otherwise (:func:`cake_jit.segment_plan`):
 pass 1 walks every segment of every document in parallel (the forward's from
 zero and from the identity: the segment offset and transfer; the backward's
 reverse walk from zero), ``seg_carry`` chains the segments' states within
-each document (TF32 on the tensor cores), pass 2 walks again from the carried
-states and writes the tapes.
+each document (TF32 on the tensor cores; with at most two heads, where its
+host rule accepts, the two-level carry ``seg_carry_v8`` forms the groups of
+segments in parallel), pass 2 walks again
+from the carried states and writes the tapes.
 
 Memory.  A :class:`KdaWorkspace` is one arena holding only the internal
 intermediates; buffers with disjoint lifetimes within one call share a slot
@@ -92,8 +100,13 @@ full ones, and a backward workspace is sized for the larger).  Outputs, the
 saved set and the tables are per-call allocations the caller owns; nothing is
 kept between calls.  :func:`workspace_bytes`, :func:`saved_bytes`,
 :func:`output_bytes` and :func:`memory_report` are the pre-allocation queries.
-``save_mode="light"`` (the default; saved set version 3) saves ``Aqk`` /
-``Akk`` on the token rows (256 B per token-head), the tables and, on the
+``save_mode="light"`` (the default; saved set version 4) saves ``Aqk`` /
+``Akk`` on the token rows (256 B per token-head), the tables, the fold's ``qg``
+(256 B per internal token-head: the light backward's prep writes none), on the
+rows whose light backward reads it from the set (the paired serial 16-head
+rows of ``sm_100a``, the segmented 16-head rows of ``sm_103a`` / ``sm_107a``
+above 32 (document, head) chains) the WY representation ``w`` / ``u`` (512 B
+more; that backward launches no WY program) and, on the
 segmented route when ``S >= 384 * NSEG`` (:func:`seg_states_saved`: the three
 FP32 state blocks are then no larger than the ``Aqk`` / ``Akk`` set), the
 forward's segment-boundary states ``hseg`` and ``seg_state``, so the
@@ -127,9 +140,12 @@ BT = CHUNK  # tokens per chunk
 D = HEAD_DIM  # head dimension of q, k, v and g
 MAX_DOCS = 65536  # the layout table finds a chunk's document with a 16-step search over [0, num_docs)
 SCALE = D**-0.5  # the default softmax-free scale of the GLM contract
-# saved set version 3 (light): {Aqk, Akk, tables} + the segment-boundary states {hseg, seg_state} on the segmented
-# route when the size rule holds (version 1, the light set without the states, is no longer produced or accepted)
-SAVED_VERSION = 3
+# saved set version 4 (light): {Aqk, Akk, tables, qg} + the segment-boundary states {hseg, seg_state} on the
+# segmented route when the size rule holds + the WY representation {w, u} on the rows whose light backward reads
+# it from the set (the paired serial 16-head rows of sm_100a, the segmented 16-head rows of sm_103a / sm_107a above
+# 32 (document, head) chains: no wy launch there); versions 1 and 3 (the light sets without qg) are no longer
+# produced or accepted
+SAVED_VERSION = 4
 SAVED_VERSION_TAPE = (
     2  # saved set version 2: + the forward's h tape and v_new (+ the segment transfers)
 )
@@ -186,9 +202,9 @@ class KdaArena:
     ``saved=None``; ``torch.utils.checkpoint`` never replays: the node's backward reads the recomputed saved set)
     and no row that dispatches the separate ``dav`` program (H 9-15, outside the contract's head counts).
     ``tail_passes = B`` (which implies ``lean``) runs the three chunk-parallel tail stages of the backward (the
-    fused gradient, GLM intra, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks on offset views of
-    the whole-sequence buffers, with the per-pass buffers (``dq_f, dk_f, dg_f, db_f, dAkk, dAqk, dg_int, db_int``)
-    sized for one range: the same kernels on the same bytes (bitwise the same gradients), ``B - 1`` more launches
+    fused gradient, GLM intra and, on ``sm_107a``, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks
+    on offset views of the whole-sequence buffers, with the per-pass buffers (``dq_f, dk_f, dg_f, db_f, dAkk, dAqk``
+    and, where the gate epilogue launches, ``dg_int, db_int``) sized for one range: the same kernels on the same bytes (bitwise the same gradients), ``B - 1`` more launches
     per tail stage.  The arena bytes: :func:`workspace_bytes` / :func:`memory_report` with ``arena=``; the floor
     from four passes on is 2820 B per internal token-head (plus three state blocks on the segmented route), against
     4488 at head (passes above four buy nothing).
@@ -368,7 +384,10 @@ class Plan:
     programs; the pair-shaped programs cover two chunks per CTA); ``R = 64 * NC_pad`` is the internal row count.
     ``recur`` is ``"seg"`` (the segmented recurrences, ``P`` segments per document, ``NSEG = num_docs * P``
     pseudo-sequences; ``proportional`` / ``seg_arg`` are the block table's form and the walk programs' segment
-    scalar, :func:`cake_jit.segment_args`) or ``"serial"`` (``P = 1``, ``NSEG = 0``).  ``records[path]`` maps
+    scalar, :func:`cake_jit.segment_args`) or ``"serial"`` (``P = 1``, ``NSEG = 0``); ``gsize`` is the segment
+    group size of the two-level carry where the plan dispatches ``seg_carry_v8`` (:func:`cake_jit.carry_choice`),
+    else 0; ``gate_fused`` whether the GLM intra program writes the gate gradients itself (``glm_intra_v14``: no
+    ``gate_epilogue`` launch, no ``dg_int`` / ``db_int`` buffers).  ``records[path]`` maps
     every stage of the path (:data:`cake_jit.PATHS`; ``light_states`` on the segmented route only) to the registry
     record its ``select_rule`` admits (``None`` for an optional stage the path or route does not launch) and
     ``grids`` every selected record to its launch grids, one per launch of the record by its stage
@@ -388,6 +407,8 @@ class Plan:
     NSEG: int
     proportional: int
     seg_arg: int
+    gsize: int
+    gate_fused: bool
     records: dict[str, dict[str, str | None]]
     grids: dict[str, tuple[tuple[int, int, int], ...]]
 
@@ -431,14 +452,35 @@ class Plan:
         ``write_int``): a record of the path other than the intra program itself binds ``aqk_int`` or ``akk_int``.
         On the saving forward (``"fwd"``) the fused serial recurrence (``fwdh_wy_rows``), the overlap rows' WY and
         pass-2 programs (``wy_fwd_rows``, ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``) and the paired serial rows'
-        WY program and 32-column recurrence (``wy_fwd_rows``, ``fwdh_o_v2_rows``) read the saved token rows instead, so
-        no copy is written there; the forward without a saved set (``"fwd_nosave"``), the 64-column serial rows and the
-        replay keep the internal-row forms and the copies."""
+        WY program and 32-column recurrence (``wy_fwd_rows``, ``fwdh_o_v2_rows``; on ``sm_107a`` the 64-column rows'
+        ``wy_fwd_rows`` / ``fwdh_o_v1_rows`` too) read the saved token rows instead, so no copy is written there; the
+        forward without a saved set (``"fwd_nosave"``), the other architectures' 64-column serial rows and the replay
+        keep the internal-row forms and the copies."""
         return any(
             {"aqk_int", "akk_int"} & set(cake_jit.MODULES[name]["logical"].values())
             for stage, name in self._records(path).items()
             if name is not None and stage != "fwd_intra"
         )
+
+    @property
+    def light_saves_qg(self) -> bool:
+        """Whether the light forward saves the fold's ``qg`` (version 4): the light backward's prep record writes
+        none (``bwd_prep_g8_noqg*``: no ``qg`` among its logical names) and reads the saved tensor instead."""
+        return "qg" not in self._light_prep_logical()
+
+    @property
+    def light_saves_wu(self) -> bool:
+        """Whether the light forward saves the WY representation ``w`` / ``u`` (version 4): the light backward's
+        prep record writes no ``kb`` (``bwd_prep_g8_noqg_nokb``: the paired serial 16-head rows of ``sm_100a`` and
+        the segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head) chains) and neither light
+        path launches a ``wy`` program; the saved tensors feed the recurrence recompute and the adjoint."""
+        return "kb" not in self._light_prep_logical()
+
+    def _light_prep_logical(self) -> set[str]:
+        name = self._records("light")["bwd_prep"]
+        if name is None:
+            raise ValueError("the light path launches no prep record")
+        return set(cake_jit.MODULES[name]["logical"].values())
 
     @property
     def seg_save(self) -> bool:
@@ -492,10 +534,14 @@ class Plan:
         paths) / ``"replay"`` (the checkpoint replay, which keeps the internal ``akk_int`` rows), and their
         ``*_tape`` forms (``save_mode="tape"``: ``h`` and ``v_new`` live in the saved set); the lean layouts
         (:data:`LEAN_MODES`, :class:`KdaArena`) take their ``tail_passes``."""
-        return _layout(self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes)
+        return _layout(
+            self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
+        )
 
     def workspace_bytes(self, mode: str = "bwd", tail_passes: int = 1) -> int:
-        return _mode_bytes(self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes)
+        return _mode_bytes(
+            self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
+        )
 
     def check_arena(self, arena: KdaArena, *, backward: bool = True) -> None:
         """``ValueError`` when ``arena`` cannot serve this plan: a lean arena on a backward row that dispatches the
@@ -548,6 +594,7 @@ class Plan:
                 backward=backward,
                 save_mode=save_mode,
                 arena=arena,
+                gate_fused=self.gate_fused,
             )
         geometries = (
             [self.batch_bound(arena)]
@@ -566,6 +613,7 @@ class Plan:
                 backward=backward,
                 save_mode=save_mode,
                 arena=arena,
+                gate_fused=self.gate_fused,
             )
             for nc_pad, rows, nseg in geometries
         )
@@ -628,7 +676,9 @@ class Plan:
         """The plan of one document group: its own geometry (``batch.NC_pad``; with ``tape`` ``NC_pad_tape``, the
         bound of its views of a whole-problem tape), this plan's records (the whole problem's selection: every
         group runs the same programs), ``P`` segments per document with the non-proportional block table
-        (``NSEG = N * P`` on the segmented route) and the grids of the records' rules at the group's scalars."""
+        (``NSEG = N * P`` on the segmented route), the whole problem's two-level carry group size (its grid at the
+        group's chain count: :func:`cake_jit.carry_grid`) and the grids of the records' rules at the group's
+        scalars."""
         nc_pad = batch.NC_pad_tape if tape else batch.NC_pad
         nseg = self.batch_segments(batch)
         scalars = {
@@ -639,7 +689,9 @@ class Plan:
         }
         grids = {
             name: tuple(
-                cake_jit.launch_grid(name, **scalars, num_segments=nseg, launch=launch)
+                cake_jit.launch_grid(
+                    name, **scalars, num_segments=nseg, launch=launch, gsize=self.gsize
+                )
                 for launch in range(cake_jit.launches(name))
             )
             for name in self.grids
@@ -658,6 +710,8 @@ class Plan:
             NSEG=nseg,
             proportional=0,
             seg_arg=self.P if self.recur == "seg" else self.seg_arg,
+            gsize=self.gsize,
+            gate_fused=self.gate_fused,
             records=self.records,
             grids=grids,
         )
@@ -721,6 +775,20 @@ def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) 
         )
         for name in names
     }
+    # the two-level carry's group size where a path dispatches it (its host rule accepted the problem: the rule
+    # of the record and its grid rule are the same function)
+    gsize = 0
+    for name in names:
+        rule = cake_jit.MODULES[name]["grid_rule"]
+        if rule["kind"] == "carry_groups":
+            choice = cake_jit.carry_choice(
+                num_docs, H, sm_count, num_segments, int(rule["s_hops"])
+            )
+            if choice is None:
+                raise ValueError(
+                    f"plan: record {name} is selected but its carry rule rejects the problem"
+                )
+            gsize = int(choice[0])
     return Plan(
         S=S,
         N=num_docs,
@@ -735,13 +803,54 @@ def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) 
         NSEG=num_segments,
         proportional=proportional,
         seg_arg=seg_arg,
+        gsize=gsize,
+        gate_fused=records["light"]["gate_epilogue"] is None,
         records=records,
         grids=grids,
     )
 
 
+def _gate_fused(arch: str | None) -> bool:
+    """Whether ``arch``'s GLM intra program writes the gate gradients itself (no ``gate_epilogue`` record admits
+    its rows; the layouts then carry no ``dg_int`` / ``db_int``).  ``arch=None`` (a byte query without an exported
+    device at hand) takes the first exported architecture's records, as :func:`plan` does."""
+    arch = cake_jit.ARCHES[0] if arch is None else arch
+    return (
+        cake_jit.select_record(
+            "gate_epilogue",
+            num_chunks_pad=2,
+            num_seqs=1,
+            num_heads=1,
+            sm_count=1,
+            arch=arch,
+            path="light",
+        )
+        is None
+    )
+
+
+def _light_prep_saves(
+    num_chunks_pad: int, num_docs: int, H: int, sm_count: int, arch: str | None
+) -> tuple[bool, bool]:
+    """``(qg, w / u)``: the per-call tensors the light forward of the problem saves (version 4), read off the light
+    backward's prep record as :attr:`Plan.light_saves_qg` / :attr:`Plan.light_saves_wu` do; ``arch=None`` takes
+    the first exported architecture's records."""
+    arch = cake_jit.ARCHES[0] if arch is None else arch
+    name = cake_jit.select_record(
+        "bwd_prep",
+        num_chunks_pad=num_chunks_pad,
+        num_seqs=num_docs,
+        num_heads=H,
+        sm_count=sm_count,
+        arch=arch,
+        path="light",
+    )
+    logical = set(cake_jit.MODULES[name]["logical"].values())
+    return "qg" not in logical, "kb" not in logical
+
+
 def seg_states_saved(S: int, NSEG: int) -> bool:
-    """Whether ``save_mode="light"`` (saved set version 3) saves the segment-boundary states: the segmented route is
+    """Whether ``save_mode="light"`` (saved set version 4) saves the segment-boundary states: the segmented route is
     dispatched (``NSEG > 0``) and ``S >= SEG_SAVE_MIN_TOKENS_PER_SEG * NSEG``, i.e. the three FP32 state blocks
     (``3 * NSEG * H * 64 KiB``: ``hseg`` and the ``seg_state`` pair) are no larger than the ``Aqk`` / ``Akk`` set
     (``2 * S * H * 256 B``).  Shorter packs keep the token-row set and the backward recomputes the states in its
@@ -866,7 +975,7 @@ Occupant = tuple[str, str, int, tuple[int, int]]
 # [3, 3] + hseg (the carried states) [3, 3] after akk_int [1, 2]; backward seg_b [3, 3], seg_m [3, 5] (the
 # transfers are read again by dhu's reverse carry at 5), hseg [3, 3], then dseg (the reverse offsets) on seg_b's
 # block and dhseg (the carried adjoint states) on hseg's block at [5, 5], between kb [1, 2] and dAkk [6, 7]: three
-# state blocks in either mode.  From a version-3 saved set carrying the states (light, S >= 384 * NSEG) the
+# state blocks in either mode.  From a version-4 saved set carrying the states (light, S >= 384 * NSEG) the
 # backward's seg_b / seg_m / hseg blocks stay unused: the states come from the set; the layouts are unchanged.
 FWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("gk", "F32", 0, (1, 3)),),
@@ -920,7 +1029,7 @@ BWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
 # which also writes
 # u).  On the segmented route the forward's seg_state is per-call too (its transfer half is the saved seg_m, read
 # by dhu's carry); the arena's seg_b / seg_m / hseg serve only the replay path (which recomputes fwd_h).
-# save_mode="light" (version 3): the forward with save_for_backward writes seg_state and hseg into per-call saved
+# save_mode="light" (version 4): the forward with save_for_backward writes seg_state and hseg into per-call saved
 # tensors as well when S >= 384 * NSEG (seg_states_saved), so the backward from that set runs fwd_h pass 2 alone;
 # the arena's blocks then serve the replay path, the forward without save_for_backward and every shorter pack.
 FWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
@@ -1001,6 +1110,9 @@ _PASS_OCCUPANTS: tuple[Occupant, ...] = (
     ("dg_int", "F32p", 0, (7, 8)),
     ("db_int", "V32p", 0, (7, 8)),
 )
+# the gate epilogue's inputs (GLM intra's per-row gate gradients); absent from the layouts of the architectures
+# whose GLM intra program writes the token-row dg / dbeta itself (``glm_intra_v14``, no gate_epilogue launch)
+_GATE_BUFFERS = ("dg_int", "db_int")
 # the segmented route's backward state blocks (as in BWD_SLOTS: offsets / transfers / carried states, then the
 # reverse offsets and carried adjoint states on the first and third block)
 _SEG_BLOCKS_BWD: tuple[Occupant, ...] = (
@@ -1140,9 +1252,23 @@ def _kind_bytes(
 
 @functools.cache
 def _layout(
-    R: int, H: int, NC: int, NSEG: int, mode: str, tail_passes: int = 1
+    R: int,
+    H: int,
+    NC: int,
+    NSEG: int,
+    mode: str,
+    tail_passes: int = 1,
+    gate_fused: bool = False,
 ) -> tuple[Region, ...]:
     slots = _slots_of(mode, tail_passes, R, H, NC, NSEG)
+    if gate_fused:  # no gate epilogue: its input buffers leave the layout (an emptied slot leaves too)
+        slots = tuple(
+            kept
+            for kept in (
+                tuple(o for o in slot if o[0] not in _GATE_BUFFERS) for slot in slots
+            )
+            if kept
+        )
     block = (
         NSEG * H * D * D * 4
     )  # one fp32 [NSEG, H, 128, 128] state block of the segmented route
@@ -1247,11 +1373,20 @@ def _num_segments(num_docs: int, H: int, sm_count: int, arch: str | None) -> int
 
 
 def _mode_bytes(
-    R: int, H: int, NC_pad: int, NSEG: int, mode: str, tail_passes: int = 1
+    R: int,
+    H: int,
+    NC_pad: int,
+    NSEG: int,
+    mode: str,
+    tail_passes: int = 1,
+    gate_fused: bool = False,
 ) -> int:
     """The bytes of one arena layout (:data:`MODES` or :data:`LEAN_MODES`)."""
     return max(
-        (r.offset + r.nbytes for r in _layout(R, H, NC_pad, NSEG, mode, tail_passes)),
+        (
+            r.offset + r.nbytes
+            for r in _layout(R, H, NC_pad, NSEG, mode, tail_passes, gate_fused)
+        ),
         default=0,
     )
 
@@ -1265,14 +1400,17 @@ def _arena_bytes(
     backward: bool,
     save_mode: str,
     arena: KdaArena | None = None,
+    gate_fused: bool = False,
 ) -> int:
     """The arena a :class:`KdaWorkspace` of the problem allocates: the larger of the saved-set and the replay
     layouts for a backward workspace (both paths run in it), the forward layout otherwise; the ``*_tape`` layouts
     under ``save_mode="tape"``; under a lean ``arena`` (:class:`KdaArena`) the lean layout of its ``tail_passes``
-    alone (a lean workspace serves no replay)."""
+    alone (a lean workspace serves no replay); ``gate_fused`` drops the gate epilogue's buffers."""
     tape = save_mode == "tape"
     if not backward:
-        return _mode_bytes(R, H, NC_pad, NSEG, "fwd_tape" if tape else "fwd")
+        return _mode_bytes(
+            R, H, NC_pad, NSEG, "fwd_tape" if tape else "fwd", 1, gate_fused
+        )
     if arena is not None and arena.lean:
         return _mode_bytes(
             R,
@@ -1281,9 +1419,10 @@ def _arena_bytes(
             NSEG,
             "bwd_tape_lean" if tape else "bwd_lean",
             arena.tail_passes,
+            gate_fused,
         )
     modes = ("bwd_tape", "replay_tape") if tape else ("bwd", "replay")
-    return max(_mode_bytes(R, H, NC_pad, NSEG, mode) for mode in modes)
+    return max(_mode_bytes(R, H, NC_pad, NSEG, mode, 1, gate_fused) for mode in modes)
 
 
 def workspace_bytes(
@@ -1319,7 +1458,14 @@ def workspace_bytes(
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     nseg = _num_segments(num_docs, H, sms, arch)
     return _arena_bytes(
-        rows, H, nc_pad, nseg, backward=backward, save_mode=save_mode, arena=arena
+        rows,
+        H,
+        nc_pad,
+        nseg,
+        backward=backward,
+        save_mode=save_mode,
+        arena=arena,
+        gate_fused=_gate_fused(arch),
     )
 
 
@@ -1353,13 +1499,17 @@ def saved_bytes(
     arch: str | None = None,
 ) -> int:
     """Bytes of the saved set: ``Aqk`` + ``Akk`` BF16 ``[S, H, 64]`` (``256 * S * H``), plus, when ``num_docs``
-    is given, the tables and, for ``save_mode="light"`` (version 3) on the segmented route when ``S >= 384 * NSEG``
-    (:func:`seg_states_saved`), the forward's segment-boundary states ``hseg`` FP32 ``[NSEG, H, 128, 128]`` and
-    ``seg_state`` FP32 ``[2, NSEG, H, 128, 128]`` (three state blocks of ``NSEG * H * 64 KiB``; the segment count
-    needs ``num_docs`` and ``sm_count`` / ``arch``, :func:`_arch_sms`).  ``save_mode="tape"`` adds the
-    internal-layout ``h`` BF16 ``[NC_pad, H,
-    128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` and, on the segmented route, the forward's segment states FP32
-    ``[2, NSEG, H, 128, 128]`` whose transfer half is the saved ``seg_m`` (``num_docs`` required)."""
+    is given, the tables and, for ``save_mode="light"`` (version 4), the fold's ``qg`` BF16 ``[R, H, 128]`` (the
+    internal rows ``R = 64 * NC_pad``), on the segmented route when ``S >= 384 * NSEG`` (:func:`seg_states_saved`)
+    the forward's segment-boundary states ``hseg`` FP32 ``[NSEG, H, 128, 128]`` and ``seg_state`` FP32 ``[2, NSEG,
+    H, 128, 128]`` (three state blocks of ``NSEG * H * 64 KiB``; the segment count needs ``num_docs`` and
+    ``sm_count`` / ``arch``, :func:`_arch_sms`) and, on the rows whose light backward reads the WY representation
+    from the set (the paired serial 16-head rows of ``sm_100a`` and the segmented 16-head rows of ``sm_103a`` /
+    ``sm_107a`` above 32 (document, head) chains; ``arch=None`` takes the first exported architecture's records),
+    ``w`` / ``u`` BF16 ``[R, H, 128]``.  ``save_mode="tape"`` adds the internal-layout
+    ``h`` BF16 ``[NC_pad, H, 128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` and, on the segmented route, the forward's
+    segment states FP32 ``[2, NSEG, H, 128, 128]`` whose transfer half is the saved ``seg_m`` (``num_docs``
+    required) instead."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"saved_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -1374,12 +1524,19 @@ def saved_bytes(
     arch, sms = _arch_sms(sm_count, arch)
     num_segments = _num_segments(num_docs, H, sms, arch)
     total += tables_bytes(S, num_docs, H, sm_count=sms, arch=arch)
+    _nc_max, nc_pad, rows = _geometry(S, num_docs)
     if save_mode == "tape":
-        _nc_max, nc_pad, rows = _geometry(S, num_docs)
         total += nc_pad * H * D * D * 2 + rows * H * D * 2
         total += 2 * num_segments * H * D * D * 4
-    elif seg_states_saved(S, num_segments):
-        # light (version 3): the segment-boundary states when the size rule holds
+        return total
+    # light (version 4): the fold's qg, the segment-boundary states when the size rule holds, and w / u on the
+    # rows whose light backward reads them from the set
+    saves_qg, saves_wu = _light_prep_saves(nc_pad, num_docs, H, sms, arch)
+    if saves_qg:
+        total += rows * H * D * 2
+    if saves_wu:
+        total += 2 * rows * H * D * 2
+    if seg_states_saved(S, num_segments):
         total += 3 * num_segments * H * D * D * 4
     return total
 
@@ -1393,14 +1550,19 @@ def output_bytes(S: int, H: int, *, backward: bool) -> int:
 
 
 def lifetime_table(
-    mode: str = "bwd", tail_passes: int = 1, *, plan: Plan | None = None
+    mode: str = "bwd",
+    tail_passes: int = 1,
+    *,
+    plan: Plan | None = None,
+    gate_fused: bool | None = None,
 ) -> list[dict[str, Any]]:
     """The layout as rows ``{slot, buffer, kind, unit, ..., first_write, last_read}``: token kinds in bytes per
     internal token-head (a tape entry of 32768 B per chunk-head spreads over the chunk's 64 rows), the segmented
     route's state blocks (``unit="seg_block"``) in bytes per (segment, head), present only when the plan
     dispatches that route.  The lean layouts (:data:`LEAN_MODES`) take ``tail_passes``; from two passes on their
     per-pass buffers (``unit="R_b*H"``: bytes per internal token-head of one tail range) are packed by the
-    problem's geometry, so a ``plan`` is required there."""
+    problem's geometry, so a ``plan`` is required there.  ``gate_fused`` (``None``: the plan's, else ``False``)
+    drops the gate epilogue's ``dg_int`` / ``db_int`` (the architectures whose GLM intra program fuses it)."""
     if mode in LEAN_MODES and tail_passes > 1:
         if plan is None:
             raise ValueError(
@@ -1410,6 +1572,16 @@ def lifetime_table(
         slots = _slots_of(mode, tail_passes, plan.R, plan.H, plan.NC_pad, plan.NSEG)
     else:
         slots = _slots_of(mode, tail_passes, 0, 1, 0, 0)
+    if gate_fused is None:
+        gate_fused = plan.gate_fused if plan is not None else False
+    if gate_fused:
+        slots = tuple(
+            kept
+            for kept in (
+                tuple(o for o in slot if o[0] not in _GATE_BUFFERS) for slot in slots
+            )
+            if kept
+        )
     rows: list[dict[str, Any]] = []
     for slot, occupants in enumerate(slots):
         for name, kind, sub, life in occupants:
@@ -1486,14 +1658,21 @@ def memory_report(
         p.check_arena(arena)
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sms, arch)
+    gf = _gate_fused(arch)
     arena_fwd = _arena_bytes(
-        rows, H, nc_pad, num_segments, backward=False, save_mode=save_mode
+        rows,
+        H,
+        nc_pad,
+        num_segments,
+        backward=False,
+        save_mode=save_mode,
+        gate_fused=gf,
     )
     arena_saved = _mode_bytes(
-        rows, H, nc_pad, num_segments, "bwd_tape" if tape else "bwd"
+        rows, H, nc_pad, num_segments, "bwd_tape" if tape else "bwd", 1, gf
     )
     arena_replay = _mode_bytes(
-        rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay"
+        rows, H, nc_pad, num_segments, "replay_tape" if tape else "replay", 1, gf
     )
     arena_bwd = max(arena_saved, arena_replay)
     if arena.batched:
@@ -1512,6 +1691,7 @@ def memory_report(
             backward=True,
             save_mode=save_mode,
             arena=arena,
+            gate_fused=gf,
         )
         arena_fwd_conf = arena_fwd
     block = num_segments * H * D * D * 4
@@ -1529,6 +1709,7 @@ def memory_report(
             backward=True,
             save_mode=save_mode,
             arena=arena,
+            gate_fused=gf,
         )
         largest = rows_bar
         if doc_lengths is not None:
@@ -1549,7 +1730,7 @@ def memory_report(
     saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
     out_f, out_b = output_bytes(S, H, backward=False), output_bytes(S, H, backward=True)
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
-    # seg_m), light three (hseg and the seg_state pair, version 3) when the size rule holds; none on the serial route.
+    # seg_m), light three (hseg and the seg_state pair, version 4) when the size rule holds; none on the serial route.
     if recur != "seg":
         saved_blocks = 0
     elif tape:
@@ -1560,6 +1741,7 @@ def memory_report(
         "save_mode": save_mode,
         "sm_count": sms,
         "arch": arch,
+        "gate_fused": gf,
         "recur": recur,
         "segments": segments,
         "num_segments": num_segments,
@@ -1626,19 +1808,24 @@ def _alloc(
 class KdaChunkSaved:
     """The forward's saved set.
 
-    Version 3 (``save_mode="light"``, the default): ``Aqk`` / ``Akk`` BF16 ``[S, H, 64]`` on the token rows (row
+    Version 4 (``save_mode="light"``, the default): ``Aqk`` / ``Akk`` BF16 ``[S, H, 64]`` on the token rows (row
     ``t`` holds the 64 chunk-local columns of its chunk; zeros above the diagonal and past the chunk end), the
     device tables ``(chunk_bos, chunk_len, seq_chunk_start, seq_order[, seg_table])``, views of one int32
-    buffer (``None`` when the caller dropped them: the backward rebuilds them) and, on the segmented route when
-    ``S >= 384 * NSEG`` (:func:`seg_states_saved`), the forward's segment-boundary states ``hseg`` FP32
-    ``[NSEG, H, 128, 128]`` (the carried initial state of every segment) and ``seg_state`` FP32
+    buffer (``None`` when the caller dropped them: the backward rebuilds them), the fold's ``qg`` BF16 ``[R, H,
+    128]`` (internal layout; the light backward's prep writes none and its adjoint reads this one), on the
+    segmented route when ``S >= 384 * NSEG`` (:func:`seg_states_saved`) the forward's segment-boundary states
+    ``hseg`` FP32 ``[NSEG, H, 128, 128]`` (the carried initial state of every segment) and ``seg_state`` FP32
     ``[2, NSEG, H, 128, 128]`` (``[0]`` the segment offsets, ``[1]`` the transfers the backward's reverse carry
-    reads): the backward's recurrence recompute is then pass 2 alone.  Both are ``None`` on the serial route and
-    for shorter packs (the backward recomputes them).  Version 2 (``save_mode="tape"``) adds the forward's ``h``
-    tape BF16 ``[NC_pad, H, 128, 128]``, ``v_new`` BF16 ``[R, H, 128]`` (internal layout, pad rows zero) and, on
-    the segmented route, ``seg_m`` FP32 ``[NSEG, H, 128, 128]`` (``None`` on the serial route) instead.  Version 1
-    (the light set without the states) is no longer produced or accepted.  ``S``, ``H``, ``num_docs`` and
-    ``scale`` identify the problem.
+    reads): the backward's recurrence recompute is then pass 2 alone (both ``None`` on the serial route and for
+    shorter packs, which the backward recomputes), and on the rows whose light backward reads the WY
+    representation from the set (:attr:`Plan.light_saves_wu`: the paired serial 16-head rows of ``sm_100a`` and
+    the segmented 16-head rows of ``sm_103a`` / ``sm_107a`` above 32 (document, head) chains) the forward's ``w``
+    / ``u`` BF16 ``[R, H, 128]`` (``None`` elsewhere: the backward's ``wy`` program recomputes
+    them).  Version 2 (``save_mode="tape"``) adds the forward's ``h`` tape BF16 ``[NC_pad, H, 128, 128]``,
+    ``v_new`` BF16 ``[R, H, 128]`` (internal layout, pad rows zero) and, on the segmented route, ``seg_m`` FP32
+    ``[NSEG, H, 128, 128]`` (``None`` on the serial route) instead, and no ``qg`` / ``w`` / ``u`` (its prep writes
+    them).  Versions 1 and 3 (the light sets without ``qg``) are no longer produced or accepted.  ``S``, ``H``,
+    ``num_docs`` and ``scale`` identify the problem.
     """
 
     version: int
@@ -1652,10 +1839,15 @@ class KdaChunkSaved:
     h: torch.Tensor | None = None
     v_new: torch.Tensor | None = None
     seg_m: torch.Tensor | None = None
-    # version 3 on the segmented route when S >= 384 * NSEG, else None: the carried states FP32
+    # version 4 on the segmented route when S >= 384 * NSEG, else None: the carried states FP32
     # [NSEG, H, 128, 128] and the kernels' seg_state FP32 [2, NSEG, H, 128, 128] (offsets, transfers)
     hseg: torch.Tensor | None = None
     seg_state: torch.Tensor | None = None
+    # version 4: the fold's qg BF16 [R, H, 128]; w / u BF16 [R, H, 128] on the rows whose light backward reads
+    # the WY representation from the set, else None
+    qg: torch.Tensor | None = None
+    w: torch.Tensor | None = None
+    u: torch.Tensor | None = None
 
 
 def _device_index(device: torch.device) -> int:
@@ -1798,14 +1990,16 @@ class KdaWorkspace:
 
     @property
     def flags(self) -> torch.Tensor:
-        """The release flags of the forward's carry || pass-2 overlap (``seg_carry_ov`` / ``fwdh_p3_o_ov*``): the
-        ``uint32`` view of :attr:`eye` (16384 words; the pair uses ``2 * NSEG * H`` of them, one per segment, head
-        and carry half, each stamped with the launch's epoch)."""
+        """The release flags of the forward's carry || pass-2 overlap (``seg_carry_ov`` / ``fwdh_p3_o_ov*``) and of
+        the two-level carry (``seg_carry_v8``): the ``uint32`` view of :attr:`eye` (16384 words; the pair uses
+        ``2 * NSEG * H`` of them, one per segment, head and carry half, the two-level carry
+        :func:`cake_jit.flag_words` of its grid, each stamped with the launch's epoch)."""
         return self.eye.view(torch.uint32)
 
     def next_epoch(self) -> int:
-        """The epoch of the next carry launch under the overlap pair (1, 2, ...): never repeats on this arena, so a
-        flag left by an earlier launch can never equal the epoch a pass-2 CTA waits for."""
+        """The epoch of the next carry launch under the overlap pair or the two-level carry (1, 2, ...): never
+        repeats on this arena, so a flag left by an earlier launch can never equal the epoch a waiting CTA
+        expects."""
         self._epoch[0] += 1
         return self._epoch[0]
 
@@ -2263,7 +2457,7 @@ def _forward_recurrence(
     output, the saved-state backward's of the rows with at most 32 (document, head) chains the WY representation
     and the transposed ``w`` tile).  ``seg_state`` and ``hseg`` are the arena's blocks or per-call tensors (the light forward above the
     size rule saves both, the tape forward saves ``seg_state``'s transfer half).  On the ``light_states`` path
-    (the backward from a version-3 saved set carrying the states) only pass 2 runs, from the saved ``hseg``; pass
+    (the backward from a version-4 saved set carrying the states) only pass 2 runs, from the saved ``hseg``; pass
     2 never writes ``seg_state`` (``write_ht = 0``).  ``write_tapes`` is 1 where the ``h`` / ``v_new`` tapes are
     needed (the backward, the tape forward).  On the forward's segmented rows whose pass-2 grid is at least 3.0
     waves of the device on ``sm_100a`` / ``sm_103a`` (2.3 on ``sm_107a``) the carry and pass 2 are the overlap pair
@@ -2272,7 +2466,8 @@ def _forward_recurrence(
     waits on the carry's per-segment release flags instead of the stream order.  The saving forward's fused serial
     recurrence is ``fwdh_wy_rows`` (the saved ``Akk`` / ``Aqk`` token rows), the other forward's ``fwdh_wy``; below
     the fused threshold its 32-column fused-output recurrence is ``fwdh_o_v2_rows`` (the saved ``Aqk`` rows), the
-    other forward's ``fwdh_o_v2`` (the 64-column form keeps ``fwdh_o_v1`` on both)."""
+    other forward's ``fwdh_o_v2``; the 64-column form is ``fwdh_o_v1_rows`` on the saving forward of ``sm_107a`` and
+    ``fwdh_o_v1`` otherwise."""
     p = ws.plan
     if p.recur != "seg":
         ws.run("fwdh", {**values, "write_tapes": int(write_tapes)}, path=path)
@@ -2303,6 +2498,8 @@ def _forward_recurrence(
             # carry runs and spins on its segment's two flags before reading h0.  Both launches read the epoch.
             passes["epoch"] = carry["epoch"] = ws.next_epoch()
             carry["flags"] = ws.flags
+        elif _two_level(ws, path):
+            carry.update(_two_level_operands(ws, path, hseg))
         ws.run("seg_carry", carry, path=path)
     ws.run(
         "fwdh_p3",
@@ -2333,23 +2530,48 @@ def _adjoint_recurrence(
         path=path,
         launch=0,
     )
-    ws.run(
-        "seg_carry",
-        {
-            **values,
-            "seg_m": seg_m,
-            "carry_b": views.dseg,
-            "carry_out": views.dhseg,
-            "reverse": 1,
-        },
-        path=path,
-    )
+    carry = {
+        **values,
+        "seg_m": seg_m,
+        "carry_b": views.dseg,
+        "carry_out": views.dhseg,
+        "reverse": 1,
+    }
+    if _two_level(ws, path):
+        carry.update(_two_level_operands(ws, path, views.dhseg))
+    ws.run("seg_carry", carry, path=path)
     ws.run(
         "dhu",
         {**passes, "use_dht": 1, "write_tapes": 1, "write_ht": 0},
         path=path,
         launch=1,
     )
+
+
+def _two_level(ws: KdaWorkspace, path: str) -> bool:
+    """Whether ``path``'s carry record is the two-level carry (its grid rule is ``carry_groups``)."""
+    name = ws.plan.record("seg_carry", path)
+    return cake_jit.MODULES[name]["grid_rule"]["kind"] == "carry_groups"
+
+
+def _two_level_operands(
+    ws: KdaWorkspace, path: str, carry_out: torch.Tensor
+) -> dict[str, Any]:
+    """The two-level carry's operands beyond the chain carry's: the carried states viewed as ``[NSEG * H, 128,
+    128]`` tiles (the groups' products ride in them), the plan's segment group size, the release flags under a
+    fresh epoch (the words a launch of the plan's grid touches must fit the flag buffer)."""
+    grid = ws.plan.grid("seg_carry", path)[0]
+    words = cake_jit.flag_words(grid)
+    if words > ws.flags.numel():
+        raise ValueError(
+            f"the two-level carry's {grid} CTAs touch {words} flag words; the flag buffer has {ws.flags.numel()}"
+        )
+    return {
+        "carry_out_tiles": carry_out.view(-1, D, D),
+        "gsize": ws.plan.gsize,
+        "flags": ws.flags,
+        "epoch": ws.next_epoch(),
+    }
 
 
 def _tail_ranges(NC_pad: int, passes: int) -> tuple[tuple[int, int], ...]:
@@ -2370,7 +2592,7 @@ def _tail_passes(
     path: str,
     h: torch.Tensor,
 ) -> None:
-    """Steps 6-8 of the backward (the fused gradient, GLM intra, the gate epilogue) once per tail range
+    """Steps 6-8 of the backward (the fused gradient, GLM intra and, where it launches, the gate epilogue) once per tail range
     (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1``.  Per range: the whole-sequence arena
     buffers (``gk``, ``v_new``, ``dv2``, ``beta_int``, the ``h`` / ``dh`` tapes) as leading-axis views offset by the
     range's first chunk, the chunk tables as the range's slices, ``seq_chunk_start`` as the one-entry count of the
@@ -2403,6 +2625,8 @@ def _tail_passes(
             "num_chunks_pad": length,
         }
         for stage in ("dqkg", "glm_intra", "gate_epilogue"):
+            if not p.dispatched(stage, path):
+                continue  # the fused GLM intra program writes dg / dbeta itself
             grid = cake_jit.launch_grid(
                 p.record(stage, path),
                 num_chunks_pad=length,
@@ -2412,6 +2636,29 @@ def _tail_passes(
                 num_segments=p.NSEG,
             )
             ws.run(stage, pass_values, path=path, grid=grid)
+
+
+def _saved_rows(
+    values: dict[str, Any],
+    p: Plan,
+    *,
+    qg: torch.Tensor | None,
+    w: torch.Tensor | None,
+    u: torch.Tensor | None,
+) -> None:
+    """Point the call's ``qg`` / ``w`` / ``u`` (and the transposed views of ``w``) at the version-4 saved
+    tensors where given."""
+    if qg is not None:
+        values["qg"] = qg
+    if w is not None or u is not None:
+        if w is None or u is None:
+            raise ValueError("the saved w and u come together")
+        values.update(
+            w=w,
+            u=u,
+            w_t=w.view(p.NC_pad, p.H, D, BT),
+            w_tk=w.view(p.NC_pad * D, p.H, BT),
+        )
 
 
 def _forward_launches(
@@ -2436,10 +2683,15 @@ def _forward_launches(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
+    qg: torch.Tensor | None = None,
+    w: torch.Tensor | None = None,
+    u: torch.Tensor | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
-    GLM prep folded in), WY where the plan dispatches it, the state recurrence."""
+    GLM prep folded in), WY where the plan dispatches it, the state recurrence.  ``qg`` / ``w`` / ``u`` are the
+    light saving forward's per-call tensors (version 4): the same writes as into the arena's slots, another
+    destination, and every consumer of the call reads them there."""
     p = ws.plan
     values = _values(
         ws,
@@ -2459,6 +2711,7 @@ def _forward_launches(
         out=out,
         scale=scale,
     )
+    _saved_rows(values, p, qg=qg, w=w, u=u)
     _fwd_intra(
         ws,
         values,
@@ -2490,10 +2743,12 @@ def chunk_kda_fwd(
     doc_lengths: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, KdaChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
-    ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` on the segmented route
-    when ``S >= 384 * NSEG``, the fresh segment-boundary states ``hseg`` / ``seg_state`` the recurrence writes
-    (version 3; shorter packs save neither and the backward recomputes them); with ``save_mode="tape"`` the fresh
-    ``h`` tape, ``v_new`` and the segment transfers instead).
+    ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` (version 4), the
+    fold's fresh ``qg``, on the segmented route when ``S >= 384 * NSEG`` the fresh segment-boundary states ``hseg``
+    / ``seg_state`` the recurrence writes (shorter packs save neither and the backward recomputes them) and, on the
+    rows whose light backward reads the WY representation from the set (:attr:`Plan.light_saves_wu`), the fresh
+    ``w`` / ``u``; with ``save_mode="tape"`` the fresh ``h`` tape, ``v_new`` and the segment transfers instead).
+    The per-call tensors replace arena slots as the destinations of the same writes: no launch is added.
 
     Launches (``Plan.launch_count("fwd")``): the table where the plan dispatches one, the intra-chunk program
     (which also writes the GLM prep's outputs), then on the serial route the state recurrence (which forms the
@@ -2546,7 +2801,7 @@ def chunk_kda_fwd(
     tape_ws = (not tape) and ws.save_mode == "tape"
     mode = "fwd_tape" if (tape or tape_ws) else "fwd"
     seg = p.recur == "seg"
-    # light (version 3): the segment-boundary states become per-call saved tensors when the size rule holds
+    # light (version 4): the segment-boundary states become per-call saved tensors when the size rule holds
     save_states = seg and save_for_backward and not tape and p.seg_save
     groups = ws.batches(doc_lengths)
     path = "fwd" if save_for_backward else "fwd_nosave"
@@ -2564,6 +2819,17 @@ def chunk_kda_fwd(
     if tape or tape_ws:
         h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
         v_new = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+    # light (version 4): the fold's qg goes to a per-call saved tensor (the light backward's prep writes none),
+    # and w / u too on the rows whose light backward reads the WY representation from the set (no wy launch there)
+    light = save_for_backward and not tape
+    qg_saved = w_saved = u_saved = None
+    if light and p.light_saves_qg:
+        qg_saved = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+    if light and p.light_saves_wu:
+        w_saved = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+        u_saved = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+    # the groups' views of whole-problem row tensors (the tape, the saved qg / w / u) take the tape geometry
+    row_slices = tape or qg_saved is not None or w_saved is not None
     seg_state = hseg = seg_m = None
     if save_states:
         seg_state = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
@@ -2602,11 +2868,14 @@ def chunk_kda_fwd(
             hseg=(a.hseg if hseg is None else hseg) if seg else None,
             aqk_ext=a.aqk_int if aqk_ext is None else aqk_ext,
             akk_ext=a.aqk_int if akk_ext is None else akk_ext,
+            qg=qg_saved,
+            w=w_saved,
+            u=u_saved,
             **common,
         )
     else:
         batches, lengths = groups
-        views_b = [(batch, ws.batch_view(batch, tape=tape)) for batch in batches]
+        views_b = [(batch, ws.batch_view(batch, tape=row_slices)) for batch in batches]
         for _batch, ws_b in views_b:
             ws_b.views(
                 mode
@@ -2633,6 +2902,8 @@ def chunk_kda_fwd(
                 v_new_b = _alloc((pb.R, H, D), torch.bfloat16, ws.device)
             else:
                 h_b, v_new_b = a.h, a.v_new
+            # the group's slices of the whole problem's saved rows (the tape geometry: they end inside it)
+            rows_b = slice(BT * batch.c0, BT * (batch.c0 + pb.NC_pad))
             _forward_launches(
                 ws_b,
                 a,
@@ -2644,6 +2915,9 @@ def chunk_kda_fwd(
                 hseg=a.hseg if seg else None,
                 aqk_ext=a.aqk_int if aqk_ext is None else aqk_ext,
                 akk_ext=a.aqk_int if akk_ext is None else akk_ext,
+                qg=None if qg_saved is None else qg_saved[rows_b],
+                w=None if w_saved is None else w_saved[rows_b],
+                u=None if u_saved is None else u_saved[rows_b],
                 **common,
             )
             if (
@@ -2683,6 +2957,9 @@ def chunk_kda_fwd(
                 float(scale),
                 hseg=hseg,
                 seg_state=seg_state,
+                qg=qg_saved,
+                w=w_saved,
+                u=u_saved,
             )
     return _ranked(out, batched), saved
 
@@ -2715,12 +2992,15 @@ def _backward_launches(
     dg: torch.Tensor,
     dbeta: torch.Tensor,
     scale: float,
+    qg: torch.Tensor | None = None,
+    w: torch.Tensor | None = None,
+    u: torch.Tensor | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
-    ``cu_seqlens`` slice, its tables, its tape slices and its gathered states; the token tensors, the saved
-    ``Aqk`` / ``Akk`` and the gradients always whole): the replay's intra recompute, the prep, WY, the recurrence
-    recompute, dA / dv, the adjoint recurrence and the tail (once, or per range of a lean workspace's
-    ``tail_passes``), each where the path and the plan dispatch it."""
+    ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u`` and its
+    gathered states; the token tensors, the saved ``Aqk`` / ``Akk`` and the gradients always whole): the replay's
+    intra recompute, the prep, WY, the recurrence recompute, dA / dv, the adjoint recurrence and the tail (once,
+    or per range of a lean workspace's ``tail_passes``), each where the path and the plan dispatch it."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -2750,6 +3030,7 @@ def _backward_launches(
         dbeta=dbeta,
         scale=scale,
     )
+    _saved_rows(values, p, qg=qg, w=w, u=u)
 
     # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
     # the replay prep's; the token-row pointers are unused, write_ext = 0): before the prep where the intra program
@@ -2784,7 +3065,7 @@ def _backward_launches(
     if p.dispatched("dav", path):
         ws.run("dav", values, path=path)
     # the segmented dhu's reverse carry reads the forward's transfers: the saved seg_m (tape), the saved
-    # seg_state[1] (version 3 with the states) or the recompute's (the arena's seg_state[1])
+    # seg_state[1] (version 4 with the states) or the recompute's (the arena's seg_state[1])
     transfers = None
     if p.recur == "seg":
         transfers = (seg_m if tape else seg_state[1]).view(-1, D, D)
@@ -2792,7 +3073,10 @@ def _backward_launches(
     if ws.arena_option.tail_passes == 1:
         ws.run("dqkg", values, path=path)
         ws.run("glm_intra", values, path=path)
-        ws.run("gate_epilogue", values, path=path)
+        if p.dispatched(
+            "gate_epilogue", path
+        ):  # not on the fused GLM intra program's architectures
+            ws.run("gate_epilogue", values, path=path)
     else:
         _tail_passes(ws, b, values, tables, path=path, h=h)
 
@@ -2814,16 +3098,17 @@ def chunk_kda_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs.
 
-    The path (:data:`cake_jit.PATHS`) follows from ``saved``: ``light`` from a version-3 set without the
+    The path (:data:`cake_jit.PATHS`) follows from ``saved``: ``light`` from a version-4 set without the
     segment-boundary states (every serial problem; a segmented short pack: the full recurrence recompute),
-    ``light_states`` from a version-3 set carrying them (the segmented recurrence as pass 2 alone from the saved
-    ``hseg``, the adjoint carry reading the saved ``seg_state[1]``), ``tape`` from a version-2 set (no recurrence
+    ``light_states`` from a version-4 set carrying them (the segmented recurrence as pass 2 alone from the saved
+    ``hseg``, the adjoint carry reading the saved ``seg_state[1]``; both light paths read the saved ``qg``, and
+    the rows whose set carries ``w`` / ``u`` launch no ``wy`` program), ``tape`` from a version-2 set (no recurrence
     recompute: dA / dv and the fused gradient read the saved ``h`` / ``v_new``, the segmented carry the saved
     ``seg_m``), ``replay`` with ``saved=None`` (the checkpoint replay: the table where the plan dispatches one,
     the prep and the intra program recompute the internal rows first; on the segmented rows up to 256 documents
     the intra program runs before the prep and writes the tables the prep reads).  The launches are the GLM prep,
     [intra], [WY], [the recurrence recompute], [dA / dv], the
-    adjoint recurrence, the fused dq / dk / dg, GLM intra and the gate epilogue, where the bracketed ones depend
+    adjoint recurrence, the fused dq / dk / dg, GLM intra and [the gate epilogue], where the bracketed ones depend
     on the path and the row (``Plan.launch_count(path)``; the tables are rebuilt when the saved set carries
     none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaWorkspace` with the
     backward layout) is reused; without one a workspace is allocated for this call.  ``arena``
@@ -2883,8 +3168,8 @@ def chunk_kda_bwd(
         if saved.version not in (SAVED_VERSION, SAVED_VERSION_TAPE):
             raise ValueError(
                 f"saved: version {saved.version}, this backend reads versions {SAVED_VERSION} (light) and "
-                f"{SAVED_VERSION_TAPE} (tape); version 1 (the light set without the segment states) is no "
-                "longer accepted"
+                f"{SAVED_VERSION_TAPE} (tape); versions 1 and 3 (the light sets without qg) are no longer "
+                "accepted"
             )
         if (saved.S, saved.H, saved.num_docs) != (S, H, N):
             raise ValueError(
@@ -2914,15 +3199,15 @@ def chunk_kda_bwd(
                     ws.device,
                 )
         elif saved.hseg is not None or saved.seg_state is not None:
-            # a version-3 set carrying the segment-boundary states
+            # a version-4 set carrying the segment-boundary states
             if not seg:
                 raise ValueError(
-                    "saved: a version-3 saved set carries segment-boundary states, but this problem runs the "
+                    "saved: a version-4 saved set carries segment-boundary states, but this problem runs the "
                     "serial recurrence (no segments)"
                 )
             if saved.hseg is None or saved.seg_state is None:
                 raise ValueError(
-                    "saved: a version-3 saved set carries hseg and seg_state together or neither"
+                    "saved: a version-4 saved set carries hseg and seg_state together or neither"
                 )
             _check(
                 saved.hseg, "saved.hseg", (p.NSEG, H, D, D), torch.float32, ws.device
@@ -2934,7 +3219,34 @@ def chunk_kda_bwd(
                 torch.float32,
                 ws.device,
             )
-    # The segmented route's state sources: a version-3 saved set carrying the states (the recurrence as pass 2
+        if not tape:
+            # a version-4 light set: the fold's qg where the light prep writes none; w / u together, exactly on
+            # the rows whose light backward reads them from the set
+            if p.light_saves_qg:
+                if saved.qg is None:
+                    raise ValueError(
+                        "saved: a version-4 light saved set carries the forward's qg (the light backward's prep "
+                        "writes none); this set has none"
+                    )
+                _check(saved.qg, "saved.qg", (p.R, H, D), torch.bfloat16, ws.device)
+            if (saved.w is None) != (saved.u is None):
+                raise ValueError(
+                    "saved: a version-4 saved set carries w and u together or neither"
+                )
+            if (saved.w is not None) != p.light_saves_wu:
+                raise ValueError(
+                    "saved: this problem's light backward "
+                    + (
+                        "reads the WY representation (w / u) from the saved set, which carries none"
+                        if p.light_saves_wu
+                        else "recomputes the WY representation; the saved set carries w / u (another "
+                        "architecture's set?)"
+                    )
+                )
+            if saved.w is not None:
+                _check(saved.w, "saved.w", (p.R, H, D), torch.bfloat16, ws.device)
+                _check(saved.u, "saved.u", (p.R, H, D), torch.bfloat16, ws.device)
+    # The segmented route's state sources: a version-4 saved set carrying the states (the recurrence as pass 2
     # alone) or the arena's blocks (the full recompute: a set without the states, the replay); the tape backward
     # runs no recurrence and its carry reads the saved seg_m.
     light_states = seg and not replay and not tape and saved.hseg is not None
@@ -2945,7 +3257,7 @@ def chunk_kda_bwd(
     else:
         path = "light_states" if light_states else "light"
     # A tape-mode workspace (arena sized for the tape layouts) recomputes h / v_new into per-call buffers
-    # whenever the saved set does not carry them (a version-3 saved set, the replay), as its forward does; a
+    # whenever the saved set does not carry them (a version-4 saved set, the replay), as its forward does; a
     # light one recomputes them inside the arena.  The launch order and the operands are the same.  The replay
     # layouts keep the internal akk_int rows the saved-set paths do without.
     tape_ws = (not tape) and ws.save_mode == "tape"
@@ -2958,6 +3270,11 @@ def chunk_kda_bwd(
     dv = _alloc((S, H, D), torch.bfloat16, ws.device)
     dg = _alloc((S, H, D), torch.float32, ws.device)
     dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+    # the version-4 rows the light paths read from the set (the groups of a batched option take their slices)
+    light_rows = not (replay or tape)
+    qg_saved = saved.qg if light_rows else None
+    w_saved = saved.w if light_rows else None
+    u_saved = saved.u if light_rows else None
     common: dict[str, Any] = {
         "path": path,
         "replay": replay,
@@ -3003,11 +3320,16 @@ def chunk_kda_bwd(
             else None,
             hseg=(saved.hseg if light_states else b.hseg) if seg else None,
             seg_m=saved.seg_m if (tape and seg) else None,
+            qg=qg_saved,
+            w=w_saved,
+            u=u_saved,
             **common,
         )
     else:
         batches, lengths = groups
-        views_b = [(batch, ws.batch_view(batch, tape=tape)) for batch in batches]
+        # the groups' views of whole-problem row tensors (the saved tape, the saved qg / w / u) take the tape geometry
+        row_slices = tape or qg_saved is not None or w_saved is not None
+        views_b = [(batch, ws.batch_view(batch, tape=row_slices)) for batch in batches]
         for _batch, ws_b in views_b:
             ws_b.views(
                 mode
@@ -3046,6 +3368,7 @@ def chunk_kda_bwd(
                 else:
                     seg_state_b = saved.seg_state.index_select(1, index)
                     hseg_b = saved.hseg.index_select(0, index)
+            rows_b = slice(BT * batch.c0, BT * (batch.c0 + pb.NC_pad))
             _backward_launches(
                 ws_b,
                 b,
@@ -3056,6 +3379,9 @@ def chunk_kda_bwd(
                 seg_state=seg_state_b,
                 hseg=hseg_b,
                 seg_m=seg_m_b,
+                qg=None if qg_saved is None else qg_saved[rows_b],
+                w=None if w_saved is None else w_saved[rows_b],
+                u=None if u_saved is None else u_saved[rows_b],
                 **common,
             )
     return tuple(_ranked(x, batched) for x in (dq, dk, dv, dbeta, dg))
@@ -3065,17 +3391,25 @@ def chunk_kda_bwd(
 # autograd
 
 
-# The per-version extra saved tensors ChunkKDAFunction hands to autograd, in this order (absent ones are dropped;
-# an absent tensor is always a suffix: the states come together, seg_m is absent only on the serial route).
+# The per-version extra saved tensors ChunkKDAFunction hands to autograd, in this order (absent ones are dropped
+# and the presence mask travels in the context: the version-4 fields are optional independently -- qg where the
+# light prep writes none, the states under the size rule, w / u on their rows).
 _EXTRA_FIELDS = {
-    SAVED_VERSION: ("hseg", "seg_state"),
+    SAVED_VERSION: ("qg", "hseg", "seg_state", "w", "u"),
     SAVED_VERSION_TAPE: ("h", "v_new", "seg_m"),
 }
 
 
-def _saved_extra(saved: KdaChunkSaved) -> tuple[torch.Tensor, ...]:
-    fields = (getattr(saved, name) for name in _EXTRA_FIELDS[saved.version])
-    return tuple(t for t in fields if t is not None)
+def _saved_extra(
+    saved: KdaChunkSaved,
+) -> tuple[tuple[torch.Tensor, ...], tuple[str, ...]]:
+    """The present extra tensors of ``saved`` and their field names, in :data:`_EXTRA_FIELDS` order."""
+    pairs = [
+        (name, getattr(saved, name))
+        for name in _EXTRA_FIELDS[saved.version]
+        if getattr(saved, name) is not None
+    ]
+    return tuple(t for _name, t in pairs), tuple(name for name, _t in pairs)
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -3115,6 +3449,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             arena=arena,
             doc_lengths=doc_lengths,
         )
+        extra, ctx.extra_fields = _saved_extra(saved)
         ctx.save_for_backward(
             q,
             k,
@@ -3125,7 +3460,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             saved.Aqk,
             saved.Akk,
             *saved.tables,
-            *_saved_extra(saved),
+            *extra,
         )
         ctx.scale = scale
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
@@ -3156,7 +3491,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             tables,
             *ctx.problem,
             ctx.scale,
-            **dict(zip(_EXTRA_FIELDS[ctx.version], extra, strict=False)),
+            **dict(zip(ctx.extra_fields, extra, strict=True)),
         )
         if not dout.is_contiguous():
             dout = (

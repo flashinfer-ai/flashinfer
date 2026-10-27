@@ -66,10 +66,22 @@
 #define GROUP_M 32
 #define WORK_STAGES 4
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DCAKE_LEVER_PDLB=<n>; the guarded defaults are
+// this file's own values) and rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>;
+// every JIT library of the family exports a distinct kernel); the defaults name this file's own
+// program.
+#ifndef CAKE_LEVER_PDLB
+#define CAKE_LEVER_PDLB 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_76f152b19e7a843ba820
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_76f152b19e7a843ba820(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -200,7 +212,11 @@ kernel_cake_kimi_k3_fp8_projection_76f152b19e7a843ba820(const __grid_constant__ 
             int num_cluster_tiles = m_tiles / CTA_GROUP * n_tiles;
             unsigned int load_stage = 0;
             unsigned int work_stage = 0;
+#if CAKE_LEVER_PDLB == 1
+            int pdlb_wait = 1;
+#else
             asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_mma_done_h0 = 1;
             unsigned int _phase_mma_done_h1 = 1;
@@ -251,22 +267,38 @@ kernel_cake_kimi_k3_fp8_projection_76f152b19e7a843ba820(const __grid_constant__ 
                     for (int iter_k = 0; iter_k < num_k_iters; iter_k++) {
                         int k_group = iter_k * 2;
                         mbarrier_wait(mma_done_h0_addr + (load_stage) * 8, _phase_mma_done_h0);
+#if CAKE_LEVER_PDLB == 0
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 60416, (&A), 0, off_m, k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 60416, (&SFA), 0, 0, sfa_tile_row + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416, (&B), 0, b_row0 % 128, b_row0 / 128 * (2 * num_k_iters) + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 4096, (&B), 0, (b_row0 + 32) % 128, (b_row0 + 32) / 128 * (2 * num_k_iters) + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 8192, (&B), 0, (b_row0 + 64) % 128, (b_row0 + 64) / 128 * (2 * num_k_iters) + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfb_all_addr + load_stage * 60416, (&SFB), 0, 0, sfb_tile_row + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#if CAKE_LEVER_PDLB == 1
+                        if (pdlb_wait == 1) {
+                            asm volatile("griddepcontrol.wait;" ::: "memory");
+                            pdlb_wait = 0;
+                        }
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 60416, (&A), 0, off_m, k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 60416, (&SFA), 0, 0, sfa_tile_row + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(30208)) : "memory");
                         mbarrier_wait(mma_done_h1_addr + (load_stage) * 8, _phase_mma_done_h1);
+#if CAKE_LEVER_PDLB == 0
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 60416 + 16384, (&A), 0, off_m, k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 60416 + 512, (&SFA), 0, 0, sfa_tile_row + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 12288, (&B), 0, b_row0 % 128, b_row0 / 128 * (2 * num_k_iters) + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 16384, (&B), 0, (b_row0 + 32) % 128, (b_row0 + 32) / 128 * (2 * num_k_iters) + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 20480, (&B), 0, (b_row0 + 64) % 128, (b_row0 + 64) / 128 * (2 * num_k_iters) + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfb_all_addr + load_stage * 60416 + 1024, (&SFB), 0, 0, sfb_tile_row + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#if CAKE_LEVER_PDLB == 1
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 60416 + 16384, (&A), 0, off_m, k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 60416 + 512, (&SFA), 0, 0, sfa_tile_row + k_group + 1, ((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((tma_full_h1_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(30208)) : "memory");

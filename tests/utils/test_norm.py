@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import os
 
 import pytest
 import torch
@@ -161,8 +162,13 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("pattern", ["zero", "tiny", "sparse", "alternating", "large"])
-def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_rmsnorm_output_contract(shape, dtype, padded, pattern, enable_pdl):
     """Exercise finite edge inputs and caller-owned output storage on the public API."""
+    if enable_pdl and not device_support_pdl(torch.device("cuda")):
+        # rmsnorm() silently turns enable_pdl=True into a plain launch below SM90;
+        # skip instead of counting that launch as PDL coverage.
+        pytest.skip("PDL requires SM90+")
     hidden = shape[-1]
     storage_shape = (*shape[:-1], hidden + 16) if padded else shape
     input_storage = torch.full(storage_shape, -23, dtype=dtype, device="cuda")
@@ -194,7 +200,7 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
     previous = None
     for poison in (float("nan"), 17.0):
         out.fill_(poison)
-        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=False)
+        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=enable_pdl)
         torch.cuda.synchronize()
         assert returned is out
         assert torch.isfinite(out).all()
@@ -207,6 +213,419 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
         if previous is not None:
             torch.testing.assert_close(out, previous, rtol=0, atol=0)
         previous = out.clone()
+
+
+# ---------------------------------------------------------------------------
+# PDL ordering. With enable_pdl the norm kernels are launched with programmatic
+# stream serialization, so they may start while the previous kernel is still
+# running. They must not read what that kernel is still writing (RAW) or write
+# what it is still reading (WAR) before griddepcontrol.wait.
+# ---------------------------------------------------------------------------
+
+# The producer releases its dependents on entry, spins, and only then copies.
+# A dependent that reads before griddepcontrol.wait sees the NaN left in a
+# destination (RAW); one that writes before it changes the bytes the producer
+# copies out (WAR). The probe reads a flag before its own wait, so it records
+# whether a dependent launch overlapped the producer at all on this setup.
+_PDL_RACE_CUDA = r"""
+// Only the stream header, not ATen/cuda/CUDAContext.h: that one pulls in the
+// cuBLAS / cuSPARSE headers, which a toolkit with just nvcc and cudart lacks.
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+#include <vector>
+
+constexpr int kMaxJobs = 4;
+
+struct CopyJobs {
+  uint8_t* dst[kMaxJobs];
+  const uint8_t* src[kMaxJobs];
+  int64_t nbytes[kMaxJobs];
+  int num_jobs;
+};
+
+__global__ void trigger_spin_copy_kernel(CopyJobs jobs, int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t tid = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  for (int j = 0; j < jobs.num_jobs; ++j) {
+    for (int64_t i = tid; i < jobs.nbytes[j]; i += stride) {
+      jobs.dst[j][i] = jobs.src[j][i];
+    }
+  }
+}
+
+__global__ void pdl_probe_kernel(const int32_t* flag, int32_t* observed) {
+  // Read before griddepcontrol.wait on purpose: a stale value means this
+  // dependent ran while the producer was still spinning.
+  int32_t seen = *reinterpret_cast<const volatile int32_t*>(flag);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;");
+#endif
+  if (threadIdx.x == 0) {
+    *observed = seen;
+  }
+}
+
+void pdl_trigger_spin_copy(std::vector<at::Tensor> dsts, std::vector<at::Tensor> srcs,
+                           int64_t spin_cycles) {
+  TORCH_CHECK(dsts.size() == srcs.size(), "dsts and srcs differ in length");
+  TORCH_CHECK(dsts.size() <= kMaxJobs, "too many copy jobs");
+  CopyJobs jobs{};
+  jobs.num_jobs = static_cast<int>(dsts.size());
+  for (size_t j = 0; j < dsts.size(); ++j) {
+    TORCH_CHECK(dsts[j].is_cuda() && srcs[j].is_cuda(), "copy jobs must be on CUDA");
+    TORCH_CHECK(dsts[j].is_contiguous() && srcs[j].is_contiguous(),
+                "copy jobs must be contiguous storage");
+    int64_t n = dsts[j].numel() * dsts[j].element_size();
+    TORCH_CHECK(n == srcs[j].numel() * srcs[j].element_size(), "copy job size mismatch");
+    jobs.dst[j] = static_cast<uint8_t*>(dsts[j].data_ptr());
+    jobs.src[j] = static_cast<const uint8_t*>(srcs[j].data_ptr());
+    jobs.nbytes[j] = n;
+  }
+  trigger_spin_copy_kernel<<<64, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(jobs,
+                                                                               spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void pdl_probe(at::Tensor flag, at::Tensor observed) {
+  TORCH_CHECK(flag.is_cuda() && observed.is_cuda(), "probe tensors must be on CUDA");
+  TORCH_CHECK(flag.scalar_type() == at::kInt && observed.scalar_type() == at::kInt,
+              "probe tensors must be int32");
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(1);
+  config.blockDim = dim3(32);
+  config.dynamicSmemBytes = 0;
+  config.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&config, pdl_probe_kernel,
+                                    static_cast<const int32_t*>(flag.data_ptr()),
+                                    static_cast<int32_t*>(observed.data_ptr())));
+}
+"""
+
+_PDL_SPIN_CYCLES = 4_000_000
+# Raise for local stress runs; CI keeps the default.
+_PDL_REPEATS = int(os.environ.get("FLASHINFER_NORM_PDL_REPEATS", "5"))
+_PDL_SEED = 3605
+
+# (api, shape, padded): one entry per CuTe variant the SM90 dispatch can pick,
+# see the cluster / cp.async / compact-vs-strided selection in
+# flashinfer/norm/kernels/{rmsnorm,fused_add_rmsnorm}.py. M = 264 keeps every
+# SM of a 132-SM part busy twice over.
+#
+# Weights are deliberately not part of the contract: they are static
+# parameters, and reading them before griddepcontrol.wait (for example to
+# prefetch them) is a legitimate optimisation. The producer therefore only
+# writes or reads activations, the residual and the output.
+_PDL_RACE_CASES = [
+    ("rmsnorm", (264, 128), False),
+    ("rmsnorm", (264, 4096), False),
+    ("rmsnorm", (264, 4096), True),
+    ("rmsnorm", (264, 131072), False),
+    ("rmsnorm", (66, 4, 128), False),
+    ("fused_add_rmsnorm", (264, 128), False),
+    ("fused_add_rmsnorm", (264, 4096), False),
+    ("fused_add_rmsnorm", (264, 32768), False),
+]
+
+
+def _pdl_case_id(case):
+    api, shape, padded = case
+    return f"{api}-{'x'.join(map(str, shape))}{'-padded' if padded else ''}"
+
+
+_pdl_race_module_cache = {}
+
+
+def _pdl_race_module():
+    major, minor = torch.cuda.get_device_capability()
+    key = (major, minor)
+    if key not in _pdl_race_module_cache:
+        from torch.utils.cpp_extension import load_inline
+
+        _pdl_race_module_cache[key] = load_inline(
+            name=f"test_norm_pdl_race_sm{major}{minor}",
+            cpp_sources=[
+                "void pdl_trigger_spin_copy(std::vector<at::Tensor> dsts, "
+                "std::vector<at::Tensor> srcs, int64_t spin_cycles);\n"
+                "void pdl_probe(at::Tensor flag, at::Tensor observed);"
+            ],
+            cuda_sources=[_PDL_RACE_CUDA],
+            extra_cuda_cflags=[
+                f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            ],
+            functions=["pdl_trigger_spin_copy", "pdl_probe"],
+            verbose=False,
+        )
+        module = _pdl_race_module_cache[key]
+        # Load both kernels eagerly: a lazily loaded module cannot be loaded
+        # while a CUDA graph is being captured.
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        observed = torch.zeros(1, dtype=torch.int32, device="cuda")
+        module.pdl_trigger_spin_copy([], [], 0)
+        module.pdl_probe(flag, observed)
+        torch.cuda.synchronize()
+    return _pdl_race_module_cache[key]
+
+
+def _skip_unless_pdl():
+    if not device_support_pdl(torch.device("cuda")):
+        # enable_pdl=True is turned into a plain launch below SM90, which would
+        # make every race test pass without testing anything.
+        pytest.skip("PDL requires SM90+")
+
+
+_pdl_overlap_cache = {}
+
+
+def _pdl_overlap_runs(mode):
+    """How many of ``_PDL_REPEATS`` probe runs started a PDL dependent while
+    the producer was still spinning."""
+    key = (torch.cuda.current_device(), mode)
+    if key not in _pdl_overlap_cache:
+        module = _pdl_race_module()
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        one = torch.ones(1, dtype=torch.int32, device="cuda")
+        observed = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+
+        def fn():
+            module.pdl_trigger_spin_copy([flag], [one], _PDL_SPIN_CYCLES)
+            module.pdl_probe(flag, observed)
+
+        run = _pdl_launcher(mode, fn)
+        stale = 0
+        for _ in range(_PDL_REPEATS):
+            flag.zero_()
+            observed.fill_(-1)
+            torch.cuda.synchronize()
+            run()
+            torch.cuda.synchronize()
+            assert int(flag.item()) == 1
+            assert int(observed.item()) in (0, 1)
+            stale += int(observed.item()) == 0
+        _pdl_overlap_cache[key] = stale
+    return _pdl_overlap_cache[key]
+
+
+def _skip_unless_pdl_overlaps(mode):
+    """Skip where a PDL dependent cannot overlap the producer: the race tests
+    would pass there without testing anything."""
+    _skip_unless_pdl()
+    if os.environ.get("CUDA_LAUNCH_BLOCKING", "0") not in ("", "0"):
+        pytest.skip("CUDA_LAUNCH_BLOCKING serializes launches; PDL cannot overlap")
+    if _pdl_overlap_runs(mode) == 0:
+        # Something serialized the launches, e.g. a sanitizer or profiler.
+        pytest.skip(
+            f"{mode}: no PDL dependent ran ahead of the producer in "
+            f"{_PDL_REPEATS} probe runs, so the race tests cannot fail here"
+        )
+
+
+def _bits(t):
+    return t.view(torch.int16) if t.element_size() == 2 else t.view(torch.int32)
+
+
+def _assert_bitwise(actual, expected, what):
+    a, e = _bits(actual), _bits(expected)
+    bad = a != e
+    if bad.any():
+        rows = bad.reshape(-1, bad.shape[-1]).any(dim=-1).nonzero().flatten()
+        raise AssertionError(
+            f"{what}: {int(bad.sum())} of {bad.numel()} elements differ bitwise; "
+            f"first differing flattened rows {rows[:8].tolist()}"
+        )
+
+
+def _pdl_launcher(mode, fn):
+    """Return a callable that runs ``fn`` eagerly or replays it from a CUDA graph."""
+    if mode == "eager":
+        return fn
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    return graph.replay
+
+
+class _PdlNormCase:
+    """Storage for one race case. Every tensor the producer touches is the
+    contiguous storage; the norm sees the (possibly padded) view."""
+
+    def __init__(self, api, shape, padded, dtype):
+        self.api, self.shape, self.padded, self.dtype = api, shape, padded, dtype
+        hidden = shape[-1]
+        self.storage_shape = (*shape[:-1], hidden + 16) if padded else shape
+        gen = torch.Generator(device="cuda").manual_seed(_PDL_SEED)
+        self.src_x = torch.randn(
+            self.storage_shape, generator=gen, device="cuda", dtype=torch.float32
+        ).to(dtype)
+        self.src_r = torch.randn(
+            self.storage_shape, generator=gen, device="cuda", dtype=torch.float32
+        ).to(dtype)
+        self.src_w = (
+            torch.rand(hidden, generator=gen, device="cuda", dtype=torch.float32) + 0.5
+        ).to(dtype)
+        self.x = torch.empty_like(self.src_x)
+        self.r = torch.empty_like(self.src_r)
+        self.w = torch.empty_like(self.src_w)
+        self.out = torch.empty_like(self.src_x)
+
+    def view(self, t):
+        return t[..., 8:-8] if self.padded else t
+
+    def call(self, enable_pdl):
+        if self.api == "rmsnorm":
+            flashinfer.norm.rmsnorm(
+                self.view(self.x),
+                self.w,
+                out=self.view(self.out),
+                enable_pdl=enable_pdl,
+            )
+        else:
+            flashinfer.norm.fused_add_rmsnorm(
+                self.view(self.x), self.view(self.r), self.w, enable_pdl=enable_pdl
+            )
+
+    def reset(self):
+        """Clean inputs, poisoned output; padding keeps a known value."""
+        self.x.copy_(self.src_x)
+        self.r.copy_(self.src_r)
+        self.w.copy_(self.src_w)
+        self.out.fill_(17.0)
+
+    def results(self):
+        if self.api == "rmsnorm":
+            return {"out": self.out.clone()}
+        return {"input": self.x.clone(), "residual": self.r.clone()}
+
+    def reference(self, enable_pdl):
+        """The same call on synchronized inputs: the bitwise target."""
+        self.reset()
+        torch.cuda.synchronize()
+        self.call(enable_pdl)
+        torch.cuda.synchronize()
+        return self.results()
+
+
+def _check_shape_fits(case):
+    api, shape, _ = case
+    if api == "fused_add_rmsnorm":
+        _skip_if_fused_norm_smem_exceeds_limit(
+            shape[-1], torch.bfloat16, torch.device("cuda")
+        )
+
+
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_pdl_race_probe_sees_overlap(mode):
+    """Calibration for the race tests below: they can only fail where a PDL
+    dependent actually starts while the producer spins. Like them, this skips
+    with the reason on setups where it never does."""
+    _skip_unless_pdl_overlaps(mode)
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_norm_pdl_waits_before_reading(case, dtype, mode):
+    """RAW: activations written by a still-running producer must not be read
+    early. Weights are excluded, see ``_PDL_RACE_CASES``."""
+    _skip_unless_pdl_overlaps(mode)
+    _check_shape_fits(case)
+    module = _pdl_race_module()
+    c = _PdlNormCase(*case, dtype)
+    expected = c.reference(enable_pdl=True)
+
+    dsts, srcs = [c.x], [c.src_x]
+    if c.api == "fused_add_rmsnorm":
+        dsts.append(c.r)
+        srcs.append(c.src_r)
+
+    def fn():
+        module.pdl_trigger_spin_copy(dsts, srcs, _PDL_SPIN_CYCLES)
+        c.call(enable_pdl=True)
+
+    run = _pdl_launcher(mode, fn)
+    for rep in range(_PDL_REPEATS):
+        c.reset()
+        for t in dsts:
+            t.fill_(float("nan"))
+        torch.cuda.synchronize()
+        run()
+        torch.cuda.synchronize()
+        for name, value in c.results().items():
+            _assert_bitwise(
+                value,
+                expected[name],
+                f"{_pdl_case_id(case)} {dtype} {mode} "
+                f"seed={_PDL_SEED} repeat={rep} {name}",
+            )
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("mode", ["eager", "graph"])
+def test_norm_pdl_waits_before_writing(case, dtype, mode):
+    """WAR: buffers a still-running producer reads must not be overwritten early."""
+    _skip_unless_pdl_overlaps(mode)
+    _check_shape_fits(case)
+    module = _pdl_race_module()
+    c = _PdlNormCase(*case, dtype)
+    expected = c.reference(enable_pdl=True)
+
+    if c.api == "rmsnorm":
+        watched = {"out": c.out}
+    else:
+        watched = {"input": c.x, "residual": c.r}
+    snapshots = {name: torch.empty_like(t) for name, t in watched.items()}
+
+    def fn():
+        module.pdl_trigger_spin_copy(
+            list(snapshots.values()), list(watched.values()), _PDL_SPIN_CYCLES
+        )
+        c.call(enable_pdl=True)
+
+    run = _pdl_launcher(mode, fn)
+    for rep in range(_PDL_REPEATS):
+        c.reset()
+        before = {name: t.clone() for name, t in watched.items()}
+        for s in snapshots.values():
+            s.fill_(-1.0)
+        torch.cuda.synchronize()
+        run()
+        torch.cuda.synchronize()
+        tag = f"{_pdl_case_id(case)} {dtype} {mode} seed={_PDL_SEED} repeat={rep}"
+        for name in watched:
+            _assert_bitwise(
+                snapshots[name], before[name], f"{tag} {name} overwritten early"
+            )
+        for name, value in c.results().items():
+            _assert_bitwise(value, expected[name], f"{tag} {name}")
+
+
+@pytest.mark.parametrize("case", _PDL_RACE_CASES, ids=_pdl_case_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_norm_pdl_matches_plain_launch(case, dtype):
+    """The PDL and non-PDL builds of a kernel give bitwise identical results."""
+    _skip_unless_pdl()
+    _check_shape_fits(case)
+    c = _PdlNormCase(*case, dtype)
+    with_pdl = c.reference(enable_pdl=True)
+    without_pdl = c.reference(enable_pdl=False)
+    for name, value in with_pdl.items():
+        _assert_bitwise(
+            value, without_pdl[name], f"{_pdl_case_id(case)} {dtype} {name}"
+        )
 
 
 @parametrize_product(

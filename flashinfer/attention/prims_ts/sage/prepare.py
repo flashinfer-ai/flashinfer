@@ -32,8 +32,8 @@ from cuda.bindings import driver as cuda_drv
 
 from flashinfer.utils import ceil_div
 
-from .config import log2_block_size
-from .index import load_flat_scale
+from .config import sage_log2_block_size
+from .index import load_sage_flat_scale
 from .layout import (
     _FLOAT4_WORDS,
     _SAGE_ATOM_TOKENS,
@@ -73,7 +73,7 @@ class _KSectionSource:
             atom_float4s=cutlass.Int32(section.atom_float4s),
             tokens_per_word=cutlass.Int32(section.tokens_per_word),
             words_per_atom=cutlass.Int32(section.words_per_atom),
-            log2_block=cutlass.Int32(log2_block_size(section.source_block_size)),
+            log2_block=cutlass.Int32(sage_log2_block_size(section.source_block_size)),
             scale_addr=scales.iterator.toint(),
             head_stride=cutlass.Int32(scales.shape[1]),
             length=cutlass.Int32(section.length),
@@ -183,7 +183,7 @@ def _write_k_float4(
         words[elem] = cutlass.Float32(0.0)
         # Only a two-word atom pads, and it is a single float4.
         if word < section.words_per_atom:
-            words[elem] = load_flat_scale(
+            words[elem] = load_sage_flat_scale(
                 section.scale_addr,
                 section.head_stride,
                 head_idx=head_idx,
@@ -212,7 +212,7 @@ def _write_q_float4(
     ``float4_in_section`` places the float4 in the sequence's Q rows. Row
     ``r`` of the tile takes the Q scale of the token and Q head the section's
     row order maps it to (``_SageQSection.row_token_and_head``);
-    ``load_flat_scale`` gives a token past the sequence's end the last token's.
+    ``load_sage_flat_scale`` gives a token past the sequence's end the last token's.
     """
 
     q_rows = layout.q_rows
@@ -229,14 +229,14 @@ def _write_q_float4(
         q_token_idx, local_head_idx = q_rows.row_token_and_head(
             tile_idx, first_row + cutlass.Int32(elem)
         )
-        words[elem] = load_flat_scale(
+        words[elem] = load_sage_flat_scale(
             q_scale.iterator.toint(),
             cutlass.Int32(q_scale.shape[1]),
             head_idx=kv_head_idx * heads_q_per_kv + local_head_idx,
             batch_idx=batch_idx,
             seq_len=cutlass.Int32(q_rows.seq_len_q),
             token_idx=q_token_idx,
-            log2_block=cutlass.Int32(log2_block_size(q_rows.q_block_size)),
+            log2_block=cutlass.Int32(sage_log2_block_size(q_rows.q_block_size)),
         )
     _store_float4(scales, float4_idx, words)
 

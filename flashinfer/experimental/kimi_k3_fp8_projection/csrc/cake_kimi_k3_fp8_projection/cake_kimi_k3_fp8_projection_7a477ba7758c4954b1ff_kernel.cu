@@ -84,10 +84,25 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     return u;
 }
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DCAKE_LEVER_PX=<n>, -DCAKE_LEVER_QER=<n>; the
+// guarded defaults are this file's own values) and rename the kernel symbol
+// (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family exports a distinct
+// kernel); the defaults name this file's own program.
+#ifndef CAKE_LEVER_PX
+#define CAKE_LEVER_PX 1
+#endif
+#ifndef CAKE_LEVER_QER
+#define CAKE_LEVER_QER 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(14,1,1) void
-kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -836,6 +851,11 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                                     : "=r"(*reinterpret_cast<uint32_t*>(&wordsh[4 * ci])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 3]))
                                     : "r"(row_h + (unsigned int)(chunk_h * 16)));
                             }
+#if CAKE_LEVER_QER == 1
+                            if (elect_sync()) {
+                                mbarrier_arrive(xb_empty_addr + (xb_q) * 8);
+                            }
+#endif
                             float amax_h = 0.0f;
                             #pragma unroll
                             for (int ci_1 = 0; ci_1 < 2; ci_1++) {
@@ -954,9 +974,11 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                                 }
                             }
                         }
+#if CAKE_LEVER_QER == 0
                         if (elect_sync()) {
                             mbarrier_arrive(xb_empty_addr + (xb_q) * 8);
                         }
+#endif
                     }
                     if (qwarp >= 4 && qwarp < 8) {
                         mbarrier_wait(xb_full1_addr + (xb_q) * 8, _phase_xb_full1);
@@ -975,6 +997,11 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                                     : "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[4 * ci_3])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 3]))
                                     : "r"(row_h_1 + (unsigned int)(chunk_h_1 * 16)));
                             }
+#if CAKE_LEVER_QER == 1
+                            if (elect_sync()) {
+                                mbarrier_arrive(xb_empty1_addr + (xb_q) * 8);
+                            }
+#endif
                             float amax_h_1 = 0.0f;
                             #pragma unroll
                             for (int ci_4 = 0; ci_4 < 2; ci_4++) {
@@ -1093,9 +1120,11 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                                 }
                             }
                         }
+#if CAKE_LEVER_QER == 0
                         if (elect_sync()) {
                             mbarrier_arrive(xb_empty1_addr + (xb_q) * 8);
                         }
+#endif
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (elect_sync()) {
@@ -1132,6 +1161,7 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                     #pragma unroll 1
                     for (int i_3 = 0; i_3 < k_count_4; i_3++) {
                         int k_group_x = (k_begin_4 + i_3) * 2;
+#if CAKE_LEVER_PX == 1
                         if (i_3 == 0) {
                             if (k_begin_4 < k_begin_4 + k_count_4) {
                                 asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_begin_4 * 2)) : "memory");
@@ -1143,6 +1173,7 @@ kernel_cake_kimi_k3_fp8_projection_7a477ba7758c4954b1ff(const __grid_constant__ 
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_px * 2)) : "memory");
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_px * 2 + 1)) : "memory");
                         }
+#endif
                         mbarrier_wait(xb_empty_addr + (xb_stage_l) * 8, _phase_xb_empty);
                         if (it_x == 0 && i_3 == 0) {
                             asm volatile("griddepcontrol.wait;" ::: "memory");

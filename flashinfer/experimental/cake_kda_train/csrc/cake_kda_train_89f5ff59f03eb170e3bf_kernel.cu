@@ -90,7 +90,7 @@ kernel_cake_kda_train_89f5ff59f03eb170e3bf(float* __restrict__ m, float* __restr
     float* slabs = reinterpret_cast<float*>(smem_raw + 8192);
     const int slabs_addr = smem + 8192;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int nblk = ncols / 16;
     int chain = blockIdx.x / nblk;
     int col0 = blockIdx.x % nblk * 16;

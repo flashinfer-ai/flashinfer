@@ -39,16 +39,14 @@ static-token-count program of the call's ``T`` whose band admits the call's
 runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
-(``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r4x2`` / ``l8r2`` / ``l4r2``, one
-CTA per batch row and head, two heads per CTA for ``l8r4x2``: grid rule
-``heads_per_cta``, the launch is ``ceil(B x HV / 2)`` CTAs and an odd head count
-leaves the last CTA one head)
+(``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one
+CTA per batch row and head)
 and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
 (``splitv8_tile8``, eight CTAs per state head); each record names its body
 (``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
 partition).  A band may differ per architecture (SM90 has neither the
-one-wave ``l8r4p`` program, the one-wave-of-5 ``l8r4w5`` program nor the
-two-heads-per-CTA ``l8r4x2`` program at ``T = 1`` and owns the one-CTA-per-SM
+one-wave ``l8r4p`` program nor the one-wave-of-5 ``l8r4w5`` program at
+``T = 1`` and owns the one-CTA-per-SM
 rows of ``T = 4`` with ``l4r2``): a selection cell then names the ``arches``
 it applies to, and a
 cell without ``arches`` applies on every architecture its record is delivered
@@ -75,8 +73,8 @@ SHA-256 of the compact JSON ``{"build": <build keywords, sorted>, "module":
 record's ``build`` spells those keywords: ``variant`` (the body's geometry:
 ``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
 ``l8r4w5`` = that geometry with the producer preload, for one wave of four
-CTAs per SM and for one wave of five; ``l8r4x2`` = that geometry with two
-heads per CTA for the many-wave rows (``B x HV >= 32 x SM count``); ``l8r2``;
+CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
+count``); ``l8r2``;
 ``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
 eight rows
 per head), ``num_householder`` (``n``),
@@ -620,152 +618,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "unit_gates": False,
             "use_initial_state": True,
             "use_state_indices": False,
-        },
-    },
-    "cake_gdp_266d24496704b9063e28": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "q",
-            ],
-            [
-                "buffer",
-                "k",
-            ],
-            [
-                "buffer",
-                "v",
-            ],
-            [
-                "buffer",
-                "state",
-            ],
-            [
-                "buffer",
-                "A_log",
-            ],
-            [
-                "buffer",
-                "a",
-            ],
-            [
-                "buffer",
-                "dt_bias",
-            ],
-            [
-                "buffer",
-                "b",
-            ],
-            [
-                "buffer",
-                "out",
-            ],
-            [
-                "buffer",
-                "initial_state_indices",
-            ],
-            [
-                "buffer",
-                "output_state_indices",
-            ],
-            [
-                "buffer",
-                "ssm_state_indices",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "num_tokens",
-            ],
-            [
-                "parameter",
-                "scale",
-            ],
-            [
-                "parameter",
-                "disable_state_update",
-            ],
-            [
-                "parameter",
-                "use_ssm_state_indices",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "body": "lanerow",
-        "build": {
-            "max_t_steps": 8,
-            "num_householder": 3,
-            "t_steps": 1,
-            "use_qk_l2norm": True,
-            "variant": "l8r4x2",
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "ctas_per_state": 1,
-            "heads_per_cta": 2,
-            "kind": "state_heads",
-        },
-        "kernel": "cake_gdp_266d24496704b9063e28",
-        "kernel_symbol": "kernel_cake_gdp_266d24496704b9063e28",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 38528,
-            "use_pdl": False,
-        },
-        "library": "cake_gdp_266d24496704b9063e28",
-        "logical": {
-            "A_log": "A_log",
-            "a": "a",
-            "b": "b",
-            "disable_state_update": "disable_state_update",
-            "dt_bias": "dt_bias",
-            "heads": "heads",
-            "initial_state_indices": "initial_state_indices",
-            "k": "k",
-            "num_tokens": "num_tokens",
-            "out": "out",
-            "output_state_indices": "output_state_indices",
-            "q": "q",
-            "scale": "scale",
-            "ssm_state_indices": "ssm_state_indices",
-            "state": "state",
-            "use_ssm_state_indices": "use_ssm_state_indices",
-            "v": "v",
-        },
-        "role": "decode",
-        "select_rule": {
-            "above": 160,
-            "at_most": None,
-            "ctas_per_sm_at_least": 32,
-            "kind": "state_heads_between",
         },
     },
     "cake_gdp_27eb88658ee4bdc4ae35": {
@@ -1685,8 +1537,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "above": 160,
             "at_most": None,
-            "ctas_per_sm_above": 4,
-            "ctas_per_sm_at_most": 5,
+            "ctas_per_sm_above": 64,
             "kind": "state_heads_between",
         },
     },
@@ -3458,7 +3309,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cooperative": False,
-            "dynamic_smem_bytes": 6400,
+            "dynamic_smem_bytes": 2304,
             "use_pdl": False,
         },
         "library": "cake_gdp_f2f0c7abbf10082a6996",
@@ -3822,8 +3673,8 @@ MODULES: dict[str, dict[str, Any]] = {
                     "sm_103a",
                 ],
                 "at_most": None,
-                "ctas_per_sm_above": 5,
-                "ctas_per_sm_below": 32,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 64,
                 "kind": "state_heads_between",
             },
             {
@@ -3881,7 +3732,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_e156ee45668b2455e46d",
             "cake_gdp_4d40c98af90453032200",
             "cake_gdp_fefa1931e0ddadb74891",
-            "cake_gdp_266d24496704b9063e28",
             "cake_gdp_27eb88658ee4bdc4ae35",
             "cake_gdp_3cbdef34ce5b580c2216",
             "cake_gdp_5970bfa6676087a3ce92",
@@ -3903,7 +3753,6 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_e156ee45668b2455e46d",
             "cake_gdp_4d40c98af90453032200",
             "cake_gdp_fefa1931e0ddadb74891",
-            "cake_gdp_266d24496704b9063e28",
             "cake_gdp_27eb88658ee4bdc4ae35",
             "cake_gdp_3cbdef34ce5b580c2216",
             "cake_gdp_5970bfa6676087a3ce92",

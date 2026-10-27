@@ -40,19 +40,26 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   backward, so both skip the trailing invalid key blocks of short rows; the
   results are those of the full row.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
-  to `cu_seqlens_k[d]`) and turns them into global key rows on device in one
-  launch of the NoPE record's index-preparation stage right before the forward
-  kernel (`index_prep`, `compact = 1`, the forward launched behind it with the
-  programmatic-dependent-launch attribute, see below; the torch twin
-  `offset_gather_kv_indices(..., compact=True)` where the stage is not
-  available -- host tensors, an unserved device, a non-contiguous prefix sum --
-  with bitwise the same result).  Every row is compacted stably: its valid keys
-  come first in ascending slot order, then `-1`, and the row's length is its
-  valid count, so rows with `-1` holes cost their valid slots in the forward
-  and the backward; rows whose valid slots already come first are unchanged
-  bytes with the same length.  A caller `topk_length` is a position cut
-  applied before compaction (slots at positions `>= topk_length[t]` are
-  invalid regardless of content).  `cu_seqlens_q`
+  to `cu_seqlens_k[d]`) and turns them into global key rows on device.  The
+  NoPE varlen entry follows the size rule of its own section below
+  (`NOPE_CONVERT_SLOT_LIMIT`, `nope_varlen_index_mode`): below the
+  limit, without caller lengths, the forward kernel converts the rows itself in
+  its single launch, position-preserving -- the global key or `-1` at the slot
+  it came from, the length the last valid slot + 1, bitwise the torch twin
+  `offset_gather_kv_indices(...)`; at or above the limit, and always with a
+  caller `topk_length`, one launch of the NoPE record's index-preparation
+  stage right before the forward kernel (`index_prep`, `compact = 1`, the
+  forward launched behind it with the programmatic-dependent-launch attribute,
+  see below) compacts every row stably: its valid keys come first in ascending
+  slot order, then `-1`, and the row's length is its valid count (bitwise the
+  torch twin `offset_gather_kv_indices(..., compact=True)`), so rows with `-1`
+  holes cost their valid slots in the forward and the backward.  The rope varlen
+  entry always launches the compacting stage (the torch twin where the stage
+  is not available -- host tensors, an unserved device, a non-contiguous prefix
+  sum -- with bitwise the same result).  Rows whose valid slots already come
+  first are unchanged bytes with the same length on every route.  A caller
+  `topk_length` is a position cut applied before compaction (slots at positions
+  `>= topk_length[t]` are invalid regardless of content).  `cu_seqlens_q`
   and `cu_seqlens_k` are independent: a query segment may be shorter than its
   key segment, in which case it is the tail of that key prefix -- query
   `local_q` of document `d` sits at key position
@@ -182,9 +189,10 @@ context-parallel window):
 
 A program may register natural-layout variants of the main stage
 (`bwd_main_natural`, and `bwd_main_pass_natural` next to the key-range-pass
-form): the same kernel traced with a drain that transposes each key's FP32
-contributions across lanes and `red.global.add`s them at their natural
-position straight into the caller's packed rows (`dkv_acc` through
+form): the same kernel source compiled with `-DDKV_NATURAL=1`, whose drain
+transposes each key's FP32 contributions across lanes and `red.global.add`s
+them at their natural position straight into the caller's packed rows
+(`dkv_acc` through
 `dkv_dst_map`).  Such a binding has no FP32 accumulators, no zero fill and no
 `bwd_cast` launch (`dsa_train_workspace_size(..., dkv_acc=True)` is smaller by
 `S * 2304` B, the runner's `dkv_direct` is set).  The lane transpose costs the
@@ -356,12 +364,18 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
   int32 global key rows, `topk_length` and the validity rules as above.
   `softmax_scale` defaults to `1 / 16`.  Without `topk_length` the flat entry
-  compacts the rows on device in one launch of the index-preparation stage's
-  flat mode right before the forward (valid keys `0 <= idx < S` first in
-  ascending slot order, then `-1`; the valid count as the row's length) into a
-  fresh `[T, K_slots]` buffer and a `[T]` vector the backward reads, so rows
-  with `-1` holes cost their valid slots; the caller's tensor is untouched.
-  With `topk_length` the rows and lengths reach the kernels as given.
+  follows the table size (`nope_flat_index_mode`): below
+  `NOPE_CONVERT_SLOT_LIMIT` slots the forward alone reads the rows as given and
+  derives each row's length (last valid slot + 1) into a `[T]` vector the
+  backward reads with the caller's rows (one launch; the caller's tensor is
+  then a saved tensor, so autograd rejects an in-place edit of it before the
+  backward); at or above the limit it compacts the rows on device in one launch
+  of the index-preparation stage's flat mode right before the forward (valid
+  keys `0 <= idx < S` first in ascending slot order, then `-1`; the valid count
+  as the row's length) into a fresh `[T, K_slots]` buffer and a `[T]` vector
+  the backward reads, so rows with `-1` holes cost their valid slots and the
+  caller's tensor is untouched.  With `topk_length` the rows and lengths reach
+  the kernels as given.
 * Rows with holes and the kernel-level entries: `forward_nope`,
   `backward_nope` and the prepared runner read rows as given (work up to the
   last valid slot, or `topk_length`).  `nope_compact_indices(indices, S,
@@ -375,7 +389,9 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
 * Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
   `forward_nope_varlen` (the packed forward without autograd: the public
   entry's index route; returns `(out, lse, o_lo, indices, topk_length)`, the
-  compacted global rows and their valid counts `backward_nope` takes with
+  global rows and lengths of that route -- position-preserving rows with last
+  valid slot + 1 below the slot limit, compacted rows with their valid counts
+  on the stage route -- that `backward_nope` takes with
   `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
   `nope_compact_indices`, `nope_globalize_indices(..., compact=False)` (one
   stage launch over per-document rows: the position-preserving rows and last
@@ -412,16 +428,30 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   main stage through a stride-carrying tensor map, the delta stage through the
   token / head strides (elements) and the element offset the launcher passes
   (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
-* Varlen: per-document indices become global key rows on device in one launch
-  of the record's index-preparation stage right before the forward
-  (`nope_varlen_index_mode`: `"index_prep"` at every table size, since
-  `NOPE_CONVERT_SLOT_LIMIT` is 0).  `index_prep` (one warp per index row, four
-  rows per 128-thread CTA, any index row stride read in place) runs with
-  `compact = 1`: every row stably compacted -- valid keys first in ascending
-  slot order, then `-1` -- and its valid count as the length, after the position
-  cut of a caller `topk_length` passed as `length_in`; the forward and the
-  saved backward read the stage's rows and counts in both cases (bitwise the
-  torch twin `offset_gather_kv_indices(..., compact=True)`).  Both forward
+* Varlen: per-document indices become global key rows on device; the route
+  follows the table size (`nope_varlen_index_mode`).  Below
+  `NOPE_CONVERT_SLOT_LIMIT` slots (both small bench tables, 1024 x 128 and
+  1024 x 512, sit below it) and without caller lengths the forward
+  converts the rows itself in its single launch (`convert = 2`): its scan lanes
+  write the position-preserving global rows -- the global key or `-1` at the
+  slot it came from -- into the fresh `indices_out` the backward reads and the
+  last valid slot + 1 as the row's length (bitwise the torch twin
+  `offset_gather_kv_indices(...)`), so no host gap separates a preparation
+  launch from the forward; a small table with holes scans them like the
+  previous version did (routing reads the table size alone: the host cannot
+  see holes without a device sync).  At or above the limit, and always with a
+  caller `topk_length`, one launch of the record's index-preparation stage runs
+  right before the forward: `index_prep` (one warp per index row, four rows per
+  128-thread CTA, any index row stride read in place) with `compact = 1`, every
+  row stably compacted -- valid keys first in ascending slot order, then `-1`
+  -- and its valid count as the length, after the position cut of a caller
+  `topk_length` passed as `length_in`; the forward and the saved backward read
+  the stage's rows and counts (bitwise the torch twin
+  `offset_gather_kv_indices(..., compact=True)`).  The limit is a measured
+  crossover (the largest measured table at which the one-launch forward stays
+  within 0.95x of the stage route on the eager forward and 1.02x on the
+  GPU-busy step, plus one, rounded up to the next power of two when the next
+  measured table also stays within 1.02x on the GPU-busy step).  Both forward
   stages (`fwd`, `nope_fwd`) launch with the programmatic-dependent-launch
   attribute (`use_pdl` in their launch records, a fixed attribute of their
   bindings): `index_prep` signals `launch_dependents` at entry and the forward
@@ -432,15 +462,18 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   before the first launch, then issues the forward from those pre-bound values
   inside the same stream context, so only the forward's binding call sits
   between the two launches (it hides behind the stage's kernel).  The forward
-  program still carries its own conversion (`cu_seqlens_q`, `cu_seqlens_k`,
+  program's conversion operands (`cu_seqlens_q`, `cu_seqlens_k`,
   `indices_out`, `num_docs`, `search_iters`, `causal`, `convert` at the end of
-  its launch arguments; `convert = 1` globalizes the rows and, since flour
-  ae939ee44, writes the same stable compaction and valid counts as the stage,
-  bitwise): the `"kernel"` route below a limit above zero (a performance
-  crossover still to be measured; the limit is 0) and the fallback of a
-  registry without the stage, which takes no caller `topk_length`.
-  `causal=True` drops keys after the query's own position, query segments are
-  tails of their key prefix.  The NoPE entries have no torch fallback.
+  its launch arguments) take three values: `convert = 0` for global rows (the
+  operands never read), `convert = 2` (`NOPE_CONVERT_MASK`) for the
+  position-preserving conversion of the small-table route, and `convert = 1`
+  (`NOPE_CONVERT_COMPACT`) for the compacting single launch -- the same stable
+  compaction and valid counts as the stage, bitwise -- which no size selects
+  (`_packed_forward_nope(..., "kernel")` by name only).  A registry without the
+  stage takes the position-preserving single launch at every size and no
+  caller `topk_length`.  `causal=True` drops keys after the query's own
+  position, query segments are tails of their key prefix.  The NoPE entries
+  have no torch fallback.
 * Backward host order: the autograd wrappers settle their backward at forward
   time (the binding key without `dout`, the operands autograd does not save,
   the caller's `dkv_acc` validated once), so the backward's host work before
@@ -508,34 +541,51 @@ reports that gap).
   the stage names of both programs (`STAGES` / `NOPE_STAGES`, `PROGRAMS`) and
   the loader glue: `library_name(stage, arch, program)` is the `build.json`
   entry `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch,
-  program)` loads through `cake_build`; `specs_for_arch(arch)` lists the JIT
-  specs of an architecture for `flashinfer.jit.build_jit_specs`.  Stages of
-  the two programs that share a kernel name the same library stem.
+  program)` loads through `cake_build`.  Stages of the two programs that
+  share a kernel name the same library stem.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  (fourteen libraries x three architectures) with its translation units, digests,
-  nvcc flags (`--use_fast_math` per stage), closure digest and `aot/<name>.so`
+  (fourteen libraries x three architectures over ten kernel sources, four of
+  them compiled a second time with `-DDKV_NATURAL=1`) with its translation
+  units, digests, nvcc flags (`--use_fast_math` per stage, plus the natural
+  variants' specialization defines), closure digest and `aot/<name>.so`
   path.  `cake_build.load_library(name)` loads the prebuilt library when
   `aot/` holds it (next to the builder's `aot/build_info.json` sidecar, which
   must agree with the library's exported `build_cuda_version()`) and otherwise
   JIT-builds the entry through FlashInfer (`gen_jit_spec`, sources
   digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
   `aot/` is never tracked (`.gitignore`).
-* `cake_launch.py` -- generated positional launchers and grid functions, one
-  per stage of either program, over the kernels' own argument names
-  (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
+* `cake_launch.py` -- generated positional launchers and grid functions over
+  the kernels' own argument names, one per distinct argument plan or grid
+  rule (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
   (tensor-argument checks, `TVM_FFI_CHECK_CUDA_ERROR`, `build_cuda_version`),
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
-  one pair per library (the main stage and its key-range-pass form each with a
-  natural-layout variant; the delta, compaction and cast pairs serve both
+  one pair per kernel (the main stage and its key-range-pass form each carry
+  their natural-layout variant as the compile-line specialization
+  `DKV_NATURAL=1` of the same pair, under the variant's own kernel symbol and
+  binding namespace; the delta, compaction and cast pairs serve both
   programs), shared by `sm_100a`, `sm_103a` and `sm_107a` and
-  compiled once per architecture (`.clang-format` disables formatting: the sources are
-  identity-checked by the digests in `build.json`).
+  compiled once per library and architecture (`.clang-format` disables formatting: the sources are
+  identity-checked by the digests in `build.json`).  The four shared pairs,
+  the registry leaves of the natural stages and their `build.json` entries are
+  a hand fold of exported files; the next export regenerates them.
+  The kernel units take their shared preamble (ABI types, the tensor-map
+  descriptor types, `make_warp_uniform`, `<math_constants.h>`) and their
+  device helpers from `cake_dsa_h64_train_device.cuh`, naming the helpers
+  they need through `CAKE_DSA_H64_TRAIN_NEED_*` defines before the include;
+  this header is part of the same hand fold, ships with the sources and is
+  covered by no `build.json` digest.
+  The main and forward bindings take their host-side check helpers from
+  `cake_dsa_h64_train_binding_helpers.h` and their shared tensor-map
+  encoders from `cake_dsa_h64_train_binding_tma_<operand>.h`, each included
+  once inside the binding's namespace; these ten headers are part of the
+  same hand fold, ship with the sources and are covered by no `build.json`
+  digest.
 
 ## Status
 

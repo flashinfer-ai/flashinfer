@@ -21,6 +21,8 @@ from flashinfer.cake_tp_moe_finalize_rmsnorm_backend import cake_jit as loader
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = Path(pkg.__file__).parent
 BLACKWELL = ("sm_100a", "sm_103a")
+R200 = ("sm_107a",)
+EVERY = BLACKWELL + R200
 KINDS = ("onehop", "rsag", "tokown", "token1", "eo")
 DATA = (
     "gemm2",
@@ -58,17 +60,18 @@ KIND_SLOTS = {
     ("sm_100a", "tp8"): {"eo": 7, "token1": 144},
     ("sm_103a", "tp2"): {"onehop": 17, "token1": 148, "rsag": 33, "eo": 64},
     ("sm_103a", "tp4"): {"onehop": 8, "eo": 24, "token1": 152},
+    ("sm_107a", "tp4"): {"onehop": 8, "eo": 24, "token1": 212},
 }
 
 
 def test_route_and_architecture_helpers():
-    assert tuple(loader.WORLDS) == (2, 4, 8) and tuple(loader.ARCHES) == BLACKWELL
+    assert tuple(loader.WORLDS) == (2, 4, 8) and tuple(loader.ARCHES) == EVERY
     assert [loader.route_key(world) for world in loader.WORLDS] == ["tp2", "tp4", "tp8"]
     with pytest.raises(ValueError, match="world size 3"):
         loader.route_key(3)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
     assert loader.arch_for_capability([10, 3]) == "sm_103a"
-    assert loader.arch_for_capability((10, 7)) is None
+    assert loader.arch_for_capability((10, 7)) == "sm_107a"
     assert loader.arch_for_capability((9, 0)) is None
     assert loader.arch_for_capability((10,)) is None
     assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
@@ -83,7 +86,7 @@ def test_registry_records_reference_the_build_manifest():
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == pkg.__name__
-    assert set(manifest["arch_flags"]) >= set(BLACKWELL)
+    assert set(manifest["arch_flags"]) >= set(EVERY)
     assert manifest["common"]["requires"]["cuda_toolkit"]["min"]
     libraries = cake_build.libraries_by_name()
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
@@ -101,7 +104,7 @@ def test_registry_records_reference_the_build_manifest():
         assert kind in KINDS and world in loader.WORLDS, name
         assert record["route"] == loader.route_key(world)
         arches = tuple(record["arches"])
-        assert arches and set(arches) <= set(BLACKWELL), name
+        assert arches and set(arches) <= set(EVERY), name
         build = record["build"]
         split = int(build.get("split", 1))
         launch = record["launch"]
@@ -179,7 +182,7 @@ def test_registry_records_reference_the_build_manifest():
 def test_routes_partition_the_token_counts():
     seen = set()
     for arch, routes in loader.ROUTES.items():
-        assert arch in BLACKWELL
+        assert arch in EVERY
         for route, names in routes.items():
             seen.add((arch, route))
             assert len(names) == len(set(names))
@@ -217,9 +220,13 @@ def test_routes_partition_the_token_counts():
         ("sm_100a", "tp8"),
         ("sm_103a", "tp2"),
         ("sm_103a", "tp4"),
+        ("sm_107a", "tp4"),
     }
     assert not loader.route_available("sm_100a", "tp4") and not loader.route_available(
         "sm_103a", "tp8"
+    )
+    assert not loader.route_available("sm_107a", "tp2") and not loader.route_available(
+        "sm_107a", "tp8"
     )
     assert loader.route_modules("sm_100a", "tp4") == ()
     with pytest.raises(NotImplementedError, match="no exported program"):
@@ -240,6 +247,7 @@ def test_kind_slots_are_the_largest_window_edges():
     for (arch, route), expected in KIND_SLOTS.items():
         assert pkg.kind_slots(arch, route) == expected, (arch, route)
     assert pkg.kind_slots("sm_100a", "tp4") == {}
+    assert pkg.kind_slots("sm_107a", "tp2") == {}
 
 
 def test_launch_grid_follows_the_record_and_the_agreed_capacity(monkeypatch):

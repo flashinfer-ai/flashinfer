@@ -193,11 +193,39 @@ def test_quant_plan_grid_and_keys():
     # One CTA per padded row regardless of the SM count.
     assert wide.threads == 128 and wide.min_blocks == 8 and wide.grid == 8192
     assert (
-        _registered(
-            cb.quant_plan(1, 28672, True, False, "sm_100a", 148), "sm_100a"
-        ).grid
+        _registered(cb.quant_plan(1, 2688, True, False, "sm_100a", 148), "sm_100a").grid
         == 128
     )
+    # Short launches of long bf16 rows split every row over a cluster of four CTAs, each
+    # with the CTA shape of a quarter row: one cluster per row, then the padding clusters
+    # (each CTA zeroes 1024 16-byte chunks of the last scale tile's 8 x padded_cols).
+    split = _registered(cb.quant_plan(1, 28672, True, False, "sm_100a", 148), "sm_100a")
+    assert split.cluster_split == 4 and split.kernel_key == "quant:t512_b1_mb1_bf16_cs4"
+    assert split.grid == (1 + 4) * 4 and split.padded_rows == 128
+    split = _registered(cb.quant_plan(32, 18432, True, True, "sm_103a", 152), "sm_103a")
+    assert (split.threads, split.blocks_per_thread, split.min_blocks) == (256, 2, 3)
+    assert split.kernel_key == "quant:t256_b2_mb3_bf16_fold_cs4"
+    assert split.grid == (32 + 3) * 4
+    static = _registered(cb.quant_plan(1, 7168, True, False, "sm_103a", 152), "sm_103a")
+    assert static.kernel_key == "quant:t128_b1_mb1_bf16_cs4_k7168"
+    assert cb.quant_plan(8, 7168, True, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(33, 28672, True, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(8, 28672, False, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(8, 12288, True, False, "sm_100a", 148).cluster_split == 1
+    # K = 8192: one CTA per row for 2..32 tokens (sm_100a) and 2..16 tokens (sm_103a),
+    # with or without the folded out_scale.  One token keeps the four-CTA split, and so
+    # does sm_103a from 17 tokens up to its limits (17 with the out_scale folded).
+    for arch, sm_count, high in (("sm_100a", 148, 32), ("sm_103a", 152, 16)):
+        for fold in (False, True):
+            splits = [
+                cb.quant_plan(m, 8192, True, fold, arch, sm_count).cluster_split
+                for m in (1, 2, high)
+            ]
+            assert splits == [4, 1, 1], (arch, fold, splits)
+    assert cb.quant_plan(17, 8192, True, True, "sm_103a", 152).cluster_split == 4
+    assert cb.quant_plan(18, 8192, True, True, "sm_103a", 152).cluster_split == 1
+    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 152).cluster_split == 4
+    assert cb.quant_plan(32, 8192, True, True, "sm_100a", 148).cluster_split == 1
     # One program per CTA shape (threads, register blocks per thread, occupancy):
     # K = 2688 and 4096 resolve to one shape, 7168 and 8192 to another.  The widths of
     # the static tier share that shape's program and differ in K_STATIC; a width outside
@@ -472,30 +500,34 @@ def _check_conditions(text):
 
 
 def test_shared_binding_sources_keep_distinct_namespaces():
-    # Programs whose exported binding text differs only in the kernel symbol and
-    # the host-shim namespace (the bf16 quantizer: also in the CTA width) build
-    # one binding translation unit: the record whose source it is selects both
-    # through the file's defaults, every other record names its own on the
-    # compile line.  Every record must still export ``run`` from its own
-    # namespace, declare and launch its own kernel symbol, and give the binding
-    # only knob values its kernel source declares, plus the launch-block knob of
-    # the shared bf16 quantizer binding, which must spell the kernel's thread
-    # count.
+    # Every record exports ``run`` from a host-shim namespace no other record uses,
+    # declares and launches its own kernel symbol, and gives the binding only knob
+    # values its kernel source declares (plus the launch-block knob of the shared
+    # bf16 quantizer binding, which must spell the kernel's thread count).  A
+    # binding is in one of two forms:
+    # - shared form: the text spells the kernel and the namespace through
+    #   ``CAKE_PROGRAM_KERNEL`` / ``CAKE_PROGRAM_SHIM``; the record whose source it
+    #   is selects both through the file's defaults, every other record names its
+    #   own on the compile line.  Every binding a second record compiles is in this
+    #   form.
+    # - own form (a rendered program): the text names the record's kernel and its
+    #   own namespace ``cake_binding_kernel_<record>`` literally, only that record
+    #   compiles it, and its compile line names neither macro.
     csrc = Path(cb.__file__).resolve().parent / "csrc"
+    users = {}
+    for name, record in MODULES.items():
+        users.setdefault(record["sources"][1], []).append(name)
     namespaces = {}
     for name, record in MODULES.items():
         binding_source = record["sources"][1]
         assert binding_source.endswith("_binding.cu"), (name, binding_source)
         text = (csrc / binding_source).read_text()
-        assert _BINDING_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
-        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
-        assert _PROGRAM_EXPORT_LINE in text, name
+        opened = _BINDING_NAMESPACE.findall(text)
+        assert len(opened) == 1, (name, opened)
         # TVM_FFI_CHECK stringizes its condition unexpanded: a kernel symbol in
         # a check condition would be spelt as the macro name in the message.
         for condition in _check_conditions(text):
             assert "CAKE_PROGRAM_" not in condition, (name, condition)
-        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
-        assert len(shim_defaults) == 1, (name, shim_defaults)
         shim_flags = [
             f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
         ]
@@ -503,14 +535,29 @@ def test_shared_binding_sources_keep_distinct_namespaces():
             f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
         ]
         assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
-        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
-        if name in binding_source:
-            assert namespace in (None, shim_defaults[0]), (name, namespace)
-            namespace = shim_defaults[0]
+        if opened == ["CAKE_PROGRAM_SHIM"]:
+            assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+            assert _PROGRAM_EXPORT_LINE in text, name
+            shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+            assert len(shim_defaults) == 1, (name, shim_defaults)
+            namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+            if name in binding_source:
+                assert namespace in (None, shim_defaults[0]), (name, namespace)
+                namespace = shim_defaults[0]
+            else:
+                assert namespace is not None, (name, record["compile_flags"])
+                assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+            assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
         else:
-            assert namespace is not None, (name, record["compile_flags"])
-            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
-        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+            namespace = opened[0]
+            assert users[binding_source] == [name], (name, users[binding_source])
+            assert name in binding_source, (name, binding_source)
+            assert not shim_flags and not kernel_flags, (name, record["compile_flags"])
+            assert namespace == f"cake_binding_kernel_{name}", (name, namespace)
+            assert f'extern "C" __global__ void kernel_{name}(' in text, name
+            export_line = f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, {namespace}::Run);"
+            assert export_line in text, name
+            assert "CAKE_PROGRAM_" not in text, name
         namespaces[name] = namespace
         kernel_text = (csrc / record["sources"][0]).read_text()
         binding_knobs = {

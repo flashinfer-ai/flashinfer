@@ -101,6 +101,7 @@ from .cake_jit import (
 )
 from .cake_policy import (
     MERGE_KEY,
+    SAMPLE_SHIFT_PERMILLE_BOUNDS,
     DispatchPolicy,
     ProgramChoice,
     finalize_grid,
@@ -148,6 +149,7 @@ SCAN_SCALARS = (
     "first_cap",
     "sample_tiles_max",
     "sample_shift_permille",
+    "far_sample",
     "check_period",
     "grid_ctas",
     "softmax_scale",
@@ -523,6 +525,7 @@ def plan_dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     outputs_aligned: bool = True,
@@ -560,7 +563,13 @@ def plan_dsa_indexer_topk(
     if sample_tiles_max is not None:
         _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
     if sample_shift_permille is not None:
-        _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
+        _check_int(
+            "sample_shift_permille",
+            sample_shift_permille,
+            *SAMPLE_SHIFT_PERMILLE_BOUNDS,
+        )
+    if far_sample is not None:
+        _check_int("far_sample", far_sample, 0, 1)
     if check_period is not None:
         _check_int("check_period", check_period, 1)
     if finalize_threads is not None:
@@ -579,6 +588,7 @@ def plan_dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=bool(outputs_aligned),
@@ -792,6 +802,7 @@ def prepare_dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> DSAIndexerRunner:
@@ -808,12 +819,18 @@ def prepare_dsa_indexer_topk(
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling) and ``finalize_threads`` (an admissible
-    registered finalize program) change only the internal partition and
-    scheduling of the work: results are bitwise identical for every admissible
-    value.  ``T == 0`` returns a runner whose launches are empty; a call
-    without keys (``Tkv == 0``) fills the outputs with padding instead of
-    launching.
+    threshold; ``0`` disables sampling and sizes the candidate buffers by the
+    record's unsampled capacity values; the shift defaults to the record's
+    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
+    one), ``far_sample`` (``1``: the sampled first threshold of the
+    ascending-tile-order scan programs ranks the far sample tiles only,
+    leaving out the sample tile nearest the diagonal; ``0``: every sample
+    tile; the descending-order and wide programs ignore it) and
+    ``finalize_threads`` (an admissible registered finalize program) change
+    only the internal partition and scheduling of the work: results are
+    bitwise identical for every admissible value.  ``T == 0`` returns a runner
+    whose launches are empty; a call without keys (``Tkv == 0``) fills the
+    outputs with padding instead of launching.
     """
     if backend != "cake":
         raise ValueError("DSA indexer top-k supports backend='cake'")
@@ -867,6 +884,7 @@ def prepare_dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=outputs_aligned,
@@ -924,6 +942,7 @@ def prepare_dsa_indexer_topk(
         ),  # regular trigger only: the first selection fires at the capacity rule
         sample_tiles_max=int(choice.sample_tiles_max),
         sample_shift_permille=int(choice.sample_shift_permille),
+        far_sample=int(choice.far_sample),
         check_period=int(choice.check_period),
         grid_ctas=int(choice.grid_ctas),
         softmax_scale=float(softmax_scale),
@@ -991,6 +1010,7 @@ def dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1021,6 +1041,7 @@ def dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         backend=backend,
     )

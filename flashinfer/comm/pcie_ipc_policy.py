@@ -72,6 +72,11 @@ class IpcVariant(IntEnum):
     COPY_ENGINE_ISLAND = 5
     # Single-piece flat ring with CE stream publication, enabled jointly on SM120.
     COPY_ENGINE_RING_MEMOP = 6
+    # Pipelined flat ring with CE stream publication, SM120 only like the one
+    # above. `blocks` is the depth: how many pieces a chunk travels as. On a
+    # ring whose hops cross the CPU interconnect, the chunks those hops skip
+    # are enlarged and only they are split; see ce_piped_geometry.
+    COPY_ENGINE_RING_PIPED = 7
 
 
 @dataclass(frozen=True)
@@ -180,6 +185,7 @@ def _is_launchable(
         IpcVariant.COPY_ENGINE_RING,
         IpcVariant.COPY_ENGINE_ISLAND,
         IpcVariant.COPY_ENGINE_RING_MEMOP,
+        IpcVariant.COPY_ENGINE_RING_PIPED,
     ):
         if config.variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
             return False
@@ -207,7 +213,13 @@ def _is_launchable(
             )
             if numel % (shards * pack_elems) != 0:
                 return False
-            if (numel // shards) % (config.blocks * pack_elems) != 0:
+            if config.variant == IpcVariant.COPY_ENGINE_RING_PIPED:
+                # Its chunks are not even shares and its pieces need not divide
+                # them; what it needs is a pack for every piece of the smallest
+                # chunk, which this guarantees for any weighting it uses.
+                if numel // pack_elems < 4 * CE_MAX_PIECES * world_size:
+                    return False
+            elif (numel // shards) % (config.blocks * pack_elems) != 0:
                 return False
         return world_size <= config.threads <= 1024
     if not 0 < config.blocks <= max_blocks:

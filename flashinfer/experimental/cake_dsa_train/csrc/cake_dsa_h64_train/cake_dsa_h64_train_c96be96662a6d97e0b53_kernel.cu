@@ -14,45 +14,9 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_dsa_h64_train_device.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
-
-#include <math_constants.h>
 
 extern "C" {
 
@@ -63,11 +27,6 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
     int g = blockIdx.x * 256 + warp * 32 + lane;
@@ -419,9 +378,44 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
         } else {
             unsigned int _packed_0[8];
             #pragma unroll
-            for (int _lp = 0; _lp < 8; _lp++) {
+            for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 0], nat[_lp*2+1 + 0]));
                 _packed_0[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 2], nat[_lp*2+1 + 2]));
+                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 4], nat[_lp*2+1 + 4]));
+                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 6], nat[_lp*2+1 + 6]));
+                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 8], nat[_lp*2+1 + 8]));
+                _packed_0[_lp + 4] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 10], nat[_lp*2+1 + 10]));
+                _packed_0[_lp + 5] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 12], nat[_lp*2+1 + 12]));
+                _packed_0[_lp + 6] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 14], nat[_lp*2+1 + 14]));
+                _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
             }
             {
                 const unsigned* _raw_stv8_16 = reinterpret_cast<const unsigned*>(_packed_0);
@@ -431,9 +425,44 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
             }
             unsigned int _packed_1[8];
             #pragma unroll
-            for (int _lp = 0; _lp < 8; _lp++) {
+            for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 16], nat[_lp*2+1 + 16]));
                 _packed_1[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 18], nat[_lp*2+1 + 18]));
+                _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 20], nat[_lp*2+1 + 20]));
+                _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 22], nat[_lp*2+1 + 22]));
+                _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 24], nat[_lp*2+1 + 24]));
+                _packed_1[_lp + 4] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 26], nat[_lp*2+1 + 26]));
+                _packed_1[_lp + 5] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 28], nat[_lp*2+1 + 28]));
+                _packed_1[_lp + 6] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nat[_lp*2 + 30], nat[_lp*2+1 + 30]));
+                _packed_1[_lp + 7] = *(uint32_t*)&_bf2;
             }
             {
                 const unsigned* _raw_stv8_17 = reinterpret_cast<const unsigned*>(_packed_1);
@@ -791,9 +820,44 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
         } else {
             unsigned int _packed_2[8];
             #pragma unroll
-            for (int _lp = 0; _lp < 8; _lp++) {
+            for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 0], rnat[_lp*2+1 + 0]));
                 _packed_2[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 2], rnat[_lp*2+1 + 2]));
+                _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 4], rnat[_lp*2+1 + 4]));
+                _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 6], rnat[_lp*2+1 + 6]));
+                _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 8], rnat[_lp*2+1 + 8]));
+                _packed_2[_lp + 4] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 10], rnat[_lp*2+1 + 10]));
+                _packed_2[_lp + 5] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 12], rnat[_lp*2+1 + 12]));
+                _packed_2[_lp + 6] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 14], rnat[_lp*2+1 + 14]));
+                _packed_2[_lp + 7] = *(uint32_t*)&_bf2;
             }
             {
                 const unsigned* _raw_stv8_34 = reinterpret_cast<const unsigned*>(_packed_2);
@@ -803,9 +867,44 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
             }
             unsigned int _packed_3[8];
             #pragma unroll
-            for (int _lp = 0; _lp < 8; _lp++) {
+            for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 16], rnat[_lp*2+1 + 16]));
                 _packed_3[_lp] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 18], rnat[_lp*2+1 + 18]));
+                _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 20], rnat[_lp*2+1 + 20]));
+                _packed_3[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 22], rnat[_lp*2+1 + 22]));
+                _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 24], rnat[_lp*2+1 + 24]));
+                _packed_3[_lp + 4] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 26], rnat[_lp*2+1 + 26]));
+                _packed_3[_lp + 5] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 28], rnat[_lp*2+1 + 28]));
+                _packed_3[_lp + 6] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rnat[_lp*2 + 30], rnat[_lp*2+1 + 30]));
+                _packed_3[_lp + 7] = *(uint32_t*)&_bf2;
             }
             {
                 const unsigned* _raw_stv8_35 = reinterpret_cast<const unsigned*>(_packed_3);

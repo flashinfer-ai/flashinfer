@@ -81,10 +81,16 @@ def serving_config(
     Port of the Cake serving seed's configuration rule: the choice depends only on
     caller-visible routing metadata (``K``, ``expected_m``, device), never on a
     trace quantile, so every replay of one profile runs one compiled program.
+
+    ``n_l2_group`` is even in every config: the two CTAs of a cluster take
+    consecutive tiles and must share one 32-row M block. ``expected_m`` is only a
+    hint, so at ``expected_m=1`` a group can still span several M blocks; with
+    ``n_l2_group=1`` the two CTAs of such a group would compute different M
+    blocks and the output would be wrong.
     """
     if k == 7168:
         if expected_m <= 1:
-            return 6, 1, "evict_normal", 0, 1
+            return 6, 1, "evict_normal", 0, 2
         if expected_m <= 3:
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
@@ -121,7 +127,7 @@ def serving_plan(
     key = serving_program_key(
         n, k, groups, num_stages, num_epi_stages, a_cache_hint, n_l2_group
     )
-    program = SERVING_PROGRAMS.get(key)
+    program = SERVING_PROGRAMS.get(f"{arch}:{key}", SERVING_PROGRAMS.get(key))
     if program is None:
         raise NotImplementedError(
             f"no generated packed-scale serving program for N={n}, K={k}, B={groups}, "

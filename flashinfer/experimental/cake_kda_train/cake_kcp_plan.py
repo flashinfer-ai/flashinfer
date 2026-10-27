@@ -205,7 +205,7 @@ PRECISION_MODES = (
     0,
     1,
     2,
-)  # 0 shipped TF32 hi/lo, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
+)  # the TF32 hi/lo walk's static knob: 0 the hi/lo form the transfer_walk knob selects, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
 FLAG_CROSSING_IN = 1
 FLAG_CROSSING_OUT = 2
 FLAG_CONTINUING = 4  # the fragment's first outputs read convolution history rows (document offset > 0)
@@ -2280,7 +2280,7 @@ def kcp_workspace_bytes(
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
     P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
-    is set, holds only known keys and selects a known ``precision_mode`` (0 shipped TF32 hi/lo; 1 the explicit
+    is set, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
     (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
     wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by

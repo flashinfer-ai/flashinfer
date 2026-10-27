@@ -53,7 +53,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
+kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -821,48 +821,45 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                     int need[2];
                                     int kw[2];
                                     int km[2];
-#if __CUDA_ARCH__ == 1000
                                     int sk[2];
-#endif
                                     int c_q = s_count[wg * 2];
                                     int limit_q = ((tau[0] != 0) ? cand_cap : first_cap);
                                     int need_q = ((limit_q < c_q + trigger_room) ? 1 : 0);
                                     int kw_q = top_k;
                                     int km_q = keep_cap;
-#if __CUDA_ARCH__ == 1000
                                     int sk_q = 0;
-#endif
                                     if (need_q == 0) {
                                         if (sample_c != 0) {
                                             if (row_valid[0] != 0) {
-#if __CUDA_ARCH__ == 1000
                                                 int vis_abs = visible[0];
                                                 int vis_c = vis_abs - lo_keys;
+#if __CUDA_ARCH__ == 1000
                                                 int _max_9 = ((vis_c - (n_tiles_5 - 1) * 128) > (0) ? (vis_c - (n_tiles_5 - 1) * 128) : (0));
                                                 int n_diag = ((_max_9) < (128) ? (_max_9) : (128));
                                                 int c_far = c_q - n_diag;
                                                 int v_far = vis_c - n_diag;
+#else
+                                                int t_near = (n_s - 1) * stride_1;
+                                                int _max_10 = ((vis_c - t_near * 128) > (0) ? (vis_c - t_near * 128) : (0));
+                                                int _min_9 = ((_max_10) < (128) ? (_max_10) : (128));
+                                                int n_near = _min_9 * far_sample;
+                                                int c_far = c_q - n_near;
+                                                int v_far = vis_c - n_near;
+#endif
                                                 if (v_far > 0) {
                                                     int r_q = (top_k * c_far + v_far - 1) / v_far;
                                                     int r_shift = r_q + r_q * sample_shift_permille / 1000 + 24;
                                                     if (r_shift < c_far) {
-#else
-                                                int vis_c = visible[0] - lo_keys;
-                                                if (vis_c > 0) {
-                                                    int r_c = (top_k * c_q + vis_c - 1) / vis_c;
-                                                    int r_shift_c = r_c + r_c * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift_c < c_q) {
-#endif
                                                         need_q = 1;
-#if __CUDA_ARCH__ == 1000
                                                         kw_q = r_shift;
+#if __CUDA_ARCH__ == 1000
                                                         int _min_10 = ((r_shift + 64) < (keep_cap) ? (r_shift + 64) : (keep_cap));
                                                         km_q = _min_10;
                                                         sk_q = n_diag;
 #else
-                                                        kw_q = r_shift_c;
-                                                        int _min_9 = ((r_shift_c + 64) < (keep_cap) ? (r_shift_c + 64) : (keep_cap));
-                                                        km_q = _min_9;
+                                                        int _min_11 = ((r_shift + 64) < (keep_cap) ? (r_shift + 64) : (keep_cap));
+                                                        km_q = _min_11;
+                                                        sk_q = n_near;
 #endif
                                                     }
                                                 }
@@ -872,49 +869,46 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                     need[0] = need_q;
                                     kw[0] = kw_q;
                                     km[0] = km_q;
-#if __CUDA_ARCH__ == 1000
                                     sk[0] = sk_q;
-#endif
                                     need_any = need_any | need_q;
                                     int c_q_0 = s_count[wg * 2 + 1];
                                     int limit_q_1 = ((tau[1] != 0) ? cand_cap : first_cap);
                                     int need_q_2 = ((limit_q_1 < c_q_0 + trigger_room) ? 1 : 0);
                                     int kw_q_3 = top_k;
                                     int km_q_4 = keep_cap;
-#if __CUDA_ARCH__ == 1000
                                     int sk_q_5 = 0;
-#endif
                                     if (need_q_2 == 0) {
                                         if (sample_c != 0) {
                                             if (row_valid[1] != 0) {
-#if __CUDA_ARCH__ == 1000
                                                 int vis_abs_1 = visible[1];
                                                 int vis_c_1 = vis_abs_1 - lo_keys;
+#if __CUDA_ARCH__ == 1000
                                                 int _max_11 = ((vis_c_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1 - (n_tiles_5 - 1) * 128) : (0));
                                                 int n_diag_1 = ((_max_11) < (128) ? (_max_11) : (128));
                                                 int c_far_1 = c_q_0 - n_diag_1;
                                                 int v_far_1 = vis_c_1 - n_diag_1;
+#else
+                                                int t_near_1 = (n_s - 1) * stride_1;
+                                                int _max_13 = ((vis_c_1 - t_near_1 * 128) > (0) ? (vis_c_1 - t_near_1 * 128) : (0));
+                                                int _min_12 = ((_max_13) < (128) ? (_max_13) : (128));
+                                                int n_near_1 = _min_12 * far_sample;
+                                                int c_far_1 = c_q_0 - n_near_1;
+                                                int v_far_1 = vis_c_1 - n_near_1;
+#endif
                                                 if (v_far_1 > 0) {
                                                     int r_q_1 = (top_k * c_far_1 + v_far_1 - 1) / v_far_1;
                                                     int r_shift_1 = r_q_1 + r_q_1 * sample_shift_permille / 1000 + 24;
                                                     if (r_shift_1 < c_far_1) {
-#else
-                                                int vis_c_1 = visible[1] - lo_keys;
-                                                if (vis_c_1 > 0) {
-                                                    int r_c_1 = (top_k * c_q_0 + vis_c_1 - 1) / vis_c_1;
-                                                    int r_shift_c_1 = r_c_1 + r_c_1 * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift_c_1 < c_q_0) {
-#endif
                                                         need_q_2 = 1;
-#if __CUDA_ARCH__ == 1000
                                                         kw_q_3 = r_shift_1;
+#if __CUDA_ARCH__ == 1000
                                                         int _min_12 = ((r_shift_1 + 64) < (keep_cap) ? (r_shift_1 + 64) : (keep_cap));
                                                         km_q_4 = _min_12;
                                                         sk_q_5 = n_diag_1;
 #else
-                                                        kw_q_3 = r_shift_c_1;
-                                                        int _min_10 = ((r_shift_c_1 + 64) < (keep_cap) ? (r_shift_c_1 + 64) : (keep_cap));
-                                                        km_q_4 = _min_10;
+                                                        int _min_14 = ((r_shift_1 + 64) < (keep_cap) ? (r_shift_1 + 64) : (keep_cap));
+                                                        km_q_4 = _min_14;
+                                                        sk_q_5 = n_near_1;
 #endif
                                                     }
                                                 }
@@ -924,25 +918,19 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                     need[1] = need_q_2;
                                     kw[1] = kw_q_3;
                                     km[1] = km_q_4;
-#if __CUDA_ARCH__ == 1000
                                     sk[1] = sk_q_5;
-#endif
                                     need_any = need_any | need_q_2;
                                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
                                     if (need_any != 0) {
                                         int need_pair = need[1];
                                         int kw_pair = kw[1];
                                         int km_pair = km[1];
-#if __CUDA_ARCH__ == 1000
                                         int sk_pair = sk[1];
-#endif
                                         if (pair == 0) {
                                             need_pair = need[0];
                                             kw_pair = kw[0];
                                             km_pair = km[0];
-#if __CUDA_ARCH__ == 1000
                                             sk_pair = sk[0];
-#endif
                                         }
                                         if (need_pair != 0) {
                                             int c_pair = s_count[slot_pair];
@@ -972,32 +960,23 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                                     for (int u = 0; u < 8; u++) {
                                                         int idx_l = s_pro * 512 + half * 32 + lane_0 + 64 * u;
                                                         ring[s_pro * 8 + u] = 0;
-#if __CUDA_ARCH__ == 1000
                                                         if (idx_l < c_pair - sk_pair) {
+#if __CUDA_ARCH__ == 1000
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pair + sk_pair + idx_l];
 #else
-                                                        if (idx_l < c_pair) {
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pair + idx_l];
 #endif
                                                         }
                                                     }
                                                 }
-#if __CUDA_ARCH__ == 1000
                                                 int nbat = (c_pair - sk_pair + 512 - 1) / 512;
-#else
-                                                int nbat = (c_pair + 512 - 1) / 512;
-#endif
                                                 #pragma unroll 1
                                                 for (int g = 0; g < nbat; g += 2) {
                                                     #pragma unroll
                                                     for (int s_st = 0; s_st < 2; s_st++) {
                                                         #pragma unroll
                                                         for (int u_1 = 0; u_1 < 8; u_1++) {
-#if __CUDA_ARCH__ == 1000
                                                             int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_pair - sk_pair) ? 1 : 0);
-#else
-                                                            int valid_p = ((c_pair > (g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1) ? 1 : 0);
-#endif
                                                             unsigned int bits_1 = (unsigned int)(ring[s_st * 8 + u_1] >> 32);
                                                             int kid_1 = (int)(unsigned int)(ring[s_st * 8 + u_1] & 4294967295);
                                                             unsigned int magnitude_1 = bits_1 & 2147483647;
@@ -1019,11 +998,10 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                                         for (int u_2 = 0; u_2 < 8; u_2++) {
                                                             int idx_l_1 = (g + s_st + 1) * 512 + half * 32 + lane_0 + 64 * u_2;
                                                             ring[(s_st + 1) % 2 * 8 + u_2] = 0;
-#if __CUDA_ARCH__ == 1000
                                                             if (idx_l_1 < c_pair - sk_pair) {
+#if __CUDA_ARCH__ == 1000
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pair + sk_pair + idx_l_1];
 #else
-                                                            if (idx_l_1 < c_pair) {
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pair + idx_l_1];
 #endif
                                                             }
@@ -1215,8 +1193,8 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                             unsigned long long _max_13 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
                                             tau[0] = _max_13;
 #else
-                                            unsigned long long _max_11 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
-                                            tau[0] = _max_11;
+                                            unsigned long long _max_15 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
+                                            tau[0] = _max_15;
 #endif
                                         }
                                         if (need[1] != 0) {
@@ -1227,8 +1205,8 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                             unsigned long long _max_14 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
                                             tau[1] = _max_14;
 #else
-                                            unsigned long long _max_12 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
-                                            tau[1] = _max_12;
+                                            unsigned long long _max_16 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
+                                            tau[1] = _max_16;
 #endif
                                         }
                                     }
@@ -1251,8 +1229,8 @@ kernel_cake_dsa_indexer_topk_521027e8563a9664acef(const __grid_constant__ CUtens
                                     int _min_15 = ((top_k) < (visible_pair - lo_keys) ? (top_k) : (visible_pair - lo_keys));
                                     if (c_final < _min_15) {
 #else
-                                    int _min_13 = ((top_k) < (visible_pair - lo_keys) ? (top_k) : (visible_pair - lo_keys));
-                                    if (c_final < _min_13) {
+                                    int _min_17 = ((top_k) < (visible_pair - lo_keys) ? (top_k) : (visible_pair - lo_keys));
+                                    if (c_final < _min_17) {
 #endif
                                         fail_pair = 1;
                                     }

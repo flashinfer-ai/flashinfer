@@ -549,7 +549,7 @@ def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
         assert synthetic_ref is not None
         assert synthetic_ref() is None
 
-    def sync_oom(local_oom):
+    def sync_oom(local_oom, **kwargs):
         gc.collect()
         if local_oom:
             assert synthetic_ref is not None
@@ -638,7 +638,7 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
             fail_preparation()
         return tensors
 
-    def sync_oom(local_oom):
+    def sync_oom(local_oom, **kwargs):
         if local_oom:
             gc.collect()
             assert synthetic_ref() is None
@@ -648,6 +648,10 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner._tune_process_group",
         object() if distributed else None,
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._check_tuning_group_phase",
+        lambda *args, **kwargs: None,
     )
     # The sentinel group models OOM handling; real collectives are covered
     # by test_autotuner_distributed.py.
@@ -674,7 +678,7 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
         )
 
     if distributed:
-        sync.assert_any_call(True)
+        assert any(call.args == (True,) for call in sync.call_args_list)
     else:
         assert exc.value is local_errors[0]
     profile.assert_not_called()

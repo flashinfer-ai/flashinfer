@@ -1,9 +1,14 @@
 # CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on push/PR to main.
+# Runs AOT build tests and GPU unit tests on PRs to main, and on main itself on
+# a schedule.
 # Uses ci/bash.sh for Docker execution (same as Jenkins).
 #
 # Permission Control:
-# - Push to main: Always runs
+# - main: a scheduled full-suite run three times a day (not per merge). Per-merge
+#   runs shared one cancel-in-progress group, so each merge cancelled the last:
+#   about 90% of them never finished. A scheduled run is never cancelled, runs
+#   every lane to completion (no fail-fast), and a failure opens or updates a
+#   tracking issue; the next green run closes it.
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
 #   Applying the label is the trigger, so new commits need a new trigger:
 #   @flashinfer-bot run.
@@ -20,8 +25,10 @@
 name: PR Test
 
 on:
-  push:
-    branches: [main]
+  # Off the 00:00 UTC nightly-release slot; one run per Asia / EU / US workday.
+  # Minute 17, not 0: GitHub delays or drops scheduled runs at the top of the hour.
+  schedule:
+    - cron: '17 4,12,20 * * *'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, ready_for_review]
@@ -39,8 +46,11 @@ on:
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
   # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
-  cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
+  # Scheduled runs on main get their own group and never cancel each other: at
+  # most one runs and one waits, so a slow run delays the next instead of wasting
+  # itself.
+  group: pr-test-${{ github.event_name == 'schedule' && 'scheduled-' || '' }}${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
 
 permissions:
   contents: read
@@ -69,7 +79,7 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
         run: |
-          # Always allow push to main and workflow_dispatch
+          # Always allow scheduled runs on main and workflow_dispatch
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
@@ -349,6 +359,8 @@ jobs:
   # them on the first failure. As separate jobs, fail-fast is scoped per group
   # and the other groups keep running on billed on-demand capacity long after
   # the result is known. Entries still start in parallel; nothing is serialized.
+  # Scheduled runs on main turn fail-fast off: they exist to report every broken
+  # lane, not the first one.
   # ---------------------------------------------------------------------------
   test:
     name: ${{ matrix.name }}
@@ -360,7 +372,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
-      fail-fast: true
+      fail-fast: ${{ github.event_name != 'schedule' }}
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
@@ -372,6 +384,12 @@ jobs:
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
       TEST_PATH_ARG: ${{ matrix.test_path }}
+      # GPU lanes route their JIT compiles through the AOT lanes' S3 sccache.
+      # On unless the repository variable FLASHINFER_GPU_TEST_SCCACHE is '0',
+      # which turns it off for A/B timing without a code change. The `|| '1'`
+      # matters: an unset variable is null, and `null != '0'` is false because
+      # mismatched types are compared as numbers (null and '0' both become 0).
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -441,46 +459,21 @@ jobs:
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
-      - name: Display sccache stats
-        if: always() && matrix.kind == 'aot'
-        run: |
-          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
-          if [ -s "${STATS_FILE}" ]; then
-            cat "${STATS_FILE}"
-          else
-            echo "::warning::sccache stats were not produced"
-          fi
-
-      - name: Record sccache job metadata
-        if: always() && matrix.kind == 'aot'
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
-          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
-          {
-            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
-            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
-            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
-            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
-            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
-          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
-
-      - name: Upload sccache stats
-        if: always() && matrix.kind == 'aot'
-        uses: actions/upload-artifact@v4
-        with:
-          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}
-          path: sccache-stats/
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Run Test
         if: matrix.kind != 'aot'
         env:
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
           # Kernel compile cache kept across this runner's jobs (see ci/bash.sh).
           # runner.workspace is the parent of the checkout, so the Cleanup step's
           # wipe of the checkout leaves it, and on the H100 hosts it sits on the
           # large NVMe work volume rather than the small root filesystem.
           CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
+          CI_COMPILE_CACHE_RUNNER: ${{ runner.name }}
+          # PR/manual runs consume private copies. Only main pushes update seeds.
+          CI_COMPILE_CACHE_MODE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
@@ -489,13 +482,29 @@ jobs:
               exit 1
               ;;
           esac
+          # ci/bash.sh options must precede the command. The credentials are
+          # forwarded by name so ci/bash.sh never echoes their values.
+          DOCKER_ARGS=()
+          LANE_COMMAND=("./scripts/${TEST_SCRIPT}")
+          if [ "${GPU_TEST_SCCACHE}" = "1" ]; then
+            mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+            DOCKER_ARGS+=(
+              -e SCCACHE_BUCKET "${SCCACHE_BUCKET}"
+              -e SCCACHE_REGION "${SCCACHE_REGION}"
+              -e AWS_ACCESS_KEY_ID
+              -e AWS_SECRET_ACCESS_KEY
+              -e SCCACHE_STATS_DIR /workspace/sccache-stats
+            )
+            LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
+          fi
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
           fi
-          # Per-build compile times, summarized by the next step.
+          # Per-build compile times, summarized by the "Summarize JIT build times"
+          # step. Appended: DOCKER_ARGS already carries the sccache settings.
           mkdir -p junit
-          DOCKER_ARGS=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
+          DOCKER_ARGS+=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
           if [ "${MATRIX_KIND}" = "gpu" ] && [ "${TEST_SCRIPT}" = "task_run_unit_tests.sh" ]; then
             # Targeted T4 runs compile with the same Ninja parallelism as the
             # bare-run T4 script (MAX_JOBS=nproc) instead of test_utils.sh's
@@ -520,16 +529,51 @@ jobs:
             # outside JIT_TEST_SCOPE. Comma-joined because ci/bash.sh word-splits
             # -e values.
             DOCKER_ARGS+=(-e JIT_TEST_SCOPE "$(IFS=,; echo "${TEST_TARGETS[*]}")")
-            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}"
           elif [ "${#TEST_TARGETS[@]}" -gt 0 ]; then
             # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}"
           fi
+
+      - name: Display sccache stats
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+            printf 'matrix_kind=%s\n' "${MATRIX_KIND}"
+            printf 'test_script=%s\n' "${TEST_SCRIPT}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        uses: actions/upload-artifact@v4
+        with:
+          # GPU lanes share a CUDA/runner pair, so they add the matrix index.
+          name: ${{ matrix.kind == 'aot' && format('sccache-stats-{0}-{1}', matrix.cuda, matrix.runner[2]) || format('sccache-stats-{0}-{1}-{2}', matrix.kind, matrix.cuda, strategy.job-index) }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Summarize JIT build times
         if: always() && matrix.kind != 'aot'
@@ -560,6 +604,7 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/collection-*/*.log
             junit/jit-builds.jsonl
             junit/run-summary.json
           if-no-files-found: warn
@@ -945,3 +990,53 @@ jobs:
           # cancelled test means "stopped early", not "flaky".
           echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # Report scheduled main results - one open tracking issue while main is red
+  # ---------------------------------------------------------------------------
+  report-main-status:
+    name: Report Main Status
+    if: github.event_name == 'schedule' && !cancelled()
+    needs: [test-results-summary]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RESULT: ${{ needs.test-results-summary.result }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      TITLE: "Scheduled PR Test is failing on main"
+    steps:
+      - name: Open, update or close the tracking issue
+        run: |
+          # A re-run keeps its run ID, so an old run re-run late must not override
+          # the result of a newer scheduled run that has already finished.
+          NEWER=$(gh run list --workflow pr-test.yml --event schedule --branch main \
+            --status completed --limit 20 --json databaseId \
+            --jq "map(select(.databaseId > $RUN_ID)) | length")
+          if [ "$NEWER" != "0" ]; then
+            echo "A newer scheduled run has already finished; leaving the issue to it"
+            exit 0
+          fi
+
+          ISSUE=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+            --json number,title --jq "map(select(.title == \"$TITLE\"))[0].number // empty")
+
+          if [ "$RESULT" == "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              gh issue close "$ISSUE" --comment "Green again at $SHA: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          BODY="Scheduled run on \`$SHA\` failed: $RUN_URL"
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" \
+              --body "$BODY. This issue gets a comment per failed run and closes on the next green one."
+          fi

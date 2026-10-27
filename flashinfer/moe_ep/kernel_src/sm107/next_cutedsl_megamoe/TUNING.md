@@ -105,7 +105,95 @@ measured MXFP8 optimum.
 
 Engine configuration has the same distinction: `knobs=None` preserves
 explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
-and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
+and a dictionary overrides fields. `knobs="auto"` also permits collective
+tuning during a FlashInfer `autotune_v2()` warmup. It uses the same candidates
+and sampled numerical checks as the offline tuner.
+
+Automatic selection checks FlashInfer records first, then the MegaMoE cache
+file, using the same capacity/live-token buckets and numerical compatibility
+rules. Replay can import a compatible file record into memory. Tuning requires
+matching measurement provenance; an older record without it triggers a search.
+Every selected winner is also written to the configured MegaMoE file, including on a
+FlashInfer cache hit. Disabling the MegaMoE file with
+`FLASHINFER_MOE_EP_KNOB_CACHE=off` does not disable FlashInfer's cache.
+The installed winner and its cache identity belong to the workspace. Returning
+to an earlier store or policy reselects from that store if a different winner
+has since been installed.
+
+Compatibility uses the existing MegaMoE backend revision, standard FlashInfer
+v2 environment metadata, and numerical, device and resource checks. Python
+source files are not hashed for tuning compatibility. Update `BACKEND_REVISION`
+in `shim/knob_cache.py` when kernel or knob semantics invalidate previous results.
+
+Without an enabled autotune context, an automatic layer can install a cached
+winner; a miss uses its initial heuristic configuration and leaves tuning
+pending. Initial allocation does not read either cache, so rank-local files
+cannot change allocation before collective selection. All EP ranks must enter
+matching contexts and forwards. Use `autotune_v2()` for automatic persistent
+output. The protocol publishes on EP rank zero; every rank participates in
+selection and execution:
+
+```python
+with autotune_v2():
+    layer.warmup(tensors)  # Construct the layer with knobs="auto".
+```
+
+A later process can load the managed store with `autotune_v2(mode="replay")`.
+No `cache=` filename is required. `persistent_cache=False` disables both managed
+storage and the MegaMoE compatibility file for the context. Protocol records
+are not read or written by the v1 JSON API.
+
+`tuning_buckets` and `round_up=True` are not supported for automatic selection
+and raise before cache lookup or tuning. Prepare workspaces with the desired
+capacities instead; selection retains MegaMoE's capacity/live-token lookup.
+
+The default measurement preserves the native CUDA-event loop. Explicit
+`MeasurementPolicy(execution_mode="eager")` includes per-call host overhead;
+`execution_mode="cuda_graph"` captures and replays the prepared candidate.
+`cold_l2=True` flushes L2 before each measured invocation, outside its timed
+interval. Every mode measures the kernel boundary without input staging and
+takes the median of matched maximum-rank samples. Policies have separate cache
+identities. Capture-unsupported candidates are skipped collectively; GPU launch
+failures abort. The diagnostic CUPTI timer uses a collective CUDA-event fallback
+if tracing is unavailable on any rank, as in the framework's ordinary profiler.
+
+Tune before CUDA graph capture. Automatic workspaces are private to their
+layer. Winner installation retains staged inputs and transformed weights and
+can replace output buffers, kernel scratch and compiled state. Reacquire borrowed
+output views after selection. Once captured, a workspace cannot
+install another winner. A later Python forward that needs selection replaces
+the default workspace before staging inputs and keeps the old storage alive
+until layer destruction. Existing graphs continue to use their original
+workspace. The replacement shares transformed weights and needs its own graph
+capture. Tuning and graph replay must run sequentially.
+Repeated capture and replacement can retain more than two workspaces. Use
+explicit handles when old workspaces need to be released before layer destruction.
+Each eager automatic forward coordinates selection across the EP group, even
+when this rank needs no change. A peer may have invalidated its local cache.
+Default workspaces also coordinate replacement before allocating storage.
+CUDA graph replay does not run these host checks.
+
+For explicit lifetime control, use `layer.create_workspace(capacity)` on an
+automatic layer. Each handle has independent storage and selection state, even
+at the same capacity. Pass it to `warmup(..., workspace=handle)` inside the v2
+context, then capture `forward(..., workspace=handle)`. Handles keep stable
+addresses after capture; later tuning requires another handle. Destroy a handle
+collectively only after retiring its referencing graphs and synchronizing all
+work that uses it. A store/policy switch or `autotune_v2_reload()` invalidates
+the automatic selection's local identity.
+Automatic handles accept the offline `live_tokens` profile hint but warn at
+creation that it does not affect automatic selection. Their lookup uses the
+actual warmup or forward batch, taking the maximum live count across EP ranks.
+`layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
+configuration; omitting `workspace` returns the default workspace's result.
+Neither getter allocates or performs selection.
+Warm up again before capture after changing the cache or measurement policy.
+If the new store has no compatible winner and tuning is disabled, an uncaptured
+workspace returns to its initial configuration instead of keeping the old
+store's winner. Captured explicit handles retain their prepared configuration.
+Adding `moe_ep.sm107.cutedsl.native.v1` to `skip_ops` forces initial knobs without
+cache lookup or search. Apply it before capture; a captured explicit handle
+with a selected winner requires a new handle to prepare the fallback.
 
 ## Benchmark workloads
 
@@ -200,6 +288,14 @@ Report Torch staging cost separately when evaluating a fused staging implementat
 
 ## Offline tuning
 
+The CLI always searches afresh and leaves its input workspace unchanged. It
+writes each winner to the managed FlashInfer v2 store and the MegaMoE file on
+EP rank zero. The default store is `FLASHINFER_CACHE_DIR/autotune`;
+`FLASHINFER_AUTOTUNE_CACHE_DIR` overrides its root directory. Applications use
+`autotune_v2()` or `autotune_v2(mode="replay")` to reuse these results.
+The managed record and MegaMoE file include implementation, dependency,
+fixed-resource and measurement compatibility information.
+
 Use a separate cache file for each qualification job to avoid concurrent
 writers. Start with the regular candidate grid; use a schedule sweep with
 production-like skew after correctness passes:
@@ -214,8 +310,9 @@ timeout --kill-after=15s 3600s torchrun --standalone --nproc_per_node=4 \
 ```
 
 The tuner verifies collective candidate agreement, rejects invalid geometry
-before symmetric allocation, checks sampled outputs against a Torch oracle,
-then measures isolated CUDA-event launches. It reduces each iteration with
+before symmetric allocation, prepares each candidate on every rank before
+launching, checks sampled outputs against a Torch oracle, then measures isolated
+CUDA-event launches. Preparation failures are reported across the EP group. It reduces each iteration with
 MAX across ranks before taking the median. Only a candidate passing the
 numerical checks can enter the cache. Runtime failures stop the job;
 relaunch in fresh workers instead of continuing on a failed CUDA context.

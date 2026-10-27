@@ -76,6 +76,10 @@ void Run(TensorView a_out, TensorView a_prefix, TensorView a_delta, TensorView a
   check_same_device(a_qk_weight, a_out, "qk_weight", "out");
   check_contiguous(a_output_norm_weight, "output_norm_weight");
   check_same_device(a_output_norm_weight, a_out, "output_norm_weight", "out");
+  TVM_FFI_CHECK((a_blocks_k_stride >= 7168LL), ValueError)
+      << KERNEL_NAME << ": requires (blocks_k_stride >= 7168)";
+  TVM_FFI_CHECK((a_blocks_m_stride >= 7168LL), ValueError)
+      << KERNEL_NAME << ": requires (blocks_m_stride >= 7168)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
