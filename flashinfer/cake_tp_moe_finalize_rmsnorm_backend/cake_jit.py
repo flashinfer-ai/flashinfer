@@ -3443,7 +3443,6 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe": {
         "arches": [
-            "sm_103a",
             "sm_107a",
         ],
         "arg_plan": [
@@ -3585,12 +3584,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "rows_between",
             "windows": {
-                "sm_103a": [
-                    [
-                        8,
-                        24,
-                    ],
-                ],
                 "sm_107a": [
                     [
                         8,
@@ -4533,6 +4526,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_tp_moe_finalize_rmsnorm_b5b7351771974b74e6b5": {
         "arches": [
+            "sm_103a",
             "sm_107a",
         ],
         "arg_plan": [
@@ -4691,6 +4685,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "rows_between",
             "windows": {
+                "sm_103a": [
+                    [
+                        8,
+                        24,
+                    ],
+                ],
                 "sm_107a": [
                     [
                         24,
@@ -4793,7 +4793,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "tp4": [
             "cake_tp_moe_finalize_rmsnorm_0357e2ae406a374a7aba",
-            "cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe",
+            "cake_tp_moe_finalize_rmsnorm_b5b7351771974b74e6b5",
             "cake_tp_moe_finalize_rmsnorm_a518b8ead2e395b00eeb",
             "cake_tp_moe_finalize_rmsnorm_796f08510bd47a117fe5",
             "cake_tp_moe_finalize_rmsnorm_84ac8b5dd4ab0a63227f",
