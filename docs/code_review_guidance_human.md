@@ -70,6 +70,13 @@ Where defendability matters more:
 - **Disposable code areas** — model-specific ops (DSv3, MSA) that matter today but likely lose
   relevance within months — warrant a lighter touch on long-term design purity.
 
+### Triggering CI
+When you start CI on a PR, pass a test target: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) or
+`/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths under `tests/`. A bare `run` with
+no target starts the full suite, which is expensive — reserve it for a final pre-merge check
+of a cross-cutting change. The PR's Tests section should name the targets; if it doesn't, ask
+the author for them rather than defaulting to a full run.
+
 ## Non-focus
 
 ### Backwards compatibility (API breakage)
