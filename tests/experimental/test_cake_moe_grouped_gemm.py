@@ -326,7 +326,7 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
     (``K`` 6144) takes the evict-first wide tile on sm_107a at 4 and 8 groups and the
     plain wide tile at 16 and 32; the down projection (``K`` 2048) and the other
     architectures never take it.  The weight gradient's 512-wide k tile starts at 4096
-    rows per group on sm_107a (32 groups) and at 8192 on sm_100a / sm_103a."""
+    rows per group (32 groups) on every architecture."""
     c = HOST_PLAN_CONSTANTS
     name = cake_jit.record_name("dgrad")
     for groups in EXPERT_GROUPS:
@@ -338,7 +338,7 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
             )
             assert tile_n == int(c["wide_block_n"]), (arch, groups, k)
             assert stage == ("main_wide_ef" if ef else "main_wide"), (arch, groups, k)
-        k512 = groups <= 16 or arch == "sm_107a"
+        k512 = EXPERT_ROWS // groups >= 4096
         for k in (2048, 6144):
             tile_k = cb.select_wgrad_tile(k, arch, EXPERT_ROWS, groups, c)
             assert tile_k == (512 if k512 else 256), (arch, groups, k)
