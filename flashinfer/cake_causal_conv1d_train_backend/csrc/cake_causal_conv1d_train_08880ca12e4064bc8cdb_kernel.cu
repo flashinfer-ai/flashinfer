@@ -50,12 +50,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_STAGE_BUF_OFF 1024
-#define SMEM_STAGE_BUF_STAGE_BYTES 32768
-#define SMEM_STAGE_BUF_STRIDE 32768
-#define SMEM_CELLS_OFF 33792
-#define SMEM_CELLS_STAGE_BYTES 16
-#define SMEM_CELLS_STRIDE 16
-#define SMEM_TOTAL 33920
+#define SMEM_STAGE_BUF_STAGE_BYTES 45056
+#define SMEM_STAGE_BUF_STRIDE 45056
+#define SMEM_CELLS_OFF 46080
+#define SMEM_CELLS_STAGE_BYTES 24
+#define SMEM_CELLS_STRIDE 24
+#define SMEM_TOTAL 46208
 #define THREADS 128
 #define LAUNCH_MIN_BLOCKS 4
 
@@ -191,8 +191,8 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
     // Kernel setup ops
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int stage_buf_addr = smem + 1024;
-    int* cells = reinterpret_cast<int*>(smem_raw + 33792);
-    const int cells_addr = smem + 33792;
+    int* cells = reinterpret_cast<int*>(smem_raw + 46080);
+    const int cells_addr = smem + 46080;
 
     // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
     // Mbarriers at smem_raw[0..16)
@@ -296,38 +296,53 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
     int row_bytes = ct_vec * 16;
     long long cbase64 = (long long)(ct * ct_vec * 8);
     int cbytes = ((row_bytes) < ((C - ct * ct_vec * 8) * 2) ? (row_bytes) : ((C - ct * ct_vec * 8) * 2));
+    int last = 0;
     if (tid == 0) {
         int _atomic_fetch_add_4 = atomicAdd(&work[ct], 1);
-        cells[0] = _atomic_fetch_add_4;
-        int _atomic_fetch_add_5 = atomicAdd(&work[ct], 1);
-        cells[1] = _atomic_fetch_add_5;
+        last = _atomic_fetch_add_4;
+        cells[0] = last;
+        cells[4] = last;
+        int second = atomicAdd(&work[ct], 1);
+        cells[1] = second;
+        cells[5] = second;
     }
     __syncthreads();
     #pragma unroll 1
     for (int k0 = 0; k0 < 2; k0++) {
-        int qn = cells[(int)((unsigned int)k0 / 1 % 4)];
+        int qn = cells[4 + k0];
         if (qn < nch) {
             int stage_t0 = qn * n_sub * 8 + (int)((unsigned int)k0 % 1) * 8;
             if (tid == 0) {
                 int rem = S - stage_t0;
-                int _max_6 = ((rem + 0) > (0) ? (rem + 0) : (0));
-                int n_full = (((int)((unsigned int)_max_6 / 8)) < (n_sub) ? ((int)((unsigned int)_max_6 / 8)) : (n_sub));
+                int _max_5 = ((rem + 0) > (0) ? (rem + 0) : (0));
+                int n_full = (((int)((unsigned int)_max_5 / 8)) < (n_sub) ? ((int)((unsigned int)_max_5 / 8)) : (n_sub));
                 int tail_rows = 0;
                 if (n_full < n_sub) {
-                    int _max_8 = ((rem - n_full * 8) > (0) ? (rem - n_full * 8) : (0));
-                    int _min_7 = ((_max_8) < (8) ? (_max_8) : (8));
-                    tail_rows = _min_7;
+                    int _max_7 = ((rem - n_full * 8) > (0) ? (rem - n_full * 8) : (0));
+                    int _min_6 = ((_max_7) < (8) ? (_max_7) : (8));
+                    tail_rows = _min_6;
+                }
+                if (stage_t0 > 0 && n_sub > 1) {
+                    tail_rows = tail_rows + 3;
                 }
                 mbarrier_arrive_expect_tx(stage_full_addr + ((int)((unsigned int)k0 % 2)) * 8, (n_full * 8 + tail_rows) * cbytes);
+                if (stage_t0 > 0 && n_sub > 1) {
+                    #pragma unroll 1
+                    for (int i = 0; i < 3; i++) {
+                        long long hsrc = (long long)(stage_t0 - 3 + i) * C64 + cbase64;
+                        int haddr = (int)stage_buf_addr + 32768 + ((int)((unsigned int)k0 % 2) * 3 + i) * 2048;
+                        cp_async_bulk_gmem2smem(haddr, reinterpret_cast<const uint8_t*>(x + hsrc), cbytes, stage_full_addr + ((int)((unsigned int)k0 % 2)) * 8);
+                    }
+                }
             }
             if (tid - sub * ct_vec == 0 && sub < n_sub) {
                 int ts_n = stage_t0 + sub * 8;
-                int _max_9 = ((S - ts_n) > (0) ? (S - ts_n) : (0));
-                int rows_n = ((_max_9) < (8) ? (_max_9) : (8));
+                int _max_8 = ((S - ts_n) > (0) ? (S - ts_n) : (0));
+                int rows_n = ((_max_8) < (8) ? (_max_8) : (8));
                 #pragma unroll 1
-                for (int i = 0; i < rows_n; i++) {
-                    long long src = (long long)(ts_n + i) * C64 + cbase64;
-                    int saddr = (int)stage_buf_addr + (((int)((unsigned int)k0 % 2) * 8 + i) * 128 + sub * ct_vec) * 16;
+                for (int i_1 = 0; i_1 < rows_n; i_1++) {
+                    long long src = (long long)(ts_n + i_1) * C64 + cbase64;
+                    int saddr = (int)stage_buf_addr + (((int)((unsigned int)k0 % 2) * 8 + i_1) * 128 + sub * ct_vec) * 16;
                     cp_async_bulk_gmem2smem(saddr, reinterpret_cast<const uint8_t*>(x + src), cbytes, stage_full_addr + ((int)((unsigned int)k0 % 2)) * 8);
                 }
             }
@@ -335,8 +350,8 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
     }
     float win[32];
     #pragma unroll
-    for (int i_1 = 0; i_1 < 32; i_1++) {
-        win[i_1] = 0.0f;
+    for (int i_2 = 0; i_2 < 32; i_2++) {
+        win[i_2] = 0.0f;
     }
     int doc_start = 0;
     int doc_end = 0;
@@ -344,7 +359,7 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
     float out[8];
     #pragma unroll 1
     for (int k = 0; k < 1 * nch; k++) {
-        int q = cells[(int)((unsigned int)k / 1 % 4)];
+        int q = cells[(int)((unsigned int)k % 4)];
         if (q >= nch) {
             break;
         }
@@ -355,16 +370,16 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
         }
         int pend = 0;
         if (grab != 0) {
-            int _atomic_fetch_add_10 = atomicAdd(&work[ct], 1);
-            pend = _atomic_fetch_add_10;
+            int _atomic_fetch_add_9 = atomicAdd(&work[ct], 1);
+            pend = _atomic_fetch_add_9;
         }
         int kst = (int)((unsigned int)k % 1);
         int ts = q * chunk + sub * 8 + kst * 8;
         int rows_k = 0;
         if (lane_on != 0) {
-            int _max_12 = ((S - ts) > (0) ? (S - ts) : (0));
-            int _min_11 = ((_max_12) < (8) ? (_max_12) : (8));
-            rows_k = _min_11;
+            int _max_11 = ((S - ts) > (0) ? (S - ts) : (0));
+            int _min_10 = ((_max_11) < (8) ? (_max_11) : (8));
+            rows_k = _min_10;
         }
         if (kst == 0 && rows_k > 0) {
             if (ts >= doc_end) {
@@ -382,26 +397,28 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
                 doc_start = cu[lo];
                 doc_end = cu[lo + 1];
             }
-            #pragma unroll
-            for (int kh = 0; kh < 3; kh++) {
-                int tk = ts - 3 + kh;
+            if (n_sub == 1) {
                 #pragma unroll
-                for (int j_2 = 0; j_2 < 8; j_2++) {
-                    win[(kh + 1) * 8 + j_2] = 0.0f;
-                }
-                if (tk >= doc_start) {
-                    long long rowk = (long long)tk * C64 + c64;
-                    {
-                        const uint4* _vptr_13 = reinterpret_cast<const uint4*>(x + rowk);
-                        uint4 _vld_13[1];
-                        #pragma unroll
-                        for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_13[_blk] = _vptr_13[_blk];
-                            uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13[_blk]);
+                for (int kh2 = 0; kh2 < 3; kh2++) {
+                    int tk2 = ts - 3 + kh2;
+                    #pragma unroll
+                    for (int j_2 = 0; j_2 < 8; j_2++) {
+                        win[(kh2 + 1) * 8 + j_2] = 0.0f;
+                    }
+                    if (tk2 >= doc_start) {
+                        long long rowk2 = (long long)tk2 * C64 + c64;
+                        {
+                            const uint4* _vptr_12 = reinterpret_cast<const uint4*>(x + rowk2);
+                            uint4 _vld_12[1];
                             #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) << 16);
-                                (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) & 0xffff0000u);
+                            for (int _blk = 0; _blk < 1; _blk++) {
+                                _vld_12[_blk] = _vptr_12[_blk];
+                                uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 4; _pair++) {
+                                    (&win[(kh2 + 1) * 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) << 16);
+                                    (&win[(kh2 + 1) * 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) & 0xffff0000u);
+                                }
                             }
                         }
                     }
@@ -413,6 +430,32 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
         mbarrier_wait(stage_full_addr + (_stage_stage_full) * 8, _parity_stage_full);
         if (rows_k > 0) {
             int sbase = (int)stage_buf_addr + ((int)((unsigned int)k % 2) * 8 * 128 + tid) * 16;
+            if (n_sub > 1) {
+                int hbase = sbase + 5 * 2048 - ct_vec * 16;
+                if (sub == 0) {
+                    hbase = (int)stage_buf_addr + 32768 + ((int)((unsigned int)k % 2) * 3 * 128 + tid) * 16;
+                }
+                #pragma unroll
+                for (int kh = 0; kh < 3; kh++) {
+                    #pragma unroll
+                    for (int j_3 = 0; j_3 < 8; j_3++) {
+                        win[(kh + 1) * 8 + j_3] = 0.0f;
+                    }
+                    if (ts - 3 + kh >= doc_start) {
+                        __int128_t _smem_raw_13;
+                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_13) : "r"(hbase + kh * 2048));
+                        pk[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[0];
+                        pk[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[1];
+                        pk[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[2];
+                        pk[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[3];
+                        #pragma unroll
+                        for (int kk3 = 0; kk3 < 4; kk3++) {
+                            win[(kh + 1) * 8 + 2 * kk3] = __uint_as_float(pk[kk3] << 16);
+                            win[(kh + 1) * 8 + 2 * kk3 + 1] = __uint_as_float(pk[kk3] & 4294901760u);
+                        }
+                    }
+                }
+            }
             int interior = 0;
             if (rows_k == 8 && ts + 8 <= doc_end) {
                 interior = 1;
@@ -505,8 +548,8 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
                             #pragma unroll
                             for (int m = 1; m < 4; m++) {
                                 #pragma unroll
-                                for (int j_3 = 0; j_3 < 8; j_3++) {
-                                    win[(u_1 % 4 + 4 - m) % 4 * 8 + j_3] = 0.0f;
+                                for (int j_4 = 0; j_4 < 8; j_4++) {
+                                    win[(u_1 % 4 + 4 - m) % 4 * 8 + j_4] = 0.0f;
                                 }
                             }
                         }
@@ -554,11 +597,11 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
                 }
             }
         }
-        if (grab != 0) {
-            cells[(int)((unsigned int)kn / 1 % 4)] = pend;
+        if (tid == 0) {
+            cells[(int)((unsigned int)kn % 4)] = pend;
         }
         __syncthreads();
-        int qn_1 = cells[(int)((unsigned int)(k + 2) / 1 % 4)];
+        int qn_1 = cells[(int)((unsigned int)kn % 4)];
         if (qn_1 < nch) {
             int stage_t0_1 = qn_1 * n_sub * 8 + (int)((unsigned int)(k + 2) % 1) * 8;
             if (tid == 0) {
@@ -571,16 +614,27 @@ kernel_cake_causal_conv1d_train_08880ca12e4064bc8cdb(__nv_bfloat16* __restrict__
                     int _min_29 = ((_max_30) < (8) ? (_max_30) : (8));
                     tail_rows_1 = _min_29;
                 }
+                if (stage_t0_1 > 0 && n_sub > 1) {
+                    tail_rows_1 = tail_rows_1 + 3;
+                }
                 mbarrier_arrive_expect_tx(stage_full_addr + ((int)((unsigned int)(k + 2) % 2)) * 8, (n_full_1 * 8 + tail_rows_1) * cbytes);
+                if (stage_t0_1 > 0 && n_sub > 1) {
+                    #pragma unroll 1
+                    for (int i_3 = 0; i_3 < 3; i_3++) {
+                        long long hsrc_1 = (long long)(stage_t0_1 - 3 + i_3) * C64 + cbase64;
+                        int haddr_1 = (int)stage_buf_addr + 32768 + ((int)((unsigned int)(k + 2) % 2) * 3 + i_3) * 2048;
+                        cp_async_bulk_gmem2smem(haddr_1, reinterpret_cast<const uint8_t*>(x + hsrc_1), cbytes, stage_full_addr + ((int)((unsigned int)(k + 2) % 2)) * 8);
+                    }
+                }
             }
             if (tid - sub * ct_vec == 0 && sub < n_sub) {
                 int ts_n_1 = stage_t0_1 + sub * 8;
                 int _max_31 = ((S - ts_n_1) > (0) ? (S - ts_n_1) : (0));
                 int rows_n_1 = ((_max_31) < (8) ? (_max_31) : (8));
                 #pragma unroll 1
-                for (int i_2 = 0; i_2 < rows_n_1; i_2++) {
-                    long long src_1 = (long long)(ts_n_1 + i_2) * C64 + cbase64;
-                    int saddr_1 = (int)stage_buf_addr + (((int)((unsigned int)(k + 2) % 2) * 8 + i_2) * 128 + sub * ct_vec) * 16;
+                for (int i_4 = 0; i_4 < rows_n_1; i_4++) {
+                    long long src_1 = (long long)(ts_n_1 + i_4) * C64 + cbase64;
+                    int saddr_1 = (int)stage_buf_addr + (((int)((unsigned int)(k + 2) % 2) * 8 + i_4) * 128 + sub * ct_vec) * 16;
                     cp_async_bulk_gmem2smem(saddr_1, reinterpret_cast<const uint8_t*>(x + src_1), cbytes, stage_full_addr + ((int)((unsigned int)(k + 2) % 2)) * 8);
                 }
             }
