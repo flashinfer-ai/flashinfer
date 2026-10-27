@@ -769,16 +769,19 @@ def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
 # times the lane's G pair rows, which its clusters read in step); a lane boundary inside a tile carries the raw FP32
 # accumulator to the next lane, and the split tiles of the trailing-wave plan keep its two K runs and their sum
 # ``(0 + P0) + P1``, so the outputs are bitwise those of ``front_split_plan``.  Its CTAs wait for words other CTAs
-# release, so it launches cooperatively: every CTA of its grid resident at once.  Taken where it measured faster: the
-# TP8 rows of 16 row tiles (T = 1793-2048) with G = 8 on every qualified part, and the TP8 rows of 8 row tiles
-# (T = 897-1024) with G = 4 on sm_103a 152-SM parts (GB300).  The plan travels in the stream-K arguments:
-# ``num_items`` = clusters, ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and
-# ``sk_max_seg`` = 2 * t0 + fold_all, t0 the trailing-wave plan's whole tiles.
+# release, so it launches cooperatively: every CTA of its grid resident at once.  Taken on the parts where it measured
+# faster: the TP8 rows of 16 row tiles (T = 1793-2048) with G = 8 on 152-SM parts (GB200 and GB300), and the TP8 rows of
+# 8 row tiles (T = 897-1024) with G = 4 on sm_103a 152-SM parts (GB300).  148-SM parts (B200, B300) keep the
+# trailing-wave plan on every row.  The plan travels in the stream-K arguments: ``num_items`` = clusters,
+# ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and ``sk_max_seg`` = 2 * t0 + fold_all,
+# t0 the trailing-wave plan's whole tiles.
 FRONT_FOLD_I_LOCAL = SHARED_INTERMEDIATE // 8  # TP8 only
-#: Pair rows per lane (G) by row-tile count, on every qualified part.
-FRONT_FOLD_LANE_ROWS = {16: 8}
-#: Pair rows per lane by (row tiles, architecture, SM count), on those parts only.
-FRONT_FOLD_LANE_ROWS_BY_PART = {(8, "sm_103a", 152): 4}
+#: Pair rows per lane (G) by (row tiles, architecture, SM count): the fold form serves these parts only.
+FRONT_FOLD_LANE_ROWS_BY_PART = {
+    (16, "sm_100a", 152): 8,
+    (16, "sm_103a", 152): 8,
+    (8, "sm_103a", 152): 4,
+}
 
 
 def front_fold_plan(
@@ -795,9 +798,7 @@ def front_fold_plan(
     m_tiles, i_local, sm_count = int(m_tiles), int(i_local), int(sm_count)
     if i_local != FRONT_FOLD_I_LOCAL:
         return None
-    lane_rows = FRONT_FOLD_LANE_ROWS_BY_PART.get(
-        (m_tiles, str(arch), sm_count), FRONT_FOLD_LANE_ROWS.get(m_tiles)
-    )
+    lane_rows = FRONT_FOLD_LANE_ROWS_BY_PART.get((m_tiles, str(arch), sm_count))
     if lane_rows is None:
         return None
     pair_rows = m_tiles // CTA_GROUP

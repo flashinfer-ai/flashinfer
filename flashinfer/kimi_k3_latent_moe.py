@@ -92,9 +92,10 @@ def prepare_kimi_k3_latent_moe_front(
         mix device state; a runner must not run concurrently with itself, and
         graphs that share one memory pool must not replay concurrently.  CUDA
         Graph capture of the runner is supported; prepare before capture, once
-        per layer and shape.  The fold form of the TP8 prefill rows launches
-        cooperatively: its whole grid must be resident at once, so launch it on
-        a stream that offers that many SMs (not a smaller green context).
+        per layer and shape.  The fold form of the TP8 prefill rows on 152-SM
+        parts launches cooperatively: its whole grid must be resident at once,
+        so launch it on a stream that offers that many SMs (not a smaller
+        green context).
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_front(
         x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
