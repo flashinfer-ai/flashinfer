@@ -417,18 +417,17 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
         ((0, 8368, 16736, 25104, 33472), 188, True),
         ((0, 33472), 170, True),
         ((0, 33472), 188, True),
-        # the compensated route overlaps up to an attention-weighted mean segment of
-        # 36864 tokens on 188 SMs and 40960 tokens on 170 SMs
+        # the compensated route overlaps every long plan on 170 and 188 SMs
         ((0, 36864), 188, True),
-        ((0, 36865), 188, False),
-        ((0, 38592), 188, False),
+        ((0, 36865), 188, True),
+        ((0, 38592), 188, True),
         ((0, 38592), 170, True),
         ((0, 40960), 170, True),
-        ((0, 40961), 170, False),
-        ((0, 48768), 170, False),
-        ((0, 48768), 188, False),
-        ((0, 109901, 109952), 170, False),
-        ((0, 109901, 109952), 188, False),
+        ((0, 40961), 170, True),
+        ((0, 48768), 170, True),
+        ((0, 48768), 188, True),
+        ((0, 109901, 109952), 170, True),
+        ((0, 109901, 109952), 188, True),
     ],
 )
 def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
