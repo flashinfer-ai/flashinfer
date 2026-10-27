@@ -206,6 +206,55 @@ def test_plan_invariants(sm_count, sizes):
                 assert plan["tail_reduce_grid"][0] > 0
             if plan["num_tail"] == 0:
                 assert plan["tail_splits"] == 1
+            assert plan["tail_tile_k"] == tile_k
+            if tile_k != 512:
+                continue
+            # The k256-tail stage: the 512-wide tile's grid, n-major, and the tail of
+            # the 256-wide tiling of the same clusters, split as that tile's own.
+            half = cb.K256_TAIL_TILE_K
+            k256t = cb.plan_wgrad(
+                sum_m=sum_m,
+                num_groups=e,
+                n=n,
+                k=k,
+                tile_k=tile_k,
+                sm_count=sm_count,
+                reduce_threads=256,
+                k256_tail=True,
+                constants=c,
+            )
+            assert k256t["grid"] == plan["grid"] and k256t["tile_k"] == 512
+            assert k256t["tail_tile_k"] == half and k256t["raster_rows"] == 0
+            clusters = k256t["clusters"]
+            assert k256t["num_tail"] == (
+                (e * (n // int(c["block_n"])) * (k // half)) % clusters
+                if int(c["wgrad_tail_split"])
+                else 0
+            )
+            assert k256t["tail_splits"] == (
+                cb.wgrad_tail_plan(
+                    k256t["num_tail"],
+                    clusters,
+                    sum_m,
+                    e,
+                    half,
+                    block_k=int(c["block_k"]),
+                    cluster_m=int(c["cluster_m"]),
+                    max_splits=int(c["tail_plan"]["max_splits"]),
+                    sm_clock_ghz=float(c["tail_plan"]["sm_clock_ghz"]),
+                    dram_tbps=float(c["tail_plan"]["dram_tbps"]),
+                    launch_us=float(c["tail_plan"]["launch_us"]),
+                    cycles_per_step=c["tail_plan"]["cycles_per_step"],
+                )
+            )
+            assert k256t["launches"] == 1 + int(k256t["tail_splits"] > 1)
+            # One reduce CTA per tail tile and row block; a thread sums epi_chunk columns.
+            rows_per_cta = 256 // (half // int(c["epi_chunk"]))
+            assert k256t["tail_reduce_grid"] == (
+                [k256t["num_tail"] * (int(c["cluster_m"]) // rows_per_cta), 1, 1]
+                if k256t["tail_splits"] > 1
+                else None
+            )
 
 
 def test_stage_bindings_are_unique_per_architecture():
@@ -234,7 +283,9 @@ def test_program_choice_follows_the_host_plan_constants():
     ``dgrad`` wide tile (``main_wide_ef``) where ``dgrad_evict_first`` holds;
     ``wave_sync_archs`` the wave build of each k tile from ``wave_sync_min_k``,
     launched with the architecture's ``wave_sync_mode``; ``k512_release_archs``
-    the twin releasing the 512-wide accumulator in halves.  Each listed
+    the twin releasing the 512-wide accumulator in halves; ``k256_tail_archs``
+    its twin running the leftover tiles as 256-column half tiles
+    (``main_halves_k256t``) where ``wgrad_k256_tail`` holds.  Each listed
     architecture's routes serve the stage the constant selects."""
     c = HOST_PLAN_CONSTANTS
     block_n, wide_n = int(c["block_n"]), int(c["wide_block_n"])
@@ -249,6 +300,9 @@ def test_program_choice_follows_the_host_plan_constants():
     assert set(c["k512_min_rows_per_group"]) == set(c["k512_archs"])
     assert all(int(v) > 0 for v in c["k512_min_rows_per_group"].values())
     assert set(c["k512_release_archs"]) <= set(c["k512_archs"])
+    assert set(c["k256_tail_archs"]) <= set(c["k512_release_archs"])
+    assert int(c["k256_tail_max_k"]) % 512 == 0 and int(c["k256_tail_max_k"]) > 0
+    assert int(c["k256_tail_min_rows"]) > 0
     assert set(c["wave_sync_archs"]) == {256, 512}
     for archs in c["wave_sync_archs"].values():
         assert set(archs) <= set(cake_jit.ARCHES)
@@ -297,8 +351,18 @@ def test_program_choice_follows_the_host_plan_constants():
                     assert cake_jit.stage_served(name, "main", arch), (name, arch)
                 if arch in c["wave_sync_archs"][tile_k]:
                     assert cake_jit.stage_served(name, "main_wave", arch), (name, arch)
-                for k in (min_k, min_k // 2):
-                    stage, wave = cb.select_wgrad_stage(name, k, tile_k, arch, c)
+                if tile_k == 512 and arch in c["k256_tail_archs"]:
+                    assert cake_jit.stage_served(name, "main_halves_k256t", arch)
+                groups = 4
+                for k, sum_m in (
+                    (min_k, 4096),
+                    (min_k, EXPERT_ROWS),
+                    (min_k // 2, 4096),
+                    (min_k // 2, EXPERT_ROWS),
+                ):
+                    stage, wave = cb.select_wgrad_stage(
+                        name, k, tile_k, arch, c, sum_m=sum_m, num_groups=groups
+                    )
                     expect_wave = (
                         k >= min_k
                         and arch in c["wave_sync_archs"][tile_k]
@@ -312,11 +376,19 @@ def test_program_choice_follows_the_host_plan_constants():
                     )
                     if tile_k == 512 and arch in c["k512_release_archs"]:
                         assert halves, (name, arch, base)
+                    k256t = (
+                        halves
+                        and base == "main"
+                        and cb.wgrad_k256_tail(k, arch, sum_m, groups, c)
+                        and cake_jit.stage_served(name, "main_halves_k256t", arch)
+                    )
+                    expected = f"{base}_halves" if halves else base
                     assert wave == expect_wave, (name, arch, k)
-                    assert stage == (f"{base}_halves" if halves else base), (
+                    assert stage == ("main_halves_k256t" if k256t else expected), (
                         name,
                         arch,
                         k,
+                        sum_m,
                     )
 
 
@@ -342,6 +414,33 @@ def test_expert_rows_take_the_measured_dgrad_stage_and_k_tile(arch):
         for k in (2048, 6144):
             tile_k = cb.select_wgrad_tile(k, arch, EXPERT_ROWS, groups, c)
             assert tile_k == (512 if k512 else 256), (arch, groups, k)
+
+
+@pytest.mark.parametrize("out_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_expert_rows_take_the_measured_wgrad_stage(arch, out_dtype):
+    """Over ``EXPERT_ROWS`` routed rows the weight gradient ``dW[e]`` (``N`` x ``K``)
+    takes the 512-wide k tile released in halves.  On sm_107a the down projection
+    (``N`` 6144, ``K`` 2048) takes its k256-tail twin (``main_halves_k256t``) at 4, 8
+    and 16 groups; at 32 groups, and for the gate/up projection (``N`` 4096, ``K``
+    6144) at every group count, it keeps ``main_halves``.  The other architectures
+    never take the twin."""
+    c = HOST_PLAN_CONSTANTS
+    name = cake_jit.record_name("wgrad", out_dtype=out_dtype, tile_k=512)
+    for groups in EXPERT_GROUPS:
+        for k in (2048, 6144):
+            assert cb.select_wgrad_tile(k, arch, EXPERT_ROWS, groups, c) == 512
+            k256t = arch == "sm_107a" and k == 2048 and groups in (4, 8, 16)
+            assert cb.wgrad_k256_tail(k, arch, EXPERT_ROWS, groups, c) == k256t
+            stage, wave = cb.select_wgrad_stage(
+                name, k, 512, arch, c, sum_m=EXPERT_ROWS, num_groups=groups
+            )
+            base = "main_wave" if wave else "main"
+            assert stage == ("main_halves_k256t" if k256t else f"{base}_halves"), (
+                arch,
+                groups,
+                k,
+            )
 
 
 def test_workspace_arguments_of_the_argument_plans():
@@ -706,6 +805,8 @@ def test_wgrad_k512_halves_gives_the_drain_build_bits(out_dtype, wave, monkeypat
     output bits are those of the build that drains the whole accumulator."""
     device = _require_program("wgrad", out_dtype)
     c = HOST_PLAN_CONSTANTS
+    # The k256-tail twin of main_halves has its own test.
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "k256_tail_archs", [])
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = 256, (int(c["wave_sync_min_k"]) if wave else 1024)
     x, _w, g, offs = _inputs(K512_E2, n, k, device, seed=10)
@@ -742,6 +843,55 @@ def test_wgrad_k512_halves_gives_the_drain_build_bits(out_dtype, wave, monkeypat
     assert drain.plan["wave_mode"] == launch.plan["wave_mode"]
     torch.cuda.synchronize()
     assert torch.equal(drain.launch(), out)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_k256_tail_gives_the_k256_tile_bits(out_dtype, monkeypatch):
+    """Where ``wgrad_k256_tail`` holds, the half-release 512-wide k tile launches its
+    twin that runs the tiles left after its full waves as 256-column half tiles
+    (``main_halves_k256t``): n-major, the last partial wave of them split as the
+    256-wide k tile splits its tail and summed by that tile's tail reduce.  Each
+    output element accumulates its rows in the order of the 256-wide k tile, so where
+    the two plans split the same tiles the same way the output bits are that tile's."""
+    device = _require_program("wgrad", out_dtype)
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    # A down-projection-like output (K at most k256_tail_max_k) over two groups of more
+    # than k256_tail_min_rows rows on average, with 128 512-wide tiles, more than the
+    # 106 clusters of a 212-SM device: the 256-column tail is split and reduced.
+    sizes = K512_E2
+    n, k = 4096, int(c["k256_tail_max_k"])
+    assert sum(sizes) // len(sizes) >= int(c["k256_tail_min_rows"])
+    x, _w, g, offs = _inputs(sizes, n, k, device, seed=11)
+    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    if arch not in c["k256_tail_archs"]:
+        assert launch.stages[0] != "main_halves_k256t"
+        pytest.skip(f"no k256-tail weight-gradient build on {arch}")
+    assert cake_jit.stage_served(launch.record_name, "main_halves_k256t", arch)
+    plan = launch.plan
+    assert plan["tile_k"] == 512 and plan["tail_tile_k"] == cb.K256_TAIL_TILE_K
+    assert plan["raster_rows"] == 0
+    tail = ("tail_reduce",) if plan["tail_splits"] > 1 else ()
+    assert launch.stages == ("main_halves_k256t", *tail)
+    outs = []
+    for _ in range(2):
+        launch.out.fill_(float("nan"))
+        outs.append(launch.launch().clone())
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[1])
+    ref = _reference("wgrad", g, x, sizes)
+    if out_dtype == torch.bfloat16:
+        _assert_bf16_close(outs[0], ref)
+    else:
+        assert ((outs[0] - ref).norm() / ref.norm()).item() <= FP32_REL_L2
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "k512_archs", [])
+    k256 = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    assert k256.plan["tile_k"] == cb.K256_TAIL_TILE_K and k256.stages[0] == "main"
+    keys = ("clusters", "num_tail", "tail_splits", "raster_rows")
+    if any(k256.plan[key] != plan[key] for key in keys):
+        pytest.skip(f"the 256-wide k tile splits other tiles on this {arch} device")
+    torch.cuda.synchronize()
+    assert torch.equal(k256.launch(), outs[0])
 
 
 def test_two_streams_take_separate_workspaces():

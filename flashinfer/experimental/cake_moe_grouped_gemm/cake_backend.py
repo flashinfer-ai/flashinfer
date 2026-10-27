@@ -52,8 +52,14 @@ architectures ``wave_sync_archs`` lists for its k tile, with the
 architecture's ``wave_sync_mode``; with the 512-wide k tile on the
 architectures listed in ``k512_release_archs`` it launches the twin of that
 build that releases the accumulator in two halves (``main_halves`` /
-``main_wave_halves``).  Every choice falls back to the plain stage where the
-route serves no such stage on the architecture.
+``main_wave_halves``).  On the architectures of ``k256_tail_archs``
+``main_halves`` gives way to its twin that runs the tiles left after the full
+waves of the 512-wide k tile as 256-column half tiles, with the split tail and
+tail reduce of the 256-wide k tile (``main_halves_k256t``), when ``K`` (the
+columns of ``dW[e]`` and of x) is at most ``k256_tail_max_k`` and the groups
+average at least ``k256_tail_min_rows`` rows (``sum_m // E``), the down
+projection of an MoE layer over few groups.  Every choice falls back to the
+plain stage where the route serves no such stage on the architecture.
 
 Stream workspaces.  The forward and data-gradient programs take a scheduler
 workspace (``sched``: ``sched_words`` u32 words whose first three rest at
@@ -99,6 +105,10 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 7): "sm_107a",
 }
 DESCRIPTOR_ALIGN = 128  # bytes; CUtensorMap slots of the caller-owned workspaces
+# The k width of the half tiles the weight gradient's ``main_halves_k256t`` stage runs
+# after the full waves of its 512-wide k tile: its split tail is the 256-wide k tile's,
+# summed by the tail-reduce stage of that tile's route.
+K256_TAIL_TILE_K = 256
 _DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 
 
@@ -328,12 +338,18 @@ def plan_wgrad(
     tile_k: int,
     sm_count: int,
     reduce_threads: int,
+    k256_tail: bool = False,
     constants: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Launch plan of ``wgrad`` for the selected ``tile_k``.
 
     ``reduce_threads`` is the thread count of the tail-reduce program (its
-    launch block); it sizes the reduce grid.
+    launch block); it sizes the reduce grid.  ``k256_tail`` plans the 512-wide
+    k tile's ``main_halves_k256t`` stage: the grid of the 512-wide tile, whose
+    full waves cover ``[0, total // clusters * clusters)`` of its tiles; the
+    tiles left run n-major (``raster_rows`` 0) as the ``K256_TAIL_TILE_K``-wide
+    half tiles of the 256-wide tiling, and the last partial wave of that tiling
+    is the tail (``tail_tile_k``), split and reduced as the 256-wide k tile's.
     """
     c = constants or host_plan_constants()
     block_n, block_k = int(c["block_n"]), int(c["block_k"])
@@ -341,9 +357,12 @@ def plan_wgrad(
     tiles = num_groups * (n // block_n) * (k // tile_k)
     grid_x = persistent_grid(sm_count, tiles, cta_group=cta_group)
     clusters = grid_x // cta_group
+    tail_tile_k = K256_TAIL_TILE_K if k256_tail else tile_k
     num_tail = 0
     if int(c["wgrad_tail_split"]):
-        num_tail = wgrad_tail_tiles(num_groups, n, k, tile_k, clusters, block_n=block_n)
+        num_tail = wgrad_tail_tiles(
+            num_groups, n, k, tail_tile_k, clusters, block_n=block_n
+        )
     splits = 1
     if num_tail:
         tail = c["tail_plan"]
@@ -352,7 +371,7 @@ def plan_wgrad(
             clusters,
             sum_m,
             num_groups,
-            tile_k,
+            tail_tile_k,
             block_k=block_k,
             cluster_m=cluster_m,
             max_splits=int(tail["max_splits"]),
@@ -361,15 +380,24 @@ def plan_wgrad(
             launch_us=float(tail["launch_us"]),
             cycles_per_step=tail["cycles_per_step"],
         )
-    raster_rows = wgrad_raster_rows(
-        n // block_n, k // tile_k, clusters, tile_k, block_n=block_n, block_k=block_k
+    raster_rows = (
+        0
+        if k256_tail
+        else wgrad_raster_rows(
+            n // block_n,
+            k // tile_k,
+            clusters,
+            tile_k,
+            block_n=block_n,
+            block_k=block_k,
+        )
     )
     reduce_grid = None
     if splits > 1:
         reduce_grid = [
             wgrad_reduce_grid(
                 num_tail,
-                tile_k,
+                tail_tile_k,
                 reduce_threads=reduce_threads,
                 epi_chunk=int(c["epi_chunk"]),
                 cluster_m=cluster_m,
@@ -381,6 +409,7 @@ def plan_wgrad(
         grid=[grid_x, 1, 1],
         clusters=clusters,
         tile_k=tile_k,
+        tail_tile_k=tail_tile_k,
         num_tail=num_tail,
         tail_splits=splits,
         raster_rows=raster_rows,
@@ -428,6 +457,33 @@ def fwd_lwh_ef(
     return arch in c["fwd_lwh_ef_archs"] and k <= int(c["fwd_lwh_ef_max_k"])
 
 
+def wgrad_k256_tail(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the weight gradient's half-release 512-wide k tile takes its twin that
+    runs the tiles left after its full waves as 256-column half tiles
+    (``main_halves_k256t``).
+
+    ``k`` is the weight-gradient ``K``: the columns of ``dW[e]`` and of ``x``
+    (``x.shape[1]``), the dimension the k tile cuts.  ``N``, the rows of ``dW[e]``
+    (the columns of ``g``), does not enter the choice, and the reduction runs over
+    the ``sum_m`` routed rows.  The twin serves the short outputs of the down
+    projection, ``K <= k256_tail_max_k``, when the groups average at least
+    ``k256_tail_min_rows`` rows (``sum_m // num_groups``), on the architectures of
+    ``k256_tail_archs``; a longer ``K`` (the gate/up projection) or fewer rows per
+    group (more groups) keeps ``main_halves``."""
+    c = constants or host_plan_constants()
+    return (
+        arch in c["k256_tail_archs"]
+        and k <= int(c["k256_tail_max_k"])
+        and sum_m // max(num_groups, 1) >= int(c["k256_tail_min_rows"])
+    )
+
+
 def select_row_stage(
     name: str,
     op: str,
@@ -462,8 +518,14 @@ def select_wgrad_stage(
     tile_k: int,
     arch: str,
     constants: Optional[dict[str, Any]] = None,
+    *,
+    sum_m: int,
+    num_groups: int,
 ) -> tuple[str, bool]:
-    """``(main stage, wave)`` of weight-gradient route ``name`` (module docstring, program choice)."""
+    """``(main stage, wave)`` of weight-gradient route ``name`` (module docstring, program choice).
+
+    ``k`` is the weight-gradient ``K``, the columns of ``dW[e]`` and of ``x``; ``sum_m``
+    and ``num_groups`` are the routed rows and the groups they are split over."""
     c = constants or host_plan_constants()
     wave = (
         k >= int(c["wave_sync_min_k"])
@@ -475,6 +537,12 @@ def select_wgrad_stage(
         halves = f"{stage}_halves"
         if stage_served(name, halves, arch):
             stage = halves
+    if (
+        stage == "main_halves"
+        and wgrad_k256_tail(k, arch, sum_m, num_groups, c)
+        and stage_served(name, "main_halves_k256t", arch)
+    ):
+        stage = "main_halves_k256t"
     return stage, wave
 
 
@@ -936,15 +1004,28 @@ def prepare_grouped_gemm_wgrad(
     name = select_module(
         "wgrad", arch, out_dtype=_DTYPE_NAMES[out_dtype], tile_k=tile_k
     )
-    reduce_threads = (
-        int(
-            PROGRAMS[stage_binding(name, "tail_reduce", arch)["program"]]["launch"][
-                "block"
-            ][0]
-        )
-        if stage_served(name, "tail_reduce", arch)
-        else 0
+    main_stage, wave = select_wgrad_stage(
+        name, k, tile_k, arch, c, sum_m=sum_m, num_groups=num_groups
     )
+    k256_tail = main_stage == "main_halves_k256t"
+    # The k256-tail stage's split tail is the 256-wide k tile's: the tail-reduce
+    # stage of that tile's route sums its partials.
+    reduce_name = (
+        select_module(
+            "wgrad",
+            arch,
+            out_dtype=_DTYPE_NAMES[out_dtype],
+            tile_k=K256_TAIL_TILE_K,
+        )
+        if k256_tail
+        else name
+    )
+    reduce_threads = 0
+    if stage_served(reduce_name, "tail_reduce", arch):
+        reduce_program = PROGRAMS[
+            stage_binding(reduce_name, "tail_reduce", arch)["program"]
+        ]
+        reduce_threads = int(reduce_program["launch"]["block"][0])
     plan = plan_wgrad(
         sum_m=sum_m,
         num_groups=num_groups,
@@ -953,9 +1034,9 @@ def prepare_grouped_gemm_wgrad(
         tile_k=tile_k,
         sm_count=sm_count(device),
         reduce_threads=reduce_threads,
+        k256_tail=k256_tail,
         constants=c,
     )
-    main_stage, wave = select_wgrad_stage(name, k, tile_k, arch, c)
     plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
     if sum_m == 0:
         return _finish("wgrad", name, plan, out, (), [], [], zero_fill=True)
@@ -967,7 +1048,9 @@ def prepare_grouped_gemm_wgrad(
     )
     units = plan["num_tail"] * splits if splits > 1 else 0
     partials = torch.empty(
-        max(units, 1) * int(c["cluster_m"]) * tile_k, dtype=torch.float32, device=device
+        max(units, 1) * int(c["cluster_m"]) * plan["tail_tile_k"],
+        dtype=torch.float32,
+        device=device,
     )
     workspaces: list = [slots, partials]
     c_view = _span_view(out)
@@ -1007,7 +1090,7 @@ def prepare_grouped_gemm_wgrad(
             grid=plan["tail_reduce_grid"],
         )
         stages.append("tail_reduce")
-        launches.append(_bind(name, "tail_reduce", reduce_kwargs, arch))
+        launches.append(_bind(reduce_name, "tail_reduce", reduce_kwargs, arch))
     return _finish("wgrad", name, plan, out, tuple(stages), launches, workspaces)
 
 

@@ -778,6 +778,9 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "tmap_slots_per_cta": 18,
     "k512_archs": ["sm_100a", "sm_103a", "sm_107a"],
     "k512_release_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "k256_tail_archs": ["sm_107a"],
+    "k256_tail_max_k": 2048,
+    "k256_tail_min_rows": 8192,
     "k512_min_rows_per_group": {"sm_100a": 4096, "sm_103a": 4096, "sm_107a": 4096},
     "wave_sync_min_k": 4096,
     "wave_sync_archs": {
