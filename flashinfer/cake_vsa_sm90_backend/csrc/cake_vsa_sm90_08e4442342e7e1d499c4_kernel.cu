@@ -1795,8 +1795,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
                 o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-                int o_off = o_row_base + m_local_r * 128 + (4 * sset + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
+                int o_off_1_0 = o_row_base + m_local_r * 128 + (4 * sset + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_0)[0] = reinterpret_cast<int4*>(o_vec)[0];
                 int m_local_r_1 = m1_local;
                 __nv_bfloat162 _bit_cast_src_109 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                 o_vec[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_109)[0];
@@ -1830,8 +1830,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
                 o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-                int o_off_2 = o_row_base + m_local_r_1 * 128 + (4 * sset + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec)[0];
+                int o_off_1_1 = o_row_base + m_local_r_1 * 128 + (4 * sset + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_1)[0] = reinterpret_cast<int4*>(o_vec)[0];
             }
             int sset_1 = my_rank + 3;
             int fold_2 = ((sset_1 < 4) ? 1 : 0);
@@ -1968,8 +1968,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
                 o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                int o_off_1 = o_row_base_1 + m_local_r_2 * 128 + (4 * sset_1 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
+                int o_off_1_2 = o_row_base_1 + m_local_r_2 * 128 + (4 * sset_1 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_2)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
                 int m_local_r_1_1 = m1_local;
                 __nv_bfloat162 _bit_cast_src_133 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                 o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_133)[0];
@@ -2003,8 +2003,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
                 o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                int o_off_2_1 = o_row_base_1 + m_local_r_1_1 * 128 + (4 * sset_1 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_2_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
+                int o_off_1_3 = o_row_base_1 + m_local_r_1_1 * 128 + (4 * sset_1 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_3)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
             }
         }
     }
@@ -2258,8 +2258,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                 o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                int o_off_3 = o_row_base_2 + m_local_r_3 * 128 + (4 * sset_2 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_3)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
+                int o_off_1_4 = o_row_base_2 + m_local_r_3 * 128 + (4 * sset_2 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_4)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                 int m_local_r_1_2 = m1_local;
                 __nv_bfloat162 _bit_cast_src_169 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
                 o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_169)[0];
@@ -2293,8 +2293,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                 o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                int o_off_2_2 = o_row_base_2 + m_local_r_1_2 * 128 + (4 * sset_2 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_2_2)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
+                int o_off_1_5 = o_row_base_2 + m_local_r_1_2 * 128 + (4 * sset_2 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_5)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
             }
             int sset_1_1 = my_rank_1 + 3;
             int fold_2_1 = ((sset_1_1 < 4) ? 1 : 0);
@@ -2431,8 +2431,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                 o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                int o_off_4 = o_row_base_3 + m_local_r_4 * 128 + (4 * sset_1_1 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_4)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
+                int o_off_1_6 = o_row_base_3 + m_local_r_4 * 128 + (4 * sset_1_1 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_6)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                 int m_local_r_1_3 = m1_local;
                 __nv_bfloat162 _bit_cast_src_193 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
                 o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_193)[0];
@@ -2466,8 +2466,8 @@ kernel_cake_vsa_sm90_08e4442342e7e1d499c4(const __grid_constant__ CUtensorMap Q,
                 o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                 o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                int o_off_2_3 = o_row_base_3 + m_local_r_1_3 * 128 + (4 * sset_1_1 + qj) * 8;
-                reinterpret_cast<int4*>(O + o_off_2_3)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
+                int o_off_1_7 = o_row_base_3 + m_local_r_1_3 * 128 + (4 * sset_1_1 + qj) * 8;
+                reinterpret_cast<int4*>(O + o_off_1_7)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
             }
         }
     }
