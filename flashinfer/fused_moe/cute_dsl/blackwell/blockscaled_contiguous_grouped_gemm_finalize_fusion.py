@@ -690,6 +690,9 @@ class Sm100BlockScaledMoeEpilogue:
             if cutlass.const_expr(self.use_per_token_scale):
                 up = _blockscaled_transpose16x32(up, scratch)
                 gate = _blockscaled_transpose16x32(gate, scratch, True)
+                if cutlass.const_expr(release_acc):
+                    cute.arch.fence_view_async_tmem_load()
+                    acc_pipeline.consumer_release(acc_state)
                 row = route_start + token_start + lane
                 token_alpha = alpha
                 if token_start + lane < valid_tokens:
@@ -705,7 +708,7 @@ class Sm100BlockScaledMoeEpilogue:
             else:
                 values = self._activate(up, gate, alpha)
                 values = _blockscaled_transpose16x32(values, scratch)
-            if cutlass.const_expr(release_acc):
+            if cutlass.const_expr(release_acc and not self.use_per_token_scale):
                 # All overlapping accumulator and transpose-scratch reads have
                 # completed before either CTA allows the next MMA to overwrite.
                 cute.arch.fence_view_async_tmem_load()
