@@ -52,10 +52,12 @@ pointer as a trailing ``out_ptr`` parameter beside the ``out`` tensor map; the
 host passes ``out`` for both.
 
 Routing is data: :data:`ROUTE_TABLE` is an ordered tuple of predicate rows
-over the host scalars ``(M, N, K, rank, has_bias)`` and the device's exported
-architecture (a row's optional ``arches``; absent applies everywhere), resolved
-once per call by :func:`select_record`; the last row is the unconditional
-fallback.  The named
+over the host scalars ``(M, N, K, rank, has_bias)``, the device's exported
+architecture (a row's optional ``arches``; absent applies everywhere) and the
+device's SM count (a ``wide_tail`` row admits only the problems whose
+:func:`tailsplit_wide_units` schedule on that SM count is the wide one),
+resolved once per call by :func:`select_record`; the last row is the
+unconditional fallback.  The named
 shape violations (``M >= 128``, ``N`` a multiple of 128, ``K`` a multiple of
 the selected program's K tile, ``rank`` a multiple of 32 up to 128) raise
 ``ValueError`` after routing, so the K-tile message names the program that
@@ -3887,9 +3889,12 @@ MODULES: dict[str, dict[str, Any]] = {
 # keys: ``m_min`` / ``m_max``, ``n_min`` / ``n_max``, ``k_min`` / ``k_max``
 # (inclusive bounds), ``k_multiple`` (``K`` divisible by it), ``ranks`` (the
 # admitted ranks), ``bias`` (``True`` / ``False``; absent or ``None`` admits
-# both) and ``arches`` (the exported architectures the row applies to; absent
+# both), ``arches`` (the exported architectures the row applies to; absent
 # applies to every architecture, so one problem may dispatch to different
-# programs on ``sm_100a`` and ``sm_103a``); the target is ``record`` or
+# programs on ``sm_100a`` and ``sm_103a``) and ``wide_tail`` (``True``: the row
+# admits a problem only where :func:`tailsplit_wide_units` on the device's SM
+# count at the problem's :func:`raster_group` is the wide schedule, else the
+# problem continues with the next rows); the target is ``record`` or
 # ``records_by_rank`` (rank -> record).
 # A row never widens the named shape violations: :func:`select_record`
 # validates ``M``, ``N``, ``K`` against the selected program and ``rank`` after
@@ -3925,7 +3930,9 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     #   (129, 3072, 12288, 128, True) on sm_103a -> 36c42441c9d625e03c54
     #   (4096, 3072, 3072, 32, True) on sm_100a -> 1d78f2bd5722fb02b75a
     #   (4096, 3072, 3072, 32, True) on sm_103a -> 5a1a17e73ef429cf8805 (K=96 MMA)
-    #   (4096, 3072, 12288, 32, True) on sm_100a -> d758d9efa72998dbcf96 (wide tail)
+    #   (4096, 3072, 12288, 32, True) on sm_100a -> d758d9efa72998dbcf96 (wide tail;
+    #       ``wide_tail``: on an SM count without the wide schedule, e.g. 148,
+    #       the rows below route it)
     #   (4096, 3072, 12288, 32, True) on sm_103a -> 3d47f26879e192ef655a (K=96 MMA)
     #   (4096, 12288, 3072, 32, True) on sm_100a -> 2ca0cf40f7bbfca9df92
     #   (4096, 12288, 3072, 32, True) on sm_103a -> 151d20658188ea0e9651 (K=96 MMA)
@@ -4107,6 +4114,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "k_max": 12288,
         "ranks": (32,),
         "bias": True,
+        "wide_tail": True,
         "record": "cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96",
     },
     {
@@ -4707,7 +4715,14 @@ def raster_group(*, m: int, n: int, k: int, rank: int, arch: str | None = None) 
 
 
 def _route(
-    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+    *,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    has_bias: bool,
+    arch: str | None = None,
+    sm_count: int | None = None,
 ) -> str:
     for row in ROUTE_TABLE:
         if not _admits(row, m=m, n=n, k=k, rank=rank, has_bias=has_bias):
@@ -4722,6 +4737,19 @@ def _route(
                 )
             if arch not in tuple(arches):
                 continue
+        if row.get("wide_tail"):
+            if sm_count is None:
+                raise TypeError(
+                    "the Cake NVFP4 SVDQuant route table routes "
+                    f"(M={m}, N={n}, K={k}, rank={rank}, bias={has_bias}) by the "
+                    "device's SM count; select_record() needs sm_count=sm_count(index)"
+                )
+            group = raster_group(m=m, n=n, k=k, rank=rank, arch=arch)
+            _, _, _, split = tailsplit_wide_units(
+                m=m, n=n, sm_count=sm_count, raster_group=group
+            )
+            if split != WIDE_TAIL_SPLIT:
+                continue
         by_rank = row.get("records_by_rank")
         if by_rank is not None:
             name = by_rank.get(rank)
@@ -4733,21 +4761,33 @@ def _route(
 
 
 def select_record(
-    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+    *,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    has_bias: bool,
+    arch: str | None = None,
+    sm_count: int | None = None,
 ) -> str:
     """The record name of the program that serves ``(M, N, K, rank, has_bias)``
-    on ``arch``, or ``ValueError`` naming the violated shape rule.
+    on ``arch`` with ``sm_count`` SMs, or ``ValueError`` naming the violated
+    shape rule.
 
     Routing is the first admitting row of :data:`ROUTE_TABLE` on ``arch`` (the
     device's exported architecture, :func:`device_arch`; a row that names
-    ``arches`` applies on those architectures only); the shape rules are
+    ``arches`` applies on those architectures only) and ``sm_count`` (the
+    device's SM count, :func:`sm_count`; a ``wide_tail`` row applies only where
+    :func:`tailsplit_wide_units` on that SM count at the problem's
+    :func:`raster_group` is the wide schedule); the shape rules are
     checked afterwards against the selected program (``M >= 128``, ``N`` a
     positive multiple of 128, ``K`` a positive multiple of the program's K
     tile, ``rank`` a multiple of 32 in ``[32, 128]``).  A problem with a bias
     is never routed to a bias-free program.  Without ``arch`` only the
     architecture-blind rows resolve: a per-architecture row that admits the
-    problem is a ``TypeError``, so no caller reads a route the device would
-    not take.
+    problem is a ``TypeError``; without ``sm_count`` a ``wide_tail`` row that
+    admits the problem on ``arch`` is a ``TypeError`` too, so no caller reads
+    a route the device would not take.
     """
     m, n, k, rank, has_bias = int(m), int(n), int(k), int(rank), bool(has_bias)
     if arch is not None and arch not in ARCHES:
@@ -4755,7 +4795,15 @@ def select_record(
             f"{arch!r} is not an exported Cake NVFP4 SVDQuant GEMM target; the "
             f"exported architectures are {ARCHES}"
         )
-    name = _route(m=m, n=n, k=k, rank=rank, has_bias=has_bias, arch=arch)
+    name = _route(
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        has_bias=has_bias,
+        arch=arch,
+        sm_count=None if sm_count is None else int(sm_count),
+    )
     record = MODULES[name]
     if arch is not None and arch not in tuple(record["arches"]):
         raise RuntimeError(

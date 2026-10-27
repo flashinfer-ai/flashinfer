@@ -215,6 +215,14 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (16384, 12288, 3072, 32, True): _P + "3d47f26879e192ef655a",
     },
 }
+# The exact rows of the wide-tail build (``wide_tail`` route rows): each admits
+# its problem only where the device's SM count yields the wide schedule of
+# ``tailsplit_wide_units`` (152 SMs, not 148); elsewhere the problem falls
+# through to the program here, the one the rows below route it to.
+WIDE_TAIL_FALLBACK: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
+    "sm_100a": {(4096, 3072, 12288, 32, True): _P + "3880e0aea2ecbe59106a"},
+    "sm_103a": {},
+}
 EXACT_BUILDS: dict[str, dict[str, object]] = {
     _P + "0f7f27a483c337265bf9": {
         "bias_path": "regs",
@@ -634,9 +642,44 @@ def _other_arch() -> str:
     return next(arch for arch in loader.ARCHES if arch != _arch())
 
 
+def _sms() -> int:
+    return loader.sm_count(_device().index)
+
+
 def _route(row) -> str:
     m, n, k, rank, bias = row
-    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
+    return loader.select_record(
+        m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch(), sm_count=_sms()
+    )
+
+
+def _wide(row, arch: str, sms: int) -> bool:
+    """Whether ``tailsplit_wide_units`` has the wide schedule for ``row`` on
+    ``arch`` with ``sms`` SMs (what a ``wide_tail`` route row admits)."""
+    m, n, k, rank, _ = row
+    group = loader.raster_group(m=m, n=n, k=k, rank=rank, arch=arch)
+    _, _, _, split = loader.tailsplit_wide_units(
+        m=m, n=n, sm_count=sms, raster_group=group
+    )
+    return split == loader.WIDE_TAIL_SPLIT
+
+
+def _exact_rows(arch: str, sms: int) -> dict[tuple[int, int, int, int, bool], str]:
+    """``EXACT_ROWS[arch]`` on a device with ``sms`` SMs: a wide-tail row
+    without the wide schedule there routes to its ``WIDE_TAIL_FALLBACK``."""
+    rows = dict(EXACT_ROWS[arch])
+    for row, name in WIDE_TAIL_FALLBACK[arch].items():
+        if not _wide(row, arch, sms):
+            rows[row] = name
+    return rows
+
+
+def _attempt(**problem) -> str:
+    """``select_record`` of ``problem``, or the name and message of its error."""
+    try:
+        return loader.select_record(**problem)
+    except (RuntimeError, TypeError, ValueError) as error:
+        return f"{type(error).__name__}: {error}"
 
 
 # --------------------------------------------------------------------------- host plan
@@ -735,6 +778,10 @@ def test_route_table_is_total_and_reaches_every_program() -> None:
     for row in table:
         arches = row.get("arches")
         assert arches is None or (arches and set(arches) < set(loader.ARCHES))
+        if "wide_tail" in row:
+            assert row["wide_tail"] is True and "record" in row
+            plan = loader.MODULES[row["record"]]["plan"]
+            assert plan["grid_rule"] == "pair_tailsplit_wide"
         if "records_by_rank" in row:
             assert "record" not in row
             for rank, name in row["records_by_rank"].items():
@@ -763,7 +810,13 @@ def test_matrix_reaches_every_program() -> None:
     this device's architecture routes to (the other architecture's exact rows
     send their problems elsewhere here)."""
     reached = {_route(row) for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS)}
-    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    # A wide-tail build is reached only on SM counts with its wide schedule.
+    unreached = {
+        EXACT_ROWS[_arch()][row]
+        for row in WIDE_TAIL_FALLBACK[_arch()]
+        if not _wide(row, _arch(), _sms())
+    }
+    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()] - unreached
     assert reached == expected, sorted(expected ^ reached)
 
 
@@ -1143,7 +1196,7 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
     lands on the build whose ``out_store`` matches the kernel's hint rule for that
     launch, and both forms are reached by the rows."""
     forms = set()
-    exact = EXACT_ROWS[_arch()]
+    exact = _exact_rows(_arch(), _sms())
     for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS):
         m, n, k, rank, bias = row
         name = _route(row)
@@ -1181,14 +1234,63 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
 
 def test_exact_rows_dispatch_per_architecture() -> None:
     """The exact-dispatch rows of the convergence finals: on this device's
-    architecture each lands on its own build (the build its row adopted); every
-    exact row is a performance row."""
+    architecture each lands on its own build (the build its row adopted; a
+    wide-tail row only on SM counts with the wide schedule, else its
+    ``WIDE_TAIL_FALLBACK``); every exact row is a performance row."""
+    exact = _exact_rows(_arch(), _sms())
     for row, name in EXACT_ROWS[_arch()].items():
         assert row in PERF_ROWS, _row_id(row)
-        assert _route(row) == name, _row_id(row)
+        assert _route(row) == exact[row], _row_id(row)
         assert loader.MODULES[name]["build"] == EXACT_BUILDS[name], (_row_id(row), name)
     reachable = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
     assert reachable >= set(EXACT_ROWS[_arch()].values())
+
+
+def test_wide_tail_rows_route_by_the_sm_count(monkeypatch) -> None:
+    """A ``wide_tail`` route row admits its problem only where the device's SM
+    count yields the wide schedule: on sm_100a the (4096, 3072, 12288, 32,
+    bias) problem takes the wide-tail build on 152 SMs and, without the wide
+    schedule (148 SMs), the program the rows below select.  A call without the
+    SM count that meets such a row is refused; every other route is the same
+    on every SM count and equal to the route without one."""
+    sm_counts = (148, 152, 160)
+    primary = (4096, 3072, 12288, 32, True)
+    assert _wide(primary, "sm_100a", 152) and not _wide(primary, "sm_100a", 148)
+    for arch, rows in WIDE_TAIL_FALLBACK.items():
+        for row, fallback in rows.items():
+            m, n, k, rank, bias = row
+            problem = dict(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            for sms in sm_counts:
+                wide = _wide(row, arch, sms)
+                expected = EXACT_ROWS[arch][row] if wide else fallback
+                got = loader.select_record(**problem, sm_count=sms)
+                assert got == expected, (arch, sms)
+            with pytest.raises(TypeError, match="SM count"):
+                loader.select_record(**problem)
+            # The fallback is the route of the table without its wide-tail rows.
+            with monkeypatch.context() as patch:
+                narrowed = [r for r in loader.ROUTE_TABLE if not r.get("wide_tail")]
+                patch.setattr(loader, "ROUTE_TABLE", tuple(narrowed))
+                assert loader.select_record(**problem) == fallback, arch
+    # Every other problem: the perf, off-table and coverage rows and a grid
+    # around each wide-tail row, on both architectures.
+    problems = {*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS}
+    for row in loader.ROUTE_TABLE:
+        if not row.get("wide_tail"):
+            continue
+        for m in (row["m_min"] - 1, row["m_min"], row["m_max"] + 1):
+            for n in (row["n_min"] - 128, row["n_min"], row["n_max"] + 128):
+                for k in (row["k_min"] - 256, row["k_min"], row["k_max"] + 256):
+                    for rank in RANKS:
+                        problems.add((m, n, k, rank, False))
+                        problems.add((m, n, k, rank, True))
+    for arch in loader.ARCHES:
+        for m, n, k, rank, bias in sorted(problems):
+            if (m, n, k, rank, bias) in WIDE_TAIL_FALLBACK[arch]:
+                continue
+            problem = dict(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            routes = {_attempt(**problem, sm_count=sms) for sms in sm_counts}
+            assert routes == {_attempt(**problem)}, (arch, m, n, k, rank, bias)
 
 
 def test_splitk_rows_fill_one_cluster_wave() -> None:
