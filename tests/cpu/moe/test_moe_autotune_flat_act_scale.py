@@ -104,6 +104,7 @@ def _scale_idx() -> int:
     return MoeRunnerInputs.idx("hidden_states_scale")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_tokens", [1, 3, 8])
 def test_flat_act_scale_is_accepted(num_tokens):
     """A flat mxfp8 scale must not be rejected by the tuning-config builder.
@@ -135,6 +136,7 @@ def test_flat_act_scale_is_accepted(num_tokens):
     assert scale_idx in [idx for idx, _ in config.tensor_initializers]
 
 
+@pytest.mark.cpu_only
 def test_flat_act_scale_profiles_scale_with_sf_per_token():
     """THE decisive test: profiled scale numel must be bucket * sf_per_token.
 
@@ -177,6 +179,7 @@ def test_flat_act_scale_profiles_scale_with_sf_per_token():
     assert prepared[scale_idx] is not inputs[scale_idx]
 
 
+@pytest.mark.cpu_only
 def test_two_dim_act_scale_mapping_is_unchanged():
     """The pre-existing 2-D layout must keep using dim 0 and no ConstraintSpec.
 
@@ -199,6 +202,7 @@ def test_two_dim_act_scale_mapping_is_unchanged():
     assert dyn_spec.dim_idx[dyn_spec.input_idx.index(scale_idx)] == 0
 
 
+@pytest.mark.cpu_only
 def test_deepseek_fp8_act_scale_mapping_is_unchanged():
     """DeepSeekFp8 keeps its [hidden//128, num_tokens] contract and dim 1."""
     runner = _make_runner(fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8)
@@ -215,6 +219,7 @@ def test_deepseek_fp8_act_scale_mapping_is_unchanged():
     assert dyn_spec.dim_idx[dyn_spec.input_idx.index(scale_idx)] == 1
 
 
+@pytest.mark.cpu_only
 def test_malformed_act_scale_is_still_rejected():
     """Relaxing the layout check must not stop catching genuinely bad scales."""
     runner = _make_runner()
@@ -241,6 +246,7 @@ def test_malformed_act_scale_is_still_rejected():
         )
 
 
+@pytest.mark.cpu_only
 def test_flat_act_sf_inferrer_is_cached():
     """The ConstraintSpec callback must be identity-stable across calls.
 
@@ -300,6 +306,7 @@ def _no_layout_deprecation():
     assert not offenders, f"unexpected layout DeprecationWarning: {offenders}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "declared", [SfLayout.layout_linear, int(SfLayout.layout_linear)]
 )
@@ -324,6 +331,7 @@ def test_explicit_linear_layout_is_accepted_and_silent(declared):
     assert scale_idx not in config.dynamic_tensor_specs[0].input_idx
 
 
+@pytest.mark.cpu_only
 def test_explicit_linear_layout_accepts_the_two_dim_scale():
     """The 2-D scale is just as layout-ambiguous as the flat one.
 
@@ -348,6 +356,7 @@ def test_explicit_linear_layout_accepts_the_two_dim_scale():
     assert dyn_spec.dim_idx[dyn_spec.input_idx.index(scale_idx)] == 0
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "scale_factory",
     [_flat_scale, lambda n: torch.ones((n, SF_PER_TOKEN), dtype=torch.uint8)],
@@ -371,6 +380,7 @@ def test_implicit_layout_emits_deprecation_warning(scale_factory):
     assert config.dynamic_tensor_specs
 
 
+@pytest.mark.cpu_only
 def test_implicit_layout_warning_names_the_inferred_layout():
     """The message must say what was assumed and that the arg becomes required.
 
@@ -393,6 +403,7 @@ def test_implicit_layout_warning_names_the_inferred_layout():
     assert "required" in message
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("layout", [SfLayout.layout_128x4, SfLayout.layout_8x4])
 def test_swizzled_layout_is_rejected(layout):
     """A declared swizzled layout must fail loudly, not be read as linear.
@@ -413,6 +424,7 @@ def test_swizzled_layout_is_rejected(layout):
         )
 
 
+@pytest.mark.cpu_only
 def test_swizzled_layout_is_rejected_before_the_numel_guard():
     """The layout rejection must not depend on the numel guard firing.
 
@@ -440,6 +452,7 @@ def test_swizzled_layout_is_rejected_before_the_numel_guard():
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "fp8_quantization_type, scale_factory",
     [
@@ -469,6 +482,7 @@ def test_unambiguous_scale_layouts_do_not_deprecate(
         _tuning_config(runner, _make_inputs(num_tokens, scale_factory(num_tokens)))
 
 
+@pytest.mark.cpu_only
 def test_absent_scale_does_not_deprecate():
     """bf16 activations carry no scale, so there is nothing to declare."""
     runner = _make_runner()
@@ -477,6 +491,7 @@ def test_absent_scale_does_not_deprecate():
         _tuning_config(runner, _make_inputs(4, None))
 
 
+@pytest.mark.cpu_only
 def test_malformed_flat_scale_message_cites_the_declared_layout():
     """The guard now validates against a KNOWN layout, and says so.
 

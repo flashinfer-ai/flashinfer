@@ -32,6 +32,7 @@ def payload():
     return {**original, "kernels": [first, second]}
 
 
+@pytest.mark.cpu_only
 def test_catalog_shares_implementations_without_merging_shape_contracts(payload):
     before = deepcopy(payload)
     catalog = normalize_manifest(payload)
@@ -53,6 +54,7 @@ def test_catalog_shares_implementations_without_merging_shape_contracts(payload)
         )
 
 
+@pytest.mark.cpu_only
 def test_catalog_preserves_ordered_repeated_constants(payload):
     for record in payload["kernels"]:
         record["source"]["parameters"]["constants"] = [
@@ -62,6 +64,7 @@ def test_catalog_preserves_ordered_repeated_constants(payload):
     assert expand_manifest(normalize_manifest(payload)) == payload
 
 
+@pytest.mark.cpu_only
 def test_catalog_references_are_stable_when_other_kernels_are_added(payload):
     catalog = normalize_manifest(payload)
     third = deepcopy(payload["kernels"][0])
@@ -73,6 +76,7 @@ def test_catalog_references_are_stable_when_other_kernels_are_added(payload):
         assert catalog[table].items() <= expanded[table].items()
 
 
+@pytest.mark.cpu_only
 def test_expanded_kernel_metadata_does_not_alias_shared_tables(payload):
     catalog = normalize_manifest(payload)
     records = expand_manifest(catalog)["kernels"]
@@ -83,6 +87,7 @@ def test_expanded_kernel_metadata_does_not_alias_shared_tables(payload):
     assert expand_manifest(catalog) == payload
 
 
+@pytest.mark.cpu_only
 def test_catalog_supports_sources_without_template_parameters(payload):
     for record in payload["kernels"]:
         del record["source"]["parameters"]
@@ -91,6 +96,7 @@ def test_catalog_supports_sources_without_template_parameters(payload):
     assert expand_manifest(catalog) == payload
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "table", ["sources", "parameters", "implementations", "contracts"]
 )
@@ -101,6 +107,7 @@ def test_catalog_rejects_missing_reference_tables(payload, table):
         expand_manifest(catalog)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("reference", ["missing", None, 0, []])
 @pytest.mark.parametrize(
     "table", ["sources", "parameters", "implementations", "contracts"]
@@ -121,6 +128,7 @@ def test_catalog_rejects_dangling_or_invalid_references(payload, table, referenc
         expand_manifest(catalog)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("field", ["arch", "abi", "source", "contract"])
 def test_catalog_entries_cannot_override_shared_implementation(payload, field):
     catalog = normalize_manifest(payload)
@@ -129,6 +137,7 @@ def test_catalog_entries_cannot_override_shared_implementation(payload, field):
         expand_manifest(catalog)
 
 
+@pytest.mark.cpu_only
 def test_manifest_writer_upgrades_v2_and_does_not_replace_on_invalid_input(
     payload, tmp_path
 ):
@@ -153,6 +162,7 @@ def test_manifest_writer_upgrades_v2_and_does_not_replace_on_invalid_input(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+@pytest.mark.cpu_only
 def test_export_adds_and_replaces_kernels_in_legacy_and_shared_catalogs(
     payload, tmp_path
 ):
@@ -172,11 +182,12 @@ def test_export_adds_and_replaces_kernels_in_legacy_and_shared_catalogs(
     assert read_manifest(path)["kernels"] == [payload["kernels"][0], updated]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("schema_version", [2, 3])
 def test_selection_copies_sources_and_prunes_unreferenced_metadata(
     payload, tmp_path, monkeypatch, schema_version
 ):
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "benchmarks"))
     from bench_cudnn_frost_moe_bf16 import copy_selected
 
     candidate = tmp_path / "candidate"
@@ -204,6 +215,7 @@ def test_selection_copies_sources_and_prunes_unreferenced_metadata(
     assert (selected / MANIFEST_FILENAME).read_bytes() == before
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
 def test_packaged_catalogs_share_verified_sources_and_preserve_shortlist_ids(dtype):
     root = artifact_root(dtype)

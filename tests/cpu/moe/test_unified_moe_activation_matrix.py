@@ -10,6 +10,7 @@ from scripts.generate_moe_activation_matrix import (
 )
 
 
+@pytest.mark.cpu_only
 def test_activation_matrix_rows_are_unique_and_complete():
     rows = get_activation_matrix_rows()
     keys = [(backend_key, label) for backend_key, _, label, _ in rows]
@@ -25,10 +26,12 @@ def test_activation_matrix_rows_are_unique_and_complete():
     assert "NVFP4" not in labels
 
 
+@pytest.mark.cpu_only
 def test_documented_activation_matrix_matches_runner_registry():
     check_activation_matrix()
 
 
+@pytest.mark.cpu_only
 def test_quant_specific_activation_mapping_must_cover_exact_variants(monkeypatch):
     class Config:
         pass

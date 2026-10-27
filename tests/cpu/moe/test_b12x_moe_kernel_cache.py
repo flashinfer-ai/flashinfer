@@ -16,7 +16,7 @@ limitations under the License.
 Naming-contract tests for the b12x MoE CuTe-DSL disk cache adopter.
 
 Replicates the contract enforced for the earlier adopters in
-``tests/jit/test_cute_dsl_cache.py``, as the design doc's rollout note asks
+``tests/cpu/jit/test_cute_dsl_cache.py``, as the design doc's rollout note asks
 of new adopters. The kernel-name string is the sole per-kernel cache key --
 the module ``meta.json`` guards only arch / DSL version / source hashes -- so
 a name that ignores a codegen parameter makes two different kernels collide
@@ -210,6 +210,7 @@ ADOPTERS = [
 KEY_OMISSIONS = {"dynamic": {"m", "max_rows"}}
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("label,getter,key_fn", [(a[0], a[1], a[2]) for a in ADOPTERS])
 def test_key_signature_covers_getter_params(label, getter, key_fn):
     """Every kernel-getter parameter must be expressible in the cache key.
@@ -233,6 +234,7 @@ def test_key_signature_covers_getter_params(label, getter, key_fn):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "label,key_fn,baseline,perturbed,param",
     [(a[0], a[2], a[3], a[4], p) for a in ADOPTERS for p in sorted(a[3])],
@@ -251,6 +253,7 @@ def test_disk_name_varies_with_every_argument(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "label,key_fn,baseline", [(a[0], a[2], a[3]) for a in ADOPTERS]
 )
@@ -265,6 +268,7 @@ def test_disk_name_is_symbol_safe(label, key_fn, baseline):
     assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "label,key_fn,baseline", [(a[0], a[2], a[3]) for a in ADOPTERS]
 )
@@ -279,6 +283,7 @@ def test_disk_name_is_stable_for_equal_keys(label, key_fn, baseline):
     assert first == second
 
 
+@pytest.mark.cpu_only
 def test_kernel_types_do_not_collide():
     """The three kernel families must never share an artifact name."""
     names = {
