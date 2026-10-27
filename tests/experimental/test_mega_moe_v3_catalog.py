@@ -209,7 +209,7 @@ def test_tp_ep_programs_launch_as_programmatic_dependents():
         markers = list(ROLE_MARKER.finditer(text, body))
         assert sorted(marker.group(1) for marker in markers) == sorted(ROLES), name
         assert all(launch_dependents < marker.start() for marker in markers), name
-        for marker, following in zip(markers, [*markers[1:], None]):
+        for marker, following in zip(markers, [*markers[1:], None], strict=True):
             role = text[marker.end() : following.start() if following else len(text)]
             assert role.count(GRID_DEP_WAIT) == 1, (name, marker.group(1))
             wait = role.index(GRID_DEP_WAIT)
