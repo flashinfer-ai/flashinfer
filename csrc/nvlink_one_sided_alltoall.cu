@@ -693,7 +693,7 @@ void moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView work
   // Validate inputs
   CHECK_INPUT(payload);
   TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
-      << "payload must be a 3D tensor [ep_size, max_tokens_per_rank, elements_per_token]";
+      << "payload must be a 3D tensor [ep_size, runtime_max_tokens_per_rank, elements_per_token]";
   TVM_FFI_ICHECK_EQ(payload.size(0), epSize) << "payload first dimension must equal epSize";
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0) << "runtimeMaxTokensPerRank must be positive";
   TVM_FFI_ICHECK_EQ(payload.size(1), runtimeMaxTokensPerRank)

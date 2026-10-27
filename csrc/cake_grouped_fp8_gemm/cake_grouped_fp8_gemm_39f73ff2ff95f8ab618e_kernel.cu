@@ -475,7 +475,6 @@ kernel_cake_grouped_fp8_gemm_39f73ff2ff95f8ab618e(const __grid_constant__ CUtens
             unsigned int n_l2_limit_1 = (unsigned int)16;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
-            unsigned int _phase_sf_full = 0;
             #pragma unroll 1
             for (unsigned int tile_idx_1 = worker_idx_1; tile_idx_1 < total_tiles_1; tile_idx_1 += num_workers_1) {
                 unsigned int l2_group_1 = tile_idx_1 / pairs_per_l2_1;
@@ -520,7 +519,7 @@ kernel_cake_grouped_fp8_gemm_39f73ff2ff95f8ab618e(const __grid_constant__ CUtens
                     #pragma unroll 1
                     for (int iter_k = 0; iter_k < k_tiles; iter_k++) {
                         mbarrier_wait(tma_full_addr + (tma_stage) * 8, _phase_tma_full);
-                        mbarrier_wait(sf_full_addr + (tma_stage) * 8, _phase_sf_full);
+                        mbarrier_wait(sf_full_addr + (tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k == 0) ? 1 : 0);
                         uint32_t _elected_0 = elect_sync();
@@ -543,7 +542,7 @@ kernel_cake_grouped_fp8_gemm_39f73ff2ff95f8ab618e(const __grid_constant__ CUtens
                         }
                         elect_commit(tma_free_addr + (tma_stage) * 8);
                         tma_stage += 1;
-                        if (tma_stage == 6) { tma_stage = 0; _phase_tma_full ^= 1; _phase_sf_full ^= 1; }
+                        if (tma_stage == 6) { tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     elect_commit(mainloop_done_addr);
                     _phase_epilogue_done ^= 1;

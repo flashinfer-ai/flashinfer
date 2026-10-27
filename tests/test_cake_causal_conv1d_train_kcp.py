@@ -502,7 +502,7 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     geometry = {"threads": 128, "vec": 8}
     legacy = cake_jit.plan(5000, 1280, 2, geometry=geometry, legacy=True)
     assert (legacy["ct_vec"], legacy["n_sub"], legacy["n_ch_tiles"]) == (128, 1, 2)
-    routed = cake_jit.plan(5000, 1280, 2, geometry=geometry)
+    routed = cake_jit.plan(5000, 1280, 2, geometry=geometry, role="bwd")
     assert (routed["ct_vec"], routed["n_sub"], routed["n_ch_tiles"]) == (32, 4, 5)
     calls = []
     original = conv_kcp.plan

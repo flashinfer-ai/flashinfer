@@ -263,6 +263,23 @@ CLUSTER_SPLIT_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
     "sm_100a": (2, 32),
     "sm_103a": (2, 16),
 }
+# The quantizer alone (the public per-token quantize entries; the quantize + GEMM chain keeps
+# :func:`quant_cluster_split`): per architecture and row width, the token-count ranges
+# ``(low, high, C)`` whose bf16 rows run as clusters of ``C`` CTAs instead.  Paired timings on
+# B200 and GB300 at the SM counts of :data:`MEASURED_SM_COUNT`; other SM counts keep the chain's
+# split.
+QUANT_ALONE_CLUSTER_SPLIT: dict[str, dict[int, tuple[tuple[int, int, int], ...]]] = {
+    "sm_100a": {
+        16384: ((1, 1, 8), (130, 130, 2)),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+    "sm_103a": {
+        16384: ((1, 1, 8),),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+}
 # 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
 CLUSTER_SPLIT_PAD_CHUNKS = 1024
 
@@ -371,6 +388,19 @@ def quant_cluster_split(m: int, k: int, is_bf16: bool, fold: bool, arch: str) ->
     return QUANT_CLUSTER_SPLIT if int(m) <= limit else 1
 
 
+def quant_alone_cluster_split(
+    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+) -> int:
+    """CTAs per token row of the quantizer alone: the range of
+    :data:`QUANT_ALONE_CLUSTER_SPLIT` holding ``M`` at ``K`` on ``arch`` at its measured SM
+    count, else :func:`quant_cluster_split`."""
+    if is_bf16 and MEASURED_SM_COUNT.get(arch) == int(sm_count):
+        for low, high, split in QUANT_ALONE_CLUSTER_SPLIT.get(arch, {}).get(int(k), ()):
+            if low <= int(m) <= high:
+                return split
+    return quant_cluster_split(m, k, is_bf16, fold, arch)
+
+
 def quant_plan(
     m: int,
     k: int,
@@ -379,13 +409,17 @@ def quant_plan(
     arch: str,
     sm_count: int,
     x_row_stride: Optional[int] = None,
+    *,
+    alone: bool = False,
 ) -> QuantizePlan:
     """Resolve the quantizer instance and grid exactly like the Cake production launcher
     (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, the
     static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
     at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
     the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
-    contiguous) only decides between the static-K and the runtime-geometry instance.
+    contiguous) only decides between the static-K and the runtime-geometry instance;
+    ``alone`` selects the cluster split of the quantizer alone
+    (:func:`quant_alone_cluster_split`) instead of the chain's.
     A row the cluster split serves (:func:`quant_cluster_split`) runs as a cluster of
     ``C`` CTAs, each with the CTA shape of a ``C``-th of the row; the grid is one cluster
     per row, then (``M`` not a multiple of 128) the padding clusters, each CTA zeroing
@@ -406,7 +440,11 @@ def quant_plan(
     k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
     grid = pm
-    split = quant_cluster_split(m, k, is_bf16, fold, arch)
+    split = (
+        quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
+        if alone
+        else quant_cluster_split(m, k, is_bf16, fold, arch)
+    )
     if split > 1:
         share = (k // SF_VEC + split - 1) // split * SF_VEC
         threads, min_blocks = cta_config(share, m)
@@ -540,18 +578,20 @@ SPLITK2_MIN_K = 16384
 # of the CTA's first tile, for its first CHAIN_EP_STAGES K tiles, into L2 before the grid
 # dependency wait, so they load while the quantizer still runs.  Per architecture, the program
 # families (kernel key without the output dtype) and the token-count range where the chain
-# (:func:`prepare_nvfp4_per_token_chain`) takes them; the GEMM alone never does.
+# (:func:`prepare_nvfp4_per_token_chain`) takes them; the GEMM alone takes them only on the
+# cells of GEMM_ALONE_EP_RULES.
 CHAIN_EP_STAGES = 4
 CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
     "sm_100a": {
         "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
         "m64_bF_l2256b_ro": (128, 128),
         "n16_sk3_l2256b": (17, 32),
         "n32_aF_l2256b": (17, 32),
         "n32_k512_aF_l2256b_s3": (17, 32),
         "n32_sk2_aF_l2256b": (17, 17),
         "n8_aF_l2256b": (1, 8),
-        "n8_aF_l2256b_o2": (8, 8),
+        "n8_aF_l2256b_o2": (1, 8),
         "n8_k512_aF_l2256b_s3": (8, 8),
         "n8_sk2_aF_l2256b": (1, 32),
         "n8_sk2_l2256b": (1, 32),
@@ -560,6 +600,8 @@ CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
     },
     "sm_103a": {
         "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
+        "m64_bF_l2256b_ro": (128, 128),
         "n16_sk3_l2256b": (17, 32),
         "n32_aF_l2256b": (17, 32),
         "n32_aF_l2256b_o2": (17, 17),
@@ -572,6 +614,21 @@ CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
         "n8_sk3_l2256b": (17, 17),
         "n8_sk4_l2256b": (1, 8),
     },
+}
+# Chain cells of the entry L2 prefetch on the SM count of :data:`MEASURED_SM_COUNT` only: per
+# architecture, the program family, the token-count range and the ``(K, N)`` shapes (paired
+# timings on B200); the GEMM alone keeps its program there.
+CHAIN_EP_MEASURED_CELLS: dict[
+    str, dict[str, tuple[int, int, tuple[tuple[int, int], ...]]]
+] = {
+    "sm_100a": {"m128_bF_ro": (128, 128, ((8192, 28672),))},
+}
+# The GEMM alone (``mm_fp4``, and :func:`prepare_mm_fp4_per_token` without a tactic) takes
+# the entry L2 prefetch program on these cells too: per architecture, the program families
+# and the token-count range, each inside a CHAIN_EP_RULES cell, so the chain and the GEMM
+# alone run one program there.
+GEMM_ALONE_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {"m64_bF_l2256b_ro": (128, 128)},
 }
 
 
@@ -918,6 +975,10 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("ro")
     if int(tactic.get("ep_stages", 0)):
         parts.append(f"ep{int(tactic['ep_stages'])}")
+    if tactic.get("fold"):
+        parts.append("fold")
+    if tactic.get("b2"):
+        parts.append("b2" + str(tactic["b2"]))
     return "gemm:" + "_".join(parts)
 
 
@@ -1017,10 +1078,12 @@ KNOWN_TACTIC_KEYS = frozenset(
     {
         "a_hint",
         "alpha_n",
+        "b2",
         "b_hint",
         "blocks_per_sm",
         "deep_k",
         "ep_stages",
+        "fold",
         "half_m",
         "l2_promo",
         "num_stages",
@@ -1034,6 +1097,34 @@ KNOWN_TACTIC_KEYS = frozenset(
         "two_cta",
         "w_rows",
     }
+)
+
+
+# The token-remainder fold (``fold`` tactics, ``_fold`` keys): the 1-CTA 128-wide m
+# tile whose remainder token rows (at most 8 past its 128-row tile) ride on its
+# weight-tile stages as a swapped-role 128 x 8 MMA instead of a second token tile.
+# Without an explicit tactic, :func:`gemm_plan` takes it for 128 < M <= 136 on these
+# (arch, K, N) cells at the architecture's :data:`MEASURED_SM_COUNT`.
+FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+FOLD_TACTIC = {
+    "tile_n": 128,
+    "deep_k": False,
+    "alpha_n": False,
+    "a_hint": None,
+    "b_hint": "evict_first",
+    "l2_promo": None,
+    "fold": True,
+}
+
+# The 2-CTA token-remainder fold (``b2="fold"`` tactics, ``_b2fold`` keys): the static
+# 2-CTA pair program with 256-wide weight tiles whose remainder token rows (at most 16
+# past its 256-row pair tile) ride on its weight-tile stages as a swapped-role
+# 256 x 16 pair MMA instead of a second token tile.  Without an explicit tactic,
+# :func:`gemm_plan` takes it for 256 < M <= 272 on these (arch, K, N) cells at the
+# architecture's :data:`MEASURED_SM_COUNT` when the default plan is that program.
+B2_FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+B2_FOLD_BASE_KEYS = frozenset(
+    {"gemm:m256_2cta_bf16_bF_l2256b", "gemm:m256_2cta_f16_bF_l2256b"}
 )
 
 
@@ -1052,8 +1143,29 @@ def gemm_plan(
     Without an explicit ``tactic``, on an SM count other than ``arch``'s
     :data:`MEASURED_SM_COUNT` a default tactic whose kernel ``arch`` does not
     register falls back to the tactic of the measured SM count, planned (grid and
-    stream-K tail) for ``sm_count``."""
+    stream-K tail) for ``sm_count``.  Without an explicit ``tactic``, 128 < M <= 136
+    on a :data:`FOLD_CELLS` cell at ``arch``'s measured SM count takes the
+    token-remainder fold (:data:`FOLD_TACTIC`), and 256 < M <= 272 on a
+    :data:`B2_FOLD_CELLS` cell at that SM count, whose default plan is a
+    :data:`B2_FOLD_BASE_KEYS` program, takes its 2-CTA fold (``b2="fold"``)."""
+    if (
+        tactic is None
+        and 128 < int(m) <= 136
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in FOLD_CELLS
+    ):
+        tactic = dict(FOLD_TACTIC)
     plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic)
+    if (
+        tactic is None
+        and 256 < int(m) <= 272
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in B2_FOLD_CELLS
+        and plan.kernel_key in B2_FOLD_BASE_KEYS
+    ):
+        plan = _gemm_plan(
+            m, n, k, out_f16, arch, sm_count, tactic={**plan.tactic, "b2": "fold"}
+        )
     measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
     if (
         tactic is not None
@@ -1163,6 +1275,46 @@ def _gemm_plan(
     )
     w_tile = w_rows if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
+    if tactic.get("fold"):
+        if (
+            alpha_n
+            or two_cta
+            or split_k > 1
+            or deep_k
+            or tile_n != 128
+            or blocks_per_sm != 1
+            or tactic.get("ring_overlay")
+            or int(tactic.get("ep_stages", 0)) not in (0, CHAIN_EP_STAGES)
+            or not 128 < m <= 136
+        ):
+            raise ValueError(
+                "fold is a knob of the 1-CTA 128-wide m tile for 128 < M <= 136"
+            )
+        # One token tile: its 128 rows and the remainder rows the fold carries.
+        tok_tiles = 1
+    if tactic.get("b2") is not None:
+        if (
+            tactic["b2"] != "fold"
+            or alpha_n
+            or not two_cta
+            or tile_n != 256
+            or deep_k
+            or half_m
+            or stream_k
+            or str(tactic.get("sched", "static")) != "static"
+            or tactic.get("raster_group")
+            or tactic.get("num_stages") is not None
+            or tactic.get("b_hint") != "evict_first"
+            or tactic.get("a_hint")
+            or tactic.get("l2_promo") != "l2_256b"
+            or not 256 < m <= 272
+        ):
+            raise ValueError(
+                'b2="fold" is a knob of the static 2-CTA pair program with 256-wide'
+                " weight tiles (b_hint evict_first, l2_promo l2_256b) for 256 < M <= 272"
+            )
+        # One pair token tile: its 256 rows and the remainder rows the fold carries.
+        tok_tiles = 1
     w_tiles = (n + w_tile - 1) // w_tile
     num_tiles = tok_tiles * w_tiles
     sched = str(tactic.get("sched", "static"))
@@ -1425,13 +1577,29 @@ def prepare_nvfp4_per_token_quantize(
     *,
     out_scale: Optional[torch.Tensor] = None,
 ) -> NVFP4PerTokenQuantizeRunner:
-    """Validate the binding, select the quantizer instance and bind the launch.
+    """Validate the binding, select the quantizer-alone instance
+    (``quant_plan(..., alone=True)``) and bind the launch.
 
     ``global_scale_inv`` is the one-element float32 inverse base scale
     (typically ``1 / (448 * 6)``); ``out_scale`` an optional one-element
     float32 tensor the returned per-token scale is multiplied by (the packed
     data is unchanged).  The JIT module of the instance is built and loaded
     here, so prepare outside CUDA Graph capture."""
+    return _prepare_quantize(
+        x, global_scale_inv, outputs, out_scale=out_scale, alone=True
+    )
+
+
+def _prepare_quantize(
+    x: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    outputs: PerTokenQuantizeOutputs,
+    *,
+    out_scale: Optional[torch.Tensor],
+    alone: bool,
+) -> NVFP4PerTokenQuantizeRunner:
+    """:func:`prepare_nvfp4_per_token_quantize` with the cluster split of the quantizer
+    alone (``alone``) or of the quantize + GEMM chain."""
     m, k = validate_quantize_inputs(x, outputs)
     device = x.device
     arch = _device_arch(device)
@@ -1439,7 +1607,14 @@ def prepare_nvfp4_per_token_quantize(
     fold = out_scale is not None
     scale_arg = _scalar_f32(out_scale, "out_scale", device) if fold else gs_inv
     plan = quant_plan(
-        m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device), row_stride_of(x)
+        m,
+        k,
+        x.dtype == torch.bfloat16,
+        fold,
+        arch,
+        _sm_count(device),
+        row_stride_of(x),
+        alone=alone,
     )
     kwargs = _quant_kwargs(plan, x, outputs, gs_inv, scale_arg)
     with torch.cuda.device(_device_index(device)):
@@ -1476,7 +1651,9 @@ def _quant_prepared(
     (``x_row_stride`` selects the static-K or the runtime-geometry instance)."""
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
-    plan = quant_plan(m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride)
+    plan = quant_plan(
+        m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride, alone=True
+    )
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1619,8 +1796,9 @@ def prepare_mm_fp4_per_token(
     ``a_sf`` / ``b_sf`` their swizzled 128x4 E4M3 block scales
     (``padded_rows(M | N) x padded_sf_cols(K)`` bytes, uint8 or float8_e4m3fn),
     ``alpha [M]`` the FP32 per-token scale and ``out [M, N]`` a contiguous bf16 /
-    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`.  The JIT module is
-    built and loaded here, so prepare outside CUDA Graph capture."""
+    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`; without it the GEMM runs the
+    program of :func:`gemm_alone_tactic` on the cells of :data:`GEMM_ALONE_EP_RULES`.  The
+    JIT module is built and loaded here, so prepare outside CUDA Graph capture."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():
@@ -1650,9 +1828,10 @@ def prepare_mm_fp4_per_token(
     a_flat = _flat_u8_scales(a_sf, "a_sf", pm, cols)
     b_flat = _flat_u8_scales(b_sf, "b_sf", pn, cols)
     arch = _device_arch(device)
-    plan = gemm_plan(
-        m, n, k, out.dtype == torch.float16, arch, _sm_count(device), tactic=tactic
-    )
+    out_f16 = out.dtype == torch.float16
+    plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=tactic)
+    if tactic is None and (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     kwargs = _gemm_kwargs(plan, a_fp4, a_flat, b_fp4, b_flat, alpha, out)
     with torch.cuda.device(_device_index(device)):
         launch = _bind(arch, plan.kernel_key, kwargs)
@@ -1724,6 +1903,8 @@ def _gemm_prepared(
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
     plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device))
+    if (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1794,24 +1975,47 @@ def mm_fp4_per_token(
 # ---------------------------------------------------------------------------
 
 
-def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
-    """The GEMM tactic of the quantize + GEMM chain whose GEMM alone resolves to ``plan``:
-    the plan's tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
+def _entry_prefetch_tactic(
+    plan: GemmPlan, rules: dict[str, dict[str, tuple[int, int]]]
+) -> Optional[dict[str, Any]]:
+    """``plan``'s tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
     when its program family (kernel key without the output dtype) and token count lie in a
-    cell of :data:`CHAIN_EP_RULES` on its architecture and that program is registered, else
-    ``None`` (the plan's own program)."""
+    cell of ``rules`` on its architecture (for the chain, also of
+    :data:`CHAIN_EP_MEASURED_CELLS`) and that program is registered, else ``None``."""
     family = "_".join(
         part
         for part in plan.kernel_key.removeprefix("gemm:").split("_")
         if part not in ("bf16", "f16")
     )
-    cell = CHAIN_EP_RULES.get(plan.arch, {}).get(family)
+    cell = rules.get(plan.arch, {}).get(family)
+    if (cell is None or not cell[0] <= plan.M <= cell[1]) and rules is CHAIN_EP_RULES:
+        measured = CHAIN_EP_MEASURED_CELLS.get(plan.arch, {}).get(family)
+        if (
+            measured is not None
+            and MEASURED_SM_COUNT.get(plan.arch) == plan.sm_count
+            and (plan.K, plan.N) in measured[2]
+        ):
+            cell = measured[:2]
     if cell is None or not cell[0] <= plan.M <= cell[1]:
         return None
     tactic = {**plan.tactic, "ep_stages": CHAIN_EP_STAGES}
     if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
         return None
     return tactic
+
+
+def gemm_alone_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The tactic the GEMM alone takes when no tactic is passed and the default-tactic plan
+    is ``plan``: the entry L2 prefetch program on the cells of :data:`GEMM_ALONE_EP_RULES`,
+    else ``None`` (the plan's own program)."""
+    return _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES)
+
+
+def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The GEMM tactic of the quantize + GEMM chain whose default-tactic GEMM plan is
+    ``plan``: the entry L2 prefetch program on the cells of :data:`CHAIN_EP_RULES`, else
+    ``None`` (the program the GEMM alone runs)."""
+    return _entry_prefetch_tactic(plan, CHAIN_EP_RULES)
 
 
 @dataclass(frozen=True)
@@ -1860,8 +2064,8 @@ def prepare_nvfp4_per_token_chain(
     activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``).  The GEMM
     runs the program of :func:`chain_gemm_tactic` (the entry L2 prefetch of the weight
     tiles on the cells of :data:`CHAIN_EP_RULES`), else the one ``mm_fp4`` runs."""
-    quantize = prepare_nvfp4_per_token_quantize(
-        x, global_scale_inv, workspace, out_scale=out_scale
+    quantize = _prepare_quantize(
+        x, global_scale_inv, workspace, out_scale=out_scale, alone=False
     )
     device = workspace.fp4.device
     plan = gemm_plan(
