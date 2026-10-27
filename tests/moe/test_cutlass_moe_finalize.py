@@ -36,7 +36,16 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 
-_SUPPORTED_ARCHES = {(8, 9), (9, 0), (10, 0), (10, 3), (11, 0), (12, 0), (12, 1)}
+_SUPPORTED_ARCHES = {
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (10, 7),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or get_compute_capability(torch.device("cuda")) not in _SUPPORTED_ARCHES,
@@ -62,7 +71,7 @@ def _finalize_module():
         prod_spec = jit_fused_moe.gen_cutlass_fused_moe_sm120_module()
     elif arch == 103:
         prod_spec = jit_fused_moe.gen_cutlass_fused_moe_sm103_module()
-    elif arch in (100, 110):
+    elif arch in (100, 107, 110):
         prod_spec = jit_fused_moe.gen_cutlass_fused_moe_sm100_module()
     elif arch == 90:
         prod_spec = jit_fused_moe.gen_cutlass_fused_moe_sm90_module()

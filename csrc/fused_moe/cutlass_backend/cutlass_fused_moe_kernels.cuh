@@ -2251,9 +2251,11 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS_PER_BLOCK, FINALIZE_WARP
     float const compact_scale = __shfl_sync(FULL_MASK, slot_scale, src);
 
     int64_t const first_elem = slice * elems_per_slice + lane;
+    bool in_row[VECS];  // the last slice of a row can be partial
     ComputeElem thread_output[VECS];
 #pragma unroll
     for (int v = 0; v < VECS; ++v) {
+      in_row[v] = first_elem + 32 * v < num_elems_in_orig_col;
       thread_output[v].fill(0);
     }
     for (int i0 = 0; i0 < num_valid; i0 += BATCH) {
@@ -2269,7 +2271,7 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS_PER_BLOCK, FINALIZE_WARP
 #pragma unroll
           for (int v = 0; v < VECS; ++v) {
             int64_t const elem = first_elem + 32 * v;
-            if (elem < num_elems_in_orig_col) {
+            if (in_row[v]) {
               expert_vals[b][v] =
                   expanded_permuted_rows_v[permuted_row * num_elems_in_padded_col + elem];
               if (bias) {
@@ -2285,11 +2287,14 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS_PER_BLOCK, FINALIZE_WARP
           float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : row_scales[b];
 #pragma unroll
           for (int v = 0; v < VECS; ++v) {
-            ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_vals[b][v]);
-            if (bias) {
-              expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_vals[b][v]);
+            if (in_row[v]) {
+              ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_vals[b][v]);
+              if (bias) {
+                expert_result =
+                    expert_result + arrayConvert<BiasElem, ComputeElem>(bias_vals[b][v]);
+              }
+              thread_output[v] = thread_output[v] + row_scale * expert_result;
             }
-            thread_output[v] = thread_output[v] + row_scale * expert_result;
           }
         }
       }
@@ -2300,7 +2305,7 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS_PER_BLOCK, FINALIZE_WARP
 #pragma unroll
     for (int v = 0; v < VECS; ++v) {
       int64_t const elem = first_elem + 32 * v;
-      if (elem < num_elems_in_orig_col) {
+      if (in_row[v]) {
         OutputVec output_elem;
         static_cast<OutputElem&>(output_elem) =
             arrayConvert<ComputeElem, OutputElem>(thread_output[v]);
