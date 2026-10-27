@@ -214,6 +214,20 @@ def compute_reference_moe(
 
 
 @contextmanager
+def env_var(name: str, value: str):
+    """Set one environment variable for the block, restoring it afterwards."""
+    saved = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+@contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
     if use_4over6:
@@ -1357,3 +1371,20 @@ def fp8_per_tensor_requant_hook(intermediate_scale_global: torch.Tensor):
         return q.to(torch.float8_e4m3fn).float() / intermediate_scale_global
 
     return hook
+
+
+def powlu_ref(gate: torch.Tensor, m: float) -> torch.Tensor:
+    """PowLU on the gate branch, in fp32 -- mirrors PowLUAdaptor.
+
+    ``m / (sqrt(g) + 1)`` is the self-adapting exponent, and the non-positive
+    half is plain SiLU. Written with ``torch.pow`` rather than ``exp2/log2`` so
+    the reference is independent of the kernel's fast-math lowering (they agree
+    to ~6e-6 relative, far below bf16 resolution). The masked-off lanes stay at
+    1.0 because pow() of a negative base is NaN, and a NaN in an unused lane
+    still poisons torch.where on some backends.
+    """
+    gate = gate.float()
+    positive = gate > 0
+    safe = torch.where(positive, gate, torch.ones_like(gate))
+    exponent = m / (safe.sqrt() + 1.0)
+    return torch.where(positive, safe.pow(exponent) * torch.sigmoid(safe), F.silu(gate))

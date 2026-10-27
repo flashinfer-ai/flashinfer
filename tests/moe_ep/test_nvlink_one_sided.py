@@ -360,7 +360,7 @@ def _run_case(case: Case, rank: int) -> dict:
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        cft_enabled = one_sided and comm.cft_enabled
+        cft_enabled = one_sided and comm._cft_enabled
         if case.mode == "cft" and not cft_enabled:
             return {"skip": "CFT counted writes are unavailable on this platform"}
         launches: list = []
@@ -386,7 +386,7 @@ def _run_case(case: Case, rank: int) -> dict:
                     slots,
                     weights,
                     hidden_states_scale=sf,
-                    max_tokens_per_rank=maximum,
+                    runtime_max_tokens_per_rank=maximum,
                     eplb_local_stats=stats,
                 )
                 combine_offsets.append(comm._round["combine_offset"])
@@ -784,7 +784,7 @@ def test_nvlink_one_sided(case: Case) -> None:
 def test_workspace_layout(cft: bool) -> None:
     """Regions are disjoint, aligned and fixed by the allocation-time capacities."""
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.kernels import (
-        get_nvlink_one_sided_module,
+        get_nvlink_one_sided_alltoall_module,
         layout_constants,
     )
 
@@ -794,7 +794,7 @@ def test_workspace_layout(cft: bool) -> None:
     combine_input_bytes = ep_size * capacity * hidden * 2
     combine_recv_bytes = ep_size * capacity * hidden if cft else 0
     layout = torch.empty(index.NUM_METAINFO_FIELDS, dtype=torch.int64)
-    get_nvlink_one_sided_module().moe_a2a_get_workspace_layout(
+    get_nvlink_one_sided_alltoall_module().moe_a2a_get_workspace_layout(
         ep_size,
         capacity,
         top_k,

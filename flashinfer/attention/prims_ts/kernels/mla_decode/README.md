@@ -1,5 +1,19 @@
 # Task-Scheduled MLA Decode
 
+Native D512 two-source sparse MLA is available through
+`BatchSparseMLADecodePagedTSWrapper` (see its `plan()` / `run()` docstrings).
+Every sparse schedule consumes separate storage-row index lists and live lengths
+for the primary and optional extra pool. Pass `indices`, `lengths`, optional
+`extra_indices`/`extra_lengths`, and attention sinks directly to `run()`.
+The caller supplies two effective scales: `softmax_scale = attention_scale *
+q_descale * kv_descale` and `output_scale = output_multiplier * kv_descale`.
+Both pools share the KV descale. Sink logits retain their original scale;
+`output_scale` applies before output quantization, while `out_scale` holds its
+generated per-block scales. Dynamic scale composition belongs in upstream work.
+Index lists use `-1` for holes and need no 128-entry padding.
+The kernel keeps source boundaries aligned to its KV tiles internally.
+The dense API contract below retains its 512-latent plus 64-RoPE layout.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
@@ -54,7 +68,7 @@ metadata directly in `run()`.
 | Q/cache dtype | Matching `torch.bfloat16` or `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` only |
 | Q length | Fixed or packed variable length; packed requests may be empty, while the static maximum remains positive |
-| K/V length | Positive and at most `2**31 - 32768`; the reserve keeps the largest padded split-KV coordinate span in signed `int32` |
+| K/V length | Positive runtime lengths are at most `2**31 - 32768`; nonpositive lengths mark inactive requests. The reserve keeps the largest padded split-KV coordinate span in signed `int32`. |
 | Q heads | Validated at 6, 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
 | K/V cache | Paged, one logical KV head; `[num_pages, page_size, 576]` or `[num_pages, 1, page_size, 576]` compact storage |
 | Metadata/cache index extents | Flattened query-head capacity, block-table elements, and physical page count must fit signed `int32` |
@@ -62,6 +76,7 @@ metadata directly in `run()`.
 | Mask | Dense or bottom-right causal |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection by kernel family and work shape |
 | Accumulation | FP32 QK/PV and softmax state |
+| Skip correction | Opt-in `softmax_rescale_threshold_log2` (binades), passed as `tuning=MLAAttentionTuning(...)` to `plan()` and the one-shot helpers; `0.0` rescales on every new row maximum, which is also what dense `None` (default) does. The name and the FP8 P scale follow the Prims-TS FMHA decode option of the same name; the bounds (8 for FP8, 32 for BF16) follow the trtllm-gen FMHA `skipCorrThreshold`. A positive value T keeps a row's anchor while a K tile raises its maximum by at most T binades, skipping that tile's O rescale. FP8 P is then quantized at `448 * 2**-T` instead of 448 (1.75 at T = 8, the trtllm-gen scale), so E4M3 P loses precision from about `10.3 - 0.69 * T` nats below the anchor and flushes to zero in the PV numerator below about `13 - 0.69 * T` nats (rows with an early attention sink and a long low-probability tail are the most exposed). Without split-KV the loss covers the whole row. Check model accuracy when enabling it for FP8. The value is compiled into the kernel. Both the 1CTA and 2CTA kernels support it, for dense and sparse attention. On the sparse API, `None` keeps each schedule's existing behavior (several BF16 schedules defer the maximum update by six binades); an explicit value, including `0.0`, replaces that on every schedule |
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
@@ -95,8 +110,7 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
   dimensions.
 - Dense page table: inner-contiguous, non-overlapping CUDA
   `int32[B, max_num_pages]` `block_tables`. Padding between rows is accepted.
-- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
-  positive and no larger than the static K/V bound.
+- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Positive lengths must not exceed the static K/V bound; nonpositive lengths mark inactive requests.
 
 Internally, the query-token and query-head axes form one affine row space,
 `flat_row = query_idx * H + head_idx`. The 1-CTA profiles partition this space
@@ -126,10 +140,9 @@ no greater than `max_seq_len_q`.
 
 The wrapper receives `block_tables`, `seq_lens`, and packed `qo_indptr` on
 every run. Their storage and values may change between completed launches
-without replanning while page IDs remain valid, K/V lengths stay positive and
-within the static bound, packed-Q deltas stay nonnegative and within their bound,
+without replanning while active page IDs remain valid, positive K/V lengths stay within the static bound, packed-Q deltas stay nonnegative and within their bound,
 and the final packed offset equals the current query/output extent. Causal
-metadata must also preserve `q_len[b] <= seq_lens[b]` for every request.
+metadata must also preserve `q_len[b] <= seq_lens[b]` for every active request.
 Individual packed requests may be empty. An all-empty packed launch requires a
 positive `max_seq_len_q` and returns an empty output without GPU dispatch.
 
@@ -180,7 +193,19 @@ synchronization contract for CLC replay and runtime pruning.
 For BF16 2-CTA paged K/V, the TMA warp holds one 32-page-ID register window.
 It refreshes the window after `32 / pages_per_k_tile` logical K tiles, when the
 next 32 page-table entries are needed. This period follows directly from page
-and tile geometry and is internal to the task schedule.
+and tile geometry and is internal to the task schedule. The window must hold
+whole K tiles, so the config builder requires `pages_per_k_tile` to divide 32;
+every supported page size meets this with the 128-token K tile.
+
+The FP8 2-CTA dense K and V loader warps each hold their own window of the same
+shape. They read it before waiting for a free K/V slot and issue the next
+window's load at the start of the current one (only when the next window starts
+inside the current work tile), so no page-table load sits between a released
+slot and its TMA. The compiled loop copies that register at the next K tile, so
+the load has at least one K tile, not a whole window, to land. The first window
+of each work tile is loaded synchronously. Like the BF16 window, indices past
+the page table clamp to its last column; those fragments are masked by the
+runtime K/V length.
 
 | Source | Responsibility |
 | --- | --- |
@@ -294,8 +319,10 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 - The latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
-- Only dense paged MLA cache addressing is exposed; sparse/indexed MLA,
-  sliding windows, attention sinks, and custom masks are not public features.
+- `BatchMLADecodePagedTSWrapper` exposes only dense paged MLA cache
+  addressing; sparse/indexed MLA is available through
+  `BatchSparseMLADecodePagedTSWrapper`. Sliding windows, attention sinks, and
+  custom masks are not public features of the dense wrapper.
 - Query and cache dtypes must match.
 - Automatic kernel selection is intentionally not user-selectable through the
   public wrapper.
@@ -312,3 +339,7 @@ graphs:
 pytest -q tests/attention/test_attention_ts_mla_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
+
+Both dense 1CTA and 2CTA families treat nonpositive runtime K/V lengths as inactive requests. They skip Q/K/V and partial-output work, preserve caller-owned O/LSE, and retain queue, cluster, TMEM-lifecycle and PDL progress. Separate reducers do not consume stale scratch for these requests. Newly allocated inactive output is unspecified. Positive plan capacity is still required.
+
+The two-source sparse API instead accepts nonnegative source lengths. An empty primary source may still attend to the extra source; two empty sources publish zero output and negative-infinity LSE.

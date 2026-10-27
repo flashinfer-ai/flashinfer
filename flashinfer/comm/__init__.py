@@ -27,7 +27,6 @@ from .trtllm_ar import QuantizationSFLayout as QuantizationSFLayout
 from .trtllm_ar import (
     compute_fp4_swizzled_layout_sf_size as compute_fp4_swizzled_layout_sf_size,
 )
-from .trtllm_ar import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .trtllm_ar import trtllm_allreduce_fusion as trtllm_allreduce_fusion
 from .trtllm_ar import (
     trtllm_create_ipc_workspace_for_all_reduce_fusion as trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -46,7 +45,6 @@ from .trtllm_ar import (
 )
 from .vllm_ar import all_reduce as vllm_all_reduce
 from .vllm_ar import dispose as vllm_dispose
-from .vllm_ar import gen_vllm_comm_module as gen_vllm_comm_module
 from .vllm_ar import get_graph_buffer_ipc_meta as vllm_get_graph_buffer_ipc_meta
 from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
@@ -55,8 +53,6 @@ from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 from .pcie_ipc_ar import (
     PcieIpcAllReduceWorkspace as PcieIpcAllReduceWorkspace,
 )
-from .pcie_ipc_ar import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
 from .pcie_ipc_collectives.all_gather import (
     PcieIpcAllGatherWorkspace as PcieIpcAllGatherWorkspace,
 )
@@ -97,8 +93,6 @@ from .pcie_ipc_topology import (
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
 from .ulysses import UlyssesWorkspace as UlyssesWorkspace
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
-from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
-from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
 from .ulysses import init_ulysses_a2a as init_ulysses_a2a
 from .ulysses import ulysses_a2a as ulysses_a2a
 from .ulysses_head_chunk import (
@@ -110,6 +104,7 @@ from .ulysses_head_chunk import (
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
+from .ulysses_topology import UlyssesPciePlan as UlyssesPciePlan
 from .ulysses_topology import UlyssesRankTopology as UlyssesRankTopology
 from .ulysses_topology import decide_ulysses_backend as decide_ulysses_backend
 from .ulysses_topology import (
@@ -130,6 +125,7 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
+from .allreduce import is_mnnvl_cutedsl_supported as is_mnnvl_cutedsl_supported
 
 with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (
@@ -141,21 +137,6 @@ with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (
         tp_moe_finalize_rmsnorm as tp_moe_finalize_rmsnorm,
     )
-
-# MNNVL A2A (Throughput Backend)
-from .trtllm_moe_alltoall import moe_a2a_active_rank_mask as moe_a2a_active_rank_mask
-from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
-from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
-from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
-from .trtllm_moe_alltoall import (
-    moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,
-)
-from .trtllm_moe_alltoall import (
-    moe_a2a_sanitize_expert_ids as moe_a2a_sanitize_expert_ids,
-)
-from .trtllm_moe_alltoall import (
-    moe_a2a_wrap_payload_tensor_in_workspace as moe_a2a_wrap_payload_tensor_in_workspace,
-)
 
 # DCP A2A (Decode Context Parallel Attention Reduction)
 from .dcp_alltoall import decode_cp_a2a_alltoall as decode_cp_a2a_alltoall
@@ -176,6 +157,12 @@ from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (
     prepare_all_gather_matmul as prepare_all_gather_matmul,
 )
+from .fp8_rowwise_gemm_allreduce import (
+    fp8_rowwise_gemm_allreduce as fp8_rowwise_gemm_allreduce,
+)
+from .fp8_rowwise_gemm_allreduce import (
+    prepare_fp8_rowwise_gemm_allreduce as prepare_fp8_rowwise_gemm_allreduce,
+)
 from .cake_fused_norm_combine import (
     CakeFusedNormCombineWorkspace as CakeFusedNormCombineWorkspace,
 )
@@ -190,6 +177,16 @@ from .cake_fused_norm_combine import (
 )
 from .cake_fused_norm_combine import (
     cake_fused_norm_combine_workspace_bytes as cake_fused_norm_combine_workspace_bytes,
+)
+
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce as cake_gemm_allreduce,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_select_route as cake_gemm_allreduce_select_route,
+)
+from .cake_gemm_allreduce import (
+    cake_gemm_allreduce_workspace_bytes as cake_gemm_allreduce_workspace_bytes,
 )
 
 

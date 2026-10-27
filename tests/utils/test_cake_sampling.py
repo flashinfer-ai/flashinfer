@@ -85,6 +85,12 @@ def _device_streams() -> bool:
     return any(stream for _, _, stream in _stage1_variants(int(optin)))
 
 
+def _stage1_builds(man) -> list:
+    """The manifest's stage-1 rows without the no-tail twins (``no_tail``), which
+    ``test_no_tail_twins_match_their_fused_tail_builds`` checks on their own."""
+    return [v for v in man["stage1"] if not v.get("no_tail", False)]
+
+
 def _assert_fallback_matches_reference(probs, k, p, seed=7, offset=8):
     """The public entry point serves a fallback request through the reference top_k_first path."""
     from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
@@ -1104,6 +1110,111 @@ def test_stage1_variants_respect_the_device_smem_limit():
     assert choose_stage1(16, 262144, sm_count=148, smem_limit=232448)[2]
 
 
+def test_measured_stage1_picks_are_frozen_variants_of_their_bins():
+    """Every measured per-device stage-1 pick is a frozen variant that fits its device's dynamic shared memory opt-in
+    and serves both ends of its vocab and batch bins; outside every bin, and on any other SM count, the pick is None
+    (the cost model's pick stays)."""
+    smem = {9: _FULL_SMEM_OPTIN, 10: _FULL_SMEM_OPTIN, 12: 99 * 1024}
+    vocabs = cs._STAGE1_PICK_VOCABS
+    for (major, minor, sms), picks in cs._STAGE1_PICKS_BY_DEVICE.items():
+        cap, limit = (major, minor), smem[major]
+        assert picks
+        for (vbin, bbin, large), pick in picks.items():
+            assert vbin in vocabs and 1 <= bbin <= 128 and bbin & (bbin - 1) == 0
+            assert pick in _stage1_variants(limit)
+            prev = vocabs[vocabs.index(vbin) - 1] if vbin != vocabs[0] else 0
+            k = cs._STAGE1_PICK_LARGE_K if large else 50
+            for vocab in (max(prev, 3 * vbin // 4) + 1, vbin):
+                for batch in (bbin // 2 + 1, bbin):
+                    got = cs._measured_stage1_pick(cap, sms, batch, vocab, k, limit)
+                    assert got == pick, (cap, sms, vocab, batch, k)
+            assert cs._measured_stage1_pick(cap, sms + 1, bbin, vbin, k, limit) is None
+    cap, sms, limit = (12, 0), 188, 99 * 1024
+    assert cs._measured_stage1_pick(cap, sms, 1, 32768, 50, limit) == (2, 32, False)
+    for batch, vocab in ((64, 32768), (129, 32768), (1, 24576), (1, 32769)):
+        assert cs._measured_stage1_pick(cap, sms, batch, vocab, 50, limit) is None
+
+
+def test_measured_large_k_picks_keep_their_measured_launch_form():
+    """A larger-top-k pick serves a top-k only when its launch takes the whole-CTA tail exactly when one at
+    ``_STAGE1_PICK_LARGE_K`` does; otherwise the cost model's pick stays.  On H100 the (8, 16) stream entries run the
+    whole-CTA tail at the measured top-k and a two-launch chain at a top-k up to ``_BLOCK_TAIL_MIN_K``."""
+    smem = {9: _FULL_SMEM_OPTIN, 10: _FULL_SMEM_OPTIN, 12: 99 * 1024}
+    ks = (
+        cs._STAGE1_LARGE_K + 1,
+        cs._BLOCK_TAIL_MIN_K,
+        cs._BLOCK_TAIL_MIN_K + 1,
+        cs._STAGE1_PICK_LARGE_K,
+    )
+    refused = 0
+    for (major, minor, sms), picks in cs._STAGE1_PICKS_BY_DEVICE.items():
+        cap, limit = (major, minor), smem[major]
+        chain = not cs._block_tail_for_capability(cap)
+        for (vbin, bbin, large), pick in picks.items():
+            if not large:
+                continue
+            c, e, st = pick
+
+            def form(k):
+                return cs._fuse_block_tail(bbin, c, e, st, sms, k, chain, vbin, cap)
+
+            for k in ks:
+                got = cs._measured_stage1_pick(cap, sms, bbin, vbin, k, limit)
+                same = form(k) == form(cs._STAGE1_PICK_LARGE_K)
+                assert got == (pick if same else None), (cap, sms, vbin, bbin, k)
+                refused += not same
+    assert refused
+    for batch in (1, 2, 4, 8):
+        h100 = ((9, 0), 132, batch, 128256)
+        assert cs._measured_stage1_pick(
+            *h100, cs._STAGE1_PICK_LARGE_K, _FULL_SMEM_OPTIN
+        ) == (8, 16, True)
+        assert (
+            cs._measured_stage1_pick(*h100, cs._BLOCK_TAIL_MIN_K, _FULL_SMEM_OPTIN)
+            is None
+        )
+
+
+def test_measured_stage1_picks_sample_like_the_cost_model():
+    """On a device with measured picks, every pick samples, renormalizes and routes bitwise like the cost model's
+    pick for the same call (the picks choose among bit-identical variants)."""
+    _require_supported_device()
+    dev = torch.cuda.current_device()
+    cap = cs._device_capability(dev)
+    picks = cs._STAGE1_PICKS_BY_DEVICE.get((*cap, cs._sm_count(dev)))
+    if not picks:
+        pytest.skip("no measured stage-1 picks for this device")
+    saved = dict(cs._STAGE1_PICKS_BY_DEVICE)
+    try:
+        for (vbin, bbin, large), pick in sorted(picks.items()):
+            k = cs._STAGE1_PICK_LARGE_K if large else 50
+            probs = _probs(bbin, vbin, seed=vbin + bbin)
+            outs = []
+            for table in (saved, {}):
+                cs._STAGE1_PICKS_BY_DEVICE.clear()
+                cs._STAGE1_PICKS_BY_DEVICE.update(table)
+                cs._launch_plan.cache_clear()
+                plan = cs._launch_plan(dev, bbin, vbin, k)
+                renorm = torch.full((bbin, SLAB), -1.0, device="cuda")
+                s = top_k_top_p_sampling_from_probs(
+                    probs, k, 0.9, philox_seed=11, philox_offset=3, renorm_out=renorm
+                )
+                outs.append(
+                    (
+                        (plan.cluster, plan.ept, plan.stream),
+                        s,
+                        renorm[:, :k].contiguous().view(torch.int32),
+                    )
+                )
+            assert outs[0][0] == pick, (vbin, bbin, k, outs[0][0])
+            assert torch.equal(outs[0][1], outs[1][1]), (vbin, bbin, k, outs[1][0])
+            assert torch.equal(outs[0][2], outs[1][2]), (vbin, bbin, k, outs[1][0])
+    finally:
+        cs._STAGE1_PICKS_BY_DEVICE.clear()
+        cs._STAGE1_PICKS_BY_DEVICE.update(saved)
+        cs._launch_plan.cache_clear()
+
+
 # --------------------------------------------------------------------------- adversarial
 
 
@@ -1387,7 +1498,7 @@ def test_adv_vocab_not_multiple_of_chunk(vocab):
     probs.copy_(torch.tensor(pn, device="cuda"))
     variants = [
         (v["cluster"], v["ept"])
-        for v in load_manifest()["stage1"]
+        for v in _stage1_builds(load_manifest())
         if 512 * v["cluster"] * v["ept"] >= vocab
         and not v["fused_block_tail"]
         and not v["coarse_sample"]
@@ -1452,7 +1563,7 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
     man = load_manifest()
     s1 = [
         (v["cluster"], v["ept"])
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if 512 * v["cluster"] * v["ept"] >= vocab
         and not v["fused_block_tail"]
         and not v["coarse_sample"]
@@ -1536,12 +1647,12 @@ def test_coarse_sample_build_matches_default_build():
     man = load_manifest()
     coarse = [
         v
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if v["coarse_sample"] and not v["slab_tail"] and not v["leader_push"]
     ]
     defaults = {
         (v["cluster"], v["ept"], bool(v["stream"])): v
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if not v["fused_block_tail"]
         and not v["coarse_sample"]
         and not v["spec_sample"]
@@ -1558,7 +1669,9 @@ def test_coarse_sample_build_matches_default_build():
         for v in coarse
     )
     assert all(
-        not v["symbol"].endswith("_cs") for v in man["stage1"] if not v["coarse_sample"]
+        not v["symbol"].endswith("_cs")
+        for v in _stage1_builds(man)
+        if not v["coarse_sample"]
     )
     assert all(cs._stage1_has_coarse_sample(c, e, True) for c, e in streams)
     assert not any(
@@ -1698,9 +1811,11 @@ def test_spec_sample_build_matches_default_build():
     """Every streaming variant whose launches can take the plain speculative sample ships a speculative-sample twin
     (`_sp`, launch_flags bit 6): its first register chunk doubles as the sample (no separate sampled read), the exact
     passes and fallbacks are the same, and the slab / samples / renorm are bitwise identical to the default build on
-    adversarial rows for every k regime.  The bit is rejected on register-resident variants and together with
-    bits 3 / 4; the host sets it for every ept-16 stream and for ept-32 streams at one chunk, two chunks on a cluster
-    of 8, or at least 16 register chunks per CTA, and never together with bit 4.  The (8, 16) stream takes the sample
+    adversarial rows for every k regime.  The bit is rejected on register-resident variants, together with bit 4,
+    and together with bit 3 on a variant without the speculative-sample whole-CTA-tail build (the cluster-1 ept-32
+    stream ships one, ``test_spec_block_tail_matches_two_launch_form``); the host sets it for every ept-16 stream and
+    for ept-32 streams at one chunk, two chunks on a cluster of 8, or at least 16 register chunks per CTA, and never
+    together with bit 4.  The (8, 16) stream takes the sample
     only on the capabilities of `_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES`, where every multi-CTA ept-16 launch takes the
     leader-push form of the build (bit 9 precedence), so its plain `_sp` build is never launched and is not built."""
     _require_supported_device()
@@ -1709,12 +1824,15 @@ def test_spec_sample_build_matches_default_build():
     man = load_manifest()
     spec = [
         v
-        for v in man["stage1"]
-        if v["spec_sample"] and not v["slab_tail"] and not v["leader_push"]
+        for v in _stage1_builds(man)
+        if v["spec_sample"]
+        and not v["slab_tail"]
+        and not v["leader_push"]
+        and not v["fused_block_tail"]
     ]
     defaults = {
         (v["cluster"], v["ept"], bool(v["stream"])): v
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if not v["fused_block_tail"]
         and not v["coarse_sample"]
         and not v["spec_sample"]
@@ -1728,7 +1846,7 @@ def test_spec_sample_build_matches_default_build():
     assert cs._stage1_has_spec_sample(8, 16, True)
     assert not any(
         (v["cluster"], v["ept"]) == (8, 16)
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if v["spec_sample"] and not v["leader_push"]
     )
     assert all(
@@ -1740,7 +1858,9 @@ def test_spec_sample_build_matches_default_build():
         for v in spec
     )
     assert all(
-        not v["symbol"].endswith("_sp") for v in man["stage1"] if not v["spec_sample"]
+        not v["symbol"].endswith("_sp")
+        for v in _stage1_builds(man)
+        if not v["spec_sample"]
     )
     assert all(cs._stage1_has_spec_sample(c, e, True) for c, e in streams)
     assert not any(
@@ -1951,7 +2071,13 @@ def test_spec_sample_build_matches_default_build():
                             base_f.renorm[r, :kr].view(np.uint32),
                             spec_f.renorm[r, :kr].view(np.uint32),
                         )
-    # bit 6 on a register-resident variant and together with bit 3 or bit 4 is rejected
+    # bit 6 on a register-resident variant, together with bit 4, and together with bit 3 on a variant without the
+    # speculative-sample whole-CTA-tail build is rejected
+    assert not any(
+        v["fused_block_tail"] and v["spec_sample"]
+        for v in _stage1_builds(man)
+        if (v["cluster"], v["ept"]) == streams[0]
+    )
     module = load_cake_sampling_module()
     probs2 = _probs(2, 32768, seed=5)
     vals, idxs, cnt = _ws(2)
@@ -2043,7 +2169,7 @@ def test_row_span_diet_flag_matches_default_build():
     streams = sorted(
         {
             (v["cluster"], v["ept"])
-            for v in man["stage1"]
+            for v in _stage1_builds(man)
             if v["stream"]
             and not v["fused_block_tail"]
             and not v["coarse_sample"]
@@ -2180,17 +2306,20 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     # streams, `_fuse_block_tail`); the default build (taken by every launch without bit 3) never carries it.
     defaults = [
         v
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if not v["fused_block_tail"]
         and not v["coarse_sample"]
         and not v["spec_sample"]
         and not v["coarse_push"]
         and not v["leader_push"]
     ]
+    # (the cluster-1 speculative-sample whole-CTA-tail builds: test_spec_block_tail_matches_two_launch_form)
     twins = [
         v
-        for v in man["stage1"]
-        if v["fused_block_tail"] and not v.get("int_tail", False)
+        for v in _stage1_builds(man)
+        if v["fused_block_tail"]
+        and not v.get("int_tail", False)
+        and not v["spec_sample"]
     ]
     default_keys = {(v["cluster"], v["ept"], v["stream"]) for v in defaults}
     assert len(default_keys) == len(defaults)
@@ -2317,6 +2446,108 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         _run_and_check(probs, 1000, 0.9, 0x748, 3)
 
 
+def test_spec_block_tail_matches_two_launch_form(monkeypatch):
+    """The cluster-1 ept-32 stream ships the speculative-sample build with the whole-CTA tail (`c1_e32s_bt_sp`, and
+    `c1_e32s_bt_sp_tia` with the integer-tested tail of launch_flags bit 11), which the host takes through launch_flags
+    bits 3 + 6 for the cells of `_C1_BLOCK_TAIL_CELLS` above k = 768; outputs are bitwise identical to the two-launch
+    form on adversarial rows, per-row k (mixing k <= 64 rows) and per-row p."""
+    _require_supported_device()
+    import flashinfer.cake_sampling as cs
+
+    man = load_manifest()
+    kcap = int(man["fused_block_tail_kcap"])
+    builds = [
+        v for v in _stage1_builds(man) if v["fused_block_tail"] and v["spec_sample"]
+    ]
+    assert [v["symbol"] for v in builds] == [
+        "kernel_cake_radix_topk_c1_e32s_bt_sp",
+        "kernel_cake_radix_topk_c1_e32s_bt_sp_tia",
+    ]
+    assert [v["int_tail"] for v in builds] == [False, True]
+    assert all(
+        (v["cluster"], v["ept"], v["stream"], v["fused_tail"]) == (1, 32, True, True)
+        and not (v["coarse_sample"] or v["slab_tail"] or v["leader_push"])
+        for v in builds
+    )
+    assert cs._stage1_has_fused_block_tail(1, 32, True)
+    assert not cs._stage1_has_fused_block_tail(1, 16, True)
+    # the policy: (V, batch) of the capability's cells, a cluster-1 stream, 768 < top_k_max <= the slab
+    for cc in ((10, 0), (10, 3), (10, 7)):
+        assert cs._c1_block_tail(128, 262144, 1, 32, True, 1000, cc)
+        assert cs._c1_block_tail(128, 262144, 1, 32, True, kcap, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, 768, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, kcap + 1, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, None, cc)
+        assert not cs._c1_block_tail(64, 262144, 1, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 151936, 1, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 262144, 2, 32, True, 1000, cc)
+        assert not cs._c1_block_tail(128, 262144, 1, 32, False, 1000, cc)
+    for cc in ((9, 0), (11, 0), (12, 0)):
+        assert not cs._c1_block_tail(128, 262144, 1, 32, True, 1000, cc)
+    fused_flags = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_SPEC_SAMPLE
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 3)) == cs._FLAG_INT_TAIL
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 0)) == 0
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 7)) == 0
+    device = torch.cuda.current_device()
+    capability = cs._device_capability(device)
+    if capability not in cs._C1_BLOCK_TAIL_CELLS or not _device_streams():
+        return
+    batch, vocab = 128, 262144
+    assert (vocab, batch) in cs._C1_BLOCK_TAIL_CELLS[capability]
+    probs = _probs(batch, vocab, seed=1368)
+    pn = probs.cpu().numpy()
+    pn[0, (np.arange(1200) * 13) % vocab] = np.float32(
+        2**-11
+    )  # ties across the k cut and the p boundary
+    pn[1, [7, 4096]] = np.inf
+    pn[2, : vocab // 2] = 0.0  # a half-zero row
+    probs.copy_(torch.tensor(pn, device="cuda"))
+    k_row = torch.randint(1, kcap + 1, (batch,), device="cuda", dtype=torch.int32)
+    k_row[0] = kcap
+    k_row[-1] = 32
+    p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+    for k, p in (
+        (1000, 0.9),
+        (kcap, 0.5),
+        (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+        (k_row, p_row),
+    ):
+        top_k_max = k if isinstance(k, int) else int(k.max().item())
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_c1_block_tail", lambda *a, **kw: False)
+            cs._launch_plan.cache_clear()
+            plan = cs._launch_plan(device, batch, vocab, top_k_max)
+            assert plan.launch_flags & cs._FLAG_FUSE_BLOCK_TAIL == 0, plan
+            two, _ = _run_and_check(probs, k, p, 0x1368, 3)
+        cs._launch_plan.cache_clear()
+        plan = cs._launch_plan(device, batch, vocab, top_k_max)
+        assert (plan.cluster, plan.ept, plan.stream, plan.one_launch) == (
+            1,
+            32,
+            True,
+            True,
+        ), plan
+        assert plan.launch_flags & fused_flags == fused_flags, plan
+        assert plan.launch_flags & cs._FLAG_INT_TAIL == cs._int_tail_flag(
+            1, 32, True, fused_flags, capability
+        )
+        fused, _ = _run_and_check(probs, k, p, 0x1368, 3)
+        label = k if isinstance(k, int) else "row"
+        assert np.array_equal(two.samples, fused.samples), label
+        assert np.array_equal(two.count, fused.count), label
+        for r in range(batch):
+            kr = int(two.count[r])
+            assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (label, r)
+            assert np.array_equal(
+                two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+            ), (label, r)
+            assert np.array_equal(
+                two.renorm[r, :kr].view(np.uint32),
+                fused.renorm[r, :kr].view(np.uint32),
+            ), (label, r)
+    cs._launch_plan.cache_clear()
+
+
 def test_fused_tail_matches_two_launch_form():
     """k <= fused_tail_kcap runs stage 2/3 inside the stage-1 kernel; outputs are bitwise identical to
     the explicit two-launch form for every stage-1 variant, per-row p, renorm and adversarial rows."""
@@ -2325,7 +2556,7 @@ def test_fused_tail_matches_two_launch_form():
     kcap = int(man["fused_tail_kcap"])
     assert kcap >= 1
     # The (8, 48) resident is the only variant built without the tail; no small-k pick may reach it.
-    assert [v["symbol"] for v in man["stage1"] if not v["fused_tail"]] == [
+    assert [v["symbol"] for v in _stage1_builds(man) if not v["fused_tail"]] == [
         "kernel_cake_radix_topk_c8_e48"
     ]
     # Dispatch tables of the measured architectures (full 227 KB opt-in).  On 12.x devices (99 KB)
@@ -2363,7 +2594,7 @@ def test_fused_tail_matches_two_launch_form():
         )
         s1 = [
             (v["cluster"], v["ept"], bool(v.get("stream", 0)))
-            for v in man["stage1"]
+            for v in _stage1_builds(man)
             if not v["fused_block_tail"]
             and not v["coarse_sample"]
             and not v["spec_sample"]
@@ -2442,7 +2673,7 @@ def test_early_trigger_flag_and_bitwise_outputs():
     streams_ok = _device_streams()
     for k, p in ((1000, 0.9), (200, 0.5)):
         base = _run_and_check(probs, k, p, 0xEA51, 4)[0]
-        for v in man["stage1"]:
+        for v in _stage1_builds(man):
             if (
                 v["fused_block_tail"]
                 or v["coarse_sample"]
@@ -2641,8 +2872,8 @@ def test_coarse_push_build_matches_default_build():
     import flashinfer.cake_sampling as cs
 
     man = load_manifest()
-    assert all(isinstance(v["coarse_push"], bool) for v in man["stage1"])
-    push = [v for v in man["stage1"] if v["coarse_push"]]
+    assert all(isinstance(v["coarse_push"], bool) for v in _stage1_builds(man))
+    push = [v for v in _stage1_builds(man) if v["coarse_push"]]
     assert push
     assert all(
         v["stream"]
@@ -2656,11 +2887,13 @@ def test_coarse_push_build_matches_default_build():
     )
     assert all(v["symbol"].endswith("s_lg") for v in push)
     assert all(
-        not v["symbol"].endswith("_lg") for v in man["stage1"] if not v["coarse_push"]
+        not v["symbol"].endswith("_lg")
+        for v in _stage1_builds(man)
+        if not v["coarse_push"]
     )
     plain = {
         (v["cluster"], v["ept"])
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if v["stream"]
         and not (
             v["fused_block_tail"]
@@ -2797,15 +3030,15 @@ def test_slab_tail_build_matches_spec_build():
     import flashinfer.cake_sampling as cs
 
     man = load_manifest()
-    assert all(isinstance(v["slab_tail"], bool) for v in man["stage1"])
-    slab = [v for v in man["stage1"] if v["slab_tail"]]
+    assert all(isinstance(v["slab_tail"], bool) for v in _stage1_builds(man))
+    slab = [v for v in _stage1_builds(man) if v["slab_tail"]]
     assert all(
         v["stream"] and v["fused_tail"] and not v["fused_block_tail"] for v in slab
     )
     assert all(v["coarse_sample"] != v["spec_sample"] for v in slab)
     streams = [
         (v["cluster"], v["ept"])
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if v["stream"]
         and not (
             v["fused_block_tail"]
@@ -2831,15 +3064,17 @@ def test_slab_tail_build_matches_spec_build():
     for twin, suffix in (("spec_sample", "s_sp_lb"), ("coarse_sample", "s_cs_lb")):
         plain = [
             (v["cluster"], v["ept"])
-            for v in man["stage1"]
+            for v in _stage1_builds(man)
             if v[twin] and not v["slab_tail"] and not v["leader_push"]
         ]
-        with_slab = [v for v in man["stage1"] if v[twin] and v["slab_tail"]]
+        with_slab = [v for v in _stage1_builds(man) if v[twin] and v["slab_tail"]]
         assert set(plain) <= set(streams)
         assert [(v["cluster"], v["ept"]) for v in with_slab] == slab_streams[twin]
         assert all(v["symbol"].endswith(suffix) for v in with_slab)
     assert all(
-        not v["symbol"].endswith("_lb") for v in man["stage1"] if not v["slab_tail"]
+        not v["symbol"].endswith("_lb")
+        for v in _stage1_builds(man)
+        if not v["slab_tail"]
     )
     for c, e in streams:
         assert cs._stage1_has_slab_tail(c, e, True, False) == (
@@ -3131,8 +3366,8 @@ def test_leader_push_build_matches_pull_build():
     import flashinfer.cake_sampling as cs
 
     man = load_manifest()
-    assert all(isinstance(v["leader_push"], bool) for v in man["stage1"])
-    lead = [v for v in man["stage1"] if v["leader_push"]]
+    assert all(isinstance(v["leader_push"], bool) for v in _stage1_builds(man))
+    lead = [v for v in _stage1_builds(man) if v["leader_push"]]
     assert lead
     assert all(v["stream"] and v["cluster"] > 1 for v in lead)
     assert all(
@@ -3144,13 +3379,13 @@ def test_leader_push_build_matches_pull_build():
     )
     assert all(
         not (v["symbol"].endswith("_lp") or v["symbol"].endswith("_lp_l1"))
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if not v["leader_push"]
     )
     multi = sorted(
         {
             (v["cluster"], v["ept"])
-            for v in man["stage1"]
+            for v in _stage1_builds(man)
             if v["stream"] and v["cluster"] > 1
         }
     )
@@ -3169,7 +3404,7 @@ def test_leader_push_build_matches_pull_build():
             assert cs._stage1_has_leader_push(c, e, True, coarse, spec) == (
                 (c, e) in lead_sample
             )
-    for v in man["stage1"]:
+    for v in _stage1_builds(man):
         if not v["stream"] or v["cluster"] == 1:
             assert not cs._stage1_has_leader_push(
                 v["cluster"], v["ept"], bool(v["stream"]), False, False
@@ -3286,7 +3521,7 @@ def test_leader_push_build_matches_pull_build():
             v["ept"],
             cs._FLAG_COARSE_SAMPLE if v["coarse_sample"] else cs._FLAG_SPEC_SAMPLE,
         )
-        for v in man["stage1"]
+        for v in _stage1_builds(man)
         if v["stream"]
         and (v["coarse_sample"] or v["spec_sample"])
         and not (v["leader_push"] or v["slab_tail"])
@@ -3482,8 +3717,8 @@ def test_local_select_build_matches_leader_push_build():
     import flashinfer.cake_sampling as cs
 
     man = load_manifest()
-    assert all(isinstance(v.get("local_select"), bool) for v in man["stage1"])
-    local = [v for v in man["stage1"] if v["local_select"]]
+    assert all(isinstance(v.get("local_select"), bool) for v in _stage1_builds(man))
+    local = [v for v in _stage1_builds(man) if v["local_select"]]
     assert local
     assert all(
         v["stream"] and v["cluster"] > 1 and v["leader_push"] and v["fused_tail"]
@@ -3498,12 +3733,14 @@ def test_local_select_build_matches_leader_push_build():
     )
     assert all(v["symbol"].endswith("_lp_l1") for v in local)
     assert all(
-        not v["symbol"].endswith("_l1") for v in man["stage1"] if not v["local_select"]
+        not v["symbol"].endswith("_l1")
+        for v in _stage1_builds(man)
+        if not v["local_select"]
     )
     multi = sorted(
         {
             (v["cluster"], v["ept"])
-            for v in man["stage1"]
+            for v in _stage1_builds(man)
             if v["stream"] and v["cluster"] > 1
         }
     )
@@ -3516,7 +3753,7 @@ def test_local_select_build_matches_leader_push_build():
         assert cs._stage1_has_local_select(c, e, True, True, False) == shipped
         assert cs._stage1_has_local_select(c, e, True, False, True) == shipped
         assert not cs._stage1_has_local_select(c, e, True, False, False)
-    for v in man["stage1"]:
+    for v in _stage1_builds(man):
         if not v["stream"] or v["cluster"] == 1:
             assert not cs._stage1_has_local_select(
                 v["cluster"], v["ept"], bool(v["stream"]), False, True
@@ -3753,22 +3990,23 @@ def test_local_select_build_matches_leader_push_build():
 
 
 def test_int_tail_build_matches_block_tail_build():
-    """Round 10, lever L3-T: the (8, 16) stream, the only whole-CTA-tail build that compute capability 10.3 dispatches, ships
-    its integer-tested form (`_bt_tia`, launch_flags bit 11 with bit 3): the tail's f64 target product, cut tests and sample tests run as the stage-2/3 integer
-    emulation.  Slab, count, samples and renorm are bitwise identical to the f64 tail; the host sets bit 11 on compute
-    capability 10.3 only, and the module rejects it without bit 3 or on a register-resident variant."""
+    """Round 10, lever L3-T: the (8, 16) stream, the only cluster-8 whole-CTA-tail build that compute capability 10.3
+    dispatches, ships its integer-tested form (`_bt_tia`, launch_flags bit 11 with bit 3): the tail's f64 target product,
+    cut tests and sample tests run as the stage-2/3 integer emulation.  The cluster-1 ept-32 speculative-sample
+    whole-CTA-tail build (bits 3 + 6) ships one too (`_bt_sp_tia`).  Slab, count, samples and renorm are bitwise
+    identical to the f64 tail; the host sets bit 11 on compute capability 10.3 only, and the module rejects it without
+    bit 3 or on a register-resident variant."""
     _require_supported_device()
     import flashinfer.cake_sampling as cs
 
     man = load_manifest()
-    assert all(isinstance(v.get("int_tail"), bool) for v in man["stage1"])
-    itail = [v for v in man["stage1"] if v["int_tail"]]
+    assert all(isinstance(v.get("int_tail"), bool) for v in _stage1_builds(man))
+    itail = [v for v in _stage1_builds(man) if v["int_tail"]]
     assert itail
     assert all(v["stream"] and v["fused_block_tail"] and v["fused_tail"] for v in itail)
     assert all(
         not (
             v["coarse_sample"]
-            or v["spec_sample"]
             or v["slab_tail"]
             or v["coarse_push"]
             or v["leader_push"]
@@ -3776,40 +4014,62 @@ def test_int_tail_build_matches_block_tail_build():
         )
         for v in itail
     )
-    assert all(v["symbol"].endswith("s_bt_tia") for v in itail)
+    # the speculative-sample int tail is the cluster-1 ept-32 stream's only
     assert all(
-        not v["symbol"].endswith("_tia") for v in man["stage1"] if not v["int_tail"]
+        not v["spec_sample"] or (v["cluster"], v["ept"]) == (1, 32) for v in itail
     )
-    block_streams = sorted(
-        {
-            (v["cluster"], v["ept"])
-            for v in man["stage1"]
-            if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
-        }
+    assert all(
+        v["symbol"].endswith("s_bt_sp_tia" if v["spec_sample"] else "s_bt_tia")
+        for v in itail
     )
-    # 10.3 (the only int-tail capability) caps the whole-CTA tail at 196608 entries, and up to there the ranking puts the
-    # ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no `_bt_tia` form
-    itail_streams = sorted({(v["cluster"], v["ept"]) for v in itail})
+    assert all(
+        not v["symbol"].endswith("_tia")
+        for v in _stage1_builds(man)
+        if not v["int_tail"]
+    )
+
+    def streams(rows):
+        return sorted({(v["cluster"], v["ept"]) for v in rows})
+
+    block = [
+        v
+        for v in _stage1_builds(man)
+        if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
+    ]
+    block_streams = streams(v for v in block if not v["spec_sample"])
+    spec_block_streams = streams(v for v in block if v["spec_sample"])
+    # 10.3 (the only int-tail capability) caps the cluster-8 whole-CTA tail at 196608 entries, and up to there the
+    # ranking puts the ept-16 stream first, so the (8, 32) `_bt` build is never dispatched with bit 11 and ships no
+    # `_bt_tia` form
+    itail_streams = streams(v for v in itail if not v["spec_sample"])
+    spec_itail_streams = streams(v for v in itail if v["spec_sample"])
     assert block_streams == [(8, 16), (8, 32)] and itail_streams == [(8, 16)]
-    for c, e in block_streams:
-        assert cs._stage1_has_int_tail(c, e, True) == ((c, e) in itail_streams)
-    for v in man["stage1"]:
+    assert spec_block_streams == spec_itail_streams == [(1, 32)]
+    for c, e in block_streams + spec_block_streams:
+        assert cs._stage1_has_int_tail(c, e, True) == (
+            (c, e) in itail_streams + spec_itail_streams
+        )
+    for v in _stage1_builds(man):
         if not v["stream"]:
             assert not cs._stage1_has_int_tail(v["cluster"], v["ept"], False)
     # policy: whole-CTA-tail launches on compute capability 10.3 only
     assert frozenset({(10, 3)}) == cs._INT_TAIL_CAPABILITIES
     assert cs._int_tail_flag(8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
-    for c, e in itail_streams:
+    # (cluster, ept, extra launch_flags of the build): the speculative-sample build also carries bit 6
+    tail_builds = [(c, e, 0) for c, e in itail_streams] + [
+        (c, e, cs._FLAG_SPEC_SAMPLE) for c, e in spec_itail_streams
+    ]
+    for c, e, x in tail_builds:
         assert (
-            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3))
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, (10, 3))
             == cs._FLAG_INT_TAIL
         )
         assert (
-            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, None)
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, None)
             == cs._FLAG_INT_TAIL
         )
         for cap in ((9, 0), (10, 0), (10, 7), (12, 0)):
-            assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL, cap) == 0
+            assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, cap) == 0
         assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_TAIL, (10, 3)) == 0
         assert cs._int_tail_flag(c, e, True, cs._FLAG_EARLY_TRIGGER, (10, 3)) == 0
     assert cs._int_tail_flag(8, 16, False, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
@@ -3820,6 +4080,7 @@ def test_int_tail_build_matches_block_tail_build():
         (151936, 8, 800),
         (262144, 1, 1000),
         (128256, 4, 200),
+        (262144, 128, 1000),
     ):
         try:
             plan = cs._launch_plan(dev, batch, vocab, k)
@@ -3852,10 +4113,10 @@ def test_int_tail_build_matches_block_tail_build():
         pn[1, [3, 5000]] = np.inf
         pn[-1, : vocab // 2] = 0.0
         probs.copy_(torch.tensor(pn, device="cuda"))
-        for c, e in itail_streams:
+        for c, e, x in tail_builds:
             for k, p in ((1000, 0.9), (200, 1e-6), (kcap, 1.0), (65, 0.5)):
                 a = _radix_topk_outputs(
-                    module, probs, k, c, e, cs._FLAG_FUSE_BLOCK_TAIL, p=p
+                    module, probs, k, c, e, cs._FLAG_FUSE_BLOCK_TAIL | x, p=p
                 )
                 b = _radix_topk_outputs(
                     module,
@@ -3863,7 +4124,90 @@ def test_int_tail_build_matches_block_tail_build():
                     k,
                     c,
                     e,
-                    cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_INT_TAIL,
+                    cs._FLAG_FUSE_BLOCK_TAIL | x | cs._FLAG_INT_TAIL,
                     p=p,
                 )
                 _assert_fused_outputs_bitwise(a, b, (vocab, c, e, k, p))
+
+
+def test_no_tail_twins_match_their_fused_tail_builds():
+    """A no-tail twin (``no_tail``, the symbol suffixed ``_nt``) doubles a fused-tail build a two-launch chain takes:
+    the same build without the tail code, launched by launch_flags bit 12 on a two-launch chain only.  Every twin's
+    outputs are bitwise those of its fused-tail build's two-launch form, and every build a capability's table names
+    ships its twin."""
+    _require_supported_device()
+    man = load_manifest()
+    builds = {v["symbol"]: v for v in _stage1_builds(man)}
+    twins = [v for v in man["stage1"] if v.get("no_tail", False)]
+    assert twins
+    shared = ("cluster", "ept", "stream", "block_threads")
+    shared += tuple(key for _, key in cs._NO_TAIL_SHARED_BITS)
+    for v in twins:
+        assert v["symbol"].endswith("_nt")
+        base = builds[v["symbol"][: -len("_nt")]]
+        assert base["fused_tail"] and not v["fused_tail"]
+        assert all(v[key] == base[key] for key in shared), v["symbol"]
+        assert not (
+            v["fused_block_tail"]
+            or v["slab_tail"]
+            or v.get("local_select", False)
+            or v.get("int_tail", False)
+        )
+
+    def bits(v):
+        return sum(bit for bit, key in cs._NO_TAIL_SHARED_BITS if v[key])
+
+    shipped = {(v["cluster"], v["ept"], bool(v["stream"]), bits(v)) for v in twins}
+    for key in shipped:
+        assert cs._stage1_has_no_tail(*key)
+    for table in cs._NO_TAIL_MAX_BATCH_BY_CAPABILITY.values():
+        assert set(table) <= shipped
+    for c, e, st, b in shipped:
+        # a fused launch never takes the twin; a two-launch chain takes it (capability None: every capability)
+        assert cs._no_tail_flag(c, e, st, b | cs._FLAG_FUSE_TAIL, 1, None) == 0
+        assert cs._no_tail_flag(c, e, st, b, 1, None) == cs._FLAG_NO_TAIL
+        # on a capability, up to the batch bound its table lists for the build, and never where it lists none
+        for cap, table in cs._NO_TAIL_MAX_BATCH_BY_CAPABILITY.items():
+            bound = table.get((c, e, st, b), 0)
+            assert cs._no_tail_flag(c, e, st, b, bound + 1, cap) == 0
+            if bound:
+                assert cs._no_tail_flag(c, e, st, b, bound, cap) == cs._FLAG_NO_TAIL
+                assert cs._no_tail_flag(c, e, st, b | cs._FLAG_FUSE_TAIL, 1, cap) == 0
+    # bitwise identity against the fused-tail build's two-launch form, adversarial rows included
+    streams_ok = _device_streams()
+    for v in twins:
+        c, e, st = v["cluster"], v["ept"], bool(v["stream"])
+        if st and not streams_ok:
+            continue
+        vocab = 151937 if st else min(32768, 512 * c * e)
+        probs = _probs(3, vocab, seed=11)
+        pn = probs.cpu().numpy()
+        pn[1, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)
+        pn[2, [3, vocab - 1]] = np.inf
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        for k, p in ((1000, 0.9), (50, 0.5)):
+            s23 = min(
+                (x["threads"], x["items"])
+                for x in man["stage23"]
+                if x["threads"] * x["items"] >= k
+            )
+            a = _run(probs, k, p, 0x5EED, 3, variant=((c, e, st), s23), flags=bits(v))
+            b = _run(
+                probs,
+                k,
+                p,
+                0x5EED,
+                3,
+                variant=((c, e, st), s23),
+                flags=bits(v) | cs._FLAG_NO_TAIL,
+            )
+            where = (v["symbol"], vocab, k, p)
+            assert np.array_equal(a.samples, b.samples), where
+            assert np.array_equal(a.count, b.count), where
+            assert np.array_equal(a.idx[:, :k], b.idx[:, :k]), where
+            assert np.array_equal(
+                a.vals[:, :k].view(np.uint32), b.vals[:, :k].view(np.uint32)
+            ), where
+            assert np.array_equal(
+                np.nan_to_num(a.renorm, nan=-1.0), np.nan_to_num(b.renorm, nan=-1.0)
+            ), where

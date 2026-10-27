@@ -490,12 +490,65 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
 }
 
-VARIANTS = ("bf16", "nvfp4_fp4pv", "nvfp4_fp8pv")
+VARIANTS = ("bf16", "nvfp4_fp4pv", "nvfp4_fp8pv", "fp8")
 STAGES = {
     "bf16": ("attention", "attention_dyn", "attention_sread", "combine"),
     "nvfp4_fp4pv": ("quantize", "attention", "attention_split", "combine"),
     "nvfp4_fp8pv": ("amax", "quantize", "attention", "attention_split", "combine"),
+    "fp8": ("attention", "attention_tiny", "combine"),
 }
+
+# The all-FP8 route (``variant="fp8"``, flashinfer-ai/flashinfer#4532
+# candidate 3B): E4M3 ``query`` / ``key`` / ``value`` with per-tensor descales,
+# two static attention programs over the BF16 planner's unit table (the
+# general one, and its ``tail_skip=32`` build for plans whose every segment
+# has at most ``FP8_TINY_SEGMENT_TOKENS`` tokens) and the BF16 route's
+# ``combine`` program for the K/V-split partials.  The attention programs are
+# in-tree generated programs (``flashinfer/jit/
+# cake_minimax_h3_varlen_fp8_attention.py``, ``CakeProgram`` constants named
+# by ``programs``), not ``MODULES`` records; the combine stage stays a
+# ``MODULES`` record.  Hand-written: the in-tree export does not edit this
+# registry.
+FP8_TINY_SEGMENT_TOKENS = 32
+FP8_ROUTES: dict[str, dict[str, Any]] = {
+    f"fp8__{_arch}": {
+        "arch": _arch,
+        "variant": "fp8",
+        "stages": ["attention", "attention_tiny", "combine"],
+        "modules": {"combine": "cake_minimax_h3_varlen_attention_579b1fc2756eec97f194"},
+        "programs": {"attention": "ATTENTION", "attention_tiny": "ATTENTION_TINY"},
+    }
+    for _arch in ("sm_100a", "sm_103a")
+}
+ROUTES.update(FP8_ROUTES)
+
+#: The generated loader of the in-tree FP8 attention program.
+FP8_LOADER = "cake_minimax_h3_varlen_fp8_attention"
+
+
+@functools.cache
+def in_tree_program(constant: str) -> Any:
+    """The ``CakeProgram`` constant ``constant`` of the FP8 loader, or ``None`` when this checkout does not ship
+    the generated loader yet (the route then reports itself unavailable)."""
+    try:
+        from ...jit import cake_minimax_h3_varlen_fp8_attention as loader
+    except ImportError:
+        return None
+    return getattr(loader, constant, None)
+
+
+def route_program(record: dict[str, Any], stage: str) -> Any:
+    """The in-tree ``CakeProgram`` of ``stage`` in the route ``record``."""
+    program = in_tree_program(record["programs"][stage])
+    if program is None:
+        raise NotImplementedError(
+            f"The generated MiniMax-H3 packed-varlen {record['variant']} attention "
+            f"program for {record['arch']} is not registered in this checkout yet "
+            "(see flashinfer-ai/flashinfer#4532)"
+        )
+    return program
+
+
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
@@ -540,11 +593,25 @@ def select_route(variant: str, arch: str) -> dict[str, Any]:
                 f"route {route_name(variant, arch)!r} stage {stage!r} names program "
                 f"{module!r}, which is not built for {arch}"
             )
+    for stage in record.get("programs", {}):
+        program = route_program(record, stage)
+        if arch not in program.targets:
+            raise RuntimeError(
+                f"route {route_name(variant, arch)!r} stage {stage!r} names generated "
+                f"program {program.name!r}, which is not built for {arch}: "
+                f"{list(program.targets)}"
+            )
     return record
 
 
 def route_available(variant: str, arch: str) -> bool:
-    return route_name(variant, arch) in ROUTES
+    record = ROUTES.get(route_name(variant, arch))
+    if record is None:
+        return False
+    return all(
+        in_tree_program(constant) is not None
+        for constant in record.get("programs", {}).values()
+    )
 
 
 def _header_dirs():

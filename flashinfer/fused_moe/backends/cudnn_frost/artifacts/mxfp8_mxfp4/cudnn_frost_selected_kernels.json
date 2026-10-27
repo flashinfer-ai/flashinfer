@@ -4208,13 +4208,11 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_gated_normal_bf16_stg.py",
-            "sha256": "e031cc583cf4add837cb3b6f0696cc99eac0cd09ca4c2dbc97fa05de6263f027"
+            "sha256": "1c642a3d4d8141761ab230f91eb8cb02c22064c0e1a19e547961204ad88cd80f"
           },
           "store_policy": "stg",
           "tile_parameters": {
             "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4": {
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "gemm_a_idx": "(0, 0)",
               "gemm_b_idx": "(0, 1)",
               "mma_size_m": "4",
@@ -4300,6 +4298,8 @@
               "sfb_tma_box_mn": "2"
             },
             "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4": {
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "gemm_a_idx": "(0, 0)",
               "gemm_b_idx": "(0, 1)",
               "num_b_operands": "2",
@@ -4463,7 +4463,7 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_gated_normal_quantized_stg.py",
-            "sha256": "60c4ee506921121139513fd239c34077af3f38b8d1df88cfb6a1a9ac75c2e0de"
+            "sha256": "7a58807bd75c20e1bde19eb922f4ff9ae9517f38db471c6bcab58143f1a49431"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -4639,7 +4639,7 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc1_gated_swap_bf16_stg.py",
-            "sha256": "6d288772bd8522667d109ea4a6f56ac87c6a116f2f03fd916609b900aaf55eb0"
+            "sha256": "d2e9a968e9b1ecae73a14d53666a8b95441b59d5dbdaa38c5adb4a4961ac3322"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -4661,8 +4661,6 @@
               "b_tma_desc_dtype": "cutlass.Float8E4M3FN",
               "b_tma_format": "None",
               "b_tma_swizzle": "_tma.TensorMapSwizzle.s128b",
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "epi_chunk_elems": "1",
               "gemm_a_idx": "(0, 1)",
               "gemm_b_idx": "(0, 0)",
@@ -4694,8 +4692,6 @@
               "b_tma_desc_dtype": "cutlass.Float8E4M3FN",
               "b_tma_format": "None",
               "b_tma_swizzle": "_tma.TensorMapSwizzle.s128b",
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "epi_chunk_elems": "1",
               "gemm_a_idx": "(0, 1)",
               "gemm_b_idx": "(0, 0)",
@@ -4865,6 +4861,8 @@
               "b_tma_desc_dtype": "cutlass.Float8E4M3FN",
               "b_tma_format": "None",
               "b_tma_swizzle": "_tma.TensorMapSwizzle.s128b",
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "epi_chunk_elems": "1",
               "gemm_a_idx": "(0, 1)",
               "gemm_b_idx": "(0, 0)",
@@ -5128,13 +5126,11 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_non_gated_normal_bf16_stg.py",
-            "sha256": "6beabbe8999b085c86250bd29feeb1b058fb22f60b715b4a7f429c2c17c73d88"
+            "sha256": "c617a038351ae426f678f52fea83bd79231d0ad3257c36c7fc5bb8b9414faf89"
           },
           "store_policy": "stg",
           "tile_parameters": {
             "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4": {
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "mma_size_m": "4",
               "mma_size_n": "2",
               "sA_packed_elems": "16384",
@@ -5143,8 +5139,6 @@
               "sB_tma_bytes": "8192"
             },
             "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2": {
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "mma_size_m": "2",
               "mma_size_n": "4",
               "sA_packed_elems": "16384",
@@ -5202,6 +5196,8 @@
               "sfb_tma_box_mn": "2"
             },
             "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4": {
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "sA_packed_elems": "4096",
               "sA_tma_bytes": "4096",
               "sB_packed_elems": "4096",
@@ -5309,7 +5305,7 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc1_non_gated_normal_quantized_stg.py",
-            "sha256": "9b722eb549192d159c8cc0a0577d7f69533100f219e4cc5a7aef0c7352d29e91"
+            "sha256": "131722fb490d622a9bdece218c51c0485ecf303ce5e51a42d9d6160908de6f5c"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -5436,7 +5432,7 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc1_non_gated_swap_bf16_stg.py",
-            "sha256": "8a74a5efcde98c88a24d7f987bd54914861f9d77b3aab2fba6f7b14e29d6745b"
+            "sha256": "80a1e429d787ae245a0b74c758808ddc77673d8c7d67b8761dd9ba16f58285a7"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -5709,6 +5705,8 @@
               "b_tma_desc_dtype": "cutlass.Float8E4M3FN",
               "b_tma_format": "None",
               "b_tma_swizzle": "_tma.TensorMapSwizzle.s128b",
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "epi_chunk_elems": "1",
               "mma_a_ptx_type": "'e2m1'",
               "mma_b_ptx_type": "'e4m3'",
@@ -5800,13 +5798,11 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd.py",
           "source": {
             "path": "sources/sm120_fc2_non_gated_normal_bf16_stg.py",
-            "sha256": "47c33955aeb683709e4aeb8bb314651fe16819f3f7367888d4ed230dc49bfe03"
+            "sha256": "e3ca2b7bea767c45994e92a2796e82c3aca950ab6c2ee5b4ec07e1a92f721ec2"
           },
           "store_policy": "stg",
           "tile_parameters": {
             "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4": {
-              "cgrp_tile_mnk": "(128, 128, 128)",
-              "cta_tile_mnk": "(128, 128, 128)",
               "mma_size_m": "4",
               "mma_size_n": "2",
               "sA_packed_elems": "16384",
@@ -5863,6 +5859,8 @@
               "sfb_tma_box_mn": "2"
             },
             "CONFIG_sm120_32x64x128_16x16x32_cluster1x1_warps2x4": {
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "sA_packed_elems": "4096",
               "sA_tma_bytes": "4096",
               "sB_packed_elems": "4096",
@@ -5941,7 +5939,7 @@
           "producer_template": "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
           "source": {
             "path": "sources/sm120_fc2_non_gated_swap_bf16_stg.py",
-            "sha256": "d50c8455565746f2837ff8440056c4e1cde4a1408efa42e1c8b72285c98ad508"
+            "sha256": "942f6d778d41982a4b958712c1c9adf081131965806e8e70b065aee1db230fd5"
           },
           "store_policy": "stg",
           "tile_parameters": {
@@ -6185,6 +6183,8 @@
               "b_tma_desc_dtype": "cutlass.Float8E4M3FN",
               "b_tma_format": "None",
               "b_tma_swizzle": "_tma.TensorMapSwizzle.s128b",
+              "cgrp_tile_mnk": "(32, 64, 128)",
+              "cta_tile_mnk": "(32, 64, 128)",
               "epi_chunk_elems": "1",
               "mma_a_ptx_type": "'e2m1'",
               "mma_b_ptx_type": "'e4m3'",
@@ -6883,9 +6883,9 @@
         "b_tma_swizzle": "_tma.TensorMapSwizzle.s64b",
         "block_size": "32",
         "cd_dtype": "cutlass.BFloat16",
-        "cgrp_tile_mnk": "(32, 64, 128)",
+        "cgrp_tile_mnk": "(128, 128, 128)",
         "cluster_shape_mnk": "(1, 1, 1)",
-        "cta_tile_mnk": "(32, 64, 128)",
+        "cta_tile_mnk": "(128, 128, 128)",
         "epi_chunk_elems": "8",
         "fake_dequant_a": "False",
         "fake_dequant_b": "False",
@@ -7173,7 +7173,8 @@
     "revisions": [
       "667fe4ce8ce437866217066f075fd4dcecad6eac",
       "667fe4ce8ce437866217066f075fd4dcecad6eac+dirty",
-      "89f408710e1f7f56769e056e448583624f795f0e"
+      "89f408710e1f7f56769e056e448583624f795f0e",
+      "9769e15b3e1a52918b32f4a16a36bac3bfa63eb9"
     ]
   },
   "schema_version": 4,

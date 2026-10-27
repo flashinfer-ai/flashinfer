@@ -509,7 +509,8 @@ def test_fast_drain_work_queue_reserves_response_and_barrier_smem():
             is_persistent=True,
             use_early_exit=True,
             use_clc_fast_drain=True,
-            is_swap_ab=False,
+            is_swap_ab=True,
+            rasterizes_features_first=False,
         ),
         name="WorkQueue",
     )
@@ -546,6 +547,7 @@ def test_fast_drain_work_queue_omits_smem_when_disabled(
             use_early_exit=use_early_exit,
             use_clc_fast_drain=use_clc_fast_drain,
             is_swap_ab=False,
+            rasterizes_features_first=is_persistent,
         ),
         name="WorkQueue",
     )
@@ -628,6 +630,8 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_padding_warps": 1,
         "padding_regs": 24,
         "use_early_exit": False,
+        "uses_non_swap_tma_store": False,
+        "use_tma_store": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

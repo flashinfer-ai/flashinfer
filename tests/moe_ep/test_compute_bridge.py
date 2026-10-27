@@ -137,6 +137,36 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
     assert torch.all(pack.topk_weights == 0.0)
 
 
+@pytest.mark.parametrize(
+    "offset, num_experts, masked_expert",
+    [(0, 16, 4), (8, 16, 12), (12, 16, 0), (0, 4, 0), (8, None, 8)],
+)
+def test_rank_major_excludes_masked_routes(offset, num_experts, masked_expert):
+    idx = torch.tensor([[0, -1, 3, 4], [-1, -1, -1, -1]])
+    weights = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]])
+    x = torch.zeros(1, 2, 64, dtype=torch.bfloat16)
+    pack = build_activation_pack_rank_major(
+        x,
+        idx,
+        weights,
+        num_local_experts=4,
+        local_expert_offset=offset,
+        num_experts=num_experts,
+        quant=QuantConfig(),
+    )
+    expected_ids = torch.tensor(
+        [[offset, masked_expert, offset + 3, masked_expert], [masked_expert] * 4],
+        dtype=torch.int32,
+    )
+    assert torch.equal(pack.topk_ids, expected_ids)
+    torch.testing.assert_close(
+        pack.topk_weights, torch.tensor([[0.1, 0.0, 0.3, 0.0], [0.0] * 4])
+    )
+    if num_experts is not None and num_experts > 4:
+        local = (pack.topk_ids >= offset) & (pack.topk_ids < offset + 4)
+        assert local.sum().item() == 2
+
+
 def test_build_activation_pack_rank_major_rejects_2d():
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     idx = torch.zeros(8, 8, dtype=torch.int64)
