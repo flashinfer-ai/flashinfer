@@ -13,6 +13,51 @@ from b12x.norm.hyperconnection import _impl
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("rows,width", [(1, 257), (32, 5376), (4096, 5376)])
+def test_prepared_relu2_replays_changed_inputs(rows, width):
+    device = require_b12x()
+    source = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
+    output = torch.empty_like(source)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=rows, hidden_size=width),
+        invocation={"operation": "relu2"},
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="relu2",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.launch(source, source, output)
+                    ),
+                ),
+            )
+        )
+        hc.run_relu2(source, out=output, plan=plan)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc.run_relu2(source, out=output, plan=plan)
+        for scale in (1.0, 8.0, 0.125):
+            source.normal_().mul_(scale)
+            source.flatten()[:5] = torch.tensor(
+                [float("nan"), float("inf"), -float("inf"), -0.0, 0.0],
+                device=device,
+                dtype=source.dtype,
+            )
+            expected = source.relu().square()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, expected, rtol=0, atol=0, equal_nan=True)
+        with pytest.raises(ValueError, match="overlap"):
+            hc.run_relu2(source, out=source, plan=plan)
+        with pytest.raises(ValueError, match="width"):
+            hc.run_relu2(source[:, : width - 1], out=output[:, : width - 1], plan=plan)
+
+
 def _engram_reference(
     state: torch.Tensor,
     projected_kv: torch.Tensor,
@@ -353,14 +398,27 @@ def test_prepared_add_retains_fp32_before_cancellation() -> None:
 
 @pytest.mark.parametrize("hidden", (128, 512, 1280))
 @pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
-def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype):
+@pytest.mark.parametrize("streams,padding", ((1, 0), (1, 37), (4, 0), (4, 37)))
+def test_ordinary_rmsnorm_uses_affine_weight_without_offset(
+    hidden, weight_dtype, streams, padding
+):
     device, capacity = require_b12x(), 7
-    state = torch.randn((capacity, hidden), device=device, dtype=torch.bfloat16)
-    weight = torch.linspace(-0.5, 1.5, hidden, device=device).to(weight_dtype)
-    normalized = torch.empty_like(state)
+    width = streams * hidden
+    owner = torch.full(
+        (capacity, width + padding), 123, device=device, dtype=torch.bfloat16
+    )
+    offset = 3 if padding else 0
+    state = owner[:, offset : offset + width]
+    state.normal_()
+    weight = torch.linspace(-0.5, 1.5, width, device=device).to(weight_dtype)
+    normalized = torch.empty((capacity, width), device=device, dtype=torch.bfloat16)
     plan = hc.plan(
         hc.Caps(
-            device=device, max_tokens=capacity, hidden_size=hidden, streams=1, lowrank=1
+            device=device,
+            max_tokens=capacity,
+            hidden_size=hidden,
+            streams=streams,
+            lowrank=1,
         ),
         invocation=FrozenMapping(
             {
@@ -392,7 +450,9 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
             )
         )
         bottleneck = torch.empty((capacity, 1), device=device, dtype=torch.bfloat16)
-        block_input = torch.empty_like(state)
+        block_input = torch.empty(
+            (capacity, hidden), device=device, dtype=torch.bfloat16
+        )
         session.freeze()
         for rows in (0, 1, capacity):
             binding = hc.bind(
@@ -414,13 +474,271 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(hidden, weight_dtype
             state.mul_(0.75)
             weight.neg_()
             normalized.fill_(float("nan"))
+            torch.cuda.synchronize(device)
+            before = torch.cuda.memory_stats(device)
             graph.replay()
-            values = state[:rows].float()
+            torch.cuda.synchronize(device)
+            after = torch.cuda.memory_stats(device)
+            for key in (
+                "allocation.all.allocated",
+                "allocation.all.freed",
+                "segment.all.allocated",
+                "segment.all.freed",
+            ):
+                assert before[key] == after[key]
+            values = state[:rows].float().reshape(rows, streams, hidden)
             expected = (
-                values
-                * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
-                * weight.float()
-            ).bfloat16()
+                (
+                    values
+                    * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-20)
+                    * weight.float().reshape(streams, hidden)
+                )
+                .flatten(1)
+                .bfloat16()
+            )
             torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
             assert torch.isnan(normalized[rows:]).all()
+            assert (owner[:, :offset] == 123).all()
+            assert (owner[:, offset + width :] == 123).all()
             graph.reset()
+
+
+@pytest.mark.parametrize("tokens", (1, 7, 4096))
+@pytest.mark.parametrize(
+    "weight_dtype,zero_centered",
+    ((torch.bfloat16, True), (torch.bfloat16, False), (torch.float32, False)),
+)
+@pytest.mark.parametrize("provided", (False, True))
+def test_combine_norm_preserves_affine_precision_and_replays(
+    tokens, weight_dtype, zero_centered, provided
+):
+    device = require_b12x()
+    generator = torch.Generator(device=device).manual_seed(5813)
+    state = torch.randn(
+        tokens, 10240, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    block = torch.randn(
+        tokens, 2560, generator=generator, device=device, dtype=torch.bfloat16
+    )
+    logits = torch.randn(
+        tokens, 336, generator=generator, device=device, dtype=torch.bfloat16
+    )[:, 320:324]
+    weight = (
+        torch.randn(10240, generator=generator, device=device, dtype=weight_dtype) * 0.3
+    )
+    if not zero_centered:
+        weight.add_(1)
+    normalized = torch.empty_like(state)
+    combined = torch.empty_like(state)
+    eps = 1e-6
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=tokens, hidden_size=2560),
+        invocation=FrozenMapping(
+            {
+                "operation": "combine_norm",
+                "output_mode": "provided" if provided else "functional",
+                "zero_centered": zero_centered,
+                "weight_dtype": str(weight_dtype).removeprefix("torch."),
+                "eps": eps,
+            }
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="combine_norm",
+                    prepare_call=lambda prepared: PreparedCall(
+                        run=lambda: prepared.launch(
+                            state, block, logits, weight, combined, normalized, eps=eps
+                        )
+                    ),
+                ),
+            )
+        )
+
+        def run():
+            return hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight,
+                eps=eps,
+                plan=plan,
+                zero_centered=zero_centered,
+                out=(state, normalized) if provided else None,
+            )
+
+        run()
+        with session.capture():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+        if provided:
+            assert captured[0] is state and captured[1] is normalized
+        for iteration in range(2):
+            state.normal_(generator=generator)
+            block.normal_(generator=generator)
+            logits.normal_(generator=generator)
+            weight.add_(0.0013)
+            residual = state.reshape(tokens, 4, 2560).float()
+            scale = 2 * torch.sigmoid(logits.float() / 4)
+            expected = (residual + scale[..., None] * block[:, None].float()).bfloat16()
+            gain = weight.float() + 1 if zero_centered else weight.float()
+            values = expected.float()
+            expected_norm = (
+                (
+                    values
+                    * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+                    * gain.reshape(4, 2560)
+                )
+                .flatten(1)
+                .bfloat16()
+            )
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(
+                captured[0], expected.flatten(1), rtol=0.01, atol=0.016
+            )
+            torch.testing.assert_close(
+                captured[1], expected_norm, rtol=0.01, atol=0.032
+            )
+            if weight_dtype == torch.float32:
+                rounded_norm = (
+                    (
+                        values
+                        * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+                        * gain.bfloat16().float().reshape(4, 2560)
+                    )
+                    .flatten(1)
+                    .bfloat16()
+                )
+                assert (captured[1] != rounded_norm).count_nonzero() > tokens * 100
+        graph.reset()
+
+
+def test_combine_norm_rejects_output_aliases_and_declaration_mismatches():
+    device = require_b12x()
+    owner = torch.zeros(3, 10240, device=device, dtype=torch.bfloat16)
+    state, partial_alias = owner[:2], owner[1:]
+    block = torch.zeros(2, 2560, device=device, dtype=torch.bfloat16)
+    logits = torch.zeros(2, 4, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(10240, device=device)
+    normalized = torch.empty_like(state)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=2, hidden_size=2560),
+        invocation=FrozenMapping(
+            {
+                "operation": "combine_norm",
+                "output_mode": "provided",
+                "zero_centered": False,
+                "weight_dtype": "float32",
+            }
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="combine_norm",
+                    prepare_call=lambda prepared: PreparedCall(
+                        run=lambda: prepared.launch(
+                            state, block, logits, weight, state, normalized, eps=1e-6
+                        )
+                    ),
+                ),
+            )
+        )
+        for out, message in (
+            ((state, state), "normalized must not overlap"),
+            ((partial_alias, normalized), "exact alias"),
+            (None, "output form"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                hc.run_combine_norm(
+                    state,
+                    block,
+                    logits,
+                    weight,
+                    eps=1e-6,
+                    plan=plan,
+                    zero_centered=False,
+                    out=out,
+                )
+        with pytest.raises(ValueError, match="recipe differs"):
+            hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight,
+                eps=1e-6,
+                plan=plan,
+                out=(state, normalized),
+            )
+        with pytest.raises(ValueError, match="dtype differs"):
+            hc.run_combine_norm(
+                state,
+                block,
+                logits,
+                weight.bfloat16(),
+                eps=1e-6,
+                plan=plan,
+                zero_centered=False,
+                out=(state, normalized),
+            )
+
+
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("round_silu", [False, True])
+def test_prepared_swiglu_clamp_order(after, round_silu):
+    device = require_b12x()
+    gate = torch.linspace(-8, 8, 4096, device=device).bfloat16().reshape(4, -1)
+    up = torch.linspace(4, -4, gate.numel(), device=device).bfloat16().reshape_as(gate)
+    gate_up = torch.cat((gate, up), dim=1)
+    output = torch.empty_like(gate)
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=4, hidden_size=gate.shape[1]),
+        invocation={
+            "operation": "swiglu",
+            "limit": 2.0,
+            "round_silu": round_silu,
+            "clamp_after_silu": after,
+        },
+    )
+    request = plan.request(
+        name="clamp-order",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.launch(gate_up, gate_up, output), output=output
+        ),
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((request,))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc.run_swiglu(
+                gate_up, limit=2.0, round_silu=round_silu, out=output, plan=plan
+            )
+        gate_up.neg_()
+        gate, up = gate_up.chunk(2, dim=1)
+        activated = (
+            F.silu(gate.float()).clamp(max=2.0)
+            if after
+            else F.silu(gate.float().clamp(max=2.0))
+        )
+        if round_silu:
+            activated = activated.bfloat16().float()
+        expected = (activated * up.float().clamp(-2.0, 2.0)).bfloat16()
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)

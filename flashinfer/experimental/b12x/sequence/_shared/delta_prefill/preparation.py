@@ -40,7 +40,12 @@ def _modules(component):
 
 def _caps_from_query(impl, query, ordinal, *, is_gdn):
     geometry = (
-        {"key_heads": query.key_heads, "value_heads": query.value_heads}
+        {
+            "key_heads": query.key_heads,
+            "value_heads": query.value_heads,
+            "intermediate_dtype": getattr(torch, query.intermediate_dtype),
+            "recurrence_policy": query.recurrence_policy,
+        }
         if is_gdn
         else {"heads": query.heads}
     )
@@ -139,7 +144,9 @@ def compile_prefill(component, query_payload, config_payload, ordinal):
     layout = impl._materialize_layout(caps, config)
     metadata = _metadata_binding(layout, query)
     with torch.cuda.device(ordinal):
-        if metadata.parallel is not None:
+        if caps.is_gdn and caps.intermediate_dtype == torch.float32:
+            from ...gdn_prefill._recurrent import compile_binding
+        elif metadata.parallel is not None:
             from ...gdn_prefill._parallel import compile_binding
         else:
             from ._cute_kernels import compile_binding
@@ -156,6 +163,7 @@ class _PrefillState:
     component_id: str
     parameter_dtypes: tuple
     parallel: bool
+    fp32_recurrent: bool
 
     def _check(self, binding):
         if binding._state is not self.layout:
@@ -194,7 +202,9 @@ class _PrefillState:
                 lower_bound, scale, eps
             )
         windows = self.layout.launched_windows(max_live_tokens, max_live_seqs)
-        if self.parallel:
+        if self.fp32_recurrent:
+            self.programs[0](binding, scale, eps)
+        elif self.parallel:
             from ...gdn_prefill._parallel import run
 
             run(binding, programs=self.programs, scale=scale, eps=eps)
@@ -254,8 +264,9 @@ def make_plan(caps, impl, tuning, *, invocation, override):
             device.ordinal,
         )
         parallel = getattr(native_layout, "parallel", None) is not None
+        fp32_recurrent = caps.is_gdn and caps.intermediate_dtype == torch.float32
         resources = None
-        if not parallel:
+        if not parallel and not fp32_recurrent:
             from ._cute_kernels import _side_resources
 
             with torch.cuda.device(caps.device):
@@ -276,6 +287,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
                 )
             ),
             parallel,
+            fp32_recurrent,
         )
 
     return Plan(

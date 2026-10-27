@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.buffers as _module__lib_dense_gemm_buffers
+import b12x._lib.dense_gemm.preparation as _module__lib_dense_gemm_preparation
+
+
 from dataclasses import dataclass
 
 import torch
@@ -61,7 +65,6 @@ class _BlockFP8Compiled:
 @program_cache(scope="preparation")
 def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
     """Compile the exact selected native branch from metadata."""
-    from b12x._lib import dense_gemm as dense
     from b12x._lib.quant.mxfp8_rows import _get_compiled_mxfp8_rows_quant
 
     query = BlockFp8LinearQuery(**dict(query_payload))
@@ -86,7 +89,9 @@ def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
             device_ordinal=ordinal,
             sm_count=sm_count,
         )
-        dense_programs = dense._compile_dense_lowering(lowering.to_dict(), ordinal)
+        dense_programs = _module__lib_dense_gemm_preparation._compile_dense_lowering(
+            lowering.to_dict(), ordinal
+        )
     return attach_programs(
         _BlockFP8Compiled(
             lowering=lowering,
@@ -255,9 +260,9 @@ def plan(
         )
 
     def memory(config, device):
-        from b12x._lib import dense_gemm as dense
-
-        alpha = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
+        alpha = _module__lib_dense_gemm_buffers._ALPHA_ONE_CACHE.get(
+            ("cuda", device.ordinal)
+        )
         resident = 0 if alpha is None else alpha.numel() * alpha.element_size()
         workspace_nbytes = _workspace_nbytes(
             _dense_lowering(query, config, device.identity)
@@ -274,8 +279,6 @@ def plan(
         )
 
     def materialize(selection, device):
-        from b12x._lib import dense_gemm as dense
-
         config = selection.config
         programs = compile_block_fp8(
             TUNING.encode_query(query),
@@ -285,12 +288,14 @@ def plan(
         )
         resolved_device = torch.device("cuda", device.ordinal)
         lowering = programs.lowering
-        core = dense._DenseExecutionState(
+        core = _module__lib_dense_gemm_preparation._DenseExecutionState(
             lowering,
             resolved_device,
             programs.dense["gemm"],
             programs.dense.get("reduce"),
-            dense._cached_alpha_one(resolved_device) if lowering.alpha_is_one else None,
+            _module__lib_dense_gemm_buffers._cached_alpha_one(resolved_device)
+            if lowering.alpha_is_one
+            else None,
         )
         workspace_nbytes = _workspace_nbytes(lowering)
         return _BlockFP8ExecutionState(

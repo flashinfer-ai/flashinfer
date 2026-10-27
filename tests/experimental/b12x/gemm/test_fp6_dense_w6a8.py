@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.compile as dense_compile
+import b12x._lib.dense_gemm.config as dense_config
+
+
 import pytest
 import torch
 
@@ -85,7 +89,6 @@ def test_w6a8_source_format_sets_act_fmt():
 )
 def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     """Fused m=1 quantization is exact; larger M keeps the same kernel."""
-    import b12x._lib.dense_gemm as _dense_mod
     import b12x.quantization.mxfp6.fp6_dense_weights as _wmod
     from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
@@ -102,20 +105,20 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     # Require the m=1 arms to resolve distinct compiled kernels so the
     # comparison exercises both code paths. Live M is not itself a compile key.
     resolved: list[object] = []
-    _resolve = _dense_mod._get_compiled_dense_gemm_mxfp6
+    _resolve = dense_compile._get_compiled_dense_gemm_mxfp6
 
     def _spy(*args, **kwargs):
         compiled = _resolve(*args, **kwargs)
         resolved.append(compiled)
         return compiled
 
-    monkeypatch.setattr(_dense_mod, "_get_compiled_dense_gemm_mxfp6", _spy)
+    monkeypatch.setattr(dense_compile, "_get_compiled_dense_gemm_mxfp6", _spy)
 
-    monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", False)
+    monkeypatch.setattr(dense_config, "_DENSE_FUSED_QUANT", False)
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", False)
     y_unfused = dense_fp6_linear(x, fp6w)
 
-    monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", True)
+    monkeypatch.setattr(dense_config, "_DENSE_FUSED_QUANT", True)
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", True)
     y_fused = dense_fp6_linear(x, fp6w)
 

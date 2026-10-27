@@ -65,7 +65,7 @@ def _gemm_operands(m: int, n: int, k: int, source_format: str):
     ],
 )
 def test_b_packed_matches_b_preexpanded(m, n, k, source_format):
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(m, n, k, source_format)
 
@@ -90,7 +90,7 @@ def test_b_packed_matches_b_preexpanded(m, n, k, source_format):
 
 @cuda_required
 def test_b_packed_rejects_bad_shapes():
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
     y = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
@@ -116,7 +116,7 @@ def test_b_packed_rejects_bad_shapes():
 
 @cuda_required
 def test_dense_gemm_rejects_misaligned_row_scale():
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
     out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
@@ -138,7 +138,7 @@ def test_dense_gemm_rejects_misaligned_row_scale():
 @cuda_required
 @pytest.mark.parametrize("missing", ["x", "scale"])
 def test_dense_gemm_requires_fused_inputs_as_a_pair(missing):
-    from b12x._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm.execution import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
     out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)

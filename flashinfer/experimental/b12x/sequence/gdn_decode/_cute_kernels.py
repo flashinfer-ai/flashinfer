@@ -817,6 +817,9 @@ class _PackedRecurrentQwenKernel:
             // Int32(self.work_ctas),
         )
         for work_iteration in cutlass.range(work_iterations, unroll=1):
+            # Warp 0 and thread 0 rewrite the shared q/k, decay and beta for
+            # this work item; wait until every warp is done with the last one.
+            cute.arch.sync_threads()
             work = work_block + work_iteration * Int32(self.work_ctas)
             value_tile = work % value_tiles
             request_value_head = work // value_tiles

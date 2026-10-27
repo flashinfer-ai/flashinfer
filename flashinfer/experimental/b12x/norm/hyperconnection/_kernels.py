@@ -39,26 +39,56 @@ def _require_disjoint(
             raise ValueError(f"{output_name} must not overlap {input_name}")
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["state_stride", "residual_stride"])
 def _grouped_rmsnorm_kernel(
     state_ptr,
     weight_ptr,
     out_ptr,
+    residual_ptr,
     eps,
+    state_stride,
+    residual_stride,
     HIDDEN_SIZE: tl.constexpr,
     STREAMS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
+    PAIRED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H).to(tl.int64)
     mask = cols < HIDDEN_SIZE
     offsets = row * HIDDEN_SIZE + cols
-    values = tl.load(state_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    source_offsets = row // STREAMS * state_stride + row % STREAMS * HIDDEN_SIZE + cols
+    if PAIRED:
+        if row % STREAMS == 0:
+            values = tl.load(
+                state_ptr + row // STREAMS * state_stride + cols, mask, other=0
+            ).to(tl.float32)
+        else:
+            values = tl.load(
+                residual_ptr + row // STREAMS * residual_stride + cols, mask, other=0
+            ).to(tl.float32)
+    else:
+        values = tl.load(state_ptr + source_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+    if ADD_RESIDUAL:
+        residual_offsets = (
+            row // STREAMS * residual_stride + row % STREAMS * HIDDEN_SIZE + cols
+        )
+        values += tl.load(residual_ptr + residual_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        values = values.to(state_ptr.dtype.element_ty).to(tl.float32)
+        tl.store(state_ptr + source_offsets, values, mask=mask)
     variance = tl.sum(values * values, axis=0) / HIDDEN_SIZE
     inv_rms = tl.rsqrt(variance + eps)
     weight_offsets = (row % STREAMS) * HIDDEN_SIZE + cols
     weight = tl.load(weight_ptr + weight_offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + offsets, values * inv_rms * (1.0 + weight), mask=mask)
+    if ZERO_CENTERED:
+        weight += 1.0
+    tl.store(out_ptr + offsets, values * inv_rms * weight, mask=mask)
 
 
 @triton.jit
@@ -141,16 +171,27 @@ def _norm_launch(
     hidden_size: int,
     block_h: int,
     num_warps: int,
+    zero_centered=True,
+    residual=None,
+    paired=None,
 ) -> None:
+    right = paired if paired is not None else residual
     _grouped_rmsnorm_kernel[(int(state.shape[0]) * streams,)](
         state,
         weight,
         out,
+        state if right is None else right,
         float(eps),
+        state.stride(0),
+        state.stride(0) if right is None else right.stride(0),
         HIDDEN_SIZE=hidden_size,
         STREAMS=streams,
         BLOCK_H=block_h,
+        ZERO_CENTERED=zero_centered,
+        ADD_RESIDUAL=residual is not None,
+        PAIRED=paired is not None,
         num_warps=num_warps,
+        enable_fp_fusion=False,
     )
 
 
@@ -243,6 +284,41 @@ def _grouped_rmsnorm_fake(
     del state, weight, out, eps, plan_handle
 
 
+@torch.library.custom_op(
+    "b12x::hyperconnection_residual_rmsnorm", mutates_args=("state", "out")
+)
+def _residual_rmsnorm_op(
+    state: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
+) -> None:
+    from ._impl import run_grouped_rmsnorm_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_grouped_rmsnorm_impl(
+        state,
+        weight,
+        eps=eps,
+        plan=prepared,
+        out=out,
+        zero_centered=zero_centered,
+        residual=residual,
+    )
+
+
+@_residual_rmsnorm_op.register_fake
+def _residual_rmsnorm_fake(
+    state, residual, weight, out, eps, plan_handle, zero_centered=True
+):
+    pass
+
+
 @torch.library.custom_op("b12x::hyperconnection_scaled_silu", mutates_args=("out",))
 def _scaled_silu_op(
     projected_down: torch.Tensor,
@@ -325,6 +401,7 @@ def _combine_norm_op(
     next_norm_weight: torch.Tensor,
     eps: float,
     plan_handle: int,
+    zero_centered: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from ._impl import run_combine_norm_impl
 
@@ -338,6 +415,7 @@ def _combine_norm_op(
         next_norm_weight,
         eps=eps,
         plan=prepared,
+        zero_centered=zero_centered,
     )
 
 
@@ -349,9 +427,56 @@ def _combine_norm_fake(
     next_norm_weight: torch.Tensor,
     eps: float,
     plan_handle: int,
+    zero_centered: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del block_output, injection_logits, next_norm_weight, eps, plan_handle
     return torch.empty_like(state), torch.empty_like(state)
+
+
+@torch.library.custom_op(
+    "b12x::hyperconnection_combine_norm_out", mutates_args=("combined", "normalized")
+)
+def _combine_norm_out_op(
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    combined: torch.Tensor,
+    normalized: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
+) -> None:
+    from ._impl import run_combine_norm_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_combine_norm_impl(
+        state,
+        block_output,
+        injection_logits,
+        next_norm_weight,
+        eps=eps,
+        plan=prepared,
+        zero_centered=zero_centered,
+        out=(combined, normalized),
+    )
+
+
+@_combine_norm_out_op.register_fake
+def _combine_norm_out_fake(
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor,
+    combined: torch.Tensor,
+    normalized: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+    zero_centered: bool = True,
+) -> None:
+    return None
 
 
 @torch.library.custom_op("b12x::hyperconnection_engram_mix", mutates_args=("out",))
@@ -420,6 +545,21 @@ def _swiglu_fake(
     del gate_up, out, limit, round_silu, plan_handle
 
 
+@torch.library.custom_op("b12x::hyperconnection_relu2", mutates_args=("out",))
+def _relu2_op(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    from ._impl import run_relu2_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", source.device
+    )
+    run_relu2_impl(source, out=out, plan=prepared)
+
+
+@_relu2_op.register_fake
+def _relu2_fake(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    pass
+
+
 @torch.library.custom_op("b12x::hyperconnection_add", mutates_args=("out",))
 def _add_op(
     left: torch.Tensor,
@@ -458,3 +598,62 @@ def _sigmoid_op(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> No
 @_sigmoid_op.register_fake
 def _sigmoid_fake(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
     return None
+
+
+@torch.library.custom_op("b12x::hyperconnection_head_gate", mutates_args=("values",))
+def _head_gate_op(values: torch.Tensor, gates: torch.Tensor, plan_handle: int) -> None:
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", values.device
+    )
+    prepared.require_operation("head_gate")
+    q = prepared.query
+    if (
+        values.ndim != 3
+        or values.shape[1:] != (q.streams, q.hidden_size)
+        or values.shape[0] > q.max_tokens
+        or values.dtype != torch.bfloat16
+        or not values.is_contiguous()
+        or gates.shape != values.shape[:2]
+        or gates.stride() != (q.gate_stride, 1)
+        or gates.dtype != values.dtype
+        or gates.device != values.device
+    ):
+        raise ValueError(
+            "head gates must match the prepared BF16 head geometry and row stride"
+        )
+    prepared.launch(values, gates, values)
+
+
+@_head_gate_op.register_fake
+def _head_gate_fake(values, gates, plan_handle):
+    pass
+
+
+@torch.library.custom_op("b12x::hyperconnection_paired_rmsnorm", mutates_args=("out",))
+def _paired_rmsnorm_op(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+) -> None:
+    from ._impl import run_grouped_rmsnorm_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", left.device
+    )
+    run_grouped_rmsnorm_impl(
+        left,
+        weight,
+        eps=eps,
+        plan=prepared,
+        out=out,
+        zero_centered=prepared.query.zero_centered,
+        paired=right,
+    )
+
+
+@_paired_rmsnorm_op.register_fake
+def _paired_rmsnorm_fake(left, right, weight, out, eps, plan_handle):
+    pass

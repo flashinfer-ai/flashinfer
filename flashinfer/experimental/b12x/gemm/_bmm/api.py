@@ -45,6 +45,8 @@ def bmm(
     from .._shared import mxfp8_bmm
 
     values, scales = mxfp8_bmm._rhs_tensors(rhs)
+    if scales.dtype == torch.float8_e8m0fnu:
+        scales = scales.view(torch.uint8)
     stream_int = (
         None
         if stream is None

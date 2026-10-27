@@ -36,7 +36,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
 from b12x.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
-from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.dense_gemm.execution import dense_gemm
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from benchmarks.experimental.b12x.common import make_l2_flush_fn, resolve_l2_flush_bytes
 
@@ -529,7 +529,7 @@ def main():
     parser.add_argument(
         "--evidence",
         type=pathlib.Path,
-        help="JSONL evidence output for A16 comparisons.",
+        help="JSONL output for checkpoint-a16.",
     )
     parser.add_argument(
         "--model-path",
@@ -625,6 +625,8 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.evidence is not None and args.dtype != "checkpoint-a16":
+        parser.error("--evidence requires --dtype checkpoint-a16")
     if args.a16_config is not None and args.dtype not in ("fp4-a16", "fp8-a16"):
         parser.error("--a16-config requires --dtype fp4-a16 or fp8-a16")
     if args.dtype == "checkpoint-a16":

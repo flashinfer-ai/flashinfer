@@ -41,10 +41,17 @@ def _quantize(
     x = tl.load(X + row * INPUT_K + k, (row < M) & (k < INPUT_K), 0).to(tl.float32)
     amax = tl.max(tl.abs(x), 1)
     if FP4:
-        g = tl.load(AG)
-        sf = (amax * (1.0 / 6.0) * g).to(tl.float8e4nv)
-        scale = sf.to(tl.float32)
-        effective_scale = scale * tl.div_rn(1.0, g)
+        if GROUP == 32:
+            ratio = tl.where(amax > 0, amax / 6.0, 1.0)
+            exponent = tl.minimum(tl.maximum(tl.ceil(tl.log2(ratio)), -127.0), 127.0)
+            effective_scale = tl.exp2(exponent)
+            sf_byte = (exponent + 127).to(tl.uint8)
+        else:
+            g = tl.load(AG)
+            sf = (amax * (1.0 / 6.0) * g).to(tl.float8e4nv)
+            scale = sf.to(tl.float32)
+            effective_scale = scale * tl.div_rn(1.0, g)
+            sf_byte = sf.to(tl.uint8, bitcast=True)
         inverse = tl.div_rn(1.0, effective_scale)
         inverse = tl.where(effective_scale == 0, 0.0, inverse)
         z = tl.minimum(tl.abs(x * inverse[:, None]), 6.0)
@@ -62,12 +69,14 @@ def _quantize(
         packed = lo | (hi << 4)
         byte = group[:, None] * (GROUP // 2) + tl.arange(0, GROUP // 2)[None, :]
         tl.store(Q + row * (K // 2) + byte, packed, (row < M) & (byte < K // 2))
-        sf_byte = sf.to(tl.uint8, bitcast=True)
         if (row == 0) & (tl.program_id(1) == 0):
-            weight_scale = tl.load(WG)
-            if RECIPROCAL:
-                weight_scale = tl.div_rn(1.0, weight_scale)
-            tl.store(ALPHA, tl.div_rn(weight_scale, g))
+            if GROUP == 32:
+                tl.store(ALPHA, 1.0)
+            else:
+                weight_scale = tl.load(WG)
+                if RECIPROCAL:
+                    weight_scale = tl.div_rn(1.0, weight_scale)
+                tl.store(ALPHA, tl.div_rn(weight_scale, g))
     else:
         ratio = tl.where(amax > 0, amax / 448.0, 1.0)
         exponent = tl.minimum(tl.maximum(tl.ceil(tl.log2(ratio)), -127.0), 127.0)
@@ -82,7 +91,7 @@ def _quantize(
         pad = (M // 128).to(tl.int64) * 128 + tl.arange(0, 128)
         tl.store(
             S + _scale_offset(pad[:, None], group[None, :], K // GROUP),
-            0 if FP4 else 127,
+            0 if FP4 and GROUP == 16 else 127,
             (pad[:, None] >= M)
             & (pad[:, None] < ((M + 127) // 128) * 128)
             & (group[None, :] < K // GROUP),

@@ -89,7 +89,7 @@ def test_prepared_native_swiglu_eager_compile_and_capture(monkeypatch):
             graph.reset()
 
 
-def test_mhc_runtime_projection_splits_share_code_across_prepared_plans(monkeypatch):
+def test_mhc_projection_shares_row_capacity_but_specializes_static_splits(monkeypatch):
     from b12x._lib import compiler
     from b12x.norm import mhc
     from b12x.norm.mhc import _impl as impl
@@ -221,18 +221,22 @@ def test_mhc_runtime_projection_splits_share_code_across_prepared_plans(monkeypa
     ) as session:
         session.prepare(requests)
         plans = {request.name: request.plan for request in requests}
-        projection, finalizers = set(), set()
-        for plan in plans.values():
+        projection, finalizers = {}, set()
+        for name, plan in plans.items():
+            projection[name] = set()
             for program in (
                 require_prepared(plan, "norm.mhc")
                 .launchers["partial"]
                 .__b12x_programs__
             ):
                 if "mhc_prefill_tf32_project_tma_" in program.name:
-                    projection.add(program)
+                    projection[name].add(program)
                 if "mhc_finalize_gram_" in program.name:
                     finalizers.add(program)
-        assert len(projection) == 1
+        assert all(len(programs) == 1 for programs in projection.values())
+        for splits in (1, 16):
+            assert projection[f"m1-s{splits}"] == projection[f"m128-s{splits}"]
+        assert projection["m1-s1"].isdisjoint(projection["m1-s16"])
         assert len(finalizers) == 2
 
         def forbidden(*args, **kwargs):
