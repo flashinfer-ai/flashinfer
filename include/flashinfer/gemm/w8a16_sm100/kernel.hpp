@@ -116,7 +116,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   // Warp specialization thread count per threadblock
   static constexpr uint32_t NumSchedThreads = NumThreadsPerWarp;                       // 1 warp
   static constexpr uint32_t NumMMAThreads = NumThreadsPerWarp;                         // 1 warp
-  static constexpr uint32_t NumMainloopLoadThreads = NumThreadsPerWarp;                // 1 warp
+  static constexpr uint32_t NumMainloopLoadAThreads = NumThreadsPerWarp;               // 1 warp
   static constexpr uint32_t NumEpilogueLoadThreads = NumThreadsPerWarp;                // 1 warp
   static constexpr uint32_t NumEpilogueThreads = CollectiveMainloop::NumAccumThreads;  // 4 warps
   static constexpr uint32_t NumEpilogueWarps = NumEpilogueThreads / NumThreadsPerWarp;
@@ -125,7 +125,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   static constexpr uint32_t NumMainloopLoadBThreads = NumThreadsPerWarp;  // 1 warp
 
   static constexpr uint32_t MaxThreadsPerBlock =
-      NumSchedThreads + NumMainloopLoadThreads + NumMMAThreads + NumEpilogueLoadThreads +
+      NumSchedThreads + NumMainloopLoadAThreads + NumMMAThreads + NumEpilogueLoadThreads +
       NumEpilogueThreads + NumTransformationThreads + NumMainloopLoadBThreads;
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
 
@@ -224,7 +224,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   enum class WarpCategory : int32_t {
     MMA = 0,
     Sched = 1,
-    MainloopLoad = 2,
+    MainloopLoadA = 2,
     EpilogueLoad = 3,
     Epilogue = 4,
     // Transformation starts at 256 thread alignment and spans two warpgroups (8 warps)
@@ -439,15 +439,15 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     IsParticipant is_participant;
     is_participant.mma = (warp_category == WarpCategory::MMA);
     is_participant.sched = (warp_category == WarpCategory::Sched) && is_first_cta_in_cluster;
-    is_participant.main_load = (warp_category == WarpCategory::MainloopLoad ||
+    is_participant.main_load = (warp_category == WarpCategory::MainloopLoadA ||
                                 warp_category == WarpCategory::MainloopLoadB);
-    is_participant.main_loadA = (warp_category == WarpCategory::MainloopLoad);
+    is_participant.main_loadA = (warp_category == WarpCategory::MainloopLoadA);
     is_participant.main_loadB = (warp_category == WarpCategory::MainloopLoadB);
     is_participant.epi_load = (warp_category == WarpCategory::EpilogueLoad) && is_epi_load_needed;
     is_participant.epilogue = (warp_category == WarpCategory::Epilogue);
     is_participant.transformation = (warp_category == WarpCategory::Transformation);
 
-    // MainloopLoad <--> Transformation Pipeline
+    // MainloopLoadA <--> Transformation Pipeline
     Load2TransformPipeline load2transform_pipeline(
         shared_storage.pipelines.mainloop.load2transform_pipeline,
         load2transform_params(warp_category, thread_idx_in_warp == 0), cluster_shape,
@@ -459,7 +459,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     Load2TransformPipelineState load2transform_pipeline_producer_state =
         cutlass::make_producer_start_state<Load2TransformPipeline>();
 
-    // MainloopLoad <--> MMA Pipeline
+    // MainloopLoadB <--> MMA Pipeline
     Load2MmaPipeline load2mma_pipeline(
         shared_storage.pipelines.mainloop.load2mma_pipeline,
         load2mma_params(warp_category,
@@ -552,9 +552,9 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     arch::ClusterBarrier& epilogue_throttle_barrier = shared_storage.pipelines.epilogue_throttle;
     if (WarpCategory::MMA == warp_category && lane_predicate) {
       epilogue_throttle_barrier.init(
-          NumMMAThreads + (is_first_cta_in_cluster ? NumSchedThreads : 0) + NumMainloopLoadThreads +
-          NumMainloopLoadBThreads + (is_epi_load_needed ? NumEpilogueLoadThreads : 0) +
-          NumTransformationThreads);
+          NumMMAThreads + (is_first_cta_in_cluster ? NumSchedThreads : 0) +
+          NumMainloopLoadAThreads + NumMainloopLoadBThreads +
+          (is_epi_load_needed ? NumEpilogueLoadThreads : 0) + NumTransformationThreads);
     }
 
     // We need this to guarantee that the Pipeline init is visible
@@ -1092,7 +1092,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   static CUTLASS_DEVICE typename Load2TransformPipeline::Params load2transform_params(
       WarpCategory warp_category, bool is_leader) {
     typename Load2TransformPipeline::Params p;
-    if (warp_category == WarpCategory::MainloopLoad) {
+    if (warp_category == WarpCategory::MainloopLoadA) {
       p.role = Load2TransformPipeline::ThreadCategory::Producer;
     } else if (warp_category == WarpCategory::Transformation) {
       p.role = Load2TransformPipeline::ThreadCategory::Consumer;
@@ -1167,7 +1167,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   static CUTLASS_DEVICE typename LoadOrderBarrier::Params load_order_params(
       WarpCategory warp_category) {
     typename LoadOrderBarrier::Params p;
-    p.group_id = (warp_category == WarpCategory::MainloopLoad) ? 0 : 1;
+    p.group_id = (warp_category == WarpCategory::MainloopLoadA) ? 0 : 1;
     p.group_size = 1;
     p.initializing_warp = 5;
     return p;
@@ -1186,7 +1186,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     p.producer_arv_count = 1;
     p.consumer_arv_count =
         NumSchedThreads +
-        cluster_size * (NumMainloopLoadThreads + NumMainloopLoadBThreads + NumEpilogueThreads +
+        cluster_size * (NumMainloopLoadAThreads + NumMainloopLoadBThreads + NumEpilogueThreads +
                         NumMMAThreads + NumTransformationThreads);
     if (is_epi_load_needed) {
       p.consumer_arv_count += cluster_size * NumEpilogueLoadThreads;
@@ -1199,13 +1199,13 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
   static CUTLASS_DEVICE typename CLCThrottlePipeline::Params clc_throttle_params(
       WarpCategory warp_category) {
     typename CLCThrottlePipeline::Params p;
-    if (WarpCategory::MainloopLoad == warp_category) {
+    if (WarpCategory::MainloopLoadA == warp_category) {
       p.role = CLCThrottlePipeline::ThreadCategory::Producer;
     }
     if (WarpCategory::Sched == warp_category) {
       p.role = CLCThrottlePipeline::ThreadCategory::Consumer;
     }
-    p.producer_arv_count = NumMainloopLoadThreads;
+    p.producer_arv_count = NumMainloopLoadAThreads;
     p.consumer_arv_count = NumSchedThreads;
     p.dst_blockid = 0;
     p.initializing_warp = 3;
