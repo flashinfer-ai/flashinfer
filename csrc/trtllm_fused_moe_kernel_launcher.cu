@@ -1049,9 +1049,13 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
+// Tile_N candidates around the tile covering num_tokens * top_k / num_local_experts. Under expert
+// parallelism a caller may pass every row it received, with global expert ids, so when
+// num_experts > num_local_experts the tile covering num_tokens * top_k / num_experts is also
+// offered if it is below every candidate: at most one extra, smaller tile.
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts,
+                                       int64_t const num_local_experts, int64_t const num_experts,
                                        int const num_smaller_tile_candidates = 2) {
   TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
       << "ascending_supported_tile_sizes must not be empty.";
@@ -1070,10 +1074,12 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_sup
   // - Here we map derived avg_tokens_per_expert to the first supported tile that covers it.
   // Because they bucket different quantities, cache bucket and runtime tile candidates can
   // diverge; launcher-side tactic resolution handles that mismatch.
-  auto it = std::lower_bound(
-      ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
-      avg_tokens_per_expert,
-      [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
+  auto const tile_below = [](int32_t tile, double average) {
+    return static_cast<double>(tile) < average;
+  };
+  auto it =
+      std::lower_bound(ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
+                       avg_tokens_per_expert, tile_below);
   if (it == ascending_supported_tile_sizes.end()) {
     it = std::prev(ascending_supported_tile_sizes.end());
   }
@@ -1101,40 +1107,24 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_sup
     selected_tile_nums.insert(*down);
   }
 
-  return selected_tile_nums;
-}
-
-// Tile_N candidates offered to the autotuner (getValidConfigs). Under expert parallelism a caller
-// may pass every row it received, with global expert ids, so rows per expert are nearer
-// num_tokens * top_k / num_experts than computeSelectedTileN's local estimate. The launcher cannot
-// tell the two cases apart, so it keeps the local candidates and adds the one tile covering the
-// global estimate when that tile is below all of them: identical when
-// num_experts == num_local_experts, otherwise at most one smaller tile.
-// The untuned fallback (selectDefaultTileN) is deliberately unchanged.
-std::set<int32_t> computeCandidateTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
-                                        int64_t const num_tokens, int64_t const top_k,
-                                        int64_t const num_local_experts,
-                                        int64_t const num_experts) {
-  std::set<int32_t> candidates =
-      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
   if (num_experts > num_local_experts) {
-    // With no smaller neighbours, the smallest tile of the window is the covering tile.
-    int32_t const global_tile =
-        *computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_experts,
-                              /*num_smaller_tile_candidates=*/0)
-             .begin();
-    if (global_tile < *candidates.begin()) {
-      candidates.insert(global_tile);
+    double const global_avg_tokens_per_expert =
+        static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_experts;
+    // The global estimate is at most the local one, so its covering tile is at or below *it.
+    int32_t const global_tile = *std::lower_bound(ascending_supported_tile_sizes.begin(), it,
+                                                  global_avg_tokens_per_expert, tile_below);
+    if (global_tile < *selected_tile_nums.begin()) {
+      selected_tile_nums.insert(global_tile);
     }
   }
-  return candidates;
+  return selected_tile_nums;
 }
 
 int64_t selectDefaultTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
-  auto selected =
-      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts, 1);
+  auto selected = computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k,
+                                       num_local_experts, /*num_experts=*/num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
@@ -2122,7 +2112,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums = computeCandidateTileN(
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
         supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
@@ -3828,7 +3818,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums = computeCandidateTileN(
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
         supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
@@ -4097,7 +4087,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums = computeCandidateTileN(
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
         supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
@@ -4675,7 +4665,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
-    std::set<int32_t> selected_tile_nums = computeCandidateTileN(
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
         supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
@@ -4931,7 +4921,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
 
     std::vector<int32_t> tile_sizes(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
-        computeCandidateTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
+        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -5375,7 +5365,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
     std::set<int32_t> selected_tile_nums =
-        computeCandidateTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
+        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
