@@ -129,7 +129,7 @@ def preprocess_mega_weights(
     ):
         raise ValueError(
             f"{KERNEL_NAME}: hidden_size and intermediate_size must be multiples of "
-            f"{SCALE_BLOCK}, got {hidden_size} and {intermediate_size}"
+            f"{FP4_PER_BYTE * SCALE_BLOCK}, got {hidden_size} and {intermediate_size}"
         )
     w13 = _as_uint8_codes(weights.w13, "w13")
     w2 = _as_uint8_codes(weights.w2, "w2")
