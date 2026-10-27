@@ -164,7 +164,7 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (129, 3072, 3072, 32, False): _P + "5852ad0db045e502e10a",
         (129, 3072, 3072, 32, True): _P + "05bda082a73c0c1a68b0",
         (129, 3072, 3072, 64, True): _P + "05bda082a73c0c1a68b0",
-        (129, 3072, 3072, 96, True): _P + "2270204930b79b8caef7",
+        (129, 3072, 3072, 96, True): _P + "05bda082a73c0c1a68b0",
         (129, 3072, 3072, 128, False): _P + "5852ad0db045e502e10a",
         (129, 3072, 3072, 128, True): _P + "2270204930b79b8caef7",
         (129, 3072, 12288, 32, False): _P + "243af01860dcca0f4e2c",
