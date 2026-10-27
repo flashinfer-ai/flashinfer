@@ -253,6 +253,7 @@ kernel_cake_selective_state_update_2daf8a1c27be3854989c(const __grid_constant__ 
             unsigned int state_carriers[8];
             unsigned int input_slot = 0;
             unsigned int tile = 0;
+            int _phase_state_full_0 = 0;
             unsigned int _phase_dt_ready = 0;
             #pragma unroll 1
             for (int work_group = bid; work_group < (total_tiles + 2 - 1) / 2; work_group += num_bids) {
@@ -300,7 +301,7 @@ kernel_cake_selective_state_update_2daf8a1c27be3854989c(const __grid_constant__ 
                     unsigned int barrier_state_stage = (unsigned int)stage;
                     unsigned int physical_state_stage = state_base + barrier_state_stage;
                     const bool _selected_wait_cond_3 = cohort == 0;
-                    mbarrier_wait((_selected_wait_cond_3 ? (state_full_0_addr + ((tile * 2 + barrier_state_stage) % 2) * 8) : (state_full_1_addr + ((tile * 2 + barrier_state_stage) % 2) * 8)), (_selected_wait_cond_3 ? ((tile * 2 + barrier_state_stage) / 2 % 2) : ((tile * 2 + barrier_state_stage) / 2 % 2)));
+                    mbarrier_wait((_selected_wait_cond_3 ? (state_full_0_addr + (barrier_state_stage) * 8) : (state_full_1_addr + (barrier_state_stage) * 8)), (_selected_wait_cond_3 ? (_phase_state_full_0) : (_phase_state_full_0)));
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     for (int subpass = 0; subpass < 2; subpass++) {
                         int row_in_stage = subpass * 16 + cohort_warp * 4 + subgroup;
@@ -475,6 +476,7 @@ kernel_cake_selective_state_update_2daf8a1c27be3854989c(const __grid_constant__ 
                 }
                 _phase_dt_ready ^= 1;
                 tile += 1;
+                _phase_state_full_0 ^= 1;
                 input_slot += 1;
                 if (input_slot == 2) { input_slot = 0; }
             }
@@ -486,11 +488,9 @@ kernel_cake_selective_state_update_2daf8a1c27be3854989c(const __grid_constant__ 
             unsigned int _phase_inputs_empty_0 = 1;
             unsigned int _phase_state_empty_0_0 = 1;
             unsigned int _phase_state_empty_0_1 = 1;
-            unsigned int _phase_inputs_empty_1 = 1;
-            unsigned int _phase_state_empty_1_0 = 1;
-            unsigned int _phase_state_empty_1_1 = 1;
             if (elect_sync()) {
                 unsigned int input_stage_1 = 0;
+                unsigned int tile_1 = 0;
                 #pragma unroll 1
                 for (int work_group_1 = bid; work_group_1 < (total_tiles + 2 - 1) / 2; work_group_1 += num_bids) {
                     int work_tile_0 = work_group_1 * 2;
@@ -519,22 +519,21 @@ kernel_cake_selective_state_update_2daf8a1c27be3854989c(const __grid_constant__ 
                     int group_1 = head_1 / heads_per_group;
                     long long source_slot_1 = state_batch_indices[batch_1];
                     unsigned int input_stage_1_1 = 2 + input_stage_1;
-                    mbarrier_wait(inputs_empty_1_addr + (input_stage_1) * 8, _phase_inputs_empty_1);
-                    mbarrier_wait(state_empty_1_addr, _phase_state_empty_1_0);
+                    mbarrier_wait(inputs_empty_1_addr + (input_stage_1) * 8, _phase_inputs_empty_0);
+                    mbarrier_wait(state_empty_1_addr, _phase_state_empty_0_0);
                     tma_4d_gmem2smem(s_b_addr + input_stage_1_1 * 1536, (&b_tma), 0, group_1, 0, batch_1, state_full_1_addr);
                     tma_4d_gmem2smem(s_c_addr + input_stage_1_1 * 1536, (&c_tma), 0, group_1, 0, batch_1, state_full_1_addr);
                     tma_4d_gmem2smem(s_x_addr + input_stage_1_1 * 768, (&x_tma), 0, head_1, 0, batch_1, state_full_1_addr);
                     tma_4d_gmem2smem(s_state_addr + 16384, (&state_tma), 0, 0, head_1, (int)source_slot_1, state_full_1_addr);
                     mbarrier_arrive_expect_tx(state_full_1_addr, 12032);
-                    mbarrier_wait(state_empty_1_addr + 8, _phase_state_empty_1_1);
+                    mbarrier_wait(state_empty_1_addr + 8, _phase_state_empty_0_1);
                     tma_4d_gmem2smem(s_state_addr + 24576, (&state_tma), 0, 32, head_1, (int)source_slot_1, state_full_1_addr + 8);
                     mbarrier_arrive_expect_tx(state_full_1_addr + 8, 8192);
+                    tile_1 += 1;
                     _phase_state_empty_0_0 ^= 1;
                     _phase_state_empty_0_1 ^= 1;
-                    _phase_state_empty_1_0 ^= 1;
-                    _phase_state_empty_1_1 ^= 1;
                     input_stage_1 += 1;
-                    if (input_stage_1 == 2) { input_stage_1 = 0; _phase_inputs_empty_0 ^= 1; _phase_inputs_empty_1 ^= 1; }
+                    if (input_stage_1 == 2) { input_stage_1 = 0; _phase_inputs_empty_0 ^= 1; }
                 }
             }
         }

@@ -507,6 +507,107 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
     assert len(poison) == 128
 
 
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("force_legacy", [False, True])
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_paged_replan_reuses_owned_prefix_without_writing_caller_buffers(
+    monkeypatch, force_legacy, lse_layout, length_dtype
+):
+    if force_legacy:
+        for module in (flashinfer.prefill, prefill):
+            monkeypatch.setattr(
+                module, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
+            )
+    direct = prefill._cudnn_supports_direct_seqlens(torch.bfloat16)
+    q = torch.randn(5, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(8, 16, 2, 128, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device=q.device), backend="cudnn"
+    )
+    qo_gpu = torch.tensor([0, 3, 5], device=q.device, dtype=length_dtype)
+    page_indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
+    last = torch.tensor([1, 1], dtype=torch.int32)
+    indices = torch.tensor([5, 1, 4, 0, 6], device=q.device, dtype=torch.int32)
+
+    def plan(qo):
+        w.plan(qo, page_indptr, indices, last, 8, 2, 128, 16, q_data_type=q.dtype)
+        if not direct:
+            assert w._cudnn_plan is None
+
+    plan(qo_gpu)
+    w.run(q, (k, v))
+    for split in (2, 3):
+        qo = torch.tensor([0, split, 5], dtype=length_dtype)
+        plan(qo)
+        if split == 2:
+            pointer, saved_plan = w._qo_indptr_buf.data_ptr(), w._cudnn_plan
+        elif length_dtype == torch.int32:
+            assert w._qo_indptr_buf.data_ptr() == pointer
+            if direct:
+                assert w._cudnn_plan is saved_plan
+        out, lse = w.run(q, (k, v), return_lse=True, lse_layout=lse_layout)
+        ref, stats = _reference(
+            q,
+            k,
+            v,
+            qo,
+            page_indptr,
+            indices.cpu(),
+            last,
+            causal=False,
+            scale=128**-0.5,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            lse.T if lse_layout == "HN" else lse,
+            stats * math.log2(math.e),
+            atol=0.003,
+            rtol=0.003,
+        )
+    torch.testing.assert_close(
+        qo_gpu.cpu(), torch.tensor([0, 3, 5], dtype=length_dtype)
+    )
+
+    # Returning to a caller-owned device prefix must use its current values,
+    # including fresh storage, without copying into the previous caller's tensor.
+    replacement = torch.tensor([0, 2, 5], device=q.device, dtype=length_dtype)
+    plan(replacement)
+    indices.copy_(torch.tensor([6, 0, 7, 1, 2], device=q.device, dtype=torch.int32))
+    plan(replacement)
+    w.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_layout=lse_layout)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_layout=lse_layout)
+    q.mul_(0.5)
+    v.add_(0.25)
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    ref, stats = _reference(
+        q,
+        k,
+        v,
+        replacement.cpu(),
+        page_indptr,
+        indices.cpu(),
+        last,
+        causal=False,
+        scale=128**-0.5,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(
+        lse.T if lse_layout == "HN" else lse,
+        stats * math.log2(math.e),
+        atol=0.003,
+        rtol=0.003,
+    )
+    torch.testing.assert_close(
+        qo_gpu.cpu(), torch.tensor([0, 3, 5], dtype=length_dtype)
+    )
+
+
 @pytest.mark.parametrize("backend", ["fa2", "auto"])
 @pytest.mark.parametrize("length_dtype", [None, torch.int32, torch.uint32])
 def test_paged_prefill_explicit_max_preserves_fallback_metadata(backend, length_dtype):
@@ -800,6 +901,141 @@ def test_paged_prefill_plan_stages_device_lengths_without_sync(
     q_lens.zero_()
     del kv_lens, q_lens
     check(last)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("backend", ["cudnn", "auto"])
+@pytest.mark.parametrize("backend_only", [False, True])
+@pytest.mark.parametrize("initial_explicit", [False, True])
+@pytest.mark.parametrize("metadata_device,layout", [("cpu", "NH"), ("cuda", "HN")])
+def test_paged_query_lengths_are_independent_of_storage_offsets(
+    monkeypatch, backend, backend_only, initial_explicit, metadata_device, layout
+):
+    if not prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
+        pytest.skip("requires token-offset cuDNN prefill")
+    if backend == "auto":
+        if (
+            not prefill._cudnn_supports_paged_auto()
+            or torch.cuda.get_device_capability() != (10, 0)
+        ):
+            pytest.skip("requires the qualified SM100 paged-auto runtime")
+        # Exercise bounded declarations without depending on a heuristic winner.
+        monkeypatch.setattr(
+            flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
+        )
+    # A previous test's cached graph must not bypass this provider control.
+    monkeypatch.setattr(
+        prefill,
+        "_build_prefill_graph",
+        prefill.cudnn.graph_cache(key_fn=prefill._sdpa_prefill_key_fn)(
+            prefill._build_prefill_graph.__wrapped__
+        ),
+    )
+    if backend_only:
+        monkeypatch.setattr(
+            prefill.cudnn.pygraph, "_candidate_engines", lambda self: []
+        )
+
+    torch.manual_seed(53)
+    qo = torch.tensor([0, 64, 96], dtype=torch.int32)
+    ip = torch.tensor([0, 128, 192], dtype=torch.int32)
+    ix = torch.randperm(192, dtype=torch.int32)
+    last = torch.tensor([16, 16], dtype=torch.int32)
+    q = torch.randn(96, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(192, 16, 2, 128, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty((96, 8) if layout == "NH" else (8, 96), device=q.device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        "HND",
+        backend=backend,
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty_like(qo, device=q.device),
+        paged_kv_indptr_buf=torch.empty_like(ip, device=q.device),
+        paged_kv_indices_buf=torch.empty_like(ix, device=q.device),
+        paged_kv_last_page_len_buf=torch.empty_like(last, device=q.device),
+        max_total_num_rows=len(q),
+    )
+
+    def plan(explicit):
+        lengths = [47, 19] if explicit else [64, 32]
+        supplied = (
+            torch.tensor(lengths, device=metadata_device, dtype=torch.int32)
+            if explicit
+            else None
+        )
+        wrapper.plan(
+            qo,
+            ip,
+            ix,
+            last,
+            8,
+            2,
+            128,
+            16,
+            causal=True,
+            q_data_type=q.dtype,
+            seq_lens_q=supplied,
+            max_token_per_sequence=64,
+            max_sequence_kv=2048,
+        )
+        assert wrapper._backend == "cudnn"
+        if supplied is not None:
+            supplied.zero_()  # plan owns its mask; caller storage may be reused.
+        rows = torch.cat(
+            [torch.arange(int(qo[b]), int(qo[b]) + n) for b, n in enumerate(lengths)]
+        ).to(q.device)
+        packed_prefix = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32)
+        return rows, packed_prefix
+
+    def run():
+        wrapper.run(
+            q,
+            (k.transpose(1, 2), v.transpose(1, 2)),
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_layout=layout,
+            lse_base="ln",
+        )
+
+    def check(rows, prefix):
+        if backend_only:
+            from cudnn.engines import is_backend_engine
+
+            graph = wrapper._cudnn_prepared.graph
+            assert is_backend_engine(
+                graph.get_engine_and_knobs_at_index(graph._plan_index)[0]
+            )
+        expected, stats = _reference(
+            q[rows], k, v, prefix, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out[rows].float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(
+            (lse if layout == "NH" else lse.T)[rows], stats, atol=0.001, rtol=0.001
+        )
+
+    rows, prefix = plan(initial_explicit)
+    run()
+    check(rows, prefix)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        for explicit in (not initial_explicit, initial_explicit):
+            ix = ix.roll(17)
+            q.mul_(0.75)
+            v.mul_(0.5)
+            rows, prefix = plan(explicit)
+            run()
+            check(rows, prefix)
+            out.fill_(torch.nan)
+            lse.fill_(torch.nan)
+            graph.replay()
+            check(rows, prefix)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")

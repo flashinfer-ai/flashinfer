@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_STATE_PIPE_STAGES 12
 #define SMEM_S_STATE_OFF 1024
 #define SMEM_S_STATE_STAGE_BYTES 8192
 #define SMEM_S_STATE_STRIDE 8192
@@ -204,7 +203,6 @@ kernel_cake_selective_state_update_141341c762041c2f0989(const __grid_constant__ 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
-            // --- pipeline 'state_pipe' ---
             // state_full: 12 barriers, init_count=1
             mbarrier_init(smem + 0, 1);
             mbarrier_init(smem + 8, 1);
@@ -360,23 +358,34 @@ kernel_cake_selective_state_update_141341c762041c2f0989(const __grid_constant__ 
                 float d_value = s_scalars[32 + head_offset];
                 int x_row = head_offset * 256 + row_in_stage;
                 int out_row = (token_base * 64 + head) * 128 + row_in_stage;
-                int ring_base = head_offset % 3 * 4;
-                int ring_lap = head_offset / 3;
+#if __CUDA_ARCH__ == 1030
+                int ring_base = (int)((unsigned int)head_offset % 3) * 4;
+#else
+#endif
                 #pragma unroll
                 for (int stage = 0; stage < 4; stage++) {
-                    int ring_stage = ring_base + stage;
+                    int ring_stage = stage + 4 * (int)((unsigned int)head_offset % 3);
                     float x_value_0 = s_x[x_row + stage * 32];
                     unsigned int state_carriers[8];
                     float state_values[16];
-                    int _parity_state_full = (int)((unsigned int)ring_lap % 2);
-                    mbarrier_wait(state_full_addr + (ring_stage) * 8, _parity_state_full);
+                    int _stage_state_full = stage + 4 * (int)((unsigned int)head_offset % 3);
+                    int _parity_state_full = (int)((unsigned int)head_offset / 3 % 2);
+                    mbarrier_wait(state_full_addr + (_stage_state_full) * 8, _parity_state_full);
                     if (pad_tile == 0) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[0])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 3]))
+#if __CUDA_ARCH__ == 1030
+                            : "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)));
+#else
                             : "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)));
+#endif
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[4])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 3]))
+#if __CUDA_ARCH__ == 1030
+                            : "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128));
+#else
                             : "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128));
+#endif
                     } else {
                         state_carriers[0] = 0;
                         state_carriers[1] = 0;
@@ -539,8 +548,13 @@ kernel_cake_selective_state_update_141341c762041c2f0989(const __grid_constant__ 
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_values[_lp*2 + 0], state_values[_lp*2+1 + 0]));
                         state_values_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
+#if __CUDA_ARCH__ == 1030
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)), "r"(state_values_bf16[0]), "r"(state_values_bf16[1]), "r"(state_values_bf16[2]), "r"(state_values_bf16[3]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128), "r"(state_values_bf16[4]), "r"(state_values_bf16[5]), "r"(state_values_bf16[6]), "r"(state_values_bf16[7]));
+#else
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)), "r"(state_values_bf16[0]), "r"(state_values_bf16[1]), "r"(state_values_bf16[2]), "r"(state_values_bf16[3]));
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128), "r"(state_values_bf16[4]), "r"(state_values_bf16[5]), "r"(state_values_bf16[6]), "r"(state_values_bf16[7]));
+#endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
@@ -620,23 +634,33 @@ kernel_cake_selective_state_update_141341c762041c2f0989(const __grid_constant__ 
                 #pragma unroll 1
                 for (int head_offset_1 = 0; head_offset_1 < work_heads_1; head_offset_1++) {
                     int head_1 = first_head_1 + head_offset_1;
-                    int ring_base_1 = head_offset_1 % 3 * 4;
-                    int ring_lap_1 = head_offset_1 / 3;
                     int next_head_valid = ((work_heads_1 > head_offset_1 + 3) ? 1 : 0);
+#if __CUDA_ARCH__ == 1030
+                    int ring_base_1 = (int)((unsigned int)head_offset_1 % 3) * 4;
+#else
+#endif
                     #pragma unroll
                     for (int stage_4 = 0; stage_4 < 4; stage_4++) {
-                        int ring_stage_1 = ring_base_1 + stage_4;
-                        int _parity_state_updated = (int)((unsigned int)ring_lap_1 % 2);
+                        int ring_stage_1 = stage_4 + 4 * (int)((unsigned int)head_offset_1 % 3);
+                        int _parity_state_updated = (int)((unsigned int)head_offset_1 / 3 % 2);
                         mbarrier_wait(state_updated_addr + (ring_stage_1) * 8, _parity_state_updated);
                         if (live != 0) {
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
+                            tma_store_4d((&state_tma), 0, stage_4 * 32, head_1, slot, s_state_addr + (unsigned int)((ring_base_1 + stage_4) * 8192));
+#else
                             tma_store_4d((&state_tma), 0, stage_4 * 32, head_1, slot, s_state_addr + (unsigned int)(ring_stage_1 * 8192));
+#endif
                             asm volatile("cp.async.bulk.commit_group;");
                             asm volatile("cp.async.bulk.wait_group.read 0;");
                         }
                         if (next_head_valid != 0) {
                             if (live != 0) {
+#if __CUDA_ARCH__ == 1030
+                                tma_4d_gmem2smem(s_state_addr + (unsigned int)((ring_base_1 + stage_4) * 8192), (&state_tma), 0, stage_4 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
+#else
                                 tma_4d_gmem2smem(s_state_addr + (unsigned int)(ring_stage_1 * 8192), (&state_tma), 0, stage_4 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
+#endif
                                 mbarrier_arrive_expect_tx(state_full_addr + (ring_stage_1) * 8, 8192);
                             } else {
                                 mbarrier_arrive(state_full_addr + (ring_stage_1) * 8);

@@ -227,10 +227,10 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "fp8-grouped-tc-v3"
+            "fp8-grouped-tc-w8-batch-v5"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
-            else "block-fp8-grouped-tc-v1"
+            else "block-fp8-grouped-tc-w8-batch-v3"
             if self.config.quant.weight is QuantFormat.DeepSeekFp8
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
@@ -238,15 +238,15 @@ class FrostLowLatencyRunner(MoERunner):
                 "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
-                    "w8a16-route-group-v1"
+                    "w8a16-grouped-tc-hopper-k256-v22"
                     if self.config.quant.weight is QuantFormat.FP8PerTensor
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v6"
+                        "bf16-grouped-tc-w8-batch-v15"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-v4"
+                            "fp16-grouped-tc-w8-batch-v13"
                             if self.config.quant.weight is QuantFormat.FP16
                             else "unified-fma-tc-standard-timing-v5"
                         )
@@ -304,16 +304,131 @@ class FrostLowLatencyRunner(MoERunner):
         if (
             self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            and self.config.quant.output is self.config.quant.activation
+            and capability == (9, 0)
+            and (
+                inputs[0].shape == (8, 2048)
+                or (
+                    inputs[0].shape == (4, 2048)
+                    and self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation == GeGLU()
+                )
+            )
+            and self.config.experts.intermediate_size == 512
+            and self.config.routing.top_k == 10
+            and (
+                self.config.activation in (SwiGLU(), GeGLU())
+                or (
+                    self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation in (ReLU2(), SiLU())
+                )
+            )
+            and self.config.finalize.do_finalize
+        ):
+            # Reused experts amortize typed fragment conversion. Keep FMA for
+            # sparse overlap, and both group sizes for warm/cold variation.
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+            if (
+                self.config.quant.activation is QuantFormat.BF16
+                and self.config.activation == GeGLU()
+            ):
+                # Wider K tiles amortize producer synchronization for reused
+                # experts. Keep the existing T8 K128 choice for tuning.
+                tokens = inputs[0].shape[0]
+                tactics.append(("warp_mma", tokens, 2, 256))
+                if tokens == 4:
+                    return tactics
+            return tactics + [
+                ("warp_mma", group, 2, 128)
+                for group in (
+                    (4, 8) if self.config.quant.activation is QuantFormat.FP16 else (8,)
+                )
+            ]
+        if (
+            self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            and self.config.quant.output is self.config.quant.activation
+            and capability == (10, 3)
+            and (
+                (
+                    inputs[0].shape in ((4, 2048), (8, 2048))
+                    and self.config.experts.intermediate_size == 512
+                    and self.config.routing.top_k == 10
+                    and (
+                        self.config.activation in (SwiGLU(), GeGLU())
+                        or (
+                            self.config.quant.activation is QuantFormat.FP16
+                            and inputs[0].shape[0] == 8
+                            and self.config.activation in (ReLU2(), SiLU())
+                        )
+                    )
+                )
+                or (
+                    self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation == SwiGLU()
+                    and (
+                        *inputs[0].shape,
+                        self.config.experts.intermediate_size,
+                        self.config.routing.top_k,
+                    )
+                    == (8, 7168, 2048, 8)
+                )
+            )
+            and self.config.finalize.do_finalize
+        ):
+            # High expert reuse amortizes compact-weight fragment conversion;
+            # partial/disjoint routing still needs all original FMA choices.
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+            if inputs[0].shape[0] == 4:
+                stages = (
+                    (2, 4) if self.config.quant.activation is QuantFormat.BF16 else (2,)
+                )
+                return tactics + [("warp_mma", 4, stage, 128) for stage in stages]
+            return tactics + [("warp_mma", 8, 2, 128)]
+        if (
+            self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
             and capability == (12, 0)
             and inputs[0].shape[0] >= 4
         ):
             # T=2 warm reuse gains did not offset its cold-cache regression.
-            return [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
                 ("ffma", a, b, group)
                 for a in (1, 2, 4)
                 for b in (1, 2, 4, 8)
                 for group in (2, 4)
             ]
+            if (
+                self.config.quant.output is self.config.quant.activation
+                and (
+                    (
+                        inputs[0].shape == (8, 2048)
+                        and self.config.experts.intermediate_size == 512
+                        and self.config.routing.top_k == 10
+                        and (
+                            self.config.activation in (SwiGLU(), GeGLU())
+                            or (
+                                self.config.quant.activation is QuantFormat.FP16
+                                and self.config.activation in (ReLU2(), SiLU())
+                            )
+                        )
+                    )
+                    or (
+                        self.config.activation == SwiGLU()
+                        and (
+                            *inputs[0].shape,
+                            self.config.experts.intermediate_size,
+                            self.config.routing.top_k,
+                        )
+                        == (8, 7168, 2048, 8)
+                    )
+                )
+                and self.config.finalize.do_finalize
+            ):
+                # Shared T8 routes amortize fragment conversion. Preserve all
+                # FMA choices for colder or less-overlapping expert routing.
+                tactics.append(("warp_mma", 8, 2, 128))
+            return tactics
         if self._fp4_weight_only or self.config.quant.weight in (
             QuantFormat.BF16,
             QuantFormat.FP16,
