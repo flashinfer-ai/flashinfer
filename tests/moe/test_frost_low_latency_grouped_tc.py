@@ -463,7 +463,7 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
             else ((8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128))
         )
         expected_tactics = [("warp_mma", *choice) for choice in choices]
-        if tokens == 8 and activation == SwiGLU():
+        if tokens == 8 and activation in (SwiGLU(), GeGLU(), ReLU2()):
             expected_tactics += [("warp_mma", *choice, True) for choice in choices]
     assert grouped == expected_tactics
     assert len(tactics) == 16 + len(expected_tactics)
@@ -782,7 +782,11 @@ def test_invalid_route_scores_are_ignored_after_graph_capture(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_sm120_weight_first_cache_and_live_graphs(dtype, monkeypatch):
+@pytest.mark.parametrize("activation", [SwiGLU(), GeGLU(), ReLU2()])
+@pytest.mark.parametrize("choice", [(8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128)])
+def test_sm120_weight_first_cache_and_live_graphs(
+    dtype, activation, choice, monkeypatch
+):
     _require_grouped_tc()
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("Weight-first scheduling is qualified on SM120")
@@ -795,7 +799,7 @@ def test_sm120_weight_first_cache_and_live_graphs(dtype, monkeypatch):
     cases = []
     for _ in range(2):
         cfg, x, w1, w2, ids, scores, weights = _inputs(
-            SwiGLU(),
+            activation,
             tokens=8,
             hidden=2048,
             intermediate=512,
@@ -813,7 +817,7 @@ def test_sm120_weight_first_cache_and_live_graphs(dtype, monkeypatch):
         assert inputs[3].data_ptr() != w1.data_ptr()
         assert inputs[4].data_ptr() != w2.data_ptr()
         cases.append((runner, inputs, x, inputs[3], inputs[4], ids, scores))
-    old = ("warp_mma", 4, 2, 64)
+    old = ("warp_mma", *choice)
     overlap = (*old, True)
     runner, inputs, *_ = cases[0]
     a = runner.forward(inputs, old).clone()
@@ -843,7 +847,7 @@ def test_sm120_weight_first_cache_and_live_graphs(dtype, monkeypatch):
             ids.add_(1).remainder_(19)
             scores.copy_(scores.flip(1))
             _, expected, _ = _reference(
-                x, w1, w2, ids, scores, SwiGLU(), True, output_dtype=dtype
+                x, w1, w2, ids, scores, activation, True, output_dtype=dtype
             )
             for graph in graphs[2 * index : 2 * index + 2]:
                 for buf in inputs[5:8]:
@@ -887,7 +891,7 @@ def test_sm120_weight_first_rejects_unqualified_manual_tactics(case):
     elif case == "topk":
         args["topk"] = 8
     elif case == "activation":
-        activation = GeGLU()
+        activation = GeGLUTanh()
     elif case == "output_dtype":
         args["output_dtype"] = torch.float16
     cfg, x, _, _, ids, scores, weights = _inputs(activation, **args)

@@ -233,7 +233,7 @@ def execute(inputs, config, tactic):
     group_size, stages, tile_k = tactic[1:4]
     weight_first = len(tactic) == 5
     if weight_first:
-        from ....api import ReLU2, SiTU, SwiGLU
+        from ....api import GeGLU, ReLU2, SiTU, SwiGLU
 
         if fp8:
             if (
@@ -256,11 +256,11 @@ def execute(inputs, config, tactic):
             or (x.shape[0], x.shape[1], mid.shape[1], ids.shape[1])
             != (8, 2048, 512, 10)
             or output.dtype != x.dtype
-            or config.activation != SwiGLU()
+            or config.activation not in (SwiGLU(), GeGLU(), ReLU2())
             or not config.finalize.do_finalize
         ):
             raise ValueError(
-                "Weight-first grouped decode requires dense BF16/FP16 SwiGLU, "
+                "Weight-first grouped decode requires dense BF16/FP16 SwiGLU/GeGLU/ReLU2, "
                 "T8/H2048/I512/top-k10, matching output dtype and finalization"
             )
     finalize = config.finalize.do_finalize
