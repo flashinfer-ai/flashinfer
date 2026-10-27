@@ -186,6 +186,30 @@ def test_ranked_shortlist_cached_before_mode_is_reranked(fake_profile, default_m
     assert not fake_profile
 
 
+class SplitDefault(SplitRunner):
+    """Its untuned default splits the reduction (e.g. SM107 warp split-K)."""
+
+    def is_batch_invariant_tactic(self, tactic):
+        return tactic not in (-1, 1)
+
+
+def test_untuned_call_uses_first_invariant_fallback_runner(default_mode):
+    tuner = reset_autotuner()
+    split, plain = SplitDefault(), SplitRunner()
+    inputs = _inputs()
+    config = TuningConfig()
+    assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (split, -1)
+    set_autotune_batch_invariant(True)
+    assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (plain, -1)
+    with autotune(tune_mode=False, skip_ops={"bi_fb"}):
+        assert tuner.choose_one("bi_fb", [split, plain], config, inputs) == (
+            plain,
+            -1,
+        )
+    with pytest.raises(RuntimeError, match="batch-invariant fallback"):
+        tuner.choose_one("bi_fb", [split], config, inputs)
+
+
 # --- autotune_v2 integration: managed cache, replay coverage, default race ---
 
 

@@ -2068,6 +2068,35 @@ class AutoTuner:
             )
         return False
 
+    @staticmethod
+    def _fallback_runner_index(runners: list[TunableRunner]) -> int | None:
+        """Index of the runner whose tactic -1 serves an untuned call.
+
+        ``0`` unless batch-invariant autotuning is enabled and ``runners[0]``
+        does not report its fallback as batch-invariant; then the first runner
+        whose fallback is, or ``None`` if there is none.
+        """
+        if not _batch_invariant:
+            return 0
+        return next(
+            (i for i, r in enumerate(runners) if r.is_batch_invariant_tactic(-1)),
+            None,
+        )
+
+    def _fallback(
+        self, custom_op: str, runners: list[TunableRunner]
+    ) -> tuple[TunableRunner, int]:
+        """The ``(runner, -1)`` pair ``choose_one`` returns without a tuned tactic."""
+        index = self._fallback_runner_index(runners)
+        if index is None:
+            raise RuntimeError(
+                f"Batch-invariant autotuning is enabled but no runner for "
+                f"{custom_op} has a batch-invariant fallback tactic "
+                f"(runners={[type(r).__name__ for r in runners]}); tune this "
+                f"shape or disable set_autotune_batch_invariant"
+            )
+        return runners[index], -1
+
     def _filter_candidates(
         self, custom_op: str, runner: TunableRunner, tactics: list[Any]
     ) -> list[Any]:
@@ -2510,7 +2539,13 @@ class AutoTuner:
                     status="miss",
                     source="fallback",
                     requested_policy=requested_policy,
-                    runner=type(runners[0]).__name__ if runners else None,
+                    runner=(
+                        type(
+                            runners[self._fallback_runner_index(runners) or 0]
+                        ).__name__
+                        if runners
+                        else None
+                    ),
                     tactic=-1,
                     reasons=reasons,
                 )
@@ -2698,7 +2733,9 @@ class AutoTuner:
             The method profiles different implementations and tactics to find the
             optimal combination based on performance measurements. It caches results
             to avoid redundant profiling of the same configuration.
-            Although runners[0] with tactic=-1 is always treated as the fallback runner.
+            Although runners[0] with tactic=-1 is always treated as the fallback runner
+            (under batch-invariant autotuning, the first runner whose tactic=-1 is
+            batch-invariant).
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
         # Hold the lock for the entire method.  In non-tuning mode this is a
@@ -2739,11 +2776,13 @@ class AutoTuner:
                         self._winner_cache_identity(),
                         status="skipped",
                         source="skip_ops",
-                        runner=type(runners[0]).__name__,
+                        runner=type(
+                            runners[self._fallback_runner_index(runners) or 0]
+                        ).__name__,
                         tactic=-1,
                         reasons=("skip_ops",),
                     )
-            return runners[0], -1
+            return self._fallback(custom_op, runners)
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
@@ -2774,6 +2813,8 @@ class AutoTuner:
                     custom_op, runners, input_shapes, tuning_config, inputs=inputs
                 )
                 runner = runners[runner_id]
+                if not is_cache_hit:
+                    runner, tactic = self._fallback(custom_op, runners)
                 # TODO: check the stored runner and tactic can implement this shape here
                 # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
 
@@ -2829,7 +2870,7 @@ class AutoTuner:
                             logger.warning(
                                 f"[AutoTuner]: No tuned config covers "
                                 f"{custom_op} input_shapes={input_shapes}; "
-                                f"falling back to runner={runners[0].__class__.__name__} "
+                                f"falling back to runner={runner.__class__.__name__} "
                                 f"tactic=-1.  This shape is outside the tuning "
                                 f"bucket range -- expand tuning_buckets / "
                                 f"max_num_tokens during the next tuning "
@@ -2968,7 +3009,7 @@ class AutoTuner:
                             logger.warning(
                                 "[Autotuner]: OOM detected, falling back to default tactic"
                             )
-                            return runners[0], -1
+                            return self._fallback(custom_op, runners)
 
                         assert tensors is not None
                         assert prepared_input_batches is not None
@@ -3037,7 +3078,7 @@ class AutoTuner:
                                 logger.warning(
                                     "[Autotuner]: OOM detected, falling back to default tactic"
                                 )
-                                return runners[0], -1
+                                return self._fallback(custom_op, runners)
 
                             try:
                                 runner_arg_names = runner_arg_names_map[r]
@@ -3079,7 +3120,7 @@ class AutoTuner:
                                 logger.warning(
                                     "[Autotuner]: OOM detected, falling back to default tactic"
                                 )
-                                return runners[0], -1
+                                return self._fallback(custom_op, runners)
 
                             for tac in valid_tactics:
                                 try:
@@ -3204,7 +3245,7 @@ class AutoTuner:
                     logger.warning(
                         "[Autotuner]: OOM detected, falling back to default tactic"
                     )
-                    return runners[0], -1
+                    return self._fallback(custom_op, runners)
 
                 if pbar is not None:
                     pbar.update(1)
@@ -3214,7 +3255,7 @@ class AutoTuner:
 
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
-            _, runner_id, tactic, _ = self.search_cache(
+            is_cache_hit, runner_id, tactic, _ = self.search_cache(
                 custom_op,
                 runners,
                 input_shapes,
@@ -3222,7 +3263,8 @@ class AutoTuner:
                 inputs=inputs,
                 require_profiling_policy=True,
             )
-
+            if not is_cache_hit:
+                return self._fallback(custom_op, runners)
             return runners[runner_id], tactic
 
     def _discard_profile_cache(
