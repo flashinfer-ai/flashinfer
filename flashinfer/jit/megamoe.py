@@ -302,7 +302,7 @@ def gen_megamoe_sm90_layout_module() -> JitSpec:
     )
 
 
-def gen_megamoe_sm90_mxfp4_module(
+def get_megamoe_sm90_mxfp4_uri(
     plan,
     num_sms,
     num_ranks,
@@ -313,8 +313,10 @@ def gen_megamoe_sm90_mxfp4_module(
     intermediate_hidden,
     activation_clamp,
     fast_math,
-) -> JitSpec:
-    # Include every compile-time policy in the key, including rank width.
+    in_kernel_weight_copy: bool = False,
+) -> str:
+    # Include every compile-time policy in the key, including rank width and
+    # the in-kernel weight copy of a replica plan.
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -327,6 +329,35 @@ def gen_megamoe_sm90_mxfp4_module(
         fast_math,
         num_ranks=num_ranks,
     ).replace("nvfp4", "mxfp4")
+    return uri + ("_eplbcopy" if in_kernel_weight_copy else "")
+
+
+def gen_megamoe_sm90_mxfp4_module(
+    plan,
+    num_sms,
+    num_ranks,
+    num_max_tokens_per_rank,
+    num_experts,
+    num_topk,
+    hidden,
+    intermediate_hidden,
+    activation_clamp,
+    fast_math,
+    in_kernel_weight_copy: bool = False,
+) -> JitSpec:
+    uri = get_megamoe_sm90_mxfp4_uri(
+        plan,
+        num_sms,
+        num_ranks,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        activation_clamp,
+        fast_math,
+        in_kernel_weight_copy,
+    )
     return _gen_fp4_module(
         uri,
         "megamoe_sm90_mxfp4_config",
@@ -342,6 +373,30 @@ def gen_megamoe_sm90_mxfp4_module(
             intermediate_hidden=intermediate_hidden,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
+            in_kernel_weight_copy=in_kernel_weight_copy,
         ),
         fast_math,
+    )
+
+
+def get_megamoe_sm90_eplb_uri(num_ranks, num_experts, num_redundant_slots) -> str:
+    return f"megamoe_sm90_eplb_r{num_ranks}_e{num_experts}_s{num_redundant_slots}"
+
+
+def gen_megamoe_sm90_eplb_module(
+    num_ranks, num_experts, num_redundant_slots
+) -> JitSpec:
+    """Replica-plan kernels of the MXFP4 fused kernel: the logical-to-physical
+    remap of the top-k ids and the separate weight copy of the changed redundant
+    expert slots. One module per slot geometry."""
+    return _gen_fp4_module(
+        get_megamoe_sm90_eplb_uri(num_ranks, num_experts, num_redundant_slots),
+        "megamoe_sm90_eplb_config",
+        ("megamoe_sm90_eplb.cu",),
+        dict(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_redundant_slots=num_redundant_slots,
+        ),
+        False,
     )

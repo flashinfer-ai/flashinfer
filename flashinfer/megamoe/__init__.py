@@ -16,6 +16,22 @@ Usage::
     # Every step: stage FP8 activations and routing, then run.
     buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
     nvfp4_mega_moe(y, w1, w2, buf, l1_global_scales=g1, l2_global_scales=g2)
+
+MXFP4 with redundant expert slots (``MegaMoEExpertSlots``): the buffer is sized
+for the physical slots, the weights live in the slots' symmetric arena, the
+logical routing is remapped onto the slots before the kernel runs, and the
+kernel copies the slots whose expert changed from their resident ranks::
+
+    buf = MegaMoESymmBuffer(group, num_experts=256 + 8 * 4, ...)
+    slots = MegaMoEExpertSlots(buf, num_experts=256, num_redundant_slots=4)
+    slots.set_resident_weights(w1, w2, g1, g2)
+    slots.set_replica_plan(slot_expert, copies, expert_base)
+    buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
+    slots.remap(num_tokens)
+    mxfp4_mega_moe(y, slots.l1_weights, slots.l2_weights, buf,
+                   l1_global_scales=slots.l1_global_scales,
+                   l2_global_scales=slots.l2_global_scales,
+                   expert_slots=slots)
 """
 
 import dataclasses
@@ -31,6 +47,8 @@ from ..jit.megamoe import (
     gen_megamoe_sm90_nvfp4_split_module,
     gen_megamoe_sm90_nvfp4_split_plan_module,
 )
+from ._jit import _get_jit_module
+from .eplb import MegaMoEExpertSlots
 from .heuristics import (
     CANDIDATE_BLOCK_M,
     FusedPlan,
@@ -47,6 +65,7 @@ from .weights import (
 
 __all__ = [
     "MegaMoESymmBuffer",
+    "MegaMoEExpertSlots",
     "nvfp4_mega_moe",
     "mxfp4_mega_moe",
     "transform_nvfp4_weights_for_mega_moe",
@@ -58,11 +77,6 @@ __all__ = [
     "select_split_plan",
     "FAMILY_THRESHOLD",
 ]
-
-
-@functools.cache
-def _get_jit_module(factory, *args):
-    return factory(*args).build_and_load()
 
 
 def _jit_args(factory, plan, b):
@@ -84,8 +98,22 @@ def _jit_args(factory, plan, b):
     return args
 
 
-def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
-    module = _get_jit_module(factory, *_jit_args(factory, plan, b))
+def _run_kernel(
+    factory,
+    entry,
+    plan,
+    y,
+    w1,
+    w2,
+    b,
+    m,
+    stats,
+    gs1,
+    gs2,
+    extra_jit_args=(),
+    extra_kernel_args=(),
+):
+    module = _get_jit_module(factory, *_jit_args(factory, plan, b), *extra_jit_args)
     getattr(module, entry)(
         y,
         b.buffer,
@@ -98,6 +126,7 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
         stats,
         gs1,
         gs2,
+        *extra_kernel_args,
     )
     return y
 
@@ -544,6 +573,7 @@ def mxfp4_mega_moe(
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
+    expert_slots: Optional[MegaMoEExpertSlots] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -566,6 +596,12 @@ def mxfp4_mega_moe(
         accumulated in place; initialize the vector before first use.
     l1_global_scales, l2_global_scales : torch.Tensor, optional
         FP32 vectors with one multiplier per local expert. Omitted scales use 1.
+    expert_slots : MegaMoEExpertSlots, optional
+        Redundant expert slots of this buffer. The kernel then copies the slots
+        listed in the slots' workspace (:meth:`MegaMoEExpertSlots.set_replica_plan`)
+        from their resident ranks while it computes, and the weights and global
+        scales must be the slots' arena views. The routing staged in the buffer
+        must already be physical (:meth:`MegaMoEExpertSlots.remap`).
 
     Returns
     -------
@@ -601,9 +637,19 @@ def mxfp4_mega_moe(
         b.num_max_tokens_per_rank,
         m,
     )
+    entry = "megamoe_sm90_mxfp4_fused"
+    extra_jit_args: Tuple[Any, ...] = ()
+    extra_kernel_args: Tuple[Any, ...] = ()
+    if expert_slots is not None:
+        expert_slots._check_kernel_operands(
+            b, l1_weights, l2_weights, l1_global_scales, l2_global_scales
+        )
+        entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
+        extra_jit_args = (True,)
+        extra_kernel_args = expert_slots._in_kernel_copy_args()
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
-        "megamoe_sm90_mxfp4_fused",
+        entry,
         plan,
         y,
         l1_weights,
@@ -613,6 +659,8 @@ def mxfp4_mega_moe(
         cumulative_local_expert_recv_stats,
         l1_global_scales,
         l2_global_scales,
+        extra_jit_args=extra_jit_args,
+        extra_kernel_args=extra_kernel_args,
     )
 
 
