@@ -1111,7 +1111,7 @@ def test_select_program_narrow_pair_policy():
         and c.sample_tiles_max == 8
         and c.key_bits == 13
     )
-    assert c.workspace_bytes == 148 * 6 * 8192 * 8
+    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + 128
     # one causal 64k document: the CTA-pair three-warpgroup program
     c = _select(p, 65536, 65536)
     assert c.scan_key == "scan:pair_l6:u1:s0:f1" and c.pair and c.grid_ctas == 148
@@ -1128,7 +1128,7 @@ def test_select_program_narrow_pair_policy():
     )
     assert c.scan_key == "scan:split_narrow:u1:s0:f0" and c.merge_key == MERGE_KEY
     assert c.cand_cap_multiplier == 8 and c.cand_cap == 16384 and c.check_period == 32
-    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8
+    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + 128
     assert (
         c.keys == ("scan:split_narrow:u1:s0:f0", "merge", "finalize:t256")
         and c.rank_window is None
@@ -1276,7 +1276,7 @@ def test_wide_first_precedence_and_pair_units_guard():
     c = _select(first, 131072, 131072)
     assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
     assert c.grid_ctas == 148 and c.cand_cap == 16384
-    assert c.workspace_bytes == 148 * 8 * 16384 * 8
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + 128
     # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
     assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
     # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
@@ -2634,6 +2634,7 @@ def test_workspace_bound_is_respected():
     assert (
         nbytes
         == (plan.grid_ctas * plan.block_q * plan.cand_cap + plan.staging_entries) * 8
+        + 128
     )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     indices = torch.empty(
