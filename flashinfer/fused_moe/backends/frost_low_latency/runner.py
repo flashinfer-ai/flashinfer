@@ -230,7 +230,7 @@ class FrostLowLatencyRunner(MoERunner):
             "fp8-grouped-tc-v4"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
-            else "block-fp8-grouped-tc-v2"
+            else "block-fp8-grouped-tc-v3"
             if self.config.quant.weight is QuantFormat.DeepSeekFp8
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
@@ -386,9 +386,11 @@ class FrostLowLatencyRunner(MoERunner):
                         tactics.append(("warp_mma", 4, 4, 128))
                         tactics.append(("warp_mma", 2, 2, 128, True))
                     elif self.config.activation in (ReLU2(), SiLU()):
-                        # Preserve gather-first and FMA. Shared-route block
-                        # FP8 benefits here, but T8 SwiGLU regresses.
-                        tactics.append(("warp_mma", 4, 2, 128, True))
+                        # Group 2 also benefits partially shared routes. Keep
+                        # gather-first and FMA for cache/reuse-dependent wins.
+                        tactics += [
+                            ("warp_mma", group, 2, 128, True) for group in (2, 4)
+                        ]
             if (
                 capability in ((8, 0), (9, 0), (12, 0))
                 and self.config.quant.weight in (QuantFormat.BF16, QuantFormat.FP16)

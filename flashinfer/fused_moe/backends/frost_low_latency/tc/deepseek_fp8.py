@@ -119,13 +119,13 @@ def execute(inputs, config, tactic):
             or (
                 x.shape[0] == 8
                 and config.activation in (ReLU2(), SiLU())
-                and tactic[1] == 4
+                and tactic[1] in (2, 4)
             )
         )
     ):
         raise ValueError(
             "Weight-first block-FP8 decode requires qualified SM120 T4 SwiGLU/group2 "
-            "or T8 ReLU2/SiLU/group4, H2048/I512/top-k10 and finalized BF16 output"
+            "or T8 ReLU2/SiLU/group2/4, H2048/I512/top-k10 and finalized BF16 output"
         )
     if (
         not config.finalize.do_finalize

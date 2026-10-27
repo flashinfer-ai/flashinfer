@@ -1734,7 +1734,11 @@ with their different scaling and intermediate-rounding contracts explicit.
 
 SM90 candidates use group2/4, four stages and K128 for SwiGLU; ReLU2/SiLU use
 group2. SM120 uses group2/4, two stages and K128, with an additional group4,
-four-stage T4 SwiGLU choice. Compiled executables cache immutable metadata only;
+four-stage T4 SwiGLU choice. SM120 additionally offers weight-first scheduling
+for T4 SwiGLU/group2 and T8 ReLU2/SiLU/group2/4. The smaller group can benefit
+partial expert reuse; the original schedule and all FMA candidates remain
+available. Both projections use the selected schedule, with no numerical change.
+Compiled executables cache immutable metadata only;
 input pointers, scales, route values, scratch and streams are bound per call.
 
 The full-call reproducer now supports SM90 CUTLASS block-FP8 and SM120 native FP8,

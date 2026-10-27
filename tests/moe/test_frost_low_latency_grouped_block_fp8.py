@@ -196,7 +196,10 @@ def test_grouped_block_fp8_admitted_candidates(tokens, activation, prequantized)
         + ([("warp_mma", 4, 4, 128)] if tokens == 4 else [])
     )
     if not hopper and (tokens == 4 or activation in (ReLU2(), SiLU())):
-        expected.append(("warp_mma", 2 if tokens == 4 else 4, 2, 128, True))
+        expected += [
+            ("warp_mma", group, 2, 128, True)
+            for group in ((2,) if tokens == 4 else (2, 4))
+        ]
     assert [v for v in choices if v[0] != "ffma"] == expected
     graphs = []
     for tactic in expected:
@@ -262,7 +265,14 @@ def test_grouped_block_fp8_unmeasured_cases_keep_fma(case):
 
 
 @pytest.mark.parametrize(
-    "tokens,activation,group", [(4, SwiGLU(), 2), (8, ReLU2(), 4), (8, SiLU(), 4)]
+    "tokens,activation,group",
+    [
+        (4, SwiGLU(), 2),
+        (8, ReLU2(), 2),
+        (8, ReLU2(), 4),
+        (8, SiLU(), 2),
+        (8, SiLU(), 4),
+    ],
 )
 @pytest.mark.parametrize("prequantized", [False, True])
 def test_sm120_block_fp8_weight_first_cache_and_live_graphs(
@@ -295,7 +305,7 @@ def test_sm120_block_fp8_weight_first_cache_and_live_graphs(
     runner, inputs, _ = cases[0]
     choices = runner.get_valid_tactics(inputs, None)
     assert old in choices and overlap in choices
-    assert "block-fp8-grouped-tc-v2" in runner._cache_key_extras()
+    assert "block-fp8-grouped-tc-v3" in runner._cache_key_extras()
     a = runner.forward(inputs, old).clone()
     b = runner.forward(inputs, overlap).clone()
     torch.testing.assert_close(a, b, rtol=0, atol=0)
