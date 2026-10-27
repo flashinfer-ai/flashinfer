@@ -606,10 +606,7 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         and all(sum(lens) <= limit for lens in units)
     ):
         tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
-        if (
-            _delivered(SHORT_EPI_RECORD, arch)
-            and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS
-        ):
+        if _delivered(SHORT_EPI_RECORD, arch) and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS:
             return SHORT_EPI_RECORD
         return SHORT_RECORD
     return "decode"
