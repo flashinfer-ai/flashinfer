@@ -21,8 +21,9 @@ names follow ``trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k > 0)``:
 offset`` of the caller's paged cache) with ``-1`` marking an empty slot
 anywhere in the row.
 
-:func:`prims_ts_dsa_sparse_mla_fp8` reads an E4M3 ``[.., 576]`` cache with a
-1CTA kernel (64 query rows = the 64 heads of one token per CTA, one CTA per
+:func:`prims_ts_dsa_sparse_mla` is the single entry point; the KV-cache format
+is selected by ``kv_cache.dtype`` (currently an E4M3 ``[.., 576]`` cache).  It
+runs a 1CTA kernel (64 query rows = the 64 heads of one token per CTA, one CTA per
 token).  It requires SM100 / SM103.  The kernel trusts the routing values it
 is given: the active ``block_tables`` entries (the first
 ``sparse_mla_top_k_lens[t]`` of row ``t``) must be ``-1`` or in ``[0, N)`` for an
@@ -42,7 +43,7 @@ from typing import Optional
 import torch
 
 from flashinfer.api_logging import flashinfer_experimental_api
-from flashinfer.trace.templates.attention import prims_ts_dsa_sparse_mla_fp8_trace
+from flashinfer.trace.templates.attention import prims_ts_dsa_sparse_mla_trace
 
 from .kernels.mla_decode.helpers.math import (
     canonicalize_softmax_rescale_threshold_log2,
@@ -56,6 +57,8 @@ from .kernels.mla_decode.throughput_latency_1cta.token_sparse_launch import (
 )
 
 _SUPPORTED_HEADS = (64, 128)
+# KV-cache formats served by ``prims_ts_dsa_sparse_mla`` (dispatched on dtype).
+_SUPPORTED_KV_DTYPES = (torch.float8_e4m3fn,)
 
 
 # Split-KV: below this many CTAs (query tokens x 64-head groups) most SMs would idle,
@@ -311,8 +314,8 @@ def _validate_route_values(
             )
 
 
-@flashinfer_experimental_api(trace=prims_ts_dsa_sparse_mla_fp8_trace)
-def prims_ts_dsa_sparse_mla_fp8(
+@flashinfer_experimental_api(trace=prims_ts_dsa_sparse_mla_trace)
+def prims_ts_dsa_sparse_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     block_tables: torch.Tensor,
@@ -328,7 +331,10 @@ def prims_ts_dsa_sparse_mla_fp8(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""DSA sparse MLA decode with an E4M3 ``[.., 576]`` KV cache (PrimTS 1CTA, 64 rows per CTA).
+    r"""DSA sparse MLA decode over token-level routes (PrimTS 1CTA, 64 rows per CTA).
+
+    One entry for every KV-cache format; the format is selected by
+    ``kv_cache.dtype``.  Supported today: E4M3 (``torch.float8_e4m3fn``).
 
     Parameters
     ----------
@@ -373,6 +379,39 @@ def prims_ts_dsa_sparse_mla_fp8(
         out=out,
         lse=lse,
     )
+    if kv_cache.dtype == torch.float8_e4m3fn:
+        return _run_e4m3(
+            query,
+            kv_cache,
+            block_tables,
+            top_k_lens,
+            out,
+            lse,
+            sparse_mla_top_k=sparse_mla_top_k,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            skip_corr_threshold=skip_corr_threshold,
+        )
+    raise ValueError(
+        f"kv_cache dtype {kv_cache.dtype} is not supported; supported: "
+        f"{', '.join(str(d) for d in _SUPPORTED_KV_DTYPES)}"
+    )
+
+
+def _run_e4m3(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    top_k_lens: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    sparse_mla_top_k: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    skip_corr_threshold: float,
+) -> torch.Tensor:
+    """E4M3 ``[.., 576]`` cache: validate the cache and launch the 1CTA kernel."""
     _require(
         kv_cache.is_cuda
         and kv_cache.dtype == torch.float8_e4m3fn
@@ -430,4 +469,4 @@ def prims_ts_dsa_sparse_mla_fp8(
     return out
 
 
-__all__ = ["prims_ts_dsa_sparse_mla_fp8"]
+__all__ = ["prims_ts_dsa_sparse_mla"]

@@ -86,7 +86,7 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
-prims_ts_dsa_sparse_mla_fp8_h64_d576_k256.json
+prims_ts_dsa_sparse_mla_h64_d576_k256.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_native_sf1d_N256_K1024_K_packed512_block_size16_SF_dim_016384.json
@@ -3226,7 +3226,7 @@ finally:
 # E4M3 row cache (SM100/SM103 only).
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts import (
-        prims_ts_dsa_sparse_mla_fp8 as _dsa_sparse_mla_fp8,
+        prims_ts_dsa_sparse_mla as _dsa_sparse_mla,
     )
 
     _dsa_T, _dsa_H, _dsa_K, _dsa_N = 2, 64, 256, 600
@@ -3236,7 +3236,7 @@ with contextlib.suppress(Exception):
     _dsa_tables = torch.stack(
         [torch.randperm(_dsa_N, device=device)[:_dsa_K] for _ in range(_dsa_T)]
     ).to(torch.int32)
-    _dsa_sparse_mla_fp8(
+    _dsa_sparse_mla(
         _dsa_q,
         _dsa_pool,
         _dsa_tables,

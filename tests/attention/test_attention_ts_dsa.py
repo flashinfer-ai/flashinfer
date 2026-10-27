@@ -31,7 +31,7 @@ cutlass = pytest.importorskip("cutlass", minversion="4.7.0")
 
 from flashinfer.attention.prims_ts import (
     dsa as dsa_module,
-    prims_ts_dsa_sparse_mla_fp8,
+    prims_ts_dsa_sparse_mla,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.token_sparse_launch import (
     compile_dsa_sparse_kernel,
@@ -172,7 +172,7 @@ def _check_against(
 
 
 def _run_fp8(fx: Fixture, *, skip_corr_threshold: float = 0.0, **kwargs):
-    return prims_ts_dsa_sparse_mla_fp8(
+    return prims_ts_dsa_sparse_mla(
         fx.query,
         fx.fp8_pool,
         fx.block_tables,
@@ -438,7 +438,7 @@ _INVALID_MATCH = {
     "out-dtype": "out must be contiguous BF16",
     "out-shape": "out must be contiguous BF16",
     "lse-shape": "lse must be contiguous FP32",
-    "cache-dtype": "kv_cache must be a contiguous CUDA E4M3 tensor",
+    "cache-dtype": "kv_cache dtype .* is not supported",
     "cache-row": "kv_cache must be a contiguous CUDA E4M3 tensor",
     "cache-misaligned": "kv_cache must start at a 16-byte-aligned address",
 }
@@ -456,7 +456,7 @@ def test_prims_ts_dsa_rejects_invalid_arguments(name: str, mutate) -> None:
     args = _valid_args(device)
     mutate(args, device)
     with pytest.raises(ValueError, match=_INVALID_MATCH[name]):
-        prims_ts_dsa_sparse_mla_fp8(**args)
+        prims_ts_dsa_sparse_mla(**args)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -467,7 +467,7 @@ def test_prims_ts_dsa_zero_tokens() -> None:
     args = _valid_args(device)
     args["query"] = args["query"][:0]
     args["block_tables"] = args["block_tables"][:0]
-    out = prims_ts_dsa_sparse_mla_fp8(**args)
+    out = prims_ts_dsa_sparse_mla(**args)
     assert tuple(out.shape) == (0, 64, _V_DIM) and out.dtype == torch.bfloat16
 
 
@@ -571,7 +571,7 @@ def test_prims_ts_dsa_paged_cache_layout(shape) -> None:
     device = torch.device("cuda")
     fx = build_fixture(Case("paged", total_q=4, ragged=True, neg=0.1), device)
     flat = _run_fp8(fx).clone()
-    paged = prims_ts_dsa_sparse_mla_fp8(
+    paged = prims_ts_dsa_sparse_mla(
         fx.query,
         fx.fp8_pool.view(*shape),
         fx.block_tables,

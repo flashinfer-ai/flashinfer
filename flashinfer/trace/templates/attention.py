@@ -6299,9 +6299,9 @@ _DSA_SPARSE_MLA_CONSTRAINTS = [
     "sparse_mla_top_k % 4 == 0",
 ]
 
-prims_ts_dsa_sparse_mla_fp8_trace = TraceTemplate(
+prims_ts_dsa_sparse_mla_trace = TraceTemplate(
     op_type="mla_sparse",
-    name_prefix="prims_ts_dsa_sparse_mla_fp8",
+    name_prefix="prims_ts_dsa_sparse_mla",
     description=(
         "PrimTS 1CTA DSA sparse MLA decode: packed E4M3 queries attend to the "
         "top-k rows of a flat E4M3 [N, 576] KV pool selected per query token; "

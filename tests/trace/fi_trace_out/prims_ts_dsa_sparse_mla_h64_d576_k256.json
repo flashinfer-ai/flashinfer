@@ -1,9 +1,9 @@
 {
-  "name": "prims_ts_dsa_sparse_mla_fp8_h64_d576_k256",
+  "name": "prims_ts_dsa_sparse_mla_h64_d576_k256",
   "description": "PrimTS 1CTA DSA sparse MLA decode: packed E4M3 queries attend to the top-k rows of a flat E4M3 [N, 576] KV pool selected per query token; BF16 output.",
   "op_type": "mla_sparse",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.dsa.prims_ts_dsa_sparse_mla_fp8",
+    "fi_api:flashinfer.attention.prims_ts.dsa.prims_ts_dsa_sparse_mla",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental",

@@ -53,7 +53,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
-| DSA sparse MLA (GLM-5.3 / DeepSeek-V3.2 token routing, 1CTA) | [below](#dsa-sparse-mla) | `prims_ts_dsa_sparse_mla_fp8` |
+| DSA sparse MLA (GLM-5.3 / DeepSeek-V3.2 token routing, 1CTA) | [below](#dsa-sparse-mla) | `prims_ts_dsa_sparse_mla` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
@@ -106,8 +106,9 @@ graph.replay()
 
 ### DSA sparse MLA
 
-`prims_ts_dsa_sparse_mla_fp8` runs GLM-5.3 / DeepSeek-V3.2 decode over
-token-level routing: every packed E4M3 query token (`[T, H, 576]`, H in
+`prims_ts_dsa_sparse_mla` is the single DSA entry; the KV-cache format is
+selected by `kv_cache.dtype` (E4M3 today).  It runs GLM-5.3 / DeepSeek-V3.2
+decode over token-level routing: every packed E4M3 query token (`[T, H, 576]`, H in
 {64, 128}) attends to the `sparse_mla_top_k` rows of an E4M3 `[.., 576]` KV
 cache its indexer selected, given as flat row indices in `block_tables`
 (`[T, top_k]` INT32, `-1` = empty slot anywhere in the row;

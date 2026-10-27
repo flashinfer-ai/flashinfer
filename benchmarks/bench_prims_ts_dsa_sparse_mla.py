@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_helpers import dsa_sparse_mla_reference as ref  # noqa: E402
 
 import flashinfer  # noqa: E402
-from flashinfer.attention.prims_ts import prims_ts_dsa_sparse_mla_fp8  # noqa: E402
+from flashinfer.attention.prims_ts import prims_ts_dsa_sparse_mla  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 HEAD_DIM, V_DIM = 576, 512
@@ -170,7 +170,7 @@ def main() -> None:
     )
 
     def run_ours(q, idx, lens, out, top_k):
-        prims_ts_dsa_sparse_mla_fp8(
+        prims_ts_dsa_sparse_mla(
             q,
             kv,
             idx,
