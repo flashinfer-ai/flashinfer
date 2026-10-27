@@ -354,6 +354,7 @@ def _moe_core_impl(
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
     gemm1_use_clc_scheduler: Optional[bool] = None,
+    gemm2_use_clc_scheduler: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -910,6 +911,7 @@ def _moe_core_impl(
             enable_pdl=enable_pdl,
             use_fused_finalize=use_fused_finalize,
             k_steps=gemm2_k_steps,
+            use_clc_scheduler=gemm2_use_clc_scheduler,
         )
 
     # Step 4: Deterministic routing-weight reduction
@@ -1238,6 +1240,7 @@ class CuteDslMoEWrapper:
         gemm1_k_steps: Optional[int] = None,
         gemm2_k_steps: Optional[int] = None,
         gemm1_use_clc_scheduler: Optional[bool] = None,
+        gemm2_use_clc_scheduler: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1288,6 +1291,7 @@ class CuteDslMoEWrapper:
             gemm1_k_steps=gemm1_k_steps,
             gemm2_k_steps=gemm2_k_steps,
             gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
+            gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1550,6 +1554,7 @@ def _cute_dsl_fused_moe_impl(
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
     gemm1_use_clc_scheduler: Optional[bool] = None,
+    gemm2_use_clc_scheduler: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1598,6 +1603,7 @@ def _cute_dsl_fused_moe_impl(
         gemm1_k_steps=gemm1_k_steps,
         gemm2_k_steps=gemm2_k_steps,
         gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
+        gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
     )
 
 

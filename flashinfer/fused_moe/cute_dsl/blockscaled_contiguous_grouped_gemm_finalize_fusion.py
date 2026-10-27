@@ -776,8 +776,9 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion_impl(
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
     k_steps: Optional[int] = None,
+    use_clc_scheduler: bool = False,
 ) -> torch.Tensor:
-    """Shared preparation and validation with an internal K-depth override."""
+    """Shared preparation with internal reduction-depth and scheduler controls."""
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
@@ -988,7 +989,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion_impl(
             prefetch_weights_before_wait=enable_pdl,
             weight_scale_cache_policy="evict_first",
             activation_cache_policy="evict_last",
-            use_clc_scheduler=False,
+            use_clc_scheduler=use_clc_scheduler,
             num_tile_info_stages=1,
             sm_count=sm_count,
         )

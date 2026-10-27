@@ -27,8 +27,9 @@ Tactic format follows TRT-LLM's style and is architecture-dependent:
 
 Internal MoE tactic/cache entries wrap both sub-tactics as
 (route_tile, gemm1, gemm2). Blackwell tuning adds a fourth field containing
-independent K-step depths for the two phases. Legacy three-field entries
-keep automatic depth.
+independent K-step depths for the two phases, followed by independent FC1/FC2
+scheduler booleans. Legacy three-field entries keep automatic depth; entries
+without the sixth field retain static FC2 scheduling.
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 """
@@ -106,14 +107,14 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 
 
 def get_blackwell_moe_valid_tactics() -> List[Tuple]:
-    """Pair geometry and reduction depths with the FC1 scheduling choice."""
+    """Pair geometry and reduction depths with independent phase schedulers."""
     return [
-        (route_tile, gemm1, gemm2, k_steps, use_clc_scheduler)
+        (route_tile, gemm1, gemm2, k_steps, fc1_use_clc, fc2_use_clc)
         for route_tile in BLACKWELL_ROUTE_TILES
         for gemm1 in get_blackwell_gemm1_valid_tactics(route_tile)
         for gemm2 in get_blackwell_gemm2_valid_tactics(route_tile)
         for k_steps in itertools.product((4, 8), repeat=2)
-        for use_clc_scheduler in (False, True)
+        for fc1_use_clc, fc2_use_clc in itertools.product((False, True), repeat=2)
     ]
 
 
@@ -314,9 +315,9 @@ def canonicalize_w4a8_tactic(tactic: Any) -> Tuple:
 
 def _split_moe_tactic(tactic: Tuple) -> Tuple:
     """Keep legacy/Rubin geometry distinct from Blackwell tuning controls."""
-    if not isinstance(tactic, (tuple, list)) or len(tactic) not in (3, 4, 5):
+    if not isinstance(tactic, (tuple, list)) or len(tactic) not in (3, 4, 5, 6):
         raise ValueError(
-            "tactic must be (tile_size, gemm1, gemm2[, k_steps_pair[, fc1_use_clc]])"
+            "tactic must be (tile_size, gemm1, gemm2[, k_steps_pair[, fc1_use_clc[, fc2_use_clc]]])"
         )
     tile_size, gemm1, gemm2 = tactic[:3]
     if not isinstance(gemm1, (tuple, list)) or not isinstance(gemm2, (tuple, list)):
@@ -338,14 +339,19 @@ def _split_moe_tactic(tactic: Tuple) -> Tuple:
         if any(type(depth) is not int or depth not in (4, 8) for depth in k_steps):
             raise ValueError("Blackwell K-step depths must be 4 or 8")
     if is_rubin:
-        use_clc_scheduler = False
+        fc1_use_clc = False
     else:
-        use_clc_scheduler = True
-    if len(tactic) == 5:
-        use_clc_scheduler = tactic[4]
-        if type(use_clc_scheduler) is not bool:
+        fc1_use_clc = True
+    if len(tactic) >= 5:
+        fc1_use_clc = tactic[4]
+        if type(fc1_use_clc) is not bool:
             raise ValueError("FC1 CLC scheduling choice must be a boolean")
-    return tile_size, gemm1, gemm2, k_steps, is_rubin, use_clc_scheduler
+    fc2_use_clc = False
+    if len(tactic) == 6:
+        fc2_use_clc = tactic[5]
+        if type(fc2_use_clc) is not bool:
+            raise ValueError("FC2 CLC scheduling choice must be a boolean")
+    return tile_size, gemm1, gemm2, k_steps, is_rubin, fc1_use_clc, fc2_use_clc
 
 
 def _is_rubin_tactic(tactic: Tuple) -> bool:
@@ -362,9 +368,15 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
         'gemm1_mma_tiler', 'gemm1_mma_inst_shape', etc. in addition to
         the standard keys.
     """
-    tile_size, gemm1_tactic, gemm2_tactic, k_steps, is_rubin, use_clc_scheduler = (
-        _split_moe_tactic(tactic)
-    )
+    (
+        tile_size,
+        gemm1_tactic,
+        gemm2_tactic,
+        k_steps,
+        is_rubin,
+        fc1_use_clc,
+        fc2_use_clc,
+    ) = _split_moe_tactic(tactic)
 
     if is_rubin:
         (
@@ -383,7 +395,8 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "tile_size": tile_size,
             "gemm1_k_steps": k_steps[0],
             "gemm2_k_steps": k_steps[1],
-            "gemm1_use_clc_scheduler": use_clc_scheduler,
+            "gemm1_use_clc_scheduler": fc1_use_clc,
+            "gemm2_use_clc_scheduler": fc2_use_clc,
             "is_rubin": True,
             "gemm1_mma_tiler_mn": (gemm1_mma_tiler[0], gemm1_mma_tiler[1]),
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
@@ -403,7 +416,8 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             "tile_size": tile_size,
             "gemm1_k_steps": k_steps[0],
             "gemm2_k_steps": k_steps[1],
-            "gemm1_use_clc_scheduler": use_clc_scheduler,
+            "gemm1_use_clc_scheduler": fc1_use_clc,
+            "gemm2_use_clc_scheduler": fc2_use_clc,
             "is_rubin": False,
             "gemm1_mma_tiler_mn": gemm1_mma_tiler_mn,
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
@@ -450,13 +464,14 @@ class CuteDslFusedMoERunner(TunableRunner):
     trying different combinations of GEMM tactics.
 
     Tactic format follows TRT-LLM style:
-        (tile_size, gemm1_tactic, gemm2_tactic[, k_steps_pair[, fc1_use_clc]])
+        (tile_size, gemm1_tactic, gemm2_tactic[, k_steps_pair[, fc1_use_clc[, fc2_use_clc]]])
     where:
         - tile_size: routed-token capacity (16, 32, 64, 128, or 256 on Blackwell)
         - gemm1_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         - k_steps_pair: optional Blackwell (FC1, FC2) depths, each 4 or 8
-        - fc1_use_clc: optional Blackwell scheduler choice; legacy tactics request CLC
+        - fc1_use_clc: optional Blackwell FC1 scheduler; legacy tactics request CLC
+        - fc2_use_clc: optional Blackwell FC2 scheduler; legacy tactics stay static
 
     Input tensor indices (for dynamic_tensor_specs):
         0: x (num_tokens, hidden_size//2) - FP4 packed input
@@ -793,7 +808,7 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         def _tactic_ok(tactic):
             """Return whether both GEMM kernels can run ``tactic`` at this shape."""
-            tile_size, gemm1_tactic, gemm2_tactic, k_steps, is_rubin, _ = (
+            tile_size, gemm1_tactic, gemm2_tactic, k_steps, is_rubin, _, _ = (
                 _split_moe_tactic(tactic)
             )
             permuted_m = get_max_num_permuted_tokens(
@@ -952,7 +967,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                  w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
                  w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
                  moe_output (optional)]
-            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic[, k_steps_pair[, fc1_use_clc]]),
+            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic[, k_steps_pair[, fc1_use_clc[, fc2_use_clc]]]),
                 or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
@@ -1044,6 +1059,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             gemm1_k_steps=params["gemm1_k_steps"],
             gemm2_k_steps=params["gemm2_k_steps"],
             gemm1_use_clc_scheduler=params["gemm1_use_clc_scheduler"],
+            gemm2_use_clc_scheduler=params["gemm2_use_clc_scheduler"],
             **kwargs,
         )
 
@@ -1353,17 +1369,24 @@ def print_all_tactics():
     ]:
         logger.info("%s MoE tactics: %d", label, len(tactics))
         for i, tactic in enumerate(tactics):
-            tile_size, gemm1_tactic, gemm2_tactic, k_steps, _, use_clc_scheduler = (
-                _split_moe_tactic(tactic)
-            )
+            (
+                tile_size,
+                gemm1_tactic,
+                gemm2_tactic,
+                k_steps,
+                _,
+                fc1_use_clc,
+                fc2_use_clc,
+            ) = _split_moe_tactic(tactic)
             logger.info(
-                "  Tactic %d: tile_size=%s, gemm1=%s, gemm2=%s, k_steps=%s, fc1_clc=%s",
+                "  Tactic %d: tile_size=%s, gemm1=%s, gemm2=%s, k_steps=%s, fc1_clc=%s, fc2_clc=%s",
                 i,
                 tile_size,
                 gemm1_tactic,
                 gemm2_tactic,
                 k_steps,
-                use_clc_scheduler,
+                fc1_use_clc,
+                fc2_use_clc,
             )
 
 
