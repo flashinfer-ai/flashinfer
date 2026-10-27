@@ -140,7 +140,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ act_scale, float* __restrict__ w_scale, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, unsigned int* __restrict__ q_out, unsigned int* __restrict__ k_out, unsigned int* __restrict__ v_out, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, uint8_t* __restrict__ v_sf, int M, int num_m_tiles, int total_tiles, float eps, float alpha, float out_scale_q, float out_scale_k, float out_scale_v, float sf_mul_q, float sf_mul_k, float sf_mul_v)
+kernel_cake_minimax_h3_sm120_quant_pre_attention_59b0462e7a98d6fbf9b7(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ act_scale, float* __restrict__ w_scale, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, unsigned int* __restrict__ q_out, unsigned int* __restrict__ k_out, unsigned int* __restrict__ v_out, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, uint8_t* __restrict__ v_sf, int M, int num_m_tiles, int total_tiles, float eps, float alpha, float out_scale_q, float out_scale_k, float out_scale_v, float sf_mul_q, float sf_mul_k, float sf_mul_v)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -214,11 +214,11 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     if (bid + (int)(load_g / 42) * num_bids < total_tiles) {
                         mbarrier_wait_hint(ab_empty_addr + (load_stage) * 8, _phase_ab_empty, 10000000);
                         mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, (((load_g & 1) == 0) ? 29696 : 25600));
-                        tma_2d_gmem2smem(A_stage_addr + load_stage * 16384, (&A), ((int)load_g - (int)(load_g / 42) * 42) * 64, ((bid + (int)(load_g / 42) * num_bids) / 1344 * 8 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8)) * 256, ab_full_addr + (load_stage) * 8);
-                        tma_2d_gmem2smem(B_stage_addr + load_stage * 8192, (&B), ((int)load_g - (int)(load_g / 42) * 42) * 64, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8) * 128, ab_full_addr + (load_stage) * 8);
-                        tma_2d_gmem2smem(SFB_stage_addr + load_stage * 1024, (&SFB), 0, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8) * 168 + ((int)load_g - (int)(load_g / 42) * 42) * 4, ab_full_addr + (load_stage) * 8);
+                        tma_2d_gmem2smem(A_stage_addr + load_stage * 16384, (&A), ((int)load_g - (int)(load_g / 42) * 42) * 64, ((bid + (int)(load_g / 42) * num_bids) / 168 * 1 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1)) * 256, ab_full_addr + (load_stage) * 8);
+                        tma_2d_gmem2smem(B_stage_addr + load_stage * 8192, (&B), ((int)load_g - (int)(load_g / 42) * 42) * 64, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1) * 128, ab_full_addr + (load_stage) * 8);
+                        tma_2d_gmem2smem(SFB_stage_addr + load_stage * 1024, (&SFB), 0, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1) * 168 + ((int)load_g - (int)(load_g / 42) * 42) * 4, ab_full_addr + (load_stage) * 8);
                         if ((load_g & 1) == 0) {
-                            tma_2d_gmem2smem(SFA_pairs_addr + (load_g >> 1 & 1) * 4096, (&SFA), ((int)load_g - (int)(load_g / 42) * 42) * 8, ((bid + (int)(load_g / 42) * num_bids) / 1344 * 8 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8)) * 256, ab_full_addr + (load_stage) * 8);
+                            tma_2d_gmem2smem(SFA_pairs_addr + (load_g >> 1 & 1) * 4096, (&SFA), ((int)load_g - (int)(load_g / 42) * 42) * 8, ((bid + (int)(load_g / 42) * num_bids) / 168 * 1 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1)) * 256, ab_full_addr + (load_stage) * 8);
                         }
                     }
                     load_stage += 1;
@@ -230,8 +230,8 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
             unsigned int _phase_ab_full = 0;
             #pragma unroll 1
             for (int tile = bid; tile < total_tiles; tile += num_bids) {
-                int tile_m = tile / 1344 * 8 + (tile - tile / 1344 * 1344) % ((num_m_tiles - tile / 1344 * 8 < 8) ? num_m_tiles - tile / 1344 * 8 : 8);
-                int tile_n = (tile - tile / 1344 * 1344) / ((num_m_tiles - tile / 1344 * 8 < 8) ? num_m_tiles - tile / 1344 * 8 : 8);
+                int tile_m = tile / 168 * 1 + (tile - tile / 168 * 168) % ((num_m_tiles - tile / 168 * 1 < 1) ? num_m_tiles - tile / 168 * 1 : 1);
+                int tile_n = (tile - tile / 168 * 168) / ((num_m_tiles - tile / 168 * 1 < 1) ? num_m_tiles - tile / 168 * 1 : 1);
                 accum[0] = 0.0f;
                 accum[1] = 0.0f;
                 accum[2] = 0.0f;
@@ -475,11 +475,11 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         if (bid + (int)(load_g / 42) * num_bids < total_tiles) {
                             mbarrier_wait_hint(ab_empty_addr + (load_stage) * 8, _phase_ab_empty, 10000000);
                             mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, (((load_g & 1) == 0) ? 29696 : 25600));
-                            tma_2d_gmem2smem(A_stage_addr + load_stage * 16384, (&A), ((int)load_g - (int)(load_g / 42) * 42) * 64, ((bid + (int)(load_g / 42) * num_bids) / 1344 * 8 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8)) * 256, ab_full_addr + (load_stage) * 8);
-                            tma_2d_gmem2smem(B_stage_addr + load_stage * 8192, (&B), ((int)load_g - (int)(load_g / 42) * 42) * 64, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8) * 128, ab_full_addr + (load_stage) * 8);
-                            tma_2d_gmem2smem(SFB_stage_addr + load_stage * 1024, (&SFB), 0, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8) * 168 + ((int)load_g - (int)(load_g / 42) * 42) * 4, ab_full_addr + (load_stage) * 8);
+                            tma_2d_gmem2smem(A_stage_addr + load_stage * 16384, (&A), ((int)load_g - (int)(load_g / 42) * 42) * 64, ((bid + (int)(load_g / 42) * num_bids) / 168 * 1 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1)) * 256, ab_full_addr + (load_stage) * 8);
+                            tma_2d_gmem2smem(B_stage_addr + load_stage * 8192, (&B), ((int)load_g - (int)(load_g / 42) * 42) * 64, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1) * 128, ab_full_addr + (load_stage) * 8);
+                            tma_2d_gmem2smem(SFB_stage_addr + load_stage * 1024, (&SFB), 0, (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) / ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1) * 168 + ((int)load_g - (int)(load_g / 42) * 42) * 4, ab_full_addr + (load_stage) * 8);
                             if ((load_g & 1) == 0) {
-                                tma_2d_gmem2smem(SFA_pairs_addr + (load_g >> 1 & 1) * 4096, (&SFA), ((int)load_g - (int)(load_g / 42) * 42) * 8, ((bid + (int)(load_g / 42) * num_bids) / 1344 * 8 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 1344 * 1344) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 < 8) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 1344 * 8 : 8)) * 256, ab_full_addr + (load_stage) * 8);
+                                tma_2d_gmem2smem(SFA_pairs_addr + (load_g >> 1 & 1) * 4096, (&SFA), ((int)load_g - (int)(load_g / 42) * 42) * 8, ((bid + (int)(load_g / 42) * num_bids) / 168 * 1 + (bid + (int)(load_g / 42) * num_bids - (bid + (int)(load_g / 42) * num_bids) / 168 * 168) % ((num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 < 1) ? num_m_tiles - (bid + (int)(load_g / 42) * num_bids) / 168 * 1 : 1)) * 256, ab_full_addr + (load_stage) * 8);
                             }
                         }
                         load_stage += 1;
@@ -1091,12 +1091,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_0 = role_tid >> 2;
                 int w_c_0 = role_tid & 3;
                 int w_grow_0 = tile_m * 256 + w_srow_0;
+                int w_chunk_lo_0 = ((w_c_0 < 3) ? w_c_0 * 16 : 96);
+                int w_chunk_hi_0 = ((w_c_0 < 3) ? w_chunk_lo_0 + 48 : 112);
                 if (w_grow_0 < M) {
-                    int w_row_head_0 = w_grow_0 * 56 + w_head;
-                    unsigned int w_st_words_0[4];
-                    float w_st_vals_0[16];
-                    int w_chunk_lo_0 = ((w_c_0 < 3) ? w_c_0 * 16 : 96);
-                    int w_chunk_hi_0 = ((w_c_0 < 3) ? w_chunk_lo_0 + 48 : 112);
                     unsigned int w_x_lo_0[8];
                     unsigned int w_x_hi_0[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -1263,69 +1260,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_0[_lp*2 + 0], w_o_hi_0[_lp*2+1 + 0]));
                                 w_o_hi_0_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            }
+                            w_x_lo_0[0] = w_o_lo_0_bf16[0];
+                            w_x_hi_0[0] = w_o_hi_0_bf16[0];
+                            w_x_lo_0[1] = w_o_lo_0_bf16[1];
+                            w_x_hi_0[1] = w_o_hi_0_bf16[1];
+                            w_x_lo_0[2] = w_o_lo_0_bf16[2];
+                            w_x_hi_0[2] = w_o_hi_0_bf16[2];
+                            w_x_lo_0[3] = w_o_lo_0_bf16[3];
+                            w_x_hi_0[3] = w_o_hi_0_bf16[3];
+                            w_x_lo_0[4] = w_o_lo_0_bf16[4];
+                            w_x_hi_0[4] = w_o_hi_0_bf16[4];
+                            w_x_lo_0[5] = w_o_lo_0_bf16[5];
+                            w_x_hi_0[5] = w_o_hi_0_bf16[5];
+                            w_x_lo_0[6] = w_o_lo_0_bf16[6];
+                            w_x_hi_0[6] = w_o_hi_0_bf16[6];
+                            w_x_lo_0[7] = w_o_lo_0_bf16[7];
+                            w_x_hi_0[7] = w_o_hi_0_bf16[7];
                         }
+                    }
+                    unsigned int w_q_words_0[4];
+                    float w_q_vals_0[16];
+                    float _unpack_bf16_10[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_10[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0[_pair]) << 16);
+                        (&_unpack_bf16_10[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_0[0] = _unpack_bf16_10[0] * w_out_scale_sel;
+                    w_q_vals_0[1] = _unpack_bf16_10[1] * w_out_scale_sel;
+                    w_q_vals_0[2] = _unpack_bf16_10[2] * w_out_scale_sel;
+                    w_q_vals_0[3] = _unpack_bf16_10[3] * w_out_scale_sel;
+                    w_q_vals_0[4] = _unpack_bf16_10[4] * w_out_scale_sel;
+                    w_q_vals_0[5] = _unpack_bf16_10[5] * w_out_scale_sel;
+                    w_q_vals_0[6] = _unpack_bf16_10[6] * w_out_scale_sel;
+                    w_q_vals_0[7] = _unpack_bf16_10[7] * w_out_scale_sel;
+                    w_q_vals_0[8] = _unpack_bf16_10[8] * w_out_scale_sel;
+                    w_q_vals_0[9] = _unpack_bf16_10[9] * w_out_scale_sel;
+                    w_q_vals_0[10] = _unpack_bf16_10[10] * w_out_scale_sel;
+                    w_q_vals_0[11] = _unpack_bf16_10[11] * w_out_scale_sel;
+                    w_q_vals_0[12] = _unpack_bf16_10[12] * w_out_scale_sel;
+                    w_q_vals_0[13] = _unpack_bf16_10[13] * w_out_scale_sel;
+                    w_q_vals_0[14] = _unpack_bf16_10[14] * w_out_scale_sel;
+                    w_q_vals_0[15] = _unpack_bf16_10[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[0]), "f"(w_q_vals_0[1]),
+                                               "f"(w_q_vals_0[2]), "f"(w_q_vals_0[3]));
+                        w_q_words_0[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[4]), "f"(w_q_vals_0[5]),
+                                               "f"(w_q_vals_0[6]), "f"(w_q_vals_0[7]));
+                        w_q_words_0[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[8]), "f"(w_q_vals_0[9]),
+                                               "f"(w_q_vals_0[10]), "f"(w_q_vals_0[11]));
+                        w_q_words_0[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[12]), "f"(w_q_vals_0[13]),
+                                               "f"(w_q_vals_0[14]), "f"(w_q_vals_0[15]));
+                        w_q_words_0[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_0 * 128) + (unsigned int)(w_chunk_lo_0 ^ (w_srow_0 & 7) << 4)), "r"(w_q_words_0[0]), "r"(w_q_words_0[1]), "r"(w_q_words_0[2]), "r"(w_q_words_0[3]) : "memory");
+                    float _unpack_bf16_11[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_11[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0[_pair]) << 16);
+                        (&_unpack_bf16_11[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_0[0] = _unpack_bf16_11[0] * w_out_scale_sel;
+                    w_q_vals_0[1] = _unpack_bf16_11[1] * w_out_scale_sel;
+                    w_q_vals_0[2] = _unpack_bf16_11[2] * w_out_scale_sel;
+                    w_q_vals_0[3] = _unpack_bf16_11[3] * w_out_scale_sel;
+                    w_q_vals_0[4] = _unpack_bf16_11[4] * w_out_scale_sel;
+                    w_q_vals_0[5] = _unpack_bf16_11[5] * w_out_scale_sel;
+                    w_q_vals_0[6] = _unpack_bf16_11[6] * w_out_scale_sel;
+                    w_q_vals_0[7] = _unpack_bf16_11[7] * w_out_scale_sel;
+                    w_q_vals_0[8] = _unpack_bf16_11[8] * w_out_scale_sel;
+                    w_q_vals_0[9] = _unpack_bf16_11[9] * w_out_scale_sel;
+                    w_q_vals_0[10] = _unpack_bf16_11[10] * w_out_scale_sel;
+                    w_q_vals_0[11] = _unpack_bf16_11[11] * w_out_scale_sel;
+                    w_q_vals_0[12] = _unpack_bf16_11[12] * w_out_scale_sel;
+                    w_q_vals_0[13] = _unpack_bf16_11[13] * w_out_scale_sel;
+                    w_q_vals_0[14] = _unpack_bf16_11[14] * w_out_scale_sel;
+                    w_q_vals_0[15] = _unpack_bf16_11[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[0]), "f"(w_q_vals_0[1]),
+                                               "f"(w_q_vals_0[2]), "f"(w_q_vals_0[3]));
+                        w_q_words_0[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[4]), "f"(w_q_vals_0[5]),
+                                               "f"(w_q_vals_0[6]), "f"(w_q_vals_0[7]));
+                        w_q_words_0[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[8]), "f"(w_q_vals_0[9]),
+                                               "f"(w_q_vals_0[10]), "f"(w_q_vals_0[11]));
+                        w_q_words_0[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0[12]), "f"(w_q_vals_0[13]),
+                                               "f"(w_q_vals_0[14]), "f"(w_q_vals_0[15]));
+                        w_q_words_0[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_0 * 128) + (unsigned int)(w_chunk_hi_0 ^ (w_srow_0 & 7) << 4)), "r"(w_q_words_0[0]), "r"(w_q_words_0[1]), "r"(w_q_words_0[2]), "r"(w_q_words_0[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_0_0 = (role_tid >> 5) * 8 + lane / 8;
+                int s_piece_0_0 = lane % 8;
+                unsigned int s_words_0_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_0_0 * 128) + (unsigned int)(s_piece_0_0 * 16 ^ (s_row_0_0 & 7) << 4)));
+                int s_dst_0_0 = ((tile_m * 256 + s_row_0_0) * 56 + w_head) * 32 + s_piece_0_0 * 4;
+                if (tile_m * 256 + s_row_0_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
+                    }
+                }
+                int s_row_0_1 = (role_tid >> 5) * 8 + 4 + lane / 8;
+                int s_piece_0_1 = lane % 8;
+                unsigned int s_words_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_0_1 * 128) + (unsigned int)(s_piece_0_1 * 16 ^ (s_row_0_1 & 7) << 4)));
+                int s_dst_0_1 = ((tile_m * 256 + s_row_0_1) * 56 + w_head) * 32 + s_piece_0_1 * 4;
+                if (tile_m * 256 + s_row_0_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -1347,18 +1483,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_0[_lp*2 + 0], w_scaled_1_0[_lp*2+1 + 0]));
                     w_scaled_1_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_10[4];
+                float _unpack_bf16_12[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_10[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16[_pair]) << 16);
-                    (&_unpack_bf16_10[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_12[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16[_pair]) << 16);
+                    (&_unpack_bf16_12[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[0] = _unpack_bf16_10[0];
-                w_rounded_1[1] = _unpack_bf16_10[1];
-                w_rounded_1[2] = _unpack_bf16_10[2];
-                w_rounded_1[3] = _unpack_bf16_10[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_10[0], _unpack_bf16_10[0], _unpack_bf16_10[1] * _unpack_bf16_10[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_10[2], _unpack_bf16_10[2], _unpack_bf16_10[3] * _unpack_bf16_10[3]);
+                w_rounded_1[0] = _unpack_bf16_12[0];
+                w_rounded_1[1] = _unpack_bf16_12[1];
+                w_rounded_1[2] = _unpack_bf16_12[2];
+                w_rounded_1[3] = _unpack_bf16_12[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_12[0], _unpack_bf16_12[0], _unpack_bf16_12[1] * _unpack_bf16_12[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_12[2], _unpack_bf16_12[2], _unpack_bf16_12[3] * _unpack_bf16_12[3]);
                 float w_scaled_1_1[4];
                 w_scaled_1_1[0] = accum[36] * w_sa_lo_1 * sw[2];
                 w_scaled_1_1[1] = accum[37] * w_sa_lo_1 * sw[3];
@@ -1370,18 +1506,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_1[_lp*2 + 0], w_scaled_1_1[_lp*2+1 + 0]));
                     w_scaled_1_1_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_11[4];
+                float _unpack_bf16_13[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_11[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16[_pair]) << 16);
-                    (&_unpack_bf16_11[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_13[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16[_pair]) << 16);
+                    (&_unpack_bf16_13[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[4] = _unpack_bf16_11[0];
-                w_rounded_1[5] = _unpack_bf16_11[1];
-                w_rounded_1[6] = _unpack_bf16_11[2];
-                w_rounded_1[7] = _unpack_bf16_11[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_11[0], _unpack_bf16_11[0], _unpack_bf16_11[1] * _unpack_bf16_11[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_11[2], _unpack_bf16_11[2], _unpack_bf16_11[3] * _unpack_bf16_11[3]);
+                w_rounded_1[4] = _unpack_bf16_13[0];
+                w_rounded_1[5] = _unpack_bf16_13[1];
+                w_rounded_1[6] = _unpack_bf16_13[2];
+                w_rounded_1[7] = _unpack_bf16_13[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_13[0], _unpack_bf16_13[0], _unpack_bf16_13[1] * _unpack_bf16_13[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_13[2], _unpack_bf16_13[2], _unpack_bf16_13[3] * _unpack_bf16_13[3]);
                 float w_scaled_1_2[4];
                 w_scaled_1_2[0] = accum[40] * w_sa_lo_1 * sw[4];
                 w_scaled_1_2[1] = accum[41] * w_sa_lo_1 * sw[5];
@@ -1393,18 +1529,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_2[_lp*2 + 0], w_scaled_1_2[_lp*2+1 + 0]));
                     w_scaled_1_2_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_12[4];
+                float _unpack_bf16_14[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_12[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16[_pair]) << 16);
-                    (&_unpack_bf16_12[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_14[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16[_pair]) << 16);
+                    (&_unpack_bf16_14[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[8] = _unpack_bf16_12[0];
-                w_rounded_1[9] = _unpack_bf16_12[1];
-                w_rounded_1[10] = _unpack_bf16_12[2];
-                w_rounded_1[11] = _unpack_bf16_12[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_12[0], _unpack_bf16_12[0], _unpack_bf16_12[1] * _unpack_bf16_12[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_12[2], _unpack_bf16_12[2], _unpack_bf16_12[3] * _unpack_bf16_12[3]);
+                w_rounded_1[8] = _unpack_bf16_14[0];
+                w_rounded_1[9] = _unpack_bf16_14[1];
+                w_rounded_1[10] = _unpack_bf16_14[2];
+                w_rounded_1[11] = _unpack_bf16_14[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_14[0], _unpack_bf16_14[0], _unpack_bf16_14[1] * _unpack_bf16_14[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_14[2], _unpack_bf16_14[2], _unpack_bf16_14[3] * _unpack_bf16_14[3]);
                 float w_scaled_1_3[4];
                 w_scaled_1_3[0] = accum[44] * w_sa_lo_1 * sw[6];
                 w_scaled_1_3[1] = accum[45] * w_sa_lo_1 * sw[7];
@@ -1416,18 +1552,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_3[_lp*2 + 0], w_scaled_1_3[_lp*2+1 + 0]));
                     w_scaled_1_3_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_13[4];
+                float _unpack_bf16_15[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_13[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16[_pair]) << 16);
-                    (&_unpack_bf16_13[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_15[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16[_pair]) << 16);
+                    (&_unpack_bf16_15[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[12] = _unpack_bf16_13[0];
-                w_rounded_1[13] = _unpack_bf16_13[1];
-                w_rounded_1[14] = _unpack_bf16_13[2];
-                w_rounded_1[15] = _unpack_bf16_13[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_13[0], _unpack_bf16_13[0], _unpack_bf16_13[1] * _unpack_bf16_13[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_13[2], _unpack_bf16_13[2], _unpack_bf16_13[3] * _unpack_bf16_13[3]);
+                w_rounded_1[12] = _unpack_bf16_15[0];
+                w_rounded_1[13] = _unpack_bf16_15[1];
+                w_rounded_1[14] = _unpack_bf16_15[2];
+                w_rounded_1[15] = _unpack_bf16_15[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_15[0], _unpack_bf16_15[0], _unpack_bf16_15[1] * _unpack_bf16_15[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_15[2], _unpack_bf16_15[2], _unpack_bf16_15[3] * _unpack_bf16_15[3]);
                 float w_scaled_1_4[4];
                 w_scaled_1_4[0] = accum[48] * w_sa_lo_1 * sw[8];
                 w_scaled_1_4[1] = accum[49] * w_sa_lo_1 * sw[9];
@@ -1439,18 +1575,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_4[_lp*2 + 0], w_scaled_1_4[_lp*2+1 + 0]));
                     w_scaled_1_4_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_14[4];
+                float _unpack_bf16_16[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_14[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16[_pair]) << 16);
-                    (&_unpack_bf16_14[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_16[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16[_pair]) << 16);
+                    (&_unpack_bf16_16[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[16] = _unpack_bf16_14[0];
-                w_rounded_1[17] = _unpack_bf16_14[1];
-                w_rounded_1[18] = _unpack_bf16_14[2];
-                w_rounded_1[19] = _unpack_bf16_14[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_14[0], _unpack_bf16_14[0], _unpack_bf16_14[1] * _unpack_bf16_14[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_14[2], _unpack_bf16_14[2], _unpack_bf16_14[3] * _unpack_bf16_14[3]);
+                w_rounded_1[16] = _unpack_bf16_16[0];
+                w_rounded_1[17] = _unpack_bf16_16[1];
+                w_rounded_1[18] = _unpack_bf16_16[2];
+                w_rounded_1[19] = _unpack_bf16_16[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_16[0], _unpack_bf16_16[0], _unpack_bf16_16[1] * _unpack_bf16_16[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_16[2], _unpack_bf16_16[2], _unpack_bf16_16[3] * _unpack_bf16_16[3]);
                 float w_scaled_1_5[4];
                 w_scaled_1_5[0] = accum[52] * w_sa_lo_1 * sw[10];
                 w_scaled_1_5[1] = accum[53] * w_sa_lo_1 * sw[11];
@@ -1462,18 +1598,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_5[_lp*2 + 0], w_scaled_1_5[_lp*2+1 + 0]));
                     w_scaled_1_5_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_15[4];
+                float _unpack_bf16_17[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_15[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16[_pair]) << 16);
-                    (&_unpack_bf16_15[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_17[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16[_pair]) << 16);
+                    (&_unpack_bf16_17[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[20] = _unpack_bf16_15[0];
-                w_rounded_1[21] = _unpack_bf16_15[1];
-                w_rounded_1[22] = _unpack_bf16_15[2];
-                w_rounded_1[23] = _unpack_bf16_15[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_15[0], _unpack_bf16_15[0], _unpack_bf16_15[1] * _unpack_bf16_15[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_15[2], _unpack_bf16_15[2], _unpack_bf16_15[3] * _unpack_bf16_15[3]);
+                w_rounded_1[20] = _unpack_bf16_17[0];
+                w_rounded_1[21] = _unpack_bf16_17[1];
+                w_rounded_1[22] = _unpack_bf16_17[2];
+                w_rounded_1[23] = _unpack_bf16_17[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_17[0], _unpack_bf16_17[0], _unpack_bf16_17[1] * _unpack_bf16_17[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_17[2], _unpack_bf16_17[2], _unpack_bf16_17[3] * _unpack_bf16_17[3]);
                 float w_scaled_1_6[4];
                 w_scaled_1_6[0] = accum[56] * w_sa_lo_1 * sw[12];
                 w_scaled_1_6[1] = accum[57] * w_sa_lo_1 * sw[13];
@@ -1485,18 +1621,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_6[_lp*2 + 0], w_scaled_1_6[_lp*2+1 + 0]));
                     w_scaled_1_6_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_16[4];
+                float _unpack_bf16_18[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_16[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16[_pair]) << 16);
-                    (&_unpack_bf16_16[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_18[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16[_pair]) << 16);
+                    (&_unpack_bf16_18[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[24] = _unpack_bf16_16[0];
-                w_rounded_1[25] = _unpack_bf16_16[1];
-                w_rounded_1[26] = _unpack_bf16_16[2];
-                w_rounded_1[27] = _unpack_bf16_16[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_16[0], _unpack_bf16_16[0], _unpack_bf16_16[1] * _unpack_bf16_16[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_16[2], _unpack_bf16_16[2], _unpack_bf16_16[3] * _unpack_bf16_16[3]);
+                w_rounded_1[24] = _unpack_bf16_18[0];
+                w_rounded_1[25] = _unpack_bf16_18[1];
+                w_rounded_1[26] = _unpack_bf16_18[2];
+                w_rounded_1[27] = _unpack_bf16_18[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_18[0], _unpack_bf16_18[0], _unpack_bf16_18[1] * _unpack_bf16_18[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_18[2], _unpack_bf16_18[2], _unpack_bf16_18[3] * _unpack_bf16_18[3]);
                 float w_scaled_1_7[4];
                 w_scaled_1_7[0] = accum[60] * w_sa_lo_1 * sw[14];
                 w_scaled_1_7[1] = accum[61] * w_sa_lo_1 * sw[15];
@@ -1508,18 +1644,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_7[_lp*2 + 0], w_scaled_1_7[_lp*2+1 + 0]));
                     w_scaled_1_7_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_17[4];
+                float _unpack_bf16_19[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_17[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16[_pair]) << 16);
-                    (&_unpack_bf16_17[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_19[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16[_pair]) << 16);
+                    (&_unpack_bf16_19[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1[28] = _unpack_bf16_17[0];
-                w_rounded_1[29] = _unpack_bf16_17[1];
-                w_rounded_1[30] = _unpack_bf16_17[2];
-                w_rounded_1[31] = _unpack_bf16_17[3];
-                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_17[0], _unpack_bf16_17[0], _unpack_bf16_17[1] * _unpack_bf16_17[1]);
-                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_17[2], _unpack_bf16_17[2], _unpack_bf16_17[3] * _unpack_bf16_17[3]);
+                w_rounded_1[28] = _unpack_bf16_19[0];
+                w_rounded_1[29] = _unpack_bf16_19[1];
+                w_rounded_1[30] = _unpack_bf16_19[2];
+                w_rounded_1[31] = _unpack_bf16_19[3];
+                w_ss_lo_1 += __fmaf_rn(_unpack_bf16_19[0], _unpack_bf16_19[0], _unpack_bf16_19[1] * _unpack_bf16_19[1]);
+                w_ss_hi_1 += __fmaf_rn(_unpack_bf16_19[2], _unpack_bf16_19[2], _unpack_bf16_19[3] * _unpack_bf16_19[3]);
                 float w_rstd_lo_1 = 1.0f;
                 float w_rstd_hi_1 = 1.0f;
                 if (w_kind < 2) {
@@ -1727,12 +1863,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_1 = role_tid >> 2;
                 int w_c_1 = role_tid & 3;
                 int w_grow_1 = tile_m * 256 + 64 + w_srow_1;
+                int w_chunk_lo_1 = ((w_c_1 < 3) ? w_c_1 * 16 : 96);
+                int w_chunk_hi_1 = ((w_c_1 < 3) ? w_chunk_lo_1 + 48 : 112);
                 if (w_grow_1 < M) {
-                    int w_row_head_1 = w_grow_1 * 56 + w_head;
-                    unsigned int w_st_words_1[4];
-                    float w_st_vals_1[16];
-                    int w_chunk_lo_1 = ((w_c_1 < 3) ? w_c_1 * 16 : 96);
-                    int w_chunk_hi_1 = ((w_c_1 < 3) ? w_chunk_lo_1 + 48 : 112);
                     unsigned int w_x_lo_1[8];
                     unsigned int w_x_hi_1[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -1749,17 +1882,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)));
                     if (w_c_1 < 3) {
                         if (w_kind < 2) {
-                            float _unpack_bf16_18[16];
+                            float _unpack_bf16_20[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_18[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) << 16);
-                                (&_unpack_bf16_18[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_20[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) << 16);
+                                (&_unpack_bf16_20[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_19[16];
+                            float _unpack_bf16_21[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_19[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) << 16);
-                                (&_unpack_bf16_19[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_21[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) << 16);
+                                (&_unpack_bf16_21[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_4[8];
                             {
@@ -1827,66 +1960,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_1_0 = _vec_load_6[0];
                             float w_cv1_1_0 = _vec_load_5[0];
                             float w_sv1_1_0 = _vec_load_7[0];
-                            w_o_lo_1[0] = __fmaf_rn(_unpack_bf16_18[0], w_cv0_1_0, -(_unpack_bf16_19[0] * w_sv0_1_0));
-                            w_o_hi_1[0] = __fmaf_rn(_unpack_bf16_19[0], w_cv0_1_0, _unpack_bf16_18[0] * w_sv0_1_0);
-                            w_o_lo_1[8] = __fmaf_rn(_unpack_bf16_18[8], w_cv1_1_0, -(_unpack_bf16_19[8] * w_sv1_1_0));
-                            w_o_hi_1[8] = __fmaf_rn(_unpack_bf16_19[8], w_cv1_1_0, _unpack_bf16_18[8] * w_sv1_1_0);
+                            w_o_lo_1[0] = __fmaf_rn(_unpack_bf16_20[0], w_cv0_1_0, -(_unpack_bf16_21[0] * w_sv0_1_0));
+                            w_o_hi_1[0] = __fmaf_rn(_unpack_bf16_21[0], w_cv0_1_0, _unpack_bf16_20[0] * w_sv0_1_0);
+                            w_o_lo_1[8] = __fmaf_rn(_unpack_bf16_20[8], w_cv1_1_0, -(_unpack_bf16_21[8] * w_sv1_1_0));
+                            w_o_hi_1[8] = __fmaf_rn(_unpack_bf16_21[8], w_cv1_1_0, _unpack_bf16_20[8] * w_sv1_1_0);
                             float w_cv0_1_1 = _vec_load_4[1];
                             float w_sv0_1_1 = _vec_load_6[1];
                             float w_cv1_1_1 = _vec_load_5[1];
                             float w_sv1_1_1 = _vec_load_7[1];
-                            w_o_lo_1[1] = __fmaf_rn(_unpack_bf16_18[1], w_cv0_1_1, -(_unpack_bf16_19[1] * w_sv0_1_1));
-                            w_o_hi_1[1] = __fmaf_rn(_unpack_bf16_19[1], w_cv0_1_1, _unpack_bf16_18[1] * w_sv0_1_1);
-                            w_o_lo_1[9] = __fmaf_rn(_unpack_bf16_18[9], w_cv1_1_1, -(_unpack_bf16_19[9] * w_sv1_1_1));
-                            w_o_hi_1[9] = __fmaf_rn(_unpack_bf16_19[9], w_cv1_1_1, _unpack_bf16_18[9] * w_sv1_1_1);
+                            w_o_lo_1[1] = __fmaf_rn(_unpack_bf16_20[1], w_cv0_1_1, -(_unpack_bf16_21[1] * w_sv0_1_1));
+                            w_o_hi_1[1] = __fmaf_rn(_unpack_bf16_21[1], w_cv0_1_1, _unpack_bf16_20[1] * w_sv0_1_1);
+                            w_o_lo_1[9] = __fmaf_rn(_unpack_bf16_20[9], w_cv1_1_1, -(_unpack_bf16_21[9] * w_sv1_1_1));
+                            w_o_hi_1[9] = __fmaf_rn(_unpack_bf16_21[9], w_cv1_1_1, _unpack_bf16_20[9] * w_sv1_1_1);
                             float w_cv0_1_2 = _vec_load_4[2];
                             float w_sv0_1_2 = _vec_load_6[2];
                             float w_cv1_1_2 = _vec_load_5[2];
                             float w_sv1_1_2 = _vec_load_7[2];
-                            w_o_lo_1[2] = __fmaf_rn(_unpack_bf16_18[2], w_cv0_1_2, -(_unpack_bf16_19[2] * w_sv0_1_2));
-                            w_o_hi_1[2] = __fmaf_rn(_unpack_bf16_19[2], w_cv0_1_2, _unpack_bf16_18[2] * w_sv0_1_2);
-                            w_o_lo_1[10] = __fmaf_rn(_unpack_bf16_18[10], w_cv1_1_2, -(_unpack_bf16_19[10] * w_sv1_1_2));
-                            w_o_hi_1[10] = __fmaf_rn(_unpack_bf16_19[10], w_cv1_1_2, _unpack_bf16_18[10] * w_sv1_1_2);
+                            w_o_lo_1[2] = __fmaf_rn(_unpack_bf16_20[2], w_cv0_1_2, -(_unpack_bf16_21[2] * w_sv0_1_2));
+                            w_o_hi_1[2] = __fmaf_rn(_unpack_bf16_21[2], w_cv0_1_2, _unpack_bf16_20[2] * w_sv0_1_2);
+                            w_o_lo_1[10] = __fmaf_rn(_unpack_bf16_20[10], w_cv1_1_2, -(_unpack_bf16_21[10] * w_sv1_1_2));
+                            w_o_hi_1[10] = __fmaf_rn(_unpack_bf16_21[10], w_cv1_1_2, _unpack_bf16_20[10] * w_sv1_1_2);
                             float w_cv0_1_3 = _vec_load_4[3];
                             float w_sv0_1_3 = _vec_load_6[3];
                             float w_cv1_1_3 = _vec_load_5[3];
                             float w_sv1_1_3 = _vec_load_7[3];
-                            w_o_lo_1[3] = __fmaf_rn(_unpack_bf16_18[3], w_cv0_1_3, -(_unpack_bf16_19[3] * w_sv0_1_3));
-                            w_o_hi_1[3] = __fmaf_rn(_unpack_bf16_19[3], w_cv0_1_3, _unpack_bf16_18[3] * w_sv0_1_3);
-                            w_o_lo_1[11] = __fmaf_rn(_unpack_bf16_18[11], w_cv1_1_3, -(_unpack_bf16_19[11] * w_sv1_1_3));
-                            w_o_hi_1[11] = __fmaf_rn(_unpack_bf16_19[11], w_cv1_1_3, _unpack_bf16_18[11] * w_sv1_1_3);
+                            w_o_lo_1[3] = __fmaf_rn(_unpack_bf16_20[3], w_cv0_1_3, -(_unpack_bf16_21[3] * w_sv0_1_3));
+                            w_o_hi_1[3] = __fmaf_rn(_unpack_bf16_21[3], w_cv0_1_3, _unpack_bf16_20[3] * w_sv0_1_3);
+                            w_o_lo_1[11] = __fmaf_rn(_unpack_bf16_20[11], w_cv1_1_3, -(_unpack_bf16_21[11] * w_sv1_1_3));
+                            w_o_hi_1[11] = __fmaf_rn(_unpack_bf16_21[11], w_cv1_1_3, _unpack_bf16_20[11] * w_sv1_1_3);
                             float w_cv0_1_4 = _vec_load_4[4];
                             float w_sv0_1_4 = _vec_load_6[4];
                             float w_cv1_1_4 = _vec_load_5[4];
                             float w_sv1_1_4 = _vec_load_7[4];
-                            w_o_lo_1[4] = __fmaf_rn(_unpack_bf16_18[4], w_cv0_1_4, -(_unpack_bf16_19[4] * w_sv0_1_4));
-                            w_o_hi_1[4] = __fmaf_rn(_unpack_bf16_19[4], w_cv0_1_4, _unpack_bf16_18[4] * w_sv0_1_4);
-                            w_o_lo_1[12] = __fmaf_rn(_unpack_bf16_18[12], w_cv1_1_4, -(_unpack_bf16_19[12] * w_sv1_1_4));
-                            w_o_hi_1[12] = __fmaf_rn(_unpack_bf16_19[12], w_cv1_1_4, _unpack_bf16_18[12] * w_sv1_1_4);
+                            w_o_lo_1[4] = __fmaf_rn(_unpack_bf16_20[4], w_cv0_1_4, -(_unpack_bf16_21[4] * w_sv0_1_4));
+                            w_o_hi_1[4] = __fmaf_rn(_unpack_bf16_21[4], w_cv0_1_4, _unpack_bf16_20[4] * w_sv0_1_4);
+                            w_o_lo_1[12] = __fmaf_rn(_unpack_bf16_20[12], w_cv1_1_4, -(_unpack_bf16_21[12] * w_sv1_1_4));
+                            w_o_hi_1[12] = __fmaf_rn(_unpack_bf16_21[12], w_cv1_1_4, _unpack_bf16_20[12] * w_sv1_1_4);
                             float w_cv0_1_5 = _vec_load_4[5];
                             float w_sv0_1_5 = _vec_load_6[5];
                             float w_cv1_1_5 = _vec_load_5[5];
                             float w_sv1_1_5 = _vec_load_7[5];
-                            w_o_lo_1[5] = __fmaf_rn(_unpack_bf16_18[5], w_cv0_1_5, -(_unpack_bf16_19[5] * w_sv0_1_5));
-                            w_o_hi_1[5] = __fmaf_rn(_unpack_bf16_19[5], w_cv0_1_5, _unpack_bf16_18[5] * w_sv0_1_5);
-                            w_o_lo_1[13] = __fmaf_rn(_unpack_bf16_18[13], w_cv1_1_5, -(_unpack_bf16_19[13] * w_sv1_1_5));
-                            w_o_hi_1[13] = __fmaf_rn(_unpack_bf16_19[13], w_cv1_1_5, _unpack_bf16_18[13] * w_sv1_1_5);
+                            w_o_lo_1[5] = __fmaf_rn(_unpack_bf16_20[5], w_cv0_1_5, -(_unpack_bf16_21[5] * w_sv0_1_5));
+                            w_o_hi_1[5] = __fmaf_rn(_unpack_bf16_21[5], w_cv0_1_5, _unpack_bf16_20[5] * w_sv0_1_5);
+                            w_o_lo_1[13] = __fmaf_rn(_unpack_bf16_20[13], w_cv1_1_5, -(_unpack_bf16_21[13] * w_sv1_1_5));
+                            w_o_hi_1[13] = __fmaf_rn(_unpack_bf16_21[13], w_cv1_1_5, _unpack_bf16_20[13] * w_sv1_1_5);
                             float w_cv0_1_6 = _vec_load_4[6];
                             float w_sv0_1_6 = _vec_load_6[6];
                             float w_cv1_1_6 = _vec_load_5[6];
                             float w_sv1_1_6 = _vec_load_7[6];
-                            w_o_lo_1[6] = __fmaf_rn(_unpack_bf16_18[6], w_cv0_1_6, -(_unpack_bf16_19[6] * w_sv0_1_6));
-                            w_o_hi_1[6] = __fmaf_rn(_unpack_bf16_19[6], w_cv0_1_6, _unpack_bf16_18[6] * w_sv0_1_6);
-                            w_o_lo_1[14] = __fmaf_rn(_unpack_bf16_18[14], w_cv1_1_6, -(_unpack_bf16_19[14] * w_sv1_1_6));
-                            w_o_hi_1[14] = __fmaf_rn(_unpack_bf16_19[14], w_cv1_1_6, _unpack_bf16_18[14] * w_sv1_1_6);
+                            w_o_lo_1[6] = __fmaf_rn(_unpack_bf16_20[6], w_cv0_1_6, -(_unpack_bf16_21[6] * w_sv0_1_6));
+                            w_o_hi_1[6] = __fmaf_rn(_unpack_bf16_21[6], w_cv0_1_6, _unpack_bf16_20[6] * w_sv0_1_6);
+                            w_o_lo_1[14] = __fmaf_rn(_unpack_bf16_20[14], w_cv1_1_6, -(_unpack_bf16_21[14] * w_sv1_1_6));
+                            w_o_hi_1[14] = __fmaf_rn(_unpack_bf16_21[14], w_cv1_1_6, _unpack_bf16_20[14] * w_sv1_1_6);
                             float w_cv0_1_7 = _vec_load_4[7];
                             float w_sv0_1_7 = _vec_load_6[7];
                             float w_cv1_1_7 = _vec_load_5[7];
                             float w_sv1_1_7 = _vec_load_7[7];
-                            w_o_lo_1[7] = __fmaf_rn(_unpack_bf16_18[7], w_cv0_1_7, -(_unpack_bf16_19[7] * w_sv0_1_7));
-                            w_o_hi_1[7] = __fmaf_rn(_unpack_bf16_19[7], w_cv0_1_7, _unpack_bf16_18[7] * w_sv0_1_7);
-                            w_o_lo_1[15] = __fmaf_rn(_unpack_bf16_18[15], w_cv1_1_7, -(_unpack_bf16_19[15] * w_sv1_1_7));
-                            w_o_hi_1[15] = __fmaf_rn(_unpack_bf16_19[15], w_cv1_1_7, _unpack_bf16_18[15] * w_sv1_1_7);
+                            w_o_lo_1[7] = __fmaf_rn(_unpack_bf16_20[7], w_cv0_1_7, -(_unpack_bf16_21[7] * w_sv0_1_7));
+                            w_o_hi_1[7] = __fmaf_rn(_unpack_bf16_21[7], w_cv0_1_7, _unpack_bf16_20[7] * w_sv0_1_7);
+                            w_o_lo_1[15] = __fmaf_rn(_unpack_bf16_20[15], w_cv1_1_7, -(_unpack_bf16_21[15] * w_sv1_1_7));
+                            w_o_hi_1[15] = __fmaf_rn(_unpack_bf16_21[15], w_cv1_1_7, _unpack_bf16_20[15] * w_sv1_1_7);
                             unsigned int w_o_lo_1_bf16[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -1899,69 +2032,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_1[_lp*2 + 0], w_o_hi_1[_lp*2+1 + 0]));
                                 w_o_hi_1_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            }
+                            w_x_lo_1[0] = w_o_lo_1_bf16[0];
+                            w_x_hi_1[0] = w_o_hi_1_bf16[0];
+                            w_x_lo_1[1] = w_o_lo_1_bf16[1];
+                            w_x_hi_1[1] = w_o_hi_1_bf16[1];
+                            w_x_lo_1[2] = w_o_lo_1_bf16[2];
+                            w_x_hi_1[2] = w_o_hi_1_bf16[2];
+                            w_x_lo_1[3] = w_o_lo_1_bf16[3];
+                            w_x_hi_1[3] = w_o_hi_1_bf16[3];
+                            w_x_lo_1[4] = w_o_lo_1_bf16[4];
+                            w_x_hi_1[4] = w_o_hi_1_bf16[4];
+                            w_x_lo_1[5] = w_o_lo_1_bf16[5];
+                            w_x_hi_1[5] = w_o_hi_1_bf16[5];
+                            w_x_lo_1[6] = w_o_lo_1_bf16[6];
+                            w_x_hi_1[6] = w_o_hi_1_bf16[6];
+                            w_x_lo_1[7] = w_o_lo_1_bf16[7];
+                            w_x_hi_1[7] = w_o_hi_1_bf16[7];
                         }
+                    }
+                    unsigned int w_q_words_1[4];
+                    float w_q_vals_1[16];
+                    float _unpack_bf16_22[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_22[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) << 16);
+                        (&_unpack_bf16_22[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_1[0] = _unpack_bf16_22[0] * w_out_scale_sel;
+                    w_q_vals_1[1] = _unpack_bf16_22[1] * w_out_scale_sel;
+                    w_q_vals_1[2] = _unpack_bf16_22[2] * w_out_scale_sel;
+                    w_q_vals_1[3] = _unpack_bf16_22[3] * w_out_scale_sel;
+                    w_q_vals_1[4] = _unpack_bf16_22[4] * w_out_scale_sel;
+                    w_q_vals_1[5] = _unpack_bf16_22[5] * w_out_scale_sel;
+                    w_q_vals_1[6] = _unpack_bf16_22[6] * w_out_scale_sel;
+                    w_q_vals_1[7] = _unpack_bf16_22[7] * w_out_scale_sel;
+                    w_q_vals_1[8] = _unpack_bf16_22[8] * w_out_scale_sel;
+                    w_q_vals_1[9] = _unpack_bf16_22[9] * w_out_scale_sel;
+                    w_q_vals_1[10] = _unpack_bf16_22[10] * w_out_scale_sel;
+                    w_q_vals_1[11] = _unpack_bf16_22[11] * w_out_scale_sel;
+                    w_q_vals_1[12] = _unpack_bf16_22[12] * w_out_scale_sel;
+                    w_q_vals_1[13] = _unpack_bf16_22[13] * w_out_scale_sel;
+                    w_q_vals_1[14] = _unpack_bf16_22[14] * w_out_scale_sel;
+                    w_q_vals_1[15] = _unpack_bf16_22[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[0]), "f"(w_q_vals_1[1]),
+                                               "f"(w_q_vals_1[2]), "f"(w_q_vals_1[3]));
+                        w_q_words_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[4]), "f"(w_q_vals_1[5]),
+                                               "f"(w_q_vals_1[6]), "f"(w_q_vals_1[7]));
+                        w_q_words_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[8]), "f"(w_q_vals_1[9]),
+                                               "f"(w_q_vals_1[10]), "f"(w_q_vals_1[11]));
+                        w_q_words_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[12]), "f"(w_q_vals_1[13]),
+                                               "f"(w_q_vals_1[14]), "f"(w_q_vals_1[15]));
+                        w_q_words_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_1 * 128) + (unsigned int)(w_chunk_lo_1 ^ (w_srow_1 & 7) << 4)), "r"(w_q_words_1[0]), "r"(w_q_words_1[1]), "r"(w_q_words_1[2]), "r"(w_q_words_1[3]) : "memory");
+                    float _unpack_bf16_23[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_23[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) << 16);
+                        (&_unpack_bf16_23[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_1[0] = _unpack_bf16_23[0] * w_out_scale_sel;
+                    w_q_vals_1[1] = _unpack_bf16_23[1] * w_out_scale_sel;
+                    w_q_vals_1[2] = _unpack_bf16_23[2] * w_out_scale_sel;
+                    w_q_vals_1[3] = _unpack_bf16_23[3] * w_out_scale_sel;
+                    w_q_vals_1[4] = _unpack_bf16_23[4] * w_out_scale_sel;
+                    w_q_vals_1[5] = _unpack_bf16_23[5] * w_out_scale_sel;
+                    w_q_vals_1[6] = _unpack_bf16_23[6] * w_out_scale_sel;
+                    w_q_vals_1[7] = _unpack_bf16_23[7] * w_out_scale_sel;
+                    w_q_vals_1[8] = _unpack_bf16_23[8] * w_out_scale_sel;
+                    w_q_vals_1[9] = _unpack_bf16_23[9] * w_out_scale_sel;
+                    w_q_vals_1[10] = _unpack_bf16_23[10] * w_out_scale_sel;
+                    w_q_vals_1[11] = _unpack_bf16_23[11] * w_out_scale_sel;
+                    w_q_vals_1[12] = _unpack_bf16_23[12] * w_out_scale_sel;
+                    w_q_vals_1[13] = _unpack_bf16_23[13] * w_out_scale_sel;
+                    w_q_vals_1[14] = _unpack_bf16_23[14] * w_out_scale_sel;
+                    w_q_vals_1[15] = _unpack_bf16_23[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[0]), "f"(w_q_vals_1[1]),
+                                               "f"(w_q_vals_1[2]), "f"(w_q_vals_1[3]));
+                        w_q_words_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[4]), "f"(w_q_vals_1[5]),
+                                               "f"(w_q_vals_1[6]), "f"(w_q_vals_1[7]));
+                        w_q_words_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[8]), "f"(w_q_vals_1[9]),
+                                               "f"(w_q_vals_1[10]), "f"(w_q_vals_1[11]));
+                        w_q_words_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1[12]), "f"(w_q_vals_1[13]),
+                                               "f"(w_q_vals_1[14]), "f"(w_q_vals_1[15]));
+                        w_q_words_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_1 * 128) + (unsigned int)(w_chunk_hi_1 ^ (w_srow_1 & 7) << 4)), "r"(w_q_words_1[0]), "r"(w_q_words_1[1]), "r"(w_q_words_1[2]), "r"(w_q_words_1[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_1_0 = (role_tid >> 5) * 8 + lane / 8;
+                int s_piece_1_0 = lane % 8;
+                unsigned int s_words_1_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_1_0 * 128) + (unsigned int)(s_piece_1_0 * 16 ^ (s_row_1_0 & 7) << 4)));
+                int s_dst_1_0 = ((tile_m * 256 + 64 + s_row_1_0) * 56 + w_head) * 32 + s_piece_1_0 * 4;
+                if (tile_m * 256 + 64 + s_row_1_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
+                    }
+                }
+                int s_row_1_1 = (role_tid >> 5) * 8 + 4 + lane / 8;
+                int s_piece_1_1 = lane % 8;
+                unsigned int s_words_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_1_1 * 128) + (unsigned int)(s_piece_1_1 * 16 ^ (s_row_1_1 & 7) << 4)));
+                int s_dst_1_1 = ((tile_m * 256 + 64 + s_row_1_1) * 56 + w_head) * 32 + s_piece_1_1 * 4;
+                if (tile_m * 256 + 64 + s_row_1_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -1983,18 +2255,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_0[_lp*2 + 0], w_scaled_2_0[_lp*2+1 + 0]));
                     w_scaled_2_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_20[4];
+                float _unpack_bf16_24[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_20[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16[_pair]) << 16);
-                    (&_unpack_bf16_20[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_24[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16[_pair]) << 16);
+                    (&_unpack_bf16_24[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[0] = _unpack_bf16_20[0];
-                w_rounded_2[1] = _unpack_bf16_20[1];
-                w_rounded_2[2] = _unpack_bf16_20[2];
-                w_rounded_2[3] = _unpack_bf16_20[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_20[0], _unpack_bf16_20[0], _unpack_bf16_20[1] * _unpack_bf16_20[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_20[2], _unpack_bf16_20[2], _unpack_bf16_20[3] * _unpack_bf16_20[3]);
+                w_rounded_2[0] = _unpack_bf16_24[0];
+                w_rounded_2[1] = _unpack_bf16_24[1];
+                w_rounded_2[2] = _unpack_bf16_24[2];
+                w_rounded_2[3] = _unpack_bf16_24[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_24[0], _unpack_bf16_24[0], _unpack_bf16_24[1] * _unpack_bf16_24[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_24[2], _unpack_bf16_24[2], _unpack_bf16_24[3] * _unpack_bf16_24[3]);
                 float w_scaled_2_1[4];
                 w_scaled_2_1[0] = accum[68] * w_sa_lo_2 * sw[2];
                 w_scaled_2_1[1] = accum[69] * w_sa_lo_2 * sw[3];
@@ -2006,18 +2278,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_1[_lp*2 + 0], w_scaled_2_1[_lp*2+1 + 0]));
                     w_scaled_2_1_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_21[4];
+                float _unpack_bf16_25[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_21[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16[_pair]) << 16);
-                    (&_unpack_bf16_21[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_25[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16[_pair]) << 16);
+                    (&_unpack_bf16_25[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[4] = _unpack_bf16_21[0];
-                w_rounded_2[5] = _unpack_bf16_21[1];
-                w_rounded_2[6] = _unpack_bf16_21[2];
-                w_rounded_2[7] = _unpack_bf16_21[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_21[0], _unpack_bf16_21[0], _unpack_bf16_21[1] * _unpack_bf16_21[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_21[2], _unpack_bf16_21[2], _unpack_bf16_21[3] * _unpack_bf16_21[3]);
+                w_rounded_2[4] = _unpack_bf16_25[0];
+                w_rounded_2[5] = _unpack_bf16_25[1];
+                w_rounded_2[6] = _unpack_bf16_25[2];
+                w_rounded_2[7] = _unpack_bf16_25[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_25[0], _unpack_bf16_25[0], _unpack_bf16_25[1] * _unpack_bf16_25[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_25[2], _unpack_bf16_25[2], _unpack_bf16_25[3] * _unpack_bf16_25[3]);
                 float w_scaled_2_2[4];
                 w_scaled_2_2[0] = accum[72] * w_sa_lo_2 * sw[4];
                 w_scaled_2_2[1] = accum[73] * w_sa_lo_2 * sw[5];
@@ -2029,18 +2301,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_2[_lp*2 + 0], w_scaled_2_2[_lp*2+1 + 0]));
                     w_scaled_2_2_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_22[4];
+                float _unpack_bf16_26[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_22[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16[_pair]) << 16);
-                    (&_unpack_bf16_22[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_26[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16[_pair]) << 16);
+                    (&_unpack_bf16_26[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[8] = _unpack_bf16_22[0];
-                w_rounded_2[9] = _unpack_bf16_22[1];
-                w_rounded_2[10] = _unpack_bf16_22[2];
-                w_rounded_2[11] = _unpack_bf16_22[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_22[0], _unpack_bf16_22[0], _unpack_bf16_22[1] * _unpack_bf16_22[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_22[2], _unpack_bf16_22[2], _unpack_bf16_22[3] * _unpack_bf16_22[3]);
+                w_rounded_2[8] = _unpack_bf16_26[0];
+                w_rounded_2[9] = _unpack_bf16_26[1];
+                w_rounded_2[10] = _unpack_bf16_26[2];
+                w_rounded_2[11] = _unpack_bf16_26[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_26[0], _unpack_bf16_26[0], _unpack_bf16_26[1] * _unpack_bf16_26[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_26[2], _unpack_bf16_26[2], _unpack_bf16_26[3] * _unpack_bf16_26[3]);
                 float w_scaled_2_3[4];
                 w_scaled_2_3[0] = accum[76] * w_sa_lo_2 * sw[6];
                 w_scaled_2_3[1] = accum[77] * w_sa_lo_2 * sw[7];
@@ -2052,18 +2324,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_3[_lp*2 + 0], w_scaled_2_3[_lp*2+1 + 0]));
                     w_scaled_2_3_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_23[4];
+                float _unpack_bf16_27[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_23[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16[_pair]) << 16);
-                    (&_unpack_bf16_23[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_27[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16[_pair]) << 16);
+                    (&_unpack_bf16_27[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[12] = _unpack_bf16_23[0];
-                w_rounded_2[13] = _unpack_bf16_23[1];
-                w_rounded_2[14] = _unpack_bf16_23[2];
-                w_rounded_2[15] = _unpack_bf16_23[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_23[0], _unpack_bf16_23[0], _unpack_bf16_23[1] * _unpack_bf16_23[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_23[2], _unpack_bf16_23[2], _unpack_bf16_23[3] * _unpack_bf16_23[3]);
+                w_rounded_2[12] = _unpack_bf16_27[0];
+                w_rounded_2[13] = _unpack_bf16_27[1];
+                w_rounded_2[14] = _unpack_bf16_27[2];
+                w_rounded_2[15] = _unpack_bf16_27[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_27[0], _unpack_bf16_27[0], _unpack_bf16_27[1] * _unpack_bf16_27[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_27[2], _unpack_bf16_27[2], _unpack_bf16_27[3] * _unpack_bf16_27[3]);
                 float w_scaled_2_4[4];
                 w_scaled_2_4[0] = accum[80] * w_sa_lo_2 * sw[8];
                 w_scaled_2_4[1] = accum[81] * w_sa_lo_2 * sw[9];
@@ -2075,18 +2347,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_4[_lp*2 + 0], w_scaled_2_4[_lp*2+1 + 0]));
                     w_scaled_2_4_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_24[4];
+                float _unpack_bf16_28[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_24[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16[_pair]) << 16);
-                    (&_unpack_bf16_24[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_28[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16[_pair]) << 16);
+                    (&_unpack_bf16_28[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[16] = _unpack_bf16_24[0];
-                w_rounded_2[17] = _unpack_bf16_24[1];
-                w_rounded_2[18] = _unpack_bf16_24[2];
-                w_rounded_2[19] = _unpack_bf16_24[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_24[0], _unpack_bf16_24[0], _unpack_bf16_24[1] * _unpack_bf16_24[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_24[2], _unpack_bf16_24[2], _unpack_bf16_24[3] * _unpack_bf16_24[3]);
+                w_rounded_2[16] = _unpack_bf16_28[0];
+                w_rounded_2[17] = _unpack_bf16_28[1];
+                w_rounded_2[18] = _unpack_bf16_28[2];
+                w_rounded_2[19] = _unpack_bf16_28[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_28[0], _unpack_bf16_28[0], _unpack_bf16_28[1] * _unpack_bf16_28[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_28[2], _unpack_bf16_28[2], _unpack_bf16_28[3] * _unpack_bf16_28[3]);
                 float w_scaled_2_5[4];
                 w_scaled_2_5[0] = accum[84] * w_sa_lo_2 * sw[10];
                 w_scaled_2_5[1] = accum[85] * w_sa_lo_2 * sw[11];
@@ -2098,18 +2370,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_5[_lp*2 + 0], w_scaled_2_5[_lp*2+1 + 0]));
                     w_scaled_2_5_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_25[4];
+                float _unpack_bf16_29[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_25[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16[_pair]) << 16);
-                    (&_unpack_bf16_25[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_29[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16[_pair]) << 16);
+                    (&_unpack_bf16_29[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[20] = _unpack_bf16_25[0];
-                w_rounded_2[21] = _unpack_bf16_25[1];
-                w_rounded_2[22] = _unpack_bf16_25[2];
-                w_rounded_2[23] = _unpack_bf16_25[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_25[0], _unpack_bf16_25[0], _unpack_bf16_25[1] * _unpack_bf16_25[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_25[2], _unpack_bf16_25[2], _unpack_bf16_25[3] * _unpack_bf16_25[3]);
+                w_rounded_2[20] = _unpack_bf16_29[0];
+                w_rounded_2[21] = _unpack_bf16_29[1];
+                w_rounded_2[22] = _unpack_bf16_29[2];
+                w_rounded_2[23] = _unpack_bf16_29[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_29[0], _unpack_bf16_29[0], _unpack_bf16_29[1] * _unpack_bf16_29[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_29[2], _unpack_bf16_29[2], _unpack_bf16_29[3] * _unpack_bf16_29[3]);
                 float w_scaled_2_6[4];
                 w_scaled_2_6[0] = accum[88] * w_sa_lo_2 * sw[12];
                 w_scaled_2_6[1] = accum[89] * w_sa_lo_2 * sw[13];
@@ -2121,18 +2393,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_6[_lp*2 + 0], w_scaled_2_6[_lp*2+1 + 0]));
                     w_scaled_2_6_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_26[4];
+                float _unpack_bf16_30[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_26[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16[_pair]) << 16);
-                    (&_unpack_bf16_26[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_30[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16[_pair]) << 16);
+                    (&_unpack_bf16_30[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[24] = _unpack_bf16_26[0];
-                w_rounded_2[25] = _unpack_bf16_26[1];
-                w_rounded_2[26] = _unpack_bf16_26[2];
-                w_rounded_2[27] = _unpack_bf16_26[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_26[0], _unpack_bf16_26[0], _unpack_bf16_26[1] * _unpack_bf16_26[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_26[2], _unpack_bf16_26[2], _unpack_bf16_26[3] * _unpack_bf16_26[3]);
+                w_rounded_2[24] = _unpack_bf16_30[0];
+                w_rounded_2[25] = _unpack_bf16_30[1];
+                w_rounded_2[26] = _unpack_bf16_30[2];
+                w_rounded_2[27] = _unpack_bf16_30[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_30[0], _unpack_bf16_30[0], _unpack_bf16_30[1] * _unpack_bf16_30[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_30[2], _unpack_bf16_30[2], _unpack_bf16_30[3] * _unpack_bf16_30[3]);
                 float w_scaled_2_7[4];
                 w_scaled_2_7[0] = accum[92] * w_sa_lo_2 * sw[14];
                 w_scaled_2_7[1] = accum[93] * w_sa_lo_2 * sw[15];
@@ -2144,18 +2416,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_7[_lp*2 + 0], w_scaled_2_7[_lp*2+1 + 0]));
                     w_scaled_2_7_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_27[4];
+                float _unpack_bf16_31[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_27[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16[_pair]) << 16);
-                    (&_unpack_bf16_27[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_31[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16[_pair]) << 16);
+                    (&_unpack_bf16_31[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2[28] = _unpack_bf16_27[0];
-                w_rounded_2[29] = _unpack_bf16_27[1];
-                w_rounded_2[30] = _unpack_bf16_27[2];
-                w_rounded_2[31] = _unpack_bf16_27[3];
-                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_27[0], _unpack_bf16_27[0], _unpack_bf16_27[1] * _unpack_bf16_27[1]);
-                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_27[2], _unpack_bf16_27[2], _unpack_bf16_27[3] * _unpack_bf16_27[3]);
+                w_rounded_2[28] = _unpack_bf16_31[0];
+                w_rounded_2[29] = _unpack_bf16_31[1];
+                w_rounded_2[30] = _unpack_bf16_31[2];
+                w_rounded_2[31] = _unpack_bf16_31[3];
+                w_ss_lo_2 += __fmaf_rn(_unpack_bf16_31[0], _unpack_bf16_31[0], _unpack_bf16_31[1] * _unpack_bf16_31[1]);
+                w_ss_hi_2 += __fmaf_rn(_unpack_bf16_31[2], _unpack_bf16_31[2], _unpack_bf16_31[3] * _unpack_bf16_31[3]);
                 float w_rstd_lo_2 = 1.0f;
                 float w_rstd_hi_2 = 1.0f;
                 if (w_kind < 2) {
@@ -2363,12 +2635,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_2 = role_tid >> 2;
                 int w_c_2 = role_tid & 3;
                 int w_grow_2 = tile_m * 256 + 128 + w_srow_2;
+                int w_chunk_lo_2 = ((w_c_2 < 3) ? w_c_2 * 16 : 96);
+                int w_chunk_hi_2 = ((w_c_2 < 3) ? w_chunk_lo_2 + 48 : 112);
                 if (w_grow_2 < M) {
-                    int w_row_head_2 = w_grow_2 * 56 + w_head;
-                    unsigned int w_st_words_2[4];
-                    float w_st_vals_2[16];
-                    int w_chunk_lo_2 = ((w_c_2 < 3) ? w_c_2 * 16 : 96);
-                    int w_chunk_hi_2 = ((w_c_2 < 3) ? w_chunk_lo_2 + 48 : 112);
                     unsigned int w_x_lo_2[8];
                     unsigned int w_x_hi_2[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2385,17 +2654,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)));
                     if (w_c_2 < 3) {
                         if (w_kind < 2) {
-                            float _unpack_bf16_28[16];
+                            float _unpack_bf16_32[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_28[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) << 16);
-                                (&_unpack_bf16_28[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) << 16);
+                                (&_unpack_bf16_32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_29[16];
+                            float _unpack_bf16_33[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_29[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) << 16);
-                                (&_unpack_bf16_29[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_33[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) << 16);
+                                (&_unpack_bf16_33[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_8[8];
                             {
@@ -2463,66 +2732,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_2_0 = _vec_load_10[0];
                             float w_cv1_2_0 = _vec_load_9[0];
                             float w_sv1_2_0 = _vec_load_11[0];
-                            w_o_lo_2[0] = __fmaf_rn(_unpack_bf16_28[0], w_cv0_2_0, -(_unpack_bf16_29[0] * w_sv0_2_0));
-                            w_o_hi_2[0] = __fmaf_rn(_unpack_bf16_29[0], w_cv0_2_0, _unpack_bf16_28[0] * w_sv0_2_0);
-                            w_o_lo_2[8] = __fmaf_rn(_unpack_bf16_28[8], w_cv1_2_0, -(_unpack_bf16_29[8] * w_sv1_2_0));
-                            w_o_hi_2[8] = __fmaf_rn(_unpack_bf16_29[8], w_cv1_2_0, _unpack_bf16_28[8] * w_sv1_2_0);
+                            w_o_lo_2[0] = __fmaf_rn(_unpack_bf16_32[0], w_cv0_2_0, -(_unpack_bf16_33[0] * w_sv0_2_0));
+                            w_o_hi_2[0] = __fmaf_rn(_unpack_bf16_33[0], w_cv0_2_0, _unpack_bf16_32[0] * w_sv0_2_0);
+                            w_o_lo_2[8] = __fmaf_rn(_unpack_bf16_32[8], w_cv1_2_0, -(_unpack_bf16_33[8] * w_sv1_2_0));
+                            w_o_hi_2[8] = __fmaf_rn(_unpack_bf16_33[8], w_cv1_2_0, _unpack_bf16_32[8] * w_sv1_2_0);
                             float w_cv0_2_1 = _vec_load_8[1];
                             float w_sv0_2_1 = _vec_load_10[1];
                             float w_cv1_2_1 = _vec_load_9[1];
                             float w_sv1_2_1 = _vec_load_11[1];
-                            w_o_lo_2[1] = __fmaf_rn(_unpack_bf16_28[1], w_cv0_2_1, -(_unpack_bf16_29[1] * w_sv0_2_1));
-                            w_o_hi_2[1] = __fmaf_rn(_unpack_bf16_29[1], w_cv0_2_1, _unpack_bf16_28[1] * w_sv0_2_1);
-                            w_o_lo_2[9] = __fmaf_rn(_unpack_bf16_28[9], w_cv1_2_1, -(_unpack_bf16_29[9] * w_sv1_2_1));
-                            w_o_hi_2[9] = __fmaf_rn(_unpack_bf16_29[9], w_cv1_2_1, _unpack_bf16_28[9] * w_sv1_2_1);
+                            w_o_lo_2[1] = __fmaf_rn(_unpack_bf16_32[1], w_cv0_2_1, -(_unpack_bf16_33[1] * w_sv0_2_1));
+                            w_o_hi_2[1] = __fmaf_rn(_unpack_bf16_33[1], w_cv0_2_1, _unpack_bf16_32[1] * w_sv0_2_1);
+                            w_o_lo_2[9] = __fmaf_rn(_unpack_bf16_32[9], w_cv1_2_1, -(_unpack_bf16_33[9] * w_sv1_2_1));
+                            w_o_hi_2[9] = __fmaf_rn(_unpack_bf16_33[9], w_cv1_2_1, _unpack_bf16_32[9] * w_sv1_2_1);
                             float w_cv0_2_2 = _vec_load_8[2];
                             float w_sv0_2_2 = _vec_load_10[2];
                             float w_cv1_2_2 = _vec_load_9[2];
                             float w_sv1_2_2 = _vec_load_11[2];
-                            w_o_lo_2[2] = __fmaf_rn(_unpack_bf16_28[2], w_cv0_2_2, -(_unpack_bf16_29[2] * w_sv0_2_2));
-                            w_o_hi_2[2] = __fmaf_rn(_unpack_bf16_29[2], w_cv0_2_2, _unpack_bf16_28[2] * w_sv0_2_2);
-                            w_o_lo_2[10] = __fmaf_rn(_unpack_bf16_28[10], w_cv1_2_2, -(_unpack_bf16_29[10] * w_sv1_2_2));
-                            w_o_hi_2[10] = __fmaf_rn(_unpack_bf16_29[10], w_cv1_2_2, _unpack_bf16_28[10] * w_sv1_2_2);
+                            w_o_lo_2[2] = __fmaf_rn(_unpack_bf16_32[2], w_cv0_2_2, -(_unpack_bf16_33[2] * w_sv0_2_2));
+                            w_o_hi_2[2] = __fmaf_rn(_unpack_bf16_33[2], w_cv0_2_2, _unpack_bf16_32[2] * w_sv0_2_2);
+                            w_o_lo_2[10] = __fmaf_rn(_unpack_bf16_32[10], w_cv1_2_2, -(_unpack_bf16_33[10] * w_sv1_2_2));
+                            w_o_hi_2[10] = __fmaf_rn(_unpack_bf16_33[10], w_cv1_2_2, _unpack_bf16_32[10] * w_sv1_2_2);
                             float w_cv0_2_3 = _vec_load_8[3];
                             float w_sv0_2_3 = _vec_load_10[3];
                             float w_cv1_2_3 = _vec_load_9[3];
                             float w_sv1_2_3 = _vec_load_11[3];
-                            w_o_lo_2[3] = __fmaf_rn(_unpack_bf16_28[3], w_cv0_2_3, -(_unpack_bf16_29[3] * w_sv0_2_3));
-                            w_o_hi_2[3] = __fmaf_rn(_unpack_bf16_29[3], w_cv0_2_3, _unpack_bf16_28[3] * w_sv0_2_3);
-                            w_o_lo_2[11] = __fmaf_rn(_unpack_bf16_28[11], w_cv1_2_3, -(_unpack_bf16_29[11] * w_sv1_2_3));
-                            w_o_hi_2[11] = __fmaf_rn(_unpack_bf16_29[11], w_cv1_2_3, _unpack_bf16_28[11] * w_sv1_2_3);
+                            w_o_lo_2[3] = __fmaf_rn(_unpack_bf16_32[3], w_cv0_2_3, -(_unpack_bf16_33[3] * w_sv0_2_3));
+                            w_o_hi_2[3] = __fmaf_rn(_unpack_bf16_33[3], w_cv0_2_3, _unpack_bf16_32[3] * w_sv0_2_3);
+                            w_o_lo_2[11] = __fmaf_rn(_unpack_bf16_32[11], w_cv1_2_3, -(_unpack_bf16_33[11] * w_sv1_2_3));
+                            w_o_hi_2[11] = __fmaf_rn(_unpack_bf16_33[11], w_cv1_2_3, _unpack_bf16_32[11] * w_sv1_2_3);
                             float w_cv0_2_4 = _vec_load_8[4];
                             float w_sv0_2_4 = _vec_load_10[4];
                             float w_cv1_2_4 = _vec_load_9[4];
                             float w_sv1_2_4 = _vec_load_11[4];
-                            w_o_lo_2[4] = __fmaf_rn(_unpack_bf16_28[4], w_cv0_2_4, -(_unpack_bf16_29[4] * w_sv0_2_4));
-                            w_o_hi_2[4] = __fmaf_rn(_unpack_bf16_29[4], w_cv0_2_4, _unpack_bf16_28[4] * w_sv0_2_4);
-                            w_o_lo_2[12] = __fmaf_rn(_unpack_bf16_28[12], w_cv1_2_4, -(_unpack_bf16_29[12] * w_sv1_2_4));
-                            w_o_hi_2[12] = __fmaf_rn(_unpack_bf16_29[12], w_cv1_2_4, _unpack_bf16_28[12] * w_sv1_2_4);
+                            w_o_lo_2[4] = __fmaf_rn(_unpack_bf16_32[4], w_cv0_2_4, -(_unpack_bf16_33[4] * w_sv0_2_4));
+                            w_o_hi_2[4] = __fmaf_rn(_unpack_bf16_33[4], w_cv0_2_4, _unpack_bf16_32[4] * w_sv0_2_4);
+                            w_o_lo_2[12] = __fmaf_rn(_unpack_bf16_32[12], w_cv1_2_4, -(_unpack_bf16_33[12] * w_sv1_2_4));
+                            w_o_hi_2[12] = __fmaf_rn(_unpack_bf16_33[12], w_cv1_2_4, _unpack_bf16_32[12] * w_sv1_2_4);
                             float w_cv0_2_5 = _vec_load_8[5];
                             float w_sv0_2_5 = _vec_load_10[5];
                             float w_cv1_2_5 = _vec_load_9[5];
                             float w_sv1_2_5 = _vec_load_11[5];
-                            w_o_lo_2[5] = __fmaf_rn(_unpack_bf16_28[5], w_cv0_2_5, -(_unpack_bf16_29[5] * w_sv0_2_5));
-                            w_o_hi_2[5] = __fmaf_rn(_unpack_bf16_29[5], w_cv0_2_5, _unpack_bf16_28[5] * w_sv0_2_5);
-                            w_o_lo_2[13] = __fmaf_rn(_unpack_bf16_28[13], w_cv1_2_5, -(_unpack_bf16_29[13] * w_sv1_2_5));
-                            w_o_hi_2[13] = __fmaf_rn(_unpack_bf16_29[13], w_cv1_2_5, _unpack_bf16_28[13] * w_sv1_2_5);
+                            w_o_lo_2[5] = __fmaf_rn(_unpack_bf16_32[5], w_cv0_2_5, -(_unpack_bf16_33[5] * w_sv0_2_5));
+                            w_o_hi_2[5] = __fmaf_rn(_unpack_bf16_33[5], w_cv0_2_5, _unpack_bf16_32[5] * w_sv0_2_5);
+                            w_o_lo_2[13] = __fmaf_rn(_unpack_bf16_32[13], w_cv1_2_5, -(_unpack_bf16_33[13] * w_sv1_2_5));
+                            w_o_hi_2[13] = __fmaf_rn(_unpack_bf16_33[13], w_cv1_2_5, _unpack_bf16_32[13] * w_sv1_2_5);
                             float w_cv0_2_6 = _vec_load_8[6];
                             float w_sv0_2_6 = _vec_load_10[6];
                             float w_cv1_2_6 = _vec_load_9[6];
                             float w_sv1_2_6 = _vec_load_11[6];
-                            w_o_lo_2[6] = __fmaf_rn(_unpack_bf16_28[6], w_cv0_2_6, -(_unpack_bf16_29[6] * w_sv0_2_6));
-                            w_o_hi_2[6] = __fmaf_rn(_unpack_bf16_29[6], w_cv0_2_6, _unpack_bf16_28[6] * w_sv0_2_6);
-                            w_o_lo_2[14] = __fmaf_rn(_unpack_bf16_28[14], w_cv1_2_6, -(_unpack_bf16_29[14] * w_sv1_2_6));
-                            w_o_hi_2[14] = __fmaf_rn(_unpack_bf16_29[14], w_cv1_2_6, _unpack_bf16_28[14] * w_sv1_2_6);
+                            w_o_lo_2[6] = __fmaf_rn(_unpack_bf16_32[6], w_cv0_2_6, -(_unpack_bf16_33[6] * w_sv0_2_6));
+                            w_o_hi_2[6] = __fmaf_rn(_unpack_bf16_33[6], w_cv0_2_6, _unpack_bf16_32[6] * w_sv0_2_6);
+                            w_o_lo_2[14] = __fmaf_rn(_unpack_bf16_32[14], w_cv1_2_6, -(_unpack_bf16_33[14] * w_sv1_2_6));
+                            w_o_hi_2[14] = __fmaf_rn(_unpack_bf16_33[14], w_cv1_2_6, _unpack_bf16_32[14] * w_sv1_2_6);
                             float w_cv0_2_7 = _vec_load_8[7];
                             float w_sv0_2_7 = _vec_load_10[7];
                             float w_cv1_2_7 = _vec_load_9[7];
                             float w_sv1_2_7 = _vec_load_11[7];
-                            w_o_lo_2[7] = __fmaf_rn(_unpack_bf16_28[7], w_cv0_2_7, -(_unpack_bf16_29[7] * w_sv0_2_7));
-                            w_o_hi_2[7] = __fmaf_rn(_unpack_bf16_29[7], w_cv0_2_7, _unpack_bf16_28[7] * w_sv0_2_7);
-                            w_o_lo_2[15] = __fmaf_rn(_unpack_bf16_28[15], w_cv1_2_7, -(_unpack_bf16_29[15] * w_sv1_2_7));
-                            w_o_hi_2[15] = __fmaf_rn(_unpack_bf16_29[15], w_cv1_2_7, _unpack_bf16_28[15] * w_sv1_2_7);
+                            w_o_lo_2[7] = __fmaf_rn(_unpack_bf16_32[7], w_cv0_2_7, -(_unpack_bf16_33[7] * w_sv0_2_7));
+                            w_o_hi_2[7] = __fmaf_rn(_unpack_bf16_33[7], w_cv0_2_7, _unpack_bf16_32[7] * w_sv0_2_7);
+                            w_o_lo_2[15] = __fmaf_rn(_unpack_bf16_32[15], w_cv1_2_7, -(_unpack_bf16_33[15] * w_sv1_2_7));
+                            w_o_hi_2[15] = __fmaf_rn(_unpack_bf16_33[15], w_cv1_2_7, _unpack_bf16_32[15] * w_sv1_2_7);
                             unsigned int w_o_lo_2_bf16[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -2535,69 +2804,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_2[_lp*2 + 0], w_o_hi_2[_lp*2+1 + 0]));
                                 w_o_hi_2_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            }
+                            w_x_lo_2[0] = w_o_lo_2_bf16[0];
+                            w_x_hi_2[0] = w_o_hi_2_bf16[0];
+                            w_x_lo_2[1] = w_o_lo_2_bf16[1];
+                            w_x_hi_2[1] = w_o_hi_2_bf16[1];
+                            w_x_lo_2[2] = w_o_lo_2_bf16[2];
+                            w_x_hi_2[2] = w_o_hi_2_bf16[2];
+                            w_x_lo_2[3] = w_o_lo_2_bf16[3];
+                            w_x_hi_2[3] = w_o_hi_2_bf16[3];
+                            w_x_lo_2[4] = w_o_lo_2_bf16[4];
+                            w_x_hi_2[4] = w_o_hi_2_bf16[4];
+                            w_x_lo_2[5] = w_o_lo_2_bf16[5];
+                            w_x_hi_2[5] = w_o_hi_2_bf16[5];
+                            w_x_lo_2[6] = w_o_lo_2_bf16[6];
+                            w_x_hi_2[6] = w_o_hi_2_bf16[6];
+                            w_x_lo_2[7] = w_o_lo_2_bf16[7];
+                            w_x_hi_2[7] = w_o_hi_2_bf16[7];
                         }
+                    }
+                    unsigned int w_q_words_2[4];
+                    float w_q_vals_2[16];
+                    float _unpack_bf16_34[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_34[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) << 16);
+                        (&_unpack_bf16_34[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_2[0] = _unpack_bf16_34[0] * w_out_scale_sel;
+                    w_q_vals_2[1] = _unpack_bf16_34[1] * w_out_scale_sel;
+                    w_q_vals_2[2] = _unpack_bf16_34[2] * w_out_scale_sel;
+                    w_q_vals_2[3] = _unpack_bf16_34[3] * w_out_scale_sel;
+                    w_q_vals_2[4] = _unpack_bf16_34[4] * w_out_scale_sel;
+                    w_q_vals_2[5] = _unpack_bf16_34[5] * w_out_scale_sel;
+                    w_q_vals_2[6] = _unpack_bf16_34[6] * w_out_scale_sel;
+                    w_q_vals_2[7] = _unpack_bf16_34[7] * w_out_scale_sel;
+                    w_q_vals_2[8] = _unpack_bf16_34[8] * w_out_scale_sel;
+                    w_q_vals_2[9] = _unpack_bf16_34[9] * w_out_scale_sel;
+                    w_q_vals_2[10] = _unpack_bf16_34[10] * w_out_scale_sel;
+                    w_q_vals_2[11] = _unpack_bf16_34[11] * w_out_scale_sel;
+                    w_q_vals_2[12] = _unpack_bf16_34[12] * w_out_scale_sel;
+                    w_q_vals_2[13] = _unpack_bf16_34[13] * w_out_scale_sel;
+                    w_q_vals_2[14] = _unpack_bf16_34[14] * w_out_scale_sel;
+                    w_q_vals_2[15] = _unpack_bf16_34[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[0]), "f"(w_q_vals_2[1]),
+                                               "f"(w_q_vals_2[2]), "f"(w_q_vals_2[3]));
+                        w_q_words_2[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[4]), "f"(w_q_vals_2[5]),
+                                               "f"(w_q_vals_2[6]), "f"(w_q_vals_2[7]));
+                        w_q_words_2[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[8]), "f"(w_q_vals_2[9]),
+                                               "f"(w_q_vals_2[10]), "f"(w_q_vals_2[11]));
+                        w_q_words_2[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[12]), "f"(w_q_vals_2[13]),
+                                               "f"(w_q_vals_2[14]), "f"(w_q_vals_2[15]));
+                        w_q_words_2[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_2 * 128) + (unsigned int)(w_chunk_lo_2 ^ (w_srow_2 & 7) << 4)), "r"(w_q_words_2[0]), "r"(w_q_words_2[1]), "r"(w_q_words_2[2]), "r"(w_q_words_2[3]) : "memory");
+                    float _unpack_bf16_35[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_35[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) << 16);
+                        (&_unpack_bf16_35[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_2[0] = _unpack_bf16_35[0] * w_out_scale_sel;
+                    w_q_vals_2[1] = _unpack_bf16_35[1] * w_out_scale_sel;
+                    w_q_vals_2[2] = _unpack_bf16_35[2] * w_out_scale_sel;
+                    w_q_vals_2[3] = _unpack_bf16_35[3] * w_out_scale_sel;
+                    w_q_vals_2[4] = _unpack_bf16_35[4] * w_out_scale_sel;
+                    w_q_vals_2[5] = _unpack_bf16_35[5] * w_out_scale_sel;
+                    w_q_vals_2[6] = _unpack_bf16_35[6] * w_out_scale_sel;
+                    w_q_vals_2[7] = _unpack_bf16_35[7] * w_out_scale_sel;
+                    w_q_vals_2[8] = _unpack_bf16_35[8] * w_out_scale_sel;
+                    w_q_vals_2[9] = _unpack_bf16_35[9] * w_out_scale_sel;
+                    w_q_vals_2[10] = _unpack_bf16_35[10] * w_out_scale_sel;
+                    w_q_vals_2[11] = _unpack_bf16_35[11] * w_out_scale_sel;
+                    w_q_vals_2[12] = _unpack_bf16_35[12] * w_out_scale_sel;
+                    w_q_vals_2[13] = _unpack_bf16_35[13] * w_out_scale_sel;
+                    w_q_vals_2[14] = _unpack_bf16_35[14] * w_out_scale_sel;
+                    w_q_vals_2[15] = _unpack_bf16_35[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[0]), "f"(w_q_vals_2[1]),
+                                               "f"(w_q_vals_2[2]), "f"(w_q_vals_2[3]));
+                        w_q_words_2[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[4]), "f"(w_q_vals_2[5]),
+                                               "f"(w_q_vals_2[6]), "f"(w_q_vals_2[7]));
+                        w_q_words_2[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[8]), "f"(w_q_vals_2[9]),
+                                               "f"(w_q_vals_2[10]), "f"(w_q_vals_2[11]));
+                        w_q_words_2[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2[12]), "f"(w_q_vals_2[13]),
+                                               "f"(w_q_vals_2[14]), "f"(w_q_vals_2[15]));
+                        w_q_words_2[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_2 * 128) + (unsigned int)(w_chunk_hi_2 ^ (w_srow_2 & 7) << 4)), "r"(w_q_words_2[0]), "r"(w_q_words_2[1]), "r"(w_q_words_2[2]), "r"(w_q_words_2[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_2_0 = (role_tid >> 5) * 8 + lane / 8;
+                int s_piece_2_0 = lane % 8;
+                unsigned int s_words_2_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_2_0 * 128) + (unsigned int)(s_piece_2_0 * 16 ^ (s_row_2_0 & 7) << 4)));
+                int s_dst_2_0 = ((tile_m * 256 + 128 + s_row_2_0) * 56 + w_head) * 32 + s_piece_2_0 * 4;
+                if (tile_m * 256 + 128 + s_row_2_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
+                    }
+                }
+                int s_row_2_1 = (role_tid >> 5) * 8 + 4 + lane / 8;
+                int s_piece_2_1 = lane % 8;
+                unsigned int s_words_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_2_1 * 128) + (unsigned int)(s_piece_2_1 * 16 ^ (s_row_2_1 & 7) << 4)));
+                int s_dst_2_1 = ((tile_m * 256 + 128 + s_row_2_1) * 56 + w_head) * 32 + s_piece_2_1 * 4;
+                if (tile_m * 256 + 128 + s_row_2_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -2619,18 +3027,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_0[_lp*2 + 0], w_scaled_3_0[_lp*2+1 + 0]));
                     w_scaled_3_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_30[4];
+                float _unpack_bf16_36[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_30[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16[_pair]) << 16);
-                    (&_unpack_bf16_30[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_36[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16[_pair]) << 16);
+                    (&_unpack_bf16_36[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[0] = _unpack_bf16_30[0];
-                w_rounded_3[1] = _unpack_bf16_30[1];
-                w_rounded_3[2] = _unpack_bf16_30[2];
-                w_rounded_3[3] = _unpack_bf16_30[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_30[0], _unpack_bf16_30[0], _unpack_bf16_30[1] * _unpack_bf16_30[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_30[2], _unpack_bf16_30[2], _unpack_bf16_30[3] * _unpack_bf16_30[3]);
+                w_rounded_3[0] = _unpack_bf16_36[0];
+                w_rounded_3[1] = _unpack_bf16_36[1];
+                w_rounded_3[2] = _unpack_bf16_36[2];
+                w_rounded_3[3] = _unpack_bf16_36[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_36[0], _unpack_bf16_36[0], _unpack_bf16_36[1] * _unpack_bf16_36[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_36[2], _unpack_bf16_36[2], _unpack_bf16_36[3] * _unpack_bf16_36[3]);
                 float w_scaled_3_1[4];
                 w_scaled_3_1[0] = accum[100] * w_sa_lo_3 * sw[2];
                 w_scaled_3_1[1] = accum[101] * w_sa_lo_3 * sw[3];
@@ -2642,18 +3050,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_1[_lp*2 + 0], w_scaled_3_1[_lp*2+1 + 0]));
                     w_scaled_3_1_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_31[4];
+                float _unpack_bf16_37[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_31[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16[_pair]) << 16);
-                    (&_unpack_bf16_31[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_37[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16[_pair]) << 16);
+                    (&_unpack_bf16_37[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[4] = _unpack_bf16_31[0];
-                w_rounded_3[5] = _unpack_bf16_31[1];
-                w_rounded_3[6] = _unpack_bf16_31[2];
-                w_rounded_3[7] = _unpack_bf16_31[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_31[0], _unpack_bf16_31[0], _unpack_bf16_31[1] * _unpack_bf16_31[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_31[2], _unpack_bf16_31[2], _unpack_bf16_31[3] * _unpack_bf16_31[3]);
+                w_rounded_3[4] = _unpack_bf16_37[0];
+                w_rounded_3[5] = _unpack_bf16_37[1];
+                w_rounded_3[6] = _unpack_bf16_37[2];
+                w_rounded_3[7] = _unpack_bf16_37[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_37[0], _unpack_bf16_37[0], _unpack_bf16_37[1] * _unpack_bf16_37[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_37[2], _unpack_bf16_37[2], _unpack_bf16_37[3] * _unpack_bf16_37[3]);
                 float w_scaled_3_2[4];
                 w_scaled_3_2[0] = accum[104] * w_sa_lo_3 * sw[4];
                 w_scaled_3_2[1] = accum[105] * w_sa_lo_3 * sw[5];
@@ -2665,18 +3073,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_2[_lp*2 + 0], w_scaled_3_2[_lp*2+1 + 0]));
                     w_scaled_3_2_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_32[4];
+                float _unpack_bf16_38[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_32[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16[_pair]) << 16);
-                    (&_unpack_bf16_32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_38[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16[_pair]) << 16);
+                    (&_unpack_bf16_38[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[8] = _unpack_bf16_32[0];
-                w_rounded_3[9] = _unpack_bf16_32[1];
-                w_rounded_3[10] = _unpack_bf16_32[2];
-                w_rounded_3[11] = _unpack_bf16_32[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_32[0], _unpack_bf16_32[0], _unpack_bf16_32[1] * _unpack_bf16_32[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_32[2], _unpack_bf16_32[2], _unpack_bf16_32[3] * _unpack_bf16_32[3]);
+                w_rounded_3[8] = _unpack_bf16_38[0];
+                w_rounded_3[9] = _unpack_bf16_38[1];
+                w_rounded_3[10] = _unpack_bf16_38[2];
+                w_rounded_3[11] = _unpack_bf16_38[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_38[0], _unpack_bf16_38[0], _unpack_bf16_38[1] * _unpack_bf16_38[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_38[2], _unpack_bf16_38[2], _unpack_bf16_38[3] * _unpack_bf16_38[3]);
                 float w_scaled_3_3[4];
                 w_scaled_3_3[0] = accum[108] * w_sa_lo_3 * sw[6];
                 w_scaled_3_3[1] = accum[109] * w_sa_lo_3 * sw[7];
@@ -2688,18 +3096,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_3[_lp*2 + 0], w_scaled_3_3[_lp*2+1 + 0]));
                     w_scaled_3_3_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_33[4];
+                float _unpack_bf16_39[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_33[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16[_pair]) << 16);
-                    (&_unpack_bf16_33[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_39[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16[_pair]) << 16);
+                    (&_unpack_bf16_39[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[12] = _unpack_bf16_33[0];
-                w_rounded_3[13] = _unpack_bf16_33[1];
-                w_rounded_3[14] = _unpack_bf16_33[2];
-                w_rounded_3[15] = _unpack_bf16_33[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_33[0], _unpack_bf16_33[0], _unpack_bf16_33[1] * _unpack_bf16_33[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_33[2], _unpack_bf16_33[2], _unpack_bf16_33[3] * _unpack_bf16_33[3]);
+                w_rounded_3[12] = _unpack_bf16_39[0];
+                w_rounded_3[13] = _unpack_bf16_39[1];
+                w_rounded_3[14] = _unpack_bf16_39[2];
+                w_rounded_3[15] = _unpack_bf16_39[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_39[0], _unpack_bf16_39[0], _unpack_bf16_39[1] * _unpack_bf16_39[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_39[2], _unpack_bf16_39[2], _unpack_bf16_39[3] * _unpack_bf16_39[3]);
                 float w_scaled_3_4[4];
                 w_scaled_3_4[0] = accum[112] * w_sa_lo_3 * sw[8];
                 w_scaled_3_4[1] = accum[113] * w_sa_lo_3 * sw[9];
@@ -2711,18 +3119,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_4[_lp*2 + 0], w_scaled_3_4[_lp*2+1 + 0]));
                     w_scaled_3_4_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_34[4];
+                float _unpack_bf16_40[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_34[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16[_pair]) << 16);
-                    (&_unpack_bf16_34[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_40[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16[_pair]) << 16);
+                    (&_unpack_bf16_40[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[16] = _unpack_bf16_34[0];
-                w_rounded_3[17] = _unpack_bf16_34[1];
-                w_rounded_3[18] = _unpack_bf16_34[2];
-                w_rounded_3[19] = _unpack_bf16_34[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_34[0], _unpack_bf16_34[0], _unpack_bf16_34[1] * _unpack_bf16_34[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_34[2], _unpack_bf16_34[2], _unpack_bf16_34[3] * _unpack_bf16_34[3]);
+                w_rounded_3[16] = _unpack_bf16_40[0];
+                w_rounded_3[17] = _unpack_bf16_40[1];
+                w_rounded_3[18] = _unpack_bf16_40[2];
+                w_rounded_3[19] = _unpack_bf16_40[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_40[0], _unpack_bf16_40[0], _unpack_bf16_40[1] * _unpack_bf16_40[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_40[2], _unpack_bf16_40[2], _unpack_bf16_40[3] * _unpack_bf16_40[3]);
                 float w_scaled_3_5[4];
                 w_scaled_3_5[0] = accum[116] * w_sa_lo_3 * sw[10];
                 w_scaled_3_5[1] = accum[117] * w_sa_lo_3 * sw[11];
@@ -2734,18 +3142,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_5[_lp*2 + 0], w_scaled_3_5[_lp*2+1 + 0]));
                     w_scaled_3_5_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_35[4];
+                float _unpack_bf16_41[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_35[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16[_pair]) << 16);
-                    (&_unpack_bf16_35[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_41[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16[_pair]) << 16);
+                    (&_unpack_bf16_41[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[20] = _unpack_bf16_35[0];
-                w_rounded_3[21] = _unpack_bf16_35[1];
-                w_rounded_3[22] = _unpack_bf16_35[2];
-                w_rounded_3[23] = _unpack_bf16_35[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_35[0], _unpack_bf16_35[0], _unpack_bf16_35[1] * _unpack_bf16_35[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_35[2], _unpack_bf16_35[2], _unpack_bf16_35[3] * _unpack_bf16_35[3]);
+                w_rounded_3[20] = _unpack_bf16_41[0];
+                w_rounded_3[21] = _unpack_bf16_41[1];
+                w_rounded_3[22] = _unpack_bf16_41[2];
+                w_rounded_3[23] = _unpack_bf16_41[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_41[0], _unpack_bf16_41[0], _unpack_bf16_41[1] * _unpack_bf16_41[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_41[2], _unpack_bf16_41[2], _unpack_bf16_41[3] * _unpack_bf16_41[3]);
                 float w_scaled_3_6[4];
                 w_scaled_3_6[0] = accum[120] * w_sa_lo_3 * sw[12];
                 w_scaled_3_6[1] = accum[121] * w_sa_lo_3 * sw[13];
@@ -2757,18 +3165,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_6[_lp*2 + 0], w_scaled_3_6[_lp*2+1 + 0]));
                     w_scaled_3_6_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_36[4];
+                float _unpack_bf16_42[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_36[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16[_pair]) << 16);
-                    (&_unpack_bf16_36[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_42[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16[_pair]) << 16);
+                    (&_unpack_bf16_42[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[24] = _unpack_bf16_36[0];
-                w_rounded_3[25] = _unpack_bf16_36[1];
-                w_rounded_3[26] = _unpack_bf16_36[2];
-                w_rounded_3[27] = _unpack_bf16_36[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_36[0], _unpack_bf16_36[0], _unpack_bf16_36[1] * _unpack_bf16_36[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_36[2], _unpack_bf16_36[2], _unpack_bf16_36[3] * _unpack_bf16_36[3]);
+                w_rounded_3[24] = _unpack_bf16_42[0];
+                w_rounded_3[25] = _unpack_bf16_42[1];
+                w_rounded_3[26] = _unpack_bf16_42[2];
+                w_rounded_3[27] = _unpack_bf16_42[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_42[0], _unpack_bf16_42[0], _unpack_bf16_42[1] * _unpack_bf16_42[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_42[2], _unpack_bf16_42[2], _unpack_bf16_42[3] * _unpack_bf16_42[3]);
                 float w_scaled_3_7[4];
                 w_scaled_3_7[0] = accum[124] * w_sa_lo_3 * sw[14];
                 w_scaled_3_7[1] = accum[125] * w_sa_lo_3 * sw[15];
@@ -2780,18 +3188,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_7[_lp*2 + 0], w_scaled_3_7[_lp*2+1 + 0]));
                     w_scaled_3_7_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_37[4];
+                float _unpack_bf16_43[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_37[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16[_pair]) << 16);
-                    (&_unpack_bf16_37[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_43[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16[_pair]) << 16);
+                    (&_unpack_bf16_43[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3[28] = _unpack_bf16_37[0];
-                w_rounded_3[29] = _unpack_bf16_37[1];
-                w_rounded_3[30] = _unpack_bf16_37[2];
-                w_rounded_3[31] = _unpack_bf16_37[3];
-                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_37[0], _unpack_bf16_37[0], _unpack_bf16_37[1] * _unpack_bf16_37[1]);
-                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_37[2], _unpack_bf16_37[2], _unpack_bf16_37[3] * _unpack_bf16_37[3]);
+                w_rounded_3[28] = _unpack_bf16_43[0];
+                w_rounded_3[29] = _unpack_bf16_43[1];
+                w_rounded_3[30] = _unpack_bf16_43[2];
+                w_rounded_3[31] = _unpack_bf16_43[3];
+                w_ss_lo_3 += __fmaf_rn(_unpack_bf16_43[0], _unpack_bf16_43[0], _unpack_bf16_43[1] * _unpack_bf16_43[1]);
+                w_ss_hi_3 += __fmaf_rn(_unpack_bf16_43[2], _unpack_bf16_43[2], _unpack_bf16_43[3] * _unpack_bf16_43[3]);
                 float w_rstd_lo_3 = 1.0f;
                 float w_rstd_hi_3 = 1.0f;
                 if (w_kind < 2) {
@@ -2999,12 +3407,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_3 = role_tid >> 2;
                 int w_c_3 = role_tid & 3;
                 int w_grow_3 = tile_m * 256 + 192 + w_srow_3;
+                int w_chunk_lo_3 = ((w_c_3 < 3) ? w_c_3 * 16 : 96);
+                int w_chunk_hi_3 = ((w_c_3 < 3) ? w_chunk_lo_3 + 48 : 112);
                 if (w_grow_3 < M) {
-                    int w_row_head_3 = w_grow_3 * 56 + w_head;
-                    unsigned int w_st_words_3[4];
-                    float w_st_vals_3[16];
-                    int w_chunk_lo_3 = ((w_c_3 < 3) ? w_c_3 * 16 : 96);
-                    int w_chunk_hi_3 = ((w_c_3 < 3) ? w_chunk_lo_3 + 48 : 112);
                     unsigned int w_x_lo_3[8];
                     unsigned int w_x_hi_3[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -3021,17 +3426,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)));
                     if (w_c_3 < 3) {
                         if (w_kind < 2) {
-                            float _unpack_bf16_38[16];
+                            float _unpack_bf16_44[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_38[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) << 16);
-                                (&_unpack_bf16_38[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_44[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) << 16);
+                                (&_unpack_bf16_44[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_39[16];
+                            float _unpack_bf16_45[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_39[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) << 16);
-                                (&_unpack_bf16_39[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_45[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) << 16);
+                                (&_unpack_bf16_45[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_12[8];
                             {
@@ -3099,66 +3504,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_3_0 = _vec_load_14[0];
                             float w_cv1_3_0 = _vec_load_13[0];
                             float w_sv1_3_0 = _vec_load_15[0];
-                            w_o_lo_3[0] = __fmaf_rn(_unpack_bf16_38[0], w_cv0_3_0, -(_unpack_bf16_39[0] * w_sv0_3_0));
-                            w_o_hi_3[0] = __fmaf_rn(_unpack_bf16_39[0], w_cv0_3_0, _unpack_bf16_38[0] * w_sv0_3_0);
-                            w_o_lo_3[8] = __fmaf_rn(_unpack_bf16_38[8], w_cv1_3_0, -(_unpack_bf16_39[8] * w_sv1_3_0));
-                            w_o_hi_3[8] = __fmaf_rn(_unpack_bf16_39[8], w_cv1_3_0, _unpack_bf16_38[8] * w_sv1_3_0);
+                            w_o_lo_3[0] = __fmaf_rn(_unpack_bf16_44[0], w_cv0_3_0, -(_unpack_bf16_45[0] * w_sv0_3_0));
+                            w_o_hi_3[0] = __fmaf_rn(_unpack_bf16_45[0], w_cv0_3_0, _unpack_bf16_44[0] * w_sv0_3_0);
+                            w_o_lo_3[8] = __fmaf_rn(_unpack_bf16_44[8], w_cv1_3_0, -(_unpack_bf16_45[8] * w_sv1_3_0));
+                            w_o_hi_3[8] = __fmaf_rn(_unpack_bf16_45[8], w_cv1_3_0, _unpack_bf16_44[8] * w_sv1_3_0);
                             float w_cv0_3_1 = _vec_load_12[1];
                             float w_sv0_3_1 = _vec_load_14[1];
                             float w_cv1_3_1 = _vec_load_13[1];
                             float w_sv1_3_1 = _vec_load_15[1];
-                            w_o_lo_3[1] = __fmaf_rn(_unpack_bf16_38[1], w_cv0_3_1, -(_unpack_bf16_39[1] * w_sv0_3_1));
-                            w_o_hi_3[1] = __fmaf_rn(_unpack_bf16_39[1], w_cv0_3_1, _unpack_bf16_38[1] * w_sv0_3_1);
-                            w_o_lo_3[9] = __fmaf_rn(_unpack_bf16_38[9], w_cv1_3_1, -(_unpack_bf16_39[9] * w_sv1_3_1));
-                            w_o_hi_3[9] = __fmaf_rn(_unpack_bf16_39[9], w_cv1_3_1, _unpack_bf16_38[9] * w_sv1_3_1);
+                            w_o_lo_3[1] = __fmaf_rn(_unpack_bf16_44[1], w_cv0_3_1, -(_unpack_bf16_45[1] * w_sv0_3_1));
+                            w_o_hi_3[1] = __fmaf_rn(_unpack_bf16_45[1], w_cv0_3_1, _unpack_bf16_44[1] * w_sv0_3_1);
+                            w_o_lo_3[9] = __fmaf_rn(_unpack_bf16_44[9], w_cv1_3_1, -(_unpack_bf16_45[9] * w_sv1_3_1));
+                            w_o_hi_3[9] = __fmaf_rn(_unpack_bf16_45[9], w_cv1_3_1, _unpack_bf16_44[9] * w_sv1_3_1);
                             float w_cv0_3_2 = _vec_load_12[2];
                             float w_sv0_3_2 = _vec_load_14[2];
                             float w_cv1_3_2 = _vec_load_13[2];
                             float w_sv1_3_2 = _vec_load_15[2];
-                            w_o_lo_3[2] = __fmaf_rn(_unpack_bf16_38[2], w_cv0_3_2, -(_unpack_bf16_39[2] * w_sv0_3_2));
-                            w_o_hi_3[2] = __fmaf_rn(_unpack_bf16_39[2], w_cv0_3_2, _unpack_bf16_38[2] * w_sv0_3_2);
-                            w_o_lo_3[10] = __fmaf_rn(_unpack_bf16_38[10], w_cv1_3_2, -(_unpack_bf16_39[10] * w_sv1_3_2));
-                            w_o_hi_3[10] = __fmaf_rn(_unpack_bf16_39[10], w_cv1_3_2, _unpack_bf16_38[10] * w_sv1_3_2);
+                            w_o_lo_3[2] = __fmaf_rn(_unpack_bf16_44[2], w_cv0_3_2, -(_unpack_bf16_45[2] * w_sv0_3_2));
+                            w_o_hi_3[2] = __fmaf_rn(_unpack_bf16_45[2], w_cv0_3_2, _unpack_bf16_44[2] * w_sv0_3_2);
+                            w_o_lo_3[10] = __fmaf_rn(_unpack_bf16_44[10], w_cv1_3_2, -(_unpack_bf16_45[10] * w_sv1_3_2));
+                            w_o_hi_3[10] = __fmaf_rn(_unpack_bf16_45[10], w_cv1_3_2, _unpack_bf16_44[10] * w_sv1_3_2);
                             float w_cv0_3_3 = _vec_load_12[3];
                             float w_sv0_3_3 = _vec_load_14[3];
                             float w_cv1_3_3 = _vec_load_13[3];
                             float w_sv1_3_3 = _vec_load_15[3];
-                            w_o_lo_3[3] = __fmaf_rn(_unpack_bf16_38[3], w_cv0_3_3, -(_unpack_bf16_39[3] * w_sv0_3_3));
-                            w_o_hi_3[3] = __fmaf_rn(_unpack_bf16_39[3], w_cv0_3_3, _unpack_bf16_38[3] * w_sv0_3_3);
-                            w_o_lo_3[11] = __fmaf_rn(_unpack_bf16_38[11], w_cv1_3_3, -(_unpack_bf16_39[11] * w_sv1_3_3));
-                            w_o_hi_3[11] = __fmaf_rn(_unpack_bf16_39[11], w_cv1_3_3, _unpack_bf16_38[11] * w_sv1_3_3);
+                            w_o_lo_3[3] = __fmaf_rn(_unpack_bf16_44[3], w_cv0_3_3, -(_unpack_bf16_45[3] * w_sv0_3_3));
+                            w_o_hi_3[3] = __fmaf_rn(_unpack_bf16_45[3], w_cv0_3_3, _unpack_bf16_44[3] * w_sv0_3_3);
+                            w_o_lo_3[11] = __fmaf_rn(_unpack_bf16_44[11], w_cv1_3_3, -(_unpack_bf16_45[11] * w_sv1_3_3));
+                            w_o_hi_3[11] = __fmaf_rn(_unpack_bf16_45[11], w_cv1_3_3, _unpack_bf16_44[11] * w_sv1_3_3);
                             float w_cv0_3_4 = _vec_load_12[4];
                             float w_sv0_3_4 = _vec_load_14[4];
                             float w_cv1_3_4 = _vec_load_13[4];
                             float w_sv1_3_4 = _vec_load_15[4];
-                            w_o_lo_3[4] = __fmaf_rn(_unpack_bf16_38[4], w_cv0_3_4, -(_unpack_bf16_39[4] * w_sv0_3_4));
-                            w_o_hi_3[4] = __fmaf_rn(_unpack_bf16_39[4], w_cv0_3_4, _unpack_bf16_38[4] * w_sv0_3_4);
-                            w_o_lo_3[12] = __fmaf_rn(_unpack_bf16_38[12], w_cv1_3_4, -(_unpack_bf16_39[12] * w_sv1_3_4));
-                            w_o_hi_3[12] = __fmaf_rn(_unpack_bf16_39[12], w_cv1_3_4, _unpack_bf16_38[12] * w_sv1_3_4);
+                            w_o_lo_3[4] = __fmaf_rn(_unpack_bf16_44[4], w_cv0_3_4, -(_unpack_bf16_45[4] * w_sv0_3_4));
+                            w_o_hi_3[4] = __fmaf_rn(_unpack_bf16_45[4], w_cv0_3_4, _unpack_bf16_44[4] * w_sv0_3_4);
+                            w_o_lo_3[12] = __fmaf_rn(_unpack_bf16_44[12], w_cv1_3_4, -(_unpack_bf16_45[12] * w_sv1_3_4));
+                            w_o_hi_3[12] = __fmaf_rn(_unpack_bf16_45[12], w_cv1_3_4, _unpack_bf16_44[12] * w_sv1_3_4);
                             float w_cv0_3_5 = _vec_load_12[5];
                             float w_sv0_3_5 = _vec_load_14[5];
                             float w_cv1_3_5 = _vec_load_13[5];
                             float w_sv1_3_5 = _vec_load_15[5];
-                            w_o_lo_3[5] = __fmaf_rn(_unpack_bf16_38[5], w_cv0_3_5, -(_unpack_bf16_39[5] * w_sv0_3_5));
-                            w_o_hi_3[5] = __fmaf_rn(_unpack_bf16_39[5], w_cv0_3_5, _unpack_bf16_38[5] * w_sv0_3_5);
-                            w_o_lo_3[13] = __fmaf_rn(_unpack_bf16_38[13], w_cv1_3_5, -(_unpack_bf16_39[13] * w_sv1_3_5));
-                            w_o_hi_3[13] = __fmaf_rn(_unpack_bf16_39[13], w_cv1_3_5, _unpack_bf16_38[13] * w_sv1_3_5);
+                            w_o_lo_3[5] = __fmaf_rn(_unpack_bf16_44[5], w_cv0_3_5, -(_unpack_bf16_45[5] * w_sv0_3_5));
+                            w_o_hi_3[5] = __fmaf_rn(_unpack_bf16_45[5], w_cv0_3_5, _unpack_bf16_44[5] * w_sv0_3_5);
+                            w_o_lo_3[13] = __fmaf_rn(_unpack_bf16_44[13], w_cv1_3_5, -(_unpack_bf16_45[13] * w_sv1_3_5));
+                            w_o_hi_3[13] = __fmaf_rn(_unpack_bf16_45[13], w_cv1_3_5, _unpack_bf16_44[13] * w_sv1_3_5);
                             float w_cv0_3_6 = _vec_load_12[6];
                             float w_sv0_3_6 = _vec_load_14[6];
                             float w_cv1_3_6 = _vec_load_13[6];
                             float w_sv1_3_6 = _vec_load_15[6];
-                            w_o_lo_3[6] = __fmaf_rn(_unpack_bf16_38[6], w_cv0_3_6, -(_unpack_bf16_39[6] * w_sv0_3_6));
-                            w_o_hi_3[6] = __fmaf_rn(_unpack_bf16_39[6], w_cv0_3_6, _unpack_bf16_38[6] * w_sv0_3_6);
-                            w_o_lo_3[14] = __fmaf_rn(_unpack_bf16_38[14], w_cv1_3_6, -(_unpack_bf16_39[14] * w_sv1_3_6));
-                            w_o_hi_3[14] = __fmaf_rn(_unpack_bf16_39[14], w_cv1_3_6, _unpack_bf16_38[14] * w_sv1_3_6);
+                            w_o_lo_3[6] = __fmaf_rn(_unpack_bf16_44[6], w_cv0_3_6, -(_unpack_bf16_45[6] * w_sv0_3_6));
+                            w_o_hi_3[6] = __fmaf_rn(_unpack_bf16_45[6], w_cv0_3_6, _unpack_bf16_44[6] * w_sv0_3_6);
+                            w_o_lo_3[14] = __fmaf_rn(_unpack_bf16_44[14], w_cv1_3_6, -(_unpack_bf16_45[14] * w_sv1_3_6));
+                            w_o_hi_3[14] = __fmaf_rn(_unpack_bf16_45[14], w_cv1_3_6, _unpack_bf16_44[14] * w_sv1_3_6);
                             float w_cv0_3_7 = _vec_load_12[7];
                             float w_sv0_3_7 = _vec_load_14[7];
                             float w_cv1_3_7 = _vec_load_13[7];
                             float w_sv1_3_7 = _vec_load_15[7];
-                            w_o_lo_3[7] = __fmaf_rn(_unpack_bf16_38[7], w_cv0_3_7, -(_unpack_bf16_39[7] * w_sv0_3_7));
-                            w_o_hi_3[7] = __fmaf_rn(_unpack_bf16_39[7], w_cv0_3_7, _unpack_bf16_38[7] * w_sv0_3_7);
-                            w_o_lo_3[15] = __fmaf_rn(_unpack_bf16_38[15], w_cv1_3_7, -(_unpack_bf16_39[15] * w_sv1_3_7));
-                            w_o_hi_3[15] = __fmaf_rn(_unpack_bf16_39[15], w_cv1_3_7, _unpack_bf16_38[15] * w_sv1_3_7);
+                            w_o_lo_3[7] = __fmaf_rn(_unpack_bf16_44[7], w_cv0_3_7, -(_unpack_bf16_45[7] * w_sv0_3_7));
+                            w_o_hi_3[7] = __fmaf_rn(_unpack_bf16_45[7], w_cv0_3_7, _unpack_bf16_44[7] * w_sv0_3_7);
+                            w_o_lo_3[15] = __fmaf_rn(_unpack_bf16_44[15], w_cv1_3_7, -(_unpack_bf16_45[15] * w_sv1_3_7));
+                            w_o_hi_3[15] = __fmaf_rn(_unpack_bf16_45[15], w_cv1_3_7, _unpack_bf16_44[15] * w_sv1_3_7);
                             unsigned int w_o_lo_3_bf16[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -3171,69 +3576,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_3[_lp*2 + 0], w_o_hi_3[_lp*2+1 + 0]));
                                 w_o_hi_3_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            }
+                            w_x_lo_3[0] = w_o_lo_3_bf16[0];
+                            w_x_hi_3[0] = w_o_hi_3_bf16[0];
+                            w_x_lo_3[1] = w_o_lo_3_bf16[1];
+                            w_x_hi_3[1] = w_o_hi_3_bf16[1];
+                            w_x_lo_3[2] = w_o_lo_3_bf16[2];
+                            w_x_hi_3[2] = w_o_hi_3_bf16[2];
+                            w_x_lo_3[3] = w_o_lo_3_bf16[3];
+                            w_x_hi_3[3] = w_o_hi_3_bf16[3];
+                            w_x_lo_3[4] = w_o_lo_3_bf16[4];
+                            w_x_hi_3[4] = w_o_hi_3_bf16[4];
+                            w_x_lo_3[5] = w_o_lo_3_bf16[5];
+                            w_x_hi_3[5] = w_o_hi_3_bf16[5];
+                            w_x_lo_3[6] = w_o_lo_3_bf16[6];
+                            w_x_hi_3[6] = w_o_hi_3_bf16[6];
+                            w_x_lo_3[7] = w_o_lo_3_bf16[7];
+                            w_x_hi_3[7] = w_o_hi_3_bf16[7];
                         }
+                    }
+                    unsigned int w_q_words_3[4];
+                    float w_q_vals_3[16];
+                    float _unpack_bf16_46[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_46[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) << 16);
+                        (&_unpack_bf16_46[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_3[0] = _unpack_bf16_46[0] * w_out_scale_sel;
+                    w_q_vals_3[1] = _unpack_bf16_46[1] * w_out_scale_sel;
+                    w_q_vals_3[2] = _unpack_bf16_46[2] * w_out_scale_sel;
+                    w_q_vals_3[3] = _unpack_bf16_46[3] * w_out_scale_sel;
+                    w_q_vals_3[4] = _unpack_bf16_46[4] * w_out_scale_sel;
+                    w_q_vals_3[5] = _unpack_bf16_46[5] * w_out_scale_sel;
+                    w_q_vals_3[6] = _unpack_bf16_46[6] * w_out_scale_sel;
+                    w_q_vals_3[7] = _unpack_bf16_46[7] * w_out_scale_sel;
+                    w_q_vals_3[8] = _unpack_bf16_46[8] * w_out_scale_sel;
+                    w_q_vals_3[9] = _unpack_bf16_46[9] * w_out_scale_sel;
+                    w_q_vals_3[10] = _unpack_bf16_46[10] * w_out_scale_sel;
+                    w_q_vals_3[11] = _unpack_bf16_46[11] * w_out_scale_sel;
+                    w_q_vals_3[12] = _unpack_bf16_46[12] * w_out_scale_sel;
+                    w_q_vals_3[13] = _unpack_bf16_46[13] * w_out_scale_sel;
+                    w_q_vals_3[14] = _unpack_bf16_46[14] * w_out_scale_sel;
+                    w_q_vals_3[15] = _unpack_bf16_46[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[0]), "f"(w_q_vals_3[1]),
+                                               "f"(w_q_vals_3[2]), "f"(w_q_vals_3[3]));
+                        w_q_words_3[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[4]), "f"(w_q_vals_3[5]),
+                                               "f"(w_q_vals_3[6]), "f"(w_q_vals_3[7]));
+                        w_q_words_3[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[8]), "f"(w_q_vals_3[9]),
+                                               "f"(w_q_vals_3[10]), "f"(w_q_vals_3[11]));
+                        w_q_words_3[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[12]), "f"(w_q_vals_3[13]),
+                                               "f"(w_q_vals_3[14]), "f"(w_q_vals_3[15]));
+                        w_q_words_3[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_3 * 128) + (unsigned int)(w_chunk_lo_3 ^ (w_srow_3 & 7) << 4)), "r"(w_q_words_3[0]), "r"(w_q_words_3[1]), "r"(w_q_words_3[2]), "r"(w_q_words_3[3]) : "memory");
+                    float _unpack_bf16_47[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_47[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) << 16);
+                        (&_unpack_bf16_47[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_3[0] = _unpack_bf16_47[0] * w_out_scale_sel;
+                    w_q_vals_3[1] = _unpack_bf16_47[1] * w_out_scale_sel;
+                    w_q_vals_3[2] = _unpack_bf16_47[2] * w_out_scale_sel;
+                    w_q_vals_3[3] = _unpack_bf16_47[3] * w_out_scale_sel;
+                    w_q_vals_3[4] = _unpack_bf16_47[4] * w_out_scale_sel;
+                    w_q_vals_3[5] = _unpack_bf16_47[5] * w_out_scale_sel;
+                    w_q_vals_3[6] = _unpack_bf16_47[6] * w_out_scale_sel;
+                    w_q_vals_3[7] = _unpack_bf16_47[7] * w_out_scale_sel;
+                    w_q_vals_3[8] = _unpack_bf16_47[8] * w_out_scale_sel;
+                    w_q_vals_3[9] = _unpack_bf16_47[9] * w_out_scale_sel;
+                    w_q_vals_3[10] = _unpack_bf16_47[10] * w_out_scale_sel;
+                    w_q_vals_3[11] = _unpack_bf16_47[11] * w_out_scale_sel;
+                    w_q_vals_3[12] = _unpack_bf16_47[12] * w_out_scale_sel;
+                    w_q_vals_3[13] = _unpack_bf16_47[13] * w_out_scale_sel;
+                    w_q_vals_3[14] = _unpack_bf16_47[14] * w_out_scale_sel;
+                    w_q_vals_3[15] = _unpack_bf16_47[15] * w_out_scale_sel;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[0]), "f"(w_q_vals_3[1]),
+                                               "f"(w_q_vals_3[2]), "f"(w_q_vals_3[3]));
+                        w_q_words_3[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[4]), "f"(w_q_vals_3[5]),
+                                               "f"(w_q_vals_3[6]), "f"(w_q_vals_3[7]));
+                        w_q_words_3[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[8]), "f"(w_q_vals_3[9]),
+                                               "f"(w_q_vals_3[10]), "f"(w_q_vals_3[11]));
+                        w_q_words_3[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3[12]), "f"(w_q_vals_3[13]),
+                                               "f"(w_q_vals_3[14]), "f"(w_q_vals_3[15]));
+                        w_q_words_3[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(w_srow_3 * 128) + (unsigned int)(w_chunk_hi_3 ^ (w_srow_3 & 7) << 4)), "r"(w_q_words_3[0]), "r"(w_q_words_3[1]), "r"(w_q_words_3[2]), "r"(w_q_words_3[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_3_0 = (role_tid >> 5) * 8 + lane / 8;
+                int s_piece_3_0 = lane % 8;
+                unsigned int s_words_3_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_3_0 * 128) + (unsigned int)(s_piece_3_0 * 16 ^ (s_row_3_0 & 7) << 4)));
+                int s_dst_3_0 = ((tile_m * 256 + 192 + s_row_3_0) * 56 + w_head) * 32 + s_piece_3_0 * 4;
+                if (tile_m * 256 + 192 + s_row_3_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
+                    }
+                }
+                int s_row_3_1 = (role_tid >> 5) * 8 + 4 + lane / 8;
+                int s_piece_3_1 = lane % 8;
+                unsigned int s_words_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage * 8192 + (unsigned int)(s_row_3_1 * 128) + (unsigned int)(s_piece_3_1 * 16 ^ (s_row_3_1 & 7) << 4)));
+                int s_dst_3_1 = ((tile_m * 256 + 192 + s_row_3_1) * 56 + w_head) * 32 + s_piece_3_1 * 4;
+                if (tile_m * 256 + 192 + s_row_3_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -3256,8 +3800,8 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
             unsigned int _phase_ab_full_1 = 0;
             #pragma unroll 1
             for (int tile_1 = bid; tile_1 < total_tiles; tile_1 += num_bids) {
-                int tile_m_1 = tile_1 / 1344 * 8 + (tile_1 - tile_1 / 1344 * 1344) % ((num_m_tiles - tile_1 / 1344 * 8 < 8) ? num_m_tiles - tile_1 / 1344 * 8 : 8);
-                int tile_n_1 = (tile_1 - tile_1 / 1344 * 1344) / ((num_m_tiles - tile_1 / 1344 * 8 < 8) ? num_m_tiles - tile_1 / 1344 * 8 : 8);
+                int tile_m_1 = tile_1 / 168 * 1 + (tile_1 - tile_1 / 168 * 168) % ((num_m_tiles - tile_1 / 168 * 1 < 1) ? num_m_tiles - tile_1 / 168 * 1 : 1);
+                int tile_n_1 = (tile_1 - tile_1 / 168 * 168) / ((num_m_tiles - tile_1 / 168 * 1 < 1) ? num_m_tiles - tile_1 / 168 * 1 : 1);
                 accum_1[0] = 0.0f;
                 accum_1[1] = 0.0f;
                 accum_1[2] = 0.0f;
@@ -3718,18 +4262,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_0_1[_lp*2 + 0], w_scaled_0_0_1[_lp*2+1 + 0]));
                     w_scaled_0_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_40[4];
+                float _unpack_bf16_48[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_40[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_0_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_40[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_0_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_48[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_0_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_48[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_0_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[0] = _unpack_bf16_40[0];
-                w_rounded_0_1[1] = _unpack_bf16_40[1];
-                w_rounded_0_1[2] = _unpack_bf16_40[2];
-                w_rounded_0_1[3] = _unpack_bf16_40[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_40[0], _unpack_bf16_40[0], _unpack_bf16_40[1] * _unpack_bf16_40[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_40[2], _unpack_bf16_40[2], _unpack_bf16_40[3] * _unpack_bf16_40[3]);
+                w_rounded_0_1[0] = _unpack_bf16_48[0];
+                w_rounded_0_1[1] = _unpack_bf16_48[1];
+                w_rounded_0_1[2] = _unpack_bf16_48[2];
+                w_rounded_0_1[3] = _unpack_bf16_48[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_48[0], _unpack_bf16_48[0], _unpack_bf16_48[1] * _unpack_bf16_48[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_48[2], _unpack_bf16_48[2], _unpack_bf16_48[3] * _unpack_bf16_48[3]);
                 float w_scaled_0_1_1[4];
                 w_scaled_0_1_1[0] = accum_1[4] * w_sa_lo_0_1 * sw_1[2];
                 w_scaled_0_1_1[1] = accum_1[5] * w_sa_lo_0_1 * sw_1[3];
@@ -3741,18 +4285,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_1_1[_lp*2 + 0], w_scaled_0_1_1[_lp*2+1 + 0]));
                     w_scaled_0_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_41[4];
+                float _unpack_bf16_49[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_41[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_1_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_41[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_1_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_49[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_1_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_49[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_1_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[4] = _unpack_bf16_41[0];
-                w_rounded_0_1[5] = _unpack_bf16_41[1];
-                w_rounded_0_1[6] = _unpack_bf16_41[2];
-                w_rounded_0_1[7] = _unpack_bf16_41[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_41[0], _unpack_bf16_41[0], _unpack_bf16_41[1] * _unpack_bf16_41[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_41[2], _unpack_bf16_41[2], _unpack_bf16_41[3] * _unpack_bf16_41[3]);
+                w_rounded_0_1[4] = _unpack_bf16_49[0];
+                w_rounded_0_1[5] = _unpack_bf16_49[1];
+                w_rounded_0_1[6] = _unpack_bf16_49[2];
+                w_rounded_0_1[7] = _unpack_bf16_49[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_49[0], _unpack_bf16_49[0], _unpack_bf16_49[1] * _unpack_bf16_49[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_49[2], _unpack_bf16_49[2], _unpack_bf16_49[3] * _unpack_bf16_49[3]);
                 float w_scaled_0_2_1[4];
                 w_scaled_0_2_1[0] = accum_1[8] * w_sa_lo_0_1 * sw_1[4];
                 w_scaled_0_2_1[1] = accum_1[9] * w_sa_lo_0_1 * sw_1[5];
@@ -3764,18 +4308,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_2_1[_lp*2 + 0], w_scaled_0_2_1[_lp*2+1 + 0]));
                     w_scaled_0_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_42[4];
+                float _unpack_bf16_50[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_42[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_2_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_42[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_2_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_50[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_2_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_50[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_2_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[8] = _unpack_bf16_42[0];
-                w_rounded_0_1[9] = _unpack_bf16_42[1];
-                w_rounded_0_1[10] = _unpack_bf16_42[2];
-                w_rounded_0_1[11] = _unpack_bf16_42[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_42[0], _unpack_bf16_42[0], _unpack_bf16_42[1] * _unpack_bf16_42[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_42[2], _unpack_bf16_42[2], _unpack_bf16_42[3] * _unpack_bf16_42[3]);
+                w_rounded_0_1[8] = _unpack_bf16_50[0];
+                w_rounded_0_1[9] = _unpack_bf16_50[1];
+                w_rounded_0_1[10] = _unpack_bf16_50[2];
+                w_rounded_0_1[11] = _unpack_bf16_50[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_50[0], _unpack_bf16_50[0], _unpack_bf16_50[1] * _unpack_bf16_50[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_50[2], _unpack_bf16_50[2], _unpack_bf16_50[3] * _unpack_bf16_50[3]);
                 float w_scaled_0_3_1[4];
                 w_scaled_0_3_1[0] = accum_1[12] * w_sa_lo_0_1 * sw_1[6];
                 w_scaled_0_3_1[1] = accum_1[13] * w_sa_lo_0_1 * sw_1[7];
@@ -3787,18 +4331,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_3_1[_lp*2 + 0], w_scaled_0_3_1[_lp*2+1 + 0]));
                     w_scaled_0_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_43[4];
+                float _unpack_bf16_51[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_43[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_3_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_43[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_3_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_51[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_3_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_51[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_3_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[12] = _unpack_bf16_43[0];
-                w_rounded_0_1[13] = _unpack_bf16_43[1];
-                w_rounded_0_1[14] = _unpack_bf16_43[2];
-                w_rounded_0_1[15] = _unpack_bf16_43[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_43[0], _unpack_bf16_43[0], _unpack_bf16_43[1] * _unpack_bf16_43[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_43[2], _unpack_bf16_43[2], _unpack_bf16_43[3] * _unpack_bf16_43[3]);
+                w_rounded_0_1[12] = _unpack_bf16_51[0];
+                w_rounded_0_1[13] = _unpack_bf16_51[1];
+                w_rounded_0_1[14] = _unpack_bf16_51[2];
+                w_rounded_0_1[15] = _unpack_bf16_51[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_51[0], _unpack_bf16_51[0], _unpack_bf16_51[1] * _unpack_bf16_51[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_51[2], _unpack_bf16_51[2], _unpack_bf16_51[3] * _unpack_bf16_51[3]);
                 float w_scaled_0_4_1[4];
                 w_scaled_0_4_1[0] = accum_1[16] * w_sa_lo_0_1 * sw_1[8];
                 w_scaled_0_4_1[1] = accum_1[17] * w_sa_lo_0_1 * sw_1[9];
@@ -3810,18 +4354,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_4_1[_lp*2 + 0], w_scaled_0_4_1[_lp*2+1 + 0]));
                     w_scaled_0_4_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_44[4];
+                float _unpack_bf16_52[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_44[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_4_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_44[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_4_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_52[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_4_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_52[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_4_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[16] = _unpack_bf16_44[0];
-                w_rounded_0_1[17] = _unpack_bf16_44[1];
-                w_rounded_0_1[18] = _unpack_bf16_44[2];
-                w_rounded_0_1[19] = _unpack_bf16_44[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_44[0], _unpack_bf16_44[0], _unpack_bf16_44[1] * _unpack_bf16_44[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_44[2], _unpack_bf16_44[2], _unpack_bf16_44[3] * _unpack_bf16_44[3]);
+                w_rounded_0_1[16] = _unpack_bf16_52[0];
+                w_rounded_0_1[17] = _unpack_bf16_52[1];
+                w_rounded_0_1[18] = _unpack_bf16_52[2];
+                w_rounded_0_1[19] = _unpack_bf16_52[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_52[0], _unpack_bf16_52[0], _unpack_bf16_52[1] * _unpack_bf16_52[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_52[2], _unpack_bf16_52[2], _unpack_bf16_52[3] * _unpack_bf16_52[3]);
                 float w_scaled_0_5_1[4];
                 w_scaled_0_5_1[0] = accum_1[20] * w_sa_lo_0_1 * sw_1[10];
                 w_scaled_0_5_1[1] = accum_1[21] * w_sa_lo_0_1 * sw_1[11];
@@ -3833,18 +4377,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_5_1[_lp*2 + 0], w_scaled_0_5_1[_lp*2+1 + 0]));
                     w_scaled_0_5_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_45[4];
+                float _unpack_bf16_53[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_45[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_5_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_45[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_5_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_53[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_5_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_53[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_5_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[20] = _unpack_bf16_45[0];
-                w_rounded_0_1[21] = _unpack_bf16_45[1];
-                w_rounded_0_1[22] = _unpack_bf16_45[2];
-                w_rounded_0_1[23] = _unpack_bf16_45[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_45[0], _unpack_bf16_45[0], _unpack_bf16_45[1] * _unpack_bf16_45[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_45[2], _unpack_bf16_45[2], _unpack_bf16_45[3] * _unpack_bf16_45[3]);
+                w_rounded_0_1[20] = _unpack_bf16_53[0];
+                w_rounded_0_1[21] = _unpack_bf16_53[1];
+                w_rounded_0_1[22] = _unpack_bf16_53[2];
+                w_rounded_0_1[23] = _unpack_bf16_53[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_53[0], _unpack_bf16_53[0], _unpack_bf16_53[1] * _unpack_bf16_53[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_53[2], _unpack_bf16_53[2], _unpack_bf16_53[3] * _unpack_bf16_53[3]);
                 float w_scaled_0_6_1[4];
                 w_scaled_0_6_1[0] = accum_1[24] * w_sa_lo_0_1 * sw_1[12];
                 w_scaled_0_6_1[1] = accum_1[25] * w_sa_lo_0_1 * sw_1[13];
@@ -3856,18 +4400,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_6_1[_lp*2 + 0], w_scaled_0_6_1[_lp*2+1 + 0]));
                     w_scaled_0_6_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_46[4];
+                float _unpack_bf16_54[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_46[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_6_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_46[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_6_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_54[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_6_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_54[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_6_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[24] = _unpack_bf16_46[0];
-                w_rounded_0_1[25] = _unpack_bf16_46[1];
-                w_rounded_0_1[26] = _unpack_bf16_46[2];
-                w_rounded_0_1[27] = _unpack_bf16_46[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_46[0], _unpack_bf16_46[0], _unpack_bf16_46[1] * _unpack_bf16_46[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_46[2], _unpack_bf16_46[2], _unpack_bf16_46[3] * _unpack_bf16_46[3]);
+                w_rounded_0_1[24] = _unpack_bf16_54[0];
+                w_rounded_0_1[25] = _unpack_bf16_54[1];
+                w_rounded_0_1[26] = _unpack_bf16_54[2];
+                w_rounded_0_1[27] = _unpack_bf16_54[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_54[0], _unpack_bf16_54[0], _unpack_bf16_54[1] * _unpack_bf16_54[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_54[2], _unpack_bf16_54[2], _unpack_bf16_54[3] * _unpack_bf16_54[3]);
                 float w_scaled_0_7_1[4];
                 w_scaled_0_7_1[0] = accum_1[28] * w_sa_lo_0_1 * sw_1[14];
                 w_scaled_0_7_1[1] = accum_1[29] * w_sa_lo_0_1 * sw_1[15];
@@ -3879,18 +4423,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_0_7_1[_lp*2 + 0], w_scaled_0_7_1[_lp*2+1 + 0]));
                     w_scaled_0_7_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_47[4];
+                float _unpack_bf16_55[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_47[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_7_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_47[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_7_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_55[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_7_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_55[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_0_7_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_0_1[28] = _unpack_bf16_47[0];
-                w_rounded_0_1[29] = _unpack_bf16_47[1];
-                w_rounded_0_1[30] = _unpack_bf16_47[2];
-                w_rounded_0_1[31] = _unpack_bf16_47[3];
-                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_47[0], _unpack_bf16_47[0], _unpack_bf16_47[1] * _unpack_bf16_47[1]);
-                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_47[2], _unpack_bf16_47[2], _unpack_bf16_47[3] * _unpack_bf16_47[3]);
+                w_rounded_0_1[28] = _unpack_bf16_55[0];
+                w_rounded_0_1[29] = _unpack_bf16_55[1];
+                w_rounded_0_1[30] = _unpack_bf16_55[2];
+                w_rounded_0_1[31] = _unpack_bf16_55[3];
+                w_ss_lo_0_1 += __fmaf_rn(_unpack_bf16_55[0], _unpack_bf16_55[0], _unpack_bf16_55[1] * _unpack_bf16_55[1]);
+                w_ss_hi_0_1 += __fmaf_rn(_unpack_bf16_55[2], _unpack_bf16_55[2], _unpack_bf16_55[3] * _unpack_bf16_55[3]);
                 float w_rstd_lo_0_1 = 1.0f;
                 float w_rstd_hi_0_1 = 1.0f;
                 if (w_kind_1 < 2) {
@@ -4098,12 +4642,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_0_1 = role_tid_1 >> 2;
                 int w_c_0_1 = role_tid_1 & 3;
                 int w_grow_0_1 = tile_m_1 * 256 + w_srow_0_1;
+                int w_chunk_lo_0_1 = ((w_c_0_1 < 3) ? w_c_0_1 * 16 : 96);
+                int w_chunk_hi_0_1 = ((w_c_0_1 < 3) ? w_chunk_lo_0_1 + 48 : 112);
                 if (w_grow_0_1 < M) {
-                    int w_row_head_0_1 = w_grow_0_1 * 56 + w_head_1;
-                    unsigned int w_st_words_0_1[4];
-                    float w_st_vals_0_1[16];
-                    int w_chunk_lo_0_1 = ((w_c_0_1 < 3) ? w_c_0_1 * 16 : 96);
-                    int w_chunk_hi_0_1 = ((w_c_0_1 < 3) ? w_chunk_lo_0_1 + 48 : 112);
                     unsigned int w_x_lo_0_1[8];
                     unsigned int w_x_hi_0_1[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -4120,17 +4661,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)));
                     if (w_c_0_1 < 3) {
                         if (w_kind_1 < 2) {
-                            float _unpack_bf16_48[16];
+                            float _unpack_bf16_56[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_48[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) << 16);
-                                (&_unpack_bf16_48[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_56[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) << 16);
+                                (&_unpack_bf16_56[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_49[16];
+                            float _unpack_bf16_57[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_49[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) << 16);
-                                (&_unpack_bf16_49[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_57[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) << 16);
+                                (&_unpack_bf16_57[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_16[8];
                             {
@@ -4198,66 +4739,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_0_0_1 = _vec_load_18[0];
                             float w_cv1_0_0_1 = _vec_load_17[0];
                             float w_sv1_0_0_1 = _vec_load_19[0];
-                            w_o_lo_0_1[0] = __fmaf_rn(_unpack_bf16_48[0], w_cv0_0_0_1, -(_unpack_bf16_49[0] * w_sv0_0_0_1));
-                            w_o_hi_0_1[0] = __fmaf_rn(_unpack_bf16_49[0], w_cv0_0_0_1, _unpack_bf16_48[0] * w_sv0_0_0_1);
-                            w_o_lo_0_1[8] = __fmaf_rn(_unpack_bf16_48[8], w_cv1_0_0_1, -(_unpack_bf16_49[8] * w_sv1_0_0_1));
-                            w_o_hi_0_1[8] = __fmaf_rn(_unpack_bf16_49[8], w_cv1_0_0_1, _unpack_bf16_48[8] * w_sv1_0_0_1);
+                            w_o_lo_0_1[0] = __fmaf_rn(_unpack_bf16_56[0], w_cv0_0_0_1, -(_unpack_bf16_57[0] * w_sv0_0_0_1));
+                            w_o_hi_0_1[0] = __fmaf_rn(_unpack_bf16_57[0], w_cv0_0_0_1, _unpack_bf16_56[0] * w_sv0_0_0_1);
+                            w_o_lo_0_1[8] = __fmaf_rn(_unpack_bf16_56[8], w_cv1_0_0_1, -(_unpack_bf16_57[8] * w_sv1_0_0_1));
+                            w_o_hi_0_1[8] = __fmaf_rn(_unpack_bf16_57[8], w_cv1_0_0_1, _unpack_bf16_56[8] * w_sv1_0_0_1);
                             float w_cv0_0_1_1 = _vec_load_16[1];
                             float w_sv0_0_1_1 = _vec_load_18[1];
                             float w_cv1_0_1_1 = _vec_load_17[1];
                             float w_sv1_0_1_1 = _vec_load_19[1];
-                            w_o_lo_0_1[1] = __fmaf_rn(_unpack_bf16_48[1], w_cv0_0_1_1, -(_unpack_bf16_49[1] * w_sv0_0_1_1));
-                            w_o_hi_0_1[1] = __fmaf_rn(_unpack_bf16_49[1], w_cv0_0_1_1, _unpack_bf16_48[1] * w_sv0_0_1_1);
-                            w_o_lo_0_1[9] = __fmaf_rn(_unpack_bf16_48[9], w_cv1_0_1_1, -(_unpack_bf16_49[9] * w_sv1_0_1_1));
-                            w_o_hi_0_1[9] = __fmaf_rn(_unpack_bf16_49[9], w_cv1_0_1_1, _unpack_bf16_48[9] * w_sv1_0_1_1);
+                            w_o_lo_0_1[1] = __fmaf_rn(_unpack_bf16_56[1], w_cv0_0_1_1, -(_unpack_bf16_57[1] * w_sv0_0_1_1));
+                            w_o_hi_0_1[1] = __fmaf_rn(_unpack_bf16_57[1], w_cv0_0_1_1, _unpack_bf16_56[1] * w_sv0_0_1_1);
+                            w_o_lo_0_1[9] = __fmaf_rn(_unpack_bf16_56[9], w_cv1_0_1_1, -(_unpack_bf16_57[9] * w_sv1_0_1_1));
+                            w_o_hi_0_1[9] = __fmaf_rn(_unpack_bf16_57[9], w_cv1_0_1_1, _unpack_bf16_56[9] * w_sv1_0_1_1);
                             float w_cv0_0_2_1 = _vec_load_16[2];
                             float w_sv0_0_2_1 = _vec_load_18[2];
                             float w_cv1_0_2_1 = _vec_load_17[2];
                             float w_sv1_0_2_1 = _vec_load_19[2];
-                            w_o_lo_0_1[2] = __fmaf_rn(_unpack_bf16_48[2], w_cv0_0_2_1, -(_unpack_bf16_49[2] * w_sv0_0_2_1));
-                            w_o_hi_0_1[2] = __fmaf_rn(_unpack_bf16_49[2], w_cv0_0_2_1, _unpack_bf16_48[2] * w_sv0_0_2_1);
-                            w_o_lo_0_1[10] = __fmaf_rn(_unpack_bf16_48[10], w_cv1_0_2_1, -(_unpack_bf16_49[10] * w_sv1_0_2_1));
-                            w_o_hi_0_1[10] = __fmaf_rn(_unpack_bf16_49[10], w_cv1_0_2_1, _unpack_bf16_48[10] * w_sv1_0_2_1);
+                            w_o_lo_0_1[2] = __fmaf_rn(_unpack_bf16_56[2], w_cv0_0_2_1, -(_unpack_bf16_57[2] * w_sv0_0_2_1));
+                            w_o_hi_0_1[2] = __fmaf_rn(_unpack_bf16_57[2], w_cv0_0_2_1, _unpack_bf16_56[2] * w_sv0_0_2_1);
+                            w_o_lo_0_1[10] = __fmaf_rn(_unpack_bf16_56[10], w_cv1_0_2_1, -(_unpack_bf16_57[10] * w_sv1_0_2_1));
+                            w_o_hi_0_1[10] = __fmaf_rn(_unpack_bf16_57[10], w_cv1_0_2_1, _unpack_bf16_56[10] * w_sv1_0_2_1);
                             float w_cv0_0_3_1 = _vec_load_16[3];
                             float w_sv0_0_3_1 = _vec_load_18[3];
                             float w_cv1_0_3_1 = _vec_load_17[3];
                             float w_sv1_0_3_1 = _vec_load_19[3];
-                            w_o_lo_0_1[3] = __fmaf_rn(_unpack_bf16_48[3], w_cv0_0_3_1, -(_unpack_bf16_49[3] * w_sv0_0_3_1));
-                            w_o_hi_0_1[3] = __fmaf_rn(_unpack_bf16_49[3], w_cv0_0_3_1, _unpack_bf16_48[3] * w_sv0_0_3_1);
-                            w_o_lo_0_1[11] = __fmaf_rn(_unpack_bf16_48[11], w_cv1_0_3_1, -(_unpack_bf16_49[11] * w_sv1_0_3_1));
-                            w_o_hi_0_1[11] = __fmaf_rn(_unpack_bf16_49[11], w_cv1_0_3_1, _unpack_bf16_48[11] * w_sv1_0_3_1);
+                            w_o_lo_0_1[3] = __fmaf_rn(_unpack_bf16_56[3], w_cv0_0_3_1, -(_unpack_bf16_57[3] * w_sv0_0_3_1));
+                            w_o_hi_0_1[3] = __fmaf_rn(_unpack_bf16_57[3], w_cv0_0_3_1, _unpack_bf16_56[3] * w_sv0_0_3_1);
+                            w_o_lo_0_1[11] = __fmaf_rn(_unpack_bf16_56[11], w_cv1_0_3_1, -(_unpack_bf16_57[11] * w_sv1_0_3_1));
+                            w_o_hi_0_1[11] = __fmaf_rn(_unpack_bf16_57[11], w_cv1_0_3_1, _unpack_bf16_56[11] * w_sv1_0_3_1);
                             float w_cv0_0_4_1 = _vec_load_16[4];
                             float w_sv0_0_4_1 = _vec_load_18[4];
                             float w_cv1_0_4_1 = _vec_load_17[4];
                             float w_sv1_0_4_1 = _vec_load_19[4];
-                            w_o_lo_0_1[4] = __fmaf_rn(_unpack_bf16_48[4], w_cv0_0_4_1, -(_unpack_bf16_49[4] * w_sv0_0_4_1));
-                            w_o_hi_0_1[4] = __fmaf_rn(_unpack_bf16_49[4], w_cv0_0_4_1, _unpack_bf16_48[4] * w_sv0_0_4_1);
-                            w_o_lo_0_1[12] = __fmaf_rn(_unpack_bf16_48[12], w_cv1_0_4_1, -(_unpack_bf16_49[12] * w_sv1_0_4_1));
-                            w_o_hi_0_1[12] = __fmaf_rn(_unpack_bf16_49[12], w_cv1_0_4_1, _unpack_bf16_48[12] * w_sv1_0_4_1);
+                            w_o_lo_0_1[4] = __fmaf_rn(_unpack_bf16_56[4], w_cv0_0_4_1, -(_unpack_bf16_57[4] * w_sv0_0_4_1));
+                            w_o_hi_0_1[4] = __fmaf_rn(_unpack_bf16_57[4], w_cv0_0_4_1, _unpack_bf16_56[4] * w_sv0_0_4_1);
+                            w_o_lo_0_1[12] = __fmaf_rn(_unpack_bf16_56[12], w_cv1_0_4_1, -(_unpack_bf16_57[12] * w_sv1_0_4_1));
+                            w_o_hi_0_1[12] = __fmaf_rn(_unpack_bf16_57[12], w_cv1_0_4_1, _unpack_bf16_56[12] * w_sv1_0_4_1);
                             float w_cv0_0_5_1 = _vec_load_16[5];
                             float w_sv0_0_5_1 = _vec_load_18[5];
                             float w_cv1_0_5_1 = _vec_load_17[5];
                             float w_sv1_0_5_1 = _vec_load_19[5];
-                            w_o_lo_0_1[5] = __fmaf_rn(_unpack_bf16_48[5], w_cv0_0_5_1, -(_unpack_bf16_49[5] * w_sv0_0_5_1));
-                            w_o_hi_0_1[5] = __fmaf_rn(_unpack_bf16_49[5], w_cv0_0_5_1, _unpack_bf16_48[5] * w_sv0_0_5_1);
-                            w_o_lo_0_1[13] = __fmaf_rn(_unpack_bf16_48[13], w_cv1_0_5_1, -(_unpack_bf16_49[13] * w_sv1_0_5_1));
-                            w_o_hi_0_1[13] = __fmaf_rn(_unpack_bf16_49[13], w_cv1_0_5_1, _unpack_bf16_48[13] * w_sv1_0_5_1);
+                            w_o_lo_0_1[5] = __fmaf_rn(_unpack_bf16_56[5], w_cv0_0_5_1, -(_unpack_bf16_57[5] * w_sv0_0_5_1));
+                            w_o_hi_0_1[5] = __fmaf_rn(_unpack_bf16_57[5], w_cv0_0_5_1, _unpack_bf16_56[5] * w_sv0_0_5_1);
+                            w_o_lo_0_1[13] = __fmaf_rn(_unpack_bf16_56[13], w_cv1_0_5_1, -(_unpack_bf16_57[13] * w_sv1_0_5_1));
+                            w_o_hi_0_1[13] = __fmaf_rn(_unpack_bf16_57[13], w_cv1_0_5_1, _unpack_bf16_56[13] * w_sv1_0_5_1);
                             float w_cv0_0_6_1 = _vec_load_16[6];
                             float w_sv0_0_6_1 = _vec_load_18[6];
                             float w_cv1_0_6_1 = _vec_load_17[6];
                             float w_sv1_0_6_1 = _vec_load_19[6];
-                            w_o_lo_0_1[6] = __fmaf_rn(_unpack_bf16_48[6], w_cv0_0_6_1, -(_unpack_bf16_49[6] * w_sv0_0_6_1));
-                            w_o_hi_0_1[6] = __fmaf_rn(_unpack_bf16_49[6], w_cv0_0_6_1, _unpack_bf16_48[6] * w_sv0_0_6_1);
-                            w_o_lo_0_1[14] = __fmaf_rn(_unpack_bf16_48[14], w_cv1_0_6_1, -(_unpack_bf16_49[14] * w_sv1_0_6_1));
-                            w_o_hi_0_1[14] = __fmaf_rn(_unpack_bf16_49[14], w_cv1_0_6_1, _unpack_bf16_48[14] * w_sv1_0_6_1);
+                            w_o_lo_0_1[6] = __fmaf_rn(_unpack_bf16_56[6], w_cv0_0_6_1, -(_unpack_bf16_57[6] * w_sv0_0_6_1));
+                            w_o_hi_0_1[6] = __fmaf_rn(_unpack_bf16_57[6], w_cv0_0_6_1, _unpack_bf16_56[6] * w_sv0_0_6_1);
+                            w_o_lo_0_1[14] = __fmaf_rn(_unpack_bf16_56[14], w_cv1_0_6_1, -(_unpack_bf16_57[14] * w_sv1_0_6_1));
+                            w_o_hi_0_1[14] = __fmaf_rn(_unpack_bf16_57[14], w_cv1_0_6_1, _unpack_bf16_56[14] * w_sv1_0_6_1);
                             float w_cv0_0_7_1 = _vec_load_16[7];
                             float w_sv0_0_7_1 = _vec_load_18[7];
                             float w_cv1_0_7_1 = _vec_load_17[7];
                             float w_sv1_0_7_1 = _vec_load_19[7];
-                            w_o_lo_0_1[7] = __fmaf_rn(_unpack_bf16_48[7], w_cv0_0_7_1, -(_unpack_bf16_49[7] * w_sv0_0_7_1));
-                            w_o_hi_0_1[7] = __fmaf_rn(_unpack_bf16_49[7], w_cv0_0_7_1, _unpack_bf16_48[7] * w_sv0_0_7_1);
-                            w_o_lo_0_1[15] = __fmaf_rn(_unpack_bf16_48[15], w_cv1_0_7_1, -(_unpack_bf16_49[15] * w_sv1_0_7_1));
-                            w_o_hi_0_1[15] = __fmaf_rn(_unpack_bf16_49[15], w_cv1_0_7_1, _unpack_bf16_48[15] * w_sv1_0_7_1);
+                            w_o_lo_0_1[7] = __fmaf_rn(_unpack_bf16_56[7], w_cv0_0_7_1, -(_unpack_bf16_57[7] * w_sv0_0_7_1));
+                            w_o_hi_0_1[7] = __fmaf_rn(_unpack_bf16_57[7], w_cv0_0_7_1, _unpack_bf16_56[7] * w_sv0_0_7_1);
+                            w_o_lo_0_1[15] = __fmaf_rn(_unpack_bf16_56[15], w_cv1_0_7_1, -(_unpack_bf16_57[15] * w_sv1_0_7_1));
+                            w_o_hi_0_1[15] = __fmaf_rn(_unpack_bf16_57[15], w_cv1_0_7_1, _unpack_bf16_56[15] * w_sv1_0_7_1);
                             unsigned int w_o_lo_0_bf16_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -4270,69 +4811,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_0_1[_lp*2 + 0], w_o_hi_0_1[_lp*2+1 + 0]));
                                 w_o_hi_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            }
+                            w_x_lo_0_1[0] = w_o_lo_0_bf16_1[0];
+                            w_x_hi_0_1[0] = w_o_hi_0_bf16_1[0];
+                            w_x_lo_0_1[1] = w_o_lo_0_bf16_1[1];
+                            w_x_hi_0_1[1] = w_o_hi_0_bf16_1[1];
+                            w_x_lo_0_1[2] = w_o_lo_0_bf16_1[2];
+                            w_x_hi_0_1[2] = w_o_hi_0_bf16_1[2];
+                            w_x_lo_0_1[3] = w_o_lo_0_bf16_1[3];
+                            w_x_hi_0_1[3] = w_o_hi_0_bf16_1[3];
+                            w_x_lo_0_1[4] = w_o_lo_0_bf16_1[4];
+                            w_x_hi_0_1[4] = w_o_hi_0_bf16_1[4];
+                            w_x_lo_0_1[5] = w_o_lo_0_bf16_1[5];
+                            w_x_hi_0_1[5] = w_o_hi_0_bf16_1[5];
+                            w_x_lo_0_1[6] = w_o_lo_0_bf16_1[6];
+                            w_x_hi_0_1[6] = w_o_hi_0_bf16_1[6];
+                            w_x_lo_0_1[7] = w_o_lo_0_bf16_1[7];
+                            w_x_hi_0_1[7] = w_o_hi_0_bf16_1[7];
                         }
+                    }
+                    unsigned int w_q_words_0_1[4];
+                    float w_q_vals_0_1[16];
+                    float _unpack_bf16_58[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_58[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) << 16);
+                        (&_unpack_bf16_58[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_0_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_0_1[0] = _unpack_bf16_58[0] * w_out_scale_sel_1;
+                    w_q_vals_0_1[1] = _unpack_bf16_58[1] * w_out_scale_sel_1;
+                    w_q_vals_0_1[2] = _unpack_bf16_58[2] * w_out_scale_sel_1;
+                    w_q_vals_0_1[3] = _unpack_bf16_58[3] * w_out_scale_sel_1;
+                    w_q_vals_0_1[4] = _unpack_bf16_58[4] * w_out_scale_sel_1;
+                    w_q_vals_0_1[5] = _unpack_bf16_58[5] * w_out_scale_sel_1;
+                    w_q_vals_0_1[6] = _unpack_bf16_58[6] * w_out_scale_sel_1;
+                    w_q_vals_0_1[7] = _unpack_bf16_58[7] * w_out_scale_sel_1;
+                    w_q_vals_0_1[8] = _unpack_bf16_58[8] * w_out_scale_sel_1;
+                    w_q_vals_0_1[9] = _unpack_bf16_58[9] * w_out_scale_sel_1;
+                    w_q_vals_0_1[10] = _unpack_bf16_58[10] * w_out_scale_sel_1;
+                    w_q_vals_0_1[11] = _unpack_bf16_58[11] * w_out_scale_sel_1;
+                    w_q_vals_0_1[12] = _unpack_bf16_58[12] * w_out_scale_sel_1;
+                    w_q_vals_0_1[13] = _unpack_bf16_58[13] * w_out_scale_sel_1;
+                    w_q_vals_0_1[14] = _unpack_bf16_58[14] * w_out_scale_sel_1;
+                    w_q_vals_0_1[15] = _unpack_bf16_58[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[0]), "f"(w_q_vals_0_1[1]),
+                                               "f"(w_q_vals_0_1[2]), "f"(w_q_vals_0_1[3]));
+                        w_q_words_0_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[4]), "f"(w_q_vals_0_1[5]),
+                                               "f"(w_q_vals_0_1[6]), "f"(w_q_vals_0_1[7]));
+                        w_q_words_0_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[8]), "f"(w_q_vals_0_1[9]),
+                                               "f"(w_q_vals_0_1[10]), "f"(w_q_vals_0_1[11]));
+                        w_q_words_0_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[12]), "f"(w_q_vals_0_1[13]),
+                                               "f"(w_q_vals_0_1[14]), "f"(w_q_vals_0_1[15]));
+                        w_q_words_0_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_0_1 * 128) + (unsigned int)(w_chunk_lo_0_1 ^ (w_srow_0_1 & 7) << 4)), "r"(w_q_words_0_1[0]), "r"(w_q_words_0_1[1]), "r"(w_q_words_0_1[2]), "r"(w_q_words_0_1[3]) : "memory");
+                    float _unpack_bf16_59[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_59[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) << 16);
+                        (&_unpack_bf16_59[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_0_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_0_1[0] = _unpack_bf16_59[0] * w_out_scale_sel_1;
+                    w_q_vals_0_1[1] = _unpack_bf16_59[1] * w_out_scale_sel_1;
+                    w_q_vals_0_1[2] = _unpack_bf16_59[2] * w_out_scale_sel_1;
+                    w_q_vals_0_1[3] = _unpack_bf16_59[3] * w_out_scale_sel_1;
+                    w_q_vals_0_1[4] = _unpack_bf16_59[4] * w_out_scale_sel_1;
+                    w_q_vals_0_1[5] = _unpack_bf16_59[5] * w_out_scale_sel_1;
+                    w_q_vals_0_1[6] = _unpack_bf16_59[6] * w_out_scale_sel_1;
+                    w_q_vals_0_1[7] = _unpack_bf16_59[7] * w_out_scale_sel_1;
+                    w_q_vals_0_1[8] = _unpack_bf16_59[8] * w_out_scale_sel_1;
+                    w_q_vals_0_1[9] = _unpack_bf16_59[9] * w_out_scale_sel_1;
+                    w_q_vals_0_1[10] = _unpack_bf16_59[10] * w_out_scale_sel_1;
+                    w_q_vals_0_1[11] = _unpack_bf16_59[11] * w_out_scale_sel_1;
+                    w_q_vals_0_1[12] = _unpack_bf16_59[12] * w_out_scale_sel_1;
+                    w_q_vals_0_1[13] = _unpack_bf16_59[13] * w_out_scale_sel_1;
+                    w_q_vals_0_1[14] = _unpack_bf16_59[14] * w_out_scale_sel_1;
+                    w_q_vals_0_1[15] = _unpack_bf16_59[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[0]), "f"(w_q_vals_0_1[1]),
+                                               "f"(w_q_vals_0_1[2]), "f"(w_q_vals_0_1[3]));
+                        w_q_words_0_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[4]), "f"(w_q_vals_0_1[5]),
+                                               "f"(w_q_vals_0_1[6]), "f"(w_q_vals_0_1[7]));
+                        w_q_words_0_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[8]), "f"(w_q_vals_0_1[9]),
+                                               "f"(w_q_vals_0_1[10]), "f"(w_q_vals_0_1[11]));
+                        w_q_words_0_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_0_1[12]), "f"(w_q_vals_0_1[13]),
+                                               "f"(w_q_vals_0_1[14]), "f"(w_q_vals_0_1[15]));
+                        w_q_words_0_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_0_1 * 128) + (unsigned int)(w_chunk_hi_0_1 ^ (w_srow_0_1 & 7) << 4)), "r"(w_q_words_0_1[0]), "r"(w_q_words_0_1[1]), "r"(w_q_words_0_1[2]), "r"(w_q_words_0_1[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_0_0_1 = (role_tid_1 >> 5) * 8 + lane / 8;
+                int s_piece_0_0_1 = lane % 8;
+                unsigned int s_words_0_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_0_0_1 * 128) + (unsigned int)(s_piece_0_0_1 * 16 ^ (s_row_0_0_1 & 7) << 4)));
+                int s_dst_0_0_1 = ((tile_m_1 * 256 + s_row_0_0_1) * 56 + w_head_1) * 32 + s_piece_0_0_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
+                    }
+                }
+                int s_row_0_1_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 8;
+                int s_piece_0_1_1 = lane % 8;
+                unsigned int s_words_0_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_0_1_1 * 128) + (unsigned int)(s_piece_0_1_1 * 16 ^ (s_row_0_1_1 & 7) << 4)));
+                int s_dst_0_1_1 = ((tile_m_1 * 256 + s_row_0_1_1) * 56 + w_head_1) * 32 + s_piece_0_1_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -4354,18 +5034,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_0_1[_lp*2 + 0], w_scaled_1_0_1[_lp*2+1 + 0]));
                     w_scaled_1_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_50[4];
+                float _unpack_bf16_60[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_50[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_50[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_60[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_60[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_0_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[0] = _unpack_bf16_50[0];
-                w_rounded_1_1[1] = _unpack_bf16_50[1];
-                w_rounded_1_1[2] = _unpack_bf16_50[2];
-                w_rounded_1_1[3] = _unpack_bf16_50[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_50[0], _unpack_bf16_50[0], _unpack_bf16_50[1] * _unpack_bf16_50[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_50[2], _unpack_bf16_50[2], _unpack_bf16_50[3] * _unpack_bf16_50[3]);
+                w_rounded_1_1[0] = _unpack_bf16_60[0];
+                w_rounded_1_1[1] = _unpack_bf16_60[1];
+                w_rounded_1_1[2] = _unpack_bf16_60[2];
+                w_rounded_1_1[3] = _unpack_bf16_60[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_60[0], _unpack_bf16_60[0], _unpack_bf16_60[1] * _unpack_bf16_60[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_60[2], _unpack_bf16_60[2], _unpack_bf16_60[3] * _unpack_bf16_60[3]);
                 float w_scaled_1_1_1[4];
                 w_scaled_1_1_1[0] = accum_1[36] * w_sa_lo_1_1 * sw_1[2];
                 w_scaled_1_1_1[1] = accum_1[37] * w_sa_lo_1_1 * sw_1[3];
@@ -4377,18 +5057,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_1_1[_lp*2 + 0], w_scaled_1_1_1[_lp*2+1 + 0]));
                     w_scaled_1_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_51[4];
+                float _unpack_bf16_61[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_51[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_51[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_61[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_61[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_1_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[4] = _unpack_bf16_51[0];
-                w_rounded_1_1[5] = _unpack_bf16_51[1];
-                w_rounded_1_1[6] = _unpack_bf16_51[2];
-                w_rounded_1_1[7] = _unpack_bf16_51[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_51[0], _unpack_bf16_51[0], _unpack_bf16_51[1] * _unpack_bf16_51[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_51[2], _unpack_bf16_51[2], _unpack_bf16_51[3] * _unpack_bf16_51[3]);
+                w_rounded_1_1[4] = _unpack_bf16_61[0];
+                w_rounded_1_1[5] = _unpack_bf16_61[1];
+                w_rounded_1_1[6] = _unpack_bf16_61[2];
+                w_rounded_1_1[7] = _unpack_bf16_61[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_61[0], _unpack_bf16_61[0], _unpack_bf16_61[1] * _unpack_bf16_61[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_61[2], _unpack_bf16_61[2], _unpack_bf16_61[3] * _unpack_bf16_61[3]);
                 float w_scaled_1_2_1[4];
                 w_scaled_1_2_1[0] = accum_1[40] * w_sa_lo_1_1 * sw_1[4];
                 w_scaled_1_2_1[1] = accum_1[41] * w_sa_lo_1_1 * sw_1[5];
@@ -4400,18 +5080,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_2_1[_lp*2 + 0], w_scaled_1_2_1[_lp*2+1 + 0]));
                     w_scaled_1_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_52[4];
+                float _unpack_bf16_62[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_52[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_52[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_62[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_62[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_2_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[8] = _unpack_bf16_52[0];
-                w_rounded_1_1[9] = _unpack_bf16_52[1];
-                w_rounded_1_1[10] = _unpack_bf16_52[2];
-                w_rounded_1_1[11] = _unpack_bf16_52[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_52[0], _unpack_bf16_52[0], _unpack_bf16_52[1] * _unpack_bf16_52[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_52[2], _unpack_bf16_52[2], _unpack_bf16_52[3] * _unpack_bf16_52[3]);
+                w_rounded_1_1[8] = _unpack_bf16_62[0];
+                w_rounded_1_1[9] = _unpack_bf16_62[1];
+                w_rounded_1_1[10] = _unpack_bf16_62[2];
+                w_rounded_1_1[11] = _unpack_bf16_62[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_62[0], _unpack_bf16_62[0], _unpack_bf16_62[1] * _unpack_bf16_62[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_62[2], _unpack_bf16_62[2], _unpack_bf16_62[3] * _unpack_bf16_62[3]);
                 float w_scaled_1_3_1[4];
                 w_scaled_1_3_1[0] = accum_1[44] * w_sa_lo_1_1 * sw_1[6];
                 w_scaled_1_3_1[1] = accum_1[45] * w_sa_lo_1_1 * sw_1[7];
@@ -4423,18 +5103,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_3_1[_lp*2 + 0], w_scaled_1_3_1[_lp*2+1 + 0]));
                     w_scaled_1_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_53[4];
+                float _unpack_bf16_63[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_53[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_53[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_63[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_63[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_3_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[12] = _unpack_bf16_53[0];
-                w_rounded_1_1[13] = _unpack_bf16_53[1];
-                w_rounded_1_1[14] = _unpack_bf16_53[2];
-                w_rounded_1_1[15] = _unpack_bf16_53[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_53[0], _unpack_bf16_53[0], _unpack_bf16_53[1] * _unpack_bf16_53[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_53[2], _unpack_bf16_53[2], _unpack_bf16_53[3] * _unpack_bf16_53[3]);
+                w_rounded_1_1[12] = _unpack_bf16_63[0];
+                w_rounded_1_1[13] = _unpack_bf16_63[1];
+                w_rounded_1_1[14] = _unpack_bf16_63[2];
+                w_rounded_1_1[15] = _unpack_bf16_63[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_63[0], _unpack_bf16_63[0], _unpack_bf16_63[1] * _unpack_bf16_63[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_63[2], _unpack_bf16_63[2], _unpack_bf16_63[3] * _unpack_bf16_63[3]);
                 float w_scaled_1_4_1[4];
                 w_scaled_1_4_1[0] = accum_1[48] * w_sa_lo_1_1 * sw_1[8];
                 w_scaled_1_4_1[1] = accum_1[49] * w_sa_lo_1_1 * sw_1[9];
@@ -4446,18 +5126,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_4_1[_lp*2 + 0], w_scaled_1_4_1[_lp*2+1 + 0]));
                     w_scaled_1_4_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_54[4];
+                float _unpack_bf16_64[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_54[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_54[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_64[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_64[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_4_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[16] = _unpack_bf16_54[0];
-                w_rounded_1_1[17] = _unpack_bf16_54[1];
-                w_rounded_1_1[18] = _unpack_bf16_54[2];
-                w_rounded_1_1[19] = _unpack_bf16_54[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_54[0], _unpack_bf16_54[0], _unpack_bf16_54[1] * _unpack_bf16_54[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_54[2], _unpack_bf16_54[2], _unpack_bf16_54[3] * _unpack_bf16_54[3]);
+                w_rounded_1_1[16] = _unpack_bf16_64[0];
+                w_rounded_1_1[17] = _unpack_bf16_64[1];
+                w_rounded_1_1[18] = _unpack_bf16_64[2];
+                w_rounded_1_1[19] = _unpack_bf16_64[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_64[0], _unpack_bf16_64[0], _unpack_bf16_64[1] * _unpack_bf16_64[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_64[2], _unpack_bf16_64[2], _unpack_bf16_64[3] * _unpack_bf16_64[3]);
                 float w_scaled_1_5_1[4];
                 w_scaled_1_5_1[0] = accum_1[52] * w_sa_lo_1_1 * sw_1[10];
                 w_scaled_1_5_1[1] = accum_1[53] * w_sa_lo_1_1 * sw_1[11];
@@ -4469,18 +5149,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_5_1[_lp*2 + 0], w_scaled_1_5_1[_lp*2+1 + 0]));
                     w_scaled_1_5_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_55[4];
+                float _unpack_bf16_65[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_55[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_55[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_65[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_65[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_5_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[20] = _unpack_bf16_55[0];
-                w_rounded_1_1[21] = _unpack_bf16_55[1];
-                w_rounded_1_1[22] = _unpack_bf16_55[2];
-                w_rounded_1_1[23] = _unpack_bf16_55[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_55[0], _unpack_bf16_55[0], _unpack_bf16_55[1] * _unpack_bf16_55[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_55[2], _unpack_bf16_55[2], _unpack_bf16_55[3] * _unpack_bf16_55[3]);
+                w_rounded_1_1[20] = _unpack_bf16_65[0];
+                w_rounded_1_1[21] = _unpack_bf16_65[1];
+                w_rounded_1_1[22] = _unpack_bf16_65[2];
+                w_rounded_1_1[23] = _unpack_bf16_65[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_65[0], _unpack_bf16_65[0], _unpack_bf16_65[1] * _unpack_bf16_65[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_65[2], _unpack_bf16_65[2], _unpack_bf16_65[3] * _unpack_bf16_65[3]);
                 float w_scaled_1_6_1[4];
                 w_scaled_1_6_1[0] = accum_1[56] * w_sa_lo_1_1 * sw_1[12];
                 w_scaled_1_6_1[1] = accum_1[57] * w_sa_lo_1_1 * sw_1[13];
@@ -4492,18 +5172,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_6_1[_lp*2 + 0], w_scaled_1_6_1[_lp*2+1 + 0]));
                     w_scaled_1_6_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_56[4];
+                float _unpack_bf16_66[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_56[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_56[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_66[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_66[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_6_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[24] = _unpack_bf16_56[0];
-                w_rounded_1_1[25] = _unpack_bf16_56[1];
-                w_rounded_1_1[26] = _unpack_bf16_56[2];
-                w_rounded_1_1[27] = _unpack_bf16_56[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_56[0], _unpack_bf16_56[0], _unpack_bf16_56[1] * _unpack_bf16_56[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_56[2], _unpack_bf16_56[2], _unpack_bf16_56[3] * _unpack_bf16_56[3]);
+                w_rounded_1_1[24] = _unpack_bf16_66[0];
+                w_rounded_1_1[25] = _unpack_bf16_66[1];
+                w_rounded_1_1[26] = _unpack_bf16_66[2];
+                w_rounded_1_1[27] = _unpack_bf16_66[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_66[0], _unpack_bf16_66[0], _unpack_bf16_66[1] * _unpack_bf16_66[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_66[2], _unpack_bf16_66[2], _unpack_bf16_66[3] * _unpack_bf16_66[3]);
                 float w_scaled_1_7_1[4];
                 w_scaled_1_7_1[0] = accum_1[60] * w_sa_lo_1_1 * sw_1[14];
                 w_scaled_1_7_1[1] = accum_1[61] * w_sa_lo_1_1 * sw_1[15];
@@ -4515,18 +5195,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_1_7_1[_lp*2 + 0], w_scaled_1_7_1[_lp*2+1 + 0]));
                     w_scaled_1_7_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_57[4];
+                float _unpack_bf16_67[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_57[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_57[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_67[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_67[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_1_7_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_1_1[28] = _unpack_bf16_57[0];
-                w_rounded_1_1[29] = _unpack_bf16_57[1];
-                w_rounded_1_1[30] = _unpack_bf16_57[2];
-                w_rounded_1_1[31] = _unpack_bf16_57[3];
-                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_57[0], _unpack_bf16_57[0], _unpack_bf16_57[1] * _unpack_bf16_57[1]);
-                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_57[2], _unpack_bf16_57[2], _unpack_bf16_57[3] * _unpack_bf16_57[3]);
+                w_rounded_1_1[28] = _unpack_bf16_67[0];
+                w_rounded_1_1[29] = _unpack_bf16_67[1];
+                w_rounded_1_1[30] = _unpack_bf16_67[2];
+                w_rounded_1_1[31] = _unpack_bf16_67[3];
+                w_ss_lo_1_1 += __fmaf_rn(_unpack_bf16_67[0], _unpack_bf16_67[0], _unpack_bf16_67[1] * _unpack_bf16_67[1]);
+                w_ss_hi_1_1 += __fmaf_rn(_unpack_bf16_67[2], _unpack_bf16_67[2], _unpack_bf16_67[3] * _unpack_bf16_67[3]);
                 float w_rstd_lo_1_1 = 1.0f;
                 float w_rstd_hi_1_1 = 1.0f;
                 if (w_kind_1 < 2) {
@@ -4734,12 +5414,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_1_1 = role_tid_1 >> 2;
                 int w_c_1_1 = role_tid_1 & 3;
                 int w_grow_1_1 = tile_m_1 * 256 + 64 + w_srow_1_1;
+                int w_chunk_lo_1_1 = ((w_c_1_1 < 3) ? w_c_1_1 * 16 : 96);
+                int w_chunk_hi_1_1 = ((w_c_1_1 < 3) ? w_chunk_lo_1_1 + 48 : 112);
                 if (w_grow_1_1 < M) {
-                    int w_row_head_1_1 = w_grow_1_1 * 56 + w_head_1;
-                    unsigned int w_st_words_1_1[4];
-                    float w_st_vals_1_1[16];
-                    int w_chunk_lo_1_1 = ((w_c_1_1 < 3) ? w_c_1_1 * 16 : 96);
-                    int w_chunk_hi_1_1 = ((w_c_1_1 < 3) ? w_chunk_lo_1_1 + 48 : 112);
                     unsigned int w_x_lo_1_1[8];
                     unsigned int w_x_hi_1_1[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -4756,17 +5433,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)));
                     if (w_c_1_1 < 3) {
                         if (w_kind_1 < 2) {
-                            float _unpack_bf16_58[16];
+                            float _unpack_bf16_68[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_58[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) << 16);
-                                (&_unpack_bf16_58[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_68[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) << 16);
+                                (&_unpack_bf16_68[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_59[16];
+                            float _unpack_bf16_69[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_59[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) << 16);
-                                (&_unpack_bf16_59[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_69[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) << 16);
+                                (&_unpack_bf16_69[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_20[8];
                             {
@@ -4834,66 +5511,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_1_0_1 = _vec_load_22[0];
                             float w_cv1_1_0_1 = _vec_load_21[0];
                             float w_sv1_1_0_1 = _vec_load_23[0];
-                            w_o_lo_1_1[0] = __fmaf_rn(_unpack_bf16_58[0], w_cv0_1_0_1, -(_unpack_bf16_59[0] * w_sv0_1_0_1));
-                            w_o_hi_1_1[0] = __fmaf_rn(_unpack_bf16_59[0], w_cv0_1_0_1, _unpack_bf16_58[0] * w_sv0_1_0_1);
-                            w_o_lo_1_1[8] = __fmaf_rn(_unpack_bf16_58[8], w_cv1_1_0_1, -(_unpack_bf16_59[8] * w_sv1_1_0_1));
-                            w_o_hi_1_1[8] = __fmaf_rn(_unpack_bf16_59[8], w_cv1_1_0_1, _unpack_bf16_58[8] * w_sv1_1_0_1);
+                            w_o_lo_1_1[0] = __fmaf_rn(_unpack_bf16_68[0], w_cv0_1_0_1, -(_unpack_bf16_69[0] * w_sv0_1_0_1));
+                            w_o_hi_1_1[0] = __fmaf_rn(_unpack_bf16_69[0], w_cv0_1_0_1, _unpack_bf16_68[0] * w_sv0_1_0_1);
+                            w_o_lo_1_1[8] = __fmaf_rn(_unpack_bf16_68[8], w_cv1_1_0_1, -(_unpack_bf16_69[8] * w_sv1_1_0_1));
+                            w_o_hi_1_1[8] = __fmaf_rn(_unpack_bf16_69[8], w_cv1_1_0_1, _unpack_bf16_68[8] * w_sv1_1_0_1);
                             float w_cv0_1_1_1 = _vec_load_20[1];
                             float w_sv0_1_1_1 = _vec_load_22[1];
                             float w_cv1_1_1_1 = _vec_load_21[1];
                             float w_sv1_1_1_1 = _vec_load_23[1];
-                            w_o_lo_1_1[1] = __fmaf_rn(_unpack_bf16_58[1], w_cv0_1_1_1, -(_unpack_bf16_59[1] * w_sv0_1_1_1));
-                            w_o_hi_1_1[1] = __fmaf_rn(_unpack_bf16_59[1], w_cv0_1_1_1, _unpack_bf16_58[1] * w_sv0_1_1_1);
-                            w_o_lo_1_1[9] = __fmaf_rn(_unpack_bf16_58[9], w_cv1_1_1_1, -(_unpack_bf16_59[9] * w_sv1_1_1_1));
-                            w_o_hi_1_1[9] = __fmaf_rn(_unpack_bf16_59[9], w_cv1_1_1_1, _unpack_bf16_58[9] * w_sv1_1_1_1);
+                            w_o_lo_1_1[1] = __fmaf_rn(_unpack_bf16_68[1], w_cv0_1_1_1, -(_unpack_bf16_69[1] * w_sv0_1_1_1));
+                            w_o_hi_1_1[1] = __fmaf_rn(_unpack_bf16_69[1], w_cv0_1_1_1, _unpack_bf16_68[1] * w_sv0_1_1_1);
+                            w_o_lo_1_1[9] = __fmaf_rn(_unpack_bf16_68[9], w_cv1_1_1_1, -(_unpack_bf16_69[9] * w_sv1_1_1_1));
+                            w_o_hi_1_1[9] = __fmaf_rn(_unpack_bf16_69[9], w_cv1_1_1_1, _unpack_bf16_68[9] * w_sv1_1_1_1);
                             float w_cv0_1_2_1 = _vec_load_20[2];
                             float w_sv0_1_2_1 = _vec_load_22[2];
                             float w_cv1_1_2_1 = _vec_load_21[2];
                             float w_sv1_1_2_1 = _vec_load_23[2];
-                            w_o_lo_1_1[2] = __fmaf_rn(_unpack_bf16_58[2], w_cv0_1_2_1, -(_unpack_bf16_59[2] * w_sv0_1_2_1));
-                            w_o_hi_1_1[2] = __fmaf_rn(_unpack_bf16_59[2], w_cv0_1_2_1, _unpack_bf16_58[2] * w_sv0_1_2_1);
-                            w_o_lo_1_1[10] = __fmaf_rn(_unpack_bf16_58[10], w_cv1_1_2_1, -(_unpack_bf16_59[10] * w_sv1_1_2_1));
-                            w_o_hi_1_1[10] = __fmaf_rn(_unpack_bf16_59[10], w_cv1_1_2_1, _unpack_bf16_58[10] * w_sv1_1_2_1);
+                            w_o_lo_1_1[2] = __fmaf_rn(_unpack_bf16_68[2], w_cv0_1_2_1, -(_unpack_bf16_69[2] * w_sv0_1_2_1));
+                            w_o_hi_1_1[2] = __fmaf_rn(_unpack_bf16_69[2], w_cv0_1_2_1, _unpack_bf16_68[2] * w_sv0_1_2_1);
+                            w_o_lo_1_1[10] = __fmaf_rn(_unpack_bf16_68[10], w_cv1_1_2_1, -(_unpack_bf16_69[10] * w_sv1_1_2_1));
+                            w_o_hi_1_1[10] = __fmaf_rn(_unpack_bf16_69[10], w_cv1_1_2_1, _unpack_bf16_68[10] * w_sv1_1_2_1);
                             float w_cv0_1_3_1 = _vec_load_20[3];
                             float w_sv0_1_3_1 = _vec_load_22[3];
                             float w_cv1_1_3_1 = _vec_load_21[3];
                             float w_sv1_1_3_1 = _vec_load_23[3];
-                            w_o_lo_1_1[3] = __fmaf_rn(_unpack_bf16_58[3], w_cv0_1_3_1, -(_unpack_bf16_59[3] * w_sv0_1_3_1));
-                            w_o_hi_1_1[3] = __fmaf_rn(_unpack_bf16_59[3], w_cv0_1_3_1, _unpack_bf16_58[3] * w_sv0_1_3_1);
-                            w_o_lo_1_1[11] = __fmaf_rn(_unpack_bf16_58[11], w_cv1_1_3_1, -(_unpack_bf16_59[11] * w_sv1_1_3_1));
-                            w_o_hi_1_1[11] = __fmaf_rn(_unpack_bf16_59[11], w_cv1_1_3_1, _unpack_bf16_58[11] * w_sv1_1_3_1);
+                            w_o_lo_1_1[3] = __fmaf_rn(_unpack_bf16_68[3], w_cv0_1_3_1, -(_unpack_bf16_69[3] * w_sv0_1_3_1));
+                            w_o_hi_1_1[3] = __fmaf_rn(_unpack_bf16_69[3], w_cv0_1_3_1, _unpack_bf16_68[3] * w_sv0_1_3_1);
+                            w_o_lo_1_1[11] = __fmaf_rn(_unpack_bf16_68[11], w_cv1_1_3_1, -(_unpack_bf16_69[11] * w_sv1_1_3_1));
+                            w_o_hi_1_1[11] = __fmaf_rn(_unpack_bf16_69[11], w_cv1_1_3_1, _unpack_bf16_68[11] * w_sv1_1_3_1);
                             float w_cv0_1_4_1 = _vec_load_20[4];
                             float w_sv0_1_4_1 = _vec_load_22[4];
                             float w_cv1_1_4_1 = _vec_load_21[4];
                             float w_sv1_1_4_1 = _vec_load_23[4];
-                            w_o_lo_1_1[4] = __fmaf_rn(_unpack_bf16_58[4], w_cv0_1_4_1, -(_unpack_bf16_59[4] * w_sv0_1_4_1));
-                            w_o_hi_1_1[4] = __fmaf_rn(_unpack_bf16_59[4], w_cv0_1_4_1, _unpack_bf16_58[4] * w_sv0_1_4_1);
-                            w_o_lo_1_1[12] = __fmaf_rn(_unpack_bf16_58[12], w_cv1_1_4_1, -(_unpack_bf16_59[12] * w_sv1_1_4_1));
-                            w_o_hi_1_1[12] = __fmaf_rn(_unpack_bf16_59[12], w_cv1_1_4_1, _unpack_bf16_58[12] * w_sv1_1_4_1);
+                            w_o_lo_1_1[4] = __fmaf_rn(_unpack_bf16_68[4], w_cv0_1_4_1, -(_unpack_bf16_69[4] * w_sv0_1_4_1));
+                            w_o_hi_1_1[4] = __fmaf_rn(_unpack_bf16_69[4], w_cv0_1_4_1, _unpack_bf16_68[4] * w_sv0_1_4_1);
+                            w_o_lo_1_1[12] = __fmaf_rn(_unpack_bf16_68[12], w_cv1_1_4_1, -(_unpack_bf16_69[12] * w_sv1_1_4_1));
+                            w_o_hi_1_1[12] = __fmaf_rn(_unpack_bf16_69[12], w_cv1_1_4_1, _unpack_bf16_68[12] * w_sv1_1_4_1);
                             float w_cv0_1_5_1 = _vec_load_20[5];
                             float w_sv0_1_5_1 = _vec_load_22[5];
                             float w_cv1_1_5_1 = _vec_load_21[5];
                             float w_sv1_1_5_1 = _vec_load_23[5];
-                            w_o_lo_1_1[5] = __fmaf_rn(_unpack_bf16_58[5], w_cv0_1_5_1, -(_unpack_bf16_59[5] * w_sv0_1_5_1));
-                            w_o_hi_1_1[5] = __fmaf_rn(_unpack_bf16_59[5], w_cv0_1_5_1, _unpack_bf16_58[5] * w_sv0_1_5_1);
-                            w_o_lo_1_1[13] = __fmaf_rn(_unpack_bf16_58[13], w_cv1_1_5_1, -(_unpack_bf16_59[13] * w_sv1_1_5_1));
-                            w_o_hi_1_1[13] = __fmaf_rn(_unpack_bf16_59[13], w_cv1_1_5_1, _unpack_bf16_58[13] * w_sv1_1_5_1);
+                            w_o_lo_1_1[5] = __fmaf_rn(_unpack_bf16_68[5], w_cv0_1_5_1, -(_unpack_bf16_69[5] * w_sv0_1_5_1));
+                            w_o_hi_1_1[5] = __fmaf_rn(_unpack_bf16_69[5], w_cv0_1_5_1, _unpack_bf16_68[5] * w_sv0_1_5_1);
+                            w_o_lo_1_1[13] = __fmaf_rn(_unpack_bf16_68[13], w_cv1_1_5_1, -(_unpack_bf16_69[13] * w_sv1_1_5_1));
+                            w_o_hi_1_1[13] = __fmaf_rn(_unpack_bf16_69[13], w_cv1_1_5_1, _unpack_bf16_68[13] * w_sv1_1_5_1);
                             float w_cv0_1_6_1 = _vec_load_20[6];
                             float w_sv0_1_6_1 = _vec_load_22[6];
                             float w_cv1_1_6_1 = _vec_load_21[6];
                             float w_sv1_1_6_1 = _vec_load_23[6];
-                            w_o_lo_1_1[6] = __fmaf_rn(_unpack_bf16_58[6], w_cv0_1_6_1, -(_unpack_bf16_59[6] * w_sv0_1_6_1));
-                            w_o_hi_1_1[6] = __fmaf_rn(_unpack_bf16_59[6], w_cv0_1_6_1, _unpack_bf16_58[6] * w_sv0_1_6_1);
-                            w_o_lo_1_1[14] = __fmaf_rn(_unpack_bf16_58[14], w_cv1_1_6_1, -(_unpack_bf16_59[14] * w_sv1_1_6_1));
-                            w_o_hi_1_1[14] = __fmaf_rn(_unpack_bf16_59[14], w_cv1_1_6_1, _unpack_bf16_58[14] * w_sv1_1_6_1);
+                            w_o_lo_1_1[6] = __fmaf_rn(_unpack_bf16_68[6], w_cv0_1_6_1, -(_unpack_bf16_69[6] * w_sv0_1_6_1));
+                            w_o_hi_1_1[6] = __fmaf_rn(_unpack_bf16_69[6], w_cv0_1_6_1, _unpack_bf16_68[6] * w_sv0_1_6_1);
+                            w_o_lo_1_1[14] = __fmaf_rn(_unpack_bf16_68[14], w_cv1_1_6_1, -(_unpack_bf16_69[14] * w_sv1_1_6_1));
+                            w_o_hi_1_1[14] = __fmaf_rn(_unpack_bf16_69[14], w_cv1_1_6_1, _unpack_bf16_68[14] * w_sv1_1_6_1);
                             float w_cv0_1_7_1 = _vec_load_20[7];
                             float w_sv0_1_7_1 = _vec_load_22[7];
                             float w_cv1_1_7_1 = _vec_load_21[7];
                             float w_sv1_1_7_1 = _vec_load_23[7];
-                            w_o_lo_1_1[7] = __fmaf_rn(_unpack_bf16_58[7], w_cv0_1_7_1, -(_unpack_bf16_59[7] * w_sv0_1_7_1));
-                            w_o_hi_1_1[7] = __fmaf_rn(_unpack_bf16_59[7], w_cv0_1_7_1, _unpack_bf16_58[7] * w_sv0_1_7_1);
-                            w_o_lo_1_1[15] = __fmaf_rn(_unpack_bf16_58[15], w_cv1_1_7_1, -(_unpack_bf16_59[15] * w_sv1_1_7_1));
-                            w_o_hi_1_1[15] = __fmaf_rn(_unpack_bf16_59[15], w_cv1_1_7_1, _unpack_bf16_58[15] * w_sv1_1_7_1);
+                            w_o_lo_1_1[7] = __fmaf_rn(_unpack_bf16_68[7], w_cv0_1_7_1, -(_unpack_bf16_69[7] * w_sv0_1_7_1));
+                            w_o_hi_1_1[7] = __fmaf_rn(_unpack_bf16_69[7], w_cv0_1_7_1, _unpack_bf16_68[7] * w_sv0_1_7_1);
+                            w_o_lo_1_1[15] = __fmaf_rn(_unpack_bf16_68[15], w_cv1_1_7_1, -(_unpack_bf16_69[15] * w_sv1_1_7_1));
+                            w_o_hi_1_1[15] = __fmaf_rn(_unpack_bf16_69[15], w_cv1_1_7_1, _unpack_bf16_68[15] * w_sv1_1_7_1);
                             unsigned int w_o_lo_1_bf16_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -4906,69 +5583,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_1_1[_lp*2 + 0], w_o_hi_1_1[_lp*2+1 + 0]));
                                 w_o_hi_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            }
+                            w_x_lo_1_1[0] = w_o_lo_1_bf16_1[0];
+                            w_x_hi_1_1[0] = w_o_hi_1_bf16_1[0];
+                            w_x_lo_1_1[1] = w_o_lo_1_bf16_1[1];
+                            w_x_hi_1_1[1] = w_o_hi_1_bf16_1[1];
+                            w_x_lo_1_1[2] = w_o_lo_1_bf16_1[2];
+                            w_x_hi_1_1[2] = w_o_hi_1_bf16_1[2];
+                            w_x_lo_1_1[3] = w_o_lo_1_bf16_1[3];
+                            w_x_hi_1_1[3] = w_o_hi_1_bf16_1[3];
+                            w_x_lo_1_1[4] = w_o_lo_1_bf16_1[4];
+                            w_x_hi_1_1[4] = w_o_hi_1_bf16_1[4];
+                            w_x_lo_1_1[5] = w_o_lo_1_bf16_1[5];
+                            w_x_hi_1_1[5] = w_o_hi_1_bf16_1[5];
+                            w_x_lo_1_1[6] = w_o_lo_1_bf16_1[6];
+                            w_x_hi_1_1[6] = w_o_hi_1_bf16_1[6];
+                            w_x_lo_1_1[7] = w_o_lo_1_bf16_1[7];
+                            w_x_hi_1_1[7] = w_o_hi_1_bf16_1[7];
                         }
+                    }
+                    unsigned int w_q_words_1_1[4];
+                    float w_q_vals_1_1[16];
+                    float _unpack_bf16_70[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_70[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) << 16);
+                        (&_unpack_bf16_70[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_1_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_1_1[0] = _unpack_bf16_70[0] * w_out_scale_sel_1;
+                    w_q_vals_1_1[1] = _unpack_bf16_70[1] * w_out_scale_sel_1;
+                    w_q_vals_1_1[2] = _unpack_bf16_70[2] * w_out_scale_sel_1;
+                    w_q_vals_1_1[3] = _unpack_bf16_70[3] * w_out_scale_sel_1;
+                    w_q_vals_1_1[4] = _unpack_bf16_70[4] * w_out_scale_sel_1;
+                    w_q_vals_1_1[5] = _unpack_bf16_70[5] * w_out_scale_sel_1;
+                    w_q_vals_1_1[6] = _unpack_bf16_70[6] * w_out_scale_sel_1;
+                    w_q_vals_1_1[7] = _unpack_bf16_70[7] * w_out_scale_sel_1;
+                    w_q_vals_1_1[8] = _unpack_bf16_70[8] * w_out_scale_sel_1;
+                    w_q_vals_1_1[9] = _unpack_bf16_70[9] * w_out_scale_sel_1;
+                    w_q_vals_1_1[10] = _unpack_bf16_70[10] * w_out_scale_sel_1;
+                    w_q_vals_1_1[11] = _unpack_bf16_70[11] * w_out_scale_sel_1;
+                    w_q_vals_1_1[12] = _unpack_bf16_70[12] * w_out_scale_sel_1;
+                    w_q_vals_1_1[13] = _unpack_bf16_70[13] * w_out_scale_sel_1;
+                    w_q_vals_1_1[14] = _unpack_bf16_70[14] * w_out_scale_sel_1;
+                    w_q_vals_1_1[15] = _unpack_bf16_70[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[0]), "f"(w_q_vals_1_1[1]),
+                                               "f"(w_q_vals_1_1[2]), "f"(w_q_vals_1_1[3]));
+                        w_q_words_1_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[4]), "f"(w_q_vals_1_1[5]),
+                                               "f"(w_q_vals_1_1[6]), "f"(w_q_vals_1_1[7]));
+                        w_q_words_1_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[8]), "f"(w_q_vals_1_1[9]),
+                                               "f"(w_q_vals_1_1[10]), "f"(w_q_vals_1_1[11]));
+                        w_q_words_1_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[12]), "f"(w_q_vals_1_1[13]),
+                                               "f"(w_q_vals_1_1[14]), "f"(w_q_vals_1_1[15]));
+                        w_q_words_1_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_1_1 * 128) + (unsigned int)(w_chunk_lo_1_1 ^ (w_srow_1_1 & 7) << 4)), "r"(w_q_words_1_1[0]), "r"(w_q_words_1_1[1]), "r"(w_q_words_1_1[2]), "r"(w_q_words_1_1[3]) : "memory");
+                    float _unpack_bf16_71[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_71[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) << 16);
+                        (&_unpack_bf16_71[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_1_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_1_1[0] = _unpack_bf16_71[0] * w_out_scale_sel_1;
+                    w_q_vals_1_1[1] = _unpack_bf16_71[1] * w_out_scale_sel_1;
+                    w_q_vals_1_1[2] = _unpack_bf16_71[2] * w_out_scale_sel_1;
+                    w_q_vals_1_1[3] = _unpack_bf16_71[3] * w_out_scale_sel_1;
+                    w_q_vals_1_1[4] = _unpack_bf16_71[4] * w_out_scale_sel_1;
+                    w_q_vals_1_1[5] = _unpack_bf16_71[5] * w_out_scale_sel_1;
+                    w_q_vals_1_1[6] = _unpack_bf16_71[6] * w_out_scale_sel_1;
+                    w_q_vals_1_1[7] = _unpack_bf16_71[7] * w_out_scale_sel_1;
+                    w_q_vals_1_1[8] = _unpack_bf16_71[8] * w_out_scale_sel_1;
+                    w_q_vals_1_1[9] = _unpack_bf16_71[9] * w_out_scale_sel_1;
+                    w_q_vals_1_1[10] = _unpack_bf16_71[10] * w_out_scale_sel_1;
+                    w_q_vals_1_1[11] = _unpack_bf16_71[11] * w_out_scale_sel_1;
+                    w_q_vals_1_1[12] = _unpack_bf16_71[12] * w_out_scale_sel_1;
+                    w_q_vals_1_1[13] = _unpack_bf16_71[13] * w_out_scale_sel_1;
+                    w_q_vals_1_1[14] = _unpack_bf16_71[14] * w_out_scale_sel_1;
+                    w_q_vals_1_1[15] = _unpack_bf16_71[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[0]), "f"(w_q_vals_1_1[1]),
+                                               "f"(w_q_vals_1_1[2]), "f"(w_q_vals_1_1[3]));
+                        w_q_words_1_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[4]), "f"(w_q_vals_1_1[5]),
+                                               "f"(w_q_vals_1_1[6]), "f"(w_q_vals_1_1[7]));
+                        w_q_words_1_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[8]), "f"(w_q_vals_1_1[9]),
+                                               "f"(w_q_vals_1_1[10]), "f"(w_q_vals_1_1[11]));
+                        w_q_words_1_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_1_1[12]), "f"(w_q_vals_1_1[13]),
+                                               "f"(w_q_vals_1_1[14]), "f"(w_q_vals_1_1[15]));
+                        w_q_words_1_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_1_1 * 128) + (unsigned int)(w_chunk_hi_1_1 ^ (w_srow_1_1 & 7) << 4)), "r"(w_q_words_1_1[0]), "r"(w_q_words_1_1[1]), "r"(w_q_words_1_1[2]), "r"(w_q_words_1_1[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_1_0_1 = (role_tid_1 >> 5) * 8 + lane / 8;
+                int s_piece_1_0_1 = lane % 8;
+                unsigned int s_words_1_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_1_0_1 * 128) + (unsigned int)(s_piece_1_0_1 * 16 ^ (s_row_1_0_1 & 7) << 4)));
+                int s_dst_1_0_1 = ((tile_m_1 * 256 + 64 + s_row_1_0_1) * 56 + w_head_1) * 32 + s_piece_1_0_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
+                    }
+                }
+                int s_row_1_1_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 8;
+                int s_piece_1_1_1 = lane % 8;
+                unsigned int s_words_1_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_1_1_1 * 128) + (unsigned int)(s_piece_1_1_1 * 16 ^ (s_row_1_1_1 & 7) << 4)));
+                int s_dst_1_1_1 = ((tile_m_1 * 256 + 64 + s_row_1_1_1) * 56 + w_head_1) * 32 + s_piece_1_1_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -4990,18 +5806,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_0_1[_lp*2 + 0], w_scaled_2_0_1[_lp*2+1 + 0]));
                     w_scaled_2_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_60[4];
+                float _unpack_bf16_72[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_60[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_60[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_72[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_72[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_0_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[0] = _unpack_bf16_60[0];
-                w_rounded_2_1[1] = _unpack_bf16_60[1];
-                w_rounded_2_1[2] = _unpack_bf16_60[2];
-                w_rounded_2_1[3] = _unpack_bf16_60[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_60[0], _unpack_bf16_60[0], _unpack_bf16_60[1] * _unpack_bf16_60[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_60[2], _unpack_bf16_60[2], _unpack_bf16_60[3] * _unpack_bf16_60[3]);
+                w_rounded_2_1[0] = _unpack_bf16_72[0];
+                w_rounded_2_1[1] = _unpack_bf16_72[1];
+                w_rounded_2_1[2] = _unpack_bf16_72[2];
+                w_rounded_2_1[3] = _unpack_bf16_72[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_72[0], _unpack_bf16_72[0], _unpack_bf16_72[1] * _unpack_bf16_72[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_72[2], _unpack_bf16_72[2], _unpack_bf16_72[3] * _unpack_bf16_72[3]);
                 float w_scaled_2_1_1[4];
                 w_scaled_2_1_1[0] = accum_1[68] * w_sa_lo_2_1 * sw_1[2];
                 w_scaled_2_1_1[1] = accum_1[69] * w_sa_lo_2_1 * sw_1[3];
@@ -5013,18 +5829,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_1_1[_lp*2 + 0], w_scaled_2_1_1[_lp*2+1 + 0]));
                     w_scaled_2_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_61[4];
+                float _unpack_bf16_73[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_61[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_61[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_73[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_73[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_1_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[4] = _unpack_bf16_61[0];
-                w_rounded_2_1[5] = _unpack_bf16_61[1];
-                w_rounded_2_1[6] = _unpack_bf16_61[2];
-                w_rounded_2_1[7] = _unpack_bf16_61[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_61[0], _unpack_bf16_61[0], _unpack_bf16_61[1] * _unpack_bf16_61[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_61[2], _unpack_bf16_61[2], _unpack_bf16_61[3] * _unpack_bf16_61[3]);
+                w_rounded_2_1[4] = _unpack_bf16_73[0];
+                w_rounded_2_1[5] = _unpack_bf16_73[1];
+                w_rounded_2_1[6] = _unpack_bf16_73[2];
+                w_rounded_2_1[7] = _unpack_bf16_73[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_73[0], _unpack_bf16_73[0], _unpack_bf16_73[1] * _unpack_bf16_73[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_73[2], _unpack_bf16_73[2], _unpack_bf16_73[3] * _unpack_bf16_73[3]);
                 float w_scaled_2_2_1[4];
                 w_scaled_2_2_1[0] = accum_1[72] * w_sa_lo_2_1 * sw_1[4];
                 w_scaled_2_2_1[1] = accum_1[73] * w_sa_lo_2_1 * sw_1[5];
@@ -5036,18 +5852,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_2_1[_lp*2 + 0], w_scaled_2_2_1[_lp*2+1 + 0]));
                     w_scaled_2_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_62[4];
+                float _unpack_bf16_74[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_62[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_62[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_74[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_74[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_2_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[8] = _unpack_bf16_62[0];
-                w_rounded_2_1[9] = _unpack_bf16_62[1];
-                w_rounded_2_1[10] = _unpack_bf16_62[2];
-                w_rounded_2_1[11] = _unpack_bf16_62[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_62[0], _unpack_bf16_62[0], _unpack_bf16_62[1] * _unpack_bf16_62[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_62[2], _unpack_bf16_62[2], _unpack_bf16_62[3] * _unpack_bf16_62[3]);
+                w_rounded_2_1[8] = _unpack_bf16_74[0];
+                w_rounded_2_1[9] = _unpack_bf16_74[1];
+                w_rounded_2_1[10] = _unpack_bf16_74[2];
+                w_rounded_2_1[11] = _unpack_bf16_74[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_74[0], _unpack_bf16_74[0], _unpack_bf16_74[1] * _unpack_bf16_74[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_74[2], _unpack_bf16_74[2], _unpack_bf16_74[3] * _unpack_bf16_74[3]);
                 float w_scaled_2_3_1[4];
                 w_scaled_2_3_1[0] = accum_1[76] * w_sa_lo_2_1 * sw_1[6];
                 w_scaled_2_3_1[1] = accum_1[77] * w_sa_lo_2_1 * sw_1[7];
@@ -5059,18 +5875,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_3_1[_lp*2 + 0], w_scaled_2_3_1[_lp*2+1 + 0]));
                     w_scaled_2_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_63[4];
+                float _unpack_bf16_75[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_63[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_63[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_75[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_75[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_3_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[12] = _unpack_bf16_63[0];
-                w_rounded_2_1[13] = _unpack_bf16_63[1];
-                w_rounded_2_1[14] = _unpack_bf16_63[2];
-                w_rounded_2_1[15] = _unpack_bf16_63[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_63[0], _unpack_bf16_63[0], _unpack_bf16_63[1] * _unpack_bf16_63[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_63[2], _unpack_bf16_63[2], _unpack_bf16_63[3] * _unpack_bf16_63[3]);
+                w_rounded_2_1[12] = _unpack_bf16_75[0];
+                w_rounded_2_1[13] = _unpack_bf16_75[1];
+                w_rounded_2_1[14] = _unpack_bf16_75[2];
+                w_rounded_2_1[15] = _unpack_bf16_75[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_75[0], _unpack_bf16_75[0], _unpack_bf16_75[1] * _unpack_bf16_75[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_75[2], _unpack_bf16_75[2], _unpack_bf16_75[3] * _unpack_bf16_75[3]);
                 float w_scaled_2_4_1[4];
                 w_scaled_2_4_1[0] = accum_1[80] * w_sa_lo_2_1 * sw_1[8];
                 w_scaled_2_4_1[1] = accum_1[81] * w_sa_lo_2_1 * sw_1[9];
@@ -5082,18 +5898,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_4_1[_lp*2 + 0], w_scaled_2_4_1[_lp*2+1 + 0]));
                     w_scaled_2_4_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_64[4];
+                float _unpack_bf16_76[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_64[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_64[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_76[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_76[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_4_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[16] = _unpack_bf16_64[0];
-                w_rounded_2_1[17] = _unpack_bf16_64[1];
-                w_rounded_2_1[18] = _unpack_bf16_64[2];
-                w_rounded_2_1[19] = _unpack_bf16_64[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_64[0], _unpack_bf16_64[0], _unpack_bf16_64[1] * _unpack_bf16_64[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_64[2], _unpack_bf16_64[2], _unpack_bf16_64[3] * _unpack_bf16_64[3]);
+                w_rounded_2_1[16] = _unpack_bf16_76[0];
+                w_rounded_2_1[17] = _unpack_bf16_76[1];
+                w_rounded_2_1[18] = _unpack_bf16_76[2];
+                w_rounded_2_1[19] = _unpack_bf16_76[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_76[0], _unpack_bf16_76[0], _unpack_bf16_76[1] * _unpack_bf16_76[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_76[2], _unpack_bf16_76[2], _unpack_bf16_76[3] * _unpack_bf16_76[3]);
                 float w_scaled_2_5_1[4];
                 w_scaled_2_5_1[0] = accum_1[84] * w_sa_lo_2_1 * sw_1[10];
                 w_scaled_2_5_1[1] = accum_1[85] * w_sa_lo_2_1 * sw_1[11];
@@ -5105,18 +5921,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_5_1[_lp*2 + 0], w_scaled_2_5_1[_lp*2+1 + 0]));
                     w_scaled_2_5_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_65[4];
+                float _unpack_bf16_77[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_65[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_65[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_77[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_77[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_5_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[20] = _unpack_bf16_65[0];
-                w_rounded_2_1[21] = _unpack_bf16_65[1];
-                w_rounded_2_1[22] = _unpack_bf16_65[2];
-                w_rounded_2_1[23] = _unpack_bf16_65[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_65[0], _unpack_bf16_65[0], _unpack_bf16_65[1] * _unpack_bf16_65[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_65[2], _unpack_bf16_65[2], _unpack_bf16_65[3] * _unpack_bf16_65[3]);
+                w_rounded_2_1[20] = _unpack_bf16_77[0];
+                w_rounded_2_1[21] = _unpack_bf16_77[1];
+                w_rounded_2_1[22] = _unpack_bf16_77[2];
+                w_rounded_2_1[23] = _unpack_bf16_77[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_77[0], _unpack_bf16_77[0], _unpack_bf16_77[1] * _unpack_bf16_77[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_77[2], _unpack_bf16_77[2], _unpack_bf16_77[3] * _unpack_bf16_77[3]);
                 float w_scaled_2_6_1[4];
                 w_scaled_2_6_1[0] = accum_1[88] * w_sa_lo_2_1 * sw_1[12];
                 w_scaled_2_6_1[1] = accum_1[89] * w_sa_lo_2_1 * sw_1[13];
@@ -5128,18 +5944,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_6_1[_lp*2 + 0], w_scaled_2_6_1[_lp*2+1 + 0]));
                     w_scaled_2_6_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_66[4];
+                float _unpack_bf16_78[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_66[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_66[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_78[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_78[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_6_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[24] = _unpack_bf16_66[0];
-                w_rounded_2_1[25] = _unpack_bf16_66[1];
-                w_rounded_2_1[26] = _unpack_bf16_66[2];
-                w_rounded_2_1[27] = _unpack_bf16_66[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_66[0], _unpack_bf16_66[0], _unpack_bf16_66[1] * _unpack_bf16_66[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_66[2], _unpack_bf16_66[2], _unpack_bf16_66[3] * _unpack_bf16_66[3]);
+                w_rounded_2_1[24] = _unpack_bf16_78[0];
+                w_rounded_2_1[25] = _unpack_bf16_78[1];
+                w_rounded_2_1[26] = _unpack_bf16_78[2];
+                w_rounded_2_1[27] = _unpack_bf16_78[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_78[0], _unpack_bf16_78[0], _unpack_bf16_78[1] * _unpack_bf16_78[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_78[2], _unpack_bf16_78[2], _unpack_bf16_78[3] * _unpack_bf16_78[3]);
                 float w_scaled_2_7_1[4];
                 w_scaled_2_7_1[0] = accum_1[92] * w_sa_lo_2_1 * sw_1[14];
                 w_scaled_2_7_1[1] = accum_1[93] * w_sa_lo_2_1 * sw_1[15];
@@ -5151,18 +5967,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_2_7_1[_lp*2 + 0], w_scaled_2_7_1[_lp*2+1 + 0]));
                     w_scaled_2_7_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_67[4];
+                float _unpack_bf16_79[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_67[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_67[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_79[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_79[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_2_7_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_2_1[28] = _unpack_bf16_67[0];
-                w_rounded_2_1[29] = _unpack_bf16_67[1];
-                w_rounded_2_1[30] = _unpack_bf16_67[2];
-                w_rounded_2_1[31] = _unpack_bf16_67[3];
-                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_67[0], _unpack_bf16_67[0], _unpack_bf16_67[1] * _unpack_bf16_67[1]);
-                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_67[2], _unpack_bf16_67[2], _unpack_bf16_67[3] * _unpack_bf16_67[3]);
+                w_rounded_2_1[28] = _unpack_bf16_79[0];
+                w_rounded_2_1[29] = _unpack_bf16_79[1];
+                w_rounded_2_1[30] = _unpack_bf16_79[2];
+                w_rounded_2_1[31] = _unpack_bf16_79[3];
+                w_ss_lo_2_1 += __fmaf_rn(_unpack_bf16_79[0], _unpack_bf16_79[0], _unpack_bf16_79[1] * _unpack_bf16_79[1]);
+                w_ss_hi_2_1 += __fmaf_rn(_unpack_bf16_79[2], _unpack_bf16_79[2], _unpack_bf16_79[3] * _unpack_bf16_79[3]);
                 float w_rstd_lo_2_1 = 1.0f;
                 float w_rstd_hi_2_1 = 1.0f;
                 if (w_kind_1 < 2) {
@@ -5370,12 +6186,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_2_1 = role_tid_1 >> 2;
                 int w_c_2_1 = role_tid_1 & 3;
                 int w_grow_2_1 = tile_m_1 * 256 + 128 + w_srow_2_1;
+                int w_chunk_lo_2_1 = ((w_c_2_1 < 3) ? w_c_2_1 * 16 : 96);
+                int w_chunk_hi_2_1 = ((w_c_2_1 < 3) ? w_chunk_lo_2_1 + 48 : 112);
                 if (w_grow_2_1 < M) {
-                    int w_row_head_2_1 = w_grow_2_1 * 56 + w_head_1;
-                    unsigned int w_st_words_2_1[4];
-                    float w_st_vals_2_1[16];
-                    int w_chunk_lo_2_1 = ((w_c_2_1 < 3) ? w_c_2_1 * 16 : 96);
-                    int w_chunk_hi_2_1 = ((w_c_2_1 < 3) ? w_chunk_lo_2_1 + 48 : 112);
                     unsigned int w_x_lo_2_1[8];
                     unsigned int w_x_hi_2_1[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -5392,17 +6205,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)));
                     if (w_c_2_1 < 3) {
                         if (w_kind_1 < 2) {
-                            float _unpack_bf16_68[16];
+                            float _unpack_bf16_80[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_68[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) << 16);
-                                (&_unpack_bf16_68[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_80[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) << 16);
+                                (&_unpack_bf16_80[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_69[16];
+                            float _unpack_bf16_81[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_69[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) << 16);
-                                (&_unpack_bf16_69[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_81[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) << 16);
+                                (&_unpack_bf16_81[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_24[8];
                             {
@@ -5470,66 +6283,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_2_0_1 = _vec_load_26[0];
                             float w_cv1_2_0_1 = _vec_load_25[0];
                             float w_sv1_2_0_1 = _vec_load_27[0];
-                            w_o_lo_2_1[0] = __fmaf_rn(_unpack_bf16_68[0], w_cv0_2_0_1, -(_unpack_bf16_69[0] * w_sv0_2_0_1));
-                            w_o_hi_2_1[0] = __fmaf_rn(_unpack_bf16_69[0], w_cv0_2_0_1, _unpack_bf16_68[0] * w_sv0_2_0_1);
-                            w_o_lo_2_1[8] = __fmaf_rn(_unpack_bf16_68[8], w_cv1_2_0_1, -(_unpack_bf16_69[8] * w_sv1_2_0_1));
-                            w_o_hi_2_1[8] = __fmaf_rn(_unpack_bf16_69[8], w_cv1_2_0_1, _unpack_bf16_68[8] * w_sv1_2_0_1);
+                            w_o_lo_2_1[0] = __fmaf_rn(_unpack_bf16_80[0], w_cv0_2_0_1, -(_unpack_bf16_81[0] * w_sv0_2_0_1));
+                            w_o_hi_2_1[0] = __fmaf_rn(_unpack_bf16_81[0], w_cv0_2_0_1, _unpack_bf16_80[0] * w_sv0_2_0_1);
+                            w_o_lo_2_1[8] = __fmaf_rn(_unpack_bf16_80[8], w_cv1_2_0_1, -(_unpack_bf16_81[8] * w_sv1_2_0_1));
+                            w_o_hi_2_1[8] = __fmaf_rn(_unpack_bf16_81[8], w_cv1_2_0_1, _unpack_bf16_80[8] * w_sv1_2_0_1);
                             float w_cv0_2_1_1 = _vec_load_24[1];
                             float w_sv0_2_1_1 = _vec_load_26[1];
                             float w_cv1_2_1_1 = _vec_load_25[1];
                             float w_sv1_2_1_1 = _vec_load_27[1];
-                            w_o_lo_2_1[1] = __fmaf_rn(_unpack_bf16_68[1], w_cv0_2_1_1, -(_unpack_bf16_69[1] * w_sv0_2_1_1));
-                            w_o_hi_2_1[1] = __fmaf_rn(_unpack_bf16_69[1], w_cv0_2_1_1, _unpack_bf16_68[1] * w_sv0_2_1_1);
-                            w_o_lo_2_1[9] = __fmaf_rn(_unpack_bf16_68[9], w_cv1_2_1_1, -(_unpack_bf16_69[9] * w_sv1_2_1_1));
-                            w_o_hi_2_1[9] = __fmaf_rn(_unpack_bf16_69[9], w_cv1_2_1_1, _unpack_bf16_68[9] * w_sv1_2_1_1);
+                            w_o_lo_2_1[1] = __fmaf_rn(_unpack_bf16_80[1], w_cv0_2_1_1, -(_unpack_bf16_81[1] * w_sv0_2_1_1));
+                            w_o_hi_2_1[1] = __fmaf_rn(_unpack_bf16_81[1], w_cv0_2_1_1, _unpack_bf16_80[1] * w_sv0_2_1_1);
+                            w_o_lo_2_1[9] = __fmaf_rn(_unpack_bf16_80[9], w_cv1_2_1_1, -(_unpack_bf16_81[9] * w_sv1_2_1_1));
+                            w_o_hi_2_1[9] = __fmaf_rn(_unpack_bf16_81[9], w_cv1_2_1_1, _unpack_bf16_80[9] * w_sv1_2_1_1);
                             float w_cv0_2_2_1 = _vec_load_24[2];
                             float w_sv0_2_2_1 = _vec_load_26[2];
                             float w_cv1_2_2_1 = _vec_load_25[2];
                             float w_sv1_2_2_1 = _vec_load_27[2];
-                            w_o_lo_2_1[2] = __fmaf_rn(_unpack_bf16_68[2], w_cv0_2_2_1, -(_unpack_bf16_69[2] * w_sv0_2_2_1));
-                            w_o_hi_2_1[2] = __fmaf_rn(_unpack_bf16_69[2], w_cv0_2_2_1, _unpack_bf16_68[2] * w_sv0_2_2_1);
-                            w_o_lo_2_1[10] = __fmaf_rn(_unpack_bf16_68[10], w_cv1_2_2_1, -(_unpack_bf16_69[10] * w_sv1_2_2_1));
-                            w_o_hi_2_1[10] = __fmaf_rn(_unpack_bf16_69[10], w_cv1_2_2_1, _unpack_bf16_68[10] * w_sv1_2_2_1);
+                            w_o_lo_2_1[2] = __fmaf_rn(_unpack_bf16_80[2], w_cv0_2_2_1, -(_unpack_bf16_81[2] * w_sv0_2_2_1));
+                            w_o_hi_2_1[2] = __fmaf_rn(_unpack_bf16_81[2], w_cv0_2_2_1, _unpack_bf16_80[2] * w_sv0_2_2_1);
+                            w_o_lo_2_1[10] = __fmaf_rn(_unpack_bf16_80[10], w_cv1_2_2_1, -(_unpack_bf16_81[10] * w_sv1_2_2_1));
+                            w_o_hi_2_1[10] = __fmaf_rn(_unpack_bf16_81[10], w_cv1_2_2_1, _unpack_bf16_80[10] * w_sv1_2_2_1);
                             float w_cv0_2_3_1 = _vec_load_24[3];
                             float w_sv0_2_3_1 = _vec_load_26[3];
                             float w_cv1_2_3_1 = _vec_load_25[3];
                             float w_sv1_2_3_1 = _vec_load_27[3];
-                            w_o_lo_2_1[3] = __fmaf_rn(_unpack_bf16_68[3], w_cv0_2_3_1, -(_unpack_bf16_69[3] * w_sv0_2_3_1));
-                            w_o_hi_2_1[3] = __fmaf_rn(_unpack_bf16_69[3], w_cv0_2_3_1, _unpack_bf16_68[3] * w_sv0_2_3_1);
-                            w_o_lo_2_1[11] = __fmaf_rn(_unpack_bf16_68[11], w_cv1_2_3_1, -(_unpack_bf16_69[11] * w_sv1_2_3_1));
-                            w_o_hi_2_1[11] = __fmaf_rn(_unpack_bf16_69[11], w_cv1_2_3_1, _unpack_bf16_68[11] * w_sv1_2_3_1);
+                            w_o_lo_2_1[3] = __fmaf_rn(_unpack_bf16_80[3], w_cv0_2_3_1, -(_unpack_bf16_81[3] * w_sv0_2_3_1));
+                            w_o_hi_2_1[3] = __fmaf_rn(_unpack_bf16_81[3], w_cv0_2_3_1, _unpack_bf16_80[3] * w_sv0_2_3_1);
+                            w_o_lo_2_1[11] = __fmaf_rn(_unpack_bf16_80[11], w_cv1_2_3_1, -(_unpack_bf16_81[11] * w_sv1_2_3_1));
+                            w_o_hi_2_1[11] = __fmaf_rn(_unpack_bf16_81[11], w_cv1_2_3_1, _unpack_bf16_80[11] * w_sv1_2_3_1);
                             float w_cv0_2_4_1 = _vec_load_24[4];
                             float w_sv0_2_4_1 = _vec_load_26[4];
                             float w_cv1_2_4_1 = _vec_load_25[4];
                             float w_sv1_2_4_1 = _vec_load_27[4];
-                            w_o_lo_2_1[4] = __fmaf_rn(_unpack_bf16_68[4], w_cv0_2_4_1, -(_unpack_bf16_69[4] * w_sv0_2_4_1));
-                            w_o_hi_2_1[4] = __fmaf_rn(_unpack_bf16_69[4], w_cv0_2_4_1, _unpack_bf16_68[4] * w_sv0_2_4_1);
-                            w_o_lo_2_1[12] = __fmaf_rn(_unpack_bf16_68[12], w_cv1_2_4_1, -(_unpack_bf16_69[12] * w_sv1_2_4_1));
-                            w_o_hi_2_1[12] = __fmaf_rn(_unpack_bf16_69[12], w_cv1_2_4_1, _unpack_bf16_68[12] * w_sv1_2_4_1);
+                            w_o_lo_2_1[4] = __fmaf_rn(_unpack_bf16_80[4], w_cv0_2_4_1, -(_unpack_bf16_81[4] * w_sv0_2_4_1));
+                            w_o_hi_2_1[4] = __fmaf_rn(_unpack_bf16_81[4], w_cv0_2_4_1, _unpack_bf16_80[4] * w_sv0_2_4_1);
+                            w_o_lo_2_1[12] = __fmaf_rn(_unpack_bf16_80[12], w_cv1_2_4_1, -(_unpack_bf16_81[12] * w_sv1_2_4_1));
+                            w_o_hi_2_1[12] = __fmaf_rn(_unpack_bf16_81[12], w_cv1_2_4_1, _unpack_bf16_80[12] * w_sv1_2_4_1);
                             float w_cv0_2_5_1 = _vec_load_24[5];
                             float w_sv0_2_5_1 = _vec_load_26[5];
                             float w_cv1_2_5_1 = _vec_load_25[5];
                             float w_sv1_2_5_1 = _vec_load_27[5];
-                            w_o_lo_2_1[5] = __fmaf_rn(_unpack_bf16_68[5], w_cv0_2_5_1, -(_unpack_bf16_69[5] * w_sv0_2_5_1));
-                            w_o_hi_2_1[5] = __fmaf_rn(_unpack_bf16_69[5], w_cv0_2_5_1, _unpack_bf16_68[5] * w_sv0_2_5_1);
-                            w_o_lo_2_1[13] = __fmaf_rn(_unpack_bf16_68[13], w_cv1_2_5_1, -(_unpack_bf16_69[13] * w_sv1_2_5_1));
-                            w_o_hi_2_1[13] = __fmaf_rn(_unpack_bf16_69[13], w_cv1_2_5_1, _unpack_bf16_68[13] * w_sv1_2_5_1);
+                            w_o_lo_2_1[5] = __fmaf_rn(_unpack_bf16_80[5], w_cv0_2_5_1, -(_unpack_bf16_81[5] * w_sv0_2_5_1));
+                            w_o_hi_2_1[5] = __fmaf_rn(_unpack_bf16_81[5], w_cv0_2_5_1, _unpack_bf16_80[5] * w_sv0_2_5_1);
+                            w_o_lo_2_1[13] = __fmaf_rn(_unpack_bf16_80[13], w_cv1_2_5_1, -(_unpack_bf16_81[13] * w_sv1_2_5_1));
+                            w_o_hi_2_1[13] = __fmaf_rn(_unpack_bf16_81[13], w_cv1_2_5_1, _unpack_bf16_80[13] * w_sv1_2_5_1);
                             float w_cv0_2_6_1 = _vec_load_24[6];
                             float w_sv0_2_6_1 = _vec_load_26[6];
                             float w_cv1_2_6_1 = _vec_load_25[6];
                             float w_sv1_2_6_1 = _vec_load_27[6];
-                            w_o_lo_2_1[6] = __fmaf_rn(_unpack_bf16_68[6], w_cv0_2_6_1, -(_unpack_bf16_69[6] * w_sv0_2_6_1));
-                            w_o_hi_2_1[6] = __fmaf_rn(_unpack_bf16_69[6], w_cv0_2_6_1, _unpack_bf16_68[6] * w_sv0_2_6_1);
-                            w_o_lo_2_1[14] = __fmaf_rn(_unpack_bf16_68[14], w_cv1_2_6_1, -(_unpack_bf16_69[14] * w_sv1_2_6_1));
-                            w_o_hi_2_1[14] = __fmaf_rn(_unpack_bf16_69[14], w_cv1_2_6_1, _unpack_bf16_68[14] * w_sv1_2_6_1);
+                            w_o_lo_2_1[6] = __fmaf_rn(_unpack_bf16_80[6], w_cv0_2_6_1, -(_unpack_bf16_81[6] * w_sv0_2_6_1));
+                            w_o_hi_2_1[6] = __fmaf_rn(_unpack_bf16_81[6], w_cv0_2_6_1, _unpack_bf16_80[6] * w_sv0_2_6_1);
+                            w_o_lo_2_1[14] = __fmaf_rn(_unpack_bf16_80[14], w_cv1_2_6_1, -(_unpack_bf16_81[14] * w_sv1_2_6_1));
+                            w_o_hi_2_1[14] = __fmaf_rn(_unpack_bf16_81[14], w_cv1_2_6_1, _unpack_bf16_80[14] * w_sv1_2_6_1);
                             float w_cv0_2_7_1 = _vec_load_24[7];
                             float w_sv0_2_7_1 = _vec_load_26[7];
                             float w_cv1_2_7_1 = _vec_load_25[7];
                             float w_sv1_2_7_1 = _vec_load_27[7];
-                            w_o_lo_2_1[7] = __fmaf_rn(_unpack_bf16_68[7], w_cv0_2_7_1, -(_unpack_bf16_69[7] * w_sv0_2_7_1));
-                            w_o_hi_2_1[7] = __fmaf_rn(_unpack_bf16_69[7], w_cv0_2_7_1, _unpack_bf16_68[7] * w_sv0_2_7_1);
-                            w_o_lo_2_1[15] = __fmaf_rn(_unpack_bf16_68[15], w_cv1_2_7_1, -(_unpack_bf16_69[15] * w_sv1_2_7_1));
-                            w_o_hi_2_1[15] = __fmaf_rn(_unpack_bf16_69[15], w_cv1_2_7_1, _unpack_bf16_68[15] * w_sv1_2_7_1);
+                            w_o_lo_2_1[7] = __fmaf_rn(_unpack_bf16_80[7], w_cv0_2_7_1, -(_unpack_bf16_81[7] * w_sv0_2_7_1));
+                            w_o_hi_2_1[7] = __fmaf_rn(_unpack_bf16_81[7], w_cv0_2_7_1, _unpack_bf16_80[7] * w_sv0_2_7_1);
+                            w_o_lo_2_1[15] = __fmaf_rn(_unpack_bf16_80[15], w_cv1_2_7_1, -(_unpack_bf16_81[15] * w_sv1_2_7_1));
+                            w_o_hi_2_1[15] = __fmaf_rn(_unpack_bf16_81[15], w_cv1_2_7_1, _unpack_bf16_80[15] * w_sv1_2_7_1);
                             unsigned int w_o_lo_2_bf16_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -5542,69 +6355,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_2_1[_lp*2 + 0], w_o_hi_2_1[_lp*2+1 + 0]));
                                 w_o_hi_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            }
+                            w_x_lo_2_1[0] = w_o_lo_2_bf16_1[0];
+                            w_x_hi_2_1[0] = w_o_hi_2_bf16_1[0];
+                            w_x_lo_2_1[1] = w_o_lo_2_bf16_1[1];
+                            w_x_hi_2_1[1] = w_o_hi_2_bf16_1[1];
+                            w_x_lo_2_1[2] = w_o_lo_2_bf16_1[2];
+                            w_x_hi_2_1[2] = w_o_hi_2_bf16_1[2];
+                            w_x_lo_2_1[3] = w_o_lo_2_bf16_1[3];
+                            w_x_hi_2_1[3] = w_o_hi_2_bf16_1[3];
+                            w_x_lo_2_1[4] = w_o_lo_2_bf16_1[4];
+                            w_x_hi_2_1[4] = w_o_hi_2_bf16_1[4];
+                            w_x_lo_2_1[5] = w_o_lo_2_bf16_1[5];
+                            w_x_hi_2_1[5] = w_o_hi_2_bf16_1[5];
+                            w_x_lo_2_1[6] = w_o_lo_2_bf16_1[6];
+                            w_x_hi_2_1[6] = w_o_hi_2_bf16_1[6];
+                            w_x_lo_2_1[7] = w_o_lo_2_bf16_1[7];
+                            w_x_hi_2_1[7] = w_o_hi_2_bf16_1[7];
                         }
+                    }
+                    unsigned int w_q_words_2_1[4];
+                    float w_q_vals_2_1[16];
+                    float _unpack_bf16_82[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_82[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) << 16);
+                        (&_unpack_bf16_82[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_2_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_2_1[0] = _unpack_bf16_82[0] * w_out_scale_sel_1;
+                    w_q_vals_2_1[1] = _unpack_bf16_82[1] * w_out_scale_sel_1;
+                    w_q_vals_2_1[2] = _unpack_bf16_82[2] * w_out_scale_sel_1;
+                    w_q_vals_2_1[3] = _unpack_bf16_82[3] * w_out_scale_sel_1;
+                    w_q_vals_2_1[4] = _unpack_bf16_82[4] * w_out_scale_sel_1;
+                    w_q_vals_2_1[5] = _unpack_bf16_82[5] * w_out_scale_sel_1;
+                    w_q_vals_2_1[6] = _unpack_bf16_82[6] * w_out_scale_sel_1;
+                    w_q_vals_2_1[7] = _unpack_bf16_82[7] * w_out_scale_sel_1;
+                    w_q_vals_2_1[8] = _unpack_bf16_82[8] * w_out_scale_sel_1;
+                    w_q_vals_2_1[9] = _unpack_bf16_82[9] * w_out_scale_sel_1;
+                    w_q_vals_2_1[10] = _unpack_bf16_82[10] * w_out_scale_sel_1;
+                    w_q_vals_2_1[11] = _unpack_bf16_82[11] * w_out_scale_sel_1;
+                    w_q_vals_2_1[12] = _unpack_bf16_82[12] * w_out_scale_sel_1;
+                    w_q_vals_2_1[13] = _unpack_bf16_82[13] * w_out_scale_sel_1;
+                    w_q_vals_2_1[14] = _unpack_bf16_82[14] * w_out_scale_sel_1;
+                    w_q_vals_2_1[15] = _unpack_bf16_82[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[0]), "f"(w_q_vals_2_1[1]),
+                                               "f"(w_q_vals_2_1[2]), "f"(w_q_vals_2_1[3]));
+                        w_q_words_2_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[4]), "f"(w_q_vals_2_1[5]),
+                                               "f"(w_q_vals_2_1[6]), "f"(w_q_vals_2_1[7]));
+                        w_q_words_2_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[8]), "f"(w_q_vals_2_1[9]),
+                                               "f"(w_q_vals_2_1[10]), "f"(w_q_vals_2_1[11]));
+                        w_q_words_2_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[12]), "f"(w_q_vals_2_1[13]),
+                                               "f"(w_q_vals_2_1[14]), "f"(w_q_vals_2_1[15]));
+                        w_q_words_2_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_2_1 * 128) + (unsigned int)(w_chunk_lo_2_1 ^ (w_srow_2_1 & 7) << 4)), "r"(w_q_words_2_1[0]), "r"(w_q_words_2_1[1]), "r"(w_q_words_2_1[2]), "r"(w_q_words_2_1[3]) : "memory");
+                    float _unpack_bf16_83[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_83[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) << 16);
+                        (&_unpack_bf16_83[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_2_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_2_1[0] = _unpack_bf16_83[0] * w_out_scale_sel_1;
+                    w_q_vals_2_1[1] = _unpack_bf16_83[1] * w_out_scale_sel_1;
+                    w_q_vals_2_1[2] = _unpack_bf16_83[2] * w_out_scale_sel_1;
+                    w_q_vals_2_1[3] = _unpack_bf16_83[3] * w_out_scale_sel_1;
+                    w_q_vals_2_1[4] = _unpack_bf16_83[4] * w_out_scale_sel_1;
+                    w_q_vals_2_1[5] = _unpack_bf16_83[5] * w_out_scale_sel_1;
+                    w_q_vals_2_1[6] = _unpack_bf16_83[6] * w_out_scale_sel_1;
+                    w_q_vals_2_1[7] = _unpack_bf16_83[7] * w_out_scale_sel_1;
+                    w_q_vals_2_1[8] = _unpack_bf16_83[8] * w_out_scale_sel_1;
+                    w_q_vals_2_1[9] = _unpack_bf16_83[9] * w_out_scale_sel_1;
+                    w_q_vals_2_1[10] = _unpack_bf16_83[10] * w_out_scale_sel_1;
+                    w_q_vals_2_1[11] = _unpack_bf16_83[11] * w_out_scale_sel_1;
+                    w_q_vals_2_1[12] = _unpack_bf16_83[12] * w_out_scale_sel_1;
+                    w_q_vals_2_1[13] = _unpack_bf16_83[13] * w_out_scale_sel_1;
+                    w_q_vals_2_1[14] = _unpack_bf16_83[14] * w_out_scale_sel_1;
+                    w_q_vals_2_1[15] = _unpack_bf16_83[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[0]), "f"(w_q_vals_2_1[1]),
+                                               "f"(w_q_vals_2_1[2]), "f"(w_q_vals_2_1[3]));
+                        w_q_words_2_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[4]), "f"(w_q_vals_2_1[5]),
+                                               "f"(w_q_vals_2_1[6]), "f"(w_q_vals_2_1[7]));
+                        w_q_words_2_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[8]), "f"(w_q_vals_2_1[9]),
+                                               "f"(w_q_vals_2_1[10]), "f"(w_q_vals_2_1[11]));
+                        w_q_words_2_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_2_1[12]), "f"(w_q_vals_2_1[13]),
+                                               "f"(w_q_vals_2_1[14]), "f"(w_q_vals_2_1[15]));
+                        w_q_words_2_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_2_1 * 128) + (unsigned int)(w_chunk_hi_2_1 ^ (w_srow_2_1 & 7) << 4)), "r"(w_q_words_2_1[0]), "r"(w_q_words_2_1[1]), "r"(w_q_words_2_1[2]), "r"(w_q_words_2_1[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_2_0_1 = (role_tid_1 >> 5) * 8 + lane / 8;
+                int s_piece_2_0_1 = lane % 8;
+                unsigned int s_words_2_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_2_0_1 * 128) + (unsigned int)(s_piece_2_0_1 * 16 ^ (s_row_2_0_1 & 7) << 4)));
+                int s_dst_2_0_1 = ((tile_m_1 * 256 + 128 + s_row_2_0_1) * 56 + w_head_1) * 32 + s_piece_2_0_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
+                    }
+                }
+                int s_row_2_1_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 8;
+                int s_piece_2_1_1 = lane % 8;
+                unsigned int s_words_2_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_2_1_1 * 128) + (unsigned int)(s_piece_2_1_1 * 16 ^ (s_row_2_1_1 & 7) << 4)));
+                int s_dst_2_1_1 = ((tile_m_1 * 256 + 128 + s_row_2_1_1) * 56 + w_head_1) * 32 + s_piece_2_1_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -5626,18 +6578,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_0_1[_lp*2 + 0], w_scaled_3_0_1[_lp*2+1 + 0]));
                     w_scaled_3_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_70[4];
+                float _unpack_bf16_84[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_70[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_70[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_84[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_84[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_0_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[0] = _unpack_bf16_70[0];
-                w_rounded_3_1[1] = _unpack_bf16_70[1];
-                w_rounded_3_1[2] = _unpack_bf16_70[2];
-                w_rounded_3_1[3] = _unpack_bf16_70[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_70[0], _unpack_bf16_70[0], _unpack_bf16_70[1] * _unpack_bf16_70[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_70[2], _unpack_bf16_70[2], _unpack_bf16_70[3] * _unpack_bf16_70[3]);
+                w_rounded_3_1[0] = _unpack_bf16_84[0];
+                w_rounded_3_1[1] = _unpack_bf16_84[1];
+                w_rounded_3_1[2] = _unpack_bf16_84[2];
+                w_rounded_3_1[3] = _unpack_bf16_84[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_84[0], _unpack_bf16_84[0], _unpack_bf16_84[1] * _unpack_bf16_84[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_84[2], _unpack_bf16_84[2], _unpack_bf16_84[3] * _unpack_bf16_84[3]);
                 float w_scaled_3_1_1[4];
                 w_scaled_3_1_1[0] = accum_1[100] * w_sa_lo_3_1 * sw_1[2];
                 w_scaled_3_1_1[1] = accum_1[101] * w_sa_lo_3_1 * sw_1[3];
@@ -5649,18 +6601,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_1_1[_lp*2 + 0], w_scaled_3_1_1[_lp*2+1 + 0]));
                     w_scaled_3_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_71[4];
+                float _unpack_bf16_85[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_71[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_71[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_85[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_85[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_1_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[4] = _unpack_bf16_71[0];
-                w_rounded_3_1[5] = _unpack_bf16_71[1];
-                w_rounded_3_1[6] = _unpack_bf16_71[2];
-                w_rounded_3_1[7] = _unpack_bf16_71[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_71[0], _unpack_bf16_71[0], _unpack_bf16_71[1] * _unpack_bf16_71[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_71[2], _unpack_bf16_71[2], _unpack_bf16_71[3] * _unpack_bf16_71[3]);
+                w_rounded_3_1[4] = _unpack_bf16_85[0];
+                w_rounded_3_1[5] = _unpack_bf16_85[1];
+                w_rounded_3_1[6] = _unpack_bf16_85[2];
+                w_rounded_3_1[7] = _unpack_bf16_85[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_85[0], _unpack_bf16_85[0], _unpack_bf16_85[1] * _unpack_bf16_85[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_85[2], _unpack_bf16_85[2], _unpack_bf16_85[3] * _unpack_bf16_85[3]);
                 float w_scaled_3_2_1[4];
                 w_scaled_3_2_1[0] = accum_1[104] * w_sa_lo_3_1 * sw_1[4];
                 w_scaled_3_2_1[1] = accum_1[105] * w_sa_lo_3_1 * sw_1[5];
@@ -5672,18 +6624,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_2_1[_lp*2 + 0], w_scaled_3_2_1[_lp*2+1 + 0]));
                     w_scaled_3_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_72[4];
+                float _unpack_bf16_86[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_72[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_72[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_86[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_86[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_2_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[8] = _unpack_bf16_72[0];
-                w_rounded_3_1[9] = _unpack_bf16_72[1];
-                w_rounded_3_1[10] = _unpack_bf16_72[2];
-                w_rounded_3_1[11] = _unpack_bf16_72[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_72[0], _unpack_bf16_72[0], _unpack_bf16_72[1] * _unpack_bf16_72[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_72[2], _unpack_bf16_72[2], _unpack_bf16_72[3] * _unpack_bf16_72[3]);
+                w_rounded_3_1[8] = _unpack_bf16_86[0];
+                w_rounded_3_1[9] = _unpack_bf16_86[1];
+                w_rounded_3_1[10] = _unpack_bf16_86[2];
+                w_rounded_3_1[11] = _unpack_bf16_86[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_86[0], _unpack_bf16_86[0], _unpack_bf16_86[1] * _unpack_bf16_86[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_86[2], _unpack_bf16_86[2], _unpack_bf16_86[3] * _unpack_bf16_86[3]);
                 float w_scaled_3_3_1[4];
                 w_scaled_3_3_1[0] = accum_1[108] * w_sa_lo_3_1 * sw_1[6];
                 w_scaled_3_3_1[1] = accum_1[109] * w_sa_lo_3_1 * sw_1[7];
@@ -5695,18 +6647,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_3_1[_lp*2 + 0], w_scaled_3_3_1[_lp*2+1 + 0]));
                     w_scaled_3_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_73[4];
+                float _unpack_bf16_87[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_73[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_73[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_87[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_87[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_3_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[12] = _unpack_bf16_73[0];
-                w_rounded_3_1[13] = _unpack_bf16_73[1];
-                w_rounded_3_1[14] = _unpack_bf16_73[2];
-                w_rounded_3_1[15] = _unpack_bf16_73[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_73[0], _unpack_bf16_73[0], _unpack_bf16_73[1] * _unpack_bf16_73[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_73[2], _unpack_bf16_73[2], _unpack_bf16_73[3] * _unpack_bf16_73[3]);
+                w_rounded_3_1[12] = _unpack_bf16_87[0];
+                w_rounded_3_1[13] = _unpack_bf16_87[1];
+                w_rounded_3_1[14] = _unpack_bf16_87[2];
+                w_rounded_3_1[15] = _unpack_bf16_87[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_87[0], _unpack_bf16_87[0], _unpack_bf16_87[1] * _unpack_bf16_87[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_87[2], _unpack_bf16_87[2], _unpack_bf16_87[3] * _unpack_bf16_87[3]);
                 float w_scaled_3_4_1[4];
                 w_scaled_3_4_1[0] = accum_1[112] * w_sa_lo_3_1 * sw_1[8];
                 w_scaled_3_4_1[1] = accum_1[113] * w_sa_lo_3_1 * sw_1[9];
@@ -5718,18 +6670,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_4_1[_lp*2 + 0], w_scaled_3_4_1[_lp*2+1 + 0]));
                     w_scaled_3_4_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_74[4];
+                float _unpack_bf16_88[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_74[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_74[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_88[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_88[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_4_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[16] = _unpack_bf16_74[0];
-                w_rounded_3_1[17] = _unpack_bf16_74[1];
-                w_rounded_3_1[18] = _unpack_bf16_74[2];
-                w_rounded_3_1[19] = _unpack_bf16_74[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_74[0], _unpack_bf16_74[0], _unpack_bf16_74[1] * _unpack_bf16_74[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_74[2], _unpack_bf16_74[2], _unpack_bf16_74[3] * _unpack_bf16_74[3]);
+                w_rounded_3_1[16] = _unpack_bf16_88[0];
+                w_rounded_3_1[17] = _unpack_bf16_88[1];
+                w_rounded_3_1[18] = _unpack_bf16_88[2];
+                w_rounded_3_1[19] = _unpack_bf16_88[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_88[0], _unpack_bf16_88[0], _unpack_bf16_88[1] * _unpack_bf16_88[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_88[2], _unpack_bf16_88[2], _unpack_bf16_88[3] * _unpack_bf16_88[3]);
                 float w_scaled_3_5_1[4];
                 w_scaled_3_5_1[0] = accum_1[116] * w_sa_lo_3_1 * sw_1[10];
                 w_scaled_3_5_1[1] = accum_1[117] * w_sa_lo_3_1 * sw_1[11];
@@ -5741,18 +6693,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_5_1[_lp*2 + 0], w_scaled_3_5_1[_lp*2+1 + 0]));
                     w_scaled_3_5_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_75[4];
+                float _unpack_bf16_89[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_75[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_75[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_89[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_89[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_5_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[20] = _unpack_bf16_75[0];
-                w_rounded_3_1[21] = _unpack_bf16_75[1];
-                w_rounded_3_1[22] = _unpack_bf16_75[2];
-                w_rounded_3_1[23] = _unpack_bf16_75[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_75[0], _unpack_bf16_75[0], _unpack_bf16_75[1] * _unpack_bf16_75[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_75[2], _unpack_bf16_75[2], _unpack_bf16_75[3] * _unpack_bf16_75[3]);
+                w_rounded_3_1[20] = _unpack_bf16_89[0];
+                w_rounded_3_1[21] = _unpack_bf16_89[1];
+                w_rounded_3_1[22] = _unpack_bf16_89[2];
+                w_rounded_3_1[23] = _unpack_bf16_89[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_89[0], _unpack_bf16_89[0], _unpack_bf16_89[1] * _unpack_bf16_89[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_89[2], _unpack_bf16_89[2], _unpack_bf16_89[3] * _unpack_bf16_89[3]);
                 float w_scaled_3_6_1[4];
                 w_scaled_3_6_1[0] = accum_1[120] * w_sa_lo_3_1 * sw_1[12];
                 w_scaled_3_6_1[1] = accum_1[121] * w_sa_lo_3_1 * sw_1[13];
@@ -5764,18 +6716,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_6_1[_lp*2 + 0], w_scaled_3_6_1[_lp*2+1 + 0]));
                     w_scaled_3_6_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_76[4];
+                float _unpack_bf16_90[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_76[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_76[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_90[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_90[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_6_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[24] = _unpack_bf16_76[0];
-                w_rounded_3_1[25] = _unpack_bf16_76[1];
-                w_rounded_3_1[26] = _unpack_bf16_76[2];
-                w_rounded_3_1[27] = _unpack_bf16_76[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_76[0], _unpack_bf16_76[0], _unpack_bf16_76[1] * _unpack_bf16_76[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_76[2], _unpack_bf16_76[2], _unpack_bf16_76[3] * _unpack_bf16_76[3]);
+                w_rounded_3_1[24] = _unpack_bf16_90[0];
+                w_rounded_3_1[25] = _unpack_bf16_90[1];
+                w_rounded_3_1[26] = _unpack_bf16_90[2];
+                w_rounded_3_1[27] = _unpack_bf16_90[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_90[0], _unpack_bf16_90[0], _unpack_bf16_90[1] * _unpack_bf16_90[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_90[2], _unpack_bf16_90[2], _unpack_bf16_90[3] * _unpack_bf16_90[3]);
                 float w_scaled_3_7_1[4];
                 w_scaled_3_7_1[0] = accum_1[124] * w_sa_lo_3_1 * sw_1[14];
                 w_scaled_3_7_1[1] = accum_1[125] * w_sa_lo_3_1 * sw_1[15];
@@ -5787,18 +6739,18 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_scaled_3_7_1[_lp*2 + 0], w_scaled_3_7_1[_lp*2+1 + 0]));
                     w_scaled_3_7_bf16_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                float _unpack_bf16_77[4];
+                float _unpack_bf16_91[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
-                    (&_unpack_bf16_77[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16_1[_pair]) << 16);
-                    (&_unpack_bf16_77[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16_1[_pair]) & 0xffff0000u);
+                    (&_unpack_bf16_91[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16_1[_pair]) << 16);
+                    (&_unpack_bf16_91[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_scaled_3_7_bf16_1[_pair]) & 0xffff0000u);
                 }
-                w_rounded_3_1[28] = _unpack_bf16_77[0];
-                w_rounded_3_1[29] = _unpack_bf16_77[1];
-                w_rounded_3_1[30] = _unpack_bf16_77[2];
-                w_rounded_3_1[31] = _unpack_bf16_77[3];
-                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_77[0], _unpack_bf16_77[0], _unpack_bf16_77[1] * _unpack_bf16_77[1]);
-                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_77[2], _unpack_bf16_77[2], _unpack_bf16_77[3] * _unpack_bf16_77[3]);
+                w_rounded_3_1[28] = _unpack_bf16_91[0];
+                w_rounded_3_1[29] = _unpack_bf16_91[1];
+                w_rounded_3_1[30] = _unpack_bf16_91[2];
+                w_rounded_3_1[31] = _unpack_bf16_91[3];
+                w_ss_lo_3_1 += __fmaf_rn(_unpack_bf16_91[0], _unpack_bf16_91[0], _unpack_bf16_91[1] * _unpack_bf16_91[1]);
+                w_ss_hi_3_1 += __fmaf_rn(_unpack_bf16_91[2], _unpack_bf16_91[2], _unpack_bf16_91[3] * _unpack_bf16_91[3]);
                 float w_rstd_lo_3_1 = 1.0f;
                 float w_rstd_hi_3_1 = 1.0f;
                 if (w_kind_1 < 2) {
@@ -6006,12 +6958,9 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                 int w_srow_3_1 = role_tid_1 >> 2;
                 int w_c_3_1 = role_tid_1 & 3;
                 int w_grow_3_1 = tile_m_1 * 256 + 192 + w_srow_3_1;
+                int w_chunk_lo_3_1 = ((w_c_3_1 < 3) ? w_c_3_1 * 16 : 96);
+                int w_chunk_hi_3_1 = ((w_c_3_1 < 3) ? w_chunk_lo_3_1 + 48 : 112);
                 if (w_grow_3_1 < M) {
-                    int w_row_head_3_1 = w_grow_3_1 * 56 + w_head_1;
-                    unsigned int w_st_words_3_1[4];
-                    float w_st_vals_3_1[16];
-                    int w_chunk_lo_3_1 = ((w_c_3_1 < 3) ? w_c_3_1 * 16 : 96);
-                    int w_chunk_hi_3_1 = ((w_c_3_1 < 3) ? w_chunk_lo_3_1 + 48 : 112);
                     unsigned int w_x_lo_3_1[8];
                     unsigned int w_x_hi_3_1[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -6028,17 +6977,17 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                         : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)));
                     if (w_c_3_1 < 3) {
                         if (w_kind_1 < 2) {
-                            float _unpack_bf16_78[16];
+                            float _unpack_bf16_92[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_78[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) << 16);
-                                (&_unpack_bf16_78[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_92[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) << 16);
+                                (&_unpack_bf16_92[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) & 0xffff0000u);
                             }
-                            float _unpack_bf16_79[16];
+                            float _unpack_bf16_93[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
-                                (&_unpack_bf16_79[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) << 16);
-                                (&_unpack_bf16_79[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) & 0xffff0000u);
+                                (&_unpack_bf16_93[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) << 16);
+                                (&_unpack_bf16_93[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) & 0xffff0000u);
                             }
                             float _vec_load_28[8];
                             {
@@ -6106,66 +7055,66 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                             float w_sv0_3_0_1 = _vec_load_30[0];
                             float w_cv1_3_0_1 = _vec_load_29[0];
                             float w_sv1_3_0_1 = _vec_load_31[0];
-                            w_o_lo_3_1[0] = __fmaf_rn(_unpack_bf16_78[0], w_cv0_3_0_1, -(_unpack_bf16_79[0] * w_sv0_3_0_1));
-                            w_o_hi_3_1[0] = __fmaf_rn(_unpack_bf16_79[0], w_cv0_3_0_1, _unpack_bf16_78[0] * w_sv0_3_0_1);
-                            w_o_lo_3_1[8] = __fmaf_rn(_unpack_bf16_78[8], w_cv1_3_0_1, -(_unpack_bf16_79[8] * w_sv1_3_0_1));
-                            w_o_hi_3_1[8] = __fmaf_rn(_unpack_bf16_79[8], w_cv1_3_0_1, _unpack_bf16_78[8] * w_sv1_3_0_1);
+                            w_o_lo_3_1[0] = __fmaf_rn(_unpack_bf16_92[0], w_cv0_3_0_1, -(_unpack_bf16_93[0] * w_sv0_3_0_1));
+                            w_o_hi_3_1[0] = __fmaf_rn(_unpack_bf16_93[0], w_cv0_3_0_1, _unpack_bf16_92[0] * w_sv0_3_0_1);
+                            w_o_lo_3_1[8] = __fmaf_rn(_unpack_bf16_92[8], w_cv1_3_0_1, -(_unpack_bf16_93[8] * w_sv1_3_0_1));
+                            w_o_hi_3_1[8] = __fmaf_rn(_unpack_bf16_93[8], w_cv1_3_0_1, _unpack_bf16_92[8] * w_sv1_3_0_1);
                             float w_cv0_3_1_1 = _vec_load_28[1];
                             float w_sv0_3_1_1 = _vec_load_30[1];
                             float w_cv1_3_1_1 = _vec_load_29[1];
                             float w_sv1_3_1_1 = _vec_load_31[1];
-                            w_o_lo_3_1[1] = __fmaf_rn(_unpack_bf16_78[1], w_cv0_3_1_1, -(_unpack_bf16_79[1] * w_sv0_3_1_1));
-                            w_o_hi_3_1[1] = __fmaf_rn(_unpack_bf16_79[1], w_cv0_3_1_1, _unpack_bf16_78[1] * w_sv0_3_1_1);
-                            w_o_lo_3_1[9] = __fmaf_rn(_unpack_bf16_78[9], w_cv1_3_1_1, -(_unpack_bf16_79[9] * w_sv1_3_1_1));
-                            w_o_hi_3_1[9] = __fmaf_rn(_unpack_bf16_79[9], w_cv1_3_1_1, _unpack_bf16_78[9] * w_sv1_3_1_1);
+                            w_o_lo_3_1[1] = __fmaf_rn(_unpack_bf16_92[1], w_cv0_3_1_1, -(_unpack_bf16_93[1] * w_sv0_3_1_1));
+                            w_o_hi_3_1[1] = __fmaf_rn(_unpack_bf16_93[1], w_cv0_3_1_1, _unpack_bf16_92[1] * w_sv0_3_1_1);
+                            w_o_lo_3_1[9] = __fmaf_rn(_unpack_bf16_92[9], w_cv1_3_1_1, -(_unpack_bf16_93[9] * w_sv1_3_1_1));
+                            w_o_hi_3_1[9] = __fmaf_rn(_unpack_bf16_93[9], w_cv1_3_1_1, _unpack_bf16_92[9] * w_sv1_3_1_1);
                             float w_cv0_3_2_1 = _vec_load_28[2];
                             float w_sv0_3_2_1 = _vec_load_30[2];
                             float w_cv1_3_2_1 = _vec_load_29[2];
                             float w_sv1_3_2_1 = _vec_load_31[2];
-                            w_o_lo_3_1[2] = __fmaf_rn(_unpack_bf16_78[2], w_cv0_3_2_1, -(_unpack_bf16_79[2] * w_sv0_3_2_1));
-                            w_o_hi_3_1[2] = __fmaf_rn(_unpack_bf16_79[2], w_cv0_3_2_1, _unpack_bf16_78[2] * w_sv0_3_2_1);
-                            w_o_lo_3_1[10] = __fmaf_rn(_unpack_bf16_78[10], w_cv1_3_2_1, -(_unpack_bf16_79[10] * w_sv1_3_2_1));
-                            w_o_hi_3_1[10] = __fmaf_rn(_unpack_bf16_79[10], w_cv1_3_2_1, _unpack_bf16_78[10] * w_sv1_3_2_1);
+                            w_o_lo_3_1[2] = __fmaf_rn(_unpack_bf16_92[2], w_cv0_3_2_1, -(_unpack_bf16_93[2] * w_sv0_3_2_1));
+                            w_o_hi_3_1[2] = __fmaf_rn(_unpack_bf16_93[2], w_cv0_3_2_1, _unpack_bf16_92[2] * w_sv0_3_2_1);
+                            w_o_lo_3_1[10] = __fmaf_rn(_unpack_bf16_92[10], w_cv1_3_2_1, -(_unpack_bf16_93[10] * w_sv1_3_2_1));
+                            w_o_hi_3_1[10] = __fmaf_rn(_unpack_bf16_93[10], w_cv1_3_2_1, _unpack_bf16_92[10] * w_sv1_3_2_1);
                             float w_cv0_3_3_1 = _vec_load_28[3];
                             float w_sv0_3_3_1 = _vec_load_30[3];
                             float w_cv1_3_3_1 = _vec_load_29[3];
                             float w_sv1_3_3_1 = _vec_load_31[3];
-                            w_o_lo_3_1[3] = __fmaf_rn(_unpack_bf16_78[3], w_cv0_3_3_1, -(_unpack_bf16_79[3] * w_sv0_3_3_1));
-                            w_o_hi_3_1[3] = __fmaf_rn(_unpack_bf16_79[3], w_cv0_3_3_1, _unpack_bf16_78[3] * w_sv0_3_3_1);
-                            w_o_lo_3_1[11] = __fmaf_rn(_unpack_bf16_78[11], w_cv1_3_3_1, -(_unpack_bf16_79[11] * w_sv1_3_3_1));
-                            w_o_hi_3_1[11] = __fmaf_rn(_unpack_bf16_79[11], w_cv1_3_3_1, _unpack_bf16_78[11] * w_sv1_3_3_1);
+                            w_o_lo_3_1[3] = __fmaf_rn(_unpack_bf16_92[3], w_cv0_3_3_1, -(_unpack_bf16_93[3] * w_sv0_3_3_1));
+                            w_o_hi_3_1[3] = __fmaf_rn(_unpack_bf16_93[3], w_cv0_3_3_1, _unpack_bf16_92[3] * w_sv0_3_3_1);
+                            w_o_lo_3_1[11] = __fmaf_rn(_unpack_bf16_92[11], w_cv1_3_3_1, -(_unpack_bf16_93[11] * w_sv1_3_3_1));
+                            w_o_hi_3_1[11] = __fmaf_rn(_unpack_bf16_93[11], w_cv1_3_3_1, _unpack_bf16_92[11] * w_sv1_3_3_1);
                             float w_cv0_3_4_1 = _vec_load_28[4];
                             float w_sv0_3_4_1 = _vec_load_30[4];
                             float w_cv1_3_4_1 = _vec_load_29[4];
                             float w_sv1_3_4_1 = _vec_load_31[4];
-                            w_o_lo_3_1[4] = __fmaf_rn(_unpack_bf16_78[4], w_cv0_3_4_1, -(_unpack_bf16_79[4] * w_sv0_3_4_1));
-                            w_o_hi_3_1[4] = __fmaf_rn(_unpack_bf16_79[4], w_cv0_3_4_1, _unpack_bf16_78[4] * w_sv0_3_4_1);
-                            w_o_lo_3_1[12] = __fmaf_rn(_unpack_bf16_78[12], w_cv1_3_4_1, -(_unpack_bf16_79[12] * w_sv1_3_4_1));
-                            w_o_hi_3_1[12] = __fmaf_rn(_unpack_bf16_79[12], w_cv1_3_4_1, _unpack_bf16_78[12] * w_sv1_3_4_1);
+                            w_o_lo_3_1[4] = __fmaf_rn(_unpack_bf16_92[4], w_cv0_3_4_1, -(_unpack_bf16_93[4] * w_sv0_3_4_1));
+                            w_o_hi_3_1[4] = __fmaf_rn(_unpack_bf16_93[4], w_cv0_3_4_1, _unpack_bf16_92[4] * w_sv0_3_4_1);
+                            w_o_lo_3_1[12] = __fmaf_rn(_unpack_bf16_92[12], w_cv1_3_4_1, -(_unpack_bf16_93[12] * w_sv1_3_4_1));
+                            w_o_hi_3_1[12] = __fmaf_rn(_unpack_bf16_93[12], w_cv1_3_4_1, _unpack_bf16_92[12] * w_sv1_3_4_1);
                             float w_cv0_3_5_1 = _vec_load_28[5];
                             float w_sv0_3_5_1 = _vec_load_30[5];
                             float w_cv1_3_5_1 = _vec_load_29[5];
                             float w_sv1_3_5_1 = _vec_load_31[5];
-                            w_o_lo_3_1[5] = __fmaf_rn(_unpack_bf16_78[5], w_cv0_3_5_1, -(_unpack_bf16_79[5] * w_sv0_3_5_1));
-                            w_o_hi_3_1[5] = __fmaf_rn(_unpack_bf16_79[5], w_cv0_3_5_1, _unpack_bf16_78[5] * w_sv0_3_5_1);
-                            w_o_lo_3_1[13] = __fmaf_rn(_unpack_bf16_78[13], w_cv1_3_5_1, -(_unpack_bf16_79[13] * w_sv1_3_5_1));
-                            w_o_hi_3_1[13] = __fmaf_rn(_unpack_bf16_79[13], w_cv1_3_5_1, _unpack_bf16_78[13] * w_sv1_3_5_1);
+                            w_o_lo_3_1[5] = __fmaf_rn(_unpack_bf16_92[5], w_cv0_3_5_1, -(_unpack_bf16_93[5] * w_sv0_3_5_1));
+                            w_o_hi_3_1[5] = __fmaf_rn(_unpack_bf16_93[5], w_cv0_3_5_1, _unpack_bf16_92[5] * w_sv0_3_5_1);
+                            w_o_lo_3_1[13] = __fmaf_rn(_unpack_bf16_92[13], w_cv1_3_5_1, -(_unpack_bf16_93[13] * w_sv1_3_5_1));
+                            w_o_hi_3_1[13] = __fmaf_rn(_unpack_bf16_93[13], w_cv1_3_5_1, _unpack_bf16_92[13] * w_sv1_3_5_1);
                             float w_cv0_3_6_1 = _vec_load_28[6];
                             float w_sv0_3_6_1 = _vec_load_30[6];
                             float w_cv1_3_6_1 = _vec_load_29[6];
                             float w_sv1_3_6_1 = _vec_load_31[6];
-                            w_o_lo_3_1[6] = __fmaf_rn(_unpack_bf16_78[6], w_cv0_3_6_1, -(_unpack_bf16_79[6] * w_sv0_3_6_1));
-                            w_o_hi_3_1[6] = __fmaf_rn(_unpack_bf16_79[6], w_cv0_3_6_1, _unpack_bf16_78[6] * w_sv0_3_6_1);
-                            w_o_lo_3_1[14] = __fmaf_rn(_unpack_bf16_78[14], w_cv1_3_6_1, -(_unpack_bf16_79[14] * w_sv1_3_6_1));
-                            w_o_hi_3_1[14] = __fmaf_rn(_unpack_bf16_79[14], w_cv1_3_6_1, _unpack_bf16_78[14] * w_sv1_3_6_1);
+                            w_o_lo_3_1[6] = __fmaf_rn(_unpack_bf16_92[6], w_cv0_3_6_1, -(_unpack_bf16_93[6] * w_sv0_3_6_1));
+                            w_o_hi_3_1[6] = __fmaf_rn(_unpack_bf16_93[6], w_cv0_3_6_1, _unpack_bf16_92[6] * w_sv0_3_6_1);
+                            w_o_lo_3_1[14] = __fmaf_rn(_unpack_bf16_92[14], w_cv1_3_6_1, -(_unpack_bf16_93[14] * w_sv1_3_6_1));
+                            w_o_hi_3_1[14] = __fmaf_rn(_unpack_bf16_93[14], w_cv1_3_6_1, _unpack_bf16_92[14] * w_sv1_3_6_1);
                             float w_cv0_3_7_1 = _vec_load_28[7];
                             float w_sv0_3_7_1 = _vec_load_30[7];
                             float w_cv1_3_7_1 = _vec_load_29[7];
                             float w_sv1_3_7_1 = _vec_load_31[7];
-                            w_o_lo_3_1[7] = __fmaf_rn(_unpack_bf16_78[7], w_cv0_3_7_1, -(_unpack_bf16_79[7] * w_sv0_3_7_1));
-                            w_o_hi_3_1[7] = __fmaf_rn(_unpack_bf16_79[7], w_cv0_3_7_1, _unpack_bf16_78[7] * w_sv0_3_7_1);
-                            w_o_lo_3_1[15] = __fmaf_rn(_unpack_bf16_78[15], w_cv1_3_7_1, -(_unpack_bf16_79[15] * w_sv1_3_7_1));
-                            w_o_hi_3_1[15] = __fmaf_rn(_unpack_bf16_79[15], w_cv1_3_7_1, _unpack_bf16_78[15] * w_sv1_3_7_1);
+                            w_o_lo_3_1[7] = __fmaf_rn(_unpack_bf16_92[7], w_cv0_3_7_1, -(_unpack_bf16_93[7] * w_sv0_3_7_1));
+                            w_o_hi_3_1[7] = __fmaf_rn(_unpack_bf16_93[7], w_cv0_3_7_1, _unpack_bf16_92[7] * w_sv0_3_7_1);
+                            w_o_lo_3_1[15] = __fmaf_rn(_unpack_bf16_92[15], w_cv1_3_7_1, -(_unpack_bf16_93[15] * w_sv1_3_7_1));
+                            w_o_hi_3_1[15] = __fmaf_rn(_unpack_bf16_93[15], w_cv1_3_7_1, _unpack_bf16_92[15] * w_sv1_3_7_1);
                             unsigned int w_o_lo_3_bf16_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 8; _lp++) {
@@ -6178,69 +7127,208 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_3_1[_lp*2 + 0], w_o_hi_3_1[_lp*2+1 + 0]));
                                 w_o_hi_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            }
+                            w_x_lo_3_1[0] = w_o_lo_3_bf16_1[0];
+                            w_x_hi_3_1[0] = w_o_hi_3_bf16_1[0];
+                            w_x_lo_3_1[1] = w_o_lo_3_bf16_1[1];
+                            w_x_hi_3_1[1] = w_o_hi_3_bf16_1[1];
+                            w_x_lo_3_1[2] = w_o_lo_3_bf16_1[2];
+                            w_x_hi_3_1[2] = w_o_hi_3_bf16_1[2];
+                            w_x_lo_3_1[3] = w_o_lo_3_bf16_1[3];
+                            w_x_hi_3_1[3] = w_o_hi_3_bf16_1[3];
+                            w_x_lo_3_1[4] = w_o_lo_3_bf16_1[4];
+                            w_x_hi_3_1[4] = w_o_hi_3_bf16_1[4];
+                            w_x_lo_3_1[5] = w_o_lo_3_bf16_1[5];
+                            w_x_hi_3_1[5] = w_o_hi_3_bf16_1[5];
+                            w_x_lo_3_1[6] = w_o_lo_3_bf16_1[6];
+                            w_x_hi_3_1[6] = w_o_hi_3_bf16_1[6];
+                            w_x_lo_3_1[7] = w_o_lo_3_bf16_1[7];
+                            w_x_hi_3_1[7] = w_o_hi_3_bf16_1[7];
                         }
+                    }
+                    unsigned int w_q_words_3_1[4];
+                    float w_q_vals_3_1[16];
+                    float _unpack_bf16_94[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_94[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) << 16);
+                        (&_unpack_bf16_94[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_lo_3_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_3_1[0] = _unpack_bf16_94[0] * w_out_scale_sel_1;
+                    w_q_vals_3_1[1] = _unpack_bf16_94[1] * w_out_scale_sel_1;
+                    w_q_vals_3_1[2] = _unpack_bf16_94[2] * w_out_scale_sel_1;
+                    w_q_vals_3_1[3] = _unpack_bf16_94[3] * w_out_scale_sel_1;
+                    w_q_vals_3_1[4] = _unpack_bf16_94[4] * w_out_scale_sel_1;
+                    w_q_vals_3_1[5] = _unpack_bf16_94[5] * w_out_scale_sel_1;
+                    w_q_vals_3_1[6] = _unpack_bf16_94[6] * w_out_scale_sel_1;
+                    w_q_vals_3_1[7] = _unpack_bf16_94[7] * w_out_scale_sel_1;
+                    w_q_vals_3_1[8] = _unpack_bf16_94[8] * w_out_scale_sel_1;
+                    w_q_vals_3_1[9] = _unpack_bf16_94[9] * w_out_scale_sel_1;
+                    w_q_vals_3_1[10] = _unpack_bf16_94[10] * w_out_scale_sel_1;
+                    w_q_vals_3_1[11] = _unpack_bf16_94[11] * w_out_scale_sel_1;
+                    w_q_vals_3_1[12] = _unpack_bf16_94[12] * w_out_scale_sel_1;
+                    w_q_vals_3_1[13] = _unpack_bf16_94[13] * w_out_scale_sel_1;
+                    w_q_vals_3_1[14] = _unpack_bf16_94[14] * w_out_scale_sel_1;
+                    w_q_vals_3_1[15] = _unpack_bf16_94[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[0]), "f"(w_q_vals_3_1[1]),
+                                               "f"(w_q_vals_3_1[2]), "f"(w_q_vals_3_1[3]));
+                        w_q_words_3_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[4]), "f"(w_q_vals_3_1[5]),
+                                               "f"(w_q_vals_3_1[6]), "f"(w_q_vals_3_1[7]));
+                        w_q_words_3_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[8]), "f"(w_q_vals_3_1[9]),
+                                               "f"(w_q_vals_3_1[10]), "f"(w_q_vals_3_1[11]));
+                        w_q_words_3_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[12]), "f"(w_q_vals_3_1[13]),
+                                               "f"(w_q_vals_3_1[14]), "f"(w_q_vals_3_1[15]));
+                        w_q_words_3_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_3_1 * 128) + (unsigned int)(w_chunk_lo_3_1 ^ (w_srow_3_1 & 7) << 4)), "r"(w_q_words_3_1[0]), "r"(w_q_words_3_1[1]), "r"(w_q_words_3_1[2]), "r"(w_q_words_3_1[3]) : "memory");
+                    float _unpack_bf16_95[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        (&_unpack_bf16_95[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) << 16);
+                        (&_unpack_bf16_95[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(w_x_hi_3_1[_pair]) & 0xffff0000u);
+                    }
+                    w_q_vals_3_1[0] = _unpack_bf16_95[0] * w_out_scale_sel_1;
+                    w_q_vals_3_1[1] = _unpack_bf16_95[1] * w_out_scale_sel_1;
+                    w_q_vals_3_1[2] = _unpack_bf16_95[2] * w_out_scale_sel_1;
+                    w_q_vals_3_1[3] = _unpack_bf16_95[3] * w_out_scale_sel_1;
+                    w_q_vals_3_1[4] = _unpack_bf16_95[4] * w_out_scale_sel_1;
+                    w_q_vals_3_1[5] = _unpack_bf16_95[5] * w_out_scale_sel_1;
+                    w_q_vals_3_1[6] = _unpack_bf16_95[6] * w_out_scale_sel_1;
+                    w_q_vals_3_1[7] = _unpack_bf16_95[7] * w_out_scale_sel_1;
+                    w_q_vals_3_1[8] = _unpack_bf16_95[8] * w_out_scale_sel_1;
+                    w_q_vals_3_1[9] = _unpack_bf16_95[9] * w_out_scale_sel_1;
+                    w_q_vals_3_1[10] = _unpack_bf16_95[10] * w_out_scale_sel_1;
+                    w_q_vals_3_1[11] = _unpack_bf16_95[11] * w_out_scale_sel_1;
+                    w_q_vals_3_1[12] = _unpack_bf16_95[12] * w_out_scale_sel_1;
+                    w_q_vals_3_1[13] = _unpack_bf16_95[13] * w_out_scale_sel_1;
+                    w_q_vals_3_1[14] = _unpack_bf16_95[14] * w_out_scale_sel_1;
+                    w_q_vals_3_1[15] = _unpack_bf16_95[15] * w_out_scale_sel_1;
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[0]), "f"(w_q_vals_3_1[1]),
+                                               "f"(w_q_vals_3_1[2]), "f"(w_q_vals_3_1[3]));
+                        w_q_words_3_1[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[4]), "f"(w_q_vals_3_1[5]),
+                                               "f"(w_q_vals_3_1[6]), "f"(w_q_vals_3_1[7]));
+                        w_q_words_3_1[1] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[8]), "f"(w_q_vals_3_1[9]),
+                                               "f"(w_q_vals_3_1[10]), "f"(w_q_vals_3_1[11]));
+                        w_q_words_3_1[2] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(w_q_vals_3_1[12]), "f"(w_q_vals_3_1[13]),
+                                               "f"(w_q_vals_3_1[14]), "f"(w_q_vals_3_1[15]));
+                        w_q_words_3_1[3] = _packed;
+                    }
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(w_srow_3_1 * 128) + (unsigned int)(w_chunk_hi_3_1 ^ (w_srow_3_1 & 7) << 4)), "r"(w_q_words_3_1[0]), "r"(w_q_words_3_1[1]), "r"(w_q_words_3_1[2]), "r"(w_q_words_3_1[3]) : "memory");
+                }
+                __syncwarp();
+                int s_row_3_0_1 = (role_tid_1 >> 5) * 8 + lane / 8;
+                int s_piece_3_0_1 = lane % 8;
+                unsigned int s_words_3_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_3_0_1 * 128) + (unsigned int)(s_piece_3_0_1 * 16 ^ (s_row_3_0_1 & 7) << 4)));
+                int s_dst_3_0_1 = ((tile_m_1 * 256 + 192 + s_row_3_0_1) * 56 + w_head_1) * 32 + s_piece_3_0_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
+                    }
+                }
+                int s_row_3_1_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 8;
+                int s_piece_3_1_1 = lane % 8;
+                unsigned int s_words_3_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 3]))
+                    : "r"(B_stage_addr + free_stage_1 * 8192 + (unsigned int)(s_row_3_1_1 * 128) + (unsigned int)(s_piece_3_1_1 * 16 ^ (s_row_3_1_1 & 7) << 4)));
+                int s_dst_3_1_1 = ((tile_m_1 * 256 + 192 + s_row_3_1_1) * 56 + w_head_1) * 32 + s_piece_3_1_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");

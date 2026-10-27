@@ -33,6 +33,7 @@ from ..jit.cake_minimax_h3_sm120_quant_pre_attention import (
     NORM_NVFP4,
     NVFP4_BF16,
     NVFP4_E4M3,
+    NVFP4_E4M3_G1,
     NVFP4_NVFP4,
 )
 from ..utils import register_custom_op, register_fake_op, supported_compute_capability
@@ -73,7 +74,17 @@ _FP8_GEMM = {
     (True, 1): FP8_MX_E4M3,
     (True, 2): FP8_MX_NVFP4,
 }
-_NVFP4_GEMM = {0: NVFP4_BF16, 1: NVFP4_E4M3, 2: NVFP4_NVFP4}
+# The NVFP4 GEMM program per (GeForce board, out mode): on the GeForce board the
+# E4M3-output program walks its tiles one M tile at a time (all 168 column tiles of
+# an M tile in turn).
+_NVFP4_GEMM = {
+    (False, 0): NVFP4_BF16,
+    (False, 1): NVFP4_E4M3,
+    (False, 2): NVFP4_NVFP4,
+    (True, 0): NVFP4_BF16,
+    (True, 1): NVFP4_E4M3_G1,
+    (True, 2): NVFP4_NVFP4,
+}
 
 Scalar = Union[float, torch.Tensor]
 
@@ -107,6 +118,12 @@ def _device_facts(index: int) -> Tuple[str, int, str]:
 
 def _fp8_unit_scale_mma(index: int) -> bool:
     """Whether the FP8 GEMM on device ``index`` runs the unit-scaled block-scale MMA form."""
+    return "GeForce" in _device_facts(index)[2]
+
+
+def _nvfp4_one_m_tile_order(index: int) -> bool:
+    """Whether the NVFP4 GEMM's E4M3-output program on device ``index`` walks its tiles
+    one M tile at a time."""
     return "GeForce" in _device_facts(index)[2]
 
 
@@ -687,7 +704,7 @@ def _nvfp4_impl(
         # The per-token / per-channel dequant scales are FP8-only; the NVFP4 kernels bind
         # a device scalar in their place and never read it.
         _run_gemm(
-            _NVFP4_GEMM[out_mode],
+            _NVFP4_GEMM[(_nvfp4_one_m_tile_order(index), out_mode)],
             target,
             index,
             a=act_q,
