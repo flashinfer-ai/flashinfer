@@ -199,9 +199,12 @@ jobs:
         run: |
           # Fetch all issue comments, newest first. GitHub's list endpoint
           # returns oldest-first by default; reverse after fetching.
+          # Only trust comments from repo collaborators — an outside
+          # contributor must not be able to inject a test scope.
           COMMENTS=$(gh api --paginate \
             "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --jq '.[].body' 2>/dev/null) || COMMENTS=""
+            --jq '[.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")] | .[].body' \
+            2>/dev/null) || COMMENTS=""
 
           # Walk comments in reverse (newest first) to find the most recent
           # `@flashinfer-bot run <paths>` command. A bare `@flashinfer-bot run`
