@@ -61,7 +61,11 @@ from . import cake_build
 # with the L2 evict-first policy, so the group's weights stay resident in L2,
 # launched in its place on the architectures of ``dgrad_evict_first_archs``
 # when the groups average at least ``dgrad_evict_first_min_rows`` rows and the
-# output has at least ``dgrad_evict_first_min_k`` columns; the weight gradient
+# output has at least ``dgrad_evict_first_min_k`` columns; the forward
+# ``main_wide_ef`` stage is its twin that releases the last wave of tiles in
+# halves and stores Y with the L2 evict-first policy, launched in its place on
+# the architectures of ``fwd_lwh_ef_archs`` when the reduction K is at most
+# ``fwd_lwh_ef_max_k`` (the down projection); the weight gradient
 # takes the 512-wide k tile on the architectures of ``k512_archs`` when the
 # groups average at least the architecture's ``k512_min_rows_per_group`` rows;
 # the weight-gradient ``main_wave`` stage is the main program with wave
@@ -692,6 +696,8 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "dgrad_evict_first_archs": ["sm_107a"],
     "dgrad_evict_first_min_rows": 16384,
     "dgrad_evict_first_min_k": 4096,
+    "fwd_lwh_ef_archs": ["sm_107a"],
+    "fwd_lwh_ef_max_k": 2048,
     "block_k": 64,
     "cta_group": 2,
     "cluster_m": 256,

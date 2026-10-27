@@ -39,7 +39,11 @@ architectures of ``dgrad_evict_first_archs`` the data gradient launches the
 twin of its wide tile that loads G and stores dX with the L2 evict-first policy
 (``main_wide_ef``) when the groups average at least
 ``dgrad_evict_first_min_rows`` rows (``sum_m // E``) and dX has at least
-``dgrad_evict_first_min_k`` columns (``K``).  The weight gradient takes the
+``dgrad_evict_first_min_k`` columns (``K``).  On the architectures of
+``fwd_lwh_ef_archs`` the forward pass launches the twin of its wide tile that
+releases the last wave of tiles in halves and stores Y with the L2 evict-first
+policy (``main_wide_ef``) when its reduction ``K`` (the columns of x) is at most
+``fwd_lwh_ef_max_k``, the down projection of an MoE layer.  The weight gradient takes the
 512-wide k tile when ``K`` is a multiple of 512, the architecture is listed in
 ``k512_archs`` and the groups average at least the architecture's
 ``k512_min_rows_per_group`` rows, else the 256-wide tile.  It launches the
@@ -407,6 +411,23 @@ def dgrad_evict_first(
     )
 
 
+def fwd_lwh_ef(
+    k: int,
+    arch: str,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the forward pass's wide tile takes its twin with the half-release last
+    wave and evict-first Y stores.
+
+    ``k`` is the forward ``K``, the reduction dimension: the columns of ``x``
+    (``x.shape[1]``, equal to ``w.shape[2]``); the output columns are ``N``
+    (``w.shape[1]``).  The twin serves the short reductions of the down projection,
+    ``K <= fwd_lwh_ef_max_k``, on the architectures of ``fwd_lwh_ef_archs``; a longer
+    reduction (the gate/up projection) keeps the plain wide tile."""
+    c = constants or host_plan_constants()
+    return arch in c["fwd_lwh_ef_archs"] and k <= int(c["fwd_lwh_ef_max_k"])
+
+
 def select_row_stage(
     name: str,
     op: str,
@@ -421,15 +442,15 @@ def select_row_stage(
     """``(stage, tile_n)`` of route ``name`` for ``fwd`` / ``dgrad``: ``main_wide`` with the wide
     tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with
     ``block_n``; a data gradient takes ``main_wide_ef`` in place of ``main_wide`` where
-    ``dgrad_evict_first`` holds and the route serves it on ``arch``."""
+    ``dgrad_evict_first`` holds, and a forward pass where ``fwd_lwh_ef`` holds, when the
+    route serves that stage on ``arch``."""
     c = constants or host_plan_constants()
     tile_n = fwd_dgrad_tile_n(op, n, k, arch, c)
     if tile_n != int(c["block_n"]) and stage_served(name, "main_wide", arch):
         if (
-            op == "dgrad"
-            and dgrad_evict_first(k, arch, sum_m, num_groups, c)
-            and stage_served(name, "main_wide_ef", arch)
-        ):
+            (op == "dgrad" and dgrad_evict_first(k, arch, sum_m, num_groups, c))
+            or (op == "fwd" and fwd_lwh_ef(k, arch, c))
+        ) and stage_served(name, "main_wide_ef", arch):
             return "main_wide_ef", tile_n
         return "main_wide", tile_n
     return "main", int(c["block_n"])

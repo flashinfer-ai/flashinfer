@@ -244,6 +244,8 @@ def test_program_choice_follows_the_host_plan_constants():
     assert set(c["dgrad_evict_first_archs"]) <= set(c["wide_dgrad_archs"])
     assert int(c["dgrad_evict_first_min_rows"]) > 0
     assert int(c["dgrad_evict_first_min_k"]) % wide_n == 0
+    assert set(c["fwd_lwh_ef_archs"]) <= set(c["wide_fwd_archs"])
+    assert int(c["fwd_lwh_ef_max_k"]) > 0
     assert set(c["k512_min_rows_per_group"]) == set(c["k512_archs"])
     assert all(int(v) > 0 for v in c["k512_min_rows_per_group"].values())
     assert set(c["k512_release_archs"]) <= set(c["k512_archs"])
@@ -259,7 +261,8 @@ def test_program_choice_follows_the_host_plan_constants():
             if arch in wide_archs:
                 assert served, (name, arch)
             served_ef = cake_jit.stage_served(name, "main_wide_ef", arch)
-            if op == "dgrad" and arch in c["dgrad_evict_first_archs"]:
+            ef_key = "dgrad_evict_first_archs" if op == "dgrad" else "fwd_lwh_ef_archs"
+            if arch in c[ef_key]:
                 assert served_ef, (name, arch)
             for cols in (4096, 4096 - block_n, block_n):
                 n, k = (cols, 512) if op == "fwd" else (512, cols)
@@ -270,9 +273,12 @@ def test_program_choice_follows_the_host_plan_constants():
                     wide = cols % wide_n == 0 and arch in wide_archs and served
                     ef = (
                         wide
-                        and op == "dgrad"
                         and served_ef
-                        and cb.dgrad_evict_first(k, arch, sum_m, groups, c)
+                        and (
+                            cb.dgrad_evict_first(k, arch, sum_m, groups, c)
+                            if op == "dgrad"
+                            else cb.fwd_lwh_ef(k, arch, c)
+                        )
                     )
                     expected = "main_wide_ef" if ef else "main_wide"
                     assert (stage, tile_n) == (
@@ -582,7 +588,16 @@ def test_wide_tile_gives_the_256_column_tile_bits(op, monkeypatch):
     wide = arch in c[f"wide_{op}_archs"] and cake_jit.stage_served(
         launch.record_name, "main_wide", arch
     )
-    assert launch.stages[0] == ("main_wide" if wide else "main")
+    # The forward pass's short reductions take the wide tile's last-wave-halves twin.
+    ef = (
+        wide
+        and op == "fwd"
+        and cb.fwd_lwh_ef(k, arch, c)
+        and cake_jit.stage_served(launch.record_name, "main_wide_ef", arch)
+    )
+    assert launch.stages[0] == (
+        "main_wide_ef" if ef else "main_wide" if wide else "main"
+    )
     assert launch.plan["tile_n"] == int(c["wide_block_n" if wide else "block_n"])
     for _ in range(3):
         launch.out.fill_(float("nan"))
@@ -637,6 +652,46 @@ def test_dgrad_evict_first_gives_the_wide_tile_bits(monkeypatch):
     assert torch.equal(plain.launch(), launch.out)
     monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wide_dgrad_archs", [])
     narrow, _ = _prepare_row_op("dgrad", sizes, n, k, device)
+    assert narrow.stages[0] == "main"
+    torch.cuda.synchronize()
+    assert torch.equal(narrow.launch(), launch.out)
+
+
+def test_fwd_lwh_ef_gives_the_wide_tile_bits(monkeypatch):
+    """Where ``fwd_lwh_ef`` holds (a short reduction, the down projection), the forward
+    pass launches the twin of its wide tile that releases the last wave in halves and
+    stores Y evict-first (``main_wide_ef``).  Neither changes the arithmetic: the
+    output bits are those of the wide tile and of the 256-column tile."""
+    device = _require_program("fwd")
+    c = HOST_PLAN_CONSTANTS
+    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
+    n, k = 2 * int(c["wide_block_n"]), int(c["fwd_lwh_ef_max_k"])
+    sizes = EVICT_FIRST_E2
+    launch, ref = _prepare_row_op("fwd", sizes, n, k, device)
+    name = launch.record_name
+    ef = arch in c["fwd_lwh_ef_archs"] and cake_jit.stage_served(
+        name, "main_wide_ef", arch
+    )
+    wide = arch in c["wide_fwd_archs"] and cake_jit.stage_served(
+        name, "main_wide", arch
+    )
+    assert launch.stages[0] == (
+        "main_wide_ef" if ef else "main_wide" if wide else "main"
+    )
+    for _ in range(2):
+        launch.out.fill_(float("nan"))
+        _assert_bf16_close(launch.launch(), ref)
+    torch.cuda.synchronize()
+    if not ef:
+        pytest.skip(f"no last-wave-halves forward tile on {arch}")
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "fwd_lwh_ef_max_k", k - 1)
+    plain, _ = _prepare_row_op("fwd", sizes, n, k, device)
+    assert plain.stages[0] == "main_wide"
+    assert plain.plan["tile_n"] == launch.plan["tile_n"]
+    torch.cuda.synchronize()
+    assert torch.equal(plain.launch(), launch.out)
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wide_fwd_archs", [])
+    narrow, _ = _prepare_row_op("fwd", sizes, n, k, device)
     assert narrow.stages[0] == "main"
     torch.cuda.synchronize()
     assert torch.equal(narrow.launch(), launch.out)

@@ -125,6 +125,12 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   `main_wide_ef` stage: the same program with G loaded and `dX` stored under
   the L2 evict-first policy, so a group's weights stay resident in L2 while
   its row blocks stream past them. Its output is bitwise that of `main_wide`.
+- `fwd` last-wave-halves evict-first twin (`fwd_lwh_ef`): on the architectures
+  listed in `fwd_lwh_ef_archs`, when the reduction `K` (the columns of `x`) is
+  at most `fwd_lwh_ef_max_k`, as in the down projection, the wide tile is the
+  route's `main_wide_ef` stage: the A-collector program that releases the last
+  wave of tiles in two halves and stores Y under the L2 evict-first policy. Its
+  output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
