@@ -819,8 +819,9 @@ def main() -> None:
             # points already measured.
             _write_report(args.output_file, metadata, results)
 
+    # Every rank joins the barrier, including one whose layer failed to build.
+    sync()
     if layer is not None:
-        sync()
         layer.destroy()
 
     if rank == 0 and results:
