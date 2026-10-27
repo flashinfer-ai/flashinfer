@@ -3810,10 +3810,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
+        q_lens_arr_host = None
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
-            self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+            q_lens_arr_host = qo_indptr_host[1:] - qo_indptr_host[:-1]
+            self._max_q_len = q_lens_arr_host.max().item()
 
         kv_lens_arr_host = None
         if max_sequence_kv is None:
@@ -4327,10 +4329,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_size, dtype=torch.int32, device=self.device
                 )
             q_lengths = (
-                seq_lens_q.flatten()
-                if seq_lens_q is not None
-                else qo_indptr_host[1:] - qo_indptr_host[:-1]
+                seq_lens_q.flatten() if seq_lens_q is not None else q_lens_arr_host
             )
+            if q_lengths is None:
+                q_lengths = qo_indptr_host[1:] - qo_indptr_host[:-1]
             self._cudnn_q_lens_buffer[:batch_size].copy_(
                 q_lengths, non_blocking=non_blocking
             )
