@@ -215,7 +215,7 @@ def plan(
         required = (
             int(query.setup["slab_nbytes"])
             + int(query.setup["stage_nbytes"])
-            + 2 * int(query.setup["flag_slots"]) * 4
+            + 3 * int(query.setup["flag_slots"]) * 4
         )
         # The runtime owns its IPC slab/stage before declaration; preparation
         # retains and reports the exact pre-existing resident envelope.

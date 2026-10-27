@@ -153,6 +153,7 @@ class PCIeAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
+        ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
     ) -> "PCIeAllReduce":
@@ -167,6 +168,7 @@ class PCIeAllReduce:
                 max_size=max_size,
                 rank_data_bytes=rank_data_bytes,
                 ext_module=ext_module,
+                ipc=ipc,
                 single_channel=single_channel,
                 max_concurrent_channels=max_concurrent_channels,
             )
@@ -182,12 +184,14 @@ class PCIeAllReduce:
                 device=device,
                 max_elements=max_size // torch.bfloat16.itemsize,
                 ext_module=ext_module,
+                ipc=ipc,
             )
         island_rs = cls._maybe_island_rs(
             exchange_group=exchange_group,
             device=device,
             max_size=max_size,
             algorithm_override=algorithm_override,
+            ipc=ipc,
         )
         return cls(
             runtime,
@@ -203,6 +207,7 @@ class PCIeAllReduce:
         device: torch.device | int | str,
         max_size: int,
         algorithm_override: str,
+        ipc: object = None,
     ) -> Any:
         """Attach the equal-quarter runtime after an explicit policy opt-in.
 
@@ -228,6 +233,7 @@ class PCIeAllReduce:
                 exchange_group=exchange_group,
                 device=device,
                 max_elements=elements - (elements % 2),
+                ipc=ipc,
             )
         except RuntimeError as exc:
             if dist.get_rank(group=exchange_group) == 0:
@@ -401,6 +407,8 @@ class PCIeAllReduce:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
+        zero_centered: bool = False,
+        reduction_dtype: torch.dtype | None = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -415,6 +423,8 @@ class PCIeAllReduce:
             plan=plan,
             out=out,
             residual_out=residual_out,
+            zero_centered=zero_centered,
+            reduction_dtype=reduction_dtype,
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
             channel_id=channel_id,

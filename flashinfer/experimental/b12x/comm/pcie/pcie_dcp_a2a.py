@@ -569,6 +569,7 @@ class PCIeDCPA2A:
         head_dim: int,
         query_head_dim: Optional[int] = None,
         ext_module=None,
+        ipc=None,
         stream_affine: bool = True,
     ) -> "PCIeDCPA2A":
         rank = dist.get_rank(group=exchange_group)
@@ -621,8 +622,10 @@ class PCIeDCPA2A:
             exchange_group=exchange_group,
         )
 
+        supplied_ipc = ipc
+
         def prepare():
-            prepared_ipc = CudaRTLibrary()
+            prepared_ipc = supplied_ipc if supplied_ipc is not None else CudaRTLibrary()
             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             layout = _staging_layout(
                 signal_bytes=(

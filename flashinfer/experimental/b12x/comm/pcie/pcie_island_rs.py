@@ -84,7 +84,9 @@ class PCIeIslandRSAllReduce:
         device: torch.device | int | str,
         max_elements: int,
         blocks: Optional[int] = None,
+        ipc: object = None,
     ) -> None:
+        """``ipc`` supplies the CUDA IPC allocator for the slab, as the hierarchical runtime accepts."""
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -119,7 +121,7 @@ class PCIeIslandRSAllReduce:
         self.final_offset = _align_up(self.part_offset + 2 * quarter_bytes)
         self.slab_bytes = _align_up(self.final_offset + 2 * vector_bytes)
 
-        self._ipc = CudaRTLibrary()
+        self._ipc = CudaRTLibrary() if ipc is None else ipc
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._slab_ptrs: tuple[int, ...] = ()
         self._local_ptr = 0

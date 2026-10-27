@@ -6,6 +6,18 @@ Caller-owned runtimes retain CUDA-IPC handles and mapped peer buffers.
 ``AllReduce.plan`` performs its existing world/message routing during planning.
 Pools select only channels provisioned before preparation.
 
+Fused one-shot reduction supports up to 36 contiguous rows with independently
+declared input, residual, normalization weight, and output dtypes (FP16, BF16,
+or FP32). Declare the actual ``residual``, ``weight``, and ``out`` tensors with
+``AllReduce.plan(inp, operation="all_reduce_fused_add_rms_norm", ...)``.
+``zero_centered=True`` applies ``1 + weight``. ``reduction_dtype`` optionally
+rounds the FP32 collective sum before adding the residual. Both arithmetic
+options must match between planning and execution. ``residual_out=residual``
+updates the residual in place; normalized output requires separate storage.
+For FP32 residuals and BF16 normalized output, use an FP32 residual tensor and
+BF16 ``out`` at both calls. These options specialize the existing one-shot
+kernel; DMA and hierarchical collectives do not provide this operation.
+
 - ``AllReduce``: peer-safe world-size dispatch. TP2-TP8 use the all-peer
   oneshot path; TP9/TP10/TP12/TP16 use bounded-degree islands of up to four GPUs.
 - ``OneshotAllReduce``: low-level one-shot all-reduce
