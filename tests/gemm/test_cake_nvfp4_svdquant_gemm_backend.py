@@ -152,8 +152,10 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
 # rows of the architectures where the swap-AB split-K program measured faster),
 # the sm_103a M 129 K 3072 rows (the 64-row builds with the TMA L2 promotion of
 # the weight descriptors, shipped for sm_103a only), the sm_103a rows of the
-# two-CTA builds on the K=96 MMA (shipped for sm_103a only) and the convergence
-# finals' rows; (M, N, K, rank, bias) -> the program it dispatches to there, the
+# two-CTA builds on the K=96 MMA (shipped for sm_103a only), the sm_100a row of
+# the wide-tail build of the tail-split program (shipped for sm_100a only) and
+# the convergence finals' rows; (M, N, K, rank, bias) -> the program it
+# dispatches to there, the
 # build keywords of those programs, and the programs only one architecture's
 # rows reach.
 _P = "cake_nvfp4_svdquant_gemm_"
@@ -170,6 +172,7 @@ EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
         (129, 3072, 12288, 128, False): _P + "243af01860dcca0f4e2c",
         (129, 3072, 12288, 128, True): _P + "36c42441c9d625e03c54",
         (4096, 3072, 3072, 32, True): _P + "1d78f2bd5722fb02b75a",
+        (4096, 3072, 12288, 32, True): _P + "d758d9efa72998dbcf96",
         (4096, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
         (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
         (6889, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
@@ -368,6 +371,11 @@ EXACT_BUILDS: dict[str, dict[str, object]] = {
         "out_store": "v8hint",
         "rank": 128,
     },
+    _P + "d758d9efa72998dbcf96": {
+        "out_store": "v8hint",
+        "rank": 32,
+        "wide_tail": 192,
+    },
 }
 ARCH_ONLY: dict[str, set[str]] = {
     "sm_100a": {
@@ -379,6 +387,7 @@ ARCH_ONLY: dict[str, set[str]] = {
         _P + "5852ad0db045e502e10a",
         _P + "c832b08a912e4c58112b",
         _P + "d16d801db12c7bdde4dc",
+        _P + "d758d9efa72998dbcf96",
         _P + "fdcf777b3acd972f8841",
     },
     "sm_103a": {
@@ -418,6 +427,7 @@ GRAPH_ROWS = (
     (129, 3072, 12288, 32, False),
     (333, 3072, 3072, 64, False),
     (4096, 3072, 3072, 64, True),
+    (4096, 3072, 12288, 32, True),
     (4097, 3072, 12288, 128, True),
     (6912, 3072, 12288, 32, True),
 )
@@ -858,13 +868,16 @@ def test_is_supported_needs_a_cuda_device() -> None:
 def test_launch_grid_follows_the_record_rule(m, n) -> None:
     grid_m = -(-m // loader.BLOCK_M)
     sms = 148
+    group = 2
     seen = set()
     for name, record in loader.MODULES.items():
         plan = record["plan"]
         grid_n = n // plan["block_n"]
         rule = plan["grid_rule"]
         seen.add(rule)
-        grid = loader.launch_grid(record, m=m, n=n, k=3072, sm_count=sms)
+        grid = loader.launch_grid(
+            record, m=m, n=n, k=3072, sm_count=sms, raster_group=group
+        )
         if rule == "linear":
             assert grid == (grid_m * grid_n, 1, 1), name
         elif rule == "cluster_n2":
@@ -880,6 +893,21 @@ def test_launch_grid_follows_the_record_rule(m, n) -> None:
             assert units == full + (tiles - full) * 2 and split in (1, 2), name
             with pytest.raises(ValueError, match="sm_count"):
                 loader.launch_grid(record, m=m, n=n, k=3072)
+        elif rule == "pair_tailsplit_wide":
+            tiles, units, full, split = loader.tailsplit_wide_units(
+                m=m, n=n, sm_count=sms, raster_group=group
+            )
+            assert grid == (2 * units, 1, 1), name
+            if split == loader.WIDE_TAIL_SPLIT:
+                assert units == full + sms // 2, name
+            else:
+                assert (tiles, units, full, split) == loader.tailsplit_units(
+                    m=m, n=n, sm_count=sms
+                ), name
+            with pytest.raises(ValueError, match="raster_group"):
+                loader.launch_grid(record, m=m, n=n, k=3072, sm_count=sms)
+            with pytest.raises(ValueError, match="sm_count"):
+                loader.launch_grid(record, m=m, n=n, k=3072, raster_group=group)
         elif rule == "splitk_cluster":
             assert grid == (plan["split_k"] * grid_n, 1, 1), name
         else:
@@ -920,6 +948,175 @@ def test_tailsplit_rows_split_on_this_device() -> None:
             continue
         tiles, units, full, split = loader.tailsplit_units(m=m, n=n, sm_count=sms)
         assert split == 2 and full < units, (_row_id(row), sms)
+
+
+def _raster_tile(
+    tile: int, tok_tiles: int, w_tiles: int, group: int
+) -> tuple[int, int]:
+    """``(w_idx, tok_idx)`` of pair tile ``tile`` in raster order: column-major
+    inside raster groups of ``group`` token tiles (the last group short; 0 is
+    one group of every token tile)."""
+    if group == 0:
+        return tile // tok_tiles, tile % tok_tiles
+    first = tile // (group * w_tiles)
+    offset = tile - first * group * w_tiles
+    rows = min(group, tok_tiles - first * group)
+    return offset // rows, first * group + offset % rows
+
+
+def _wide_unit_columns(
+    unit: int, *, m: int, n: int, units: int, full: int, group: int
+) -> tuple[int, int, int]:
+    """``(tok_idx, n0, width)`` of tail unit ``unit`` of a wide-tail schedule:
+    the in-kernel decode of the wide-tail build.  The ``g = tail - pairs / 2``
+    groups of three column-adjacent tail tiles fill blocks of three columns by
+    the ``rows`` token tiles of one raster group, starting ``start`` tile ids
+    after ``full``; tail unit ``q < 4 g`` is 192-wide piece ``q % 4`` of group
+    ``q // 4``, the others are the half units of the remaining tail tiles in
+    tile order."""
+    tok_tiles, w_tiles = -(-m // 256), -(-n // 256)
+    tiles = tok_tiles * w_tiles
+    groups = (tiles - full) - (units - full) // 2
+    group_rows = group or tok_tiles
+    size = group_rows * w_tiles
+    first = full // size
+    rows = min(group_rows, tok_tiles - first * group_rows)
+    column, partial = divmod(full - first * size, rows)
+    start = 0
+    if partial and column + 1 < w_tiles:
+        start = rows - partial
+    elif partial:
+        start = (first + 1) * size - full
+        rows = min(group_rows, tok_tiles - (first + 1) * group_rows)
+    q = unit - full
+    if q < 4 * groups:
+        index, piece = divmod(q, 4)
+        block, row = divmod(index, rows)
+        tile = full + start + 3 * block * rows + row
+        w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+        return tok_idx, 256 * w_idx + 192 * piece, 192
+    half, h = divmod(q - 4 * groups, 2)
+    blocks, last = divmod(groups, rows)
+    tile = full + half + 3 * groups
+    if half < start:
+        tile = full + half
+    elif last and half < start + 3 * (rows - last):
+        col, row = divmod(half - start, rows - last)
+        tile = full + start + 3 * rows * blocks + col * rows + last + row
+    w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+    return tok_idx, 256 * w_idx + 128 * h, 128
+
+
+def test_tailsplit_wide_units_schedule() -> None:
+    """The wide-tail schedule: a last partial wave of more than half and at most
+    three quarters of the CTA pairs runs as one wave of ``pairs`` units when its
+    groups of three tiles fit in full tiles of one raster group; every other
+    problem keeps the :func:`tailsplit_units` schedule."""
+    units = loader.tailsplit_wide_units
+    wide = loader.WIDE_TAIL_SPLIT
+    # 192 pair tiles on 76 pairs: 2 waves + 40 tail tiles -> 2 groups of three
+    # tiles (token tiles 12 and 13, columns 1024-1791) as 8 192-wide units and
+    # the other 34 tail tiles as 68 half units.
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2) == (192, 228, 152, wide)
+    pieces = [
+        _wide_unit_columns(u, m=4096, n=3072, units=228, full=152, group=2)
+        for u in range(152, 160)
+    ]
+    assert pieces == [(12, 1024 + 192 * p, 192) for p in range(4)] + [
+        (13, 1024 + 192 * p, 192) for p in range(4)
+    ]
+    assert units(m=4096, n=3072, sm_count=152, raster_group=8) == (192, 228, 152, wide)
+    # 74 pairs: 2 waves + 44 tail tiles -> 7 groups in 4 blocks need 12 columns
+    # from column 2: whole tiles.
+    assert units(m=4096, n=3072, sm_count=148, raster_group=2) == (192, 192, 192, 1)
+    # 2 * tail <= pairs keeps the half units; groups that do not fit keep
+    # whole tiles.
+    assert units(m=6912, n=3072, sm_count=152, raster_group=2) == (324, 344, 304, 2)
+    assert units(m=9216, n=3072, sm_count=152, raster_group=2) == (432, 432, 432, 1)
+    # Forced schedules and the admitted values.
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=1) == (
+        192,
+        192,
+        192,
+        1,
+    )
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=2) == (
+        192,
+        232,
+        152,
+        2,
+    )
+    assert units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=wide) == (
+        192,
+        228,
+        152,
+        wide,
+    )
+    with pytest.raises(ValueError, match="no wide tail"):
+        units(m=4096, n=3072, sm_count=148, raster_group=2, tail_split=wide)
+    with pytest.raises(ValueError, match="tail_split"):
+        units(m=4096, n=3072, sm_count=152, raster_group=2, tail_split=4)
+
+
+def test_tailsplit_wide_units_cover_the_tail_exactly_once() -> None:
+    """Over every token-tile count up to 40, N up to 6144 in steps of 128 (and
+    two N that are not multiples of 128), raster groups 0 / 1 / 2 / 8 and 148 /
+    152 / 160 SMs: a wide-tail schedule is one wave of ``pairs`` tail units in
+    the admitted band whose columns cover every tail tile exactly once, the
+    192-wide units first, each inside the full 256-column tiles at a scale
+    offset of 0 or 2 words, every half unit 128-aligned; every other problem
+    keeps the :func:`tailsplit_units` schedule."""
+    wide = 0
+    for sms in (148, 152, 160):
+        pairs = sms // 2
+        for group in (0, 1, 2, 8):
+            for tok_tiles in range(1, 41):
+                for n in (*range(128, 6144 + 1, 128), 1000, 3000):
+                    m = 256 * tok_tiles
+                    tiles, units, full, split = loader.tailsplit_wide_units(
+                        m=m, n=n, sm_count=sms, raster_group=group
+                    )
+                    where = (m, n, group, sms)
+                    if split != loader.WIDE_TAIL_SPLIT:
+                        assert (tiles, units, full, split) == loader.tailsplit_units(
+                            m=m, n=n, sm_count=sms
+                        ), where
+                        continue
+                    wide += 1
+                    tail = tiles - full
+                    groups = tail - pairs // 2
+                    assert pairs % 2 == 0 and pairs < 2 * tail, where
+                    assert 4 * tail <= 3 * pairs and n % 128 == 0 and groups >= 1, where
+                    assert full == tiles // pairs * pairs and units == full + pairs, (
+                        where
+                    )
+                    w_tiles = -(-n // 256)
+                    expected = set()
+                    for tile in range(full, tiles):
+                        w_idx, tok_idx = _raster_tile(tile, tok_tiles, w_tiles, group)
+                        expected.update(
+                            (tok_idx, 256 * w_idx + 64 * g) for g in range(4)
+                        )
+                    covered = []
+                    for unit in range(full, units):
+                        tok_idx, n0, width = _wide_unit_columns(
+                            unit, m=m, n=n, units=units, full=full, group=group
+                        )
+                        assert n0 % 64 == 0, (where, unit)
+                        if unit - full < 4 * groups:
+                            assert width == 192 and n0 // 32 % 4 in (0, 2), (
+                                where,
+                                unit,
+                            )
+                            assert n0 + width <= n // 256 * 256, (where, unit)
+                        else:
+                            assert width == 128 and n0 % 128 == 0, (where, unit)
+                        covered.extend(
+                            (tok_idx, n0 + 64 * g) for g in range(width // 64)
+                        )
+                    assert len(covered) == len(set(covered)), where
+                    assert set(covered) == expected, where
+    assert wide > 100, wide
 
 
 def test_raster_group_follows_its_table() -> None:
@@ -1151,8 +1348,14 @@ def test_plan_values_view_the_scale_factors_in_place(has_bias) -> None:
         assert values["rank"] == rank and values["rank_chunks"] == 1
         assert values["grid_n"] == n // plan["block_n"]
         sms = loader.sm_count(p.a.device.index)
-        assert values["grid"] == loader.launch_grid(record, m=m, n=n, k=k, sm_count=sms)
-        if plan["grid_rule"] in ("pair_persistent", "pair_tailsplit"):
+        assert values["grid"] == loader.launch_grid(
+            record, m=m, n=n, k=k, sm_count=sms, raster_group=values.get("raster_group")
+        )
+        if plan["grid_rule"] in (
+            "pair_persistent",
+            "pair_tailsplit",
+            "pair_tailsplit_wide",
+        ):
             assert values["raster_group"] == loader.raster_group(
                 m=m, n=n, k=k, rank=rank, arch=_arch()
             )
@@ -1161,6 +1364,20 @@ def test_plan_values_view_the_scale_factors_in_place(has_bias) -> None:
             assert "raster_group" not in values
         if plan["grid_rule"] == "pair_tailsplit":
             tiles, units, full, split = loader.tailsplit_units(m=m, n=n, sm_count=sms)
+            assert (
+                values["num_units"],
+                values["full_units"],
+                values["tail_split"],
+            ) == (
+                units,
+                full,
+                split,
+            )
+            assert values["grid"] == (2 * units, 1, 1)
+        elif plan["grid_rule"] == "pair_tailsplit_wide":
+            tiles, units, full, split = loader.tailsplit_wide_units(
+                m=m, n=n, sm_count=sms, raster_group=values["raster_group"]
+            )
             assert (
                 values["num_units"],
                 values["full_units"],
