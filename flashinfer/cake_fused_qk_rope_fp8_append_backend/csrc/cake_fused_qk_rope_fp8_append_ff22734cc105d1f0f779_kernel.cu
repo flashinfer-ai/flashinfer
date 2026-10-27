@@ -54,13 +54,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_META_STRIDE 16
 #define SMEM_TOTAL 0
 #define THREADS 96
+#define LAUNCH_MIN_BLOCKS 9
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(96) void
-kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max)
+__global__ __launch_bounds__(96, LAUNCH_MIN_BLOCKS) void
+kernel_cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -77,7 +78,7 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
     int* meta = reinterpret_cast<int*>(smem_static_raw + 0);
     const int meta_addr = (int)(unsigned long long)__cvta_generic_to_shared(meta);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int tid_0 = tid;
     int slot = tid_0 / 8;
     int lane_1 = tid_0 % 8;
@@ -256,9 +257,9 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
         }
     }
     int req_id = bid_1 - num_rows;
-    int clear_last_pos = -1;
+    int clear_len = 0;
     if (!is_row_cta && req_id < num_requests) {
-        clear_last_pos = seq_lens[req_id] - 1;
+        clear_len = seq_lens[req_id];
     }
     int g_req = 0;
     int g_b = 0;
@@ -276,11 +277,27 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
         g_e = q_indptr[g_req + 1];
         g_l = seq_lens[g_req];
     }
-    int f_phys = 0;
-    if (g_l >= 1) {
-        int f_slot0 = (g_l - 1) / page_size;
-        if (g_l - 1 - f_slot0 * page_size + 1 < page_size) {
-            f_phys = page_indices[row * max_pages_per_request + f_slot0];
+    bool pf_ok = max_pages_per_request <= 48;
+    int pf_e0 = 0;
+    int pf_e1 = 0;
+    int pf_lane = tid_0 % 32;
+    bool pf_load = 0;
+    int pf_req = 0;
+    if (is_row_cta) {
+        pf_req = g_req;
+        pf_load = pf_ok && tid_0 >= 64 && pf_lane >= 8 && !has_out_kv && num_requests > 0;
+    } else {
+        pf_req = req_id;
+        pf_load = pf_ok && pf_lane >= 8 && req_id < num_requests;
+    }
+    if (pf_load) {
+        int pf_idx = (pf_lane - 8) * 2;
+        int pf_base = pf_req * max_pages_per_request;
+        if (pf_idx < max_pages_per_request) {
+            pf_e0 = page_indices[pf_base + pf_idx];
+        }
+        if (pf_idx + 1 < max_pages_per_request) {
+            pf_e1 = page_indices[pf_base + pf_idx + 1];
         }
     }
     bool any_bad = 0;
@@ -322,33 +339,22 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
         if (g_b >= 0 && g_b <= row && row < g_e && g_e <= num_rows) {
             have = 1;
             batch_i = g_req;
-            pos = row + g_l - g_e;
+            int _max_10 = ((row + g_l - g_e) > (0) ? (row + g_l - g_e) : (0));
+            pos = _max_10;
             tok = row - g_b;
             if (is_q || is_k) {
                 long long cs_base = (long long)pos * 128 + (long long)(lane_1 * 8);
-                {
-                    unsigned _v4_10_0;
-                    unsigned _v4_10_1;
-                    unsigned _v4_10_2;
-                    unsigned _v4_10_3;
-                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(_v4_10_0), "=r"(_v4_10_1), "=r"(_v4_10_2), "=r"(_v4_10_3) : "l"((const void*)(cos_sin + cs_base + (0))) : "memory");
-                    c_lo[0 + 0] = __uint_as_float(_v4_10_0);
-                    c_lo[0 + 1] = __uint_as_float(_v4_10_1);
-                    c_lo[0 + 2] = __uint_as_float(_v4_10_2);
-                    c_lo[0 + 3] = __uint_as_float(_v4_10_3);
-                }
                 {
                     unsigned _v4_11_0;
                     unsigned _v4_11_1;
                     unsigned _v4_11_2;
                     unsigned _v4_11_3;
                     asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(_v4_11_0), "=r"(_v4_11_1), "=r"(_v4_11_2), "=r"(_v4_11_3) : "l"((const void*)(cos_sin + (cs_base + 4) + (0))) : "memory");
-                    c_lo[4 + 0] = __uint_as_float(_v4_11_0);
-                    c_lo[4 + 1] = __uint_as_float(_v4_11_1);
-                    c_lo[4 + 2] = __uint_as_float(_v4_11_2);
-                    c_lo[4 + 3] = __uint_as_float(_v4_11_3);
+                        : "=r"(_v4_11_0), "=r"(_v4_11_1), "=r"(_v4_11_2), "=r"(_v4_11_3) : "l"((const void*)(cos_sin + cs_base + (0))) : "memory");
+                    c_lo[0 + 0] = __uint_as_float(_v4_11_0);
+                    c_lo[0 + 1] = __uint_as_float(_v4_11_1);
+                    c_lo[0 + 2] = __uint_as_float(_v4_11_2);
+                    c_lo[0 + 3] = __uint_as_float(_v4_11_3);
                 }
                 {
                     unsigned _v4_12_0;
@@ -356,11 +362,11 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                     unsigned _v4_12_2;
                     unsigned _v4_12_3;
                     asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(_v4_12_0), "=r"(_v4_12_1), "=r"(_v4_12_2), "=r"(_v4_12_3) : "l"((const void*)(cos_sin + (cs_base + 64) + (0))) : "memory");
-                    c_hi[0 + 0] = __uint_as_float(_v4_12_0);
-                    c_hi[0 + 1] = __uint_as_float(_v4_12_1);
-                    c_hi[0 + 2] = __uint_as_float(_v4_12_2);
-                    c_hi[0 + 3] = __uint_as_float(_v4_12_3);
+                        : "=r"(_v4_12_0), "=r"(_v4_12_1), "=r"(_v4_12_2), "=r"(_v4_12_3) : "l"((const void*)(cos_sin + (cs_base + 4) + (0))) : "memory");
+                    c_lo[4 + 0] = __uint_as_float(_v4_12_0);
+                    c_lo[4 + 1] = __uint_as_float(_v4_12_1);
+                    c_lo[4 + 2] = __uint_as_float(_v4_12_2);
+                    c_lo[4 + 3] = __uint_as_float(_v4_12_3);
                 }
                 {
                     unsigned _v4_13_0;
@@ -368,59 +374,48 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                     unsigned _v4_13_2;
                     unsigned _v4_13_3;
                     asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                        : "=r"(_v4_13_0), "=r"(_v4_13_1), "=r"(_v4_13_2), "=r"(_v4_13_3) : "l"((const void*)(cos_sin + (cs_base + 64 + 4) + (0))) : "memory");
-                    c_hi[4 + 0] = __uint_as_float(_v4_13_0);
-                    c_hi[4 + 1] = __uint_as_float(_v4_13_1);
-                    c_hi[4 + 2] = __uint_as_float(_v4_13_2);
-                    c_hi[4 + 3] = __uint_as_float(_v4_13_3);
+                        : "=r"(_v4_13_0), "=r"(_v4_13_1), "=r"(_v4_13_2), "=r"(_v4_13_3) : "l"((const void*)(cos_sin + (cs_base + 64) + (0))) : "memory");
+                    c_hi[0 + 0] = __uint_as_float(_v4_13_0);
+                    c_hi[0 + 1] = __uint_as_float(_v4_13_1);
+                    c_hi[0 + 2] = __uint_as_float(_v4_13_2);
+                    c_hi[0 + 3] = __uint_as_float(_v4_13_3);
+                }
+                {
+                    unsigned _v4_14_0;
+                    unsigned _v4_14_1;
+                    unsigned _v4_14_2;
+                    unsigned _v4_14_3;
+                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                        : "=r"(_v4_14_0), "=r"(_v4_14_1), "=r"(_v4_14_2), "=r"(_v4_14_3) : "l"((const void*)(cos_sin + (cs_base + 64 + 4) + (0))) : "memory");
+                    c_hi[4 + 0] = __uint_as_float(_v4_14_0);
+                    c_hi[4 + 1] = __uint_as_float(_v4_14_1);
+                    c_hi[4 + 2] = __uint_as_float(_v4_14_2);
+                    c_hi[4 + 3] = __uint_as_float(_v4_14_3);
                 }
             }
             if ((is_k || is_v) && !has_out_kv) {
                 int page_slot = pos / page_size;
                 int row_in_page = pos - page_slot * page_size;
-                int phys = page_indices[batch_i * max_pages_per_request + page_slot];
-                cache_row = ((long long)phys * (long long)page_size + (long long)row_in_page) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
-            }
-        }
-    }
-    uint32_t _cta_or_0 = __syncthreads_or(any_bad);
-    unsigned int invalid = _cta_or_0;
-    if (tid_0 < 1) {
-        int f_flag = ((invalid != 0) ? -1 : 0);
-        *(reinterpret_cast<int*>(split_k_flag + (row * num_kv_heads + clear_head0 + tid_0)) + (0)) = f_flag;
-    }
-    if (invalid == 0) {
-        int f_from = page_size;
-        if (g_l >= 1) {
-            f_from = g_l - 1 - (g_l - 1) / page_size * page_size + 1;
-        }
-        if (f_from < page_size) {
-            long long f_phys64 = f_phys;
-            unsigned int f_zero[4];
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 4; j_2++) {
-                f_zero[j_2] = 0;
-            }
-            int f_rows = page_size - f_from;
-            int f_items = f_rows * 16;
-            #pragma unroll 1
-            for (int h = 0; h < 1; h++) {
-                long long f_head = (long long)((clear_head0 + h) * 128);
-                #pragma unroll 1
-                for (int item = tid_0; item < f_items; item += 96) {
-                    int f_r = item / 16;
-                    int f_sub = item - f_r * 16;
-                    int f_chunk = f_sub % 8;
-                    long long f_base = (f_phys64 * (long long)page_size + (long long)f_from + (long long)f_r) * (long long)(num_kv_heads * 128) + f_head + (long long)(f_chunk * 16);
-                    if (f_sub < 8) {
-                        reinterpret_cast<int4*>(key_cache + f_base)[0] = reinterpret_cast<int4*>(f_zero)[0];
-                    } else {
-                        reinterpret_cast<int4*>(value_cache + f_base)[0] = reinterpret_cast<int4*>(f_zero)[0];
-                    }
+                if (!pf_ok) {
+                    int phys = page_indices[batch_i * max_pages_per_request + page_slot];
+                    cache_row = ((long long)phys * (long long)page_size + (long long)row_in_page) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
                 }
             }
         }
     }
+    if (is_row_cta && tid_0 >= 64) {
+        bool g_hit = g_b >= 0 && g_b <= row && row < g_e && g_e <= num_rows;
+        if (pf_ok && g_hit && !has_out_kv) {
+            int pf_pos = row + g_l - g_e;
+            int pf_slot = pf_pos / page_size;
+            int pf_sel = (((pf_slot & 1) == 0) ? pf_e0 : pf_e1);
+            int pf_phys = __shfl_sync(0xFFFFFFFF, pf_sel, 8 + (pf_slot >> 1));
+            if (is_k || is_v) {
+                cache_row = ((long long)pf_phys * (long long)page_size + (long long)(pf_pos - pf_slot * page_size)) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
+            }
+        }
+    }
+    uint32_t invalid = __syncthreads_or(any_bad);
     if (is_row_cta) {
         if (invalid == 0 && active) {
             if (!have) {
@@ -430,28 +425,16 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                 if (is_q || is_k) {
                     long long cs_base_1 = (long long)pos * 128 + (long long)(lane_1 * 8);
                     {
-                        unsigned _v4_14_0;
-                        unsigned _v4_14_1;
-                        unsigned _v4_14_2;
-                        unsigned _v4_14_3;
-                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_v4_14_0), "=r"(_v4_14_1), "=r"(_v4_14_2), "=r"(_v4_14_3) : "l"((const void*)(cos_sin + cs_base_1 + (0))) : "memory");
-                        c_lo[0 + 0] = __uint_as_float(_v4_14_0);
-                        c_lo[0 + 1] = __uint_as_float(_v4_14_1);
-                        c_lo[0 + 2] = __uint_as_float(_v4_14_2);
-                        c_lo[0 + 3] = __uint_as_float(_v4_14_3);
-                    }
-                    {
                         unsigned _v4_15_0;
                         unsigned _v4_15_1;
                         unsigned _v4_15_2;
                         unsigned _v4_15_3;
                         asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_v4_15_0), "=r"(_v4_15_1), "=r"(_v4_15_2), "=r"(_v4_15_3) : "l"((const void*)(cos_sin + (cs_base_1 + 4) + (0))) : "memory");
-                        c_lo[4 + 0] = __uint_as_float(_v4_15_0);
-                        c_lo[4 + 1] = __uint_as_float(_v4_15_1);
-                        c_lo[4 + 2] = __uint_as_float(_v4_15_2);
-                        c_lo[4 + 3] = __uint_as_float(_v4_15_3);
+                            : "=r"(_v4_15_0), "=r"(_v4_15_1), "=r"(_v4_15_2), "=r"(_v4_15_3) : "l"((const void*)(cos_sin + cs_base_1 + (0))) : "memory");
+                        c_lo[0 + 0] = __uint_as_float(_v4_15_0);
+                        c_lo[0 + 1] = __uint_as_float(_v4_15_1);
+                        c_lo[0 + 2] = __uint_as_float(_v4_15_2);
+                        c_lo[0 + 3] = __uint_as_float(_v4_15_3);
                     }
                     {
                         unsigned _v4_16_0;
@@ -459,11 +442,11 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                         unsigned _v4_16_2;
                         unsigned _v4_16_3;
                         asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_v4_16_0), "=r"(_v4_16_1), "=r"(_v4_16_2), "=r"(_v4_16_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64) + (0))) : "memory");
-                        c_hi[0 + 0] = __uint_as_float(_v4_16_0);
-                        c_hi[0 + 1] = __uint_as_float(_v4_16_1);
-                        c_hi[0 + 2] = __uint_as_float(_v4_16_2);
-                        c_hi[0 + 3] = __uint_as_float(_v4_16_3);
+                            : "=r"(_v4_16_0), "=r"(_v4_16_1), "=r"(_v4_16_2), "=r"(_v4_16_3) : "l"((const void*)(cos_sin + (cs_base_1 + 4) + (0))) : "memory");
+                        c_lo[4 + 0] = __uint_as_float(_v4_16_0);
+                        c_lo[4 + 1] = __uint_as_float(_v4_16_1);
+                        c_lo[4 + 2] = __uint_as_float(_v4_16_2);
+                        c_lo[4 + 3] = __uint_as_float(_v4_16_3);
                     }
                     {
                         unsigned _v4_17_0;
@@ -471,11 +454,23 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                         unsigned _v4_17_2;
                         unsigned _v4_17_3;
                         asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                            : "=r"(_v4_17_0), "=r"(_v4_17_1), "=r"(_v4_17_2), "=r"(_v4_17_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64 + 4) + (0))) : "memory");
-                        c_hi[4 + 0] = __uint_as_float(_v4_17_0);
-                        c_hi[4 + 1] = __uint_as_float(_v4_17_1);
-                        c_hi[4 + 2] = __uint_as_float(_v4_17_2);
-                        c_hi[4 + 3] = __uint_as_float(_v4_17_3);
+                            : "=r"(_v4_17_0), "=r"(_v4_17_1), "=r"(_v4_17_2), "=r"(_v4_17_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64) + (0))) : "memory");
+                        c_hi[0 + 0] = __uint_as_float(_v4_17_0);
+                        c_hi[0 + 1] = __uint_as_float(_v4_17_1);
+                        c_hi[0 + 2] = __uint_as_float(_v4_17_2);
+                        c_hi[0 + 3] = __uint_as_float(_v4_17_3);
+                    }
+                    {
+                        unsigned _v4_18_0;
+                        unsigned _v4_18_1;
+                        unsigned _v4_18_2;
+                        unsigned _v4_18_3;
+                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_v4_18_0), "=r"(_v4_18_1), "=r"(_v4_18_2), "=r"(_v4_18_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64 + 4) + (0))) : "memory");
+                        c_hi[4 + 0] = __uint_as_float(_v4_18_0);
+                        c_hi[4 + 1] = __uint_as_float(_v4_18_1);
+                        c_hi[4 + 2] = __uint_as_float(_v4_18_2);
+                        c_hi[4 + 3] = __uint_as_float(_v4_18_3);
                     }
                 }
                 if ((is_k || is_v) && !has_out_kv) {
@@ -501,82 +496,67 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                 if (norm_policy == 2) {
                     float ss = 0.0f;
                     #pragma unroll
-                    for (int j_3 = 0; j_3 < 8; j_3++) {
-                        float _fma_0 = __fmaf_rn(x_lo[j_3], x_lo[j_3], ss);
-                        ss = _fma_0;
-                        float _fma_1 = __fmaf_rn(x_hi[j_3], x_hi[j_3], ss);
-                        ss = _fma_1;
+                    for (int j_2 = 0; j_2 < 8; j_2++) {
+                        ss = __fmaf_rn(x_lo[j_2], x_lo[j_2], ss);
+                        ss = __fmaf_rn(x_hi[j_2], x_hi[j_2], ss);
                     }
-                    float _shfl_xor_0 = __shfl_xor_sync(grp_mask, ss, 4);
-                    ss = ss + _shfl_xor_0;
-                    float _shfl_xor_1 = __shfl_xor_sync(grp_mask, ss, 2);
-                    ss = ss + _shfl_xor_1;
-                    float _shfl_xor_2 = __shfl_xor_sync(grp_mask, ss, 1);
-                    ss = ss + _shfl_xor_2;
-                    float _rsqrt_0 = rsqrtf(__fmaf_rn(ss, 0.0078125f, 1e-06f));
-                    float inv_rms = _rsqrt_0;
+                    float _shfl_xor_sync_19 = __shfl_xor_sync(grp_mask, ss, 4);
+                    ss = ss + _shfl_xor_sync_19;
+                    float _shfl_xor_sync_20 = __shfl_xor_sync(grp_mask, ss, 2);
+                    ss = ss + _shfl_xor_sync_20;
+                    float _shfl_xor_sync_21 = __shfl_xor_sync(grp_mask, ss, 1);
+                    ss = ss + _shfl_xor_sync_21;
+                    float inv_rms = rsqrtf(__fmaf_rn(ss, 0.0078125f, 1e-06f));
                     #pragma unroll
-                    for (int j_4 = 0; j_4 < 8; j_4++) {
-                        x_lo[j_4] = x_lo[j_4] * (inv_rms * w_lo[j_4]);
-                        x_hi[j_4] = x_hi[j_4] * (inv_rms * w_hi[j_4]);
+                    for (int j_3 = 0; j_3 < 8; j_3++) {
+                        x_lo[j_3] = x_lo[j_3] * (inv_rms * w_lo[j_3]);
+                        x_hi[j_3] = x_hi[j_3] * (inv_rms * w_hi[j_3]);
                     }
                 }
                 #pragma unroll
-                for (int j_5 = 0; j_5 < 8; j_5++) {
-                    float y_lo = __fmaf_rn(x_lo[j_5], c_lo[j_5], -(x_hi[j_5] * c_hi[j_5]));
-                    float y_hi = __fmaf_rn(x_hi[j_5], c_lo[j_5], x_lo[j_5] * c_hi[j_5]);
-                    x_lo[j_5] = y_lo;
-                    x_hi[j_5] = y_hi;
+                for (int j_4 = 0; j_4 < 8; j_4++) {
+                    float y_lo = __fmaf_rn(x_lo[j_4], c_lo[j_4], -(x_hi[j_4] * c_hi[j_4]));
+                    float y_hi = __fmaf_rn(x_hi[j_4], c_lo[j_4], x_lo[j_4] * c_hi[j_4]);
+                    x_lo[j_4] = y_lo;
+                    x_hi[j_4] = y_hi;
                 }
                 if (norm_policy == 1) {
                     float ss1 = 0.0f;
                     #pragma unroll
-                    for (int j_6 = 0; j_6 < 8; j_6++) {
-                        float _fma_2 = __fmaf_rn(x_lo[j_6], x_lo[j_6], ss1);
-                        ss1 = _fma_2;
-                        float _fma_3 = __fmaf_rn(x_hi[j_6], x_hi[j_6], ss1);
-                        ss1 = _fma_3;
+                    for (int j_5 = 0; j_5 < 8; j_5++) {
+                        ss1 = __fmaf_rn(x_lo[j_5], x_lo[j_5], ss1);
+                        ss1 = __fmaf_rn(x_hi[j_5], x_hi[j_5], ss1);
                     }
-                    float _shfl_xor_3 = __shfl_xor_sync(grp_mask, ss1, 4);
-                    ss1 = ss1 + _shfl_xor_3;
-                    float _shfl_xor_4 = __shfl_xor_sync(grp_mask, ss1, 2);
-                    ss1 = ss1 + _shfl_xor_4;
-                    float _shfl_xor_5 = __shfl_xor_sync(grp_mask, ss1, 1);
-                    ss1 = ss1 + _shfl_xor_5;
-                    float _rsqrt_1 = rsqrtf(__fmaf_rn(ss1, 0.0078125f, 1e-06f));
-                    float inv_rms1 = _rsqrt_1;
+                    float _shfl_xor_sync_22 = __shfl_xor_sync(grp_mask, ss1, 4);
+                    ss1 = ss1 + _shfl_xor_sync_22;
+                    float _shfl_xor_sync_23 = __shfl_xor_sync(grp_mask, ss1, 2);
+                    ss1 = ss1 + _shfl_xor_sync_23;
+                    float _shfl_xor_sync_24 = __shfl_xor_sync(grp_mask, ss1, 1);
+                    ss1 = ss1 + _shfl_xor_sync_24;
+                    float inv_rms1 = rsqrtf(__fmaf_rn(ss1, 0.0078125f, 1e-06f));
                     #pragma unroll
-                    for (int j_7 = 0; j_7 < 8; j_7++) {
-                        x_lo[j_7] = x_lo[j_7] * (inv_rms1 * w_lo[j_7]);
-                        x_hi[j_7] = x_hi[j_7] * (inv_rms1 * w_hi[j_7]);
+                    for (int j_6 = 0; j_6 < 8; j_6++) {
+                        x_lo[j_6] = x_lo[j_6] * (inv_rms1 * w_lo[j_6]);
+                        x_hi[j_6] = x_hi[j_6] * (inv_rms1 * w_hi[j_6]);
                     }
                 }
             }
-            float _rcp_0 = __frcp_rn(v_scale_v);
-            float mult = _rcp_0;
+            float mult = __frcp_rn(v_scale_v);
             if (is_q) {
                 if (quant_policy == 1) {
                     float m = 1e-06f;
                     #pragma unroll
-                    for (int j_8 = 0; j_8 < 8; j_8++) {
-                        float _fabs_0 = fabsf(x_lo[j_8]);
-                        float _fmax_0 = fmaxf(m, _fabs_0);
-                        m = _fmax_0;
-                        float _fabs_1 = fabsf(x_hi[j_8]);
-                        float _fmax_1 = fmaxf(m, _fabs_1);
-                        m = _fmax_1;
+                    for (int j_7 = 0; j_7 < 8; j_7++) {
+                        m = fmaxf(m, fabsf(x_lo[j_7]));
+                        m = fmaxf(m, fabsf(x_hi[j_7]));
                     }
-                    float _shfl_xor_6 = __shfl_xor_sync(grp_mask, m, 4);
-                    float _fmax_2 = fmaxf(m, _shfl_xor_6);
-                    m = _fmax_2;
-                    float _shfl_xor_7 = __shfl_xor_sync(grp_mask, m, 2);
-                    float _fmax_3 = fmaxf(m, _shfl_xor_7);
-                    m = _fmax_3;
-                    float _shfl_xor_8 = __shfl_xor_sync(grp_mask, m, 1);
-                    float _fmax_4 = fmaxf(m, _shfl_xor_8);
-                    m = _fmax_4;
-                    float _fdiv_rn_0 = __fdiv_rn(m, upper_max);
-                    float scale_val = _fdiv_rn_0;
+                    float _shfl_xor_sync_25 = __shfl_xor_sync(grp_mask, m, 4);
+                    m = fmaxf(m, _shfl_xor_sync_25);
+                    float _shfl_xor_sync_26 = __shfl_xor_sync(grp_mask, m, 2);
+                    m = fmaxf(m, _shfl_xor_sync_26);
+                    float _shfl_xor_sync_27 = __shfl_xor_sync(grp_mask, m, 1);
+                    m = fmaxf(m, _shfl_xor_sync_27);
+                    float scale_val = __fdiv_rn(m, upper_max);
                     if (lane_1 == 0) {
                         if (is_prefill) {
                             if (tok < max_seqlen_aligned) {
@@ -588,212 +568,312 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
                             *(reinterpret_cast<float*>(q_scale + qs_idx2) + (0)) = scale_val;
                         }
                     }
-                    float _rcp_1 = __frcp_rn(scale_val);
-                    mult = _rcp_1;
+                    float _rcp_28 = __frcp_rn(scale_val);
+                    mult = _rcp_28;
                 } else {
                     mult = q_static;
                 }
             } else if (is_k) {
-                float _rcp_2 = __frcp_rn(k_scale_v);
-                mult = _rcp_2;
+                float _rcp_29 = __frcp_rn(k_scale_v);
+                mult = _rcp_29;
             }
             #pragma unroll
-            for (int j_9 = 0; j_9 < 8; j_9++) {
-                x_lo[j_9] = x_lo[j_9] * mult;
-                x_hi[j_9] = x_hi[j_9] * mult;
+            for (int j_8 = 0; j_8 < 8; j_8++) {
+                x_lo[j_8] = x_lo[j_8] * mult;
+                x_hi[j_8] = x_hi[j_8] * mult;
             }
             long long row64 = row;
             if (is_q) {
                 long long q_dst = (row64 * (long long)num_q_heads + (long long)head_in_row) * 128;
+                unsigned int _packed_0[2];
                 {
-                    unsigned int _fp8_pk[2];
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
+                    uint32_t _packed;
+                    asm volatile("{\n\t"
+                        ".reg .b16 _lo;\n\t"
+                        ".reg .b16 _hi;\n\t"
                         "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                         "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                         "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                        "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
-                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                        "}"
+                        : "=r"(_packed) : "f"(x_lo[0]), "f"(x_lo[1]),
+                                           "f"(x_lo[2]), "f"(x_lo[3]));
+                    _packed_0[0] = _packed;
                 }
                 {
-                    unsigned int _fp8_pk[2];
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
+                    uint32_t _packed;
+                    asm volatile("{\n\t"
+                        ".reg .b16 _lo;\n\t"
+                        ".reg .b16 _hi;\n\t"
                         "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                         "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                         "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
-                    asm("{\n\t"
-                        ".reg .b16 _lo, _hi;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                        "mov.b32 %0, {_lo, _hi};\n\t"
-                        "}\n"
-                        : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
-                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                        "}"
+                        : "=r"(_packed) : "f"(x_lo[4]), "f"(x_lo[5]),
+                                           "f"(x_lo[6]), "f"(x_lo[7]));
+                    _packed_0[1] = _packed;
                 }
+                reinterpret_cast<int2*>(out_q + (q_dst + (long long)lane_lo))[0] = reinterpret_cast<int2*>(_packed_0)[0];
+                unsigned int _packed_1[2];
+                {
+                    uint32_t _packed;
+                    asm volatile("{\n\t"
+                        ".reg .b16 _lo;\n\t"
+                        ".reg .b16 _hi;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                        "mov.b32 %0, {_lo, _hi};\n\t"
+                        "}"
+                        : "=r"(_packed) : "f"(x_hi[0]), "f"(x_hi[1]),
+                                           "f"(x_hi[2]), "f"(x_hi[3]));
+                    _packed_1[0] = _packed;
+                }
+                {
+                    uint32_t _packed;
+                    asm volatile("{\n\t"
+                        ".reg .b16 _lo;\n\t"
+                        ".reg .b16 _hi;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                        "mov.b32 %0, {_lo, _hi};\n\t"
+                        "}"
+                        : "=r"(_packed) : "f"(x_hi[4]), "f"(x_hi[5]),
+                                           "f"(x_hi[6]), "f"(x_hi[7]));
+                    _packed_1[1] = _packed;
+                }
+                reinterpret_cast<int2*>(out_q + (q_dst + (long long)lane_hi))[0] = reinterpret_cast<int2*>(_packed_1)[0];
             } else if (is_k) {
                 if (has_out_kv) {
                     long long k_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
+                    unsigned int _packed_2[2];
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[0]), "f"(x_lo[1]),
+                                               "f"(x_lo[2]), "f"(x_lo[3]));
+                        _packed_2[0] = _packed;
                     }
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[4]), "f"(x_lo[5]),
+                                               "f"(x_lo[6]), "f"(x_lo[7]));
+                        _packed_2[1] = _packed;
                     }
+                    reinterpret_cast<int2*>(out_k + (k_dst + (long long)lane_lo))[0] = reinterpret_cast<int2*>(_packed_2)[0];
+                    unsigned int _packed_3[2];
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[0]), "f"(x_hi[1]),
+                                               "f"(x_hi[2]), "f"(x_hi[3]));
+                        _packed_3[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[4]), "f"(x_hi[5]),
+                                               "f"(x_hi[6]), "f"(x_hi[7]));
+                        _packed_3[1] = _packed;
+                    }
+                    reinterpret_cast<int2*>(out_k + (k_dst + (long long)lane_hi))[0] = reinterpret_cast<int2*>(_packed_3)[0];
                 } else {
+                    unsigned int _packed_4[2];
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[0]), "f"(x_lo[1]),
+                                               "f"(x_lo[2]), "f"(x_lo[3]));
+                        _packed_4[0] = _packed;
                     }
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[4]), "f"(x_lo[5]),
+                                               "f"(x_lo[6]), "f"(x_lo[7]));
+                        _packed_4[1] = _packed;
                     }
+                    reinterpret_cast<int2*>(key_cache + (cache_row + (long long)lane_lo))[0] = reinterpret_cast<int2*>(_packed_4)[0];
+                    unsigned int _packed_5[2];
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[0]), "f"(x_hi[1]),
+                                               "f"(x_hi[2]), "f"(x_hi[3]));
+                        _packed_5[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[4]), "f"(x_hi[5]),
+                                               "f"(x_hi[6]), "f"(x_hi[7]));
+                        _packed_5[1] = _packed;
+                    }
+                    reinterpret_cast<int2*>(key_cache + (cache_row + (long long)lane_hi))[0] = reinterpret_cast<int2*>(_packed_5)[0];
                 }
             } else {
                 if (has_out_kv) {
                     long long v_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
+                    unsigned int _packed_6[2];
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[0]), "f"(x_lo[1]),
+                                               "f"(x_lo[2]), "f"(x_lo[3]));
+                        _packed_6[0] = _packed;
                     }
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[4]), "f"(x_lo[5]),
+                                               "f"(x_lo[6]), "f"(x_lo[7]));
+                        _packed_6[1] = _packed;
                     }
+                    reinterpret_cast<int2*>(out_v + (v_dst + (long long)lane_lo))[0] = reinterpret_cast<int2*>(_packed_6)[0];
+                    unsigned int _packed_7[2];
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[0]), "f"(x_hi[1]),
+                                               "f"(x_hi[2]), "f"(x_hi[3]));
+                        _packed_7[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[4]), "f"(x_hi[5]),
+                                               "f"(x_hi[6]), "f"(x_hi[7]));
+                        _packed_7[1] = _packed;
+                    }
+                    reinterpret_cast<int2*>(out_v + (v_dst + (long long)lane_hi))[0] = reinterpret_cast<int2*>(_packed_7)[0];
                 } else {
+                    unsigned int _packed_8[2];
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[0]), "f"(x_lo[1]),
+                                               "f"(x_lo[2]), "f"(x_lo[3]));
+                        _packed_8[0] = _packed;
                     }
                     {
-                        unsigned int _fp8_pk[2];
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
-                        asm("{\n\t"
-                            ".reg .b16 _lo, _hi;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                            "mov.b32 %0, {_lo, _hi};\n\t"
-                            "}\n"
-                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
-                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                            "}"
+                            : "=r"(_packed) : "f"(x_lo[4]), "f"(x_lo[5]),
+                                               "f"(x_lo[6]), "f"(x_lo[7]));
+                        _packed_8[1] = _packed;
                     }
+                    reinterpret_cast<int2*>(value_cache + (cache_row + (long long)lane_lo))[0] = reinterpret_cast<int2*>(_packed_8)[0];
+                    unsigned int _packed_9[2];
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[0]), "f"(x_hi[1]),
+                                               "f"(x_hi[2]), "f"(x_hi[3]));
+                        _packed_9[0] = _packed;
+                    }
+                    {
+                        uint32_t _packed;
+                        asm volatile("{\n\t"
+                            ".reg .b16 _lo;\n\t"
+                            ".reg .b16 _hi;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                            "mov.b32 %0, {_lo, _hi};\n\t"
+                            "}"
+                            : "=r"(_packed) : "f"(x_hi[4]), "f"(x_hi[5]),
+                                               "f"(x_hi[6]), "f"(x_hi[7]));
+                        _packed_9[1] = _packed;
+                    }
+                    reinterpret_cast<int2*>(value_cache + (cache_row + (long long)lane_hi))[0] = reinterpret_cast<int2*>(_packed_9)[0];
                 }
             }
         }
@@ -803,24 +883,31 @@ kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* _
             *(reinterpret_cast<int*>(split_k_flag + (req_id * num_kv_heads + kv_head)) + (0)) = flag_val;
         }
         if (invalid == 0) {
-            int last_pos = clear_last_pos;
+            int last_pos = clear_len + (int)invalid - 1;
             if (last_pos >= 0) {
                 int last_slot = last_pos / page_size;
                 int zero_from = last_pos - last_slot * page_size + 1;
                 if (zero_from < page_size) {
-                    int phys_last = page_indices[req_id * max_pages_per_request + last_slot];
+                    int phys_last = 0;
+                    if (pf_ok) {
+                        int pf_sel_c = (((last_slot & 1) == 0) ? pf_e0 : pf_e1);
+                        int _shfl_sync_30 = __shfl_sync(0xFFFFFFFF, pf_sel_c, 8 + (last_slot >> 1));
+                        phys_last = _shfl_sync_30;
+                    } else {
+                        phys_last = page_indices[req_id * max_pages_per_request + last_slot];
+                    }
                     long long phys_last64 = phys_last;
                     unsigned int zero_w[4];
                     #pragma unroll
-                    for (int j_10 = 0; j_10 < 4; j_10++) {
-                        zero_w[j_10] = 0;
+                    for (int j_9 = 0; j_9 < 4; j_9++) {
+                        zero_w[j_9] = 0;
                     }
                     int n_rows = page_size - zero_from;
                     int total_items = n_rows * 16;
                     #pragma unroll 1
-                    for (int item_1 = tid_0; item_1 < total_items; item_1 += 96) {
-                        int r = item_1 / 16;
-                        int sub = item_1 - r * 16;
+                    for (int item = tid_0; item < total_items; item += 96) {
+                        int r = item / 16;
+                        int sub = item - r * 16;
                         int chunk = sub % 8;
                         long long base = (phys_last64 * (long long)page_size + (long long)zero_from + (long long)r) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128) + (long long)(chunk * 16);
                         if (sub < 8) {
