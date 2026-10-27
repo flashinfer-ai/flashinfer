@@ -26,11 +26,16 @@ of CTAs per work unit; ``reduce``, the split-KV combine, launched only when the
 plan has more than one split).  Each stage may have further records, which
 the host picks once per plan; the programs of one stage give bitwise
 identical outputs.  The decode stage's are ``decode_qk_ahead``, an SM100
-decode (the QK MMAs issued two tiles ahead of PV) that
-``select_decode_record`` picks for long balanced plans, and
-``decode_short``, a decode that reads its unit range in the kernel setup and
-frees its tensor memory once the last epilogue has read it, which
-``select_decode_record`` picks for plans of short units; the combine's is
+decode (the QK MMAs issued two tiles ahead of PV, its row-pair max exchange
+gated by a vote on the exchange barrier) that ``select_decode_record`` picks
+for long balanced plans, ``decode_xv``, an SM103 decode with that gated
+exchange, which ``select_decode_record`` picks for plans whose every unit
+streams long pieces, ``decode_short``, a decode that reads its unit range in
+the kernel setup and frees its tensor memory once the last epilogue has read
+it, which ``select_decode_record`` picks for plans of short units, and
+``decode_short_epi_warp``, that decode with its epilogue store path picked
+per softmax warp, which ``select_decode_record`` picks in its place when
+every request ends in a CTA of at least 32 valid query rows; the combine's is
 ``reduce_general``, a combine that reads the first pair of splits of a row
 from its top loads, which ``select_reduce_record`` picks for plans of more
 than two splits per row.  A renamed program still changes no host code.  A
@@ -67,9 +72,9 @@ The program name ``cake_nvfp4_mla_decode_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
 program was rendered from; a changed keyword is a new program.  The exception
-is a keyword at its implicit default (``qk_ahead``, ``short_rows`` and
-``general_splits`` at ``False``): the name omits it, so programs named before
-the keyword existed keep their names.
+is a keyword at its implicit default (``qk_ahead``, ``short_rows``, ``xv``,
+``epi_warp`` and ``general_splits`` at ``False``): the name omits it, so
+programs named before the keyword existed keep their names.
 """
 
 from __future__ import annotations
@@ -222,6 +227,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_raw_stages": 3,
             "num_v_stages": 2,
             "qk_ahead": True,
+            "xv": True,
         },
         "ffi_entry": "run",
         "flag_direct_out": 2,
@@ -231,8 +237,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "units_by_cluster",
         },
         "item_fields": 8,
-        "kernel": "cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
-        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
+        "kernel": "cake_nvfp4_mla_decode_05927afc40e38d96365b",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_05927afc40e38d96365b",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -240,7 +246,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222208,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_mla_decode_48db04e5f7665bc25adb",
+        "library": "cake_nvfp4_mla_decode_05927afc40e38d96365b",
         "logical": {
             "KV": "KV",
             "KVS": "KVS",

@@ -80,6 +80,19 @@ QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every u
 # cluster streams a short range.
 SHORT_RECORD = "decode_short"
 SHORT_MAX_UNIT_TILES = {"sm_100a": 32, "sm_103a": 64}  # pipeline tiles of every unit
+# The short-row program with a per-warp epilogue store path: a softmax warp
+# whose 32 query rows are all valid takes the bulk store path in a partially
+# valid CTA too. It runs in place of the short-row program when every request
+# ends in a CTA of at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows.
+SHORT_EPI_RECORD = "decode_short_epi_warp"
+SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
+# The SM103 decode with its row-pair max exchange gated by a vote on the
+# exchange barrier. Each piece pays a warm-up worth about ``XV_WARMUP_TILES``
+# tiles of the saving, so it pays off when every cluster streams at least
+# ``XV_MIN_STEADY_TILES`` pipeline tiles past that warm-up of its pieces.
+XV_RECORD = "decode_xv"
+XV_WARMUP_TILES = 48  # pipeline tiles of every piece
+XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
 # Further combine program (``select_reduce_record``), giving the combine
 # program's outputs bit for bit: it reads the first pair of splits of a row
 # from its top loads, which pays off for rows of more than two splits.
@@ -215,7 +228,8 @@ class WorkPlan:
     row tile): a piece with more than one split goes through the BF16 partials
     and the split-KV combine kernel, a single-split piece keeps
     ``FLAG_DIRECT_OUT`` and its CTAs write ``O`` / ``LSE`` directly, even when
-    other pieces of the batch are split.
+    other pieces of the batch are split. ``q_len`` and ``num_heads`` are the
+    query tokens per request and the heads the plan was built for.
     """
 
     schedule: str
@@ -223,6 +237,8 @@ class WorkPlan:
     unit_first: tuple
     max_splits: int
     tiles_per_split: Optional[int]
+    q_len: int
+    num_heads: int
 
     @property
     def num_items(self) -> int:
@@ -328,6 +344,8 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
         unit_first=tuple(range(0, len(items) + 1, CLUSTER_PAIR)),
         max_splits=max_splits,
         tiles_per_split=tiles_per_split,
+        q_len=q_len,
+        num_heads=num_heads,
     )
 
 
@@ -456,6 +474,8 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
         unit_first=tuple(unit_first),
         max_splits=max_splits,
         tiles_per_split=None,
+        q_len=q_len,
+        num_heads=num_heads,
     )
 
 
@@ -546,10 +566,17 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     ``QK_AHEAD_RECORD`` (the same kernel with the QK MMAs issued two tiles
     ahead of PV, delivered for SM100 only) runs a balanced plan when every
     unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with a
-    piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; ``SHORT_RECORD`` runs a
-    plan of either schedule when every unit holds at most
-    ``SHORT_MAX_UNIT_TILES[arch]`` pipeline tiles; every other plan runs
-    ``"decode"``. The decode programs' outputs are bitwise identical.
+    piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; ``XV_RECORD`` (the
+    decode with its row-pair max exchange gated by a vote, delivered for
+    SM103 only) runs a plan of either schedule when every unit holds at least
+    ``XV_MIN_STEADY_TILES`` pipeline tiles past ``XV_WARMUP_TILES`` tiles of
+    each of its pieces; ``SHORT_RECORD`` runs a plan of either schedule when
+    every unit holds at most ``SHORT_MAX_UNIT_TILES[arch]`` pipeline tiles,
+    and ``SHORT_EPI_RECORD`` (the short-row program with a per-warp epilogue
+    store path) runs such a plan in its place when the last CTA of every
+    request holds at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows;
+    every other plan runs ``"decode"``. The decode programs' outputs are
+    bitwise identical.
     """
     # One item per piece: both rows of a pair share the piece's tile range
     # (item fields 3 and 4: tile_start, tile_end).
@@ -567,12 +594,23 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         )
     ):
         return QK_AHEAD_RECORD
+    if _delivered(XV_RECORD, arch) and all(
+        sum(max(0, tiles - XV_WARMUP_TILES) for tiles in lens) >= XV_MIN_STEADY_TILES
+        for lens in units
+    ):
+        return XV_RECORD
     limit = SHORT_MAX_UNIT_TILES.get(arch)
     if (
         _delivered(SHORT_RECORD, arch)
         and limit is not None
         and all(sum(lens) <= limit for lens in units)
     ):
+        tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
+        if (
+            _delivered(SHORT_EPI_RECORD, arch)
+            and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS
+        ):
+            return SHORT_EPI_RECORD
         return SHORT_RECORD
     return "decode"
 
