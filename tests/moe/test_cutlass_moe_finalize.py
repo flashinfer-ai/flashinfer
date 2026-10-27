@@ -307,6 +307,21 @@ def _run(c: _Case, block_kernels: bool, inputs, out_init):
     return out
 
 
+def _launched_finalize_kernels(fn):
+    """Run fn and return (its result, names of the finalize kernels it launched).
+
+    The kernel names come from CUPTI via the PyTorch profiler, so this records the branch the
+    production launcher actually took, independently of canUseFinalizeMoeRoutingWarpKernel.
+    """
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        result = fn()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if "finalizeMoeRouting" in e.name]
+    return result, names
+
+
 def _check(c: _Case, expect_warp_kernel: bool = True):
     device = torch.device("cuda")
     inputs = _make_inputs(c, device)
@@ -333,7 +348,14 @@ def _check(c: _Case, expect_warp_kernel: bool = True):
     )
     assert uses_warp == expect_warp_kernel
 
-    new = _run(c, False, inputs, out_init)
+    new, launched = _launched_finalize_kernels(lambda: _run(c, False, inputs, out_init))
+    if c.num_rows > 0:
+        # The launcher must have taken the branch that uses_warp_kernel predicts.
+        assert launched, "no finalize kernel was launched"
+        is_warp = ["finalizeMoeRoutingWarpKernel" in name for name in launched]
+        assert all(w == uses_warp for w in is_warp), (
+            f"expected the {'warp' if uses_warp else 'block-per-row'} kernel, launched {launched}"
+        )
     if c.num_rows == 0:
         torch.cuda.synchronize()
         return
