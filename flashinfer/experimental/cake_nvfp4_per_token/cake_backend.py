@@ -359,6 +359,9 @@ class QuantizePlan:
     padded_cols: int
     kernel_key: str
     cluster_split: int = 1  # CTAs per token row (one cluster of that many CTAs)
+    # The key the planner selected when ``arch`` does not register it and the plan runs
+    # the nearest registered program instead (None: the plan runs its own program).
+    unregistered_key: Optional[str] = None
 
 
 def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional[int]:
@@ -454,7 +457,7 @@ def quant_plan(
             -(-8 * cols // (CLUSTER_SPLIT_PAD_CHUNKS * split)) if m % ROW_TILE else 0
         )
         grid = (m + pad_clusters) * split
-    return QuantizePlan(
+    plan = QuantizePlan(
         arch=arch,
         sm_count=int(sm_count),
         M=m,
@@ -480,6 +483,76 @@ def quant_plan(
             split,
         ),
         cluster_split=split,
+    )
+    if plan.kernel_key in KERNELS.get(arch, {}):
+        return plan
+    contiguous = m == 1 or x_row_stride is None or x_row_stride == k
+    return _registered_quant_plan(plan, contiguous)
+
+
+def _quant_shape_of_key(
+    key: str,
+) -> Optional[tuple[int, int, int, bool, bool, str, Optional[int]]]:
+    """``(threads, blocks_per_thread, min_blocks, is_bf16, fold, store_hint, k_static)`` of
+    a one-CTA-per-row quantizer key of :func:`quant_kernel_key`, else ``None``."""
+    head = key.removeprefix("quant:").split("_")
+    if not key.startswith("quant:") or len(head) < 4:
+        return None
+    t, b, mb, dtype, *rest = head
+    if not (t[1:].isdigit() and b[1:].isdigit() and mb[2:].isdigit()):
+        return None
+    k_static = next((int(p[1:]) for p in rest if p[1:].isdigit()), None)
+    hint = STORE_HINT_LARGE_ROW if "sl" in rest else STORE_HINT_DEFAULT
+    shape = (int(t[1:]), int(b[1:]), int(mb[2:]), dtype == "bf16", "fold" in rest)
+    if quant_kernel_key(*shape, hint, k_static) != key:
+        return None
+    return (*shape, hint, k_static)
+
+
+def _registered_quant_plan(plan: QuantizePlan, contiguous: bool) -> QuantizePlan:
+    """The plan of the registered one-CTA-per-row quantizer program nearest to
+    ``plan``'s unregistered instance that runs its rows: the same input dtype and folded
+    scale, a CTA holding the row (threads x register blocks x 16 >= K) and a compiled-in
+    width only for contiguous rows of that width; the same CTA width first, then the
+    closest register capacity, occupancy, store policy, then the key.  The result records
+    ``plan``'s key in ``unregistered_key``; ``plan`` itself when no registered program
+    runs the rows."""
+    best: Optional[tuple[tuple[Any, ...], str, tuple]] = None
+    for key in KERNELS.get(plan.arch, {}):
+        shape = _quant_shape_of_key(key)
+        if shape is None:
+            continue
+        threads, blocks, min_blocks, is_bf16, fold, hint, k_static = shape
+        if (is_bf16, fold) != (plan.is_bf16, plan.fold) or (
+            threads * blocks * SF_VEC < plan.K
+        ):
+            continue
+        if k_static is not None and (k_static != plan.K or not contiguous):
+            continue
+        cost = (
+            threads != plan.threads,
+            abs(blocks - plan.blocks_per_thread),
+            min_blocks != plan.min_blocks,
+            hint != plan.store_hint,
+            k_static != plan.k_static,
+            key,
+        )
+        if best is None or cost < best[0]:
+            best = (cost, key, shape)
+    if best is None:
+        return plan
+    threads, blocks, min_blocks, _, _, hint, k_static = best[2]
+    return replace(
+        plan,
+        threads=threads,
+        blocks_per_thread=blocks,
+        min_blocks=min_blocks,
+        store_hint=hint,
+        k_static=k_static,
+        grid=plan.padded_rows,
+        kernel_key=best[1],
+        cluster_split=1,
+        unregistered_key=plan.kernel_key,
     )
 
 

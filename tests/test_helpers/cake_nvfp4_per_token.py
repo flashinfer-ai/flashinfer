@@ -124,10 +124,10 @@ def required_kernel_keys(arch: str, sm_count: Optional[int] = None) -> tuple[str
         sm_count = ARCH_SM_COUNT[arch]
     keys: list[str] = []
     for kind, k, n, m, x_bf16, out_f16, fold in validated_problems():
-        plan_keys = [quant_plan(m, k, x_bf16, fold, arch, sm_count).kernel_key]
+        plans = [quant_plan(m, k, x_bf16, fold, arch, sm_count)]
         if kind == "gemm":
-            plan = gemm_plan(m, n, k, out_f16, arch, sm_count)
-            plan_keys.append(plan.unregistered_key or plan.kernel_key)
+            plans.append(gemm_plan(m, n, k, out_f16, arch, sm_count))
+        plan_keys = [plan.unregistered_key or plan.kernel_key for plan in plans]
         for key in plan_keys:
             if key not in keys:
                 keys.append(key)

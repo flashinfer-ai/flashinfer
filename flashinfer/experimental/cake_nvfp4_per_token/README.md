@@ -76,7 +76,11 @@ outside the matrix whose tactic selects a kernel that is not registered runs the
 registered program: the same orientation, CTA group and closest tile width, with the raster
 group, stream-K tail, scheduler or cache hints of that program (on GB200 / B300 the program
 B200 / GB300 runs); its plan records the replaced key in `unregistered_key`.  A quantizer
-shape outside the matrix raises `NotImplementedError` naming the missing kernel.
+shape whose instance is not registered runs the nearest registered one-CTA-per-row program
+of the same activation dtype and folded scale whose CTA holds the row (a compiled-in row
+width only for contiguous rows of that width), and records the replaced key the same way.
+fp16 activations without such a program (row widths other than 7168, a folded output
+scale, row-strided rows) raise `NotImplementedError` naming the missing kernel.
 
 Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; GEMM
 `|out - ref| <= 1e-2 + 1e-2 |ref| + half an output ulp` against the FP32 dequantized
