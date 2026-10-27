@@ -349,7 +349,7 @@ def _mx_generated_json_rows():
                         },
                     )
                 )
-        for tile_k, stages in ((128, 6), (256, 3)):
+        for tile_k, stages in ((128, 4), (128, 5), (128, 6), (256, 3)):
             rows.append(
                 (
                     "MxFp4xMxFp8_FC1_HighThroughput_tileN_256",
@@ -609,7 +609,7 @@ def test_generated_mx_json_rows_construct_ts_configs():
     assert Counter(comment for comment, _ in rows) == {
         "MxFp4xMxFp8_FC1_LowLatency": 24,
         "MxFp4xMxFp8_FC1_HighThroughput": 16,
-        "MxFp4xMxFp8_FC1_HighThroughput_tileN_256": 4,
+        "MxFp4xMxFp8_FC1_HighThroughput_tileN_256": 8,
         "MxFp4xMxFp8_FC2_LowLatency": 12,
         "MxFp4xMxFp8_FC2_HighThroughput": 8,
         "MxFp4xMxFp8_FC2_HighThroughput_tileN_256": 2,
@@ -1356,6 +1356,7 @@ class TestMxFc1HighThroughput:
         stages,
         num_tokens=128,
         problem_n=256,
+        problem_k=None,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             SfLayout,
@@ -1391,7 +1392,7 @@ class TestMxFc1HighThroughput:
             cfg,
             num_tokens=num_tokens,
             problem_n=problem_n,
-            problem_k=tile_k,
+            problem_k=problem_k or tile_k,
         )
 
     def test_mxfp4_mxfp8_tile64_k128_cluster_persistent(self):
@@ -1479,6 +1480,21 @@ class TestMxFc1HighThroughput:
             dtype_a=DType.MXE4M3,
             tile_k=256,
             stages=3,
+        )
+
+    @pytest.mark.parametrize("stages", [4, 5, 6])
+    def test_mxfp4_mxfp8_tile256_k128_tma_overlap_deep_pipeline(self, stages):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+        )
+
+        self._run_tile256_tma_overlap(
+            dtype_a=DType.MXE2M1,
+            tile_k=128,
+            stages=stages,
+            num_tokens=512,
+            problem_n=1024,
+            problem_k=1024,
         )
 
     def test_mxfp4_mxfp8_tile256_k256_tma_overlap_multi_n_regression(self):
