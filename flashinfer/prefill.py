@@ -8840,7 +8840,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
+        # The cake backend takes a device bmm1 scale as given: its device-scale
+        # programs convert it to log2 form themselves, which saves this extra
+        # launch.
+        if backend != "cake":
+            bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
@@ -8916,18 +8920,19 @@ def trtllm_batch_context_with_kv_cache(
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # A device-scale program reads both scales through device pointers
-        # (bmm1 in log2 form). The other context adapters consume host scalar
-        # scales: device scalar values are resolved only after route
-        # selection, preserving their public value while converting bmm1 back
-        # from log2 form.
+        # A device-scale program reads both scales through device pointers and
+        # converts the raw bmm1 scale to log2 form itself. The other context
+        # adapters consume host scalar scales: device scalar values are
+        # resolved only after route selection. bmm1 keeps the value of the
+        # FP32 log2 product converted back (the value these adapters always
+        # received).
         if (
             cake_route is None
             or cake_route.program is None
             or not cake_route.device_scales
         ):
             if isinstance(bmm1_scale, torch.Tensor):
-                bmm1_scale = float(bmm1_scale.item()) / log2e
+                bmm1_scale = float((bmm1_scale * log2e).item()) / log2e
             if isinstance(bmm2_scale, torch.Tensor):
                 bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(
