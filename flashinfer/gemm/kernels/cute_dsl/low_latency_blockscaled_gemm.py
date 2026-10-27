@@ -1090,6 +1090,10 @@ class LowLatencyBlockscaledGemmKernel:
         tAgSFA = cute.filter_zeros(tAgSFA)
         tAgSFA = tAgSFA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
 
+        # Weights and their scales can be produced by the preceding grid.
+        if self.use_pdl:
+            cute.arch.griddepcontrol_wait()
+
         # Empty barriers start at phase 0, so the producer starts at phase 1
         ab_state = make_pipeline_state(PipelineUserType.Producer, DMA_Stage)
         pdl_count = self.pdl_count
@@ -1217,7 +1221,7 @@ class LowLatencyBlockscaledGemmKernel:
             tBgSFB = cute.filter_zeros(tBgSFB)
         tBgSFB = tBgSFB[(None, work_tile_info.N_idx, None, work_tile_info.L_idx)]
 
-        # PDL: wait on dependent grids only for B (the activation tensor)
+        # PDL: wait before reading B (the activation tensor) and its scales
         if self.use_pdl:
             cute.arch.griddepcontrol_wait()
 
