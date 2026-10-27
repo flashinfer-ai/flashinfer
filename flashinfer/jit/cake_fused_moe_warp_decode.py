@@ -47,9 +47,9 @@ _CONTRACT_HEADER = "cake_warp_decode_contract.cuh"
 # directories hold the kernels that differ. The generated manifest header
 # declares every symbol listed here for the matching target.
 _COMMON_SOURCES: tuple[str, ...] = (
-    "cake_warp_decode_0686b950e5dc33f7f54f_kernel.cu",
     "cake_warp_decode_0b0064c2b6a78da3094a_kernel.cu",
     "cake_warp_decode_2d89b2ccfa19074dd9fb_kernel.cu",
+    "cake_warp_decode_30aabe6953736fdeda01_kernel.cu",
     "cake_warp_decode_345efbf7077827bc328e_kernel.cu",
     "cake_warp_decode_3aa297e8ff45f1333ec9_kernel.cu",
     "cake_warp_decode_510ad9e9035da24674b6_kernel.cu",

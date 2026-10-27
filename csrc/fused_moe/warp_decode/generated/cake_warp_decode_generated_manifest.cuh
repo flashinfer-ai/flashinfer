@@ -43,7 +43,7 @@
 #if FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR == 0
 extern "C" {
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(512, 1) void
 kernel_cake_warp_decode_3aa297e8ff45f1333ec9(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
@@ -146,7 +146,7 @@ struct KernelSpec {
   bool programmatic_dependent_launch;
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
+  {"kernel_cake_warp_decode_30aabe6953736fdeda01", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
   {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
   {"kernel_cake_warp_decode_7d6f94378c1107da3804", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true},
   {"kernel_cake_warp_decode_6aee17fe7c1c9a9fbc4f", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
@@ -2368,7 +2368,7 @@ struct KernelArgs_0 {
 };
 inline cudaError_t SubmitKernel_0(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_0*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_0686b950e5dc33f7f54f,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_30aabe6953736fdeda01,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -5566,7 +5566,7 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
   const void* functions[41] = {
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_0686b950e5dc33f7f54f),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_30aabe6953736fdeda01),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_3aa297e8ff45f1333ec9),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_7d6f94378c1107da3804),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_6aee17fe7c1c9a9fbc4f),
@@ -6050,7 +6050,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
 #else
 extern "C" {
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(256) void
 kernel_cake_warp_decode_31a3880ae8e28c314b6e(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(256) void
@@ -6153,7 +6153,7 @@ struct KernelSpec {
   bool programmatic_dependent_launch;
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_0686b950e5dc33f7f54f", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
+  {"kernel_cake_warp_decode_30aabe6953736fdeda01", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true},
   {"kernel_cake_warp_decode_31a3880ae8e28c314b6e", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true},
   {"kernel_cake_warp_decode_3754ea7477cc2b195d70", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true},
   {"kernel_cake_warp_decode_3aa297e8ff45f1333ec9", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true},
@@ -8382,7 +8382,7 @@ struct KernelArgs_0 {
 };
 inline cudaError_t SubmitKernel_0(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_0*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_0686b950e5dc33f7f54f,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_30aabe6953736fdeda01,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -11610,7 +11610,7 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
   const void* functions[41] = {
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_0686b950e5dc33f7f54f),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_30aabe6953736fdeda01),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_31a3880ae8e28c314b6e),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_3754ea7477cc2b195d70),
       reinterpret_cast<const void*>(kernel_cake_warp_decode_3aa297e8ff45f1333ec9),

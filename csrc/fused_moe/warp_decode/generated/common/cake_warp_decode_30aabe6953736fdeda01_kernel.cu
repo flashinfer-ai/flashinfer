@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work)
+kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -101,7 +101,8 @@ kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, in
     int* scan_values = reinterpret_cast<int*>(smem_raw + 6160);
     const int scan_values_addr = smem + 6160;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int expert = tid;
     if (expert < num_experts) {
         expert_counts[expert] = 0;
@@ -121,10 +122,14 @@ kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, in
         fc2_work_counter[0] = fc2_initial_work;
     }
     __syncthreads();
+    int rank_expert = -1;
+    int count_rank = 0;
     for (int route = tid; route < route_count; route += THREADS) {
         int expert_1 = route_experts[route] - local_expert_offset;
         if (expert_1 >= 0 && expert_1 < num_experts) {
-            atomicAdd(&expert_counts[expert_1], 1);
+            int counted = atomicAdd(&expert_counts[expert_1], 1);
+            rank_expert = expert_1;
+            count_rank = counted;
         }
     }
     __syncthreads();
@@ -142,45 +147,35 @@ kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, in
     }
     int first_inclusive = first_tiles;
     int second_inclusive = second_tiles;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 1, 32);
-    int first_peer = _shfl_up_0;
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 1, 32);
-    int second_peer = _shfl_up_1;
+    int first_peer = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 1, 32);
+    int second_peer = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 1, 32);
     if (lane >= 1) {
         first_inclusive = first_inclusive + first_peer;
         second_inclusive = second_inclusive + second_peer;
     }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 2, 32);
-    int first_peer_1 = _shfl_up_2;
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 2, 32);
-    int second_peer_2 = _shfl_up_3;
+    int first_peer_0 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 2, 32);
+    int second_peer_1 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 2, 32);
     if (lane >= 2) {
-        first_inclusive = first_inclusive + first_peer_1;
-        second_inclusive = second_inclusive + second_peer_2;
+        first_inclusive = first_inclusive + first_peer_0;
+        second_inclusive = second_inclusive + second_peer_1;
     }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 4, 32);
-    int first_peer_3 = _shfl_up_4;
-    int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 4, 32);
-    int second_peer_4 = _shfl_up_5;
+    int first_peer_2 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 4, 32);
+    int second_peer_3 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 4, 32);
     if (lane >= 4) {
-        first_inclusive = first_inclusive + first_peer_3;
-        second_inclusive = second_inclusive + second_peer_4;
+        first_inclusive = first_inclusive + first_peer_2;
+        second_inclusive = second_inclusive + second_peer_3;
     }
-    int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 8, 32);
-    int first_peer_5 = _shfl_up_6;
-    int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 8, 32);
-    int second_peer_6 = _shfl_up_7;
+    int first_peer_4 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 8, 32);
+    int second_peer_5 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 8, 32);
     if (lane >= 8) {
-        first_inclusive = first_inclusive + first_peer_5;
-        second_inclusive = second_inclusive + second_peer_6;
+        first_inclusive = first_inclusive + first_peer_4;
+        second_inclusive = second_inclusive + second_peer_5;
     }
-    int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 16, 32);
-    int first_peer_7 = _shfl_up_8;
-    int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 16, 32);
-    int second_peer_8 = _shfl_up_9;
+    int first_peer_6 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 16, 32);
+    int second_peer_7 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 16, 32);
     if (lane >= 16) {
-        first_inclusive = first_inclusive + first_peer_7;
-        second_inclusive = second_inclusive + second_peer_8;
+        first_inclusive = first_inclusive + first_peer_6;
+        second_inclusive = second_inclusive + second_peer_7;
     }
     if (lane == 31) {
         scan_values[warp] = first_inclusive;
@@ -192,31 +187,17 @@ kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, in
         if (lane < 16) {
             chunk_prefix = scan_values[lane];
         }
-        int _shfl_up_10 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 1, 32);
-        int chunk_peer = _shfl_up_10;
-        if (lane >= 1) {
-            chunk_prefix = chunk_prefix + chunk_peer;
+        int _warp_scan_sum_0 = chunk_prefix;
+        {
+            uint32_t _warp_scan_sum_0_scan = (uint32_t)_warp_scan_sum_0;
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _warp_scan_sum_0_scan, 1, 32); if (lane >= 1) { _warp_scan_sum_0_scan += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _warp_scan_sum_0_scan, 2, 32); if (lane >= 2) { _warp_scan_sum_0_scan += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _warp_scan_sum_0_scan, 4, 32); if (lane >= 4) { _warp_scan_sum_0_scan += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _warp_scan_sum_0_scan, 8, 32); if (lane >= 8) { _warp_scan_sum_0_scan += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _warp_scan_sum_0_scan, 16, 32); if (lane >= 16) { _warp_scan_sum_0_scan += peer; } }
+            _warp_scan_sum_0 = (int)_warp_scan_sum_0_scan;
         }
-        int _shfl_up_11 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 2, 32);
-        int chunk_peer_0 = _shfl_up_11;
-        if (lane >= 2) {
-            chunk_prefix = chunk_prefix + chunk_peer_0;
-        }
-        int _shfl_up_12 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 4, 32);
-        int chunk_peer_1 = _shfl_up_12;
-        if (lane >= 4) {
-            chunk_prefix = chunk_prefix + chunk_peer_1;
-        }
-        int _shfl_up_13 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 8, 32);
-        int chunk_peer_2 = _shfl_up_13;
-        if (lane >= 8) {
-            chunk_prefix = chunk_prefix + chunk_peer_2;
-        }
-        int _shfl_up_14 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 16, 32);
-        int chunk_peer_3 = _shfl_up_14;
-        if (lane >= 16) {
-            chunk_prefix = chunk_prefix + chunk_peer_3;
-        }
+        chunk_prefix = _warp_scan_sum_0;
         if (lane < 16) {
             scan_values[lane] = chunk_prefix;
         }
@@ -238,26 +219,43 @@ kernel_cake_warp_decode_0686b950e5dc33f7f54f(int* __restrict__ route_experts, in
         num_non_exiting_ctas[0] = total_tiles;
         expert_tile_offsets[num_experts] = total_tiles;
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     __syncthreads();
-    for (int route_1 = tid; route_1 < route_count; route_1 += THREADS) {
-        int expert_1_1 = route_experts[route_1] - local_expert_offset;
-        if (expert_1_1 >= 0 && expert_1_1 < num_experts) {
-            int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[expert_1_1], 1);
-            int local_row = _atomic_old_0;
-            int tile = expert_tile_offsets[expert_1_1] + local_row / TILE_N;
-            int row = local_row % TILE_N;
-            int slot = tile * TILE_N + row;
-            route_map[slot] = route_1 / top_k;
-            route_slots[route_1] = slot;
-            if (row == 0) {
-                int remaining = expert_counts[expert_1_1] - local_row;
-                int valid_rows = TILE_N;
-                if (remaining < TILE_N) {
-                    valid_rows = remaining;
+    if (route_count <= THREADS) {
+        if (rank_expert >= 0) {
+            int rank_tile = expert_tile_offsets[rank_expert] + count_rank / TILE_N;
+            int rank_row = count_rank % TILE_N;
+            int rank_slot = rank_tile * TILE_N + rank_row;
+            route_map[rank_slot] = tid / top_k;
+            route_slots[tid] = rank_slot;
+            if (rank_row == 0) {
+                int rank_remaining = expert_counts[rank_expert] - count_rank;
+                int rank_valid_rows = TILE_N;
+                if (rank_remaining < TILE_N) {
+                    rank_valid_rows = rank_remaining;
                 }
-                tile_expert[tile] = expert_1_1;
-                tile_mn_limit[tile] = tile * TILE_N + valid_rows;
+                tile_expert[rank_tile] = rank_expert;
+                tile_mn_limit[rank_tile] = rank_tile * TILE_N + rank_valid_rows;
+            }
+        }
+    } else {
+        for (int route_1 = tid; route_1 < route_count; route_1 += THREADS) {
+            int expert_1_1 = route_experts[route_1] - local_expert_offset;
+            if (expert_1_1 >= 0 && expert_1_1 < num_experts) {
+                int local_row = atomicAdd(&expert_scatter_offsets[expert_1_1], 1);
+                int tile = expert_tile_offsets[expert_1_1] + local_row / TILE_N;
+                int row = local_row % TILE_N;
+                int slot = tile * TILE_N + row;
+                route_map[slot] = route_1 / top_k;
+                route_slots[route_1] = slot;
+                if (row == 0) {
+                    int remaining = expert_counts[expert_1_1] - local_row;
+                    int valid_rows = TILE_N;
+                    if (remaining < TILE_N) {
+                        valid_rows = remaining;
+                    }
+                    tile_expert[tile] = expert_1_1;
+                    tile_mn_limit[tile] = tile * TILE_N + valid_rows;
+                }
             }
         }
     }
