@@ -661,41 +661,49 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+@functools.cache
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
+@functools.cache
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+@functools.cache
 def is_sm120a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm120f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm12x_supported(device: torch.device) -> bool:
     """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
 
