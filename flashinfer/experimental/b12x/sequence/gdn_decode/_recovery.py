@@ -16,8 +16,8 @@ from cutlass import BFloat16, Float32, Int32, Int64
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.intrinsics import warp_reduce
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.utils.device import current_cuda_stream
 
 from ._cute_kernels import _add, _fake_pointer, _numeric_type, _pointer
 

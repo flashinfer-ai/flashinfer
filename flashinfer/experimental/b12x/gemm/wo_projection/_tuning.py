@@ -142,8 +142,8 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=6,
-    config_schema_version=2,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
     encode_query=lambda query: {

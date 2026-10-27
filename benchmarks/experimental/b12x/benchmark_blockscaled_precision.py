@@ -26,7 +26,7 @@ from b12x.gemm.blockscaled import _a16
 from b12x.gemm.blockscaled._preparation import _workspace_bytes
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm._shared.wo_mxfp8 import (
     quantize_mxfp8_rows_torch,
@@ -423,7 +423,10 @@ def _run_case(
         outputs.append(output)
 
     add("quantized", qcall, qref)
-    from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
+    from b12x._lib.intrinsics.reference import (
+        as_grouped_scale_view,
+        as_grouped_scale_view_mx,
+    )
 
     fp4 = recipe == "nvfp4"
     sf_offset, alpha_offset, partial_offset, total = _a16._layout(m, n, k, fp4)

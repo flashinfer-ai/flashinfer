@@ -8,8 +8,9 @@ import pytest
 import torch
 
 from b12x._lib.compiler import compile as compile_kernel
-from b12x._lib.intrinsics import shared_ptr_to_u32
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.attention._shared.mla.decode_math import (
     _nvfp4_pair_bfloat2,
     s0_normalize_dsv41_kv_to_fp8,

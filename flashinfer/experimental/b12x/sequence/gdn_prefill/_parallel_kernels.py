@@ -14,15 +14,15 @@ from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n8k16_f32,
+from b12x._lib.intrinsics.memory import (
     cp_async_bulk_g2s_mbar,
     ldmatrix_m8n8x4_trans_b16,
     shared_ptr_to_u32,
     st_global_v2_f32,
 )
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from .._shared.delta_prefill._cute_kernels import (
     _RecurrenceKernel,
     _fake_pointer,

@@ -7,14 +7,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
-from b12x._lib.intrinsics import (
-    FLOAT8_E4M3_MAX,
+from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+from b12x._lib.intrinsics.conversion import (
     cvt_f32x4_to_e4m3x4,
-    fabs_f32,
-    fmax_f32,
     pow2_ceil_ue8m0,
     ue8m0_to_output_scale,
 )
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
 
 
 class W4A8CompactMicroActivationKernel:

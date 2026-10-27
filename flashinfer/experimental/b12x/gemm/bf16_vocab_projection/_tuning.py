@@ -160,8 +160,8 @@ def _tuning_parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.bf16_vocab_projection",
-    query_schema_version=1,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
     encode_query=_encode,

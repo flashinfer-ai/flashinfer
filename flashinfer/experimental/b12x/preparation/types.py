@@ -207,11 +207,14 @@ class MemoryRequirements:
     @classmethod
     def sequential(cls, requirements):
         """Calls reuse scratch sequentially; persistent allocation keys are shared."""
-        scratch, size, persistent = (), 0, []
+        scratch, size, persistent = (), (0, 0), []
         for requirement in requirements:
             if not isinstance(requirement, cls):
                 raise TypeError("memory callback must return MemoryRequirements")
-            candidate_size = requirement.scratch_nbytes
+            candidate_size = (
+                requirement.scratch_nbytes,
+                sum(spec.nbytes for spec in requirement.scratch),
+            )
             if candidate_size > size:
                 scratch, size = requirement.scratch, candidate_size
             persistent.extend(requirement.persistent)

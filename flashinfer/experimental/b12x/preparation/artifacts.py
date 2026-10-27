@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from filelock import FileLock, Timeout
 
 from b12x._lib.cache_integrity import _fsync_directory, _mkdir_durable, valid_object
 
@@ -45,12 +45,8 @@ class CuTeArtifactCache:
         )
         if not valid_object(object_path, manifest_path, key):
             return False
-        with self.path(key, ".lock").open("a") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return self.has(key)
-            try:
+        try:
+            with FileLock(self.path(key, ".lock"), timeout=0):
                 if self.has(key):
                     return True
                 for path in (object_path, manifest_path):
@@ -59,5 +55,5 @@ class CuTeArtifactCache:
                     os.replace(path, self.path(key, path.suffix))
                 _fsync_directory(self.path(key, ".o").parent)
                 return True
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        except Timeout:
+            return self.has(key)

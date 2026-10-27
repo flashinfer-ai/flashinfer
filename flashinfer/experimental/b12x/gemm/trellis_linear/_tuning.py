@@ -182,8 +182,8 @@ def _tuning_parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.trellis_linear",
-    query_schema_version=4,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     semantic_version=1,
     query_fields=frozenset(field.name for field in fields(TrellisQuery)),
     config_fields=frozenset(field.name for field in fields(TrellisConfig)),

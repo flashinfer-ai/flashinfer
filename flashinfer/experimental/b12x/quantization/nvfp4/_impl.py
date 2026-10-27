@@ -13,13 +13,13 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
 )
-from b12x._lib.intrinsics import align_up
-from b12x._lib.utils import (
+from b12x._lib.intrinsics.math import align_up
+from b12x._lib.utils.device import (
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
-    make_ptr,
 )
+from b12x._lib.utils.pointers import make_ptr
 from b12x.quantization.nvfp4._kernel import Bf16ToFp4TmaKernel
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,

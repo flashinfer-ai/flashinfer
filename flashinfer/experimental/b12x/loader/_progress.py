@@ -42,13 +42,22 @@ class _Frame:
 
 
 class CheckpointDisplay:
-    """Publish immutable snapshots; the refresh thread reads only UI state."""
+    """Publish immutable snapshots; the refresh thread reads only UI state.
 
-    def __init__(self, *, enabled=True, stream=None):
+    A shared Rich console supports nesting beneath another live display.
+    Transient panels disappear on exit instead of remaining in scrollback.
+    """
+
+    def __init__(self, *, enabled=True, stream=None, console=None, transient=False):
         self._enabled = enabled
-        self._stream = sys.stderr if stream is None else stream
+        self._stream = (
+            console.file
+            if console is not None
+            else (sys.stderr if stream is None else stream)
+        )
+        self._transient = transient
         self._frame = _Frame()
-        self._console = self._live = None
+        self._console, self._live = console, None
         self._started = self._ended = None
         self._last_stage = None
         self._last_log = 0.0
@@ -59,12 +68,18 @@ class CheckpointDisplay:
 
     def __enter__(self):
         self._started = self._phase_started = time.monotonic()
-        if self._enabled and self._stream.isatty():
+        terminal = (
+            self._console.is_terminal
+            if self._console is not None
+            else self._stream.isatty()
+        )
+        if self._enabled and terminal:
             from rich.console import Console
             from rich.live import Live
 
             with self._output_lock:
-                self._console = Console(file=self._stream)
+                if self._console is None:
+                    self._console = Console(file=self._stream)
                 for line in self._pending_output:
                     self._console.print(line, markup=False, highlight=False)
                 self._pending_output.clear()
@@ -72,7 +87,7 @@ class CheckpointDisplay:
                     console=self._console,
                     get_renderable=self._render,
                     refresh_per_second=8,
-                    transient=False,
+                    transient=self._transient,
                     vertical_overflow="crop",
                 )
                 self._live.start(refresh=True)
@@ -95,6 +110,10 @@ class CheckpointDisplay:
 
     def advance(self, selected_bytes):
         self._publish(shards=self._frame.shards + 1, selected_bytes=selected_bytes)
+
+    def update(self, selected_bytes):
+        """Update selected payload bytes without advancing a checkpoint shard."""
+        self._publish(selected_bytes=selected_bytes)
 
     def phase(self, phase):
         self._record_phase(time.monotonic())

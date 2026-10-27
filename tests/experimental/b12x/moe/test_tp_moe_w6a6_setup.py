@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
 
 
 def _tp_moe():

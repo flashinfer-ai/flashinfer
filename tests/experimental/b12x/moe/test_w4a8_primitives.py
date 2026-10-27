@@ -18,17 +18,21 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import (
-    MX_SF_VEC_SIZE,
-    broadcast_f32_to_half2,
+from b12x._lib.intrinsics.constants import MX_SF_VEC_SIZE
+from b12x._lib.intrinsics.conversion import (
     e2m1x8_mul_residual_to_e4m3x8,
     e2m1x8_to_e4m3x8,
+)
+from b12x._lib.intrinsics.packed import broadcast_f32_to_half2
+from b12x._lib.intrinsics.quantization import (
     max_abs_32,
+    quantize_block_fp8_mx,
+    silu_mul_quantize_block_fp8_mx,
+)
+from b12x._lib.intrinsics.reference import (
     pow2_ceil_ue8m0_torch,
     quant_dequant_mxfp8_torch,
-    quantize_block_fp8_mx,
     quantize_grouped_mxfp8_torch,
-    silu_mul_quantize_block_fp8_mx,
 )
 
 from ..conftest import require_b12x
@@ -452,7 +456,10 @@ class _QdE4M3Kernel:
 
     @cute.kernel
     def kernel(self, mIn: cute.Tensor, mOut: cute.Tensor):
-        from b12x._lib.intrinsics import mx_scale_from_amax32, quant_dequant_e4m3_2
+        from b12x._lib.intrinsics.quantization import (
+            mx_scale_from_amax32,
+            quant_dequant_e4m3_2,
+        )
 
         tidx = cute.arch.thread_idx()[0]
         bidx = cute.arch.block_idx()[0]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.reference import (
     as_grouped_scale_view_mx,
     quantize_grouped_mxfp8_torch,
     swizzle_block_scale,

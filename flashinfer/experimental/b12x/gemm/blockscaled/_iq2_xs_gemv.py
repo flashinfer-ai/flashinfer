@@ -10,18 +10,12 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
-from b12x._lib.intrinsics import (
-    get_ptr_as_int64,
-    warp_reduce,
-    iq2_xxs_descriptor_pair,
-    q8_0_pair_to_bf16x2,
-)
+from b12x._lib.intrinsics.memory import get_ptr_as_int64
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.intrinsics.trellis import iq2_xxs_descriptor_pair, q8_0_pair_to_bf16x2
 from b12x._lib.program_cache import program_cache
-from b12x._lib.utils import (
-    cuda_stream_from_int_or_current,
-    current_cuda_stream,
-    make_ptr,
-)
+from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.gemm.bf16_gemv._kernel import _dot_bf16x8, _fadd, _flat
 
 

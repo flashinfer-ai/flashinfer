@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from b12x.moe import fused_moe
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 
 
 def weight_plan(**kwargs):

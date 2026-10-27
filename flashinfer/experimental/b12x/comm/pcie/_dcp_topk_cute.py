@@ -12,9 +12,10 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics import ld_global_v4_u32, st_global_v4_u32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from ._dcp_cute_common import block_pair_barrier
 

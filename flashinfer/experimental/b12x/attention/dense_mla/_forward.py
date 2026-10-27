@@ -10,7 +10,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
 
 from ._io import issue_dense_page_gather
 from ._layout import (

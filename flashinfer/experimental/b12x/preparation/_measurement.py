@@ -8,7 +8,7 @@ import math
 import os
 import statistics
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from b12x._lib.compile_plan import (
     ProgramKey,
@@ -16,13 +16,54 @@ from b12x._lib.compile_plan import (
     observe_programs,
     record_program,
 )
-from .types import _prime, _close_all
+from .types import _prime, _close_all, call_scope
 
 # Surviving candidates complete three scored rounds within the leader margin.
 SURVIVOR_ROUNDS = 3
 ELIMINATION_MARGIN = 1.10
 DEFAULT_SAMPLES = 2
 ROUND_BUDGET_US = 256.0
+
+
+def capture_benchmark_call(call):
+    """Explicitly capture the timed operation, retaining live sample producers."""
+    import torch
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                _prime(call)
+        stream.synchronize()
+        with call_scope(), torch.cuda.graph(graph, stream=stream):
+            call.invoke()
+    except BaseException:
+        try:
+            graph.reset()
+            with call_scope():
+                if call.restore is not None:
+                    call.restore()
+        finally:
+            if call.close is not None:
+                call.close()
+        raise
+
+    def close():
+        try:
+            graph.reset()
+        finally:
+            if call.close is not None:
+                call.close()
+
+    return replace(
+        call,
+        run=graph.replay,
+        owners=(call, graph, stream),
+        close=close,
+        capture_safe=True,
+    )
 
 
 class _ParentCompilations:

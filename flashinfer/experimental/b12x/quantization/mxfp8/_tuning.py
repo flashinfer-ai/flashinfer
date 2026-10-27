@@ -52,7 +52,7 @@ def _validate_query(query: Mxfp8Query, device) -> None:
 # compiler parameters remain unavailable as public overrides.
 TUNING = replace(
     TUNING,
-    query_schema_version=3,
+    query_schema_version=22,
     semantic_version=3,
     validate_query=_validate_query,
 )

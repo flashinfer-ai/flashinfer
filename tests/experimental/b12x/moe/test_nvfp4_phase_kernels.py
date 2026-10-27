@@ -20,7 +20,7 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import Int32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x.moe._shared.kernels.nvfp4_phase1 import Nvfp4MaterializedPhase1Kernel
 from b12x.moe._shared.kernels.nvfp4_phase2 import Nvfp4MaterializedPhase2Kernel
 from b12x.moe._shared.kernels.reference import compare_to_reference
@@ -55,7 +55,7 @@ def _gptr(dtype, t: torch.Tensor, align: int = 16):
 
 def _pack_fp4_rows(values: torch.Tensor) -> torch.Tensor:
     """Pack quantized FP4 values (float codes) into uint8 byte rows."""
-    from b12x._lib.intrinsics import _fp4_encode_nibbles
+    from b12x._lib.intrinsics.reference import _fp4_encode_nibbles
 
     nib = _fp4_encode_nibbles(values)
     pair = nib.view(*values.shape[:-1], values.shape[-1] // 2, 2)
@@ -69,7 +69,8 @@ def _quantize_nvfp4_rows(x: torch.Tensor, global_scale: float):
     scale = e4m3(amax * gs / 6); payload = fp4(x / (scale/gs)).
     Returns (packed_bytes [R, C/2], dequant_values [R, C], scale_f32 [R, C/16]).
     """
-    from b12x._lib.intrinsics import FLOAT8_E4M3_MAX, fp4_quantize_values_torch
+    from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+    from b12x._lib.intrinsics.reference import fp4_quantize_values_torch
 
     x2 = x.float() if x.dim() == 2 else x.float().unsqueeze(0)
     rows, cols = x2.shape
@@ -593,7 +594,8 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
     )
     sf_plane = raw[rows_capacity * words_per_row * 4 :]
 
-    from b12x._lib.intrinsics import FLOAT8_E4M3_MAX, fp4_quantize_values_torch
+    from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+    from b12x._lib.intrinsics.reference import fp4_quantize_values_torch
 
     worst = 0.0
     checked = 0

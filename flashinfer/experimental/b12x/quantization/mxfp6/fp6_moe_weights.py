@@ -28,14 +28,14 @@ from typing import Optional
 
 import torch
 
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.fp6 import (
     FLOAT6_E2M3_MAX,
     FLOAT6_E3M2_MAX,
     SF_VEC_SIZE_FP6,
     _ue8m0_scale_from_block_max,
 )
-from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
 
 _TILE = 128
 

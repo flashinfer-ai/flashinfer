@@ -20,9 +20,11 @@ from cutlass import BFloat16, Boolean, Float32, Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.compiler import run_compiled
-from b12x._lib.intrinsics import block_reduce, fmax_f32, warp_reduce
+from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 
 def _add(a, b):

@@ -45,6 +45,34 @@ def _progress(**overrides):
     return PreparationProgress(**base)
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_transient_panel_leaves_only_its_parent_display(failed):
+    from rich.live import Live
+
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, width=100, height=30)
+    with Live(
+        "Prepare and tune kernels", console=console, auto_refresh=False
+    ) as parent:
+        with PreparationDisplay(
+            global_rank=0, console=console, transient=True
+        ) as display:
+            display.update(_progress())
+            parent.refresh()
+            assert "b12x / kernel autotuning" in output.getvalue()
+            output.seek(0)
+            output.truncate()
+            if failed:
+                display.close(failed=True)
+            else:
+                display.update(
+                    _progress(done=True, phase="ready", completed_requests=6)
+                )
+        parent.refresh()
+    assert "Prepare and tune kernels" in output.getvalue()
+    assert "b12x" not in output.getvalue()
+
+
 def _timeline():
     """Two cached, two fixed, one tuned, and one stopped request."""
     yield _progress(phase="planning", total_requests=0)

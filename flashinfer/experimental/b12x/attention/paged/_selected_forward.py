@@ -45,15 +45,16 @@ from b12x._lib.compile_plan import (
     program_keys,
     record_program,
 )
-from b12x._lib.intrinsics import (
-    fp8x4_e4m3_to_bfloat2x2_native_sm120,
+from b12x._lib.intrinsics.memory import (
     ld_global_nc_v4_u32,
     shared_ptr_to_u32,
     st_shared_v4_u32,
-    warp_reduce,
 )
+from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_bfloat2x2_native_sm120
+from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from ._selected_forward_config import HEAD_DIM as _HEAD_DIM
 from ._selected_forward_config import MAX_SPLITS as _NUM_SPLITS

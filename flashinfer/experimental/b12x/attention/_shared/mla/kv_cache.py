@@ -85,26 +85,27 @@ from b12x._lib.compiler import (
     tensor_compile_fact,
 )
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.conversion import (
     cvt_e4m3_to_f32_via_f16,
     cvt_f32_to_e4m3,
     cvt_f32x4_to_e4m3x4,
-    div_rn_f32,
     f16x2_to_f32x2,
-    fabs_f32,
-    fmax_f32,
-    get_ptr_as_int64,
-    max_abs_16,
     pow2_ceil_ue8m0,
-    quantize_and_pack_16_div_rn,
-    quantize_and_pack_16_fast,
-    rcp_approx_ftz,
+)
+from b12x._lib.intrinsics.math import div_rn_f32, fabs_f32, fmax_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
     st_global_f32,
     st_global_u32,
     st_global_u64,
     st_global_u8,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.quantization import (
+    max_abs_16,
+    quantize_and_pack_16_div_rn,
+    quantize_and_pack_16_fast,
+)
+from b12x._lib.utils.device import current_cuda_stream
 
 _KV_LORA_RANK = 512
 _PE_DIM = 64

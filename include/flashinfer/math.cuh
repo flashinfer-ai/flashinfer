@@ -191,7 +191,7 @@ __forceinline__ __device__ half2 ptx_exp2(half2 x) {
  * \param x input
  */
 __forceinline__ __device__ half ptx_exp2(half x) {
-  ushort y_u16;
+  uint16_t y_u16;
   asm volatile("ex2.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
   return __ushort_as_half(y_u16);
 }
@@ -266,7 +266,7 @@ __forceinline__ __device__ half2 tanh(half2 x) {
  * \param x input
  */
 __forceinline__ __device__ half tanh(half x) {
-  ushort y_u16;
+  uint16_t y_u16;
   asm volatile("tanh.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
   return __ushort_as_half(y_u16);
 }

@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import (
     cp_async_bulk_g2s_mbar,
     get_ptr_as_int64,
     shared_ptr_to_u32,

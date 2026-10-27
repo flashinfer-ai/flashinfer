@@ -8,8 +8,8 @@ import time
 
 import torch
 
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.utils import get_hardware_info
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
+from b12x._lib.utils.device import get_hardware_info
 
 
 FLOAT4_E2M1_MAX = 6.0

@@ -77,6 +77,7 @@ class _Obligation:
     coverage: dict = field(default_factory=dict)
     selection: Selection | None = None
     key: str | None = None
+    candidate_program_identity: str | None = None
     programs: dict = field(default_factory=dict)
     compiled: dict = field(default_factory=dict)
     compile_assignments: dict = field(default_factory=dict)
@@ -400,7 +401,7 @@ class PreparationSession:
         self._pool = None
         self._job = None
         self._pending_collective_barrier = None
-        self._plans = []
+        self._plans = {}
         self._shared = {}
         self._guard = None
         self._tuning_rank = 0
@@ -646,8 +647,8 @@ class PreparationSession:
             prepared.users.remove(plan)
         if plan._prepared is prepared:
             plan._clear()
-        if plan in self._plans and plan._prepared is None:
-            self._plans.remove(plan)
+        if plan._prepared is None:
+            self._plans.pop(plan, None)
         if plan.shared:
             key = _declaration_key(plan)
             if self._shared.get(key) is plan and plan.prepared is not prepared:
@@ -1103,8 +1104,9 @@ class PreparationJob:
                 prepared = plan._prepared
                 if prepared is not None:
                     closers.append(
-                        lambda plan=plan,
-                        prepared=prepared: self.session._release_payload(plan, prepared)
+                        lambda plan=plan, prepared=prepared: (
+                            self.session._release_payload(plan, prepared)
+                        )
                     )
         if self.session._pool is not None:
             pool, self.session._pool = self.session._pool, None
@@ -1119,6 +1121,8 @@ class PreparationJob:
                 _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
+        if obligation.candidate_program_identity is None:
+            return None
         request, configuration = obligation.request, obligation.configuration
         dependencies = []
         for name in request.dependencies:
@@ -1147,6 +1151,7 @@ class PreparationJob:
                 if configuration.pinned is None
                 else contract.config_payload(configuration.pinned).to_dict(),
                 "dependencies": dependencies,
+                "candidate_programs": obligation.candidate_program_identity,
             }
         )
 
@@ -1203,8 +1208,7 @@ class PreparationJob:
         plan._install(prepared)
         if previous is not None and previous is not prepared:
             self.session._release_payload(plan, previous)
-        if plan not in self.session._plans:
-            self.session._plans.append(plan)
+        self.session._plans[plan] = None
         self._new_plans.append(plan)
         obligation.selection = prepared.selection
         obligation.ready = True
@@ -1295,8 +1299,6 @@ class PreparationJob:
                 single_product = all(
                     len(knob.values) == 1 for knob in configuration.space.knobs
                 )
-                if not single_product:
-                    self._lookup(obligation, settled)
                 if (
                     obligation.selection is None
                     and not single_product
@@ -1328,11 +1330,6 @@ class PreparationJob:
                                 break
                             if candidate is not None:
                                 obligation.candidates.append(candidate)
-                            if (
-                                self.session.cache_only
-                                and len(obligation.candidates) == 2
-                            ):
-                                break
                         complete = iterator.done
                         coverage = {
                             "cartesian_count": iterator.cartesian_count,
@@ -1354,6 +1351,10 @@ class PreparationJob:
                         raise ValueError(
                             f"no eligible configurations for {plan.component_id}"
                         )
+                    if complete and len(obligation.candidates) > 1:
+                        yield from self._describe_candidates(obligation)
+                        if not self._warmup_only:
+                            self._lookup(obligation, settled)
                     if complete and len(obligation.candidates) == 1:
                         assignment, config = obligation.candidates[0]
                         obligation.selection = self._selection(
@@ -1365,6 +1366,7 @@ class PreparationJob:
                         )
                     elif (
                         self.session.cache_only
+                        and obligation.selection is None
                         and self._choice_key(obligation, settled) is not None
                     ):
                         raise LookupError(f"no completed selection for {request.name}")
@@ -1402,7 +1404,23 @@ class PreparationJob:
         self._total_candidates = sum(item.planned_candidates for item in obligations)
         return obligations
 
-    def _compile(self, obligation, config, *, required):
+    def _describe_candidates(self, obligation):
+        contract = obligation.request.plan.contract
+        identities = []
+        for assignment, config in obligation.candidates:
+            programs = yield from self._describe_programs(obligation, config)
+            if self._warmup_only:
+                return
+            identities.append(
+                {
+                    "assignment": assignment.to_dict(),
+                    "config": contract.config_payload(config).to_dict(),
+                    "programs": sorted((p.dialect, p.key) for p in programs),
+                }
+            )
+        obligation.candidate_program_identity = digest(identities)
+
+    def _describe_programs(self, obligation, config):
         contract, plan = obligation.request.plan.contract, obligation.request.plan
         payload = contract.config_payload(config)
         if payload not in obligation.compiled:
@@ -1419,7 +1437,13 @@ class PreparationJob:
             obligation.programs[payload] = frozenset(
                 p for item in compiled for p in item.programs
             )
-        programs = obligation.programs[payload]
+        return obligation.programs[payload]
+
+    def _compile(self, obligation, config, *, required):
+        programs = yield from self._describe_programs(obligation, config)
+        payload = obligation.request.plan.contract.config_payload(config)
+        if payload not in obligation.compiled:
+            return programs
         self._all_programs.update(programs)
         missing = [
             item
@@ -1636,8 +1660,10 @@ class PreparationJob:
                 race,
                 device_ordinal=self.session.device.ordinal,
                 rounds=self.session.rounds,
-                compilation_active=lambda: self.session._pool is not None
-                and self.session._pool.active_compilations,
+                compilation_active=lambda: (
+                    self.session._pool is not None
+                    and self.session._pool.active_compilations
+                ),
                 eliminate=True,
                 champion=champion,
             )
@@ -1865,8 +1891,7 @@ class PreparationJob:
         prepared.users.append(plan)
         previous = plan._prepared
         plan._install(prepared)
-        if plan not in self.session._plans:
-            self.session._plans.append(plan)
+        self.session._plans[plan] = None
         if plan.shared:
             self.session._shared[_declaration_key(plan)] = plan
         self._new_plans.append(plan)

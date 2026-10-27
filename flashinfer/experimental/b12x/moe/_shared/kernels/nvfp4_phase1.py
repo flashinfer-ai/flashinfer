@@ -36,21 +36,23 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
-    cp_async4_shared_global,
-    cp_async_u32_shared_global,
-    fabs_f32,
-    get_ptr_as_int64,
+from b12x._lib.intrinsics.atomics import (
     ld_shared_bf16_to_f32,
     ld_shared_u32,
-    nvfp4_mma_m16n8k64_f32_e2m1,
-    pack_f32x2_to_bfloat2,
-    quantize_block_fp4,
+    st_shared_u32,
+)
+from b12x._lib.intrinsics.math import fabs_f32
+from b12x._lib.intrinsics.memory import (
+    cp_async4_shared_global,
+    cp_async_u32_shared_global,
+    get_ptr_as_int64,
     shared_ptr_to_u32,
     st_global_u64,
     st_global_u32,
-    st_shared_u32,
 )
+from b12x._lib.intrinsics.mma import nvfp4_mma_m16n8k64_f32_e2m1
+from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
+from b12x._lib.intrinsics.quantization import quantize_block_fp4
 
 
 class Nvfp4MaterializedPhase1Kernel:

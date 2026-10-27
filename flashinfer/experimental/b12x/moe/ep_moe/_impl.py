@@ -20,13 +20,13 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x._lib.intrinsics import align_up
+from b12x._lib.intrinsics.math import align_up
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import get_num_sm
+from b12x._lib.utils.device import get_num_sm
 from b12x.moe._shared.execution import MoEWeightPreparationPlan
 from b12x.moe._shared.kernels.activations import (
     moe_activation_w1_rows,

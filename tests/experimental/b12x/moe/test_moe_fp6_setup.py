@@ -9,7 +9,7 @@
 import cutlass
 import pytest
 
-from b12x._lib.utils import mxfp6_tile_k, mxfp6_num_k_blocks
+from b12x._lib.utils.fp6_geometry import mxfp6_tile_k, mxfp6_num_k_blocks
 from b12x.moe._shared.kernels import mxfp6_moe
 from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
 

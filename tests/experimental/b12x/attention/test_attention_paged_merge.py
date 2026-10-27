@@ -14,7 +14,7 @@ from b12x.attention.paged.merge import (
     PagedPersistentMergeKernel,
 )
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 from b12x.testing.reference.helpers import require_b12x
 

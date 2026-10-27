@@ -26,12 +26,12 @@ from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import (
+from b12x._lib.utils.device import (
     cuda_stream_from_int_or_current,
     cuda_stream_to_int,
     current_cuda_stream,
-    make_ptr,
 )
+from b12x._lib.utils.pointers import make_ptr
 
 
 @dsl_user_op

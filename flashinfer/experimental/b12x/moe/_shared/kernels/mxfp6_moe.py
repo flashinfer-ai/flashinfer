@@ -13,7 +13,7 @@ from cutlass import Float32, Uint8, Uint64
 from cutlass.cutlass_dsl import Int32, Int64
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 
-from b12x._lib.intrinsics import get_ptr_as_int64, st_global_u64
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, st_global_u64
 from b12x._lib.fp6 import (
     quantize_block_fp6_e2m3,
     quantize_block_fp6_e2m3_containers,

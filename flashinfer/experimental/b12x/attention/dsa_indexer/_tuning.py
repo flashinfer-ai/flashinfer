@@ -221,8 +221,8 @@ def _parameters(query, _device):
 
 TUNING = TuningContract(
     component_id="attention.dsa_indexer",
-    query_schema_version=4,
-    config_schema_version=3,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),
     encode_query=_encode_query,

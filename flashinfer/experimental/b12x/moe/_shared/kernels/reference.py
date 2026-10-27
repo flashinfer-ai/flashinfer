@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.reference import (
     fp4_quantize_values_torch,
     quant_dequant_mxfp8_scaled_torch,
 )
@@ -1134,7 +1134,7 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
 
 
 def _quant_dequant_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
-    from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+    from b12x._lib.intrinsics.reference import quant_dequant_mxfp8_torch
 
     return quant_dequant_mxfp8_torch(x)
 

@@ -79,6 +79,17 @@ def test_stream_gate_rejects_blocking_launches_before_queuing_a_wait(monkeypatch
         _measurement._StreamGate()
 
 
+def test_scenario_score_minimizes_total_time_despite_geometric_speedup(host_timing):
+    class ScenarioTimer(_Timer):
+        def samples(self):
+            return self.latencies_us
+
+    baseline = ScenarioTimer(100.0, 1000.0)
+    relative_gain = ScenarioTimer(80.0, 1100.0)
+    measurement = _measure(_race((baseline, relative_gain)))
+    assert measurement.latencies_us == (550.0, 590.0)
+
+
 def test_trailing_candidates_stop_after_one_round_and_keep_their_median(host_timing):
     leader, near, behind, far = _Timer(10.0), _Timer(10.9), _Timer(12.0), _Timer(40.0)
     prepared = _race((leader, near, behind, far))

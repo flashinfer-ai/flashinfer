@@ -14,7 +14,7 @@ from .test_blockscaled_a16 import make_weight, assert_close
 
 
 def _quantized_source(source, activation_scale):
-    from b12x._lib.intrinsics import fp4_quantize_values_torch
+    from b12x._lib.intrinsics.reference import fp4_quantize_values_torch
 
     rows, k = source.shape
     blocks = source.float().view(rows, k // 16, 16)

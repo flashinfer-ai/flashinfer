@@ -12,10 +12,11 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from ..._lib.intrinsics import q8_0_pair_to_bf16x2
+from b12x._lib.intrinsics.trellis import q8_0_pair_to_bf16x2
 from ..._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from ..._lib.runtime_control import raise_if_kernel_resolution_frozen
-from ..._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 
 @dsl_user_op

@@ -578,8 +578,8 @@ def _materialize_tuning(query, device, choice):
 
 TUNING = TuningContract(
     component_id="norm.mhc",
-    query_schema_version=8,
-    config_schema_version=4,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
     encode_query=_encode,

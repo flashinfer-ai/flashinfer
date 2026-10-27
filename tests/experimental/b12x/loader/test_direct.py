@@ -1,4 +1,4 @@
-"""Prove O_DIRECT input, final destinations, bounded alignment and ownership."""
+"""Prove unbuffered input, final destinations, bounded alignment and ownership."""
 
 import os
 import subprocess
@@ -11,6 +11,12 @@ import torch
 from safetensors.torch import save_file
 
 from b12x.loader import DirectWeightSession
+
+
+def direct_open(session, path):
+    if os.name == "nt":
+        return session.native.direct_open(str(path))
+    return os.open(path, os.O_RDONLY | os.O_DIRECT)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -62,6 +68,49 @@ def test_transform_materialization_owns_values_after_session_close(tmp_path):
     torch.testing.assert_close(actual.cpu(), expected[:, 64:], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("read_mode", ["bounce", "gds"])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.uint16, torch.uint32])
+def test_concatenated_components_preserve_bytes_and_destination_bounds(
+    tmp_path, read_mode, dtype
+):
+    if os.name == "nt" and read_mode == "gds":
+        pytest.skip("GPUDirect Storage requires Linux")
+    expected = [torch.arange(n, dtype=torch.int64).to(dtype) for n in (0, 31, 259, 7)]
+    paths = [tmp_path / f"components-{i}.safetensors" for i in range(2)]
+    save_file({str(i): expected[i] for i in (0, 2)}, paths[0])
+    save_file({str(i): expected[i] for i in (1, 3)}, paths[1])
+    count = sum(t.numel() for t in expected)
+    backing = torch.full((count + 2,), 77, dtype=dtype, device="cuda")
+    with DirectWeightSession(read_mode=read_mode) as session:
+        sources = dict(session.weights(paths))
+        session.concatenate(backing[1:-1], [sources[str(i)] for i in range(4)])
+        assert session.payload_bytes == count * dtype.itemsize
+        assert session.loaded_tensors == 4
+    assert torch.equal(backing[1:-1].cpu(), torch.cat(expected))
+    assert backing[0].item() == backing[-1].item() == 77
+
+
+def test_concatenation_rejects_transformed_sources_without_queuing_partial_reads(
+    tmp_path,
+):
+    path = tmp_path / "components.safetensors"
+    save_file({"first": torch.arange(32), "second": torch.arange(32)}, path)
+    with DirectWeightSession() as session:
+        sources = dict(session.weights([path]))
+        first, second = sources["first"], sources["second"]
+        destination = torch.empty(64, dtype=torch.int64, device="cuda")
+        for invalid in (second[:16], second + 1, second.to(torch.float32)):
+            with pytest.raises(NotImplementedError):
+                session.concatenate(destination, (first, invalid))
+            assert not session.records
+        second.add_(1)
+        with pytest.raises(NotImplementedError, match="unmodified whole tensor"):
+            session.concatenate(destination, (first, second))
+        with pytest.raises(ValueError, match="exactly fill"):
+            session.concatenate(destination, (first,))
+        assert not session.records
+
+
 @pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])
 def test_ring_reads_exact_bytes_with_large_file_offsets(tmp_path, offset):
     path = tmp_path / "payload"
@@ -76,7 +125,14 @@ def test_ring_reads_exact_bytes_with_large_file_offsets(tmp_path, offset):
         target = backing[257:-257]
         with (
             path.open("rb") as buffered,
-            pytest.raises(RuntimeError, match="requires O_DIRECT"),
+            pytest.raises(
+                RuntimeError,
+                match=(
+                    "requires FILE_FLAG_NO_BUFFERING"
+                    if os.name == "nt"
+                    else "requires O_DIRECT"
+                ),
+            ),
         ):
             session._execute(
                 array(
@@ -93,7 +149,7 @@ def test_ring_reads_exact_bytes_with_large_file_offsets(tmp_path, offset):
                     ),
                 )
             )
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        fd = direct_open(session, path)
         try:
             session._execute(
                 array("Q", (fd, offset, len(expected), target.data_ptr(), 0, 1, 0, 0))
@@ -164,7 +220,7 @@ def test_truncated_direct_input_fails_without_buffered_retry(tmp_path):
     path.write_bytes(bytes(4096))
     with DirectWeightSession() as session:
         target = torch.empty(8192, device="cuda", dtype=torch.uint8)
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        fd = direct_open(session, path)
         try:
             with pytest.raises(RuntimeError, match="file range"):
                 session._execute(
@@ -320,7 +376,9 @@ def test_bounce_ring_recycles_slots_without_changing_final_weights(
         assert stats["bounce_buffer_bytes"] == 16 << 20
         assert stats["scratch_bytes"] == (16 << 20) + (64 << 10)
         assert stats["bounced_bytes"] == expected.nbytes
-        assert stats["io_uring_submits"] > 0
+        assert (
+            stats["overlapped_submits" if os.name == "nt" else "io_uring_submits"] > 0
+        )
         assert stats["max_inflight_reads"] == io_threads
         # Flush is the publication boundary, before destroying the executor.
         torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
@@ -352,6 +410,7 @@ def test_preexisting_cuda_storage_survives_session_and_orders_loading_stream(tmp
     assert target.data_ptr() == pointer
 
 
+@pytest.mark.skipif(os.name == "nt", reason="PyTorch expandable segments require Linux")
 def test_expandable_weights_span_cuda_mappings_and_reject_unmapped_tail(tmp_path):
     """Large ordinary weights cross mapping boundaries; reserved VA is not storage."""
     subprocess.run(

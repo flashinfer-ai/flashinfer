@@ -14,7 +14,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.compiler import key_field, run_compiled
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 _LOCK = RLock()
 _CACHE: dict[tuple[int, int, bool], object] = {}
