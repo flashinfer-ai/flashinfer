@@ -1874,8 +1874,8 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
         assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
         assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
     # Each small-M (and split-K small-M) tiling appears under policy 0 and then,
-    # appended after all of them, under policy 1 (the GEMM launches once the
-    # quantize half is done).
+    # appended after all of them, under policy 1 (the GEMM mainloop waits only
+    # for the quantize half).
     for begin, end in ((small, split), (split, len(variants))):
         family_variants = variants[begin:end]
         if not family_variants:

@@ -398,9 +398,9 @@ def sm120_producer_variants(
     nobody measured still reaches the fused prefix and a card nobody measured on
     ranks the candidates itself. The address policy is a large-M axis; the
     small-M kernel forms its addresses differently and takes 0, except that at
-    rank 128 policy 1 repeats each small-M tiling with the PDL launch of the
-    GEMM held until the quantize half is done, so that the GEMM mainloop runs
-    under LoRA-down instead of after it.
+    rank 128 policy 1 repeats each small-M tiling with the GEMM mainloop
+    acquiring the quantize output through a barrier, so that it runs under
+    LoRA-down instead of after it.
     """
     if rank not in SM120_CUTLASS_LORA_RANKS:
         return ()

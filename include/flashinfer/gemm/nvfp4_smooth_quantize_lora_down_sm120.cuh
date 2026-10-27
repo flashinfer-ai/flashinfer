@@ -343,12 +343,13 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
        KSplit - 1) /
       KSplit * KSplit;
   if constexpr (GateLaunchOnQuant) {
-    // The consumer GEMM runs its FP4 mainloop without waiting for this grid and
-    // waits only before loading LoRA-down, so it may launch only once XQ/SF are
-    // written. Down CTAs signal now; quantize CTAs signal by exiting after
-    // fencing their stores, so the GEMM launches when the quantize half is done
-    // while LoRA-down keeps running under its mainloop.
-    if (static_cast<int>(blockIdx.x) >= kQuantBlocks && threadIdx.x == 0) {
+    // The consumer GEMM acquires XQ/SF through the quantize barrier (or waits for
+    // this whole grid when it has no barrier slot) and waits for the grid before
+    // loading LoRA-down, so its launch point carries no data dependency. Every CTA
+    // signals at its start: the GEMM launches once this grid is resident, its
+    // launch latency overlaps the quantize work, and its mainloop runs under
+    // LoRA-down.
+    if (threadIdx.x == 0) {
       cudaTriggerProgrammaticLaunchCompletion();
     }
   }
@@ -396,7 +397,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
         }
       }
       if constexpr (GateLaunchOnQuant) {
-        // Exiting is this CTA's launch signal; see the top of the kernel.
+        // Publish XQ/SF to the GEMM's quantize barrier; see the top of the kernel.
         __threadfence();
         quantize_barrier.arrive();
       }
@@ -1841,8 +1842,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if (family == 1) {
     // At rank 128 the linear route lets the PDL-launched GEMM start its prologue
     // while this prefix runs; the GEMM waits on the grid before reading outputs.
-    // Address policy 1 instead holds the GEMM back until the quantize half is
-    // done and lets its mainloop run under LoRA-down (see GateLaunchOnQuant).
+    // Address policy 1 instead lets the GEMM mainloop run under LoRA-down,
+    // acquiring XQ/SF through the quantize barrier (see GateLaunchOnQuant).
 #define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                                  \
   if (a == (BT) && b == (DTC) && c == (RPQB)) {                                            \
     if constexpr (Rank == 128) {                                                           \
