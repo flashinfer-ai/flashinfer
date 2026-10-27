@@ -807,6 +807,8 @@ def _moe_core_impl(
                 enable_pdl=enable_pdl,
                 nvfp4_4over6=nvfp4_4over6,
                 valid_rows=total_num_padded_tokens,
+                row_limits=tile_idx_to_mn_limit,
+                rows_per_group=tile_size,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(

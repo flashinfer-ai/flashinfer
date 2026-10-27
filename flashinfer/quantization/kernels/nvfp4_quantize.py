@@ -904,6 +904,7 @@ class NVFP4QuantizePerTokenKernel:
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
         fold_out_scale: bool = False,
         threads: int | None = None,
+        rows_per_group: int = 0,
     ):
         self.dtype = dtype
         self.K = K
@@ -913,6 +914,7 @@ class NVFP4QuantizePerTokenKernel:
         self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
         self.sf_layout = sf_layout
+        self.rows_per_group = rows_per_group
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
 
@@ -997,6 +999,7 @@ class NVFP4QuantizePerTokenKernel:
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
         mValidRows: Optional[cute.Tensor],
+        mRowLimits: Optional[cute.Tensor],
         stream,
     ):
         self.kernel(
@@ -1009,6 +1012,7 @@ class NVFP4QuantizePerTokenKernel:
             mGlobalScaleInv,
             mOutScale,
             mValidRows,
+            mRowLimits,
         ).launch(
             grid=[num_blocks, 1, 1],
             block=[self.threads, 1, 1],
@@ -1030,6 +1034,7 @@ class NVFP4QuantizePerTokenKernel:
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
         mValidRows: Optional[cute.Tensor],
+        mRowLimits: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1065,17 +1070,20 @@ class NVFP4QuantizePerTokenKernel:
         threads = Int32(self.threads)
         grid_stride, _, _ = cute.arch.grid_dim()
         for row_idx in cutlass.range(bidx, padded_M, grid_stride):
-            if row_idx >= M:
-                # Padding row: no token owns it, but the GEMM reads whole 128x4
-                # scale atoms, so its slots still have to be defined.
-                if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
-                    sf_col_idx = tidx
-                    while sf_col_idx < padded_sf_cols:
-                        sf_offset = self._compute_sf_offset(
-                            row_idx, sf_col_idx, padded_sf_cols
-                        )
-                        mScales[sf_offset] = Uint8(0)
-                        sf_col_idx = sf_col_idx + threads
+            row_is_valid = row_idx < M
+            if cutlass.const_expr(mRowLimits is not None):
+                if row_is_valid:
+                    row_is_valid = row_idx < mRowLimits[row_idx // self.rows_per_group]
+            if not row_is_valid:
+                # Inactive rows can be inside the live prefix. Define their
+                # SF slots in every layout; rounded MMA lanes may read them.
+                sf_col_idx = tidx
+                while sf_col_idx < padded_sf_cols:
+                    sf_offset = self._compute_sf_offset(
+                        row_idx, sf_col_idx, padded_sf_cols
+                    )
+                    mScales[sf_offset] = Uint8(0)
+                    sf_col_idx = sf_col_idx + threads
             elif cutlass.const_expr(self.register_resident):
                 self._quantize_row_register_resident(
                     mInput,
@@ -1886,12 +1894,15 @@ def _nvfp4_kernel_name(
     fold_out_scale: bool = False,
     threads: int | None = None,
     has_valid_rows: bool = False,
+    rows_per_group: int = 0,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
     """
     if has_valid_rows:
         variant += "_validrows"
+    if rows_per_group:
+        variant += f"_rowlimits{rows_per_group}"
     name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
     if not global_scale_is_tensor:
         name += "_host_sf"
@@ -2345,6 +2356,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     fold_out_scale: bool = False,
     threads: int | None = None,
     has_valid_rows: bool = False,
+    rows_per_group: int = 0,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -2378,6 +2390,12 @@ def _get_compiled_kernel_nvfp4_per_token(
         if has_valid_rows
         else None
     )
+    if rows_per_group:
+        row_limits_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (cute.sym_int(),), assumed_align=4
+        )
+    else:
+        row_limits_fake = None
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     kernel_obj = NVFP4QuantizePerTokenKernel(
@@ -2389,6 +2407,7 @@ def _get_compiled_kernel_nvfp4_per_token(
         nvfp4_4over6_config=nvfp4_4over6_config,
         fold_out_scale=fold_out_scale,
         threads=threads,
+        rows_per_group=rows_per_group,
     )
 
     return build_and_load_cute_dsl_kernel(
@@ -2405,6 +2424,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             fold_out_scale=fold_out_scale,
             threads=threads,
             has_valid_rows=has_valid_rows,
+            rows_per_group=rows_per_group,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -2418,6 +2438,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             global_scale_inv_fake,
             out_scale_fake,
             valid_rows_fake,
+            row_limits_fake,
             stream_fake,
             options="--enable-tvm-ffi",
         ),
@@ -3174,6 +3195,8 @@ def nvfp4_quantize_per_token_cute_dsl(
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     valid_rows: torch.Tensor | None = None,
+    row_limits: torch.Tensor | None = None,
+    rows_per_group: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -3227,6 +3250,17 @@ def nvfp4_quantize_per_token_cute_dsl(
         padding through its final layout tile is zeroed. Values and scales
         beyond that prefix and its scale padding are unspecified. Omit to
         quantize all rows. Output allocation shapes remain unchanged.
+    row_limits : torch.Tensor, optional
+        Contiguous CUDA int32 vector on the input device with one absolute
+        exclusive row limit per consecutive group of ``rows_per_group`` rows.
+        Only rows below their group's limit and inside ``valid_rows`` are
+        quantized. Inactive rows have zero block scales; their packed values
+        and per-token scales are unspecified. Limits may change during graph
+        replay and are read after the PDL wait. The vector must cover the
+        input allocation; each limit must lie within its group's row interval.
+    rows_per_group : int, optional
+        Positive compile-time group size, required exactly when ``row_limits``
+        is supplied. Omit both arguments to quantize every row in the prefix.
 
     Returns
     -------
@@ -3270,6 +3304,25 @@ def nvfp4_quantize_per_token_cute_dsl(
                 "on the input device"
             )
     m, k = input.shape
+    if row_limits is None:
+        if rows_per_group is not None:
+            raise ValueError("rows_per_group requires row_limits")
+        group_rows = 0
+    else:
+        if type(rows_per_group) is not int or rows_per_group <= 0:
+            raise ValueError("row_limits requires a positive integer rows_per_group")
+        group_rows = rows_per_group
+        if (
+            row_limits.dtype != torch.int32
+            or row_limits.ndim != 1
+            or row_limits.numel() < (m + group_rows - 1) // group_rows
+            or row_limits.device != input.device
+            or not row_limits.is_contiguous()
+        ):
+            raise ValueError(
+                "row_limits must be a contiguous int32 vector on the input "
+                "device with one entry per row group"
+            )
     assert k % NVFP4_SF_VEC_SIZE == 0, (
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
@@ -3326,6 +3379,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         fold_out_scale,
         threads,
         valid_rows is not None,
+        group_rows,
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
@@ -3345,6 +3399,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         global_scale_inv_tensor,
         out_scale if fold_out_scale else global_scale_inv_tensor,
         valid_rows,
+        row_limits,
     )
 
     scale_output = scale_output.reshape(-1, padded_sf_cols)
