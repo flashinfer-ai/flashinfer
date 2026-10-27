@@ -1343,14 +1343,20 @@ def _plan_text(plan) -> str:
     return f"{stage1} f{plan.launch_flags} {'1L' if plan.one_launch else '2L'}"
 
 
-def _emulated_launch_plans(monkeypatch, emulated=None, cells=_PLAN_CELLS) -> dict:
+def _emulated_launch_plans(
+    monkeypatch, emulated=None, cells=_PLAN_CELLS, cuda=False
+) -> dict:
     """``(device, vocab, batch, top-k) -> _launch_plan`` of every ``cells`` cell (default ``_PLAN_CELLS``) on every
     ``emulated`` device (default ``_PLAN_DEVICES``; None where no frozen stage-1 variant covers the vocabulary),
-    computed on the host: the device queries answer for the emulated device and the per-device caches are bypassed."""
+    computed on the host: the device queries answer for the emulated device and the per-device caches are bypassed.
+    ``cuda``: CUDA is reported present, as on the emulated device (a k > 64 launch plans the two-launch chain without
+    it), so the plans of every top-k need no GPU."""
     emulated = _PLAN_DEVICES if emulated is None else emulated
     devices = dict(enumerate(emulated.items(), start=1 << 16))  # no real device
     plans = {}
     with monkeypatch.context() as m:
+        if cuda:
+            m.setattr(torch.cuda, "is_available", lambda: True)
         m.setattr(cs, "_device_capability", lambda index: devices[index][1][0])
         m.setattr(cs, "_sm_count", lambda index: devices[index][1][1])
         m.setattr(cs, "_smem_optin", lambda index: devices[index][1][2])
@@ -1387,10 +1393,11 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     from the whole-CTA tail to the leader-push chain on 9.0 / 10.0 / 10.3 (B200's V = 151936 B = 1, 2 and 4 cells and
     every V = 128256 cell keep the tail); L-PK2 adds measured stage-1 picks on H100, B200 and GB300, two of them in the
     CTA-local-select top-k class only (top-k 10 changes, top-k 50 keeps its plan).  R200 and RTX PRO 6000 keep every
-    plan."""
+    plan.  Both sides leave out round 17's leader-push whole-CTA tail (``_LEADER_PUSH_BLOCK_TAIL_CELLS``)."""
     if not torch.cuda.is_available():
         # without CUDA every k > 64 launch plans the two-launch chain
         pytest.skip("CUDA required")
+    monkeypatch.setattr(cs, "_LEADER_PUSH_BLOCK_TAIL_CELLS", {})
     new = _emulated_plans(monkeypatch)
     with monkeypatch.context() as m:
         m.setattr(cs, "_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY", _R14_BLOCK_TAIL_MAX_VOCAB)
@@ -3158,6 +3165,7 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
             top_k_max = k if isinstance(k, int) else int(k.max().item())
             with monkeypatch.context() as m:
                 m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
+                m.setattr(cs, "_leader_push_block_tail", lambda *a, **kw: False)
                 _clear_plan_caches()
                 plan = cs._launch_plan(0, batch, vocab, top_k_max)
                 assert plan.launch_flags & cs._FLAG_FUSE_BLOCK_TAIL == 0, plan
@@ -4179,8 +4187,9 @@ def test_leader_push_build_matches_pull_build():
     list into rank 0's receive buffer and its length into every CTA before the single exchange barrier; the fused slab,
     count, samples and renorm are bitwise identical to the pull form, and a chain's global slab holds the same exact candidate
     set (positions differ: concatenation order vs the per-CTA thread-major collect) with bitwise-identical stage-2/3 outputs.  The host sets bit 9 on compute capability 10.3 / 10.7 for any ept-16
-    stream and for single-chunk ept-32 rows, never with the whole-CTA tail, and drops bits 7 / 8 when it is taken; the module
-    rejects it with bit 3 / 7 / 8 and on single-CTA or register-resident variants."""
+    stream and for single-chunk ept-32 rows, never with the whole-CTA tail but on round 17's leader-push whole-CTA-tail
+    cells (test_leader_push_block_tail_changes_only_its_cells), and drops bits 7 / 8 when it is taken; the module rejects
+    it with bit 7 / 8, with bit 3 where no variant ships that form, and on single-CTA or register-resident variants."""
     _require_supported_device()
     import flashinfer.cake_sampling as cs
 
@@ -4306,7 +4315,13 @@ def test_leader_push_build_matches_pull_build():
             # vocabulary is beyond the frozen stage-1 capacity and the cell is not served here
             continue
         flags = plan.launch_flags
-        if flags & cs._FLAG_LEADER_PUSH:
+        if flags & cs._FLAG_LEADER_PUSH and flags & cs._FLAG_FUSE_BLOCK_TAIL:
+            # round 17: the leader-push whole-CTA tail on its listed cells
+            assert cs._leader_push_block_tail(batch, vocab, k, cs._sm_count(dev), cap)
+            assert (plan.cluster, plan.ept, plan.stream) == (
+                cs._LEADER_PUSH_BLOCK_TAIL_STAGE1
+            )
+        elif flags & cs._FLAG_LEADER_PUSH:
             assert plan.stream and plan.cluster > 1
             assert not flags & (
                 cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_SLAB_TAIL | cs._FLAG_COARSE_PUSH
@@ -5376,3 +5391,202 @@ def test_compact_list_twins_sample_as_the_pipeline():
                 )
             for name, run in runs.items():
                 _assert_runs_bitwise(ref, run, (v["symbol"], name, k, p))
+
+
+# Round 17 (lever LP-BT 3b, ``_LEADER_PUSH_BLOCK_TAIL_CELLS``): (device, vocab, batch, top-k) -> (plan without it, plan
+# with it) of every owner cell it changes.  H100, B200 and GB300 run top-k 1000 at V = 128256 / 151936 / 262144 with 1-8
+# rows on the (8, 16) stream's leader-push whole-CTA tail in one launch (bits 3 + 5 + 9, with 11 on GB300), in place of
+# the pull whole-CTA tail, the leader-push chain of the same stream or the (8, 32) resident's chain.
+_R17_LPBT_PLAN_CHANGES = {
+    **{
+        ("H100", 128256, batch, 1000): ("8_16_1 f8 1L", "8_16_1 f552 1L")
+        for batch in (1, 2, 4, 8)
+    },
+    **{
+        ("H100", vocab, batch, 1000): ("8_16_1 f546 2L", "8_16_1 f552 1L")
+        for vocab in (151936, 262144)
+        for batch in (1, 2, 4, 8)
+    },
+    ("B200", 128256, 1, 1000): ("8_32_0 f2 2L", "8_16_1 f552 1L"),
+    ("B200", 128256, 2, 1000): ("8_16_1 f8 1L", "8_16_1 f552 1L"),
+    ("B200", 128256, 4, 1000): ("8_16_1 f8 1L", "8_16_1 f552 1L"),
+    ("B200", 128256, 8, 1000): ("8_32_0 f2 2L", "8_16_1 f552 1L"),
+    **{
+        ("B200", 151936, batch, 1000): ("8_16_1 f8 1L", "8_16_1 f552 1L")
+        for batch in (1, 2, 4)
+    },
+    ("B200", 151936, 8, 1000): ("8_16_1 f550 2L", "8_16_1 f552 1L"),
+    **{
+        ("B200", 262144, batch, 1000): ("8_16_1 f550 2L", "8_16_1 f552 1L")
+        for batch in (1, 2, 4, 8)
+    },
+    **{
+        ("GB300", 128256, batch, 1000): ("8_32_0 f2 2L", "8_16_1 f2600 1L")
+        for batch in (1, 2, 4, 8)
+    },
+    **{
+        ("GB300", vocab, batch, 1000): ("8_16_1 f550 2L", "8_16_1 f2600 1L")
+        for vocab in (151936, 262144)
+        for batch in (1, 2, 4, 8)
+    },
+}
+# A wide grid around the leader-push whole-CTA-tail cells: vocabularies on both sides of each listed one, batches of one
+# to several cluster-8 waves, top-k on both sides of _BLOCK_TAIL_MIN_K, of each capability's
+# _LEADER_PUSH_BLOCK_TAIL_MIN_K and of each cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, the slab and the fused tail.
+_R17_LPBT_WIDE_TOP_K = (1, 64, 65, 768, 769, 799, 800, 801, 900, 999, 1000, 1024)
+_R17_LPBT_WIDE_CELLS = tuple(
+    itertools.product(
+        (32768, 96192, 128255, 128256, 128257, 151936, 151937, 196608, 262144),
+        (1, 2, 3, 4, 5, 8, 9, 16, 17, 18, 19, 20, 32, 64),
+        _R17_LPBT_WIDE_TOP_K,
+    )
+)
+
+
+def test_leader_push_block_tail_changes_only_its_cells(monkeypatch):
+    """The leader-push whole-CTA tail (``_LEADER_PUSH_BLOCK_TAIL_CELLS``) changes the launch plans of the owner cells on
+    H100, B200, GB300, R200 and RTX PRO 6000 exactly on the cells of ``_R17_LPBT_PLAN_CHANGES``, against the plans
+    without it.  On a wide grid it changes exactly the launches of a listed (vocab, batch) cell with top-k in
+    (the capability's _LEADER_PUSH_BLOCK_TAIL_MIN_K or the cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, whichever is
+    larger, fused_block_tail_kcap] on a one-wave (8, 16) grid of a listed capability, each into the one-launch plan of
+    the (8, 16) stream with bits 3 + 9 (+ 5 with the row-span arm, + 11 on 10.3) and the same stage-2/3 slab.
+    R200 with 212 or 208 SMs and 12.0 devices with 188, 170 or 84 SMs keep every plan.  The emulated devices report
+    CUDA (a k > 64 launch plans the chain without it), so no GPU is needed."""
+    kcap = cs._fused_block_tail_kcap()
+    # the policy: a listed cell, top-k in (the capability's minimum, fused_block_tail_kcap], a one-wave (8, 16) grid
+    assert set(cs._LEADER_PUSH_BLOCK_TAIL_CELLS) == {(9, 0), (10, 0), (10, 3)}
+    assert cs._LEADER_PUSH_BLOCK_TAIL_MIN_K == {(9, 0): 768, (10, 0): 799, (10, 3): 800}
+    assert cs._LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K == {
+        (10, 3): {
+            (128256, 2): 801,
+            (262144, 1): 801,
+            (262144, 2): 900,
+            (262144, 8): 999,
+        }
+    }
+
+    def cell_min_k(cap, vocab, batch):
+        return max(
+            cs._LEADER_PUSH_BLOCK_TAIL_MIN_K[cap],
+            cs._LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K.get(cap, {}).get((vocab, batch), 0),
+        )
+
+    for cap, cells in cs._LEADER_PUSH_BLOCK_TAIL_CELLS.items():
+        assert cap in cs._BLOCK_TAIL_CAPABILITIES
+        assert cells == frozenset(
+            itertools.product((128256, 151936, 262144), (1, 2, 4, 8))
+        )
+        min_k = cs._LEADER_PUSH_BLOCK_TAIL_MIN_K[cap]
+        assert cs._BLOCK_TAIL_MIN_K <= min_k < 1000
+        for vocab, batch in cells:
+            cell_min = cell_min_k(cap, vocab, batch)
+            assert min_k <= cell_min < 1000
+            for k in (cell_min + 1, 1000, kcap):
+                assert cs._leader_push_block_tail(batch, vocab, k, 132, cap)
+            for k in (None, 64, cs._BLOCK_TAIL_MIN_K, min_k, cell_min, kcap + 1):
+                assert not cs._leader_push_block_tail(batch, vocab, k, 132, cap)
+            assert not cs._leader_push_block_tail(batch, vocab + 1, 1000, 132, cap)
+        for vocab, batch in itertools.product((128256, 151936, 262144), (3, 5, 16)):
+            assert not cs._leader_push_block_tail(batch, vocab, 1000, 132, cap)
+    for cap in ((10, 7), (12, 0), (11, 0)):
+        assert not cs._leader_push_block_tail(1, 151936, 1000, 212, cap)
+    for int_tail in (False, True):
+        assert cs._stage1_has_leader_push_block_tail(8, 16, True, int_tail)
+        assert not cs._stage1_has_leader_push_block_tail(8, 32, True, int_tail)
+
+    def without_rule(cells=_PLAN_CELLS, emulated=None):
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_LEADER_PUSH_BLOCK_TAIL_CELLS", {})
+            return _emulated_launch_plans(m, emulated, cells, cuda=True)
+
+    new = _emulated_launch_plans(monkeypatch, cuda=True)
+    old = without_rule()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan))
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert changed == _R17_LPBT_PLAN_CHANGES
+    devices = dict(_PLAN_DEVICES)
+    smem = _PLAN_DEVICES["RTX PRO 6000"][2]
+    devices.update({f"(12, 0) {n} SMs": ((12, 0), n, smem) for n in (170, 84)})
+    new = _emulated_launch_plans(monkeypatch, devices, _R17_LPBT_WIDE_CELLS, cuda=True)
+    old = without_rule(_R17_LPBT_WIDE_CELLS, devices)
+    moved = 0
+    for cell, plan in new.items():
+        name, vocab, batch, k = cell
+        cap, sms, _ = devices[name]
+        listed = (vocab, batch) in cs._LEADER_PUSH_BLOCK_TAIL_CELLS.get(cap, ())
+        want = (
+            listed
+            and cell_min_k(cap, vocab, batch) < k <= kcap
+            and batch * 8 <= cs._wave_ctas(sms)[8]
+        )
+        if not want:
+            assert plan == old[cell], cell
+            continue
+        moved += 1
+        before = old[cell]
+        flags = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_LEADER_PUSH
+        flags |= cs._FLAG_ROW_SPAN_DIET if cs._LEADER_PUSH_BLOCK_TAIL_ROW_SPAN else 0
+        flags |= cs._FLAG_INT_TAIL if cap in cs._INT_TAIL_CAPABILITIES else 0
+        assert (plan.cluster, plan.ept, plan.stream) == (8, 16, True), cell
+        assert plan.one_launch and plan.launch_flags == flags, (cell, plan)
+        assert (plan.threads, plan.items) == (before.threads, before.items), cell
+    assert moved == sum(
+        cell_min_k(cap, vocab, batch) < k <= kcap
+        for cap, cells in cs._LEADER_PUSH_BLOCK_TAIL_CELLS.items()
+        for vocab, batch in cells
+        for k in _R17_LPBT_WIDE_TOP_K
+    )
+
+
+def test_leader_push_block_tail_route_samples_like_the_chain(monkeypatch):
+    """On a device whose capability lists leader-push whole-CTA-tail cells, the public route plans the (8, 16) stream's
+    leader-push whole-CTA tail in one launch on such a cell and samples the same tokens and writes the same slab and
+    renormalized probabilities as the two-launch chain the cell takes without the rule, bitwise and against the
+    reference: ties across the k cut, +inf entries, the candidates of one CTA's span past its receive slots, a
+    descending row, per-row top-k mixing k <= 64 rows and per-row top-p."""
+    _require_supported_device()
+    device = torch.cuda.current_device()
+    cap = cs._device_capability(device)
+    cells = cs._LEADER_PUSH_BLOCK_TAIL_CELLS.get(cap, frozenset())
+    if not cells or not _device_streams() or not cs._block_tail_enabled(device):
+        pytest.skip("no leader-push whole-CTA-tail cell on this device")
+    kcap = cs._fused_block_tail_kcap()
+    for vocab, batch in sorted(cells)[::3]:
+        probs = _probs(batch, vocab, seed=1717 + batch)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)
+        if batch > 1:
+            pn[1, [3, 5000]] = np.inf
+            pn[1, :1200] = np.float32(2**-10)
+        if batch > 2:
+            pn[2] = np.sort(pn[2])[::-1]
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        k_row = torch.tensor(
+            [(1000, 32, kcap, 769)[r % 4] for r in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        for k, p in ((1000, 0.9), (kcap, 1e-6), (k_row, p_row)):
+            top_k_max = k if isinstance(k, int) else int(k.max().item())
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_LEADER_PUSH_BLOCK_TAIL_CELLS", {})
+                m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
+                _clear_plan_caches()
+                plan = cs._launch_plan(device, batch, vocab, top_k_max)
+                assert not plan.one_launch, plan
+                chain, _ = _run_and_check(probs, k, p, 0x1717, 9)
+            _clear_plan_caches()
+            plan = cs._launch_plan(device, batch, vocab, top_k_max)
+            assert (plan.cluster, plan.ept, plan.stream) == (8, 16, True), plan
+            assert plan.one_launch, plan
+            both = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_LEADER_PUSH
+            assert plan.launch_flags & both == both, plan
+            fused, _ = _run_and_check(probs, k, p, 0x1717, 9)
+            _assert_runs_bitwise(
+                chain, fused, (vocab, batch, k if isinstance(k, int) else "row")
+            )
+    _clear_plan_caches()

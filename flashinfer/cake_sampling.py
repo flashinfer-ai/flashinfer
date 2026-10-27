@@ -551,6 +551,143 @@ def _c1_block_tail(
     return _stage1_has_block_tail_build(cluster, ept, True)
 
 
+# Round 17 (lever LP-BT 3b): the leader-push form of the cluster-8 ept-16 stream's whole-CTA-tail build (`_lp_bt`, and
+# `_lp_bt_tia` with the integer-tested tail; launch_flags bits 3 + 9).  Every CTA stores its candidate list into rank
+# 0's shared memory before the one exchange barrier; rank 0 selects the k pairs into a shared-memory slab and runs the
+# whole-CTA tail after a CTA barrier, with no second cluster barrier and no slab round trip through L2.  A row whose
+# lists exceed the 512 receive slots of a CTA or 2048 in all takes the cluster passes or the exact fallback with every
+# CTA, the cluster barrier and the global slab, as the pull build does.  Its candidate need is 1.5 k + 64, as the pull
+# build's.  The (vocab, batch) cells per capability whose launch of a top-k above the capability's
+# _LEADER_PUSH_BLOCK_TAIL_MIN_K (or above the cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, where that is larger) takes it,
+# on the (8, 16) stream whatever the measured pick, in one launch: against the plans they replace (the pull whole-CTA
+# tail or the leader-push chain of the same stream, or the (8, 32) resident's chain), at top-k 769 / 800 / 1000 / 1024,
+# 1-8 rows, two boards per device, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same
+# sampled tokens, H100 ran 0.877-0.957x (-0.7..-2.2 us), B200 0.878-0.989x (-0.1..-2.2 us) and GB300 0.897-0.987x
+# (-0.2..-1.8 us) on every listed cell inside its window.
+_LEADER_PUSH_BLOCK_TAIL_STAGE1 = (8, 16, True)
+_LEADER_PUSH_BLOCK_TAIL_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
+    (9, 0): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+    (10, 0): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+    (10, 3): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+}
+# The top-k above which a listed cell takes the leader-push whole-CTA tail, per capability (never below
+# _BLOCK_TAIL_MIN_K).  At V = 262144 the replaced chain was as fast with 1 row at top-k 769 on B200 (up to 1.003x) and
+# on GB300 with 1-2 rows at top-k 769 and 1 row at top-k 800 (up to 1.008x), so the window starts at 800 on B200 and
+# above 800 on GB300.
+_LEADER_PUSH_BLOCK_TAIL_MIN_K: dict[tuple[int, int], int] = {
+    (9, 0): 768,
+    (10, 0): 799,
+    (10, 3): 800,
+}
+# Cells whose window starts above their capability's (the larger start applies).  On two GB300 boards at top-k
+# 801 / 850 / 900 / 950 / 999 (eager and CUDA graph, two input placements, 12 rounds after a warm-up round, the same
+# sampled tokens) the replaced chain was as fast at V = 262144 with 1 row at top-k 801 (up to 1.002x) and with 8 rows
+# at top-k 999 (up to 1.007x, on one of the two boards).  V = 128256 with 2 rows at top-k 801 and V = 262144 with
+# 2 rows at top-k 900 ran faster than the replaced plans (up to 0.924x and 0.972x) and the earlier shipped kernels on
+# every row, but one outlying record of the repeated baseline run widened the noise band past the gain on one board,
+# so the windows of those two cells start above top-k 801 and 900 as well.
+_LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K: dict[
+    tuple[int, int], dict[tuple[int, int], int]
+] = {
+    (10, 3): {(128256, 2): 801, (262144, 1): 801, (262144, 2): 900, (262144, 8): 999},
+}
+# The leader-push whole-CTA-tail launch takes the row-span filter arm (launch_flags bit 5) where the chain does.
+_LEADER_PUSH_BLOCK_TAIL_ROW_SPAN = True
+
+
+@functools.cache
+def _stage1_has_leader_push_block_tail(
+    cluster: int, ept: int, stream: bool, int_tail: bool
+) -> bool:
+    """Whether the frozen variant ships the leader-push form of its whole-CTA-tail build in the given tail form (a
+    manifest entry with ``leader_push``, ``fused_block_tail`` and the matching ``int_tail``)."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream)
+        and v["fused_block_tail"]
+        and v.get("leader_push", False)
+        and bool(v.get("int_tail", False)) == bool(int_tail)
+        for v in load_manifest()["stage1"]
+    )
+
+
+def _leader_push_block_tail(
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+    sm_count: int,
+    capability: tuple[int, int],
+) -> bool:
+    """Whether a launch runs the leader-push whole-CTA tail (``_LEADER_PUSH_BLOCK_TAIL_CELLS``): its largest top-k lies
+    in (the capability's _LEADER_PUSH_BLOCK_TAIL_MIN_K or the cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, whichever is
+    larger, fused_block_tail_kcap], its (vocab, batch) cell is listed for the capability, the device policy runs the
+    whole-CTA tail and the (8, 16) stream grid is one wave."""
+    cc = (int(capability[0]), int(capability[1]))
+    min_k = max(
+        _BLOCK_TAIL_MIN_K,
+        _LEADER_PUSH_BLOCK_TAIL_MIN_K.get(cc, _BLOCK_TAIL_MIN_K),
+        _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K.get(cc, {}).get((int(vocab), int(batch)), 0),
+    )
+    if top_k_max is None or not (min_k < top_k_max <= _fused_block_tail_kcap()):
+        return False
+    if (int(vocab), int(batch)) not in _LEADER_PUSH_BLOCK_TAIL_CELLS.get(
+        cc, frozenset()
+    ):
+        return False
+    if not _block_tail_for_capability(cc):
+        return False
+    cluster, ept, stream = _LEADER_PUSH_BLOCK_TAIL_STAGE1
+    if int(batch) * cluster > _wave_ctas(int(sm_count))[cluster]:
+        return False
+    return _stage1_has_leader_push_block_tail(
+        cluster, ept, stream, cc in _INT_TAIL_CAPABILITIES
+    )
+
+
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
     return (int(capability[0]), int(capability[1])) in _BLOCK_TAIL_CAPABILITIES
 
@@ -667,7 +804,8 @@ _FLAG_COARSE_PUSH = 256
 # the capabilities in _LEADER_PUSH_CAPABILITIES for any ept-16 stream and for an ept-32 (_LEADER_PUSH_WIDE_EPT) stream only
 # when the row is at most _LEADER_PUSH_WIDE_MAX_CHUNKS register chunks per CTA (round-9 ledger: R200 ept-16 `_cs` cells
 # 0.88-0.94, H100 c8 e16 `_cs` 0.82-0.86 / `_sp` 0.92-0.96, B200 `_sp` 0.89-0.97, GB300 ept-16 `_sp` cells 0.96-0.99 against the slab form; the two-chunk and longer ept-32 rows 1.02-1.31 on
-# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; never with bit 3.
+# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; with bit 3 only
+# on the cells of _LEADER_PUSH_BLOCK_TAIL_CELLS (round 17: the leader-push whole-CTA-tail build).
 _FLAG_LEADER_PUSH = 512
 _LEADER_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3), (10, 7)}
@@ -1175,7 +1313,8 @@ def _leader_push_flag(
     of the build the sample bits select, on a multi-CTA streaming variant that ships it, on the capabilities in
     ``_LEADER_PUSH_CAPABILITIES`` (``capability`` None: every capability), for any row on an ept-16 stream and for a
     row of at most ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` register chunks per CTA on an ept-``_LEADER_PUSH_WIDE_EPT`` stream.
-    Never with the whole-CTA tail (bit 3); the caller drops the slab tail (bit 7) and the pushed coarse sums (bit 8)
+    Never with the whole-CTA tail (bit 3; its leader-push form is ``_leader_push_block_tail``'s); the caller drops the
+    slab tail (bit 7) and the pushed coarse sums (bit 8)
     when this bit is taken.  ``local_select_reach`` (round 10) and ``small_batch_reach`` (round 11,
     ``_leader_push_small_batch_reach``) extend it to a two-chunk ept-32 row."""
     if not stream or int(cluster) < 2 or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) != 0:
@@ -2019,16 +2158,24 @@ def _launch_plan(
     capability = _device_capability(device_index)
     two_launch = _launch_is_two_kernels(top_k_max, device_index)
     smem_limit = _smem_optin(device_index)
-    cluster, ept, stream = _sm12x_resident(
-        capability,
-        sm_count,
-        vocab,
-        smem_limit,
-        _measured_stage1_pick(capability, sm_count, batch, vocab, top_k_max, smem_limit)
-        or _choose_stage1_resolved(
-            batch, vocab, sm_count, smem_limit, top_k_max, two_launch
-        ),
+    lp_block = _block_tail_enabled(device_index) and _leader_push_block_tail(
+        batch, vocab, top_k_max, sm_count, capability
     )
+    if lp_block:
+        cluster, ept, stream = _LEADER_PUSH_BLOCK_TAIL_STAGE1
+    else:
+        cluster, ept, stream = _sm12x_resident(
+            capability,
+            sm_count,
+            vocab,
+            smem_limit,
+            _measured_stage1_pick(
+                capability, sm_count, batch, vocab, top_k_max, smem_limit
+            )
+            or _choose_stage1_resolved(
+                batch, vocab, sm_count, smem_limit, top_k_max, two_launch
+            ),
+        )
     threads, items = choose_stage23(top_k_max)
     # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch), except for the multi-wave
     # launches of a variant ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists for the device, which take the chain.
@@ -2044,18 +2191,22 @@ def _launch_plan(
     c1_block = not fused and _c1_block_tail(
         batch, vocab, cluster, ept, stream, top_k_max, capability
     )
-    fused_block = c1_block or (
-        not fused
-        and _fuse_block_tail(
-            batch,
-            cluster,
-            ept,
-            stream,
-            sm_count,
-            top_k_max,
-            not _block_tail_enabled(device_index),
-            vocab,
-            capability,
+    fused_block = (
+        c1_block
+        or lp_block
+        or (
+            not fused
+            and _fuse_block_tail(
+                batch,
+                cluster,
+                ept,
+                stream,
+                sm_count,
+                top_k_max,
+                not _block_tail_enabled(device_index),
+                vocab,
+                capability,
+            )
         )
     )
     if fused:
@@ -2086,6 +2237,12 @@ def _launch_plan(
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if c1_block else 0)
         launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
+        if lp_block:
+            launch_flags |= _FLAG_LEADER_PUSH
+            if _LEADER_PUSH_BLOCK_TAIL_ROW_SPAN:
+                launch_flags |= _row_span_diet_flag(
+                    cluster, stream, top_k_max, device_index
+                )
     else:
         # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
         # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
