@@ -51,6 +51,13 @@ class GroupedGemm(Protocol):
     ``offsets`` is the ``int64 [E + 1]`` expert-major row prefix written by the
     protocol's prefix kernel; rows beyond ``offsets[E]`` are never read as
     valid output (the kernels guard stores by the per-expert row bound).
+
+    The runner passes ``pdl`` on every call: ``True`` asks for a programmatic
+    dependent launch of the kernel. It passes ``sched`` only to an implementation
+    whose ``supports_early_start`` attribute is true, and only in early-start
+    rounds, to both calls of the round: FC1 releases per-m-tile readiness
+    counters into it, and FC2, launched next on the same stream, claims its
+    tiles as they become ready.
     """
 
     def fc1(
@@ -59,6 +66,9 @@ class GroupedGemm(Protocol):
         w13: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
         """``out[m, I] = silu(a @ gate.T) * (a @ up.T)`` with gate/up-interleaved ``w13``."""
 
@@ -68,6 +78,9 @@ class GroupedGemm(Protocol):
         w2: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
         """``out[m, H] = h @ w2[e].T``."""
 
