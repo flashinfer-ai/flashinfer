@@ -293,20 +293,21 @@ jobs:
           SCOPE_ARGS: ${{ steps.scope.outputs.scope_args }}
         run: |
           # Helper: clear all existing ci/test-scope-N statuses on this SHA so
-          # pr-test.yml sees no scope and runs the full suite.
+          # pr-test.yml sees no scope and runs the full suite. Fails the step
+          # if the lookup or any clearing POST fails — we must not apply the
+          # run-ci label while stale narrow-scope statuses might remain.
           clear_stale_scopes() {
             local MAX
             MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
               --jq '[.statuses[].context
                 | select(test("^ci/test-scope-[0-9]+$"))
-                | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
-              || MAX=0
+                | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
             MAX=${MAX:-0}
             for ((i = 1; i <= MAX; i++)); do
               gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
                 -f state=success \
                 -f context="ci/test-scope-$i" \
-                -f description="" > /dev/null 2>&1 || true
+                -f description="" > /dev/null
             done
           }
 
@@ -362,6 +363,7 @@ jobs:
           steps.org-check.outputs.is_member == 'true'
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
+          && steps.publish-scope.outcome != 'failure'
         env:
           # Use the bot PAT so the labeled event triggers pr-test.yml.
           # (Events from GITHUB_TOKEN do not trigger other workflows.)
