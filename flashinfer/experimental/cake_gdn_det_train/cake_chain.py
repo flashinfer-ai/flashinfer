@@ -29,7 +29,11 @@ split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
 fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
 at most ``DHU_TC_GAIN`` of the register path; then, for a value-head group of
 two, the fused tcgen05 tail (``tail_g2``), else ``dqkwg``, the WY pullback and
-the finalize.
+the finalize.  A host-built table lists the sequences longest first
+(:func:`lpt_sequence_order`; every chunk keeps its token offset, the state rows
+are gathered into that order and the final state and its gradient scattered
+back) and ``fwd_ho`` walks the forward segments longest first
+(:func:`lpt_walk`): each CTA computes what it computes in the caller's order.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -43,8 +47,8 @@ The chain is deterministic: no atomics, no data-dependent ordering, so the
 outputs and gradients are bitwise run to run for one layout and one plan.
 The plan pins that tests and tuning use are explicit keyword arguments of
 :func:`chunk_gated_delta_rule` (``scan_config``, ``segment_chunks``,
-``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``); nothing here reads an
-environment variable.
+``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``); nothing here
+reads an environment variable.
 """
 
 from __future__ import annotations
@@ -80,6 +84,8 @@ __all__ = [
     "finalize_stage",
     "gdn_chunk_backward",
     "gdn_chunk_forward",
+    "lpt_sequence_order",
+    "lpt_walk",
     "make_options",
     "scan_plans",
     "stage_set",
@@ -234,7 +240,8 @@ class ChainOptions:
     ``None``: the selection rule); ``prep`` forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
     grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule); ``save_state`` keeps the
     forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
-    chunk tables, the selection results and the per-stream workspaces between calls.
+    chunk tables, the selection results and the per-stream workspaces between calls; ``lpt`` dispatches the
+    sequences of a host-built table longest first (the same bits; ``False``: the caller's order).
     """
 
     scan_config: tuple[int, int] | None = None
@@ -245,6 +252,7 @@ class ChainOptions:
     host_cache: bool = True
     dhu_scan: str | None = None
     prep: str | None = None
+    lpt: bool = True
 
     @property
     def pins(self) -> tuple:
@@ -261,6 +269,7 @@ def make_options(
     host_cache: bool = True,
     dhu_scan: str | None = None,
     prep: str | None = None,
+    lpt: bool = True,
 ) -> ChainOptions:
     """Validated :class:`ChainOptions`."""
     if scan_config is not None:
@@ -306,6 +315,7 @@ def make_options(
         bool(host_cache),
         dhu_scan,
         prep,
+        bool(lpt),
     )
 
 
@@ -368,10 +378,16 @@ class SegmentTable:
     num_segments: int
     segment_len: int
     scan_config: tuple[int, int]
+    # fwd_ho's segment order (CTA group b runs walk[b]); None: the identity
+    walk: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class ChunkMeta:
+    """The chunk and segment tables of one layout.  ``order`` (host route): table sequence ``vs`` is the caller's
+    sequence ``order[vs]``, its chunks at their original token offsets (``None``: the caller's order);
+    ``order_index`` holds it on the device as ``[order, inverse]`` for the state rows."""
+
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
     seq_chunk_start: torch.Tensor
@@ -380,6 +396,8 @@ class ChunkMeta:
     seq_lens: tuple[int, ...] | None
     fwd_segments: SegmentTable
     bwd_segments: SegmentTable
+    order: tuple[int, ...] | None = None
+    order_index: torch.Tensor | None = None
 
 
 def segment_bounds(num_chunks: int, segment_len: int) -> list[int]:
@@ -402,24 +420,60 @@ def _segment_lists(seq_chunk_start: list[int], segment_len: int):
     return seg_chunk_start, seg_seq, seq_seg_start
 
 
+def lpt_sequence_order(seq_lens) -> tuple[int, ...] | None:
+    """The sequences longest first by chunk count, ties in the caller's order (``None`` when that is the caller's
+    order)."""
+    chunks = [-(-int(x) // CHUNK) for x in seq_lens]
+    order = tuple(sorted(range(len(chunks)), key=lambda s: (-chunks[s], s)))
+    return None if order == tuple(range(len(chunks))) else order
+
+
+def lpt_walk(seg_chunk_start) -> list[int] | None:
+    """The segments of a segment table longest first by chunk count, ties in table order (``None`` when that is the
+    table order)."""
+    lens = [
+        b - a for a, b in zip(seg_chunk_start[:-1], seg_chunk_start[1:], strict=True)
+    ]
+    walk = sorted(range(len(lens)), key=lambda s: (-lens[s], s))
+    return None if walk == list(range(len(lens))) else walk
+
+
 def build_chunk_meta(
-    seq_lens, device, *, scan_plans: tuple[ScanPlan, ScanPlan]
+    seq_lens, device, *, scan_plans: tuple[ScanPlan, ScanPlan], lpt: bool = False
 ) -> ChunkMeta:
-    """Host route: the chunk and segment tables of known sequence lengths, copied to ``device`` in one transfer."""
+    """Host route: the chunk and segment tables of known sequence lengths, copied to ``device`` in one transfer.
+
+    ``lpt`` dispatches longest first: the tables list the sequences in :func:`lpt_sequence_order` (each chunk keeps its
+    token offset; the state rows follow ``order_index``) and ``fwd_ho`` walks the forward segments in
+    :func:`lpt_walk` order.  Every CTA computes what it computes in the caller's order: the same bits."""
+    lengths = [int(x) for x in seq_lens]
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    order = lpt_sequence_order(lengths) if lpt else None
     starts: list[int] = []
     lens: list[int] = []
     seq_chunk_start = [0]
-    token = 0
-    for seq_len in seq_lens:
-        seq_len = int(seq_len)
+    for seq in order if order is not None else range(len(lengths)):
+        seq_len, token = lengths[seq], offsets[seq]
         for chunk_start in range(0, seq_len, CHUNK):
             starts.append(token + chunk_start)
             lens.append(min(CHUNK, seq_len - chunk_start))
         seq_chunk_start.append(len(starts))
-        token += seq_len
     parts: list[list[int]] = [starts, lens, seq_chunk_start]
     for plan in scan_plans:
         parts.extend(_segment_lists(seq_chunk_start, int(plan.segment_len)))
+    walk = lpt_walk(parts[3]) if lpt else None
+    extra: dict[str, int] = {}
+    if walk is not None:
+        extra["walk"] = len(parts)
+        parts.append(walk)
+    if order is not None:
+        inverse = [0] * len(order)
+        for vs, seq in enumerate(order):
+            inverse[seq] = vs
+        extra["order_index"] = len(parts)
+        parts.append(list(order) + inverse)
     table = torch.tensor([x for part in parts for x in part], dtype=torch.int32)
     device = torch.device(device)
     table = (
@@ -440,19 +494,24 @@ def build_chunk_meta(
             num_segments=len(parts[4 + 3 * i]),
             segment_len=int(scan_plans[i].segment_len),
             scan_config=cast("tuple[int, int]", tuple(scan_plans[i].config)),
+            walk=views[extra["walk"]] if i == 0 and "walk" in extra else None,
         )
         for i in range(2)
     ]
-    return ChunkMeta(views[0], views[1], views[2], len(starts), len(seq_lens), tuple(int(x) for x in seq_lens),
-                     segments[0], segments[1])  # fmt: skip
+    order_index = views[extra["order_index"]].view(2, -1) if order is not None else None
+    return ChunkMeta(views[0], views[1], views[2], len(starts), len(lengths), tuple(lengths), segments[0],
+                     segments[1], order, order_index)  # fmt: skip
 
 
 @lru_cache(maxsize=256)
 def _host_chunk_meta(
-    seq_lens: tuple[int, ...], plans: tuple[ScanPlan, ScanPlan], device_index: int
+    seq_lens: tuple[int, ...],
+    plans: tuple[ScanPlan, ScanPlan],
+    device_index: int,
+    lpt: bool,
 ) -> ChunkMeta:
     return build_chunk_meta(
-        seq_lens, torch.device("cuda", device_index), scan_plans=plans
+        seq_lens, torch.device("cuda", device_index), scan_plans=plans, lpt=lpt
     )
 
 
@@ -1177,9 +1236,13 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
 _WALKS: dict = {}
 
 
-def _walk(device, num_segments: int, options: ChainOptions) -> torch.Tensor:
-    """The identity walk of ``fwd_ho`` (CTA group ``b // HV`` runs segment ``b``): a constant table per (device,
-    segment count), kept between calls under ``host_cache``."""
+def _walk(device, segs: SegmentTable, options: ChainOptions) -> torch.Tensor:
+    """The walk of ``fwd_ho`` (CTA group ``b // HV`` runs segment ``walk[b]``): the table's own (longest first) when it
+    has one, else the identity, a constant table per (device, segment count) kept between calls under
+    ``host_cache``."""
+    if segs.walk is not None:
+        return segs.walk
+    num_segments = segs.num_segments
     key = (_device_index(device), int(num_segments))
     walk = _WALKS.get(key) if options.host_cache else None
     if walk is None:
@@ -1187,6 +1250,20 @@ def _walk(device, num_segments: int, options: ChainOptions) -> torch.Tensor:
         if options.host_cache:
             _WALKS[key] = walk
     return walk
+
+
+def _table_rows(state, meta: ChunkMeta):
+    """Per-sequence state rows (``initial_state``, ``dht``) in the table's sequence order."""
+    if state is None or meta.order_index is None:
+        return state
+    return state.index_select(0, meta.order_index[0])
+
+
+def _caller_rows(state, meta: ChunkMeta):
+    """Per-sequence state rows (``final_state``, ``dh0``) back in the caller's sequence order."""
+    if meta.order_index is None:
+        return state
+    return state.index_select(0, meta.order_index[1])
 
 
 def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads, *, store_final_state, table,
@@ -1241,7 +1318,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
         _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start, segs.seq_seg_start,
                 seg_flag, num_v_heads, use_init, 0)  # fmt: skip
         use_seg = 1
-    walk = _walk(device, segs.num_segments, options)
+    walk = _walk(device, segs, options)
     _launch("fwd_ho", segs.num_segments * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o,
             final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
             walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
@@ -1300,9 +1377,12 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
     )
     workspaces = _workspaces(options)
     table = workspaces.table(_device_index(kn.device))
-    h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads,
-                                              store_final_state=output_final_state, table=table,
-                                              workspaces=workspaces, options=options, scale=scale)  # fmt: skip
+    h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, _table_rows(initial_state, meta), meta,
+                                              num_heads, num_v_heads, store_final_state=output_final_state,
+                                              table=table, workspaces=workspaces, options=options,
+                                              scale=scale)  # fmt: skip
+    if output_final_state:
+        final_state = _caller_rows(final_state, meta)
     return {
         "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
@@ -1352,7 +1432,8 @@ def gdn_chunk_backward(
     else:
         w, u = forward["w"], forward["u"]
     if forward.get("h") is None or forward.get("v_new") is None:
-        h, v_new, _ = _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads,
+        h, v_new, _ = _launch_fwd_h(arch, kn, w, u, g_cs, _table_rows(initial_state, meta), meta, num_heads,
+                                    num_v_heads,
                                     store_final_state=False, table=table, workspaces=workspaces,
                                     options=options)  # fmt: skip
     else:
@@ -1384,7 +1465,7 @@ def gdn_chunk_backward(
             device,
         )
     if dht is not None:
-        dht32 = dht.contiguous()
+        dht32 = _table_rows(dht, meta).contiguous()
         if dht32.dtype != torch.float32:
             dht32 = dht32.float()
         use_dht = 1
@@ -1440,7 +1521,7 @@ def gdn_chunk_backward(
                 meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, scale,
                 1 if forward.get("normalize_qk", True) else 0)  # fmt: skip
         return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
-                "dinitial_state": dh0 if has_initial_state else None}  # fmt: skip
+                "dinitial_state": _caller_rows(dh0, meta) if has_initial_state else None}  # fmt: skip
     dq_hv = workspaces.take(table, "b_dq_hv", token_hv, qn.dtype, device)
     dk_hv = workspaces.take(table, "b_dk_hv", token_hv, qn.dtype, device)
     dw = workspaces.take(table, "b_dw", w.shape, w.dtype, device)
@@ -1472,7 +1553,7 @@ def gdn_chunk_backward(
             forward["rstd_q"], forward["rstd_k"], dq_hv, dk_hv, dk2, dg1, dg2, dq, dk, dg, meta.chunk_start,
             meta.chunk_len, num_heads, num_v_heads, 1 if forward.get("normalize_qk", True) else 0)  # fmt: skip
     return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
-            "dinitial_state": dh0 if has_initial_state else None}  # fmt: skip
+            "dinitial_state": _caller_rows(dh0, meta) if has_initial_state else None}  # fmt: skip
 
 
 # --------------------------------------------------------------------------- #
@@ -1612,7 +1693,14 @@ def _chunk_meta(
     else:
         layout = _host_offsets(cu_seqlens_cpu)
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
-    key = (layout, int(num_v_heads), int(index), total_tokens, options.pins)
+    key = (
+        layout,
+        int(num_v_heads),
+        int(index),
+        total_tokens,
+        options.pins,
+        options.lpt,
+    )
     if options.host_cache:
         meta = _META_FRONT.get(key)
         if meta is not None:
@@ -1622,7 +1710,7 @@ def _chunk_meta(
         _check_offsets(layout, total_tokens)
     plans = scan_plans(total_tokens, len(seq_lens), int(num_v_heads), int(index), seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
-    meta = _host_chunk_meta(seq_lens, plans, int(index))
+    meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if options.host_cache:
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
             del _META_FRONT[next(iter(_META_FRONT))]
@@ -1723,6 +1811,7 @@ def chunk_gated_delta_rule(
     host_cache: bool = True,
     dhu_scan: str | None = None,
     prep: str | None = None,
+    lpt: bool = True,
 ):
     """Deterministic chunked gated delta rule with FLA's signature (head dimension 128, ``HV`` a multiple of ``H``).
 
@@ -1748,7 +1837,7 @@ def chunk_gated_delta_rule(
     _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu)
     options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
                            warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
-                           dhu_scan=dhu_scan, prep=prep)  # fmt: skip
+                           dhu_scan=dhu_scan, prep=prep, lpt=lpt)  # fmt: skip
     if g.dtype != torch.float32:
         g = g.float()
     if scale is None:

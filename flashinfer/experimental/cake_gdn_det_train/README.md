@@ -67,6 +67,15 @@ group of two (`HV == 2 * H`) one fused tcgen05 kernel then computes `dq`, `dk`,
 `dv`, `dg` and `dbeta`; other groups run `dqkwg`, the WY pullback and the
 finalize.
 
+On the host-table route the long sequences start first.  The tables list the
+sequences by chunk count, longest first (ties in the caller's order); every
+chunk keeps its token offset, the initial-state rows are gathered into that
+order and the final state and the initial-state gradient come back in the
+caller's order.  The forward scan also walks its segments longest first.  Each
+CTA computes what it computes in the caller's order, so the outputs and the
+gradients are bitwise the same with `lpt=False`.  The device route keeps the
+caller's order.
+
 ## Plan pins (keyword-only)
 
 | keyword | default | effect |
@@ -79,6 +88,7 @@ finalize.
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
+| `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order (the same bits) |
 
 ## Limitations
 

@@ -24,7 +24,8 @@ packed layouts (host and device table routes, FP32 and BF16 ``beta``, every regi
 and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
 unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
 initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
-contracts: two runs, the two table routes on one plan, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
+contracts: two runs, the two table routes on one plan, the longest-first dispatch order against the caller's (and its
+tables without a device), the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
 alignment (the plain prep), and an equal-length batch against the same sequences packed; and the input contract: every
 rejected input raises before the first launch, and the device route does not synchronize.
 
@@ -395,6 +396,8 @@ def test_options_validate_their_pins() -> None:
     assert opts.prep is None
     assert cake_chain.make_options(dhu_scan="tc").dhu_scan == "tc"
     assert cake_chain.make_options(prep="tma").prep == "tma"
+    assert opts.lpt
+    assert cake_chain.make_options(lpt=False).lpt is False
     for bad in (
         {"scan_config": (32,)},
         {"scan_config": (32, 0)},
@@ -507,6 +510,66 @@ def test_host_tables_follow_the_layout() -> None:
     assert bwd.seg_chunk_start.tolist() == [0, 2, 5, 8, 12, 13, 14]
     assert bwd.seg_seq.tolist() == [0, 1, 1, 1, 2, 3]
     assert bwd.seq_seg_start.tolist() == [0, 1, 4, 5, 6]
+    # the caller's order: no sequence order and the identity walk
+    assert meta.order is None and meta.order_index is None
+    assert fwd.walk is None and bwd.walk is None
+
+
+def _segment_lens(seg_chunk_start) -> list[int]:
+    starts = seg_chunk_start.tolist()
+    return [b - a for a, b in zip(starts[:-1], starts[1:], strict=True)]
+
+
+@pytest.mark.parametrize("fwd_segment_len", [0, 4], ids=["serial", "split"])
+def test_lpt_tables_reorder_the_sequences_and_the_walk(fwd_segment_len) -> None:
+    seq_lens = (100, 640, 1, 64, 2000, 640)
+    chunks = [-(-n // 64) for n in seq_lens]
+    offsets = _cu(seq_lens)
+    plans = (
+        cake_chain.ScanPlan((32, 2), fwd_segment_len),
+        cake_chain.ScanPlan((64, 1), 0),
+    )
+    meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+    plain = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans)
+    order = meta.order
+    # the sequences longest first by chunk count, ties in the caller's order: a permutation
+    assert sorted(order) == list(range(len(seq_lens)))
+    assert order == cake_chain.lpt_sequence_order(seq_lens) == (4, 1, 5, 0, 2, 3)
+    assert [chunks[s] for s in order] == sorted(chunks, reverse=True)
+    assert meta.order_index.tolist() == [
+        list(order),
+        [order.index(s) for s in range(len(order))],
+    ]
+    # every chunk keeps its token offset and length; sequence vs of the table is the caller's order[vs]
+    seq_chunk_start = meta.seq_chunk_start.tolist()
+    for vs, seq in enumerate(order):
+        c0, c1 = seq_chunk_start[vs], seq_chunk_start[vs + 1]
+        assert c1 - c0 == chunks[seq]
+        if c1 > c0:
+            assert meta.chunk_start.tolist()[c0] == offsets[seq]
+    pairs = sorted(zip(meta.chunk_start.tolist(), meta.chunk_len.tolist(), strict=True))
+    assert pairs == sorted(
+        zip(plain.chunk_start.tolist(), plain.chunk_len.tolist(), strict=True)
+    )
+    assert (
+        meta.num_chunks == plain.num_chunks
+        and meta.seq_lens == plain.seq_lens == seq_lens
+    )
+    # fwd_ho's walk: the forward segments longest first, ties in table order (None: already in that order)
+    fwd = meta.fwd_segments
+    lens = _segment_lens(fwd.seg_chunk_start)
+    walk = fwd.walk.tolist() if fwd.walk is not None else list(range(fwd.num_segments))
+    assert sorted(walk) == list(range(fwd.num_segments))
+    assert walk == sorted(range(len(lens)), key=lambda seg: (-lens[seg], seg))
+    if fwd_segment_len == 0:
+        # the table order of a serial plan is already longest first
+        assert fwd.walk is None
+    else:
+        assert fwd.walk is not None
+    assert meta.bwd_segments.walk is None
+    # an already longest-first layout keeps the caller's tables
+    equal = cake_chain.build_chunk_meta((4096,) * 4, "cpu", scan_plans=plans, lpt=True)
+    assert equal.order is None and equal.order_index is None
 
 
 # --------------------------------------------------------------------------- against the FP64 recurrence
@@ -690,6 +753,50 @@ def test_run_to_run_bitwise(route, device) -> None:
         _assert_bitwise(first, _run(inputs, seq_lens, route=route), OUTPUT_NAMES)
     uncached = _run(inputs, seq_lens, route=route, host_cache=False)
     _assert_bitwise(first, uncached, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [{}, {"save_state": False}, {"scan_config": (32, 2), "segment_chunks": 4}],
+    ids=["rule", "recompute", "fwd-split"],
+)
+def test_lpt_order_matches_the_caller_order(pins, device) -> None:
+    # the host route's longest-first sequence order and fwd_ho walk against the caller's order, with an initial state
+    # and a final-state gradient (state rows gathered and scattered): the same bits on every output
+    seq_lens, heads = (300, 1000, 77, 640), (2, 4)
+    assert cake_chain.lpt_sequence_order(seq_lens) == (1, 3, 0, 2)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=53)
+    gen = torch.Generator().manual_seed(59)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    runs = {
+        lpt: _run(
+            inputs,
+            seq_lens,
+            initial_state=h0,
+            output_final_state=True,
+            dht=dht,
+            lpt=lpt,
+            **pins,
+        )
+        for lpt in (True, False)
+    }
+    _assert_bitwise(runs[True], runs[False], OUTPUT_NAMES + ("final_state", "dh0"))
+
+
+def test_device_route_keeps_the_caller_order(device) -> None:
+    seq_lens = (300, 1000, 77, 640)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int32, device=device)
+    options = cake_chain.make_options(scan_config=(32, 2), segment_chunks=4)
+    meta = cake_chain._chunk_meta(cu, None, 1, sum(seq_lens), device, 4, options)
+    assert meta.seq_lens is None and meta.order is None and meta.order_index is None
+    assert meta.fwd_segments.walk is None and meta.bwd_segments.walk is None
+    walk = cake_chain._walk(device, meta.fwd_segments, options)
+    assert walk.tolist() == list(range(meta.fwd_segments.num_segments))
 
 
 @pytest.mark.parametrize("route", ["host", "device"])
