@@ -81,7 +81,8 @@ SM_COUNT = 148
 #: ``prepare_*`` plans every route from the device's ``multi_processor_count`` -- the decode
 #: grids are tile-bound (94 / 112 / 131 co-resident CTAs on either count) and the prefill plans
 #: pass their resident-pair windows (``num_items`` / ``sk_*``) as runtime arguments -- and admits
-#: only these counts: the decode programs need every CTA of their grid resident and the stream-K
+#: only these counts: the cooperative programs (the fused decode tail instances, the fused tail
+#: GEMMs and the front's fold form) need every CTA of their grid resident and the stream-K
 #: windows were validated on these parts only (README, "Tested physical configurations").
 QUALIFIED_SM_COUNTS = (148, 152)
 #: Largest token count served by the decode (weight-streaming) kernels.
@@ -1122,7 +1123,9 @@ def resident_grid(num_items: int, sm_count: int) -> int:
 def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool:
     """One launch (the GEMM's epilogue warps normalise the latent while the shared-expert K blocks
     stream) when the grid is single-wave and the shared-expert window of ``k2_iters`` 64-wide K
-    blocks hides the normalisation: TP1 (96 blocks) fuses, TP8 (12 blocks) keeps the norm launch."""
+    blocks hides the normalisation: TP1 (96 blocks) fuses, TP8 (12 blocks) keeps the norm launch.
+    The single-wave fused instances run one work item per cluster (no cluster launch control) and
+    launch cooperatively: their CTAs wait for latent rows that other CTAs normalise."""
     return fused_norm_fits(M, gemm_ctas, sm_count) and k2_iters >= FUSED_MIN_K2_ITERS
 
 

@@ -132,14 +132,36 @@ Contract:
   capture takes fresh words, which are never freed.  Prefer prepared runners
   under capture and where a PDL kernel that never waits on its predecessor can
   sit between two calls on one stream.
-- A cooperative route (the decode routes, the claimed tail and the front's fold
-  form) needs its whole grid resident at once, one CTA per SM.  Launched eagerly on a stream that
+- A cooperative route (see "Residency" below) needs its whole grid resident at
+  once, one CTA per SM.  Launched eagerly on a stream that
   offers fewer SMs (a smaller green context), it runs nothing and raises a
   `RuntimeError` naming the route and the SMs it needs; the CUDA runtime's last
   error is cleared, so later work in the process is unaffected.  Captured on
   such a stream, the launch fails the capture, again with no lasting error;
   note that `torch.cuda.graph` leaves its capture stream current when the
   capture fails, so restore the caller's stream before launching further work.
+
+### Residency
+
+Grid, launch and partition behaviour per route (`P` routed partials; on a
+partition, such as a green context, that offers fewer SMs than a cooperative
+grid, the launch is refused as above; an ordinary launch runs there in more
+waves):
+
+| route | keys | grid (CTAs) | launch | waits for other CTAs |
+| --- | --- | --- | --- | --- |
+| front, `T <= 128` | `decode:*_o3584_*` | 131 (TP1), 94 (TP8) | ordinary | no |
+| front, `T > 128` | `front:i<6144/TP>[e1][n224]` | one CTA pair per work item; cluster launch control hands out the rest | ordinary | no unbounded wait: whichever CTA arrives last sums a split tile's halves |
+| front, TP8 fold rows | `front:i768e1fold` | 144; 152 for `T` 897-1024 on `sm_103a` 152-SM parts | cooperative | yes: the carries and partial runs of other lanes |
+| tail, `T <= 128` | `decode:*_o7168_*_f*` | 112 | cooperative, except the staged-rows instances (`_sb`) | yes: the fused norm's grid counter (`_sb`: no) |
+| tail, `T > 128`, unfused | `tail_norm:*` + `tail_gemm:*f0*` | norm row blocks; GEMM one CTA pair per work item, cluster launch control | ordinary; the GEMM programmatic-dependent | no |
+| tail, `T > 128`, fused single wave (TP1) | `tail_gemm:tp1e1f1*` | at most the SM count, one work item per CTA pair | cooperative, programmatic-dependent | yes: latent rows that other CTAs normalise |
+| tail, `T > 128`, fused claimed (TP1) | `tail_gemm:*f1*ci` | one CTA pair per resident cluster, at most one per work item: up to every SM | cooperative, programmatic-dependent | yes: rows, the item ticket and the retirement count |
+
+A cooperative grid starts only with all of its CTAs resident, one per SM, so
+it does not overlap work that keeps those SMs busy: the claimed tail takes up
+to every SM, the fold rows 144 or 152 of them and the decode tail 112.  None of
+the cooperative programs uses cluster launch control.
 
 ## Tested physical configurations
 

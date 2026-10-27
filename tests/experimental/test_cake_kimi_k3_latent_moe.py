@@ -623,6 +623,46 @@ def test_route_keys_are_registered_for_every_token_count(sm_count, arch):
         route_kernel_keys("tail", 8, 8, sm_count, 0)
 
 
+def _waits_grid_wide(key):
+    """Whether the program of route ``key`` has CTAs that wait for words other CTAs of its grid release: the
+    fused decode tail instances (the norm's grid counter) except the staged-rows ones (``_sb``), the fused
+    tail GEMMs (row-release semaphores; the claimed ones also their item ticket) and the front's fold form
+    (carries and partial runs of other lanes)."""
+    stage, name = key.split(":", 1)
+    if stage == "decode":
+        segments = name.split("_")
+        return "f" in segments and "sb" not in segments
+    if stage == "tail_gemm":
+        return re.match(r"tp\d+e[01]f1", name) is not None
+    if stage == "front":
+        return name.endswith("fold")
+    return False
+
+
+def test_cooperative_launch_follows_grid_wide_waits():
+    """A program whose CTAs wait for words other CTAs of its grid release launches cooperatively (the driver
+    holds the whole grid resident or refuses the launch); every other program launches without the attribute.
+    No cooperative program uses cluster launch control, whose cancel of a cluster that has not started
+    would leave that cluster's work unrun."""
+    assert MODULES and KERNELS
+    csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
+    cooperative = set()
+    for key, name in KERNELS.items():
+        record = MODULES[name]
+        waits = _waits_grid_wide(key)
+        assert bool(record["launch"]["cooperative"]) is waits, (key, name)
+        if waits:
+            cooperative.add(key.split(":", 1)[0])
+            for source in record["sources"]:
+                text = (csrc / source).read_text()
+                assert "clusterlaunchcontrol" not in text, (key, name, source)
+    assert cooperative == {"decode", "tail_gemm", "front"}
+    # The front base instances (256- and 224-wide) and the unfused tail GEMMs hand out work items through
+    # cluster launch control and never wait on another cluster: an ordinary launch.
+    for key in ("front:i6144", "front:i6144e1", "front:i768", "front:i768e1"):
+        assert not MODULES[KERNELS[key]]["launch"]["cooperative"], key
+
+
 def test_plans_follow_the_device_sm_count():
     """152-SM parts (GB200 / GB300) re-plan the resident-pair windows from their own count; the
     decode grids are tile-bound and identical on both qualified counts."""
@@ -1468,7 +1508,7 @@ def test_tail_tp1_claimed_resident_grid(tokens):
         assert torch.equal(first[0], y) and torch.equal(first[1], out)
 
 
-@pytest.mark.parametrize("tokens", (3, 8, 16, 64))
+@pytest.mark.parametrize("tokens", (3, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128))
 @pytest.mark.parametrize("num_partials", (2, 3))
 def test_tail_decode_sums_routed_partials(tokens, num_partials):
     """The fused decode tail reduces P >= 2 routed partials on device before the norm."""
@@ -1500,6 +1540,46 @@ def test_tail_decode_sums_routed_partials(tokens, num_partials):
     runner()
     torch.cuda.synchronize()
     assert torch.equal(first[0], y) and torch.equal(first[1], out)
+
+
+@pytest.mark.parametrize("tokens", (256, 300, 512))
+def test_tail_prefill_on_a_side_stream(tokens):
+    """The TP1 prefill tail rows of one wave (the fused single-wave GEMMs, launched cooperatively and
+    programmatic-dependent) run on a side stream behind other work on it, eagerly and captured there, with the
+    outputs of the current stream, bitwise, and every control word back at zero."""
+    tp = 1
+    device = _require_program("tail", tp, tokens)
+    args, kwargs = _tail_args(device, tp, tokens, 1, 3100 + tokens)
+    runner = prepare_kimi_k3_latent_moe_tail(*args, **kwargs)
+    gemm = [launch for launch in runner.launches if launch.key.startswith("tail_gemm:")]
+    assert gemm and all(launch.cooperative_ctas for launch in gemm), runner.kernel_keys
+    runner()
+    torch.cuda.synchronize()
+    reference = _snapshot(runner.outputs)
+    side = torch.cuda.Stream()
+    for rnd in range(3):
+        _nan_fill(runner.outputs)
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(100_000)
+            runner()
+        torch.cuda.synchronize()
+        _assert_bitwise(runner.outputs, reference, f"T={tokens} side stream {rnd}")
+        _assert_words_zero(runner, f"T={tokens} side stream {rnd}")
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        runner()
+    for rnd in range(3):
+        _nan_fill(runner.outputs)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(side):
+            graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise(
+            runner.outputs, reference, f"T={tokens} side-stream replay {rnd}"
+        )
+        _assert_words_zero(runner, f"T={tokens} side-stream replay {rnd}")
 
 
 def test_rejects_invalid_operands():
