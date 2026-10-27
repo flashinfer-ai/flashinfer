@@ -82,6 +82,14 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     the one-block-per-row compact and the route-serial publish.  ``None``
     reads ``FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM`` /
     ``FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM`` (default ``0``).
+
+    ``per_route_publish_pdl`` launches the combine publish of a pipe on the
+    per-route wire (by default a token capacity of at most 8) as a
+    programmatic dependent launch through the backend's own publish kernel,
+    as if ``pdl`` contained the publish edge; pipes on the pre-reduced wires
+    are unaffected.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL`` (default off).  It
+    changes no stored value.
     """
 
     intermediate_size: int
@@ -100,3 +108,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     grid_dispatch_min_tokens: int | None = None
     compact_form: int | None = None
     publish_form: int | None = None
+    per_route_publish_pdl: bool | None = None

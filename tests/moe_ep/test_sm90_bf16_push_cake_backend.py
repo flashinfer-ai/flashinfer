@@ -329,6 +329,35 @@ def test_ep1_copy_forms_bitwise(mode: str, wire: str) -> None:
 
 @requires_sm90
 @pytest.mark.parametrize("wire", WIRES)
+def test_ep1_per_route_publish_pdl(wire: str) -> None:
+    """per_route_publish_pdl adds the publish edge on the per-route wire only (same bytes)."""
+    device = torch.device("cuda", 0)
+    ref, w13, w2 = _build_layer(1, 0, device, combine_wire=wire, pdl=6, pdl_late=True)
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        pdl=6,
+        pdl_late=True,
+        per_route_publish_pdl=True,
+    )
+    runner = _warm_runner(layer, device)
+    assert runner.pdl == 6 and runner.per_route_publish_pdl
+    assert runner._pdl_flag(8) & 1 == (1 if wire == "per_route" else 0)
+    for num_tokens in (1, 8, TOKEN_CAPACITY):
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 47 + num_tokens, device
+        )
+        output = _forward(layer, x, ids, weights).clone()
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference), f"T={num_tokens}"
+    _check(output, x, ids, weights, w13, w2, label=f" ep1 {wire} per_route_publish_pdl")
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("case", ["short", "masked", "hot", "empty", "dup_rank"])
 def test_ep1_edge_routes(case: str, wire: str) -> None:
     device = torch.device("cuda", 0)
@@ -376,6 +405,16 @@ def _find_runner(root, class_name="Sm90CakeBf16MoERunner", max_depth=8):
                 children = []
         frontier.extend((child, depth + 1) for child in children)
     return None
+
+
+def _warm_runner(layer, device: torch.device):
+    """One single-token round (the workspace and its runner are created lazily), then the runner."""
+    x, ids, weights = _make_inputs(1, LOCAL_EXPERTS, 5, device)
+    _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    runner = _find_runner(layer)
+    assert runner is not None
+    return runner
 
 
 @requires_sm90
@@ -819,6 +858,61 @@ def test_ep_copy_forms_bitwise(mode: str, wire: str) -> None:
         )
         for name, output in outputs.items():
             assert torch.equal(output, outputs["f0"]), (
+                f"{name} differs at T={num_tokens}"
+            )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "dup_remote", "empty_rank"])
+def test_ep_per_route_publish_pdl_bitwise(mode: str) -> None:
+    """Per-route wire: the PDL-launched publish twin writes the same bytes, also when ranks mix it with the
+    vendored publish."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    common = dict(combine_wire="per_route", token_capacity=8, pdl=6, pdl_late=True)
+    # own pool key for the mixed layer on every rank: the workspace pool shares a pipe
+    # between layers with equal configs, so a layer whose config depends on the rank
+    # would share the "off" pipe on some ranks and the "on" pipe on the others
+    layers = {
+        name: _build_layer(
+            world_size, rank, device, per_route_publish_pdl=on, **common, **extra
+        )
+        for name, on, extra in (
+            ("off", False, {}),
+            ("on", True, {}),
+            ("mixed", bool(rank % 2), {"init_timeout_s": 601.0}),
+        )
+    }
+    _, w13, w2 = layers["off"]
+    for num_tokens in (1, 5, 8):
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            89 + rank + num_tokens,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs["on"],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} {mode} T={num_tokens} per_route_publish_pdl",
+        )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["off"]), (
                 f"{name} differs at T={num_tokens}"
             )
     dist.barrier()

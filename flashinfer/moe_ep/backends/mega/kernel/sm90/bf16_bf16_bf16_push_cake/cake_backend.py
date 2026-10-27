@@ -266,6 +266,12 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(
                     f"{_NAME} {name} must be 0, 1 or None, got {value!r}"
                 )
+        if kcfg.per_route_publish_pdl is not None and not isinstance(
+            kcfg.per_route_publish_pdl, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} per_route_publish_pdl must be a bool or None, got {kcfg.per_route_publish_pdl!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -381,6 +387,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 grid_dispatch_min_tokens=kcfg.grid_dispatch_min_tokens,
                 compact_form=kcfg.compact_form,
                 publish_form=kcfg.publish_form,
+                per_route_publish_pdl=kcfg.per_route_publish_pdl,
             )
         except Exception:
             pipe.destroy()
@@ -414,6 +421,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.grid_dispatch_min_tokens,
             kcfg.compact_form,
             kcfg.publish_form,
+            kcfg.per_route_publish_pdl,
             float(kcfg.init_timeout_s),
         )
 

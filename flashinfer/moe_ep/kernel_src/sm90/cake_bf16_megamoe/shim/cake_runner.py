@@ -65,6 +65,7 @@ __all__ = [
     "PDL_EDGE_TAIL",
     "PDL_ENV",
     "PDL_LATE_ENV",
+    "PER_ROUTE_PUBLISH_PDL_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
     "GRID_DISPATCH_MIN_TOKENS_ENV",
     "PUBLISH_FORM_ENV",
@@ -146,6 +147,11 @@ PDL_EDGES_ALL = 31
 # when they exit instead of right after their own wait (the early form lets
 # the dependent's blocks occupy the SMs while the producer runs).
 PDL_LATE_ENV = "FLASHINFER_SM90_CAKE_BF16_PDL_LATE"
+# 1 = with the per-route wire (token capacity at or below
+# COMBINE_WIRE_PER_SHAPE_MAX_TOKENS by default) the combine publish is launched
+# with the PDL attribute as if PDL_EDGE_PUBLISH were in the mask (it then runs
+# this package's per-route twin); pipes on the pre-reduced wires are unaffected.
+PER_ROUTE_PUBLISH_PDL_ENV = "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL"
 # Round opening folded into the small-round fused dispatch (requires the fused
 # tail and the fused dispatch path): 1 = the tag bump and the ack wait run in
 # the dispatch launch, 2 = also the receiver-side prefix (wait_prefix).
@@ -207,6 +213,11 @@ def _pdl_mask(value: bool | int | str) -> int:
 
 def _pdl_default() -> int:
     return _pdl_mask(os.environ.get(PDL_ENV, "0"))
+
+
+def _per_route_publish_pdl_default() -> bool:
+    raw = os.environ.get(PER_ROUTE_PUBLISH_PDL_ENV, "0").strip().lower()
+    return raw not in ("0", "false", "off", "no", "")
 
 
 def _pdl_late_default() -> bool:
@@ -326,6 +337,7 @@ class Sm90CakeBf16MoERunner:
         grid_dispatch_min_tokens: int | None = None,
         compact_form: int | None = None,
         publish_form: int | None = None,
+        per_route_publish_pdl: bool | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -408,9 +420,18 @@ class Sm90CakeBf16MoERunner:
         self._grid_dispatch_min_tokens = grid_min
         self._compact_form = _form(compact_form, COMPACT_FORM_ENV, "compact_form")
         self._publish_form = _form(publish_form, PUBLISH_FORM_ENV, "publish_form")
+        self._per_route_publish_pdl = (
+            _per_route_publish_pdl_default()
+            if per_route_publish_pdl is None
+            else bool(per_route_publish_pdl)
+        )
+        # effective edge mask of this pipe's launches (``pdl`` reports the requested one)
+        self._pdl_edges = self._pdl
+        if self._per_route_publish_pdl and wire == COMBINE_WIRE_PER_ROUTE:
+            self._pdl_edges |= PDL_EDGE_PUBLISH
         # the per-route wire publishes through this package's twin under PDL
         self._own_per_route = (
-            bool(self._pdl & PDL_EDGE_PUBLISH)
+            bool(self._pdl_edges & PDL_EDGE_PUBLISH)
             and self._fused_tail
             and wire == COMBINE_WIRE_PER_ROUTE
         )
@@ -517,13 +538,18 @@ class Sm90CakeBf16MoERunner:
         return self._pdl
 
     @property
+    def per_route_publish_pdl(self) -> bool:
+        """True when a per-route-wire pipe launches its publish as a PDL secondary (``PER_ROUTE_PUBLISH_PDL_ENV``)."""
+        return self._per_route_publish_pdl
+
+    @property
     def pdl_late(self) -> bool:
         """True when the small kernels let their PDL dependents start only at exit."""
         return self._pdl_late
 
     def _pdl_flag(self, edge: int) -> int:
         # bit 0: launch with the PDL attribute; bit 1: no early trigger
-        return (1 if self._pdl & edge else 0) | (2 if self._pdl_late else 0)
+        return (1 if self._pdl_edges & edge else 0) | (2 if self._pdl_late else 0)
 
     @property
     def fused_dispatch_max_tokens(self) -> int:
