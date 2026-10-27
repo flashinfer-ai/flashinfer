@@ -521,6 +521,11 @@ def test_prefill_tail_plan_and_trigger():
 # counts the decode tail plans on (P >= 2 selects the un-staged instances).
 COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384,)
 COVERAGE_PARTIALS = (1, 2, 4)
+# The few-token multi-partial tail cells served by the global-y instances with the resident-B arithmetic.
+SB_NORM_ROUTES = {
+    1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
+    8: (8, {1: 5, 2: 5, 3: 4, 4: 4}),
+}
 
 
 def _reached_programs(sm_count, arch):
@@ -1550,6 +1555,145 @@ def test_tail_decode_sums_routed_partials(tokens, num_partials):
     runner()
     torch.cuda.synchronize()
     assert torch.equal(first[0], y) and torch.equal(first[1], out)
+
+
+def _sb_norm_rows():
+    """The (tp, tokens, num_partials) cells ``TAIL_SB_NORM_ROUTES`` sends to the global-y instance with the resident-B
+    arithmetic, at the fewest partials each serves."""
+    return tuple(
+        (tp, tokens, least)
+        for tp, (_, cells) in sorted(cb.TAIL_SB_NORM_ROUTES.items())
+        for tokens, least in sorted(cells.items())
+    )
+
+
+def test_tail_sb_norm_rules(monkeypatch):
+    """The few-token multi-partial tails of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of the table's N_PAD with
+    the resident-B arithmetic (``sb_norm``, ``_sbn``): its plan is that instance's but for the flag, on both qualified
+    SM counts and from the table's partial count up; every other row keeps its plan, and the rows taken are rows of the
+    resident-B instance (``_sb``) the planner chooses without the table."""
+    assert cb.TAIL_SB_NORM_ROUTES == SB_NORM_ROUTES
+    taken = {}
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for tp in SUPPORTED_TP:
+            n_pad, least = cb.TAIL_SB_NORM_ROUTES[tp]
+            for tokens in range(1, DECODE_MAX_T + 1):
+                for num_partials in range(1, 17):
+                    plan = decode_tail_plan(
+                        tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                    )
+                    routed = tokens in least and num_partials >= least[tokens]
+                    assert plan["sb_norm"] is routed, (tp, tokens, num_partials)
+                    assert cb.tail_sb_norm_n_pad(tokens, tp, num_partials) == (
+                        n_pad if routed else 0
+                    )
+                    key = decode_kernel_key(plan)
+                    if not routed:
+                        assert not key.endswith("_sbn")
+                        continue
+                    base = decode_tail_plan(
+                        n_pad, i_local_for_tp(tp), tp, num_partials, sm_count
+                    )
+                    assert not (base["sb_norm"] or base["smem_b1"] or base["split_fin"])
+                    assert plan == dict(base, sb_norm=True)
+                    assert key == decode_kernel_key(base) + "_sbn" and key in KERNELS
+                    taken[sm_count, tp, tokens, num_partials] = key
+    assert taken
+    monkeypatch.setattr(cb, "TAIL_SB_NORM_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        for sm_count, tp, tokens, num_partials in taken:
+            default = decode_tail_plan(
+                tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+            )
+            assert default["smem_b1"] and not default["rows_smem"]
+            assert not default["sb_norm"] and "_sb" in decode_kernel_key(default)
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+@pytest.mark.parametrize(("tp", "tokens", "num_partials"), _sb_norm_rows())
+def test_tail_sb_norm_is_bitwise_the_resident_b_instance(
+    monkeypatch, tp, tokens, num_partials
+):
+    """The global-y instance with the resident-B arithmetic reproduces the resident-B instance's ``y`` and ``out`` bit for
+    bit -- partial sums that flush to ``-0.0`` and subnormal partials of both signs included -- in the first launch,
+    re-launches over NaN-filled outputs and graph replays, with the control words back at zero."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    seed = 4100 + 97 * tp + 13 * tokens + num_partials
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    # A quarter of the elements: partials 0 and 1 cancel to -m * 2^-133, a negative FP32 subnormal the
+    # flush-to-zero add turns into -0.0, and the other partials are -0.0 (the sum keeps its sign).
+    a = 2.0**-126 * (
+        1.0 + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+    )
+    m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+    cancel = pick < 0.25
+    parts[0] = torch.where(cancel, -a, parts[0])
+    parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts[2:] = torch.where(cancel, torch.full_like(parts[2:], -0.0), parts[2:])
+    # Another quarter: bf16 subnormal partials of both signs.
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    runner = prepare_kimi_k3_latent_moe_tail(
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
+    )
+    assert runner.plan["sb_norm"] and runner.kernel_keys[0].endswith("_sbn")
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    assert int((first[0] == -32768).sum()) > 0, "no -0.0 in y"
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, "TAIL_SB_NORM_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        out_sb = torch.full_like(out, float("nan"))
+        y_sb = torch.full_like(y, float("nan"))
+        resident = prepare_kimi_k3_latent_moe_tail(
+            routed,
+            w["norm_weight"],
+            w["up_weight"],
+            shared_act,
+            w["shared_down_weight"],
+            out_sb,
+            tp=tp,
+            rank=rank,
+            y_workspace=y_sb,
+        )
+        assert resident.plan["smem_b1"] and not resident.plan["sb_norm"]
+        resident()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_sb, out_sb), first, "resident-B instance")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
 
 
 @pytest.mark.parametrize("tokens", (256, 300, 512))

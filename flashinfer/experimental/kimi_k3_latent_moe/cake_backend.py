@@ -360,6 +360,7 @@ def decode_front_plan(
         split_fin=bool(split_fin),
         early_arrive=False,
         up_prefetch=False,
+        sb_norm=False,
         tiles=tiles,
     )
 
@@ -372,7 +373,18 @@ def decode_tail_plan(
     num_partials: int = 1,
     sm_count: int = SM_COUNT,
 ) -> dict[str, Any]:
-    """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults)."""
+    """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults); the
+    few-token multi-partial rows of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of their N_PAD with the
+    resident-B arithmetic (``sb_norm``)."""
+    sb_norm_n_pad = tail_sb_norm_n_pad(num_tokens, tp, num_partials)
+    if sb_norm_n_pad:
+        plan = decode_tail_plan(sb_norm_n_pad, i_local, tp, num_partials, sm_count)
+        if plan["smem_b1"] or plan["split_fin"]:
+            raise AssertionError(
+                f"tp{tp} N_PAD {sb_norm_n_pad} P={num_partials}: not a global-y instance"
+            )
+        plan["sb_norm"] = True
+        return plan
     n_pad = n_pad_for(num_tokens)
     tiles = HIDDEN // BLOCK_ROWS
     k_up = LATENT // tp
@@ -484,6 +496,7 @@ def decode_tail_plan(
         split_fin=bool(split_fin),
         early_arrive=bool(early_arrive),
         up_prefetch=bool(up_prefetch),
+        sb_norm=False,
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -519,6 +532,20 @@ TAIL_SPLIT_FIN_MIN_N_PAD = 32
 TAIL_EARLY_ARRIVE_TP = 1
 TAIL_UP_PREFETCH_TP = 8
 TAIL_UP_PREFETCH_N_PAD = (32, 64)
+# Resident-B arithmetic on the global-y tails (``sb_norm``, symbol suffix ``_sbn``).  The resident-B tail instances
+# (``_sb``: TP1 up to 8 tokens, TP8 up to 4) normalise every row in every CTA: each CTA sums the P routed partials of
+# all T rows in a dependent loop before its first up unit, one HBM round trip per partial under the weight stream, and
+# from three partials (TP1, five to eight tokens) the loop outlasts the down units it overlaps.  The global-y instance
+# at N_PAD ``n`` with ``sb_norm`` normalises each row once, in the warp that owns it, with the resident-B arithmetic
+# statement for statement (bf16 of the FP32 partial sum, sum of squares in element order, warp reduction, rsqrt,
+# ``bf16(bf16(sum) x rstd)``, ``bf16(w x normed)`` in FP32), so its ``y`` and ``out`` are bitwise the resident-B
+# instance's for every input, signed zeros and subnormals included.  ``TAIL_SB_NORM_ROUTES`` maps a TP to the N_PAD of
+# that instance and, per token count, the fewest partials it serves: the cells where it measured faster than the
+# resident-B instance on B300, GB300 and GB200 (paired CUDA-graph timing, both passes beyond the A/A band).
+TAIL_SB_NORM_ROUTES: dict[int, tuple[int, dict[int, int]]] = {
+    1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
+    8: (8, {1: 5, 2: 5, 3: 4, 4: 4}),
+}
 
 
 def split_fin_route(stage: str, n_pad: int, num_partials: int = 1) -> bool:
@@ -527,6 +554,14 @@ def split_fin_route(stage: str, n_pad: int, num_partials: int = 1) -> bool:
     if stage != "tail":
         return int(n_pad) >= SPLIT_FIN_MIN_N_PAD
     return int(n_pad) >= TAIL_SPLIT_FIN_MIN_N_PAD and int(num_partials) == 1
+
+
+def tail_sb_norm_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
+    """N_PAD of the global-y instance with the resident-B arithmetic that serves the decode tail of ``num_tokens``
+    tokens and ``num_partials`` routed partials at ``tp`` (``TAIL_SB_NORM_ROUTES``), or 0 for the default instance."""
+    n_pad, min_partials = TAIL_SB_NORM_ROUTES.get(int(tp), (0, {}))
+    least = min_partials.get(int(num_tokens))
+    return n_pad if least is not None and int(num_partials) >= least else 0
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -548,7 +583,7 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{'_ef' if plan.get('a_evict_first') else ''}"
         f"{_l2_promotion_suffix(plan.get('a_l2_promotion', 'none'))}"
         f"{'_sf' if plan.get('split_fin') else ''}{'_ea' if plan.get('early_arrive') else ''}"
-        f"{'_upf' if plan.get('up_prefetch') else ''}"
+        f"{'_upf' if plan.get('up_prefetch') else ''}{'_sbn' if plan.get('sb_norm') else ''}"
     )
 
 
@@ -2419,6 +2454,7 @@ __all__ = [
     "tail_gemm_config",
     "tail_gemm_final_ts",
     "tail_gemm_kernel_key",
+    "tail_sb_norm_n_pad",
     "tail_wide_min_tokens",
     "use_fused_norm",
     "use_packed_norm",
