@@ -498,8 +498,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                             unsigned int hidden = (_fast_div_r_1 * _fast_div_q_0 + ((_fast_div_r_1 < _fast_div_r_0) ? _fast_div_r_1 : _fast_div_r_0)) * 64 + kb * 64;
                             if (warp == 0) {
                                 unsigned int stage = seq % 3;
-                                unsigned int _phase_stage_1 = seq / 3 % 2 ^ 1;
-                                mbarrier_wait(empty_io_addr + (stage) * 8, _phase_stage_1);
+                                unsigned int _stage_empty_io = seq % 3;
+                                unsigned int _parity_empty_io = seq / 3 % 2 ^ 1;
+                                mbarrier_wait(empty_io_addr + (_stage_empty_io) * 8, _parity_empty_io);
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -513,8 +514,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                                 mbarrier_arrive_expect_tx(full_io_addr + (stage) * 8, 40960);
                             } else {
                                 unsigned int stage_1 = seq % 2;
-                                unsigned int _phase_stage_1_1 = seq / 2 % 2 ^ 1;
-                                mbarrier_wait(empty_fn_addr + (stage_1) * 8, _phase_stage_1_1);
+                                unsigned int _stage_empty_fn = seq % 2;
+                                unsigned int _parity_empty_fn = seq / 2 % 2 ^ 1;
+                                mbarrier_wait(empty_fn_addr + (_stage_empty_fn) * 8, _parity_empty_fn);
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -552,19 +554,23 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     uint32_t _fast_div_q_2 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(task_1), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(task_1);
                     uint32_t _fast_div_r_2 = (uint32_t)(task_1) - _fast_div_q_2 * (uint32_t)(split_div.divisor);
                     unsigned int ustage = useq % 2;
-                    unsigned int _phase_ustage_1 = useq / 2 % 2 ^ 1;
-                    mbarrier_wait(small_empty_addr + (ustage) * 8, _phase_ustage_1);
+                    unsigned int _stage_small_empty = useq % 2;
+                    unsigned int _parity_small_empty = useq / 2 % 2 ^ 1;
+                    mbarrier_wait(small_empty_addr + (_stage_small_empty) * 8, _parity_small_empty);
                     #pragma unroll 1
                     for (unsigned int kb_1 = 0; kb_1 < _fast_div_q_0 + ((_fast_div_r_2 < _fast_div_r_0) ? 1 : 0); kb_1++) {
                         unsigned int fstage = fseq % 2;
-                        unsigned int _phase_fstage = fseq / 2 % 2;
-                        mbarrier_wait(full_fn_addr + (fstage) * 8, _phase_fstage);
+                        unsigned int _stage_full_fn = fseq % 2;
+                        unsigned int _parity_full_fn = fseq / 2 % 2;
+                        mbarrier_wait(full_fn_addr + (_stage_full_fn) * 8, _parity_full_fn);
                         unsigned int cstage = cseq % 2;
-                        unsigned int _phase_cstage_1 = cseq / 2 % 2 ^ 1;
-                        mbarrier_wait(big_empty_addr + (cstage) * 8, _phase_cstage_1);
+                        unsigned int _stage_big_empty = cseq % 2;
+                        unsigned int _parity_big_empty = cseq / 2 % 2 ^ 1;
+                        mbarrier_wait(big_empty_addr + (_stage_big_empty) * 8, _parity_big_empty);
                         unsigned int astage = aseq % 4;
-                        unsigned int _phase_astage = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage) * 8, _phase_astage);
+                        unsigned int _stage_full_a = aseq % 4;
+                        unsigned int _parity_full_a = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a) * 8, _parity_full_a);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_0 = make_warp_uniform((((fn_pieces_addr) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -636,8 +642,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                         elect_commit(empty_a_addr + (astage) * 8);
                         aseq += 1;
                         unsigned int astage_0 = aseq % 4;
-                        unsigned int _phase_astage_0 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_0) * 8, _phase_astage_0);
+                        unsigned int _stage_full_a_1 = aseq % 4;
+                        unsigned int _parity_full_a_1 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_1) * 8, _parity_full_a_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_12 = make_warp_uniform((((fn_pieces_addr + 32) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -711,11 +718,13 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                         elect_commit(big_full_addr + (cstage) * 8);
                         cseq += 1;
                         unsigned int cstage_1 = cseq % 2;
-                        unsigned int _phase_cstage_1_1 = cseq / 2 % 2 ^ 1;
-                        mbarrier_wait(big_empty_addr + (cstage_1) * 8, _phase_cstage_1_1);
+                        unsigned int _stage_big_empty_1 = cseq % 2;
+                        unsigned int _parity_big_empty_1 = cseq / 2 % 2 ^ 1;
+                        mbarrier_wait(big_empty_addr + (_stage_big_empty_1) * 8, _parity_big_empty_1);
                         unsigned int astage_2 = aseq % 4;
-                        unsigned int _phase_astage_2 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_2) * 8, _phase_astage_2);
+                        unsigned int _stage_full_a_2 = aseq % 4;
+                        unsigned int _parity_full_a_2 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_2) * 8, _parity_full_a_2);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_24 = make_warp_uniform((((fn_pieces_addr + 64) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -787,8 +796,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                         elect_commit(empty_a_addr + (astage_2) * 8);
                         aseq += 1;
                         unsigned int astage_3 = aseq % 4;
-                        unsigned int _phase_astage_3 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_3) * 8, _phase_astage_3);
+                        unsigned int _stage_full_a_3 = aseq % 4;
+                        unsigned int _parity_full_a_3 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_3) * 8, _parity_full_a_3);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_36 = make_warp_uniform((((fn_pieces_addr + 96) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -870,6 +880,7 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
             } else {
                 unsigned int io_seq = 0;
                 unsigned int coeff_seq = 0;
+                unsigned int tasks_done = 0;
                 if ((unsigned int)bid < (num_tokens + 63) / 64 * num_splits) {
                     mbarrier_wait(empty_coeff_addr, 1);
                     if (elect_sync()) {
@@ -890,8 +901,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     #pragma unroll 1
                     for (unsigned int kb_2 = 0; kb_2 < blocks; kb_2++) {
                         unsigned int stage_2 = io_seq % 3;
-                        unsigned int _phase_stage = io_seq / 3 % 2;
-                        mbarrier_wait(store_ready_addr + (stage_2) * 8, _phase_stage);
+                        unsigned int _stage_store_ready = io_seq % 3;
+                        unsigned int _parity_store_ready = io_seq / 3 % 2;
+                        mbarrier_wait(store_ready_addr + (_stage_store_ready) * 8, _parity_store_ready);
                         unsigned int prefetch = kb_2 + 1 == blocks && task_2 + num_ctas < (num_tokens + 63) / 64 * num_splits;
                         if (prefetch != 0) {
                             unsigned int _stage_empty_coeff = coeff_seq % 2;
@@ -926,6 +938,7 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     if (elect_sync()) {
                         mbarrier_arrive(mix_arrival_addr);
                     }
+                    tasks_done += 1;
                 }
             }
         }
@@ -970,8 +983,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                 uint32_t _fast_div_q_6 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(task_3), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(task_3);
                 uint32_t _fast_div_r_6 = (uint32_t)(task_3) - _fast_div_q_6 * (uint32_t)(split_div.divisor);
                 unsigned int coeff_stage = coeff_seq_1 % 2;
-                unsigned int _phase_coeff_stage = coeff_seq_1 / 2 % 2;
-                mbarrier_wait(full_coeff_addr + (coeff_stage) * 8, _phase_coeff_stage);
+                unsigned int _stage_full_coeff = coeff_seq_1 % 2;
+                unsigned int _parity_full_coeff = coeff_seq_1 / 2 % 2;
+                mbarrier_wait(full_coeff_addr + (_stage_full_coeff) * 8, _parity_full_coeff);
                 float post_coeff[8];
                 float comb_coeff[32];
                 #pragma unroll
@@ -1001,8 +1015,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                 #pragma unroll 1
                 for (unsigned int kb_3 = 0; kb_3 < _fast_div_q_0 + ((_fast_div_r_6 < _fast_div_r_0) ? 1 : 0); kb_3++) {
                     unsigned int io_stage = io_seq_1 % 3;
-                    unsigned int _phase_io_stage = io_seq_1 / 3 % 2;
-                    mbarrier_wait(full_io_addr + (io_stage) * 8, _phase_io_stage);
+                    unsigned int _stage_full_io = io_seq_1 % 3;
+                    unsigned int _parity_full_io = io_seq_1 / 3 % 2;
+                    mbarrier_wait(full_io_addr + (_stage_full_io) * 8, _parity_full_io);
                     unsigned int words[16];
                     unsigned int offset = offs[0];
                     unsigned int x_word = x_pairs[io_stage * 2048 + offset];
@@ -1433,8 +1448,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     hc_comp[1] = _sub_26;
                     hc_acc[1] = _add_3;
                     unsigned int ast = a_seq % 4;
-                    unsigned int _phase_ast_1 = a_seq / 4 % 2 ^ 1;
-                    mbarrier_wait(empty_a_addr + (ast) * 8, _phase_ast_1);
+                    unsigned int _stage_empty_a = a_seq % 4;
+                    unsigned int _parity_empty_a = a_seq / 4 % 2 ^ 1;
+                    mbarrier_wait(empty_a_addr + (_stage_empty_a) * 8, _parity_empty_a);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x256b.x4.b32"
@@ -1874,8 +1890,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     hc_comp[1] = _sub_54;
                     hc_acc[1] = _add_7;
                     unsigned int ast_350 = a_seq % 4;
-                    unsigned int _phase_ast_350_1 = a_seq / 4 % 2 ^ 1;
-                    mbarrier_wait(empty_a_addr + (ast_350) * 8, _phase_ast_350_1);
+                    unsigned int _stage_empty_a_1 = a_seq % 4;
+                    unsigned int _parity_empty_a_1 = a_seq / 4 % 2 ^ 1;
+                    mbarrier_wait(empty_a_addr + (_stage_empty_a_1) * 8, _parity_empty_a_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x256b.x4.b32"
@@ -1978,8 +1995,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                 #pragma unroll 1
                 for (unsigned int chunk = 0; chunk < (_fast_div_q_0 + ((_fast_div_r_7 < _fast_div_r_0) ? 1 : 0)) * 2; chunk++) {
                     unsigned int cstage_2 = cseq_1 % 2;
-                    unsigned int _phase_cstage = cseq_1 / 2 % 2;
-                    mbarrier_wait(big_full_addr + (cstage_2) * 8, _phase_cstage);
+                    unsigned int _stage_big_full = cseq_1 % 2;
+                    unsigned int _parity_big_full = cseq_1 / 2 % 2;
+                    mbarrier_wait(big_full_addr + (_stage_big_full) * 8, _parity_big_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_0[8];
                     asm volatile(
@@ -2264,8 +2282,9 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     cseq_1 += 1;
                 }
                 unsigned int ustage_1 = seq_1 % 2;
-                unsigned int _phase_ustage = seq_1 / 2 % 2;
-                mbarrier_wait(small_full_addr + (ustage_1) * 8, _phase_ustage);
+                unsigned int _stage_small_full = seq_1 % 2;
+                unsigned int _parity_small_full = seq_1 / 2 % 2;
+                mbarrier_wait(small_full_addr + (_stage_small_full) * 8, _parity_small_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                 float _tmem_load_2[8];
@@ -2615,7 +2634,7 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     float2 _v2 = make_float2(values_18[0 + 0], values_18[0 + 1]);
                     *reinterpret_cast<float2*>((scratch + ((unsigned long long)task_4 * 1536 + (unsigned long long)(row_17 * 24) + 16 + (unsigned long long)(lane_in_warp % 4 * 2))) + 0) = _v2;
                 }
-                unsigned int _parity_full_stats = seq_1 % 2;
+                int _parity_full_stats = (int)((unsigned int)(int)seq_1 % 2);
                 mbarrier_wait(full_stats_addr, _parity_full_stats);
                 if (lane_in_warp < 16) {
                     unsigned int row_0_1 = warp % 4 * 16 + lane_in_warp;
@@ -2635,7 +2654,7 @@ kernel_cake_mega_mhc_1c61fed11caf93d1b762(const __grid_constant__ CUtensorMap re
                     mbarrier_arrive(mix_arrival_addr);
                 }
                 if (warp % 4 == 0) {
-                    unsigned int _parity_mix_arrival = seq_1 % 2;
+                    int _parity_mix_arrival = (int)((unsigned int)(int)seq_1 % 2);
                     mbarrier_wait(mix_arrival_addr, _parity_mix_arrival);
                     if (elect_sync()) {
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
