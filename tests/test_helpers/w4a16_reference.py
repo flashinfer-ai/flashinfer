@@ -566,13 +566,29 @@ def canonical_split_w4a16_weights(tensors, gated):
             tensors[f"{name}_weight_sf"], rows, 2 * packed_k, experts
         )
         if name == "w1" and gated:
-            # Split stores [up64,gate64,...]; the oracle consumes
-            # canonical [all_gate,all_up], including matching scales.
-            assert rows % 128 == 0
+            # Split interleaves up/gate rows in 16-row groups on Blackwell
+            # and 64-row groups on Rubin. The oracle consumes canonical
+            # [all_gate,all_up], including matching scales.
+            capability = torch.cuda.get_device_capability(packed.device)
+            if capability in ((10, 0), (10, 3)):
+                group_size = 16
+            elif capability == (10, 7):
+                group_size = 64
+            else:
+                raise ValueError(
+                    f"Unsupported split W4A16 reference device: {capability}"
+                )
+            assert rows % (2 * group_size) == 0
 
             def gate_first(value):
                 return (
-                    value.reshape(experts, rows // 128, 2, 64, value.shape[-1])
+                    value.reshape(
+                        experts,
+                        rows // (2 * group_size),
+                        2,
+                        group_size,
+                        value.shape[-1],
+                    )
                     .transpose(1, 2)
                     .flip(1)
                     .reshape_as(value)

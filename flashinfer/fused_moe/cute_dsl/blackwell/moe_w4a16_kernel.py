@@ -272,6 +272,7 @@ class Sm100W4A16GroupedGemmKernel:
         raster_along_m: bool,
         transform_fragment_size: int,
         m_cluster_aligned: bool,
+        gated_weight_group_size: int,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -293,6 +294,9 @@ class Sm100W4A16GroupedGemmKernel:
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
         self.m_cluster_aligned = m_cluster_aligned
+        if gated_weight_group_size not in (16, 64):
+            raise ValueError("gated_weight_group_size must be 16 or 64")
+        self.gated_weight_group_size = gated_weight_group_size
         if activation_type is None:
             if situ_beta is not None or situ_linear_beta is not None:
                 raise ValueError("SiTU parameters require an activation")
@@ -1280,8 +1284,19 @@ class Sm100W4A16GroupedGemmKernel:
         sS_tma = cute.make_tensor(sS_input.iterator, scale_tma_smem_layout)
         sA_transform_input = sA_input
         sS_transform_input = sS_input
-        # Prepared gated weights already pair up16/gate16 rows, matching each
-        # epilogue warp's 32 TMEM lanes. Decode weights and scales in that order.
+        # Prepared 16-row groups already match each epilogue warp's TMEM rows.
+        if cutlass.const_expr(self.gated and self.gated_weight_group_size == 64):
+            # Pair 16-row up/gate slices during decode so each epilogue warp
+            # owns both operands in its 32 TMEM lanes.
+            gated_row_layout = cute.make_layout(((16, 2), 4), stride=((1, 64), 16))
+            sA_transform_input = cute.composition(
+                sA_input,
+                ((gated_row_layout, None), None, None, None),
+            )
+            sS_transform_input = cute.composition(
+                sS_input,
+                ((gated_row_layout, None), None, None),
+            )
         sB_input = smem.allocate_tensor(
             element_type=self.b_dtype,
             layout=b_smem_layout.outer,

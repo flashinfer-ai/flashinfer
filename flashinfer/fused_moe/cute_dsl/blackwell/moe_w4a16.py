@@ -122,6 +122,7 @@ def _get_compiled_kernel(
     mma_tiler_mnk: Tuple[int, int, int],
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
+    gated_weight_group_size: int,
 ):
     mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
@@ -149,6 +150,7 @@ def _get_compiled_kernel(
         raster_along_m,
         transform_fragment_size,
         m_cluster_aligned,
+        gated_weight_group_size,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -172,6 +174,7 @@ def _get_compiled_kernel(
             raster_along_m=raster_along_m,
             transform_fragment_size=transform_fragment_size,
             m_cluster_aligned=m_cluster_aligned,
+            gated_weight_group_size=gated_weight_group_size,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -219,6 +222,9 @@ def _run_grouped_gemm(
     enable_pdl: bool,
     tactic: W4A16GemmTactic,
 ) -> None:
+    from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
+
+    gated_weight_group_size = _cute_dsl_gated_weight_group_size(weight.device)
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
@@ -339,6 +345,7 @@ def _run_grouped_gemm(
         mma_tiler_mnk,
         cluster_shape_mn,
         raster_along_m,
+        gated_weight_group_size,
     )
     compiled(
         weight_ptr,
