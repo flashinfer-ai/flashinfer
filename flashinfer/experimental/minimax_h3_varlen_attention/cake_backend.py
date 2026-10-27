@@ -75,7 +75,10 @@ Two program families share this package:
   ``NVFP4_TWO_STAGE_DENSE`` (sm_100a, fp8 PV) runs every unit on both Q
   stages and takes the cluster-tile count ``total_clusters`` instead of
   ``num_tiles``: its plans carry whole two-stage units only (``q_half`` 0, no
-  halves).  The attention launch is a
+  halves).  On ``NVFP4_QS_DENSE`` (sm_100a, fp8 PV) a plan whose single-stage
+  tables have tail-round Q-split units and no K/V-split units binds the
+  single-stage dense program ``attention_qs`` with those tables instead
+  (:func:`nvfp4_tile_tables`).  The attention launch is a
   programmatic dependent launch (PDL): the quantizer signals
   ``griddepcontrol.launch_dependents`` at its end and the attention prologue
   waits with ``griddepcontrol.wait`` after its barrier/TMEM setup.  The PDL
@@ -88,7 +91,8 @@ Two program families share this package:
   attention programs are registered per architecture -- the dense
   ``attention`` (no K/V-split code, no split parameters) and
   ``attention_split`` (five more parameters: K/V range, partial slots,
-  partial workspace) -- and the runner binds the
+  partial workspace) -- plus, on the fp8 route of ``NVFP4_QS_DENSE_ARCHES``,
+  the single-stage dense ``attention_qs``, and the runner binds the
   one the plan needs with that program's parameter set
   (:func:`nvfp4_attention_stage`).
 
@@ -149,6 +153,7 @@ from .cake_jit import (
     BF16_TINY_ARCHES,
     FP8_TINY_SEGMENT_TOKENS,
     MODULES,
+    NVFP4_QS_DENSE_ARCHES,
     NVFP4_QUANTIZE_TP_ARCHES,
     STAGES,
     load_cake_minimax_h3_varlen_attention_module,
@@ -414,7 +419,8 @@ AMAX_KWARGS = ("v", "v_amax_partial", "num_vectors", "num_chunks", "grid")
 # count ``num_tiles``; the ``attention_split`` program adds the K/V range and
 # partial-slot tables and the partial workspace.  The dense program of a
 # ``NVFP4_TWO_STAGE_DENSE`` pair takes the plan's cluster-tile count
-# ``total_clusters`` in place of ``num_tiles`` (:func:`nvfp4_attention_kwargs`).
+# ``total_clusters`` in place of ``num_tiles``, and the ``attention_qs`` program
+# of a ``NVFP4_QS_DENSE`` pair the dense parameters (:func:`nvfp4_attention_kwargs`).
 NVFP4_ATTENTION_COMMON_KWARGS = (
     "Q",
     "K",
@@ -460,8 +466,17 @@ NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS = (
 # :func:`build_tile_tables` ``two_stage_dense``).  Its split program, and every
 # program of the other pairs, runs single-stage units and Q-split halves.  On
 # sm_100a fp8 PV the single-stage form of the dense program costs more per
-# unit than the placement it buys.
+# unit than the placement it buys, except for the tail-round Q-split halves:
+# a ``NVFP4_QS_DENSE`` pair binds the single-stage dense program
+# ``attention_qs`` for a plan whose single-stage tables have Q-split units and
+# no K/V-split units (:func:`nvfp4_tile_tables`), the two-stage ``attention``
+# for every other plan without K/V-split units.
 NVFP4_TWO_STAGE_DENSE: frozenset[tuple[str, str]] = frozenset({("fp8", "sm_100a")})
+NVFP4_QS_DENSE: frozenset[tuple[str, str]] = frozenset(
+    ("fp8", arch) for arch in NVFP4_QS_DENSE_ARCHES
+)
+# The attention stages of the NVFP4 routes; the runner binds one per plan.
+NVFP4_ATTENTION_STAGES = ("attention", "attention_qs", "attention_split")
 NVFP4_ATTENTION_TWO_STAGE_FP8PV_KWARGS = tuple(
     "total_clusters" if name == "num_tiles" else name
     for name in NVFP4_ATTENTION_FP8PV_KWARGS
@@ -1301,6 +1316,7 @@ def build_tile_tables(
     ),
     q_split: Optional[Union[bool, str]] = None,
     two_stage_dense: bool = False,
+    q_split_dense: bool = False,
 ) -> TileTables:
     """Per-unit tables: segment-major enumeration, K/V splits, Q halves, then LPT slot placement.
 
@@ -1321,7 +1337,11 @@ def build_tile_tables(
     plans a plan without K/V-split units as whole two-stage units: ``q_half``
     0 everywhere, every cost undiscounted and no Q-split halves, so the units
     are the ``heads * total_clusters`` the program runs; a plan with split
-    units binds the split program and keeps both.  The
+    units binds the split program and keeps both.  ``q_split_dense`` (a
+    ``NVFP4_QS_DENSE`` pair) decides the Q-splits on the single-stage costs
+    first: a plan without K/V-split units whose tail round takes halves keeps
+    them and its single-stage costs (it binds the single-stage dense program),
+    so ``two_stage_dense`` applies only to a plan with neither.  The
     units are then placed into the persistent grid's statically strided slots
     longest-processing-time first (:func:`assign_unit_slots`; equal costs keep
     the enumeration order).  The
@@ -1331,6 +1351,59 @@ def build_tile_tables(
     ``bf16_grid_clusters(device)``, a CUDA device).  Mirrors the Cake
     production planner's ``build_tile_tables``.
     """
+    pre = _tile_units(
+        plan,
+        heads,
+        device,
+        num_clusters=num_clusters,
+        kv_splits=kv_splits,
+        program_cost=program_cost,
+        single_stage_cost=single_stage_cost,
+    )
+    units, costs, half_costs = pre.units, pre.costs, pre.half_costs
+    if q_split_dense and two_stage_dense and not pre.combine:
+        halve = _q_split_halves(costs, half_costs, pre.num_clusters, q_split)
+        if any(halve):
+            return _place_tile_units(plan, pre, units, costs, half_costs, halve, device)
+    if two_stage_dense and not pre.combine:
+        units, costs, half_costs = _two_stage_dense_units(plan, pre, single_stage_cost)
+    halve = _q_split_halves(costs, half_costs, pre.num_clusters, q_split)
+    return _place_tile_units(plan, pre, units, costs, half_costs, halve, device)
+
+
+@dataclass(frozen=True)
+class _TileUnits:
+    """The host prefix of :func:`build_tile_tables` shared by both dense forms.
+
+    The units in enumeration order with their LPT costs and Q-half costs
+    (``None``: stays whole), the combine records and partial-slot count of
+    the K/V-split units, ``split_of`` per enumerated unit, the cluster-tile
+    columns ``cl`` and the resolved ``num_clusters``.  ``two_stage_dense`` and
+    the Q-split decision act on it afterwards; nothing here touches a device.
+    """
+
+    heads: int
+    num_clusters: int
+    cl: dict[str, list[int]]
+    split_of: list[int]
+    units: list[tuple[int, int, int, int, int, int]]
+    costs: list[int]
+    half_costs: list[Optional[int]]
+    combine: list[int]
+    partial_slots: int
+
+
+def _tile_units(
+    plan: PackedSegmentPlan,
+    heads: int,
+    device: torch.device,
+    *,
+    num_clusters: Optional[int],
+    kv_splits: Optional[int],
+    program_cost: float,
+    single_stage_cost: tuple[int, int],
+) -> _TileUnits:
+    """Enumeration, K/V splits (:func:`choose_kv_splits`) and costs of :func:`build_tile_tables`."""
     heads = int(heads)
     if heads <= 0:
         raise ValueError("heads must be positive")
@@ -1408,37 +1481,78 @@ def build_tile_tables(
                     )
                     half_costs.append(None)  # K/V ranges stay clear of the combine path
                     partial_slots += 1
-    if two_stage_dense and not combine:
-        # The dense program runs both Q stages of every unit: whole units, no halves.
-        units = [(*unit[:5], 0) for unit in units]
-        costs = [nvfp4_unit_cost(unit[3], False, single_stage_cost) for unit in units]
-        half_costs = [None for _ in units]
-        assert len(units) == heads * plan.total_clusters
+    return _TileUnits(
+        heads=heads,
+        num_clusters=num_clusters,
+        cl=cl,
+        split_of=split_of,
+        units=units,
+        costs=costs,
+        half_costs=half_costs,
+        combine=combine,
+        partial_slots=partial_slots,
+    )
+
+
+def _two_stage_dense_units(
+    plan: PackedSegmentPlan, pre: _TileUnits, single_stage_cost: tuple[int, int]
+) -> tuple[list[tuple[int, int, int, int, int, int]], list[int], list[Optional[int]]]:
+    """``two_stage_dense`` on a plan without K/V-split units: whole two-stage units, undiscounted, no halves."""
+    assert not pre.combine
+    # The dense program runs both Q stages of every unit: whole units, no halves.
+    units = [(*unit[:5], 0) for unit in pre.units]
+    costs = [nvfp4_unit_cost(unit[3], False, single_stage_cost) for unit in units]
+    half_costs: list[Optional[int]] = [None for _ in units]
+    assert len(units) == pre.heads * plan.total_clusters
+    return units, costs, half_costs
+
+
+def _q_split_halves(
+    costs: Sequence[int],
+    half_costs: Sequence[Optional[int]],
+    num_clusters: int,
+    q_split: Optional[Union[bool, str]],
+) -> list[bool]:
+    """The units :func:`build_tile_tables` halves (``q_split`` as there)."""
     if q_split is None:
         q_split = bool(NVFP4_Q_SPLIT_PLAN)
+    if not q_split:
+        return [False] * len(costs)
+    if q_split == "all":
+        return [half is not None for half in half_costs]
+    return bf16_choose_q_splits(costs, half_costs, int(num_clusters))
+
+
+def _place_tile_units(
+    plan: PackedSegmentPlan,
+    pre: _TileUnits,
+    units: list[tuple[int, int, int, int, int, int]],
+    costs: list[int],
+    half_costs: Sequence[Optional[int]],
+    halve: Sequence[bool],
+    device: torch.device,
+) -> TileTables:
+    """The halves, the LPT slot placement and the device tables of :func:`build_tile_tables`."""
+    heads, num_clusters, cl = pre.heads, pre.num_clusters, pre.cl
+    split_of, combine, partial_slots = pre.split_of, pre.combine, pre.partial_slots
     num_q_split_units = 0
-    if q_split:
-        if q_split == "all":
-            halve = [half is not None for half in half_costs]
-        else:
-            halve = bf16_choose_q_splits(costs, half_costs, int(num_clusters))
-        if any(halve):
-            split_units: list[tuple[int, int, int, int, int, int]] = []
-            split_costs: list[int] = []
-            for u, (unit, cost) in enumerate(zip(units, costs, strict=True)):
-                if not halve[u]:
-                    split_units.append(unit)
-                    split_costs.append(cost)
-                    continue
-                half_cost = half_costs[u]
-                assert half_cost is not None
-                # Consecutive in enumeration order: the stable LPT sort keeps
-                # the two halves on neighbouring slots (one head's K/V in L2).
-                for q_half in (1, 2):
-                    split_units.append((*unit[:5], q_half))
-                    split_costs.append(half_cost)
-                num_q_split_units += 1
-            units, costs = split_units, split_costs
+    if any(halve):
+        split_units: list[tuple[int, int, int, int, int, int]] = []
+        split_costs: list[int] = []
+        for u, (unit, cost) in enumerate(zip(units, costs, strict=True)):
+            if not halve[u]:
+                split_units.append(unit)
+                split_costs.append(cost)
+                continue
+            half_cost = half_costs[u]
+            assert half_cost is not None
+            # Consecutive in enumeration order: the stable LPT sort keeps
+            # the two halves on neighbouring slots (one head's K/V in L2).
+            for q_half in (1, 2):
+                split_units.append((*unit[:5], q_half))
+                split_costs.append(half_cost)
+            num_q_split_units += 1
+        units, costs = split_units, split_costs
     num_tiles = len(units)
     slots = [
         units[u]
@@ -1905,8 +2019,9 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     launch) into the caller-owned ``out`` with no CUDA allocation and no host
     synchronization.  ``quantize()`` and ``attention()`` run the stages
     separately so callers can time them on their own.  The attention launch
-    uses one of two generated programs, chosen at preparation from the plan:
-    the dense ``attention`` module for plans without split units and
+    uses one of the generated programs, chosen at preparation from the plan:
+    the dense ``attention`` module for plans without split units (on a
+    ``NVFP4_QS_DENSE`` pair ``attention_qs`` for the Q-split plans) and
     ``attention_split`` otherwise (``attention_stage``).  Packed operands live in ``workspace`` (allocated at
     preparation).  Prepare a new runner when ``cu_seqlens``, shapes or tensor
     bindings change; values may change freely since quantization is part of
@@ -1956,8 +2071,9 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
 
     @property
     def attention_stage(self) -> str:
-        """``"attention_split"`` for plans with K/V-split units, else ``"attention"``."""
-        return nvfp4_attention_stage(self.tile_tables)
+        """``"attention_split"`` for plans with K/V-split units, ``"attention_qs"``
+        for the Q-split plans of a ``NVFP4_QS_DENSE`` pair, else ``"attention"``."""
+        return nvfp4_attention_stage(self.tile_tables, self.pv_mode, self.arch)
 
     def launch(self) -> torch.Tensor:
         self._run(STAGES[self.variant])
@@ -2000,29 +2116,45 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
         )
 
 
-def nvfp4_attention_stage(tiles: TileTables) -> str:
+def nvfp4_attention_stage(
+    tiles: TileTables, pv_mode: Optional[str] = None, arch: Optional[str] = None
+) -> str:
     """The attention program a plan binds: ``attention_split`` when the tile
-    tables hold any K/V-split unit (partial slots), else the dense ``attention``.
+    tables hold any K/V-split unit (partial slots), ``attention_qs`` when the
+    tables of a ``NVFP4_QS_DENSE`` ``(pv_mode, arch)`` pair hold Q-split units
+    (:func:`nvfp4_tile_tables` plans them single-stage only then), else the
+    dense ``attention``.
 
-    Both are the same generated program specialised at build time; the dense
+    They are the same generated program specialised at build time; the dense
     variant carries no K/V-range or partial-slot code, which keeps the softmax
     block loop of unsplit units at the schedule of the single-program kernel.
     """
-    return "attention_split" if int(tiles.num_partial_slots) > 0 else "attention"
+    if int(tiles.num_partial_slots) > 0:
+        return "attention_split"
+    if (pv_mode, arch) in NVFP4_QS_DENSE and int(tiles.num_q_split_units) > 0:
+        return "attention_qs"
+    return "attention"
 
 
 def nvfp4_attention_kwargs(pv_mode: str, arch: str, stage: str) -> tuple[str, ...]:
     """The parameters, in order, the host binds to the ``stage`` attention program
-    (``"attention"`` / ``"attention_split"``) of ``(pv_mode, arch)``.
+    (``"attention"`` / ``"attention_qs"`` / ``"attention_split"``) of
+    ``(pv_mode, arch)``.
 
     The dense program of a ``NVFP4_TWO_STAGE_DENSE`` pair takes
-    ``total_clusters`` in place of ``num_tiles``; :func:`_bind_stage` refuses a
-    generated program whose argument plan names a different set.
+    ``total_clusters`` in place of ``num_tiles``, and the ``attention_qs``
+    program of a ``NVFP4_QS_DENSE`` pair the single-stage dense parameters
+    (``num_tiles``); :func:`_bind_stage` refuses a generated program whose
+    argument plan names a different set.
     """
     if stage == "attention_split":
         if pv_mode == "fp4":
             return NVFP4_ATTENTION_SPLIT_FP4PV_KWARGS
         return NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS
+    if stage == "attention_qs":
+        if (pv_mode, arch) not in NVFP4_QS_DENSE:
+            raise ValueError(f"no attention_qs program for {(pv_mode, arch)!r}")
+        return NVFP4_ATTENTION_FP8PV_KWARGS
     if stage != "attention":
         raise ValueError(f"not an NVFP4 attention stage: {stage!r}")
     if (pv_mode, arch) in NVFP4_TWO_STAGE_DENSE:
@@ -2031,6 +2163,38 @@ def nvfp4_attention_kwargs(pv_mode: str, arch: str, stage: str) -> tuple[str, ..
     if pv_mode == "fp4":
         return NVFP4_ATTENTION_FP4PV_KWARGS
     return NVFP4_ATTENTION_FP8PV_KWARGS
+
+
+def nvfp4_tile_tables(
+    plan: PackedSegmentPlan,
+    heads: int,
+    device: torch.device,
+    pv_mode: str,
+    arch: str,
+    *,
+    num_clusters: Optional[int] = None,
+) -> TileTables:
+    """The tile tables an NVFP4 plan of ``(pv_mode, arch)`` binds
+    (:func:`build_tile_tables` with the pair's costs).
+
+    One :func:`build_tile_tables` call with the pair's costs: a
+    ``NVFP4_QS_DENSE`` pair passes ``q_split_dense``, so a plan with tail-round
+    Q-split units and no K/V-split units keeps its single-stage tables (they
+    bind ``attention_qs``, :func:`nvfp4_attention_stage`) and only a plan with
+    neither takes the ``two_stage_dense`` form.  ``num_clusters``: as
+    :func:`build_tile_tables`.
+    """
+    pair = (pv_mode, arch)
+    return build_tile_tables(
+        plan,
+        heads,
+        device,
+        num_clusters=num_clusters,
+        program_cost=SPLIT_PROGRAM_COST.get(pair, 1.0),
+        single_stage_cost=NVFP4_SINGLE_STAGE_COST[pair],
+        two_stage_dense=pair in NVFP4_TWO_STAGE_DENSE,
+        q_split_dense=pair in NVFP4_QS_DENSE,
+    )
 
 
 def nvfp4_quantize_stage(
@@ -2427,14 +2591,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
                     f"{NVFP4_WORKSPACE_ALIGN}-byte aligned"
                 )
     PB = int(plan.PB)
-    tiles = build_tile_tables(
-        plan,
-        num_heads,
-        device,
-        program_cost=SPLIT_PROGRAM_COST.get((pv_mode, arch), 1.0),
-        single_stage_cost=NVFP4_SINGLE_STAGE_COST[(pv_mode, arch)],
-        two_stage_dense=(pv_mode, arch) in NVFP4_TWO_STAGE_DENSE,
-    )
+    tiles = nvfp4_tile_tables(plan, num_heads, device, pv_mode, arch)
     quantize_kwargs = dict(
         q=query,
         k=key,
@@ -2515,7 +2672,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         )
     else:
         pv_operands = dict(V=workspace["v_fp8"], v_amax=workspace["v_amax"])
-    # Both programs take the unit count (the two-stage dense program the
+    # Every program takes the unit count (the two-stage dense program the
     # plan's cluster-tile count instead); the split program additionally the
     # K/V range / partial-slot tables and the partial workspace; exactly one
     # of them is bound.
@@ -2538,6 +2695,12 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         pv_mode, arch, "attention_split"
     )
     stage_kwargs["attention"] = attention_kwargs
+    if pv_mode == "fp8":
+        # The single-stage dense program of a NVFP4_QS_DENSE pair (bound for
+        # its Q-split plans) takes the unit count; the route of any other
+        # architecture names no such stage and never binds it.
+        stage_kwargs["attention_qs"] = {**attention_common, **pv_operands}
+        assert tuple(stage_kwargs["attention_qs"]) == NVFP4_ATTENTION_FP8PV_KWARGS
     stage_kwargs["attention_split"] = attention_split_kwargs
     stage_kwargs["combine"] = combine_kwargs(
         tiles.partial_O,
@@ -2550,7 +2713,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         tiles.num_combine_units,
     )
     assert tuple(stage_kwargs) == STAGES[variant]
-    attention_stage = nvfp4_attention_stage(tiles)
+    attention_stage = nvfp4_attention_stage(tiles, pv_mode, arch)
     quantize_stage = nvfp4_quantize_stage(
         pv_mode, num_heads, PB, _device_facts(_device_index(device))[0], arch=arch
     )
@@ -2559,7 +2722,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         skipped = (
             total_tiles == 0
             or (stage == "combine" and tiles.num_combine_units == 0)
-            or (stage in ("attention", "attention_split") and stage != attention_stage)
+            or (stage in NVFP4_ATTENTION_STAGES and stage != attention_stage)
             or (stage in QUANTIZER_STAGES and stage != quantize_stage)
         )
         if skipped:
@@ -2571,7 +2734,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
             route["modules"][stage],
             arch,
             stage_kwargs[stage],
-            exact=stage in ("attention", "attention_split", "quantize_tp"),
+            exact=stage in (*NVFP4_ATTENTION_STAGES, "quantize_tp"),
             by_value=QUANTIZE_TP_BY_VALUE if stage == "quantize_tp" else (),
         )
         stages.append((stage, entry, arguments))

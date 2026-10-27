@@ -43,7 +43,9 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #                     "attention_split", "combine")`` on sm_100a and ``("quantize",
 #                     "attention", "attention_split", "combine")`` on sm_103a
 # * ``nvfp4_fp8pv``   stages ``("amax", "quantize", "quantize_early_qk",
-#                     "attention", "attention_split", "combine")``
+#                     "attention", "attention_qs", "attention_split", "combine")``
+#                     on sm_100a and ``("amax", "quantize", "quantize_early_qk",
+#                     "attention", "attention_split", "combine")`` on sm_103a
 #
 # ``quantize`` is one fused single-launch quantizer per PV mode
 # (``minimax_h3_varlen_nvfp4_quantize_qkv`` / ``..._quantize_qk_fp8v``); the
@@ -61,9 +63,13 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # kernel's programmatic dependent launch); the NVFP4 routes carry two
 # attention programs, the dense ``attention`` (no K/V-split code; bound for
 # plans without split units) and ``attention_split`` (reads the unit's K/V
-# block range and writes partial rows; bound when the plan has split units)
-# -- the runner binds exactly one of them per plan -- and both bindings carry
-# the programmatic dependent launch attribute; the BF16 route carries four
+# block range and writes partial rows; bound when the plan has split units),
+# and the fp8 route on ``NVFP4_QS_DENSE_ARCHES`` a third, ``attention_qs`` (the
+# single-stage dense program, bound for plans with tail-round Q-split units and
+# no K/V-split units; ``attention`` is the two-stage dense program there,
+# ``cake_backend.NVFP4_TWO_STAGE_DENSE``) -- the runner binds exactly one of
+# them per plan -- and every attention binding carries the programmatic
+# dependent launch attribute; the BF16 route carries four
 # bitwise-identical attention programs selected per plan by the host planner
 # (``cake_backend.build_bf16_segment_plan``): ``attention_tiny`` (on
 # ``BF16_TINY_ARCHES``; one CTA per head and segment, for plans whose every
@@ -143,7 +149,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     "cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16": {
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "role": "kernel",
         "sources": [
             "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16_kernel.cu",
@@ -173,7 +179,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_103a": "e34915522906425f5b9216ae6d0e1c132a9fd19b452a7518a1fce0759b578fe2",
+            "sm_100a": "3c3802902e7d8606d61803358476c114739cb54c72133b475d676fb35706f1cb",
+            "sm_103a": "023d480ad29eeae4423732e9d8a3d943c42db865594a9c7a2f849dcb0980ce51",
         },
     },
     "cake_minimax_h3_varlen_attention_1f0285434cb51b016f42": {
@@ -685,6 +692,7 @@ ROUTES: dict[str, dict[str, Any]] = {
             "quantize",
             "quantize_early_qk",
             "attention",
+            "attention_qs",
             "attention_split",
             "combine",
         ],
@@ -693,6 +701,7 @@ ROUTES: dict[str, dict[str, Any]] = {
             "quantize": "cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34",
             "quantize_early_qk": "cake_minimax_h3_varlen_attention_bf109517d2bd582e5452",
             "attention": "cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1",
+            "attention_qs": "cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16",
             "attention_split": "cake_minimax_h3_varlen_attention_89f32e4786d93ee3b7bb",
             "combine": "cake_minimax_h3_varlen_attention_5e9badc10a1a02a423c0",
         },
@@ -740,6 +749,7 @@ STAGES = {
         "quantize",
         "quantize_early_qk",
         "attention",
+        "attention_qs",
         "attention_split",
         "combine",
     ),
@@ -814,6 +824,11 @@ BF16_TINY_ARCHES = ("sm_100a", "sm_103a")
 # by-value-table build of the fp4 quantizer, built for sm_100a only); a plan on
 # any other route binds ``quantize``.
 NVFP4_QUANTIZE_TP_ARCHES = ("sm_100a",)
+# Architectures whose fp8-PV route carries the ``attention_qs`` program (the
+# single-stage dense program beside the two-stage ``attention`` program of
+# ``cake_backend.NVFP4_TWO_STAGE_DENSE``); a plan on any other route binds
+# ``attention`` for every plan without K/V-split units.
+NVFP4_QS_DENSE_ARCHES = ("sm_100a",)
 
 
 def stages_for(variant: str, arch: str) -> tuple[str, ...]:
@@ -825,6 +840,8 @@ def stages_for(variant: str, arch: str) -> tuple[str, ...]:
         stages = tuple(s for s in stages if s != "attention_tiny")
     if variant == "nvfp4_fp4pv" and arch not in NVFP4_QUANTIZE_TP_ARCHES:
         stages = tuple(s for s in stages if s != "quantize_tp")
+    if variant == "nvfp4_fp8pv" and arch not in NVFP4_QS_DENSE_ARCHES:
+        stages = tuple(s for s in stages if s != "attention_qs")
     return stages
 
 

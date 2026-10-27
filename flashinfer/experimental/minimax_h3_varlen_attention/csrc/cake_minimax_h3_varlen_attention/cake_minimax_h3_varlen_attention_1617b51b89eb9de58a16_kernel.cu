@@ -75,7 +75,11 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_V_STRIDE 8192
 #define SMEM_TOTAL 144384
 #define THREADS 512
+#if __CUDA_ARCH__ == 1030
 #define USE_TMEM_LD_RED 1
+#else
+#define USE_TMEM_LD_RED 0
+#endif
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
@@ -252,6 +256,41 @@ __device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) 
     }
 }
 
+#if __CUDA_ARCH__ == 1030
+#else
+
+__device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
+    const float c0 = 1.0f, c1 = 0.695146143436431884765625f;
+    const float c2 = 0.227564394474029541015625f, c3 = 0.077119089663028717041015625f;
+    const float magic = 12582912.0f;
+    float x0 = max_noftz(value.x, -127.0f), x1 = max_noftz(value.y, -127.0f);
+    float2 xc2 = make_float2(x0, x1), magic2 = make_float2(magic, magic);
+    float2 xr2;
+    asm("add.rm.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xr2)
+        : "l"(*(unsigned long long*)&xc2), "l"(*(unsigned long long*)&magic2));
+    float2 c3_2 = make_float2(c3, c3), c2_2 = make_float2(c2, c2);
+    float2 c1_2 = make_float2(c1, c1), c0_2 = make_float2(c0, c0);
+    float2 xrb2, xfrac2;
+    asm("sub.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xrb2)
+        : "l"(*(unsigned long long*)&xr2), "l"(*(unsigned long long*)&magic2));
+    asm("sub.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xfrac2)
+        : "l"(*(unsigned long long*)&xc2), "l"(*(unsigned long long*)&xrb2));
+    float2 poly2;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
+        : "l"(*(unsigned long long*)&c3_2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c2_2));
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
+        : "l"(*(unsigned long long*)&poly2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c1_2));
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
+        : "l"(*(unsigned long long*)&poly2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c0_2));
+    int x0r_i, x1r_i, p0_i, p1_i;
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(x0r_i), "=r"(x1r_i) : "l"(*(unsigned long long*)&xr2));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(p0_i), "=r"(p1_i) : "l"(*(unsigned long long*)&poly2));
+    float r0, r1;
+    asm("mov.b32 %0, %1;" : "=f"(r0) : "r"((x0r_i << 23) + p0_i));
+    asm("mov.b32 %0, %1;" : "=f"(r1) : "r"((x1r_i << 23) + p1_i));
+    return make_float2(r0, r1);
+}
+#endif
 
 
 
@@ -532,12 +571,16 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                         float sv[128];
                         float tile_max = -CUDART_INF_F;
                         {
+#if __CUDA_ARCH__ == 1030
                             float lo_max = -CUDART_INF_F;
                             float hi_max = -CUDART_INF_F;
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                             #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
                             #endif
+#else
+#endif
                             asm volatile(
+#if __CUDA_ARCH__ == 1030
                                 "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
                                 : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(lo_max)
@@ -546,13 +589,46 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                             #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
                             #endif
+#else
+                                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31])
+                                : "r"(s_addr));
+#endif
                             asm volatile(
+#if __CUDA_ARCH__ == 1030
                                 "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                                 " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
                                 : "=f"(sv[64]), "=f"(sv[65]), "=f"(sv[66]), "=f"(sv[67]), "=f"(sv[68]), "=f"(sv[69]), "=f"(sv[70]), "=f"(sv[71]), "=f"(sv[72]), "=f"(sv[73]), "=f"(sv[74]), "=f"(sv[75]), "=f"(sv[76]), "=f"(sv[77]), "=f"(sv[78]), "=f"(sv[79]), "=f"(sv[80]), "=f"(sv[81]), "=f"(sv[82]), "=f"(sv[83]), "=f"(sv[84]), "=f"(sv[85]), "=f"(sv[86]), "=f"(sv[87]), "=f"(sv[88]), "=f"(sv[89]), "=f"(sv[90]), "=f"(sv[91]), "=f"(sv[92]), "=f"(sv[93]), "=f"(sv[94]), "=f"(sv[95]), "=f"(sv[96]), "=f"(sv[97]), "=f"(sv[98]), "=f"(sv[99]), "=f"(sv[100]), "=f"(sv[101]), "=f"(sv[102]), "=f"(sv[103]), "=f"(sv[104]), "=f"(sv[105]), "=f"(sv[106]), "=f"(sv[107]), "=f"(sv[108]), "=f"(sv[109]), "=f"(sv[110]), "=f"(sv[111]), "=f"(sv[112]), "=f"(sv[113]), "=f"(sv[114]), "=f"(sv[115]), "=f"(sv[116]), "=f"(sv[117]), "=f"(sv[118]), "=f"(sv[119]), "=f"(sv[120]), "=f"(sv[121]), "=f"(sv[122]), "=f"(sv[123]), "=f"(sv[124]), "=f"(sv[125]), "=f"(sv[126]), "=f"(sv[127]), "=f"(hi_max)
                                 : "r"(tmem_scores + 64 + (warp % 4 * 32 << 16)));
+#else
+                                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
+                                : "r"(s_addr + 32));
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                : "=f"(sv[64]), "=f"(sv[65]), "=f"(sv[66]), "=f"(sv[67]), "=f"(sv[68]), "=f"(sv[69]), "=f"(sv[70]), "=f"(sv[71]), "=f"(sv[72]), "=f"(sv[73]), "=f"(sv[74]), "=f"(sv[75]), "=f"(sv[76]), "=f"(sv[77]), "=f"(sv[78]), "=f"(sv[79]), "=f"(sv[80]), "=f"(sv[81]), "=f"(sv[82]), "=f"(sv[83]), "=f"(sv[84]), "=f"(sv[85]), "=f"(sv[86]), "=f"(sv[87]), "=f"(sv[88]), "=f"(sv[89]), "=f"(sv[90]), "=f"(sv[91]), "=f"(sv[92]), "=f"(sv[93]), "=f"(sv[94]), "=f"(sv[95])
+                                : "r"(s_addr + 64));
+                            asm volatile(
+                                "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                                " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                                : "=f"(sv[96]), "=f"(sv[97]), "=f"(sv[98]), "=f"(sv[99]), "=f"(sv[100]), "=f"(sv[101]), "=f"(sv[102]), "=f"(sv[103]), "=f"(sv[104]), "=f"(sv[105]), "=f"(sv[106]), "=f"(sv[107]), "=f"(sv[108]), "=f"(sv[109]), "=f"(sv[110]), "=f"(sv[111]), "=f"(sv[112]), "=f"(sv[113]), "=f"(sv[114]), "=f"(sv[115]), "=f"(sv[116]), "=f"(sv[117]), "=f"(sv[118]), "=f"(sv[119]), "=f"(sv[120]), "=f"(sv[121]), "=f"(sv[122]), "=f"(sv[123]), "=f"(sv[124]), "=f"(sv[125]), "=f"(sv[126]), "=f"(sv[127])
+                                : "r"(s_addr + 96));
+#endif
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
                             tile_max = max_noftz(lo_max, hi_max);
+#else
+                            float2 _reg_reduce_max2_1 = {-CAKE_INF, -CAKE_INF};
+                            row_max_x32_accum(&sv[0], _reg_reduce_max2_1);
+                            row_max_x32_accum(&sv[32], _reg_reduce_max2_1);
+                            row_max_x32_accum(&sv[64], _reg_reduce_max2_1);
+                            row_max_x32_accum(&sv[96], _reg_reduce_max2_1);
+                            float _reg_array_reduce_0 = row_max_reduce(_reg_reduce_max2_1);
+                            tile_max = _reg_array_reduce_0;
+#endif
                         }
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile(
@@ -560,6 +636,7 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             :: "r"((s_empty_addr + (stage) * 8) & 0xFEFFFFFF) : "memory");
                         int tail_valid = tail_base - n_block * 128;
                         if (tail_valid < 128) {
+#if __CUDA_ARCH__ == 1030
                             uint32_t _thresh_mask_0;
                             {
                                 int _lim_1 = tail_valid;
@@ -605,9 +682,15 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             if (!(_thresh_mask_0 & (1u << 29))) sv[29] = -CUDART_INF_F;
                             if (!(_thresh_mask_0 & (1u << 30))) sv[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_0 & (1u << 31))) sv[31] = -CUDART_INF_F;
+#else
+#endif
                             uint32_t _thresh_mask_2;
                             {
+#if __CUDA_ARCH__ == 1030
                                 int _lim_3 = tail_valid - 32;
+#else
+                                int _lim_3 = tail_valid;
+#endif
                                 if (_lim_3 <= 0) { _thresh_mask_2 = 0u; }
                                 else if (_lim_3 >= 32) { _thresh_mask_2 = 0xFFFFFFFFu; }
                                 else {
@@ -618,6 +701,7 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                                         "}" : "=r"(_thresh_mask_2) : "r"(_lim_3));
                                 }
                             }
+#if __CUDA_ARCH__ == 1030
                             if (!(_thresh_mask_2 & (1u << 0))) sv[32] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 1))) sv[33] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 2))) sv[34] = -CUDART_INF_F;
@@ -650,9 +734,47 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             if (!(_thresh_mask_2 & (1u << 29))) sv[61] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 30))) sv[62] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 31))) sv[63] = -CUDART_INF_F;
+#else
+                            if (!(_thresh_mask_2 & (1u << 0))) sv[0] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 1))) sv[1] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 2))) sv[2] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 3))) sv[3] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 4))) sv[4] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 5))) sv[5] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 6))) sv[6] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 7))) sv[7] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 8))) sv[8] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 9))) sv[9] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 10))) sv[10] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 11))) sv[11] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 12))) sv[12] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 13))) sv[13] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 14))) sv[14] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 15))) sv[15] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 16))) sv[16] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 17))) sv[17] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 18))) sv[18] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 19))) sv[19] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 20))) sv[20] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 21))) sv[21] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 22))) sv[22] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 23))) sv[23] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 24))) sv[24] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 25))) sv[25] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 26))) sv[26] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 27))) sv[27] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 28))) sv[28] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 29))) sv[29] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 30))) sv[30] = -CUDART_INF_F;
+                            if (!(_thresh_mask_2 & (1u << 31))) sv[31] = -CUDART_INF_F;
+#endif
                             uint32_t _thresh_mask_4;
                             {
+#if __CUDA_ARCH__ == 1030
                                 int _lim_5 = tail_valid - 64;
+#else
+                                int _lim_5 = tail_valid - 32;
+#endif
                                 if (_lim_5 <= 0) { _thresh_mask_4 = 0u; }
                                 else if (_lim_5 >= 32) { _thresh_mask_4 = 0xFFFFFFFFu; }
                                 else {
@@ -663,6 +785,7 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                                         "}" : "=r"(_thresh_mask_4) : "r"(_lim_5));
                                 }
                             }
+#if __CUDA_ARCH__ == 1030
                             if (!(_thresh_mask_4 & (1u << 0))) sv[64] = -CUDART_INF_F;
                             if (!(_thresh_mask_4 & (1u << 1))) sv[65] = -CUDART_INF_F;
                             if (!(_thresh_mask_4 & (1u << 2))) sv[66] = -CUDART_INF_F;
@@ -695,9 +818,47 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             if (!(_thresh_mask_4 & (1u << 29))) sv[93] = -CUDART_INF_F;
                             if (!(_thresh_mask_4 & (1u << 30))) sv[94] = -CUDART_INF_F;
                             if (!(_thresh_mask_4 & (1u << 31))) sv[95] = -CUDART_INF_F;
+#else
+                            if (!(_thresh_mask_4 & (1u << 0))) sv[32] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 1))) sv[33] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 2))) sv[34] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 3))) sv[35] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 4))) sv[36] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 5))) sv[37] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 6))) sv[38] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 7))) sv[39] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 8))) sv[40] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 9))) sv[41] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 10))) sv[42] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 11))) sv[43] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 12))) sv[44] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 13))) sv[45] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 14))) sv[46] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 15))) sv[47] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 16))) sv[48] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 17))) sv[49] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 18))) sv[50] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 19))) sv[51] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 20))) sv[52] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 21))) sv[53] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 22))) sv[54] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 23))) sv[55] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 24))) sv[56] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 25))) sv[57] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 26))) sv[58] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 27))) sv[59] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 28))) sv[60] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 29))) sv[61] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 30))) sv[62] = -CUDART_INF_F;
+                            if (!(_thresh_mask_4 & (1u << 31))) sv[63] = -CUDART_INF_F;
+#endif
                             uint32_t _thresh_mask_6;
                             {
+#if __CUDA_ARCH__ == 1030
                                 int _lim_7 = tail_valid - 96;
+#else
+                                int _lim_7 = tail_valid - 64;
+#endif
                                 if (_lim_7 <= 0) { _thresh_mask_6 = 0u; }
                                 else if (_lim_7 >= 32) { _thresh_mask_6 = 0xFFFFFFFFu; }
                                 else {
@@ -708,6 +869,7 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                                         "}" : "=r"(_thresh_mask_6) : "r"(_lim_7));
                                 }
                             }
+#if __CUDA_ARCH__ == 1030
                             if (!(_thresh_mask_6 & (1u << 0))) sv[96] = -CUDART_INF_F;
                             if (!(_thresh_mask_6 & (1u << 1))) sv[97] = -CUDART_INF_F;
                             if (!(_thresh_mask_6 & (1u << 2))) sv[98] = -CUDART_INF_F;
@@ -747,6 +909,92 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             row_max_x32_accum(&sv[96], _reg_reduce_max2_9);
                             float _reg_array_reduce_8 = row_max_reduce(_reg_reduce_max2_9);
                             tile_max = _reg_array_reduce_8;
+#else
+                            if (!(_thresh_mask_6 & (1u << 0))) sv[64] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 1))) sv[65] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 2))) sv[66] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 3))) sv[67] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 4))) sv[68] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 5))) sv[69] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 6))) sv[70] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 7))) sv[71] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 8))) sv[72] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 9))) sv[73] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 10))) sv[74] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 11))) sv[75] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 12))) sv[76] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 13))) sv[77] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 14))) sv[78] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 15))) sv[79] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 16))) sv[80] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 17))) sv[81] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 18))) sv[82] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 19))) sv[83] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 20))) sv[84] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 21))) sv[85] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 22))) sv[86] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 23))) sv[87] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 24))) sv[88] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 25))) sv[89] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 26))) sv[90] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 27))) sv[91] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 28))) sv[92] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 29))) sv[93] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 30))) sv[94] = -CUDART_INF_F;
+                            if (!(_thresh_mask_6 & (1u << 31))) sv[95] = -CUDART_INF_F;
+                            uint32_t _thresh_mask_8;
+                            {
+                                int _lim_9 = tail_valid - 96;
+                                if (_lim_9 <= 0) { _thresh_mask_8 = 0u; }
+                                else if (_lim_9 >= 32) { _thresh_mask_8 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_thresh_mask_8) : "r"(_lim_9));
+                                }
+                            }
+                            if (!(_thresh_mask_8 & (1u << 0))) sv[96] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 1))) sv[97] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 2))) sv[98] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 3))) sv[99] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 4))) sv[100] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 5))) sv[101] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 6))) sv[102] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 7))) sv[103] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 8))) sv[104] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 9))) sv[105] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 10))) sv[106] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 11))) sv[107] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 12))) sv[108] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 13))) sv[109] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 14))) sv[110] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 15))) sv[111] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 16))) sv[112] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 17))) sv[113] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 18))) sv[114] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 19))) sv[115] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 20))) sv[116] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 21))) sv[117] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 22))) sv[118] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 23))) sv[119] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 24))) sv[120] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 25))) sv[121] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 26))) sv[122] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 27))) sv[123] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 28))) sv[124] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 29))) sv[125] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 30))) sv[126] = -CUDART_INF_F;
+                            if (!(_thresh_mask_8 & (1u << 31))) sv[127] = -CUDART_INF_F;
+                            float2 _reg_reduce_max2_11 = {-CAKE_INF, -CAKE_INF};
+                            row_max_x32_accum(&sv[0], _reg_reduce_max2_11);
+                            row_max_x32_accum(&sv[32], _reg_reduce_max2_11);
+                            row_max_x32_accum(&sv[64], _reg_reduce_max2_11);
+                            row_max_x32_accum(&sv[96], _reg_reduce_max2_11);
+                            float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);
+                            tile_max = _reg_array_reduce_10;
+#endif
                         }
                         float new_max;
                         asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(tile_max), "f"(row_max));
@@ -758,8 +1006,13 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             acc_scale = 1.0f;
                             new_max_scaled = row_max_scaled;
                         } else {
+#if __CUDA_ARCH__ == 1030
                             float _exp2_10 = approx_exp2(acc_scale_log2);
                             acc_scale = ((row_max > -CUDART_INF_F) ? _exp2_10 : 1.0f);
+#else
+                            float _exp2_12 = approx_exp2(acc_scale_log2);
+                            acc_scale = ((row_max > -CUDART_INF_F) ? _exp2_12 : 1.0f);
+#endif
                             row_max = new_max;
                             row_max_scaled = new_max_scaled;
                         }
@@ -773,16 +1026,80 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             mbarrier_arrive(corr_sig_hi_addr + (stage) * 8);
                         }
                         float block_sum = 0.0f;
+#if __CUDA_ARCH__ == 1030
                         const float2 _fma_b2_11 = {softmax_scale_log2, softmax_scale_log2};
                         const float2 _fma_c2_12 = {-new_max_scaled, -new_max_scaled};
+#else
+                        const float2 _fma_b2_13 = {softmax_scale_log2, softmax_scale_log2};
+                        const float2 _fma_c2_14 = {-new_max_scaled, -new_max_scaled};
+#endif
                         #pragma unroll
                         for (int _lf = 0; _lf < 64; _lf++)
+#if __CUDA_ARCH__ == 1030
                             fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_11, _fma_c2_12);
+#else
+                            fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_13, _fma_c2_14);
+#endif
                         {
                             #pragma unroll
+#if __CUDA_ARCH__ == 1030
                             for (int _le = 0; _le < 128; _le++) {
+#else
+                            for (int _le = 0; _le < 96; _le++) {
+#endif
                                 sv[_le] = approx_exp2(sv[_le]);
                             }
+#if __CUDA_ARCH__ == 1030
+#else
+                            float2 _exp2_pair_15 = ex2_emulation_f32x2_value(make_float2(sv[96], sv[97]));
+                            sv[96] = _exp2_pair_15.x;
+                            sv[97] = _exp2_pair_15.y;
+                            float2 _exp2_pair_16 = ex2_emulation_f32x2_value(make_float2(sv[98], sv[99]));
+                            sv[98] = _exp2_pair_16.x;
+                            sv[99] = _exp2_pair_16.y;
+                            float2 _exp2_pair_17 = ex2_emulation_f32x2_value(make_float2(sv[100], sv[101]));
+                            sv[100] = _exp2_pair_17.x;
+                            sv[101] = _exp2_pair_17.y;
+                            float2 _exp2_pair_18 = ex2_emulation_f32x2_value(make_float2(sv[102], sv[103]));
+                            sv[102] = _exp2_pair_18.x;
+                            sv[103] = _exp2_pair_18.y;
+                            float2 _exp2_pair_19 = ex2_emulation_f32x2_value(make_float2(sv[104], sv[105]));
+                            sv[104] = _exp2_pair_19.x;
+                            sv[105] = _exp2_pair_19.y;
+                            float2 _exp2_pair_20 = ex2_emulation_f32x2_value(make_float2(sv[106], sv[107]));
+                            sv[106] = _exp2_pair_20.x;
+                            sv[107] = _exp2_pair_20.y;
+                            float2 _exp2_pair_21 = ex2_emulation_f32x2_value(make_float2(sv[108], sv[109]));
+                            sv[108] = _exp2_pair_21.x;
+                            sv[109] = _exp2_pair_21.y;
+                            float2 _exp2_pair_22 = ex2_emulation_f32x2_value(make_float2(sv[110], sv[111]));
+                            sv[110] = _exp2_pair_22.x;
+                            sv[111] = _exp2_pair_22.y;
+                            float2 _exp2_pair_23 = ex2_emulation_f32x2_value(make_float2(sv[112], sv[113]));
+                            sv[112] = _exp2_pair_23.x;
+                            sv[113] = _exp2_pair_23.y;
+                            float2 _exp2_pair_24 = ex2_emulation_f32x2_value(make_float2(sv[114], sv[115]));
+                            sv[114] = _exp2_pair_24.x;
+                            sv[115] = _exp2_pair_24.y;
+                            float2 _exp2_pair_25 = ex2_emulation_f32x2_value(make_float2(sv[116], sv[117]));
+                            sv[116] = _exp2_pair_25.x;
+                            sv[117] = _exp2_pair_25.y;
+                            float2 _exp2_pair_26 = ex2_emulation_f32x2_value(make_float2(sv[118], sv[119]));
+                            sv[118] = _exp2_pair_26.x;
+                            sv[119] = _exp2_pair_26.y;
+                            float2 _exp2_pair_27 = ex2_emulation_f32x2_value(make_float2(sv[120], sv[121]));
+                            sv[120] = _exp2_pair_27.x;
+                            sv[121] = _exp2_pair_27.y;
+                            float2 _exp2_pair_28 = ex2_emulation_f32x2_value(make_float2(sv[122], sv[123]));
+                            sv[122] = _exp2_pair_28.x;
+                            sv[123] = _exp2_pair_28.y;
+                            float2 _exp2_pair_29 = ex2_emulation_f32x2_value(make_float2(sv[124], sv[125]));
+                            sv[124] = _exp2_pair_29.x;
+                            sv[125] = _exp2_pair_29.y;
+                            float2 _exp2_pair_30 = ex2_emulation_f32x2_value(make_float2(sv[126], sv[127]));
+                            sv[126] = _exp2_pair_30.x;
+                            sv[127] = _exp2_pair_30.y;
+#endif
                         }
                         int p_addr = taddr + (unsigned int)p_col + (unsigned int)(warp % 4 * 32 << 16);
                         unsigned int p0[8];
@@ -1259,18 +1576,32 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                     }
                     float v_amax_reg[1];
                     {
+#if __CUDA_ARCH__ == 1030
                         uint32_t _scalar_bits_13;
+#else
+                        uint32_t _scalar_bits_31;
+#endif
                         asm volatile("ld.volatile.global.b32 %0, [%1];"
+#if __CUDA_ARCH__ == 1030
                             : "=r"(_scalar_bits_13) : "l"((const void*)(v_amax + (0))) : "memory");
                         v_amax_reg[0] = __uint_as_float(_scalar_bits_13);
+#else
+                            : "=r"(_scalar_bits_31) : "l"((const void*)(v_amax + (0))) : "memory");
+                        v_amax_reg[0] = __uint_as_float(_scalar_bits_31);
+#endif
                     }
                     mbarrier_wait(o_full_addr + (stage) * 8, _phase_o_full);
                     _phase_o_full ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float final_scale = 0.0f;
                     float v_dequant = v_amax_reg[0] * 0.002232143f;
+#if __CUDA_ARCH__ == 1030
                     float _rcp_14 = approx_rcp(row_sum);
                     final_scale = ((row_sum != 0.0f && row_sum == row_sum) ? _rcp_14 * v_dequant : 0.0f);
+#else
+                    float _rcp_32 = approx_rcp(row_sum);
+                    final_scale = ((row_sum != 0.0f && row_sum == row_sum) ? _rcp_32 * v_dequant : 0.0f);
+#endif
                     int seg_len_out = seg_len;
                     int local_row = ((unsigned int)m_block + stage) * 128 + (unsigned int)(warp % 4 * 32 + lane);
                     int token = seg_begin + local_row;
@@ -1295,10 +1626,18 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (local_row < seg_len_out) {
                             float _scaled_0[16];
+#if __CUDA_ARCH__ == 1030
                             const float2 _scale2_15 = {final_scale, final_scale};
+#else
+                            const float2 _scale2_33 = {final_scale, final_scale};
+#endif
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
                                 reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(ov)[_ls], _scale2_15);
+#else
+                                reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(ov)[_ls], _scale2_33);
+#endif
                             unsigned int _packed_0[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -1343,10 +1682,18 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)(part * 4 * 32)), "r"(_packed_0[0]), "r"(_packed_0[1]), "r"(_packed_0[2]), "r"(_packed_0[3]) : "memory");
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)(part * 4 * 32 + 16)), "r"(_packed_0[4]), "r"(_packed_0[5]), "r"(_packed_0[6]), "r"(_packed_0[7]) : "memory");
                             float _scaled_1[16];
+#if __CUDA_ARCH__ == 1030
                             const float2 _scale2_16 = {final_scale, final_scale};
+#else
+                            const float2 _scale2_34 = {final_scale, final_scale};
+#endif
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
                                 reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 16))[_ls], _scale2_16);
+#else
+                                reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 16))[_ls], _scale2_34);
+#endif
                             unsigned int _packed_1[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -1391,10 +1738,18 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 1) * 32)), "r"(_packed_1[0]), "r"(_packed_1[1]), "r"(_packed_1[2]), "r"(_packed_1[3]) : "memory");
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 1) * 32 + 16)), "r"(_packed_1[4]), "r"(_packed_1[5]), "r"(_packed_1[6]), "r"(_packed_1[7]) : "memory");
                             float _scaled_2[16];
+#if __CUDA_ARCH__ == 1030
                             const float2 _scale2_17 = {final_scale, final_scale};
+#else
+                            const float2 _scale2_35 = {final_scale, final_scale};
+#endif
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
                                 reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 32))[_ls], _scale2_17);
+#else
+                                reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 32))[_ls], _scale2_35);
+#endif
                             unsigned int _packed_2[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -1439,10 +1794,18 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 2) * 32)), "r"(_packed_2[0]), "r"(_packed_2[1]), "r"(_packed_2[2]), "r"(_packed_2[3]) : "memory");
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 2) * 32 + 16)), "r"(_packed_2[4]), "r"(_packed_2[5]), "r"(_packed_2[6]), "r"(_packed_2[7]) : "memory");
                             float _scaled_3[16];
+#if __CUDA_ARCH__ == 1030
                             const float2 _scale2_18 = {final_scale, final_scale};
+#else
+                            const float2 _scale2_36 = {final_scale, final_scale};
+#endif
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
+#if __CUDA_ARCH__ == 1030
                                 reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 48))[_ls], _scale2_18);
+#else
+                                reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 48))[_ls], _scale2_36);
+#endif
                             unsigned int _packed_3[8];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
@@ -1491,10 +1854,18 @@ kernel_cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16(const __grid_consta
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (local_row < seg_len_out) {
                         {
+#if __CUDA_ARCH__ == 1030
                             void* _cpbulk_dst_19 = reinterpret_cast<void*>(O + out_off);
+#else
+                            void* _cpbulk_dst_37 = reinterpret_cast<void*>(O + out_off);
+#endif
                             asm volatile(
                                 "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+#if __CUDA_ARCH__ == 1030
                                 :: "l"(_cpbulk_dst_19), "r"(row_addr), "r"((uint32_t)(256))
+#else
+                                :: "l"(_cpbulk_dst_37), "r"(row_addr), "r"((uint32_t)(256))
+#endif
                                 : "memory");
                         }
                     }

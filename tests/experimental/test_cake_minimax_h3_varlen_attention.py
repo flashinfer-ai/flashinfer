@@ -40,6 +40,7 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     CTA_Q_ROWS,
     NVFP4_ATTENTION_FP8PV_KWARGS,
     NVFP4_Q_HALF_SHIFT,
+    NVFP4_QS_DENSE,
     NVFP4_SINGLE_STAGE_COST,
     NVFP4_TWO_STAGE_DENSE,
     HEAD_DIM,
@@ -62,7 +63,9 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     build_tile_tables,
     normalize_cu_seqlens,
     nvfp4_attention_kwargs,
+    nvfp4_attention_stage,
     nvfp4_quantize_grid,
+    nvfp4_tile_tables,
     nvfp4_unit_cost,
     nvfp4_workspace_shapes,
     prepare_minimax_h3_varlen_attention,
@@ -882,8 +885,11 @@ def test_nvfp4_tile_tables_two_stage_dense(label, cu, heads, grid_clusters, q_sp
 
 def test_nvfp4_attention_kwargs_per_arch():
     # The dense program of NVFP4_TWO_STAGE_DENSE takes total_clusters in place
-    # of num_tiles; every other attention program takes num_tiles.
+    # of num_tiles; every other attention program takes num_tiles, the
+    # single-stage dense program of NVFP4_QS_DENSE (attention_qs) included.
     assert set(NVFP4_TWO_STAGE_DENSE) == {("fp8", "sm_100a")}
+    assert set(NVFP4_QS_DENSE) == {("fp8", "sm_100a")}
+    assert cake_jit.NVFP4_QS_DENSE_ARCHES == ("sm_100a",)
     for arch in ("sm_100a", "sm_103a"):
         for pv_mode in ("fp4", "fp8"):
             split = nvfp4_attention_kwargs(pv_mode, arch, "attention_split")
@@ -896,8 +902,83 @@ def test_nvfp4_attention_kwargs_per_arch():
                 )
             else:
                 assert "num_tiles" in dense and "total_clusters" not in dense
+            if (pv_mode, arch) in NVFP4_QS_DENSE:
+                qs = nvfp4_attention_kwargs(pv_mode, arch, "attention_qs")
+                assert qs == NVFP4_ATTENTION_FP8PV_KWARGS
+            else:
+                with pytest.raises(ValueError, match="no attention_qs program"):
+                    nvfp4_attention_kwargs(pv_mode, arch, "attention_qs")
     with pytest.raises(ValueError, match="not an NVFP4 attention stage"):
         nvfp4_attention_kwargs("fp8", "sm_100a", "combine")
+
+
+# fp8 PV plans on the 74-cluster grid (B200): center_4s_p2_m16736 has
+# tail-round Q-split units and no K/V-split units in its single-stage tables,
+# center_8s_p2_m29472 neither, and 12 cluster tiles x 7 heads (1.14 waves)
+# K/V-split units.
+NVFP4_DISPATCH_ROWS = [
+    ("q_split", [0, 16736], 28),
+    ("whole", [0, 29472], 28),
+    ("kv_split", [0, 6096], 7),
+]
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_dense_dispatch_binds_attention_qs_for_q_split_plans(pv_mode, arch):
+    # A NVFP4_QS_DENSE pair (sm_100a, fp8 PV) binds the single-stage dense
+    # program attention_qs to the single-stage tables of a plan with Q-split
+    # units and no K/V-split units, and the two-stage attention program to the
+    # two-stage tables of every other plan without K/V-split units; every other
+    # pair keeps its tables and binds attention / attention_split as before.
+    cpu = torch.device("cpu")
+    program_cost = SPLIT_PROGRAM_COST.get((pv_mode, arch), 1.0)
+    single_stage_cost = NVFP4_SINGLE_STAGE_COST[(pv_mode, arch)]
+    two_stage_dense = (pv_mode, arch) in NVFP4_TWO_STAGE_DENSE
+    bound = {}
+    for label, cu, heads in NVFP4_DISPATCH_ROWS:
+        plan = build_packed_segment_plan(cu, cpu)
+        tiles = nvfp4_tile_tables(plan, heads, cpu, pv_mode, arch, num_clusters=74)
+        single, planned = (
+            build_tile_tables(
+                plan,
+                heads,
+                cpu,
+                num_clusters=74,
+                program_cost=program_cost,
+                single_stage_cost=single_stage_cost,
+                two_stage_dense=two_stage,
+            )
+            for two_stage in (False, two_stage_dense)
+        )
+        stage = nvfp4_attention_stage(tiles, pv_mode, arch)
+        bound[label] = stage
+        expected = single if stage == "attention_qs" else planned
+        for name in TileTables.NAMES + ("combine_table",):
+            got, want = getattr(tiles, name).tolist(), getattr(expected, name).tolist()
+            assert got == want, (label, name)
+        assert tiles.total_tiles == expected.total_tiles, label
+        if stage == "attention_qs":
+            assert single.num_partial_slots == 0 and single.num_q_split_units > 0
+            assert tiles.num_q_split_units == single.num_q_split_units > 0
+        elif stage == "attention" and two_stage_dense:
+            # Whole two-stage units: no Q-split halves.
+            assert tiles.num_q_split_units == 0
+            assert tiles.total_tiles == heads * plan.total_clusters
+        # The tables' own stage (without the pair) never names attention_qs.
+        assert nvfp4_attention_stage(tiles) != "attention_qs"
+    if (pv_mode, arch) in NVFP4_QS_DENSE:
+        assert bound == {
+            "q_split": "attention_qs",
+            "whole": "attention",
+            "kv_split": "attention_split",
+        }
+    else:
+        assert bound == {
+            "q_split": "attention",
+            "whole": "attention",
+            "kv_split": "attention_split",
+        }
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
@@ -907,7 +988,13 @@ def test_nvfp4_attention_programs_take_the_host_parameters(pv_mode, arch):
     # parameters the host binds to it on that architecture: the runner binds
     # with _bind_stage(exact=True), which refuses any other program.
     route = cake_jit.select_route(cake_backend.NVFP4_VARIANT[pv_mode], arch)
-    for stage in ("attention", "attention_split"):
+    stages = [s for s in route["stages"] if s in cake_backend.NVFP4_ATTENTION_STAGES]
+    assert stages == (
+        ["attention", "attention_qs", "attention_split"]
+        if (pv_mode, arch) in NVFP4_QS_DENSE
+        else ["attention", "attention_split"]
+    )
+    for stage in stages:
         record = cake_jit.MODULES[route["modules"][stage]]
         planned = {
             "grid" if kind == "grid" else name for kind, name in record["arg_plan"]
@@ -1980,9 +2067,9 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
         else ("quantize", "quantize_tp")
     )
     assert tuple(runner.stage_kwargs) == route_quantize_stages + (
-        "attention",
-        "attention_split",
-        "combine",
+        ("attention", "attention_qs", "attention_split", "combine")
+        if pv_mode == "fp8"
+        else ("attention", "attention_split", "combine")
     )
     quantize_stages = (
         ("amax", runner.quantize_stage)
@@ -1999,14 +2086,22 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
             head = runner.stage_kwargs["quantize"][name]
             assert torch.equal(tp[name][:9], head.cpu()), name
     assert runner.route_metadata["quantize_variant"] == runner.quantize_stage
-    # A 3-segment plan far below one wave has no split units: the dense
-    # attention program is bound, the split program and combine are not.
+    # A 3-segment plan far below one wave has no split units: a dense
+    # attention program is bound (on a NVFP4_QS_DENSE pair the single-stage
+    # attention_qs when its single-stage tables hold Q-split units), the
+    # split program and combine are not.
     assert runner.tile_tables.num_partial_slots == 0
-    assert runner.attention_stage == "attention"
-    assert runner.route_metadata["attention_variant"] == "attention"
+    dense_stage = runner.attention_stage
+    qs = (pv_mode, runner.arch) in NVFP4_QS_DENSE
+    assert dense_stage == (
+        "attention_qs"
+        if qs and runner.tile_tables.num_q_split_units > 0
+        else "attention"
+    )
+    assert runner.route_metadata["attention_variant"] == dense_stage
     assert [name for name, entry, _ in runner._stages if entry is not None] == list(
         quantize_stages
-    ) + ["attention"]
+    ) + [dense_stage]
     if pv_mode == "fp8":
         assert tuple(runner.stage_kwargs["amax"]) == cake_backend.AMAX_KWARGS
         assert runner.stage_kwargs["amax"]["grid"] == (cake_backend.AMAX_CTAS, 1, 1)
@@ -2019,17 +2114,21 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     split_names = nvfp4_attention_kwargs(pv_mode, runner.arch, "attention_split")
     assert tuple(runner.stage_kwargs["attention"]) == dense_names
     assert tuple(runner.stage_kwargs["attention_split"]) == split_names
-    two_stage = (pv_mode, runner.arch) in NVFP4_TWO_STAGE_DENSE
+    if pv_mode == "fp8":
+        qs_names = nvfp4_attention_kwargs(pv_mode, "sm_100a", "attention_qs")
+        assert tuple(runner.stage_kwargs["attention_qs"]) == qs_names
+    two_stage_program = (pv_mode, runner.arch) in NVFP4_TWO_STAGE_DENSE
     assert set(split_names) - set(dense_names) == set(
         cake_backend.NVFP4_ATTENTION_SPLIT_KWARGS
-    ) | ({"num_tiles"} if two_stage else set())
+    ) | ({"num_tiles"} if two_stage_program else set())
+    two_stage = two_stage_program and dense_stage == "attention"
     tiles = runner.tile_tables
     q_half = [w >> NVFP4_Q_HALF_SHIFT for w in tiles.cl_q_block.tolist()]
     if two_stage:
         assert runner.stage_kwargs["attention"]["total_clusters"] == 4
         assert tiles.total_tiles == heads * 4 and q_half == [0] * heads * 4
     else:
-        assert runner.stage_kwargs["attention"]["num_tiles"] == tiles.total_tiles
+        assert runner.stage_kwargs[dense_stage]["num_tiles"] == tiles.total_tiles
         # The 133- and 167-token tiles and the 600-token segment's second tile
         # (88 rows) run single-stage.
         assert q_half.count(1) >= 3 * heads
@@ -2115,12 +2214,15 @@ def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mo
     clusters; other grids check the invariants only), and every unit with
     ``q_split="all"``; both equal the plan without halves.  The dense program
     of ``NVFP4_TWO_STAGE_DENSE`` (sm_100a fp8 PV) runs whole two-stage units
-    only, so no option halves a unit there."""
+    only: a plan with halves binds the single-stage dense program
+    ``attention_qs`` of ``NVFP4_QS_DENSE`` there, the plan without them the
+    two-stage program, and the outputs are bitwise equal across the two."""
     _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
     cu, heads, halved = [0, 14736], 14, {76: 26}
     q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=14)
     capacity = cake_backend.bf16_grid_clusters(q.device)
-    two_stage = (pv_mode, cake_backend._arch_for(q.device)) in NVFP4_TWO_STAGE_DENSE
+    pair = (pv_mode, cake_backend._arch_for(q.device))
+    two_stage, qs = pair in NVFP4_TWO_STAGE_DENSE, pair in NVFP4_QS_DENSE
     build = cake_backend.build_tile_tables
     outs, units = {}, {}
     for option in (False, None, "all"):
@@ -2135,7 +2237,10 @@ def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mo
             q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
         )
         tiles = runner.tile_tables
-        assert tiles.num_combine_units == 0 and runner.attention_stage == "attention"
+        halves = tiles.num_q_split_units > 0
+        assert tiles.num_combine_units == 0 and runner.attention_stage == (
+            "attention_qs" if qs and halves else "attention"
+        )
         assert tiles.total_tiles == 406 + tiles.num_q_split_units
         assert runner.route_metadata["q_split_units"] == tiles.num_q_split_units
         q_half = [w >> NVFP4_Q_HALF_SHIFT for w in tiles.cl_q_block.tolist()]
@@ -2144,11 +2249,11 @@ def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mo
         outs[option] = runner().clone()
         torch.cuda.synchronize()
     monkeypatch.undo()
-    if two_stage:
+    if two_stage and not qs:
         assert units == {False: 0, None: 0, "all": 0}
     else:
         assert units[False] == 0 and units["all"] == 406
-    if capacity in halved and not two_stage:
+    if capacity in halved and (qs or not two_stage):
         assert units[None] == halved[capacity], (
             f"{units[None]} halved units on {capacity} clusters"
         )
