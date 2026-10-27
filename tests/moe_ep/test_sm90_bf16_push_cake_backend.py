@@ -356,6 +356,47 @@ def test_ep1_per_route_publish_pdl(wire: str) -> None:
     _check(output, x, ids, weights, w13, w2, label=f" ep1 {wire} per_route_publish_pdl")
 
 
+# Environment fallbacks of the backend's round switches (every one is also a config field).
+ROUND_SWITCH_ENVS = (
+    "FLASHINFER_SM90_CAKE_BF16_PDL",
+    "FLASHINFER_SM90_CAKE_BF16_PDL_LATE",
+    "FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN",
+    "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM",
+    "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM",
+    "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL",
+)
+
+
+@requires_sm90
+def test_ep1_round_switch_defaults(monkeypatch) -> None:
+    """With no config value and no environment override the runner resolves the
+    shipped round switches."""
+    for name in ROUND_SWITCH_ENVS + (
+        "FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL",
+        "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    device = torch.device("cuda", 0)
+    # a token capacity no other test uses: the workspace pool is keyed on
+    # (max_tokens_per_rank, config) and the switches are resolved when the pooled
+    # runner is built
+    layer, w13, w2 = _build_layer(1, 0, device, token_capacity=37)
+    runner = _warm_runner(layer, device)
+    assert runner.pdl == 6  # FC1 and FC2 edges
+    assert runner.pdl_late is True
+    assert runner.fused_begin == 2
+    assert runner.fused_dispatch_max_tokens == 512
+    assert runner.grid_dispatch_min_tokens == 513
+    assert runner.compact_form == 1 and runner.publish_form == 1
+    assert runner.per_route_publish_pdl is True
+    x, ids, weights = _make_inputs(37, LOCAL_EXPERTS, 59, device)
+    output = _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    _check(output, x, ids, weights, w13, w2, label=" ep1 round switch defaults")
+
+
 @requires_sm90
 @pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("case", ["short", "masked", "hot", "empty", "dup_rank"])
@@ -915,6 +956,79 @@ def test_ep_per_route_publish_pdl_bitwise(mode: str) -> None:
             assert torch.equal(output, outputs["off"]), (
                 f"{name} differs at T={num_tokens}"
             )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_shared_workspace_round_paths(mode: str) -> None:
+    """Layers of one config share one pooled workspace; each round takes the dispatch
+    path of each rank's own token count (fused up to 512 tokens, grid-strided from 513),
+    which differs between ranks and rounds (across that bound, an idle rank), and every
+    layer stays bitwise equal to a layer with every round switch off."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = 640
+    off = dict(
+        pdl=0,
+        pdl_late=False,
+        fused_begin=0,
+        fused_dispatch_max_tokens=128,
+        grid_dispatch_min_tokens=0,
+        compact_form=0,
+        publish_form=0,
+        per_route_publish_pdl=False,
+    )
+    ref, w13, w2 = _build_layer(
+        world_size, rank, device, token_capacity=capacity, **off
+    )
+    layers = [
+        _build_layer(world_size, rank, device, token_capacity=capacity)[0]
+        for _ in range(3)
+    ]
+    plans = (
+        lambda r: 1,
+        lambda r: 16 + r % 2,
+        lambda r: 124 + 8 * (r % 2),
+        lambda r: 0 if r == 0 else 128,
+        lambda r: 512 + r % 2,
+        lambda r: 640 - r,
+    )
+    for index, plan in enumerate(plans):
+        num_tokens = plan(rank)
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            131 + 7 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        for layer_index, layer in enumerate(layers):
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(output, reference), (
+                f"layer {layer_index} differs at round {index} T={num_tokens}"
+            )
+        if num_tokens:
+            _check(
+                reference,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} round {index} T={num_tokens} shared",
+            )
+    runners = {id(_find_runner(layer)) for layer in layers}
+    assert len(runners) == 1, "layers of one config must share one pooled runner"
+    assert id(_find_runner(ref)) not in runners
     dist.barrier()
 
 

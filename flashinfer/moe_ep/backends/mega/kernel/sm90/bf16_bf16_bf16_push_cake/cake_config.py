@@ -60,20 +60,22 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     kernels, ``2`` additionally runs the receiver-side prefix in the same
     launch.  Neither switch changes a stored value.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_PDL`` / ``FLASHINFER_SM90_CAKE_BF16_PDL_LATE`` /
-    ``FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN`` (default: off / off / ``0``).
+    ``FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN`` (defaults: mask ``6`` = FC1 and FC2,
+    ``True``, ``2``).
 
     ``fused_dispatch_max_tokens`` is the largest round (tokens per rank) that
     takes the single-launch fused dispatch (``None``:
-    ``FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS``, default 128; at
-    most 512).  It changes no stored value.
+    ``FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS``, default 512, the
+    largest value).  It changes no stored value.
 
     ``grid_dispatch_min_tokens`` routes dedup rounds of at least that many
     tokens per rank through the grid-strided single-launch dispatch (round
     opening, count, reserve, store and, at ``fused_begin`` 2, the receiver
     prefix in one cooperative launch over the co-resident blocks), ahead of
     the fused small-round path.  ``None`` reads
-    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``0`` =
-    off).  It changes no stored value.
+    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``513``, the
+    rounds above the default fused bound; ``0`` = off).  It changes no stored
+    value.
 
     ``compact_form`` and ``publish_form`` select kernel forms that write the
     same bytes: ``1`` runs the latency-pipelined compact (several rows in
@@ -81,14 +83,14 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     publish (a group's route loads issued before its fp32 fma chain), ``0``
     the one-block-per-row compact and the route-serial publish.  ``None``
     reads ``FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM`` /
-    ``FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM`` (default ``0``).
+    ``FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM`` (default ``1``).
 
     ``per_route_publish_pdl`` launches the combine publish of a pipe on the
     per-route wire (by default a token capacity of at most 8) as a
     programmatic dependent launch through the backend's own publish kernel,
     as if ``pdl`` contained the publish edge; pipes on the pre-reduced wires
     are unaffected.  ``None`` reads
-    ``FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL`` (default off).  It
+    ``FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL`` (default on).  It
     changes no stored value.
     """
 

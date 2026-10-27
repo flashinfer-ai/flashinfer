@@ -89,7 +89,7 @@ FUSED_COMBINE_TAIL_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL"
 # with T * top_k <= FUSED_DISPATCH_MAX_ROUTES launch the kernel's small-route
 # instance, larger ones its large-route instance.
 FUSED_DISPATCH_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH"
-FUSED_DISPATCH_MAX_TOKENS = 128
+FUSED_DISPATCH_MAX_TOKENS = 512
 FUSED_DISPATCH_MAX_ROUTES = 1024
 FUSED_DISPATCH_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS"
 FUSED_DISPATCH_MAX_TOKENS_LIMIT = 512
@@ -98,9 +98,11 @@ FUSED_DISPATCH_MAX_ROUTES_LIMIT = 4096
 # co-resident blocks (count + reserve + store_publish, plus the round opening
 # and the receiver prefix at the fused_begin level) vs. the vendored kernels.
 # Rounds with T >= the bound (runner ``grid_dispatch_min_tokens`` or this
-# environment variable) take it, ahead of the fused small-T path; 0 (default)
+# environment variable; default GRID_DISPATCH_MIN_TOKENS, the rounds above the
+# default fused-dispatch bound) take it, ahead of the fused small-T path; 0
 # disables it.  Bit-identical outputs; interoperates with peers on any setting.
 GRID_DISPATCH_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS"
+GRID_DISPATCH_MIN_TOKENS = FUSED_DISPATCH_MAX_TOKENS + 1
 _GRID_DISPATCH_MAX_SMEM_INTS = (
     12 * 1024
 )  # 2 * E * ep + 1 + 2 * ep ints of dynamic smem (48 KB)
@@ -143,18 +145,21 @@ PDL_EDGE_FC2 = 4
 PDL_EDGE_PUBLISH = 8
 PDL_EDGE_TAIL = 16
 PDL_EDGES_ALL = 31
-# 1 = this package's small kernels let their PDL dependents be scheduled only
-# when they exit instead of right after their own wait (the early form lets
-# the dependent's blocks occupy the SMs while the producer runs).
+# Default edges: FC1 and FC2 (each GEMM is launched as a programmatic dependent
+# of the kernel before it).
+PDL_EDGES_DEFAULT = PDL_EDGE_FC1 | PDL_EDGE_FC2
+# 1 (default) = this package's small kernels let their PDL dependents be
+# scheduled only when they exit instead of right after their own wait (the
+# early form lets the dependent's blocks occupy the SMs while the producer runs).
 PDL_LATE_ENV = "FLASHINFER_SM90_CAKE_BF16_PDL_LATE"
-# 1 = with the per-route wire (token capacity at or below
+# 1 (default) = with the per-route wire (token capacity at or below
 # COMBINE_WIRE_PER_SHAPE_MAX_TOKENS by default) the combine publish is launched
 # with the PDL attribute as if PDL_EDGE_PUBLISH were in the mask (it then runs
 # this package's per-route twin); pipes on the pre-reduced wires are unaffected.
 PER_ROUTE_PUBLISH_PDL_ENV = "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL"
 # Round opening folded into the small-round fused dispatch (requires the fused
 # tail and the fused dispatch path): 1 = the tag bump and the ack wait run in
-# the dispatch launch, 2 = also the receiver-side prefix (wait_prefix).
+# the dispatch launch, 2 (default) = also the receiver-side prefix (wait_prefix).
 FUSED_BEGIN_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN"
 FUSED_BEGIN_LEVELS = (0, 1, 2)
 _FUSED_PREFIX_MAX_KEYS = (
@@ -163,8 +168,8 @@ _FUSED_PREFIX_MAX_KEYS = (
 # Kernel forms of the compact (inbox rows -> expert-major activation matrix) and of
 # the pre-reduced combine publish: 0 = the one-block-per-row compact and the
 # route-serial publish, 1 = the latency-pipelined compact (several rows in flight,
-# loads hoisted before stores) and the load-hoisted publish.  Both forms write
-# the same bytes, so ranks may run different forms.
+# loads hoisted before stores) and the load-hoisted publish (default).  Both
+# forms write the same bytes, so ranks may run different forms.
 COMPACT_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM"
 PUBLISH_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM"
 COPY_FORMS = (0, 1)
@@ -190,7 +195,7 @@ def _fused_dispatch_max_tokens_default() -> int:
 
 def _grid_dispatch_min_tokens_default() -> int:
     raw = os.environ.get(GRID_DISPATCH_MIN_TOKENS_ENV)
-    return 0 if raw is None else int(raw.strip())
+    return GRID_DISPATCH_MIN_TOKENS if raw is None else int(raw.strip())
 
 
 def _pdl_mask(value: bool | int | str) -> int:
@@ -212,16 +217,17 @@ def _pdl_mask(value: bool | int | str) -> int:
 
 
 def _pdl_default() -> int:
-    return _pdl_mask(os.environ.get(PDL_ENV, "0"))
+    raw = os.environ.get(PDL_ENV)
+    return PDL_EDGES_DEFAULT if raw is None else _pdl_mask(raw)
 
 
 def _per_route_publish_pdl_default() -> bool:
-    raw = os.environ.get(PER_ROUTE_PUBLISH_PDL_ENV, "0").strip().lower()
+    raw = os.environ.get(PER_ROUTE_PUBLISH_PDL_ENV, "1").strip().lower()
     return raw not in ("0", "false", "off", "no", "")
 
 
 def _pdl_late_default() -> bool:
-    return os.environ.get(PDL_LATE_ENV, "0").strip().lower() not in (
+    return os.environ.get(PDL_LATE_ENV, "1").strip().lower() not in (
         "0",
         "false",
         "off",
@@ -230,7 +236,7 @@ def _pdl_late_default() -> bool:
 
 
 def _fused_begin_default() -> int:
-    raw = os.environ.get(FUSED_BEGIN_ENV, "0").strip().lower()
+    raw = os.environ.get(FUSED_BEGIN_ENV, "2").strip().lower()
     if raw in ("0", "false", "off", "no"):
         return 0
     if raw in ("1", "2"):
@@ -239,7 +245,7 @@ def _fused_begin_default() -> int:
 
 
 def _form_default(env: str) -> int:
-    raw = os.environ.get(env, "0").strip().lower()
+    raw = os.environ.get(env, "1").strip().lower()
     if raw in ("0", "false", "off", "no"):
         return 0
     if raw in ("1", "true", "on", "yes"):
