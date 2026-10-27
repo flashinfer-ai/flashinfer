@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_GEMM_W8A16_CONVERT_HPP_
-#define FLASHINFER_GEMM_W8A16_CONVERT_HPP_
+#ifndef FLASHINFER_GEMM_W8A16_CONVERT_CUH_
+#define FLASHINFER_GEMM_W8A16_CONVERT_CUH_
 
 // e4m3 -> 16-bit conversion of the W8A16 weight fragments, for both the Hopper mainloop
 // (register-sourced mixed input: each consumer warpgroup converts in front of wgmma) and
@@ -153,4 +153,4 @@ struct NumericArrayConverter<cutlass::half_t, cutlass::float_e4m3_t, 4, Round> {
 
 }  // namespace cutlass
 
-#endif  // FLASHINFER_GEMM_W8A16_CONVERT_HPP_
+#endif  // FLASHINFER_GEMM_W8A16_CONVERT_CUH_

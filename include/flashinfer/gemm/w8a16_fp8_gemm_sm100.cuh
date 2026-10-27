@@ -22,7 +22,7 @@
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
-// The pieces (w8a16_sm100/; shared with Hopper: w8a16_common.hpp, w8a16_convert.hpp for the
+// The pieces (w8a16_sm100/; shared with Hopper: w8a16_common.hpp, w8a16_convert.cuh for the
 // e4m3 -> bf16 / f16 conversion the transform warps run, w8a16_dispatch.hpp for the host-side
 // arguments / workspace / run sequence):
 //   policy.hpp, builder.hpp, collective.hpp, kernel.hpp

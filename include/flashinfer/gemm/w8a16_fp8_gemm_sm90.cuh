@@ -21,7 +21,7 @@
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
 // The pieces, in include order (w8a16_sm90/; shared with Blackwell: w8a16_common.hpp,
-// w8a16_convert.hpp for the e4m3 -> bf16 / f16 fragment conversion that replaces CUTLASS's
+// w8a16_convert.cuh for the e4m3 -> bf16 / f16 fragment conversion that replaces CUTLASS's
 // converter, w8a16_dispatch.hpp for the host-side arguments / workspace / run sequence):
 //   scheduler.hpp   the padding-free L2-grouped persistent tile scheduler
 //   tile_order.hpp  raster order and L2 group size per problem

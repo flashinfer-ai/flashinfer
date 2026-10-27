@@ -28,7 +28,7 @@
 // between the TMA load and the MMA: TMA lands the fp8 tile in smem, two transform
 // warpgroups (256 threads, each owning half of the conversion fragment; SplitOnK in
 // collective.hpp says how it is partitioned) convert it
-// (w8a16_convert.hpp) and write the 16-bit copy to TMEM, or to smem for the tile whose
+// (w8a16_convert.cuh) and write the 16-bit copy to TMEM, or to smem for the tile whose
 // accumulators take all of TMEM (AInSmem below); the MMA warp issues tcgen05.mma with A from
 // there and B (the activation) from smem.  The operand mapping, the fused epilogue and the
 // host-side lifecycle (arguments, workspace, run) are in w8a16_dispatch.hpp.
@@ -52,7 +52,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
-#include "flashinfer/gemm/w8a16_convert.hpp"
+#include "flashinfer/gemm/w8a16_convert.cuh"
 #include "flashinfer/gemm/w8a16_dispatch.hpp"
 #include "flashinfer/gemm/w8a16_sm100/builder.hpp"
 #include "flashinfer/gemm/w8a16_sm100/collective.hpp"

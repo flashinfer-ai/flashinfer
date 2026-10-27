@@ -23,7 +23,7 @@
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
 // TMA lands the fp8 weight tile and the 16-bit activation tile in smem, each consumer
-// warpgroup pulls its 64 weight rows into registers, converts them (w8a16_convert.hpp) and
+// warpgroup pulls its 64 weight rows into registers, converts them (w8a16_convert.cuh) and
 // issues wgmma with A from registers and B from smem.  The operand mapping, the fused
 // epilogue and the host-side lifecycle (arguments, workspace, run) are in w8a16_dispatch.hpp.
 
@@ -46,7 +46,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
-#include "flashinfer/gemm/w8a16_convert.hpp"
+#include "flashinfer/gemm/w8a16_convert.cuh"
 #include "flashinfer/gemm/w8a16_dispatch.hpp"
 #include "flashinfer/gemm/w8a16_sm90/scheduler.hpp"
 #include "flashinfer/gemm/w8a16_sm90/tile_order.hpp"
