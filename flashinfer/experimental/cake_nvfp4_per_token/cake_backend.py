@@ -676,6 +676,34 @@ SF_RING_G8_CELLS: dict[str, dict[tuple[int, int], tuple[int, int]]] = {
         (28672, 8192): (1281, 2304),
     },
 }
+# The K = 96 2-CTA pair programs with 256-wide weight tiles that have no ring twin
+# (SF_RING_FORM_KEYS: the static schedule without raster groups, the CLC schedule
+# without or with raster groups of 8) take a ring program of SF_RING_FORMS on the
+# measured cells of SF_RING_FORM_CELLS: per kind, keyed by ``(K, N)``, the token
+# ranges (``None``: no upper bound) and the form, ``"g8"`` (static, raster groups
+# of 8) or ``"g16_clc"`` (CLC, raster groups of 16).  The tile order and the
+# schedule change; the MMA sequence of every tile and so the outputs do not.
+SF_RING_FORM_KEYS = frozenset(
+    f"gemm:m256_2cta_{out}_aL_bL_l2256b{suffix}"
+    for out in ("bf16", "f16")
+    for suffix in ("", "_clc", "_g8_clc")
+)
+SF_RING_FORMS: dict[str, dict[str, Any]] = {
+    "g8": {"raster_group": 8},
+    "g16_clc": {"raster_group": 16, "sched": "clc"},
+}
+SF_RING_FORM_CELLS: dict[
+    str, dict[tuple[int, int], tuple[tuple[int, Optional[int], str], ...]]
+] = {
+    "gemm": {
+        (7168, 18432): ((513, 2560, "g16_clc"),),
+        (28672, 8192): ((5889, 8192, "g8"),),
+    },
+    "chain": {
+        (7168, 18432): ((513, 2560, "g8"),),
+        (28672, 8192): ((5889, 8192, "g8"),),
+    },
+}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
@@ -2317,18 +2345,38 @@ def _sf_ring_tactic(plan: GemmPlan, kind: str) -> Optional[dict[str, Any]]:
     """``plan``'s tactic with the scale-factor ring (``sf_ring``) when ``plan`` runs on
     :data:`SF_RING_ARCH` at its measured SM count and its program is a
     :data:`SF_RING_CLC_KEYS` program, or a :data:`SF_RING_G8_KEYS` program on a cell of
-    ``SF_RING_G8_CELLS[kind]``, and the ring program is registered, else ``None``."""
+    ``SF_RING_G8_CELLS[kind]``, and the ring program is registered; for a
+    :data:`SF_RING_FORM_KEYS` program on a cell of ``SF_RING_FORM_CELLS[kind]``, the
+    ring tactic of the cell's form (:data:`SF_RING_FORMS`); else ``None``."""
     if plan.arch != SF_RING_ARCH or MEASURED_SM_COUNT.get(plan.arch) != plan.sm_count:
         return None
-    if plan.kernel_key not in SF_RING_CLC_KEYS:
-        cell = SF_RING_G8_CELLS[kind].get((plan.K, plan.N))
-        if (
-            plan.kernel_key not in SF_RING_G8_KEYS
-            or cell is None
-            or not cell[0] <= plan.M <= cell[1]
-        ):
+    if plan.kernel_key in SF_RING_FORM_KEYS:
+        form = next(
+            (
+                form
+                for lo, hi, form in SF_RING_FORM_CELLS[kind].get((plan.K, plan.N), ())
+                if lo <= plan.M and (hi is None or hi >= plan.M)
+            ),
+            None,
+        )
+        if form is None:
             return None
-    tactic = {**plan.tactic, "sf_ring": True}
+        tactic = {
+            name: value
+            for name, value in plan.tactic.items()
+            if name not in ("sched", "stream_k", "sk_split")
+        }
+        tactic.update(SF_RING_FORMS[form], sf_ring=True)
+    else:
+        if plan.kernel_key not in SF_RING_CLC_KEYS:
+            cell = SF_RING_G8_CELLS[kind].get((plan.K, plan.N))
+            if (
+                plan.kernel_key not in SF_RING_G8_KEYS
+                or cell is None
+                or not cell[0] <= plan.M <= cell[1]
+            ):
+                return None
+        tactic = {**plan.tactic, "sf_ring": True}
     if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
         return None
     return tactic
