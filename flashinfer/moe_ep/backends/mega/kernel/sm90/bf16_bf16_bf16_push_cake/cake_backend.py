@@ -251,6 +251,15 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} fused_dispatch_max_tokens must be an int in [1, 512] or None, got "
                 f"{kcfg.fused_dispatch_max_tokens!r}"
             )
+        if kcfg.grid_dispatch_min_tokens is not None and not (
+            isinstance(kcfg.grid_dispatch_min_tokens, int)
+            and not isinstance(kcfg.grid_dispatch_min_tokens, bool)
+            and kcfg.grid_dispatch_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} grid_dispatch_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.grid_dispatch_min_tokens!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -363,6 +372,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 pdl_late=kcfg.pdl_late,
                 fused_begin=kcfg.fused_begin,
                 fused_dispatch_max_tokens=kcfg.fused_dispatch_max_tokens,
+                grid_dispatch_min_tokens=kcfg.grid_dispatch_min_tokens,
             )
         except Exception:
             pipe.destroy()
@@ -393,6 +403,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.pdl_late,
             kcfg.fused_begin,
             kcfg.fused_dispatch_max_tokens,
+            kcfg.grid_dispatch_min_tokens,
             float(kcfg.init_timeout_s),
         )
 

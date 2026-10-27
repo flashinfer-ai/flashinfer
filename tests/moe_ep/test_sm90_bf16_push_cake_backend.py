@@ -143,6 +143,7 @@ def _build_layer(
     combine_wire: str | None = None,
     token_capacity: int = TOKEN_CAPACITY,
     seed: int = 7,
+    **dispatch_kwargs,
 ):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -183,6 +184,7 @@ def _build_layer(
                 dedup_dispatch=dedup_dispatch,
                 clamp_limit=clamp_limit,
                 combine_wire=combine_wire,
+                **dispatch_kwargs,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -660,6 +662,53 @@ def test_ep_forward_modes(mode: str, dedup_dispatch: bool, wire: str) -> None:
     )
     for repeat in outputs[1:]:
         assert torch.equal(repeat, outputs[0])
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize(
+    "mode", ["random", "hot", "masked", "dup_rank", "dup_remote", "empty_rank"]
+)
+def test_ep_grid_dispatch_matches_vendored(mode: str) -> None:
+    """The grid-strided single-launch dispatch is bit-identical to the vendored kernels."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    # vendored count / reserve / store_publish (no fused small-round path, no grid path)
+    vendored, w13, w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        fused_dispatch_max_tokens=1,
+        grid_dispatch_min_tokens=0,
+    )
+    grid, _w13, _w2 = _build_layer(world_size, rank, device, grid_dispatch_min_tokens=1)
+    x, ids, weights = _make_inputs(
+        TOKEN_CAPACITY,
+        total_experts,
+        101 + rank,
+        device,
+        mode=mode,
+        rank=rank,
+        world_size=world_size,
+    )
+    reference = _forward(vendored, x, ids, weights).clone()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        output = _forward(grid, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference), f"ep{world_size} rank{rank} {mode}"
+    _check(
+        reference,
+        x,
+        ids,
+        weights,
+        w13,
+        w2,
+        label=f" ep{world_size} rank{rank} {mode} grid",
+    )
     dist.barrier()
 
 

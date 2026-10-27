@@ -66,6 +66,14 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     takes the single-launch fused dispatch (``None``:
     ``FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS``, default 128; at
     most 512).  It changes no stored value.
+
+    ``grid_dispatch_min_tokens`` routes dedup rounds of at least that many
+    tokens per rank through the grid-strided single-launch dispatch (round
+    opening, count, reserve, store and, at ``fused_begin`` 2, the receiver
+    prefix in one cooperative launch over the co-resident blocks), ahead of
+    the fused small-round path.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``0`` =
+    off).  It changes no stored value.
     """
 
     intermediate_size: int
@@ -81,3 +89,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     pdl_late: bool | None = None
     fused_begin: int | None = None
     fused_dispatch_max_tokens: int | None = None
+    grid_dispatch_min_tokens: int | None = None

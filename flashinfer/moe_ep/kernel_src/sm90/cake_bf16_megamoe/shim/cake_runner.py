@@ -41,6 +41,7 @@ from .cake_jit import (
     gen_sm90_cake_bf16_combine_tail_module,
     gen_sm90_cake_bf16_combine_tail_prereduced_module,
     gen_sm90_cake_bf16_compact_module,
+    gen_sm90_cake_bf16_dispatch_grid_module,
     gen_sm90_cake_bf16_dispatch_module,
 )
 from .cake_weights import GATE_UP_GROUP, Sm90CakeBf16Weights
@@ -63,6 +64,7 @@ __all__ = [
     "PDL_ENV",
     "PDL_LATE_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
+    "GRID_DISPATCH_MIN_TOKENS_ENV",
     "Sm90CakeBf16MoERunner",
 ]
 
@@ -88,6 +90,16 @@ FUSED_DISPATCH_MAX_ROUTES = 1024
 FUSED_DISPATCH_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS"
 FUSED_DISPATCH_MAX_TOKENS_LIMIT = 512
 FUSED_DISPATCH_MAX_ROUTES_LIMIT = 4096
+# Sender-side dispatch of large dedup rounds: one cooperative launch over the
+# co-resident blocks (count + reserve + store_publish, plus the round opening
+# and the receiver prefix at the fused_begin level) vs. the vendored kernels.
+# Rounds with T >= the bound (runner ``grid_dispatch_min_tokens`` or this
+# environment variable) take it, ahead of the fused small-T path; 0 (default)
+# disables it.  Bit-identical outputs; interoperates with peers on any setting.
+GRID_DISPATCH_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS"
+_GRID_DISPATCH_MAX_SMEM_INTS = (
+    12 * 1024
+)  # 2 * E * ep + 1 + 2 * ep ints of dynamic smem (48 KB)
 # Combine wire format (NOT interoperable: every rank of a pipe must agree, checked
 # at construction).  "prereduced": the expert rank pre-reduces the routes of a
 # token that landed on it in fp32 (ascending k), rounds once to bf16 and sends
@@ -157,6 +169,11 @@ def _fused_dispatch_default() -> bool:
 def _fused_dispatch_max_tokens_default() -> int:
     raw = os.environ.get(FUSED_DISPATCH_MAX_TOKENS_ENV)
     return FUSED_DISPATCH_MAX_TOKENS if raw is None else int(raw.strip())
+
+
+def _grid_dispatch_min_tokens_default() -> int:
+    raw = os.environ.get(GRID_DISPATCH_MIN_TOKENS_ENV)
+    return 0 if raw is None else int(raw.strip())
 
 
 def _pdl_mask(value: bool | int | str) -> int:
@@ -279,6 +296,7 @@ class Sm90CakeBf16MoERunner:
         pdl_late: bool | None = None,
         fused_begin: int | None = None,
         fused_dispatch_max_tokens: int | None = None,
+        grid_dispatch_min_tokens: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -323,6 +341,10 @@ class Sm90CakeBf16MoERunner:
             raise ValueError(
                 f"fused_begin must be one of {FUSED_BEGIN_LEVELS}, got {fused_begin!r}"
             )
+        # the grid dispatch takes the round opening (and the prefix) at the same level
+        self._grid_begin = (
+            level if (self._fused_tail and pipe.config.dedup_dispatch) else 0
+        )
         if not (
             self._fused_tail and self._fused_dispatch and pipe.config.dedup_dispatch
         ):
@@ -341,6 +363,20 @@ class Sm90CakeBf16MoERunner:
                 f"got {max_tokens!r}"
             )
         self._fused_dispatch_max_tokens = max_tokens
+        grid_min = (
+            _grid_dispatch_min_tokens_default()
+            if grid_dispatch_min_tokens is None
+            else int(grid_dispatch_min_tokens)
+        )
+        if grid_min < 0:
+            raise ValueError(
+                f"grid_dispatch_min_tokens must be >= 0, got {grid_dispatch_min_tokens!r}"
+            )
+        if not pipe.config.dedup_dispatch or (
+            2 * pipe.E * pipe.ep + 1 + 2 * pipe.ep > _GRID_DISPATCH_MAX_SMEM_INTS
+        ):
+            grid_min = 0  # dedup payload mode only; the key tables must fit in smem
+        self._grid_dispatch_min_tokens = grid_min
         # the per-route wire publishes through this package's twin under PDL
         self._own_per_route = (
             bool(self._pdl & PDL_EDGE_PUBLISH)
@@ -419,6 +455,11 @@ class Sm90CakeBf16MoERunner:
                 if self._fused_dispatch
                 else None
             )
+            self.dispatch_grid_module = (
+                gen_sm90_cake_bf16_dispatch_grid_module().build_and_load()
+                if self._grid_dispatch_min_tokens > 0
+                else None
+            )
             self.gemm = gemm if gemm is not None else create_grouped_gemm(clamp=clamp)
             return None
 
@@ -459,6 +500,11 @@ class Sm90CakeBf16MoERunner:
         return self._fused_dispatch_max_tokens
 
     @property
+    def grid_dispatch_min_tokens(self) -> int:
+        """Smallest round (tokens) that takes the grid-strided single-launch dispatch (0 = off)."""
+        return self._grid_dispatch_min_tokens
+
+    @property
     def fused_begin(self) -> int:
         """Round-opening fusion level of small rounds (0, 1 or 2; see ``FUSED_BEGIN_ENV``)."""
         return self._fused_begin
@@ -471,6 +517,9 @@ class Sm90CakeBf16MoERunner:
             and num_tokens <= self._fused_dispatch_max_tokens
             and num_tokens * pipe.K <= FUSED_DISPATCH_MAX_ROUTES_LIMIT
         )
+
+    def _use_grid_dispatch(self, num_tokens: int) -> bool:
+        return 0 < self._grid_dispatch_min_tokens <= num_tokens
 
     # ------------------------------------------------------------------ setup
     def _check_weights(self, weights: Sm90CakeBf16Weights) -> None:
@@ -501,6 +550,13 @@ class Sm90CakeBf16MoERunner:
         self._tail_blocks_done = torch.zeros(1, dtype=torch.int32, device=dv)
         # fused dispatch: per-destination meta / payload bases shared across blocks
         self._dispatch_bases = torch.zeros(2 * pipe.ep, dtype=torch.int32, device=dv)
+        if self._grid_dispatch_min_tokens > 0:
+            # grid dispatch: dense carrier-route list, block-local item index, item
+            # counter (zero here; the kernel resets it at the end of every round)
+            routes = pipe.token_capacity * pipe.K
+            self._grid_items = torch.empty(routes, dtype=torch.int32, device=dv)
+            self._grid_iloc = torch.empty(routes, dtype=torch.int32, device=dv)
+            self._grid_item_ctr = torch.zeros(1, dtype=torch.int32, device=dv)
         if self._combine_wire in _PREREDUCED_WIRES:
             # (owner rank, token) group worklist of the pre-reduced publish
             nslots = pipe.ep * pipe.token_capacity
@@ -689,13 +745,44 @@ class Sm90CakeBf16MoERunner:
             # a capture the caller must have joined the streams beforehand.
             stream.wait_event(self._round_event)
         nv = self.record_stages
-        use_fused = self._use_fused_dispatch(num_tokens)
-        level = self._fused_begin if use_fused else 0
+        use_grid = self._use_grid_dispatch(num_tokens)
+        use_fused = not use_grid and self._use_fused_dispatch(num_tokens)
+        level = (
+            self._grid_begin if use_grid else (self._fused_begin if use_fused else 0)
+        )
         try:
             with _record_stage("begin_round", nv):
                 self._begin_round(fused=level > 0)
             with _record_stage("dispatch", nv):
-                if use_fused:
+                if use_grid:
+                    pipe = self.pipe
+                    self.dispatch_grid_module.sm90_cake_dispatch_grid_bf16(
+                        x,
+                        topk_ids,
+                        topk_weights,
+                        *pipe._layout_args(),
+                        pipe._round,
+                        pipe._lc,
+                        pipe._loff,
+                        pipe._ploff,
+                        pipe._keybase,
+                        self._dispatch_bases,
+                        self._grid_items,
+                        self._grid_iloc,
+                        self._grid_item_ctr,
+                        1 if level >= 1 else 0,
+                        1 if level == 2 else 0,
+                        pipe._rows_per_src,
+                        pipe._offsets,
+                        pipe._seg_src_base,
+                        pipe._seg_out_base,
+                        pipe._pad_base,
+                        pipe._m_dev,
+                        pipe._p_dev,
+                        pipe._next_row,
+                        pipe.m_cap,
+                    )
+                elif use_fused:
                     pipe = self.pipe
                     self.dispatch_module.sm90_cake_dispatch_fused_bf16(
                         x,

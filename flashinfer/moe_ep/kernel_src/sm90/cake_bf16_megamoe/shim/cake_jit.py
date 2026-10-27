@@ -35,6 +35,7 @@ __all__ = [
     "gen_sm90_cake_bf16_combine_tail_module",
     "gen_sm90_cake_bf16_combine_tail_prereduced_module",
     "gen_sm90_cake_bf16_compact_module",
+    "gen_sm90_cake_bf16_dispatch_grid_module",
     "gen_sm90_cake_bf16_dispatch_module",
     "gen_sm90_cake_bf16_grouped_gemm_module",
     "grouped_gemm_manifest",
@@ -44,6 +45,7 @@ __all__ = [
     "sm90_cake_bf16_combine_tail_prereduced_uri",
     "sm90_cake_bf16_combine_tail_uri",
     "sm90_cake_bf16_compact_uri",
+    "sm90_cake_bf16_dispatch_grid_uri",
     "sm90_cake_bf16_dispatch_uri",
 ]
 
@@ -69,6 +71,10 @@ _COMBINE_TAIL_SOURCES: _Sources = (
 )
 _DISPATCH_SOURCES: _Sources = (
     ("cake_dispatch_fused_bf16.cu", _SOURCE_DIR / "cake_dispatch_fused_bf16.cu"),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_DISPATCH_GRID_SOURCES: _Sources = (
+    ("cake_dispatch_grid_bf16.cu", _SOURCE_DIR / "cake_dispatch_grid_bf16.cu"),
     ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
 )
 _COMBINE_PREREDUCED_SOURCES: _Sources = (
@@ -200,6 +206,22 @@ def gen_sm90_cake_bf16_dispatch_module() -> JitSpec:
     """JIT spec of ``sm90_cake_dispatch_fused_bf16`` (count + reserve + store_publish, one cooperative launch)."""
     return _gen_module(
         "sm90_cake_bf16_dispatch", _DISPATCH_SOURCES, "cake_dispatch_fused_bf16.cu"
+    )
+
+
+def sm90_cake_bf16_dispatch_grid_uri(cuda_flags: tuple[str, ...] | None = None) -> str:
+    """Content-addressed name of the grid-strided large-round dispatch module."""
+    return _module_uri(
+        "sm90_cake_bf16_dispatch_grid", _DISPATCH_GRID_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_dispatch_grid_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_dispatch_grid_bf16`` (round opening + count + reserve + store_publish + prefix, one cooperative launch over the co-resident blocks)."""
+    return _gen_module(
+        "sm90_cake_bf16_dispatch_grid",
+        _DISPATCH_GRID_SOURCES,
+        "cake_dispatch_grid_bf16.cu",
     )
 
 
