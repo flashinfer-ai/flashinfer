@@ -5,6 +5,7 @@
 
 """Direct public-API tests for the frozen GDN non-CP non-CP GDN prefill routes."""
 
+import gc
 import itertools
 import math
 import os
@@ -1957,6 +1958,9 @@ def test_public_cake_gdn_prefill_repeated_calls_allocate_no_device_memory(
     if case["state_checkpoints"].numel():
         case["state_checkpoints"].fill_(float("nan"))
     torch.cuda.synchronize()
+    # Garbage left by earlier tests of this process must not be collected inside the measured call: a cyclic
+    # GC pass there frees unrelated device blocks (84 frees with 0 allocations in one nightly shard).
+    gc.collect()
     before = torch.cuda.memory_stats()
     _launch(case)
     torch.cuda.synchronize()
