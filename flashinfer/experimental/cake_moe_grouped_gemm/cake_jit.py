@@ -536,6 +536,31 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_moe_grouped_gemm_f6441c89bf898d4db030": {
+        "library": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
 }
 ROUTES: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_dgrad": {
@@ -655,6 +680,11 @@ ROUTES: dict[str, dict[str, Any]] = {
                 "specializations": {},
             },
             {
+                "name": "main_halves_k256t",
+                "program": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
+                "specializations": {},
+            },
+            {
                 "name": "tail_reduce",
                 "program": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
                 "specializations": {"WGRAD_TILE": 512},
@@ -714,6 +744,11 @@ ROUTES: dict[str, dict[str, Any]] = {
             {
                 "name": "main_wave_halves",
                 "program": "cake_moe_grouped_gemm_96f299e996aea2331023",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_halves_k256t",
+                "program": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
                 "specializations": {"WGRAD_OUT": 32},
             },
             {
