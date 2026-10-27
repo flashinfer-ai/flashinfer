@@ -227,7 +227,7 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "fp8-grouped-tc-v3"
+            "fp8-grouped-tc-v4"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
             else "block-fp8-grouped-tc-v1"
@@ -349,6 +349,14 @@ class FrostLowLatencyRunner(MoERunner):
                     tactics.append(("wgmma", 2, 4, 128))
                 else:
                     tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+                    if self.config.activation in (SwiGLU(), SiTU()) or (
+                        inputs[0].shape[0] == 8 and self.config.activation == ReLU2()
+                    ):
+                        # Retain gather-first: T4 shared warm can regress with
+                        # weight-first even when cold weights benefit.
+                        tactics += [
+                            ("warp_mma", group, 2, 128, True) for group in (2, 4)
+                        ]
             if (
                 capability in ((9, 0), (12, 0))
                 and self.config.quant.weight is QuantFormat.DeepSeekFp8
