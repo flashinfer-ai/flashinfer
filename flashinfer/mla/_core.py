@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
+    trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..utils import (
@@ -1816,7 +1817,7 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch)
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
