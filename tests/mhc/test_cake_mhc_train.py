@@ -1049,6 +1049,16 @@ def test_checkpoint_replay_is_bitwise(T: int) -> None:
         )
 
 
+def _live_bytes() -> int:
+    """Bytes the live CUDA tensors asked the caching allocator for (its ``requested_bytes``), not the bytes of the
+    blocks they occupy (``torch.cuda.memory_allocated``): a tensor placed in a reused free block up to 1 MiB larger
+    than itself (the allocator does not split a large block for a remainder of at most 1 MiB) would otherwise count
+    that slack as memory kept alive, as the flashinfer-ci nightly did on torch 2.15 (186880 B on B200, 1047040 B on
+    R200) for the checkpointed output below."""
+    torch.cuda.synchronize()
+    return int(torch.cuda.memory_stats()["requested_bytes.all.current"])
+
+
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
@@ -1073,11 +1083,9 @@ def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
     (connection(*plain).float() * i["dY"].float()).sum().backward()
 
     checkpointed = leaves()
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = _live_bytes()
     Y = checkpoint(connection, *checkpointed, use_reentrant=False)
-    torch.cuda.synchronize()
-    kept = torch.cuda.memory_allocated() - before - Y.untyped_storage().nbytes()
+    kept = _live_bytes() - before - Y.untyped_storage().nbytes()
     assert kept == 0, f"{kept} bytes kept alive after a checkpointed forward"
     (Y.float() * i["dY"].float()).sum().backward()
     for p, c in zip(plain, checkpointed, strict=True):
@@ -1109,11 +1117,9 @@ def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -
     checkpointed = leaves()
     U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
     stats = handle.stats  # pinned: save_stats=False releases it in the finish forward
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = _live_bytes()
     Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=False)
-    torch.cuda.synchronize()
-    kept = torch.cuda.memory_allocated() - before - Y.untyped_storage().nbytes()
+    kept = _live_bytes() - before - Y.untyped_storage().nbytes()
     assert kept == 0, f"{kept} bytes kept alive after a checkpointed finish"
     assert handle.stats is None, "the handle kept the statistics after the forward"
     del stats
