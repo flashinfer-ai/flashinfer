@@ -11,7 +11,7 @@ points the factory rows of the modules it replaces at it (``_RENDERED_HEAD_ROUTE
 per head count where a program's build depends on it, ``_RENDERED_WORK_BIN_ROUTES``
 for launches that ask for a program built with work bins,
 ``_RENDERED_OWNER_HELPER_ROUTES`` for the owner/helper build a call selects when the
-device holds its grid).
+device holds its grid, ``_RENDERED_OWNER_HELPER_POOL_ROUTES`` for its pooled build).
 """
 
 from functools import cache
@@ -4189,6 +4189,13 @@ _RENDERED_OWNER_HELPER_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> the generated pooled owner/helper program of
+# its body: the owner/helper program whose helper CTAs of a head form one pool
+# that serves the chunks of every sequence in turn, so the program runs
+# cooperatively with ``tasks + heads * pool`` CTAs. ``_factory`` returns it when
+# the call asks for it (``owner_helper_pool=True``).
+_RENDERED_OWNER_HELPER_POOL_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 # architecture -> shipped module -> the generated build of the affine apply
 # route's main module that also writes the block pair maps of the tail windows.
 # The runtime takes it instead of the ``_RENDERED_ROUTES`` program when it
@@ -5272,6 +5279,10 @@ class PreparedKernel:
     #: (``_RENDERED_OWNER_HELPER_ROUTES``): its grid is ``tasks * (1 + helpers)``
     #: CTAs, all resident at once, and it takes a zeroed packet ring.
     owner_helper = False
+    #: Whether the owner/helper build is the pooled one
+    #: (``_RENDERED_OWNER_HELPER_POOL_ROUTES``): its grid is ``tasks + heads * pool``
+    #: CTAs, the helpers of a head serving the chunks of every sequence in turn.
+    owner_helper_pool = False
 
     #: The program runs bins of (sequence, head) tasks: its ``seq_order``
     #: argument is a bin table and its grid is one CTA per bin.
@@ -5429,7 +5440,13 @@ def prepare_descriptors(prepared):
 
 
 def _factory(
-    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
 ):
     """The prepared module of one factory row, through the routes.
 
@@ -5440,6 +5457,9 @@ def _factory(
     one (its record sets ``work_bins``). ``owner_helper`` asks for the
     owner/helper program of the module; a module without one keeps its route
     (the returned kernel's ``owner_helper`` says which the call got).
+    ``owner_helper_pool`` with ``owner_helper`` asks for its pooled program; a
+    module without one keeps the owner/helper program (the returned kernel's
+    ``owner_helper_pool`` says which the call got).
     """
     arch = device_arch()
     variants = FACTORIES.get(arch, {}).get(name, {})
@@ -5449,6 +5469,13 @@ def _factory(
             f"Unexported KDA schedule specialization: {(arch, name, *key)}"
         )
     module = variants[key]
+    if owner_helper and owner_helper_pool:
+        program = _RENDERED_OWNER_HELPER_POOL_ROUTES.get(arch, {}).get(module)
+        if program is not None:
+            kernel = PreparedKernel(program, arch)
+            kernel.owner_helper = True
+            kernel.owner_helper_pool = True
+            return kernel
     if owner_helper:
         program = _RENDERED_OWNER_HELPER_ROUTES.get(arch, {}).get(module)
         if program is not None:

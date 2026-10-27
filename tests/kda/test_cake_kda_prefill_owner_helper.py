@@ -13,6 +13,15 @@ keeps the one-CTA program.  The split moves prepare work between CTAs and
 leaves every value the recurrence computes unchanged, so out, the final state
 pool and the FP32 checkpoint rows are the bits of the one-CTA program, launch
 after launch (the program leaves its ring words zero for the next launch).
+
+Where the per-task split has one helper per task and the SMs it leaves idle
+give each head at least 13/12 as many helpers (and every sequence has the same
+chunk count), the call takes the pooled program instead: the helpers of a head
+form one pool of ``pool`` CTAs serving the head's chunks of every sequence in
+turn, launched with ``tasks + heads * pool`` CTAs. It moves the same prepare
+work between other CTAs, so its results are the same bits as well; the bitwise
+checks also force the pool where the route keeps the per-task split (two
+helpers per task).
 """
 
 import pytest
@@ -48,6 +57,39 @@ def test_owner_helper_count(gpu_arch, sm_count, tasks, max_seq_len, expected):
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("sm_count", "seqs", "heads", "helpers", "uniform", "expected"),
+    [
+        (148, 4, 16, 1, True, 5),  # 4 x 4096, H16: 64 + 16 x 5 = 144 CTAs
+        (152, 4, 16, 1, True, 5),
+        (148, 5, 12, 1, True, 7),  # 60 + 12 x 7 = 144 CTAs
+        (148, 71, 1, 1, True, 77),  # 12 x 77 >= 13 x 71: 148 CTAs
+        (148, 72, 1, 1, True, 0),  # 76 helpers for 72 sequences: below 13/12
+        (148, 4, 12, 2, True, 0),  # 4 x 4096, H12: two helpers per task
+        (148, 2, 12, 2, True, 0),  # two helpers per task (a pool of 5 fits)
+        (148, 4, 16, 1, False, 0),  # chunk counts differ
+        (148, 1, 64, 1, True, 0),  # one sequence: the pool stays at the helper
+        (148, 4, 16, 0, True, 0),  # no owner/helper split
+    ],
+)
+def test_owner_helper_pool_count(sm_count, seqs, heads, helpers, uniform, expected):
+    pool = runtime._owner_helper_pool_count(
+        sm_count=sm_count,
+        num_seqs=seqs,
+        num_heads=heads,
+        helpers=helpers,
+        uniform_chunks=uniform,
+    )
+    assert pool == expected
+    if pool:
+        tasks = seqs * heads
+        grid = tasks + heads * pool
+        # Every CTA resident (one per SM) and the program reads the same
+        # helpers per task from its grid as the per-task split.
+        assert grid <= sm_count and grid // tasks - 1 == helpers
+        assert 12 * pool >= 13 * helpers * seqs
 
 
 def test_owner_helper_count_other_arch():
@@ -147,18 +189,44 @@ def _bits(tensor):
     return tensor.contiguous().view(torch.uint8)
 
 
-@requires_sm100
-@pytest.mark.parametrize("heads", [12, 16])
-def test_owner_helper_is_bitwise_the_one_cta_program(heads, monkeypatch):
-    lengths = (4096,) * 4
+def _supported_pool_count(*, sm_count, num_seqs, num_heads, helpers, uniform_chunks):
+    """The largest pool the program supports, also where the route keeps the split."""
+    if helpers < 1 or not uniform_chunks:
+        return 0
+    total_tasks = num_seqs * num_heads
+    pool = min((sm_count - total_tasks) // num_heads, (helpers + 1) * num_seqs - 1)
+    return pool if pool > helpers * num_seqs else 0
+
+
+def _expected_suffix(lengths, heads):
+    """The schedule suffix of the owner/helper launch the call takes here."""
+    from flashinfer.jit import cake_kda_tf32 as registry
+
     tasks = len(lengths) * heads
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     helpers = min(runtime.OWNER_HELPER_MAX_HELPERS, sm_count // tasks - 1)
     if helpers < 1:
         pytest.skip(f"{sm_count} SMs leave no helper for {tasks} tasks")
+    pool = runtime._owner_helper_pool_count(
+        sm_count=sm_count,
+        num_seqs=len(lengths),
+        num_heads=heads,
+        helpers=helpers,
+        uniform_chunks=len({(n + 31) // 32 for n in lengths}) == 1,
+    )
+    if pool and registry._RENDERED_OWNER_HELPER_POOL_ROUTES.get(registry.device_arch()):
+        return f"_owner{helpers}helper_pool{pool}"
+    return f"_owner{helpers}helper"
+
+
+@requires_sm100
+@pytest.mark.parametrize("heads", [12, 16])
+def test_owner_helper_is_bitwise_the_one_cta_program(heads, monkeypatch):
+    lengths = (4096,) * 4
+    suffix = _expected_suffix(lengths, heads)
     d = _inputs(lengths, heads)
     split_schedule, split = _run(d, lengths, heads, launches=3)
-    assert split_schedule.endswith(f"_owner{helpers}helper"), split_schedule
+    assert split_schedule.endswith(suffix), (split_schedule, suffix)
     monkeypatch.setattr(runtime, "OWNER_HELPER_MAX_HELPERS", 0)
     one_schedule, one = _run(d, lengths, heads, launches=1)
     assert "owner" not in one_schedule, one_schedule
@@ -174,3 +242,38 @@ def test_short_sequences_keep_the_one_cta_program():
     d = _inputs(lengths, 12)
     schedule, _ = _run(d, lengths, 12, launches=1)
     assert "owner" not in schedule, schedule
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    ("lengths", "heads", "forced"),
+    [
+        ((4096,) * 4, 16, False),
+        ((2048,) * 5, 12, False),
+        ((4096, 4090, 4096, 4065), 16, False),  # one chunk count, other lengths
+        ((4096, 4096, 4096, 4000), 16, False),  # chunk counts differ: the split
+        ((1024,) * 2, 12, True),  # two helpers per task: the pool forced
+        ((1024,) * 3, 12, True),
+    ],
+)
+def test_owner_helper_pool_is_bitwise_the_per_task_split(
+    lengths, heads, forced, monkeypatch
+):
+    if forced:
+        monkeypatch.setattr(runtime, "_owner_helper_pool_count", _supported_pool_count)
+    suffix = _expected_suffix(lengths, heads)
+    if forced:
+        assert "_pool" in suffix, suffix
+    d = _inputs(lengths, heads)
+    with monkeypatch.context() as m:
+        m.setattr(runtime, "_owner_helper_pool_count", lambda **_: 0)
+        split_schedule, split = _run(d, lengths, heads, launches=1)
+    if "_owner" not in split_schedule:
+        pytest.skip(f"{split_schedule}: the call takes no owner/helper split here")
+    assert "_pool" not in split_schedule, split_schedule
+    pool_schedule, pooled = _run(d, lengths, heads, launches=3)
+    assert pool_schedule.endswith(suffix), (pool_schedule, suffix)
+    assert pool_schedule.startswith(split_schedule), (pool_schedule, split_schedule)
+    for launch in pooled:
+        for got, want in zip(launch, split[0], strict=True):
+            assert torch.equal(_bits(got), _bits(want))

@@ -10,8 +10,9 @@ https://www.apache.org/licenses/LICENSE-2.0
 own device unit and host binding under ``csrc/kda/prefill/``) and
 ``_RENDERED_ROUTES`` points the shipped modules of each architecture at them;
 ``_RENDERED_WORK_BIN_ROUTES`` names the programs built with work bins that
-launches asking for work bins take instead, and ``_RENDERED_OWNER_HELPER_ROUTES``
-the owner/helper program a call takes when the device holds its grid.
+launches asking for work bins take instead, ``_RENDERED_OWNER_HELPER_ROUTES``
+the owner/helper program a call takes when the device holds its grid, and
+``_RENDERED_OWNER_HELPER_POOL_ROUTES`` its pooled program.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -128,6 +129,18 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_OWNER_HELPER_POOL_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_OWNER_HELPER_POOL_ROUTES.items():
+        for module, program in modules.items():
+            # A call the pool does not serve takes the owner/helper program.
+            assert module in registry._RENDERED_OWNER_HELPER_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_OWNER_HELPER_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert set(registry._RENDERED_FOLD_ROUTES) == set(registry.ARCHES)
     for arch, modules in registry._RENDERED_FOLD_ROUTES.items():
         for module, program in modules.items():
@@ -176,6 +189,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_ROUTES[arch].items(),
             *registry._RENDERED_OWNER_HELPER_ROUTES[arch].items(),
+            *registry._RENDERED_OWNER_HELPER_POOL_ROUTES[arch].items(),
             *registry._RENDERED_FOLD_ROUTES[arch].items(),
         ]
         for module, program in routes:
@@ -279,6 +293,45 @@ def test_factory_resolves_the_owner_helper_routes(monkeypatch, arch):
                 # A module without an owner/helper program keeps its route.
                 assert kernel.name == routes.get(module, module)
                 assert getattr(kernel, "owner_helper", False) is False
+    assert seen == set(by_module)
+
+
+@requires_programs
+@pytest.mark.parametrize("arch", sorted(registry.ARCHES))
+def test_factory_resolves_the_owner_helper_pool_routes(monkeypatch, arch):
+    monkeypatch.setattr(registry, "device_arch", lambda device=None: arch)
+    monkeypatch.setattr(
+        registry,
+        "PreparedKernel",
+        lambda name, target: SimpleNamespace(name=name, arch=target),
+    )
+    by_module = registry._RENDERED_OWNER_HELPER_POOL_ROUTES[arch]
+    owner_helper = registry._RENDERED_OWNER_HELPER_ROUTES[arch]
+    routes = registry._RENDERED_ROUTES[arch]
+    seen = set()
+    for family, variants in registry.FACTORIES[arch].items():
+        for (args, kwargs), module in variants.items():
+            kernel = registry._factory(
+                family, *args, owner_helper=True, owner_helper_pool=True, **dict(kwargs)
+            )
+            if module in by_module:
+                seen.add(module)
+                assert (kernel.name, kernel.arch) == (by_module[module], arch)
+                assert kernel.owner_helper is True and kernel.owner_helper_pool is True
+            elif module in owner_helper:
+                # A module without a pooled program keeps its owner/helper program.
+                assert kernel.name == owner_helper[module]
+                assert kernel.owner_helper is True
+                assert getattr(kernel, "owner_helper_pool", False) is False
+            else:
+                assert kernel.name == routes.get(module, module)
+                assert getattr(kernel, "owner_helper", False) is False
+            # The pool alone asks for nothing: the call keeps its route.
+            alone = registry._factory(
+                family, *args, owner_helper_pool=True, **dict(kwargs)
+            )
+            assert alone.name == routes.get(module, module)
+            assert getattr(alone, "owner_helper_pool", False) is False
     assert seen == set(by_module)
 
 
@@ -802,6 +855,7 @@ def unrouted(monkeypatch):
             "_RENDERED_MERGE_ROUTES",
             "_RENDERED_WORK_BIN_ROUTES",
             "_RENDERED_OWNER_HELPER_ROUTES",
+            "_RENDERED_OWNER_HELPER_POOL_ROUTES",
             "_RENDERED_FOLD_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})

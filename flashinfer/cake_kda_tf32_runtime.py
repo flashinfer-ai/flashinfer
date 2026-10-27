@@ -890,7 +890,13 @@ class _CorrectionMergeUnavailable(Exception):
 
 
 def _correction_merge_factory(
-    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
 ):
     """The merging build of the factory row's correction module.
 
@@ -900,7 +906,7 @@ def _correction_merge_factory(
     keywords are not part of the row's key, and a merging build has no
     work bins and no owner/helper build.
     """
-    del route_heads, route_work_bins, owner_helper
+    del route_heads, route_work_bins, owner_helper, owner_helper_pool
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
@@ -1085,6 +1091,39 @@ def _owner_helper_count(
         return 0
     helpers = min(OWNER_HELPER_MAX_HELPERS, sm_count // max(total_tasks, 1) - 1)
     return helpers if helpers >= 1 else 0
+
+
+# The pooled owner/helper split: the helper CTAs of a head form one pool of
+# ``pool`` CTAs that prepares the head's chunks of every sequence in chunk-major
+# order (item ``chunk * sequences + sequence`` goes to pool member ``item % pool``),
+# so the SMs the per-task split leaves idle help as well. The grid is
+# ``tasks + heads * pool``; the pool stays below ``(helpers + 1) * sequences`` so
+# the program reads the same ``helpers`` (and ring depth) from its grid as the
+# per-task split, and every wait of a member is on an item of a smaller index, so
+# the resident grid cannot deadlock. The chunk-major order needs one chunk count
+# for every sequence. The pool is taken where the per-task split has one helper
+# per task and the pool gives each head at least 13/12 as many helpers: below
+# that ratio, and wherever the split already has two helpers per task, the
+# shared ring costs more than the extra helpers return.
+OWNER_HELPER_POOL_MIN_RATIO = (13, 12)
+
+
+def _owner_helper_pool_count(
+    *, sm_count: int, num_seqs: int, num_heads: int, helpers: int, uniform_chunks: bool
+) -> int:
+    """Pooled helper CTAs per head, or 0 to keep ``tasks * (1 + helpers)`` CTAs.
+
+    Taken where the per-task split has one helper per task, every sequence has
+    the same chunk count and the pool gives a head at least
+    ``OWNER_HELPER_POOL_MIN_RATIO`` times the split's helpers
+    (``12 * pool >= 13 * sequences``).
+    """
+    if helpers != 1 or not uniform_chunks or num_seqs < 1 or num_heads < 1:
+        return 0
+    total_tasks = num_seqs * num_heads
+    pool = min((sm_count - total_tasks) // num_heads, (helpers + 1) * num_seqs - 1)
+    num, den = OWNER_HELPER_POOL_MIN_RATIO
+    return pool if den * pool >= num * helpers * num_seqs else 0
 
 
 def _should_use_small_bh_owner_helper(
@@ -2796,6 +2835,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 f"the {unexported_route} kernel family, which is not exported"
             )
         owner_helpers = 0
+        owner_helper_pool = 0
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -2848,12 +2888,29 @@ class FlashKDABlackwellBF16FusedLaunch:
                 and not (self._force_direct_m128 or self._force_direct_m128_n32)
                 else 0
             )
+            # The pooled program where its pool outnumbers the per-task
+            # helpers of every head; the factory keeps the owner/helper program
+            # for a module without one.
+            owner_helper_pool = _owner_helper_pool_count(
+                sm_count=sm_count,
+                num_seqs=num_seqs,
+                num_heads=num_heads,
+                helpers=owner_helpers,
+                uniform_chunks=len(
+                    {
+                        (end - start + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    }
+                )
+                == 1,
+            )
             self.module = self._build_body(
                 partial(
                     _factory,
                     "compiled_bf16_fused_m128",
                     route_work_bins=route_work_bins,
                     **({"owner_helper": True} if owner_helpers else {}),
+                    **({"owner_helper_pool": True} if owner_helper_pool else {}),
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
@@ -3142,7 +3199,17 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.owner_helpers = (
             owner_helpers if getattr(self.module, "owner_helper", False) else 0
         )
-        if self.owner_helpers:
+        self.owner_helper_pool = (
+            owner_helper_pool
+            if self.owner_helpers and getattr(self.module, "owner_helper_pool", False)
+            else 0
+        )
+        if self.owner_helper_pool:
+            self.grid = (total_tasks + num_heads * self.owner_helper_pool, 1, 1)
+            self.schedule += (
+                f"_owner{self.owner_helpers}helper_pool{self.owner_helper_pool}"
+            )
+        elif self.owner_helpers:
             self.grid = (total_tasks * (1 + self.owner_helpers), 1, 1)
             self.schedule += f"_owner{self.owner_helpers}helper"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
@@ -3268,6 +3335,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             # words (zero_workspace) and the consumed words
             # (state_checkpoint_needed). The program leaves every word zero when
             # it exits, so one zeroed allocation serves every launch of the plan.
+            # The pooled program keeps the per-task ring of the same helpers.
             slots = total_tasks * OWNER_HELPER_SLOTS_PER_HELPER * self.owner_helpers
             owner_helper_words = torch.zeros(
                 2 * slots, dtype=torch.uint32, device=q.device
@@ -3653,7 +3721,13 @@ class _PairMapFoldUnavailable(Exception):
 
 
 def _pair_map_fold_program(
-    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
 ):
     """The pair-map fold build of the factory row's main module, or ``None``.
 
@@ -3662,8 +3736,9 @@ def _pair_map_fold_program(
     for a work-binned or owner/helper build the loader names for the module
     (a fold build has neither), or when the loader names no fold build of the
     module (``_RENDERED_FOLD_ROUTES``).  The routing keywords are not part of
-    the row's key.
+    the row's key (a pooled owner/helper build is an owner/helper build).
     """
+    del owner_helper_pool
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
