@@ -78,9 +78,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_K_ITERS 112
 #define R_TILES 4
 #define L_TILES 14
-#define S_TILES 48
-#define N_TILES 66
-#define I_LOCAL 6144
+#define S_TILES 6
+#define N_TILES 24
+#define I_LOCAL 768
 #define NUM_EXPERTS 896
 #define LATENT 3584
 #define tiles_per_group (GROUP_M * N_TILES)
@@ -208,7 +208,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap WG, const __grid_constant__ CUtensorMap WD, const __grid_constant__ CUtensorMap WS, float* __restrict__ logits, __nv_bfloat16* __restrict__ latent, __nv_bfloat16* __restrict__ shared_act, float* __restrict__ ws, int* __restrict__ counters, int M, int m_tiles, int num_items, int full_items, int sk_ipc, int sk_max_seg, int sk_total)
+kernel_cake_kimi_k3_latent_moe_50f3060652e574ca1898(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap WG, const __grid_constant__ CUtensorMap WD, const __grid_constant__ CUtensorMap WS, float* __restrict__ logits, __nv_bfloat16* __restrict__ latent, __nv_bfloat16* __restrict__ shared_act, float* __restrict__ ws, int* __restrict__ counters, int M, int m_tiles, int num_items, int full_items, int sk_ipc, int sk_max_seg, int sk_total)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -552,7 +552,7 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                         if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_1 = 0;
+                    uint32_t clc_valid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -561,10 +561,10 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_1)
+                        : "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_1 = 0;
+                    uint32_t clc_ctaid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -573,7 +573,7 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_1)
+                        : "+r"(clc_ctaid)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -587,10 +587,10 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                         :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_1 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid_m = _clc_ctaid_1 + (unsigned int)cta_rank;
+                    this_bid_m = clc_ctaid + (unsigned int)cta_rank;
                 }
             }
         }
@@ -1796,7 +1796,7 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                     if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                uint32_t _clc_valid_2 = 0;
+                uint32_t clc_valid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1805,10 +1805,10 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_2)
+                    : "=r"(clc_valid_1)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_2 = 0;
+                uint32_t clc_ctaid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1817,7 +1817,7 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_2)
+                    : "+r"(clc_ctaid_1)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1831,10 +1831,10 @@ kernel_cake_kimi_k3_latent_moe_fbc6ba0abdf108d4db08(const __grid_constant__ CUte
                     :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                 work_stage_2 += 1;
                 if (work_stage_2 == 4) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                if (_clc_valid_2 == 0) {
+                if (clc_valid_1 == 0) {
                     break;
                 }
-                this_bid_1 = _clc_ctaid_2 + (unsigned int)cta_rank;
+                this_bid_1 = clc_ctaid_1 + (unsigned int)cta_rank;
             }
         }
     }
