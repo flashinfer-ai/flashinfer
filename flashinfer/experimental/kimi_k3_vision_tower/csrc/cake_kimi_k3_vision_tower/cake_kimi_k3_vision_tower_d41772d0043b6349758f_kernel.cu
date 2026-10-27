@@ -1671,8 +1671,6 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     for (unsigned int n_iter_2 = 0; n_iter_2 < num_n_blocks_2 - 1; n_iter_2++) {
                         unsigned int v_stage = kv_stage;
                         mbarrier_wait(kv_full_addr + (kv_stage) * 8, _phase_kv_full);
-                        kv_stage += 1;
-                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
                         int first_pv_flag = first_pv;
                         mbarrier_wait(p_full_addr, _phase_p_full_0);
                         _phase_p_full_0 ^= 1;
@@ -1740,10 +1738,8 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_3), "r"(tmem_probs_0), "r"(1) : "memory");
-                        unsigned int k_stage = kv_stage;
-                        mbarrier_wait(kv_full_addr + (kv_stage) * 8, _phase_kv_full);
-                        kv_stage += 1;
-                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
+                        unsigned int k_stage = ((kv_stage + 1 < 5) ? kv_stage + 1 : (unsigned int)0);
+                        mbarrier_wait(kv_full_addr + (((kv_stage + 1 < 5) ? kv_stage + 1 : (unsigned int)0)) * 8, ((kv_stage + 1 < 5) ? _phase_kv_full : _phase_kv_full ^ 1));
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_2 = (((smem_qa_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                         int _mma_b_lo_4 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
@@ -1890,7 +1886,9 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
 #else
                         }
 #endif
-                        elect_commit_cg2_multicast(kv_empty_addr + (((kv_stage + 3 >= 5) ? kv_stage + 3 - 5 : kv_stage + 3)) * 8, (uint16_t)(3));
+                        elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
+                        kv_stage += 1;
+                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
 #if __CUDA_ARCH__ == 1000
                         int _mma_a_lo_3 = (((smem_qb_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                         int _mma_b_lo_7 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
@@ -1962,7 +1960,9 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                             s_pub_1 += 1;
                         }
 #endif
-                        elect_commit_cg2_multicast(kv_empty_addr + (((kv_stage + 4 >= 5) ? kv_stage + 4 - 5 : kv_stage + 4)) * 8, (uint16_t)(3));
+                        elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
+                        kv_stage += 1;
+                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
                         first_pv = 0;
                     }
                     q_stage += 1;
