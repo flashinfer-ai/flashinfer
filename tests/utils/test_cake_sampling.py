@@ -87,9 +87,14 @@ def _device_streams() -> bool:
 
 
 def _stage1_builds(man) -> list:
-    """The manifest's stage-1 rows without the no-tail twins (``no_tail``), which
-    ``test_no_tail_twins_match_their_fused_tail_builds`` checks on their own."""
-    return [v for v in man["stage1"] if not v.get("no_tail", False)]
+    """The manifest's stage-1 rows without the no-tail twins (``no_tail``) and the compact-list twins
+    (``compact_list``), which ``test_no_tail_twins_match_their_fused_tail_builds`` and
+    ``test_compact_list_twins_sample_as_the_pipeline`` check on their own."""
+    return [
+        v
+        for v in man["stage1"]
+        if not v.get("no_tail", False) and not v.get("compact_list", False)
+    ]
 
 
 def _clear_plan_caches():
@@ -1542,9 +1547,12 @@ def test_round16_sm12x_resident_changes_only_its_cells(monkeypatch):
                         )
 
 
-def _fused_tail_launch(module, probs, k, p, variant, seed, offset) -> Run:
-    """One fused-tail launch (launch_flags bit 0: stage 2/3 inside the stage-1 kernel) of the stage-1 ``variant``
-    ``(cluster, ept, stream)`` with a scalar or per-row ``k`` / ``p``."""
+def _fused_tail_launch(
+    module, probs, k, p, variant, seed, offset, flags=cs._FLAG_FUSE_TAIL
+) -> Run:
+    """One fused-tail launch (launch_flags bit 0 by default, or bit 3 for the whole-CTA tail, with any build bits in
+    ``flags``: stage 2/3 inside the stage-1 kernel) of the stage-1 ``variant`` ``(cluster, ept, stream)`` with a scalar
+    or per-row ``k`` / ``p``."""
     batch = probs.shape[0]
     vals, idxs, cnt = _ws(batch)
     out = torch.empty(batch, device="cuda", dtype=torch.int32)
@@ -1567,7 +1575,7 @@ def _fused_tail_launch(module, probs, k, p, variant, seed, offset) -> Run:
         seed,
         offset,
         1,
-        cs._FLAG_FUSE_TAIL,
+        flags,
         torch.cuda.current_stream().cuda_stream,
     )
     torch.cuda.synchronize()
@@ -3092,13 +3100,17 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         and not v["coarse_push"]
         and not v["leader_push"]
     ]
-    # (the cluster-1 speculative-sample whole-CTA-tail builds: test_spec_block_tail_matches_two_launch_form)
+    # (the cluster-1 speculative-sample whole-CTA-tail builds: test_spec_block_tail_matches_two_launch_form; the
+    # leader-push forms: test_leader_push_block_tail_builds_match_pull_builds; the cluster-1 / cluster-2 default-sample
+    # ones: test_default_sample_block_tail_builds_match_two_launch_form)
     twins = [
         v
         for v in _stage1_builds(man)
         if v["fused_block_tail"]
         and not v.get("int_tail", False)
         and not v["spec_sample"]
+        and not v["leader_push"]
+        and v["cluster"] >= cs._BLOCK_TAIL_MIN_CLUSTER
     ]
     default_keys = {(v["cluster"], v["ept"], v["stream"]) for v in defaults}
     assert len(default_keys) == len(defaults)
@@ -3219,9 +3231,10 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, kcap + 1, False)
     assert not cs._fuse_block_tail(4, 8, 16, True, 148, 1000, True)
     # the `_bt` twin ships for the fused-tail variants the host can fuse: `_fuse_block_tail` takes bit 3 only for a
-    # stream of at least _BLOCK_TAIL_MIN_CLUSTER CTAs, so the resident and cluster < 8 twins were never launched and
-    # are not built.  B200 and GB300 run it for the cluster-8 streams at k > 768, round 8 adds H100 (graph-replay A/B
-    # 0.93-0.99), the other capabilities keep the chain until their graph-replay A/B is recorded
+    # stream of at least _BLOCK_TAIL_MIN_CLUSTER CTAs, so the resident twins were never launched and are not built
+    # (round 17 adds the default-sample twins of the (1, 16) and (2, 32) streams, launched on listed cells only).  B200
+    # and GB300 run it for the cluster-8 streams at k > 768, round 8 adds H100 (graph-replay A/B 0.93-0.99), the other
+    # capabilities keep the chain until their graph-replay A/B is recorded
     assert twins
     assert [(v["cluster"], v["ept"], bool(v["stream"])) for v in twins] == [
         (v["cluster"], v["ept"], bool(v["stream"]))
@@ -3270,7 +3283,13 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
         for v in builds
     )
     assert cs._stage1_has_fused_block_tail(1, 32, True)
-    assert not cs._stage1_has_fused_block_tail(1, 16, True)
+    assert cs._stage1_has_block_tail_build(1, 32, True)
+    assert not cs._stage1_has_block_tail_build(1, 32, False)
+    # round 17: the (1, 16) stream ships the default-sample whole-CTA-tail build only, which this policy never takes
+    assert cs._stage1_has_fused_block_tail(1, 16, True)
+    assert not cs._stage1_has_block_tail_build(1, 16, True)
+    for cc in ((10, 0), (10, 3), (10, 7)):
+        assert not cs._c1_block_tail(128, 262144, 1, 16, True, 1000, cc)
     # the policy: (V, batch) of the capability's cells, a cluster-1 stream, 768 < top_k_max <= the slab
     for cc in ((10, 0), (10, 3), (10, 7)):
         assert cs._c1_block_tail(128, 262144, 1, 32, True, 1000, cc)
@@ -4170,6 +4189,13 @@ def test_leader_push_build_matches_pull_build():
     lead = [v for v in _stage1_builds(man) if v["leader_push"]]
     assert lead
     assert all(v["stream"] and v["cluster"] > 1 for v in lead)
+    # round 17: the leader-push whole-CTA-tail builds (`_lp_bt`, `_lp_bt_tia`) have their own test
+    # (test_leader_push_block_tail_builds_match_pull_builds)
+    assert sorted(v["symbol"] for v in lead if v["fused_block_tail"]) == [
+        "kernel_cake_radix_topk_c8_e16s_lp_bt",
+        "kernel_cake_radix_topk_c8_e16s_lp_bt_tia",
+    ]
+    lead = [v for v in lead if not v["fused_block_tail"]]
     assert all(
         not (v["fused_block_tail"] or v["slab_tail"] or v["coarse_push"]) for v in lead
     )
@@ -4804,6 +4830,11 @@ def test_int_tail_build_matches_block_tail_build():
     itail = [v for v in _stage1_builds(man) if v["int_tail"]]
     assert itail
     assert all(v["stream"] and v["fused_block_tail"] and v["fused_tail"] for v in itail)
+    # round 17: the leader-push form of the (8, 16) `_bt_tia` build (test_leader_push_block_tail_builds_match_pull_builds)
+    assert [v["symbol"] for v in itail if v["leader_push"]] == [
+        "kernel_cake_radix_topk_c8_e16s_lp_bt_tia"
+    ]
+    itail = [v for v in itail if not v["leader_push"]]
     assert all(
         not (
             v["coarse_sample"]
@@ -4834,9 +4865,18 @@ def test_int_tail_build_matches_block_tail_build():
     block = [
         v
         for v in _stage1_builds(man)
-        if v["stream"] and v["fused_block_tail"] and not v["int_tail"]
+        if v["stream"]
+        and v["fused_block_tail"]
+        and not v["int_tail"]
+        and not v["leader_push"]
     ]
-    block_streams = streams(v for v in block if not v["spec_sample"])
+    block_streams = streams(
+        v for v in block if not v["spec_sample"] and v["cluster"] >= 8
+    )
+    # round 17: the cluster-1 / cluster-2 default-sample whole-CTA-tail builds ship no `_bt_tia` form
+    c12_block_streams = streams(
+        v for v in block if not v["spec_sample"] and v["cluster"] < 8
+    )
     spec_block_streams = streams(v for v in block if v["spec_sample"])
     # 10.3 (the only int-tail capability) caps the cluster-8 whole-CTA tail at 128256 entries (196608 before round
     # 15), and up to there the ranking puts the ept-16 stream first, so the (8, 32) `_bt` build is never dispatched
@@ -4844,8 +4884,9 @@ def test_int_tail_build_matches_block_tail_build():
     itail_streams = streams(v for v in itail if not v["spec_sample"])
     spec_itail_streams = streams(v for v in itail if v["spec_sample"])
     assert block_streams == [(8, 16), (8, 32)] and itail_streams == [(8, 16)]
+    assert c12_block_streams == [(1, 16), (2, 32)]
     assert spec_block_streams == spec_itail_streams == [(1, 32)]
-    for c, e in block_streams + spec_block_streams:
+    for c, e in block_streams + c12_block_streams + spec_block_streams:
         assert cs._stage1_has_int_tail(c, e, True) == (
             (c, e) in itail_streams + spec_itail_streams
         )
@@ -4938,7 +4979,12 @@ def test_no_tail_twins_match_their_fused_tail_builds():
     _require_supported_device()
     man = load_manifest()
     builds = {v["symbol"]: v for v in _stage1_builds(man)}
-    twins = [v for v in man["stage1"] if v.get("no_tail", False)]
+    # the compact-list no-tail twins double compact-list builds: test_compact_list_twins_sample_as_the_pipeline
+    twins = [
+        v
+        for v in man["stage1"]
+        if v.get("no_tail", False) and not v.get("compact_list", False)
+    ]
     assert twins
     shared = ("cluster", "ept", "stream", "block_threads")
     shared += tuple(key for _, key in cs._NO_TAIL_SHARED_BITS)
@@ -5011,3 +5057,322 @@ def test_no_tail_twins_match_their_fused_tail_builds():
             assert np.array_equal(
                 np.nan_to_num(a.renorm, nan=-1.0), np.nan_to_num(b.renorm, nan=-1.0)
             ), where
+
+
+def _outputs_run(outputs) -> Run:
+    """A ``Run`` of ``_radix_topk_outputs``'s (vals, idxs, count, samples, renorm) tensors."""
+    vals, idxs, cnt, out, rn = outputs
+    return Run(
+        out.cpu().numpy().copy(),
+        rn.cpu().numpy(),
+        vals.cpu().numpy(),
+        idxs.cpu().numpy(),
+        cnt.cpu().numpy(),
+    )
+
+
+def _assert_runs_bitwise(a: Run, b: Run, where):
+    """Samples, count, and the first ``count`` slab indices / values / renormalized probabilities of every row match
+    bitwise."""
+    assert np.array_equal(a.samples, b.samples), where
+    assert np.array_equal(a.count, b.count), where
+    for r in range(a.count.shape[0]):
+        n = int(a.count[r])
+        assert np.array_equal(a.idx[r, :n], b.idx[r, :n]), (*where, r)
+        for x, y in ((a.vals, b.vals), (a.renorm, b.renorm)):
+            assert np.array_equal(x[r, :n].view(np.uint32), y[r, :n].view(np.uint32)), (
+                *where,
+                r,
+            )
+
+
+def test_leader_push_block_tail_builds_match_pull_builds():
+    """Round 17, lever LP-BT 3b: the cluster-8 ept-16 stream ships the leader-push form of its whole-CTA-tail build
+    (`_lp_bt`, and `_lp_bt_tia` with the integer-tested tail), taken by launch_flags bits 3 + 9: every CTA stores its
+    candidate list into rank 0's receive buffer, and rank 0 selects the k pairs into shared memory and runs the
+    whole-CTA tail after a CTA barrier; a row whose lists exceed the 512 receive slots of a CTA or 2048 in all takes the
+    cluster passes or the exact fallback with every CTA, as the pull build does.  The slab, count, samples and renorm
+    are bitwise the pull build's (the same bits without 9) and the reference's, on adversarial rows, with and without
+    the integer-tested tail and the row-span filter arm.  No other variant ships the form: the module rejects bits
+    3 + 9 there, and the leader-push queries of the exchange-only builds ignore it."""
+    _require_supported_device()
+    man = load_manifest()
+    lead_block = [
+        v for v in _stage1_builds(man) if v["leader_push"] and v["fused_block_tail"]
+    ]
+    assert sorted(v["symbol"] for v in lead_block) == [
+        "kernel_cake_radix_topk_c8_e16s_lp_bt",
+        "kernel_cake_radix_topk_c8_e16s_lp_bt_tia",
+    ]
+    for v in lead_block:
+        assert (v["cluster"], v["ept"], bool(v["stream"])) == (8, 16, True)
+        assert v["fused_tail"] and v["int_tail"] == v["symbol"].endswith("_tia")
+        assert not (
+            v["coarse_sample"]
+            or v["spec_sample"]
+            or v["slab_tail"]
+            or v["coarse_push"]
+            or v["local_select"]
+            or v.get("no_tail", False)
+            or v.get("compact_list", False)
+        )
+        assert int(v["dynamic_smem_bytes"]) <= _FULL_SMEM_OPTIN
+    # the exchange-only leader-push builds keep their own answers (the (8, 16) stream ships the default `_lp`)
+    assert cs._stage1_has_leader_push(8, 16, True, False, False)
+    assert not cs._stage1_has_leader_push(8, 32, True, False, False)
+    assert not cs._stage1_has_block_tail_build(8, 16, True)
+    if not _device_streams():
+        pytest.skip(
+            "165 KB streaming variants exceed this device's shared-memory opt-in"
+        )
+    module = load_cake_sampling_module()
+    kcap = int(man["fused_block_tail_kcap"])
+    with pytest.raises(Exception):  # noqa: B017 -- the binding finds no (8, 32) leader-push whole-CTA-tail build
+        _radix_topk_outputs(
+            module,
+            _probs(2, 131072),
+            1000,
+            8,
+            32,
+            cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_LEADER_PUSH,
+        )
+    # rows: ties across the k cut, +inf, the candidates of one CTA's span past its receive slots (the cluster passes),
+    # a descending row (the exact fallback), a half-zero row and a row of three positive entries
+    for vocab, batch in ((151937, 6), (262144, 6), (128256, 6)):
+        probs = _probs(batch, vocab)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)
+        pn[1, [3, 5000]] = np.inf
+        pn[2, :1200] = np.float32(2**-10) * (
+            1.0 + np.arange(1200, dtype=np.float32) / 4096
+        )
+        pn[3] = np.sort(pn[3])[::-1]
+        pn[4, : vocab // 2] = 0.0
+        pn[5] = 0.0
+        pn[5, [17, vocab // 2, vocab - 1]] = (0.5, 0.25, 0.25)
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        for k, p in (
+            (1000, 0.9),
+            (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+            (kcap, 1.0),
+            (200, 0.5),
+            (64, 0.9),
+        ):
+            for x in (
+                0,
+                cs._FLAG_INT_TAIL,
+                cs._FLAG_ROW_SPAN_DIET,
+                cs._FLAG_INT_TAIL | cs._FLAG_ROW_SPAN_DIET,
+            ):
+                pull = cs._FLAG_FUSE_BLOCK_TAIL | x
+                a = _radix_topk_outputs(module, probs, k, 8, 16, pull, p=p)
+                b = _radix_topk_outputs(
+                    module, probs, k, 8, 16, pull | cs._FLAG_LEADER_PUSH, p=p
+                )
+                _assert_fused_outputs_bitwise(a, b, (vocab, k, p, x))
+                if not x:
+                    # _radix_topk_outputs draws with seed 7, offset 1
+                    _check(_outputs_run(b), pn, k, p, 7, 1)
+
+
+def test_default_sample_block_tail_builds_match_two_launch_form():
+    """Round 17, lever BT-X: the (1, 16) and (2, 32) streams ship a whole-CTA-tail build of their default sample
+    (`c1_e16s_bt`, `c2_e32s_bt`; launch_flags bit 3 without bit 6): rank 0 of each cluster runs the whole-CTA stage 2/3
+    after its row, so one launch replaces the chain.  The slab, count, samples and renorm are bitwise those of the same
+    stream's two-launch chain and of the reference, on adversarial rows, per-row k (mixing k <= 64 rows) and per-row p.
+    The (2, 16) stream ships none (its build spills on sm_100a / sm_103a), neither ships an integer-tested form, and the
+    cluster-1 speculative-sample policy never takes them."""
+    _require_supported_device()
+    man = load_manifest()
+    kcap = int(man["fused_block_tail_kcap"])
+    builds = [
+        v
+        for v in _stage1_builds(man)
+        if v["fused_block_tail"]
+        and v["stream"]
+        and not v["spec_sample"]
+        and v["cluster"] < 8
+    ]
+    assert [v["symbol"] for v in builds] == [
+        "kernel_cake_radix_topk_c1_e16s_bt",
+        "kernel_cake_radix_topk_c2_e32s_bt",
+    ]
+    assert all(
+        v["fused_tail"]
+        and not (
+            v["coarse_sample"]
+            or v["slab_tail"]
+            or v["coarse_push"]
+            or v["leader_push"]
+            or v["local_select"]
+            or v["int_tail"]
+        )
+        and int(v["dynamic_smem_bytes"]) <= _FULL_SMEM_OPTIN
+        for v in builds
+    )
+    for c, e in ((1, 16), (2, 32)):
+        assert cs._stage1_has_block_tail_build(c, e, False)
+        assert not cs._stage1_has_block_tail_build(c, e, True)
+        assert not cs._stage1_has_int_tail(c, e, True)
+    assert not cs._stage1_has_fused_block_tail(2, 16, True)
+    if not _device_streams():
+        pytest.skip(
+            "165 KB streaming variants exceed this device's shared-memory opt-in"
+        )
+    module = load_cake_sampling_module()
+    for (c, e), (vocab, batch) in itertools.product(
+        ((1, 16), (2, 32)), ((32768, 7), (262144, 5))
+    ):
+        probs = _probs(batch, vocab, seed=1369 + c * e)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1200) * 13) % vocab] = np.float32(
+            2**-11
+        )  # ties across the k cut and the p boundary
+        pn[1, [7, 4096]] = np.inf
+        pn[2, : vocab // 2] = 0.0  # a half-zero row
+        pn[3] = np.sort(pn[3])[::-1]  # a descending row: the exact fallback
+        pn[4] = np.float32(2**-18)  # a uniform row
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        k_row = torch.tensor(
+            [(kcap, 32, 769, 1, 1000, 64, 900)[r % 7] for r in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        for k, p in (
+            (1000, 0.9),
+            (kcap, 0.5),
+            (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+            (k_row, p_row),
+        ):
+            kmax = k if isinstance(k, int) else int(k.max().item())
+            chain, _ = _run_and_check(
+                probs, k, p, 0x1369, 5, variant=((c, e, True), choose_stage23(kmax))
+            )
+            fused = _fused_tail_launch(
+                module,
+                probs,
+                k,
+                p,
+                (c, e, True),
+                0x1369,
+                5,
+                flags=cs._FLAG_FUSE_BLOCK_TAIL,
+            )
+            _assert_runs_bitwise(
+                chain, fused, (c, e, vocab, k if isinstance(k, int) else "row")
+            )
+
+
+# The build keys a compact-list twin shares with the full-list stream build it doubles.
+_COMPACT_SHARED = (
+    "cluster",
+    "ept",
+    "stream",
+    "block_threads",
+    "fused_tail",
+    "fused_block_tail",
+    "coarse_sample",
+    "spec_sample",
+    "slab_tail",
+    "coarse_push",
+    "leader_push",
+    "local_select",
+    "int_tail",
+    "no_tail",
+)
+
+
+def test_compact_list_twins_sample_as_the_pipeline():
+    """Round 17, lever RTX-S: a compact-list twin (``compact_list``, the symbol component ``_cl8``) doubles a cluster-1
+    / 2 / 4 stream build (its default and speculative-sample builds and their no-tail twins) with a candidate list of
+    8192 entries per CTA, 512 per warp segment, so one streaming CTA fits the 12.x opt-in of 101,376 B; launch_flags bit
+    13 selects it.  The twins are no stage-1 variants of their own: the cost model never ranks them on any opt-in.  On
+    this device every twin's two-launch chain and, up to fused_tail_kcap, its fused one launch (not for a no-tail twin)
+    write the slab, count, samples and renorm of the pipeline route and of the reference, bitwise, adversarial rows
+    included: rows whose candidates crowd one warp's segment far past 512 entries, or past 512 but within the full
+    list's 1024, take the exact fallback.  The module rejects bit 13 on a resident and on a stream without a twin."""
+    _require_supported_device()
+    man = load_manifest()
+    compact = [v for v in man["stage1"] if v.get("compact_list", False)]
+    assert len(compact) == 23
+    full = {
+        v["symbol"]: v
+        for v in man["stage1"]
+        if v["stream"] and not v.get("compact_list", False)
+    }
+    for v in compact:
+        assert "_cl8" in v["symbol"], v["symbol"]
+        parent = full[v["symbol"].replace("_cl8", "")]
+        assert all(v[key] == parent[key] for key in _COMPACT_SHARED), v["symbol"]
+        assert v["cluster"] in (1, 2, 4) and int(v["dynamic_smem_bytes"]) <= 101376
+        assert int(parent["dynamic_smem_bytes"]) > 101376
+        assert not (
+            v["fused_block_tail"]
+            or v["coarse_sample"]
+            or v["slab_tail"]
+            or v["coarse_push"]
+            or v["leader_push"]
+        )
+    assert len(cs._stage1_variants()) == len(man["stage1"]) - len(compact)
+    assert not any(stream for _, _, stream in cs._stage1_variants(101376))
+    for sm_count, vocab, batch, k in itertools.product(
+        (84, 170, 188), (32768, 128256, 151936), (1, 17, 64, 128), (10, 1000)
+    ):
+        pick = choose_stage1(
+            batch, vocab, sm_count=sm_count, smem_limit=101376, top_k_max=k
+        )
+        assert not pick[2], (sm_count, vocab, batch, k, pick)
+    module = load_cake_sampling_module()
+    probs = _probs(2, 32768)
+    for bad in (
+        ((8, 32, False), cs._FLAG_COMPACT_LIST),  # a resident: no stream
+        ((8, 16, True), cs._FLAG_COMPACT_LIST),  # a stream without a compact-list twin
+    ):
+        with pytest.raises(Exception):  # noqa: B017 -- the binding rejects the build selection
+            _run(
+                probs, 50, 0.9, 1, 1, variant=(bad[0], choose_stage23(50)), flags=bad[1]
+            )
+    kcap = cs._fused_tail_kcap()
+    vocab = 151937
+    probs = _probs(6, vocab, seed=17)
+    pn = probs.cpu().numpy()
+    pn[1, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)
+    pn[2, [3, vocab - 1]] = np.inf
+    # one warp segment of every compact stream overflows (the exact fallback): far past 512 entries, and past 512 but
+    # within the full list's 1024
+    pn[3, :3000] = np.float32(2**-12)
+    pn[4, 100:800] = np.float32(2**-12)
+    pn[5] = np.sort(pn[5])[::-1]
+    probs.copy_(torch.tensor(pn, device="cuda"))
+    for k, p in ((1000, 0.9), (kcap, 1.0), (50, 0.5), (10, 0.7)):
+        ref, _ = _run_and_check(probs, k, p, 0x5EED, 3)
+        for v in compact:
+            bits = (cs._FLAG_SPEC_SAMPLE if v["spec_sample"] else 0) | (
+                cs._FLAG_NO_TAIL if v["no_tail"] else 0
+            )
+            variant = (v["cluster"], v["ept"], True)
+            runs = {
+                "chain": _run(
+                    probs,
+                    k,
+                    p,
+                    0x5EED,
+                    3,
+                    variant=(variant, choose_stage23(k)),
+                    flags=bits | cs._FLAG_COMPACT_LIST,
+                )
+            }
+            if k <= kcap and not v["no_tail"]:
+                runs["fused"] = _fused_tail_launch(
+                    module,
+                    probs,
+                    k,
+                    p,
+                    variant,
+                    0x5EED,
+                    3,
+                    flags=cs._FLAG_FUSE_TAIL | bits | cs._FLAG_COMPACT_LIST,
+                )
+            for name, run in runs.items():
+                _assert_runs_bitwise(ref, run, (v["symbol"], name, k, p))

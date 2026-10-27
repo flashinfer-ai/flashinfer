@@ -299,11 +299,14 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
     """Frozen stage-1 variants whose dynamic shared memory fits ``smem_limit`` (all when None).
 
     The frozen variants were sized for the 227 KB opt-in limit of 9.x-11.x devices; 12.x devices
-    opt in to 99 KB, so the larger register-resident variants are not candidates there."""
+    opt in to 99 KB, so the larger register-resident variants are not candidates there.  The
+    compact-list twins (``compact_list``, launch_flags bit 13) are not variants of their own: their
+    (cluster, ept) are those of the full-list streams they double, which do not fit a 12.x opt-in."""
     return [
         (v["cluster"], v["ept"], bool(v["stream"]))
         for v in load_manifest()["stage1"]
-        if smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit
+        if not v.get("compact_list", False)
+        and (smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit)
     ]
 
 
@@ -498,6 +501,20 @@ _BLOCK_TAIL_ABOVE_VOCAB_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]]
 }
 
 
+@functools.cache
+def _stage1_has_block_tail_build(cluster: int, ept: int, spec_sample: bool) -> bool:
+    """Whether the frozen stream (cluster, ept) ships a whole-CTA-tail build of that sample form (a manifest stream
+    entry with ``fused_block_tail`` and ``spec_sample`` as given, the pull exchange and the f64 tail)."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, True)
+        and v["fused_block_tail"]
+        and bool(v["spec_sample"]) == bool(spec_sample)
+        and not v.get("leader_push", False)
+        and not v.get("int_tail", False)
+        for v in load_manifest()["stage1"]
+    )
+
+
 # Cluster-1 cells whose spec-sample stream takes the whole-CTA tail (launch_flags bits 3 + 6) per capability: one CTA
 # per row, so every row's tail runs beside the others in a one-wave grid and the stage-2/3 launch, its ramp and its
 # prologue leave the chain.  At V = 262144, batch 128, k = 1000 the one launch runs about 0.95-0.97 of the two-launch
@@ -531,7 +548,7 @@ def _c1_block_tail(
     )
     if (int(vocab), int(batch)) not in cells:
         return False
-    return _stage1_has_fused_block_tail(cluster, ept, stream)
+    return _stage1_has_block_tail_build(cluster, ept, True)
 
 
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
@@ -710,6 +727,10 @@ _INT_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 3)})
 # Stage-1 launch_flags bit 12: the no-tail form (`_nt` twin) of a fused-tail build, taken by a two-launch chain, whose
 # stage 1 never runs a tail; built without the tail code, the passes keep the registers it took.
 _FLAG_NO_TAIL = 4096
+# Stage-1 launch_flags bit 13: the compact-list form (`_cl8` twin) of a cluster-1 / 2 / 4 stream build, whose candidate
+# list holds 8192 entries per CTA (512 per warp segment) instead of 16384, so one streaming CTA fits the 101,376 B opt-in
+# of compute capability 12.x.  A warp whose segment overflows takes the exact fallback; every output is bit-identical.
+_FLAG_COMPACT_LIST = 8192
 # The build-selection bits a no-tail twin shares with the build it doubles (manifest key per bit).
 _NO_TAIL_SHARED_BITS = (
     (_FLAG_COARSE_SAMPLE, "coarse_sample"),
@@ -1122,13 +1143,15 @@ def _stage1_has_leader_push(
 ) -> bool:
     """Whether the frozen variant ships the leader-push exchange form of its default (neither flag), coarse-sample
     (``coarse``) or speculative-sample (``spec``) build (a manifest entry with ``leader_push`` and the matching sample
-    flags): the kernel taken by launch_flags bit 9.  Every output is bit-identical to the pull form."""
+    flags, not the whole-CTA-tail build's): the kernel taken by launch_flags bit 9.  Every output is bit-identical to
+    the pull form."""
     found = False
     for v in load_manifest()["stage1"]:
         if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
             found = True
             if (
                 v.get("leader_push", False)
+                and not v["fused_block_tail"]
                 and bool(v["coarse_sample"]) == bool(coarse)
                 and bool(v["spec_sample"]) == bool(spec)
             ):
