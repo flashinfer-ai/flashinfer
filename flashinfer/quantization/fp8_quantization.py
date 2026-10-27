@@ -831,8 +831,8 @@ def mxfp8_grouped_quantize(
         ``a`` and ``mask``; ``"cuda"`` also requires ``a`` to be 32-byte
         aligned. A failed launch is not retried on another backend.
 
-        Outputs match across backends for finite inputs, except possibly in
-        bfloat16 blocks whose largest magnitude is at most ``448 * 2**-117``.
+        Outputs match across backends for finite inputs, including bfloat16
+        subnormals. A zero UE8M0 scale byte produces signed-zero payloads.
         ``"cuda"`` quantizes NaN and infinities to 448, as
         :func:`mxfp8_quantize` does; blocks that hold them can differ.
 

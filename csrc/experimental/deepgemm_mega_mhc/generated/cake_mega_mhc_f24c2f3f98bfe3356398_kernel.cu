@@ -86,25 +86,15 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_TAIL_CONTROL_OFF 207360
 #define SMEM_TAIL_CONTROL_STAGE_BYTES 256
 #define SMEM_TAIL_CONTROL_STRIDE 256
-#if __CUDA_ARCH__ == 1070
-#define SMEM_QUEUE_OFF 207616
-#else
 #define SMEM_QUEUE_OFF 207576
-#endif
 #define SMEM_QUEUE_STAGE_BYTES 4
 #define SMEM_QUEUE_STRIDE 4
-#if __CUDA_ARCH__ == 1070
-#define SMEM_EXHAUSTED_OFF 207680
-#define SMEM_EXHAUSTED_STAGE_BYTES 64
-#define SMEM_EXHAUSTED_STRIDE 64
-#else
 #define SMEM_PAIR_SUMS_OFF 207616
 #define SMEM_PAIR_SUMS_STAGE_BYTES 256
 #define SMEM_PAIR_SUMS_STRIDE 256
 #define SMEM_EXHAUSTED_OFF 207580
 #define SMEM_EXHAUSTED_STAGE_BYTES 4
 #define SMEM_EXHAUSTED_STRIDE 4
-#endif
 #define SMEM_TOTAL 208896
 #define THREADS 768
 #define LAUNCH_MIN_BLOCKS 1
@@ -315,19 +305,12 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
     const int tail_scratch_addr = smem + 207360;
     unsigned int* tail_control = reinterpret_cast<unsigned int*>(smem_raw + 207360);
     const int tail_control_addr = smem + 207360;
-#if __CUDA_ARCH__ == 1070
-    unsigned int* queue = reinterpret_cast<unsigned int*>(smem_raw + 207616);
-    const int queue_addr = smem + 207616;
-    unsigned int* exhausted = reinterpret_cast<unsigned int*>(smem_raw + 207680);
-    const int exhausted_addr = smem + 207680;
-#else
     unsigned int* queue = reinterpret_cast<unsigned int*>(smem_raw + 207576);
     const int queue_addr = smem + 207576;
     float* pair_sums = reinterpret_cast<float*>(smem_raw + 207616);
     const int pair_sums_addr = smem + 207616;
     unsigned int* exhausted = reinterpret_cast<unsigned int*>(smem_raw + 207580);
     const int exhausted_addr = smem + 207580;
-#endif
     unsigned int lane_in_warp = threadIdx.x % 32;
     uint32_t _fast_div_q_0 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(64), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(64);
     uint32_t _fast_div_r_0 = (uint32_t)(64) - _fast_div_q_0 * (uint32_t)(split_div.divisor);
@@ -335,24 +318,6 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
         if (elect_sync()) {
             queue[0] = 0;
             exhausted[0] = 0;
-#if __CUDA_ARCH__ == 1070
-            exhausted[1] = 0;
-            exhausted[2] = 0;
-            exhausted[3] = 0;
-            exhausted[4] = 0;
-            exhausted[5] = 0;
-            exhausted[6] = 0;
-            exhausted[7] = 0;
-            exhausted[8] = 0;
-            exhausted[9] = 0;
-            exhausted[10] = 0;
-            exhausted[11] = 0;
-            exhausted[12] = 0;
-            exhausted[13] = 0;
-            exhausted[14] = 0;
-            exhausted[15] = 0;
-#else
-#endif
             asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&residual_map))) : "memory");
             asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&x_map))) : "memory");
             asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&fnp_map))) : "memory");
@@ -484,8 +449,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                             unsigned int hidden = (_fast_div_r_1 * _fast_div_q_0 + ((_fast_div_r_1 < _fast_div_r_0) ? _fast_div_r_1 : _fast_div_r_0)) * 64 + kb * 64;
                             if (warp == 0) {
                                 unsigned int stage = seq % 3;
-                                unsigned int _phase_stage_1 = seq / 3 % 2 ^ 1;
-                                mbarrier_wait(empty_io_addr + (stage) * 8, _phase_stage_1);
+                                unsigned int _stage_empty_io = seq % 3;
+                                unsigned int _parity_empty_io = seq / 3 % 2 ^ 1;
+                                mbarrier_wait(empty_io_addr + (_stage_empty_io) * 8, _parity_empty_io);
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -499,8 +465,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                                 mbarrier_arrive_expect_tx(full_io_addr + (stage) * 8, 40960);
                             } else {
                                 unsigned int stage_1 = seq % 2;
-                                unsigned int _phase_stage_1_1 = seq / 2 % 2 ^ 1;
-                                mbarrier_wait(empty_fn_addr + (stage_1) * 8, _phase_stage_1_1);
+                                unsigned int _stage_empty_fn = seq % 2;
+                                unsigned int _parity_empty_fn = seq / 2 % 2 ^ 1;
+                                mbarrier_wait(empty_fn_addr + (_stage_empty_fn) * 8, _parity_empty_fn);
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -538,19 +505,23 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     uint32_t _fast_div_q_2 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(task_1), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(task_1);
                     uint32_t _fast_div_r_2 = (uint32_t)(task_1) - _fast_div_q_2 * (uint32_t)(split_div.divisor);
                     unsigned int ustage = useq % 2;
-                    unsigned int _phase_ustage_1 = useq / 2 % 2 ^ 1;
-                    mbarrier_wait(small_empty_addr + (ustage) * 8, _phase_ustage_1);
+                    unsigned int _stage_small_empty = useq % 2;
+                    unsigned int _parity_small_empty = useq / 2 % 2 ^ 1;
+                    mbarrier_wait(small_empty_addr + (_stage_small_empty) * 8, _parity_small_empty);
                     #pragma unroll 1
                     for (unsigned int kb_1 = 0; kb_1 < _fast_div_q_0 + ((_fast_div_r_2 < _fast_div_r_0) ? 1 : 0); kb_1++) {
                         unsigned int fstage = fseq % 2;
-                        unsigned int _phase_fstage = fseq / 2 % 2;
-                        mbarrier_wait(full_fn_addr + (fstage) * 8, _phase_fstage);
+                        unsigned int _stage_full_fn = fseq % 2;
+                        unsigned int _parity_full_fn = fseq / 2 % 2;
+                        mbarrier_wait(full_fn_addr + (_stage_full_fn) * 8, _parity_full_fn);
                         unsigned int cstage = cseq % 2;
-                        unsigned int _phase_cstage_1 = cseq / 2 % 2 ^ 1;
-                        mbarrier_wait(big_empty_addr + (cstage) * 8, _phase_cstage_1);
+                        unsigned int _stage_big_empty = cseq % 2;
+                        unsigned int _parity_big_empty = cseq / 2 % 2 ^ 1;
+                        mbarrier_wait(big_empty_addr + (_stage_big_empty) * 8, _parity_big_empty);
                         unsigned int astage = aseq % 4;
-                        unsigned int _phase_astage = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage) * 8, _phase_astage);
+                        unsigned int _stage_full_a = aseq % 4;
+                        unsigned int _parity_full_a = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a) * 8, _parity_full_a);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_0 = make_warp_uniform((((fn_pieces_addr) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -622,8 +593,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         elect_commit(empty_a_addr + (astage) * 8);
                         aseq += 1;
                         unsigned int astage_0 = aseq % 4;
-                        unsigned int _phase_astage_0 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_0) * 8, _phase_astage_0);
+                        unsigned int _stage_full_a_1 = aseq % 4;
+                        unsigned int _parity_full_a_1 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_1) * 8, _parity_full_a_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_12 = make_warp_uniform((((fn_pieces_addr + 32) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -697,11 +669,13 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         elect_commit(big_full_addr + (cstage) * 8);
                         cseq += 1;
                         unsigned int cstage_1 = cseq % 2;
-                        unsigned int _phase_cstage_1_1 = cseq / 2 % 2 ^ 1;
-                        mbarrier_wait(big_empty_addr + (cstage_1) * 8, _phase_cstage_1_1);
+                        unsigned int _stage_big_empty_1 = cseq % 2;
+                        unsigned int _parity_big_empty_1 = cseq / 2 % 2 ^ 1;
+                        mbarrier_wait(big_empty_addr + (_stage_big_empty_1) * 8, _parity_big_empty_1);
                         unsigned int astage_2 = aseq % 4;
-                        unsigned int _phase_astage_2 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_2) * 8, _phase_astage_2);
+                        unsigned int _stage_full_a_2 = aseq % 4;
+                        unsigned int _parity_full_a_2 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_2) * 8, _parity_full_a_2);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_24 = make_warp_uniform((((fn_pieces_addr + 64) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -773,8 +747,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         elect_commit(empty_a_addr + (astage_2) * 8);
                         aseq += 1;
                         unsigned int astage_3 = aseq % 4;
-                        unsigned int _phase_astage_3 = aseq / 4 % 2;
-                        mbarrier_wait(full_a_addr + (astage_3) * 8, _phase_astage_3);
+                        unsigned int _stage_full_a_3 = aseq % 4;
+                        unsigned int _parity_full_a_3 = aseq / 4 % 2;
+                        mbarrier_wait(full_a_addr + (_stage_full_a_3) * 8, _parity_full_a_3);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_b_lo_36 = make_warp_uniform((((fn_pieces_addr + 96) >> 4) & 0x7FFF) + (fstage * 12 + 2) * 192);
@@ -856,6 +831,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
             } else {
                 unsigned int io_seq = 0;
                 unsigned int coeff_seq = 0;
+                unsigned int tasks_done = 0;
                 if ((unsigned int)bid < (num_tokens + 63) / 64 * num_splits) {
                     mbarrier_wait(empty_coeff_addr, 1);
                     if (elect_sync()) {
@@ -876,8 +852,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     #pragma unroll 1
                     for (unsigned int kb_2 = 0; kb_2 < blocks; kb_2++) {
                         unsigned int stage_2 = io_seq % 3;
-                        unsigned int _phase_stage = io_seq / 3 % 2;
-                        mbarrier_wait(store_ready_addr + (stage_2) * 8, _phase_stage);
+                        unsigned int _stage_store_ready = io_seq % 3;
+                        unsigned int _parity_store_ready = io_seq / 3 % 2;
+                        mbarrier_wait(store_ready_addr + (_stage_store_ready) * 8, _parity_store_ready);
                         unsigned int prefetch = kb_2 + 1 == blocks && task_2 + num_ctas < (num_tokens + 63) / 64 * num_splits;
                         if (prefetch != 0) {
                             unsigned int _stage_empty_coeff = coeff_seq % 2;
@@ -912,6 +889,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     if (elect_sync()) {
                         mbarrier_arrive(mix_arrival_addr);
                     }
+                    tasks_done += 1;
                 }
             }
         }
@@ -956,8 +934,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 uint32_t _fast_div_q_6 = (split_div.divisor != 1) ? (__umulhi((uint32_t)(task_3), split_div.multiplier) >> split_div.shift_right) : (uint32_t)(task_3);
                 uint32_t _fast_div_r_6 = (uint32_t)(task_3) - _fast_div_q_6 * (uint32_t)(split_div.divisor);
                 unsigned int coeff_stage = coeff_seq_1 % 2;
-                unsigned int _phase_coeff_stage = coeff_seq_1 / 2 % 2;
-                mbarrier_wait(full_coeff_addr + (coeff_stage) * 8, _phase_coeff_stage);
+                unsigned int _stage_full_coeff = coeff_seq_1 % 2;
+                unsigned int _parity_full_coeff = coeff_seq_1 / 2 % 2;
+                mbarrier_wait(full_coeff_addr + (_stage_full_coeff) * 8, _parity_full_coeff);
                 float post_coeff[8];
                 float comb_coeff[32];
                 #pragma unroll
@@ -987,8 +966,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 #pragma unroll 1
                 for (unsigned int kb_3 = 0; kb_3 < _fast_div_q_0 + ((_fast_div_r_6 < _fast_div_r_0) ? 1 : 0); kb_3++) {
                     unsigned int io_stage = io_seq_1 % 3;
-                    unsigned int _phase_io_stage = io_seq_1 / 3 % 2;
-                    mbarrier_wait(full_io_addr + (io_stage) * 8, _phase_io_stage);
+                    unsigned int _stage_full_io = io_seq_1 % 3;
+                    unsigned int _parity_full_io = io_seq_1 / 3 % 2;
+                    mbarrier_wait(full_io_addr + (_stage_full_io) * 8, _parity_full_io);
                     unsigned int words[16];
                     unsigned int offset = offs[0];
                     unsigned int x_word = x_pairs[io_stage * 2048 + offset];
@@ -1419,8 +1399,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     hc_comp[1] = _sub_26;
                     hc_acc[1] = _add_3;
                     unsigned int ast = a_seq % 4;
-                    unsigned int _phase_ast_1 = a_seq / 4 % 2 ^ 1;
-                    mbarrier_wait(empty_a_addr + (ast) * 8, _phase_ast_1);
+                    unsigned int _stage_empty_a = a_seq % 4;
+                    unsigned int _parity_empty_a = a_seq / 4 % 2 ^ 1;
+                    mbarrier_wait(empty_a_addr + (_stage_empty_a) * 8, _parity_empty_a);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x256b.x4.b32"
@@ -1860,8 +1841,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     hc_comp[1] = _sub_54;
                     hc_acc[1] = _add_7;
                     unsigned int ast_350 = a_seq % 4;
-                    unsigned int _phase_ast_350_1 = a_seq / 4 % 2 ^ 1;
-                    mbarrier_wait(empty_a_addr + (ast_350) * 8, _phase_ast_350_1);
+                    unsigned int _stage_empty_a_1 = a_seq % 4;
+                    unsigned int _parity_empty_a_1 = a_seq / 4 % 2 ^ 1;
+                    mbarrier_wait(empty_a_addr + (_stage_empty_a_1) * 8, _parity_empty_a_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x256b.x4.b32"
@@ -1964,8 +1946,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 #pragma unroll 1
                 for (unsigned int chunk = 0; chunk < (_fast_div_q_0 + ((_fast_div_r_7 < _fast_div_r_0) ? 1 : 0)) * 2; chunk++) {
                     unsigned int cstage_2 = cseq_1 % 2;
-                    unsigned int _phase_cstage = cseq_1 / 2 % 2;
-                    mbarrier_wait(big_full_addr + (cstage_2) * 8, _phase_cstage);
+                    unsigned int _stage_big_full = cseq_1 % 2;
+                    unsigned int _parity_big_full = cseq_1 / 2 % 2;
+                    mbarrier_wait(big_full_addr + (_stage_big_full) * 8, _parity_big_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_0[8];
                     asm volatile(
@@ -2250,8 +2233,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     cseq_1 += 1;
                 }
                 unsigned int ustage_1 = seq_1 % 2;
-                unsigned int _phase_ustage = seq_1 / 2 % 2;
-                mbarrier_wait(small_full_addr + (ustage_1) * 8, _phase_ustage);
+                unsigned int _stage_small_full = seq_1 % 2;
+                unsigned int _parity_small_full = seq_1 / 2 % 2;
+                mbarrier_wait(small_full_addr + (_stage_small_full) * 8, _parity_small_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                 float _tmem_load_2[8];
@@ -2601,7 +2585,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float2 _v2 = make_float2(values_18[0 + 0], values_18[0 + 1]);
                     *reinterpret_cast<float2*>((scratch + ((unsigned long long)task_4 * 1536 + (unsigned long long)(row_17 * 24) + 16 + (unsigned long long)(lane_in_warp % 4 * 2))) + 0) = _v2;
                 }
-                unsigned int _parity_full_stats = seq_1 % 2;
+                int _parity_full_stats = (int)((unsigned int)(int)seq_1 % 2);
                 mbarrier_wait(full_stats_addr, _parity_full_stats);
                 if (lane_in_warp < 16) {
                     unsigned int row_0_1 = warp % 4 * 16 + lane_in_warp;
@@ -2621,7 +2605,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     mbarrier_arrive(mix_arrival_addr);
                 }
                 if (warp % 4 == 0) {
-                    unsigned int _parity_mix_arrival = seq_1 % 2;
+                    int _parity_mix_arrival = (int)((unsigned int)(int)seq_1 % 2);
                     mbarrier_wait(mix_arrival_addr, _parity_mix_arrival);
                     if (elect_sync()) {
                         #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
@@ -2672,28 +2656,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
             unsigned int step = num_ctas * 4;
             unsigned int stop = num_tokens;
             unsigned int first_0 = first + (unsigned int)(warp / 4 - 4) * num_ctas * 4;
-#if __CUDA_ARCH__ == 1070
-            unsigned int step_1 = (((num_tokens + 63) / 64 * num_splits <= 3 * (unsigned int)num_ctas) ? num_ctas * 8 : num_ctas * 4);
-            unsigned int stop_2 = (((num_tokens + 63) / 64 * num_splits <= 3 * (unsigned int)num_ctas || warp < 20) ? num_tokens : 0);
-            unsigned int first_3 = (((num_tokens + 63) / 64 * num_splits <= num_ctas) ? (unsigned int)bid + (unsigned int)(warp - 16) * num_ctas : first_0);
-#else
             unsigned int step_1 = (((num_tokens + 63) / 64 * num_splits <= 3 * (unsigned int)num_ctas && (num_tokens + 63) / 64 * num_splits <= num_ctas) ? num_ctas * 8 : num_ctas * 4);
             unsigned int stop_2 = ((num_tokens > 0 || warp < 20) ? num_tokens : 0);
             unsigned int first_3 = (((num_tokens + 63) / 64 * num_splits <= num_ctas) ? (unsigned int)bid + ((warp < 20) ? (unsigned int)(warp - 16) : (((num_tokens + 63) / 64 * num_splits > num_ctas || num_tokens <= num_ctas * 4) ? (unsigned int)(warp - 18) % 4 : (unsigned int)(warp - 16))) * num_ctas : (unsigned int)bid * 4 + ((warp < 20) ? (unsigned int)(warp - 16) : (((num_tokens + 63) / 64 * num_splits > num_ctas || num_tokens <= num_ctas * 4) ? (unsigned int)(warp - 18) % 4 : (unsigned int)(warp - 16))));
-#endif
             #pragma unroll 1
             for (unsigned int token = first_3; token < stop_2; token += step_1) {
                 unsigned int mb_1 = token / 64;
                 float sc = ((lane_in_warp < 4) ? mix_scales[0] : ((lane_in_warp < 8) ? mix_scales[1] : mix_scales[2]));
                 float bs = mix_bases[((lane_in_warp < 24) ? lane_in_warp : 23)];
-#if __CUDA_ARCH__ == 1070
-                unsigned long long target = epoch_base + (unsigned long long)num_splits;
-                {
-                unsigned long long _acquire_observed;
-                do {
-                asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_acquire_observed) : "l"(reinterpret_cast<unsigned long long*>(split_barriers + ((16384 + mb_1) * 16))) : "memory");
-                } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(target)) >= static_cast<unsigned long long>(1));
-#else
                 unsigned int flag = ((warp >= 20 && ((num_tokens + 63) / 64 * num_splits > num_ctas || num_tokens <= num_ctas * 4)) ? 1 : 0);
                 if (flag == 0) {
                     unsigned long long target = epoch_base + (unsigned long long)num_splits;
@@ -2703,15 +2673,17 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_acquire_observed) : "l"(reinterpret_cast<unsigned long long*>(split_barriers + ((16384 + mb_1) * 16))) : "memory");
                     } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(target)) >= static_cast<unsigned long long>(1));
                     }
-#endif
                 }
                 float s = 0.0f;
                 float q = 0.0f;
+                if ((num_tokens + 63) / 64 * num_splits > num_ctas || num_tokens <= num_ctas * 4) {
+                    unsigned int w = ((flag == 1) ? (unsigned int)(warp - 18) : (unsigned int)(warp - 16)) % 4;
+                    unsigned int col0 = flag * 12;
+                    asm volatile("barrier.sync %0, 64;" :: "r"(4 + w) : "memory");
 #if __CUDA_ARCH__ == 1070
-                if ((num_tokens + 63) / 64 * num_splits <= num_ctas) {
                     unsigned int row_8 = token % 64;
                     unsigned int first_task = mb_1 * num_splits;
-                    float sums[32];
+                    float sums[16];
                     sums[0] = 0.0f;
                     sums[1] = 0.0f;
                     sums[2] = 0.0f;
@@ -2728,37 +2700,17 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     sums[13] = 0.0f;
                     sums[14] = 0.0f;
                     sums[15] = 0.0f;
-                    sums[16] = 0.0f;
-                    sums[17] = 0.0f;
-                    sums[18] = 0.0f;
-                    sums[19] = 0.0f;
-                    sums[20] = 0.0f;
-                    sums[21] = 0.0f;
-                    sums[22] = 0.0f;
-                    sums[23] = 0.0f;
-                    sums[24] = 0.0f;
-                    sums[25] = 0.0f;
-                    sums[26] = 0.0f;
-                    sums[27] = 0.0f;
-                    sums[28] = 0.0f;
-                    sums[29] = 0.0f;
-                    sums[30] = 0.0f;
-                    sums[31] = 0.0f;
                     unsigned int split = lane_in_warp * 2;
                     unsigned int safe_split = ((split < num_splits) ? split : 0);
                     unsigned long long record = ((unsigned long long)first_task + (unsigned long long)safe_split) * 1536 + (unsigned long long)(row_8 * 24);
                     float _vec_load_0[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + (unsigned long long)col0) + 0);
                         _vec_load_0[0 + 0] = _v4.x;
                         _vec_load_0[0 + 1] = _v4.y;
                         _vec_load_0[0 + 2] = _v4.z;
                         _vec_load_0[0 + 3] = _v4.w;
 #else
-                if ((num_tokens + 63) / 64 * num_splits > num_ctas || num_tokens <= num_ctas * 4) {
-                    unsigned int w = ((flag == 1) ? (unsigned int)(warp - 18) : (unsigned int)(warp - 16)) % 4;
-                    unsigned int col0 = flag * 12;
-                    asm volatile("barrier.sync %0, 64;" :: "r"(4 + w) : "memory");
                     float total_1 = 0.0f;
                     if (num_splits > 22) {
                         unsigned int row_8 = token % 64;
@@ -3721,459 +3673,384 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float value_1 = ((split < num_splits) ? _vec_load_0[0] : 0.0f);
                     sums[0] = value_1;
                     float value_0 = ((split < num_splits) ? _vec_load_0[1] : 0.0f);
-                    sums[16] = value_0;
+                    sums[8] = value_0;
                     float value_1_1 = ((split < num_splits) ? _vec_load_0[2] : 0.0f);
-                    sums[8] = value_1_1;
+                    sums[4] = value_1_1;
                     float value_2 = ((split < num_splits) ? _vec_load_0[3] : 0.0f);
-                    sums[24] = value_2;
+                    sums[12] = value_2;
                     float _vec_load_1[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + 4) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + (unsigned long long)(col0 + 4)) + 0);
                         _vec_load_1[0 + 0] = _v4.x;
                         _vec_load_1[0 + 1] = _v4.y;
                         _vec_load_1[0 + 2] = _v4.z;
                         _vec_load_1[0 + 3] = _v4.w;
-#else
-                    float total_0_1 = total_1;
-                    if (flag == 1 && lane_in_warp < 12) {
-                        pair_sums[w * 16 + lane_in_warp] = total_0_1;
-#endif
                     }
-#if __CUDA_ARCH__ == 1070
                     float value_3 = ((split < num_splits) ? _vec_load_1[0] : 0.0f);
-                    sums[4] = value_3;
+                    sums[2] = value_3;
                     float value_4 = ((split < num_splits) ? _vec_load_1[1] : 0.0f);
-                    sums[20] = value_4;
+                    sums[10] = value_4;
                     float value_5 = ((split < num_splits) ? _vec_load_1[2] : 0.0f);
-                    sums[12] = value_5;
+                    sums[6] = value_5;
                     float value_6 = ((split < num_splits) ? _vec_load_1[3] : 0.0f);
-                    sums[28] = value_6;
+                    sums[14] = value_6;
                     float _vec_load_2[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + 8) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + (unsigned long long)(col0 + 8)) + 0);
                         _vec_load_2[0 + 0] = _v4.x;
                         _vec_load_2[0 + 1] = _v4.y;
                         _vec_load_2[0 + 2] = _v4.z;
                         _vec_load_2[0 + 3] = _v4.w;
                     }
                     float value_7 = ((split < num_splits) ? _vec_load_2[0] : 0.0f);
-                    sums[2] = value_7;
+                    sums[1] = value_7;
                     float value_8_1 = ((split < num_splits) ? _vec_load_2[1] : 0.0f);
-                    sums[18] = value_8_1;
+                    sums[9] = value_8_1;
                     float value_9 = ((split < num_splits) ? _vec_load_2[2] : 0.0f);
-                    sums[10] = value_9;
+                    sums[5] = value_9;
                     float value_10 = ((split < num_splits) ? _vec_load_2[3] : 0.0f);
-                    sums[26] = value_10;
+                    sums[13] = value_10;
+                    float q_word = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task * 64 + (unsigned long long)(safe_split * 64) + (unsigned long long)row_8];
+                    float q_value = ((split < num_splits) ? q_word : 0.0f);
+                    sums[3] = q_value;
+                    unsigned int split_11 = lane_in_warp * 2 + 1;
+                    unsigned int safe_split_12 = ((split_11 < num_splits) ? split_11 : 0);
+                    unsigned long long record_13 = ((unsigned long long)first_task + (unsigned long long)safe_split_12) * 1536 + (unsigned long long)(row_8 * 24);
                     float _vec_load_3[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + 12) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_13 + (unsigned long long)col0) + 0);
                         _vec_load_3[0 + 0] = _v4.x;
                         _vec_load_3[0 + 1] = _v4.y;
                         _vec_load_3[0 + 2] = _v4.z;
                         _vec_load_3[0 + 3] = _v4.w;
                     }
-                    float value_11 = ((split < num_splits) ? _vec_load_3[0] : 0.0f);
-                    sums[6] = value_11;
-                    float value_12 = ((split < num_splits) ? _vec_load_3[1] : 0.0f);
-                    sums[22] = value_12;
-                    float value_13 = ((split < num_splits) ? _vec_load_3[2] : 0.0f);
-                    sums[14] = value_13;
-                    float value_14 = ((split < num_splits) ? _vec_load_3[3] : 0.0f);
-                    sums[30] = value_14;
+                    float value_14 = ((split_11 < num_splits) ? _vec_load_3[0] : 0.0f);
+                    float _add_4_2;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_4_2) : "f"(sums[0]), "f"(value_14));
+                    sums[0] = _add_4_2;
+                    float value_15 = ((split_11 < num_splits) ? _vec_load_3[1] : 0.0f);
+                    float _add_5_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5_1) : "f"(sums[8]), "f"(value_15));
+                    sums[8] = _add_5_1;
+                    float value_16 = ((split_11 < num_splits) ? _vec_load_3[2] : 0.0f);
+                    float _add_6_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6_1) : "f"(sums[4]), "f"(value_16));
+                    sums[4] = _add_6_1;
+                    float value_17_1 = ((split_11 < num_splits) ? _vec_load_3[3] : 0.0f);
+                    float _add_7_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7_1) : "f"(sums[12]), "f"(value_17_1));
+                    sums[12] = _add_7_1;
                     float _vec_load_4[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + 16) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_13 + (unsigned long long)(col0 + 4)) + 0);
                         _vec_load_4[0 + 0] = _v4.x;
                         _vec_load_4[0 + 1] = _v4.y;
                         _vec_load_4[0 + 2] = _v4.z;
                         _vec_load_4[0 + 3] = _v4.w;
                     }
-                    float value_15 = ((split < num_splits) ? _vec_load_4[0] : 0.0f);
-                    sums[1] = value_15;
-                    float value_16 = ((split < num_splits) ? _vec_load_4[1] : 0.0f);
-                    sums[17] = value_16;
-                    float value_17_1 = ((split < num_splits) ? _vec_load_4[2] : 0.0f);
-                    sums[9] = value_17_1;
-                    float value_18 = ((split < num_splits) ? _vec_load_4[3] : 0.0f);
-                    sums[25] = value_18;
+                    float value_18 = ((split_11 < num_splits) ? _vec_load_4[0] : 0.0f);
+                    float _add_9_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9_1) : "f"(sums[2]), "f"(value_18));
+                    sums[2] = _add_9_1;
+                    float value_19 = ((split_11 < num_splits) ? _vec_load_4[1] : 0.0f);
+                    float _add_10_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10_1) : "f"(sums[10]), "f"(value_19));
+                    sums[10] = _add_10_1;
+                    float value_20 = ((split_11 < num_splits) ? _vec_load_4[2] : 0.0f);
+                    float _add_11_2;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11_2) : "f"(sums[6]), "f"(value_20));
+                    sums[6] = _add_11_2;
+                    float value_21 = ((split_11 < num_splits) ? _vec_load_4[3] : 0.0f);
+                    float _add_12_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12_1) : "f"(sums[14]), "f"(value_21));
+                    sums[14] = _add_12_1;
                     float _vec_load_5[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record + 20) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_13 + (unsigned long long)(col0 + 8)) + 0);
                         _vec_load_5[0 + 0] = _v4.x;
                         _vec_load_5[0 + 1] = _v4.y;
                         _vec_load_5[0 + 2] = _v4.z;
                         _vec_load_5[0 + 3] = _v4.w;
                     }
-                    float value_19 = ((split < num_splits) ? _vec_load_5[0] : 0.0f);
-                    sums[5] = value_19;
-                    float value_20 = ((split < num_splits) ? _vec_load_5[1] : 0.0f);
-                    sums[21] = value_20;
-                    float value_21 = ((split < num_splits) ? _vec_load_5[2] : 0.0f);
-                    sums[13] = value_21;
-                    float value_22 = ((split < num_splits) ? _vec_load_5[3] : 0.0f);
-                    sums[29] = value_22;
-                    float q_word = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task * 64 + (unsigned long long)(safe_split * 64) + (unsigned long long)row_8];
-                    float q_value = ((split < num_splits) ? q_word : 0.0f);
-                    sums[3] = q_value;
-                    unsigned int split_23 = lane_in_warp * 2 + 1;
-                    unsigned int safe_split_24 = ((split_23 < num_splits) ? split_23 : 0);
-                    unsigned long long record_25 = ((unsigned long long)first_task + (unsigned long long)safe_split_24) * 1536 + (unsigned long long)(row_8 * 24);
+                    float value_22 = ((split_11 < num_splits) ? _vec_load_5[0] : 0.0f);
+                    float _add_14_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14_1) : "f"(sums[1]), "f"(value_22));
+                    sums[1] = _add_14_1;
+                    float value_23 = ((split_11 < num_splits) ? _vec_load_5[1] : 0.0f);
+                    float _add_15_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15_1) : "f"(sums[9]), "f"(value_23));
+                    sums[9] = _add_15_1;
+                    float value_24 = ((split_11 < num_splits) ? _vec_load_5[2] : 0.0f);
+                    float _add_16_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_16_1) : "f"(sums[5]), "f"(value_24));
+                    sums[5] = _add_16_1;
+                    float value_25 = ((split_11 < num_splits) ? _vec_load_5[3] : 0.0f);
+                    float _add_17_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17_1) : "f"(sums[13]), "f"(value_25));
+                    sums[13] = _add_17_1;
+                    float q_word_26 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task * 64 + (unsigned long long)(safe_split_12 * 64) + (unsigned long long)row_8];
+                    float q_value_27 = ((split_11 < num_splits) ? q_word_26 : 0.0f);
+                    float _add_18_2;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18_2) : "f"(sums[3]), "f"(q_value_27));
+                    sums[3] = _add_18_2;
+                    float half_l1[8];
+                    float keep = ((lane_in_warp % 2 == 1) ? sums[8] : sums[0]);
+                    float send = ((lane_in_warp % 2 == 1) ? sums[0] : sums[8]);
+                    float _shfl_xor_sync_20 = __shfl_xor_sync(0xFFFFFFFF, send, 1);
+                    float _add_19_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19_1) : "f"(keep), "f"(_shfl_xor_sync_20));
+                    half_l1[0] = _add_19_1;
+                    float keep_28 = ((lane_in_warp % 2 == 1) ? sums[9] : sums[1]);
+                    float send_29 = ((lane_in_warp % 2 == 1) ? sums[1] : sums[9]);
+                    float _shfl_xor_sync_22 = __shfl_xor_sync(0xFFFFFFFF, send_29, 1);
+                    float _add_21_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21_1) : "f"(keep_28), "f"(_shfl_xor_sync_22));
+                    half_l1[1] = _add_21_1;
+                    float keep_30 = ((lane_in_warp % 2 == 1) ? sums[10] : sums[2]);
+                    float send_31 = ((lane_in_warp % 2 == 1) ? sums[2] : sums[10]);
+                    float _shfl_xor_sync_24 = __shfl_xor_sync(0xFFFFFFFF, send_31, 1);
+                    float _add_23_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23_1) : "f"(keep_30), "f"(_shfl_xor_sync_24));
+                    half_l1[2] = _add_23_1;
+                    float keep_32 = ((lane_in_warp % 2 == 1) ? sums[11] : sums[3]);
+                    float send_33 = ((lane_in_warp % 2 == 1) ? sums[3] : sums[11]);
+                    float _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, send_33, 1);
+                    float _add_25_2;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25_2) : "f"(keep_32), "f"(_shfl_xor_sync_26));
+                    half_l1[3] = _add_25_2;
+                    float keep_34 = ((lane_in_warp % 2 == 1) ? sums[12] : sums[4]);
+                    float send_35 = ((lane_in_warp % 2 == 1) ? sums[4] : sums[12]);
+                    float _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, send_35, 1);
+                    float _add_27_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27_1) : "f"(keep_34), "f"(_shfl_xor_sync_28));
+                    half_l1[4] = _add_27_1;
+                    float keep_36 = ((lane_in_warp % 2 == 1) ? sums[13] : sums[5]);
+                    float send_37 = ((lane_in_warp % 2 == 1) ? sums[5] : sums[13]);
+                    float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, send_37, 1);
+                    float _add_29_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29_1) : "f"(keep_36), "f"(_shfl_xor_sync_30));
+                    half_l1[5] = _add_29_1;
+                    float keep_38 = ((lane_in_warp % 2 == 1) ? sums[14] : sums[6]);
+                    float send_39 = ((lane_in_warp % 2 == 1) ? sums[6] : sums[14]);
+                    float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, send_39, 1);
+                    float _add_31_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_31_1) : "f"(keep_38), "f"(_shfl_xor_sync_32));
+                    half_l1[6] = _add_31_1;
+                    float keep_40 = ((lane_in_warp % 2 == 1) ? sums[15] : sums[7]);
+                    float send_41 = ((lane_in_warp % 2 == 1) ? sums[7] : sums[15]);
+                    float _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, send_41, 1);
+                    float _add_33_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33_1) : "f"(keep_40), "f"(_shfl_xor_sync_34));
+                    half_l1[7] = _add_33_1;
+                    float half_l2[4];
+                    float keep_42 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[4] : half_l1[0]);
+                    float send_43 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[0] : half_l1[4]);
+                    float _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, send_43, 2);
+                    float _add_35_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35_1) : "f"(keep_42), "f"(_shfl_xor_sync_36));
+                    half_l2[0] = _add_35_1;
+                    float keep_44 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[5] : half_l1[1]);
+                    float send_45 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[1] : half_l1[5]);
+                    float _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, send_45, 2);
+                    float _add_37;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37) : "f"(keep_44), "f"(_shfl_xor_sync_38));
+                    half_l2[1] = _add_37;
+                    float keep_46 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[6] : half_l1[2]);
+                    float send_47 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[2] : half_l1[6]);
+                    float _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, send_47, 2);
+                    float _add_39_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_39_1) : "f"(keep_46), "f"(_shfl_xor_sync_40));
+                    half_l2[2] = _add_39_1;
+                    float keep_48 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[7] : half_l1[3]);
+                    float send_49 = ((lane_in_warp / 2 % 2 == 1) ? half_l1[3] : half_l1[7]);
+                    float _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, send_49, 2);
+                    float _add_41;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_41) : "f"(keep_48), "f"(_shfl_xor_sync_42));
+                    half_l2[3] = _add_41;
+                    float half_l3[2];
+                    float keep_50 = ((lane_in_warp / 4 % 2 == 1) ? half_l2[2] : half_l2[0]);
+                    float send_51 = ((lane_in_warp / 4 % 2 == 1) ? half_l2[0] : half_l2[2]);
+                    float _shfl_xor_sync_44 = __shfl_xor_sync(0xFFFFFFFF, send_51, 4);
+                    float _add_43;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_43) : "f"(keep_50), "f"(_shfl_xor_sync_44));
+                    half_l3[0] = _add_43;
+                    float keep_52 = ((lane_in_warp / 4 % 2 == 1) ? half_l2[3] : half_l2[1]);
+                    float send_53 = ((lane_in_warp / 4 % 2 == 1) ? half_l2[1] : half_l2[3]);
+                    float _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, send_53, 4);
+                    float _add_45;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_45) : "f"(keep_52), "f"(_shfl_xor_sync_46));
+                    half_l3[1] = _add_45;
+                    float half_l4[1];
+                    float keep_54 = ((lane_in_warp / 8 % 2 == 1) ? half_l3[1] : half_l3[0]);
+                    float send_55 = ((lane_in_warp / 8 % 2 == 1) ? half_l3[0] : half_l3[1]);
+                    float _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, send_55, 8);
+                    float _add_47;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47) : "f"(keep_54), "f"(_shfl_xor_sync_48));
+                    half_l4[0] = _add_47;
+                    float _shfl_xor_sync_49 = __shfl_xor_sync(0xFFFFFFFF, half_l4[0], 16);
+                    float total_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(total_1) : "f"(half_l4[0]), "f"(_shfl_xor_sync_49));
+                    float total_56 = total_1;
+#else
+                    float total_0_1 = total_1;
+#endif
+                    if (flag == 1 && lane_in_warp < 12) {
+#if __CUDA_ARCH__ == 1070
+                        pair_sums[w * 16 + lane_in_warp] = total_56;
+#else
+                        pair_sums[w * 16 + lane_in_warp] = total_0_1;
+#endif
+                    }
+                    asm volatile("barrier.sync %0, 64;" :: "r"(4 + w) : "memory");
+                    unsigned int pidx = ((lane_in_warp >= 12 && lane_in_warp < 24) ? lane_in_warp - 12 : 0);
+                    float partner = pair_sums[w * 16 + pidx];
+#if __CUDA_ARCH__ == 1070
+                    float s_57 = ((lane_in_warp < 12) ? total_56 : ((lane_in_warp < 24) ? partner : 0.0f));
+                    float q_58 = __shfl_sync(0xFFFFFFFF, total_56, 12);
+                    s = s_57;
+                    q = q_58;
+                } else if ((num_tokens + 63) / 64 * num_splits <= num_ctas) {
+                    unsigned int row_11 = token % 64;
+                    unsigned int first_task_1 = mb_1 * num_splits;
+                    float sums_1[32];
+                    sums_1[0] = 0.0f;
+                    sums_1[1] = 0.0f;
+                    sums_1[2] = 0.0f;
+                    sums_1[3] = 0.0f;
+                    sums_1[4] = 0.0f;
+                    sums_1[5] = 0.0f;
+                    sums_1[6] = 0.0f;
+                    sums_1[7] = 0.0f;
+                    sums_1[8] = 0.0f;
+                    sums_1[9] = 0.0f;
+                    sums_1[10] = 0.0f;
+                    sums_1[11] = 0.0f;
+                    sums_1[12] = 0.0f;
+                    sums_1[13] = 0.0f;
+                    sums_1[14] = 0.0f;
+                    sums_1[15] = 0.0f;
+                    sums_1[16] = 0.0f;
+                    sums_1[17] = 0.0f;
+                    sums_1[18] = 0.0f;
+                    sums_1[19] = 0.0f;
+                    sums_1[20] = 0.0f;
+                    sums_1[21] = 0.0f;
+                    sums_1[22] = 0.0f;
+                    sums_1[23] = 0.0f;
+                    sums_1[24] = 0.0f;
+                    sums_1[25] = 0.0f;
+                    sums_1[26] = 0.0f;
+                    sums_1[27] = 0.0f;
+                    sums_1[28] = 0.0f;
+                    sums_1[29] = 0.0f;
+                    sums_1[30] = 0.0f;
+                    sums_1[31] = 0.0f;
+                    unsigned int split_1 = lane_in_warp * 2;
+                    unsigned int safe_split_1 = ((split_1 < num_splits) ? split_1 : 0);
+                    unsigned long long record_1 = ((unsigned long long)first_task_1 + (unsigned long long)safe_split_1) * 1536 + (unsigned long long)(row_11 * 24);
                     float _vec_load_6[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_25 + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_1 + 0);
                         _vec_load_6[0 + 0] = _v4.x;
                         _vec_load_6[0 + 1] = _v4.y;
                         _vec_load_6[0 + 2] = _v4.z;
                         _vec_load_6[0 + 3] = _v4.w;
                     }
-                    float value_26_1 = ((split_23 < num_splits) ? _vec_load_6[0] : 0.0f);
-                    float _add_7_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7_1) : "f"(sums[0]), "f"(value_26_1));
-                    sums[0] = _add_7_1;
-                    float value_27 = ((split_23 < num_splits) ? _vec_load_6[1] : 0.0f);
-                    float _add_8_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8_1) : "f"(sums[16]), "f"(value_27));
-                    sums[16] = _add_8_1;
-                    float value_28 = ((split_23 < num_splits) ? _vec_load_6[2] : 0.0f);
-                    float _add_9_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9_1) : "f"(sums[8]), "f"(value_28));
-                    sums[8] = _add_9_1;
-                    float value_29 = ((split_23 < num_splits) ? _vec_load_6[3] : 0.0f);
-                    float _add_10_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10_1) : "f"(sums[24]), "f"(value_29));
-                    sums[24] = _add_10_1;
+                    float value_11 = ((split_1 < num_splits) ? _vec_load_6[0] : 0.0f);
+                    sums_1[0] = value_11;
+                    float value_0_1 = ((split_1 < num_splits) ? _vec_load_6[1] : 0.0f);
+                    sums_1[16] = value_0_1;
+                    float value_1_2 = ((split_1 < num_splits) ? _vec_load_6[2] : 0.0f);
+                    sums_1[8] = value_1_2;
+                    float value_2_1 = ((split_1 < num_splits) ? _vec_load_6[3] : 0.0f);
+                    sums_1[24] = value_2_1;
                     float _vec_load_7[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 4) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 4) + 0);
                         _vec_load_7[0 + 0] = _v4.x;
                         _vec_load_7[0 + 1] = _v4.y;
                         _vec_load_7[0 + 2] = _v4.z;
                         _vec_load_7[0 + 3] = _v4.w;
                     }
-                    float value_30 = ((split_23 < num_splits) ? _vec_load_7[0] : 0.0f);
-                    float _add_12_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12_1) : "f"(sums[4]), "f"(value_30));
-                    sums[4] = _add_12_1;
-                    float value_31 = ((split_23 < num_splits) ? _vec_load_7[1] : 0.0f);
-                    float _add_13_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13_1) : "f"(sums[20]), "f"(value_31));
-                    sums[20] = _add_13_1;
-                    float value_32 = ((split_23 < num_splits) ? _vec_load_7[2] : 0.0f);
-                    float _add_14_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14_1) : "f"(sums[12]), "f"(value_32));
-                    sums[12] = _add_14_1;
-                    float value_33 = ((split_23 < num_splits) ? _vec_load_7[3] : 0.0f);
-                    float _add_15_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15_1) : "f"(sums[28]), "f"(value_33));
-                    sums[28] = _add_15_1;
+                    float value_3_1 = ((split_1 < num_splits) ? _vec_load_7[0] : 0.0f);
+                    sums_1[4] = value_3_1;
+                    float value_4_1 = ((split_1 < num_splits) ? _vec_load_7[1] : 0.0f);
+                    sums_1[20] = value_4_1;
+                    float value_5_1 = ((split_1 < num_splits) ? _vec_load_7[2] : 0.0f);
+                    sums_1[12] = value_5_1;
+                    float value_6_1 = ((split_1 < num_splits) ? _vec_load_7[3] : 0.0f);
+                    sums_1[28] = value_6_1;
                     float _vec_load_8[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 8) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 8) + 0);
                         _vec_load_8[0 + 0] = _v4.x;
                         _vec_load_8[0 + 1] = _v4.y;
                         _vec_load_8[0 + 2] = _v4.z;
                         _vec_load_8[0 + 3] = _v4.w;
                     }
-                    float value_34 = ((split_23 < num_splits) ? _vec_load_8[0] : 0.0f);
-                    float _add_17_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17_1) : "f"(sums[2]), "f"(value_34));
-                    sums[2] = _add_17_1;
-                    float value_35 = ((split_23 < num_splits) ? _vec_load_8[1] : 0.0f);
-                    float _add_18_2;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18_2) : "f"(sums[18]), "f"(value_35));
-                    sums[18] = _add_18_2;
-                    float value_36 = ((split_23 < num_splits) ? _vec_load_8[2] : 0.0f);
-                    float _add_19_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19_1) : "f"(sums[10]), "f"(value_36));
-                    sums[10] = _add_19_1;
-                    float value_37 = ((split_23 < num_splits) ? _vec_load_8[3] : 0.0f);
-                    float _add_20_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_20_1) : "f"(sums[26]), "f"(value_37));
-                    sums[26] = _add_20_1;
+                    float value_7_1 = ((split_1 < num_splits) ? _vec_load_8[0] : 0.0f);
+                    sums_1[2] = value_7_1;
+                    float value_8_2 = ((split_1 < num_splits) ? _vec_load_8[1] : 0.0f);
+                    sums_1[18] = value_8_2;
+                    float value_9_1 = ((split_1 < num_splits) ? _vec_load_8[2] : 0.0f);
+                    sums_1[10] = value_9_1;
+                    float value_10_1 = ((split_1 < num_splits) ? _vec_load_8[3] : 0.0f);
+                    sums_1[26] = value_10_1;
                     float _vec_load_9[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 12) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 12) + 0);
                         _vec_load_9[0 + 0] = _v4.x;
                         _vec_load_9[0 + 1] = _v4.y;
                         _vec_load_9[0 + 2] = _v4.z;
                         _vec_load_9[0 + 3] = _v4.w;
                     }
-                    float value_38 = ((split_23 < num_splits) ? _vec_load_9[0] : 0.0f);
-                    float _add_22_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_22_1) : "f"(sums[6]), "f"(value_38));
-                    sums[6] = _add_22_1;
-                    float value_39 = ((split_23 < num_splits) ? _vec_load_9[1] : 0.0f);
-                    float _add_23_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23_1) : "f"(sums[22]), "f"(value_39));
-                    sums[22] = _add_23_1;
-                    float value_40 = ((split_23 < num_splits) ? _vec_load_9[2] : 0.0f);
-                    float _add_24_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_24_1) : "f"(sums[14]), "f"(value_40));
-                    sums[14] = _add_24_1;
-                    float value_41 = ((split_23 < num_splits) ? _vec_load_9[3] : 0.0f);
-                    float _add_25_2;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25_2) : "f"(sums[30]), "f"(value_41));
-                    sums[30] = _add_25_2;
+                    float value_11_1 = ((split_1 < num_splits) ? _vec_load_9[0] : 0.0f);
+                    sums_1[6] = value_11_1;
+                    float value_12 = ((split_1 < num_splits) ? _vec_load_9[1] : 0.0f);
+                    sums_1[22] = value_12;
+                    float value_13 = ((split_1 < num_splits) ? _vec_load_9[2] : 0.0f);
+                    sums_1[14] = value_13;
+                    float value_14_1 = ((split_1 < num_splits) ? _vec_load_9[3] : 0.0f);
+                    sums_1[30] = value_14_1;
                     float _vec_load_10[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 16) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 16) + 0);
                         _vec_load_10[0 + 0] = _v4.x;
                         _vec_load_10[0 + 1] = _v4.y;
                         _vec_load_10[0 + 2] = _v4.z;
                         _vec_load_10[0 + 3] = _v4.w;
                     }
-                    float value_42 = ((split_23 < num_splits) ? _vec_load_10[0] : 0.0f);
-                    float _add_27_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27_1) : "f"(sums[1]), "f"(value_42));
-                    sums[1] = _add_27_1;
-                    float value_43 = ((split_23 < num_splits) ? _vec_load_10[1] : 0.0f);
-                    float _add_28_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_28_1) : "f"(sums[17]), "f"(value_43));
-                    sums[17] = _add_28_1;
-                    float value_44_1 = ((split_23 < num_splits) ? _vec_load_10[2] : 0.0f);
-                    float _add_29_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29_1) : "f"(sums[9]), "f"(value_44_1));
-                    sums[9] = _add_29_1;
-                    float value_45 = ((split_23 < num_splits) ? _vec_load_10[3] : 0.0f);
-                    float _add_30_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_30_1) : "f"(sums[25]), "f"(value_45));
-                    sums[25] = _add_30_1;
+                    float value_15_1 = ((split_1 < num_splits) ? _vec_load_10[0] : 0.0f);
+                    sums_1[1] = value_15_1;
+                    float value_16_1 = ((split_1 < num_splits) ? _vec_load_10[1] : 0.0f);
+                    sums_1[17] = value_16_1;
+                    float value_17_2 = ((split_1 < num_splits) ? _vec_load_10[2] : 0.0f);
+                    sums_1[9] = value_17_2;
+                    float value_18_1 = ((split_1 < num_splits) ? _vec_load_10[3] : 0.0f);
+                    sums_1[25] = value_18_1;
                     float _vec_load_11[4];
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 20) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 20) + 0);
                         _vec_load_11[0 + 0] = _v4.x;
                         _vec_load_11[0 + 1] = _v4.y;
                         _vec_load_11[0 + 2] = _v4.z;
                         _vec_load_11[0 + 3] = _v4.w;
                     }
-                    float value_46 = ((split_23 < num_splits) ? _vec_load_11[0] : 0.0f);
-                    float _add_32_2;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_32_2) : "f"(sums[5]), "f"(value_46));
-                    sums[5] = _add_32_2;
-                    float value_47 = ((split_23 < num_splits) ? _vec_load_11[1] : 0.0f);
-                    float _add_33_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33_1) : "f"(sums[21]), "f"(value_47));
-                    sums[21] = _add_33_1;
-                    float value_48 = ((split_23 < num_splits) ? _vec_load_11[2] : 0.0f);
-                    float _add_34_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_34_1) : "f"(sums[13]), "f"(value_48));
-                    sums[13] = _add_34_1;
-                    float value_49 = ((split_23 < num_splits) ? _vec_load_11[3] : 0.0f);
-                    float _add_35_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35_1) : "f"(sums[29]), "f"(value_49));
-                    sums[29] = _add_35_1;
-                    float q_word_50 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task * 64 + (unsigned long long)(safe_split_24 * 64) + (unsigned long long)row_8];
-                    float q_value_51 = ((split_23 < num_splits) ? q_word_50 : 0.0f);
-                    float _add_36;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_36) : "f"(sums[3]), "f"(q_value_51));
-                    sums[3] = _add_36;
-                    float fold_level1[16];
-                    float keep = ((lane_in_warp % 2 == 1) ? sums[16] : sums[0]);
-                    float send = ((lane_in_warp % 2 == 1) ? sums[0] : sums[16]);
-                    float _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, send, 1);
-                    float _add_37;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37) : "f"(keep), "f"(_shfl_xor_sync_38));
-                    fold_level1[0] = _add_37;
-                    float keep_52 = ((lane_in_warp % 2 == 1) ? sums[17] : sums[1]);
-                    float send_53 = ((lane_in_warp % 2 == 1) ? sums[1] : sums[17]);
-                    float _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, send_53, 1);
-                    float _add_39_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_39_1) : "f"(keep_52), "f"(_shfl_xor_sync_40));
-                    fold_level1[1] = _add_39_1;
-                    float keep_54 = ((lane_in_warp % 2 == 1) ? sums[18] : sums[2]);
-                    float send_55 = ((lane_in_warp % 2 == 1) ? sums[2] : sums[18]);
-                    float _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, send_55, 1);
-                    float _add_41;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_41) : "f"(keep_54), "f"(_shfl_xor_sync_42));
-                    fold_level1[2] = _add_41;
-                    float keep_56 = ((lane_in_warp % 2 == 1) ? sums[19] : sums[3]);
-                    float send_57 = ((lane_in_warp % 2 == 1) ? sums[3] : sums[19]);
-                    float _shfl_xor_sync_44 = __shfl_xor_sync(0xFFFFFFFF, send_57, 1);
-                    float _add_43;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_43) : "f"(keep_56), "f"(_shfl_xor_sync_44));
-                    fold_level1[3] = _add_43;
-                    float keep_58 = ((lane_in_warp % 2 == 1) ? sums[20] : sums[4]);
-                    float send_59 = ((lane_in_warp % 2 == 1) ? sums[4] : sums[20]);
-                    float _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, send_59, 1);
-                    float _add_45;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_45) : "f"(keep_58), "f"(_shfl_xor_sync_46));
-                    fold_level1[4] = _add_45;
-                    float keep_60 = ((lane_in_warp % 2 == 1) ? sums[21] : sums[5]);
-                    float send_61 = ((lane_in_warp % 2 == 1) ? sums[5] : sums[21]);
-                    float _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, send_61, 1);
-                    float _add_47;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47) : "f"(keep_60), "f"(_shfl_xor_sync_48));
-                    fold_level1[5] = _add_47;
-                    float keep_62 = ((lane_in_warp % 2 == 1) ? sums[22] : sums[6]);
-                    float send_63 = ((lane_in_warp % 2 == 1) ? sums[6] : sums[22]);
-                    float _shfl_xor_sync_50 = __shfl_xor_sync(0xFFFFFFFF, send_63, 1);
-                    float _add_49;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_49) : "f"(keep_62), "f"(_shfl_xor_sync_50));
-                    fold_level1[6] = _add_49;
-                    float keep_64 = ((lane_in_warp % 2 == 1) ? sums[23] : sums[7]);
-                    float send_65 = ((lane_in_warp % 2 == 1) ? sums[7] : sums[23]);
-                    float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, send_65, 1);
-                    float _add_51;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_51) : "f"(keep_64), "f"(_shfl_xor_sync_52));
-                    fold_level1[7] = _add_51;
-                    float keep_66 = ((lane_in_warp % 2 == 1) ? sums[24] : sums[8]);
-                    float send_67 = ((lane_in_warp % 2 == 1) ? sums[8] : sums[24]);
-                    float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, send_67, 1);
-                    float _add_53_1;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_53_1) : "f"(keep_66), "f"(_shfl_xor_sync_54));
-                    fold_level1[8] = _add_53_1;
-                    float keep_68 = ((lane_in_warp % 2 == 1) ? sums[25] : sums[9]);
-                    float send_69 = ((lane_in_warp % 2 == 1) ? sums[9] : sums[25]);
-                    float _shfl_xor_sync_56_1 = __shfl_xor_sync(0xFFFFFFFF, send_69, 1);
-                    float _add_55;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_55) : "f"(keep_68), "f"(_shfl_xor_sync_56_1));
-                    fold_level1[9] = _add_55;
-                    float keep_70 = ((lane_in_warp % 2 == 1) ? sums[26] : sums[10]);
-                    float send_71 = ((lane_in_warp % 2 == 1) ? sums[10] : sums[26]);
-                    float _shfl_xor_sync_58_1 = __shfl_xor_sync(0xFFFFFFFF, send_71, 1);
-                    float _add_57;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_57) : "f"(keep_70), "f"(_shfl_xor_sync_58_1));
-                    fold_level1[10] = _add_57;
-                    float keep_72 = ((lane_in_warp % 2 == 1) ? sums[27] : sums[11]);
-                    float send_73 = ((lane_in_warp % 2 == 1) ? sums[11] : sums[27]);
-                    float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, send_73, 1);
-                    float _add_59;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_59) : "f"(keep_72), "f"(_shfl_xor_sync_60));
-                    fold_level1[11] = _add_59;
-                    float keep_74 = ((lane_in_warp % 2 == 1) ? sums[28] : sums[12]);
-                    float send_75 = ((lane_in_warp % 2 == 1) ? sums[12] : sums[28]);
-                    float _shfl_xor_sync_62 = __shfl_xor_sync(0xFFFFFFFF, send_75, 1);
-                    float _add_61;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_61) : "f"(keep_74), "f"(_shfl_xor_sync_62));
-                    fold_level1[12] = _add_61;
-                    float keep_76 = ((lane_in_warp % 2 == 1) ? sums[29] : sums[13]);
-                    float send_77 = ((lane_in_warp % 2 == 1) ? sums[13] : sums[29]);
-                    float _shfl_xor_sync_64 = __shfl_xor_sync(0xFFFFFFFF, send_77, 1);
-                    float _add_63;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_63) : "f"(keep_76), "f"(_shfl_xor_sync_64));
-                    fold_level1[13] = _add_63;
-                    float keep_78 = ((lane_in_warp % 2 == 1) ? sums[30] : sums[14]);
-                    float send_79 = ((lane_in_warp % 2 == 1) ? sums[14] : sums[30]);
-                    float _shfl_xor_sync_66 = __shfl_xor_sync(0xFFFFFFFF, send_79, 1);
-                    float _add_65;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_65) : "f"(keep_78), "f"(_shfl_xor_sync_66));
-                    fold_level1[14] = _add_65;
-                    float keep_80 = ((lane_in_warp % 2 == 1) ? sums[31] : sums[15]);
-                    float send_81 = ((lane_in_warp % 2 == 1) ? sums[15] : sums[31]);
-                    float _shfl_xor_sync_68 = __shfl_xor_sync(0xFFFFFFFF, send_81, 1);
-                    float _add_67;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_67) : "f"(keep_80), "f"(_shfl_xor_sync_68));
-                    fold_level1[15] = _add_67;
-                    float fold_level2[8];
-                    float keep_82 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[8] : fold_level1[0]);
-                    float send_83 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[0] : fold_level1[8]);
-                    float _shfl_xor_sync_70 = __shfl_xor_sync(0xFFFFFFFF, send_83, 2);
-                    float _add_69;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_69) : "f"(keep_82), "f"(_shfl_xor_sync_70));
-                    fold_level2[0] = _add_69;
-                    float keep_84 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[9] : fold_level1[1]);
-                    float send_85 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[1] : fold_level1[9]);
-                    float _shfl_xor_sync_72 = __shfl_xor_sync(0xFFFFFFFF, send_85, 2);
-                    float _add_71;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_71) : "f"(keep_84), "f"(_shfl_xor_sync_72));
-                    fold_level2[1] = _add_71;
-                    float keep_86 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[10] : fold_level1[2]);
-                    float send_87 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[2] : fold_level1[10]);
-                    float _shfl_xor_sync_74 = __shfl_xor_sync(0xFFFFFFFF, send_87, 2);
-                    float _add_73;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_73) : "f"(keep_86), "f"(_shfl_xor_sync_74));
-                    fold_level2[2] = _add_73;
-                    float keep_88 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[11] : fold_level1[3]);
-                    float send_89 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[3] : fold_level1[11]);
-                    float _shfl_xor_sync_76 = __shfl_xor_sync(0xFFFFFFFF, send_89, 2);
-                    float _add_75;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_75) : "f"(keep_88), "f"(_shfl_xor_sync_76));
-                    fold_level2[3] = _add_75;
-                    float keep_90 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[12] : fold_level1[4]);
-                    float send_91 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[4] : fold_level1[12]);
-                    float _shfl_xor_sync_78 = __shfl_xor_sync(0xFFFFFFFF, send_91, 2);
-                    float _add_77;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_77) : "f"(keep_90), "f"(_shfl_xor_sync_78));
-                    fold_level2[4] = _add_77;
-                    float keep_92 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[13] : fold_level1[5]);
-                    float send_93 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[5] : fold_level1[13]);
-                    float _shfl_xor_sync_80 = __shfl_xor_sync(0xFFFFFFFF, send_93, 2);
-                    float _add_79;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_79) : "f"(keep_92), "f"(_shfl_xor_sync_80));
-                    fold_level2[5] = _add_79;
-                    float keep_94 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[14] : fold_level1[6]);
-                    float send_95 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[6] : fold_level1[14]);
-                    float _shfl_xor_sync_82 = __shfl_xor_sync(0xFFFFFFFF, send_95, 2);
-                    float _add_81;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_81) : "f"(keep_94), "f"(_shfl_xor_sync_82));
-                    fold_level2[6] = _add_81;
-                    float keep_96 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[15] : fold_level1[7]);
-                    float send_97 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[7] : fold_level1[15]);
-                    float _shfl_xor_sync_84 = __shfl_xor_sync(0xFFFFFFFF, send_97, 2);
-                    float _add_83;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_83) : "f"(keep_96), "f"(_shfl_xor_sync_84));
-                    fold_level2[7] = _add_83;
-                    float fold_level3[4];
-                    float keep_98 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[4] : fold_level2[0]);
-                    float send_99 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[0] : fold_level2[4]);
-                    float _shfl_xor_sync_86 = __shfl_xor_sync(0xFFFFFFFF, send_99, 4);
-                    float _add_85;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_85) : "f"(keep_98), "f"(_shfl_xor_sync_86));
-                    fold_level3[0] = _add_85;
-                    float keep_100 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[5] : fold_level2[1]);
-                    float send_101 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[1] : fold_level2[5]);
-                    float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, send_101, 4);
-                    float _add_87;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_87) : "f"(keep_100), "f"(_shfl_xor_sync_88));
-                    fold_level3[1] = _add_87;
-                    float keep_102 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[6] : fold_level2[2]);
-                    float send_103 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[2] : fold_level2[6]);
-                    float _shfl_xor_sync_90 = __shfl_xor_sync(0xFFFFFFFF, send_103, 4);
-                    float _add_89;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_89) : "f"(keep_102), "f"(_shfl_xor_sync_90));
-                    fold_level3[2] = _add_89;
-                    float keep_104 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[7] : fold_level2[3]);
-                    float send_105 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[3] : fold_level2[7]);
-                    float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, send_105, 4);
-                    float _add_91;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_91) : "f"(keep_104), "f"(_shfl_xor_sync_92));
-                    fold_level3[3] = _add_91;
-                    float fold_level4[2];
-                    float keep_106 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[2] : fold_level3[0]);
-                    float send_107 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[0] : fold_level3[2]);
-                    float _shfl_xor_sync_94 = __shfl_xor_sync(0xFFFFFFFF, send_107, 8);
-                    float _add_93;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_93) : "f"(keep_106), "f"(_shfl_xor_sync_94));
-                    fold_level4[0] = _add_93;
-                    float keep_108 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[3] : fold_level3[1]);
-                    float send_109 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[1] : fold_level3[3]);
-                    float _shfl_xor_sync_96 = __shfl_xor_sync(0xFFFFFFFF, send_109, 8);
-                    float _add_95;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_95) : "f"(keep_108), "f"(_shfl_xor_sync_96));
-                    fold_level4[1] = _add_95;
-                    float fold_level5[1];
-                    float keep_110 = ((lane_in_warp / 16 % 2 == 1) ? fold_level4[1] : fold_level4[0]);
-                    float send_111 = ((lane_in_warp / 16 % 2 == 1) ? fold_level4[0] : fold_level4[1]);
-                    float _shfl_xor_sync_98 = __shfl_xor_sync(0xFFFFFFFF, send_111, 16);
-                    float _add_97;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_97) : "f"(keep_110), "f"(_shfl_xor_sync_98));
-                    fold_level5[0] = _add_97;
-                    float total_1 = fold_level5[0];
-                    float s_112 = ((lane_in_warp < 24) ? total_1 : 0.0f);
-                    float q_113 = __shfl_sync(0xFFFFFFFF, total_1, 24);
-                    s = s_112;
-                    q = q_113;
-                } else {
-                    unsigned int row_11 = token % 64;
-                    unsigned int first_task_1 = mb_1 * num_splits;
-                    float sums_1[25];
-                    unsigned int split_1 = lane_in_warp * 2;
-                    unsigned int safe_split_1 = ((split_1 < num_splits) ? split_1 : 0);
-                    unsigned long long record_1 = ((unsigned long long)first_task_1 + (unsigned long long)safe_split_1) * 1536 + (unsigned long long)(row_11 * 24);
+                    float value_19_1 = ((split_1 < num_splits) ? _vec_load_11[0] : 0.0f);
+                    sums_1[5] = value_19_1;
+                    float value_20_1 = ((split_1 < num_splits) ? _vec_load_11[1] : 0.0f);
+                    sums_1[21] = value_20_1;
+                    float value_21_1 = ((split_1 < num_splits) ? _vec_load_11[2] : 0.0f);
+                    sums_1[13] = value_21_1;
+                    float value_22_1 = ((split_1 < num_splits) ? _vec_load_11[3] : 0.0f);
+                    sums_1[29] = value_22_1;
+                    float q_word_1 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_1 * 64 + (unsigned long long)(safe_split_1 * 64) + (unsigned long long)row_11];
+                    float q_value_1 = ((split_1 < num_splits) ? q_word_1 : 0.0f);
+                    sums_1[3] = q_value_1;
+                    unsigned int split_23 = lane_in_warp * 2 + 1;
+                    unsigned int safe_split_24 = ((split_23 < num_splits) ? split_23 : 0);
+                    unsigned long long record_25 = ((unsigned long long)first_task_1 + (unsigned long long)safe_split_24) * 1536 + (unsigned long long)(row_11 * 24);
 #else
-                    asm volatile("barrier.sync %0, 64;" :: "r"(4 + w) : "memory");
-                    unsigned int pidx = ((lane_in_warp >= 12 && lane_in_warp < 24) ? lane_in_warp - 12 : 0);
-                    float partner = pair_sums[w * 16 + pidx];
                     float s_1 = ((lane_in_warp < 12) ? total_0_1 : ((lane_in_warp < 24) ? partner : 0.0f));
                     float q_2 = __shfl_sync(0xFFFFFFFF, total_0_1, 12);
                     s = s_1;
@@ -4221,7 +4098,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_12[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_1 + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_25 + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_2 + 0);
 #endif
@@ -4231,14 +4108,22 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_12[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_23 = ((split_1 < num_splits) ? _vec_load_12[0] : 0.0f);
-                    sums_1[0] = value_23;
-                    float value_0_1 = ((split_1 < num_splits) ? _vec_load_12[1] : 0.0f);
-                    sums_1[1] = value_0_1;
-                    float value_1_2 = ((split_1 < num_splits) ? _vec_load_12[2] : 0.0f);
-                    sums_1[2] = value_1_2;
-                    float value_2_1 = ((split_1 < num_splits) ? _vec_load_12[3] : 0.0f);
-                    sums_1[3] = value_2_1;
+                    float value_26_1 = ((split_23 < num_splits) ? _vec_load_12[0] : 0.0f);
+                    float _add_57;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_57) : "f"(sums_1[0]), "f"(value_26_1));
+                    sums_1[0] = _add_57;
+                    float value_27 = ((split_23 < num_splits) ? _vec_load_12[1] : 0.0f);
+                    float _add_58;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_58) : "f"(sums_1[16]), "f"(value_27));
+                    sums_1[16] = _add_58;
+                    float value_28 = ((split_23 < num_splits) ? _vec_load_12[2] : 0.0f);
+                    float _add_59;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_59) : "f"(sums_1[8]), "f"(value_28));
+                    sums_1[8] = _add_59;
+                    float value_29 = ((split_23 < num_splits) ? _vec_load_12[3] : 0.0f);
+                    float _add_60;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_60) : "f"(sums_1[24]), "f"(value_29));
+                    sums_1[24] = _add_60;
 #else
                     float value_12 = ((split_2 < num_splits) ? _vec_load_12[0] : 0.0f);
                     sums_2[0] = value_12;
@@ -4252,7 +4137,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_13[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 4) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 4) + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 4) + 0);
 #endif
@@ -4262,14 +4147,22 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_13[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_3_1 = ((split_1 < num_splits) ? _vec_load_13[0] : 0.0f);
-                    sums_1[4] = value_3_1;
-                    float value_4_1 = ((split_1 < num_splits) ? _vec_load_13[1] : 0.0f);
-                    sums_1[5] = value_4_1;
-                    float value_5_1 = ((split_1 < num_splits) ? _vec_load_13[2] : 0.0f);
-                    sums_1[6] = value_5_1;
-                    float value_6_1 = ((split_1 < num_splits) ? _vec_load_13[3] : 0.0f);
-                    sums_1[7] = value_6_1;
+                    float value_30 = ((split_23 < num_splits) ? _vec_load_13[0] : 0.0f);
+                    float _add_62;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_62) : "f"(sums_1[4]), "f"(value_30));
+                    sums_1[4] = _add_62;
+                    float value_31 = ((split_23 < num_splits) ? _vec_load_13[1] : 0.0f);
+                    float _add_63;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_63) : "f"(sums_1[20]), "f"(value_31));
+                    sums_1[20] = _add_63;
+                    float value_32 = ((split_23 < num_splits) ? _vec_load_13[2] : 0.0f);
+                    float _add_64;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_64) : "f"(sums_1[12]), "f"(value_32));
+                    sums_1[12] = _add_64;
+                    float value_33 = ((split_23 < num_splits) ? _vec_load_13[3] : 0.0f);
+                    float _add_65;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_65) : "f"(sums_1[28]), "f"(value_33));
+                    sums_1[28] = _add_65;
 #else
                     float value_3_2 = ((split_2 < num_splits) ? _vec_load_13[0] : 0.0f);
                     sums_2[4] = value_3_2;
@@ -4283,7 +4176,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_14[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 8) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 8) + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 8) + 0);
 #endif
@@ -4293,14 +4186,22 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_14[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_7_1 = ((split_1 < num_splits) ? _vec_load_14[0] : 0.0f);
-                    sums_1[8] = value_7_1;
-                    float value_8_2 = ((split_1 < num_splits) ? _vec_load_14[1] : 0.0f);
-                    sums_1[9] = value_8_2;
-                    float value_9_1 = ((split_1 < num_splits) ? _vec_load_14[2] : 0.0f);
-                    sums_1[10] = value_9_1;
-                    float value_10_1 = ((split_1 < num_splits) ? _vec_load_14[3] : 0.0f);
-                    sums_1[11] = value_10_1;
+                    float value_34 = ((split_23 < num_splits) ? _vec_load_14[0] : 0.0f);
+                    float _add_67;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_67) : "f"(sums_1[2]), "f"(value_34));
+                    sums_1[2] = _add_67;
+                    float value_35 = ((split_23 < num_splits) ? _vec_load_14[1] : 0.0f);
+                    float _add_68;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_68) : "f"(sums_1[18]), "f"(value_35));
+                    sums_1[18] = _add_68;
+                    float value_36 = ((split_23 < num_splits) ? _vec_load_14[2] : 0.0f);
+                    float _add_69;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_69) : "f"(sums_1[10]), "f"(value_36));
+                    sums_1[10] = _add_69;
+                    float value_37 = ((split_23 < num_splits) ? _vec_load_14[3] : 0.0f);
+                    float _add_70;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_70) : "f"(sums_1[26]), "f"(value_37));
+                    sums_1[26] = _add_70;
 #else
                     float value_7_2 = ((split_2 < num_splits) ? _vec_load_14[0] : 0.0f);
                     sums_2[2] = value_7_2;
@@ -4314,7 +4215,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_15[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 12) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 12) + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 12) + 0);
 #endif
@@ -4324,14 +4225,22 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_15[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_11_1 = ((split_1 < num_splits) ? _vec_load_15[0] : 0.0f);
-                    sums_1[12] = value_11_1;
-                    float value_12_1 = ((split_1 < num_splits) ? _vec_load_15[1] : 0.0f);
-                    sums_1[13] = value_12_1;
-                    float value_13_1 = ((split_1 < num_splits) ? _vec_load_15[2] : 0.0f);
-                    sums_1[14] = value_13_1;
-                    float value_14_1 = ((split_1 < num_splits) ? _vec_load_15[3] : 0.0f);
-                    sums_1[15] = value_14_1;
+                    float value_38 = ((split_23 < num_splits) ? _vec_load_15[0] : 0.0f);
+                    float _add_72;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_72) : "f"(sums_1[6]), "f"(value_38));
+                    sums_1[6] = _add_72;
+                    float value_39 = ((split_23 < num_splits) ? _vec_load_15[1] : 0.0f);
+                    float _add_73;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_73) : "f"(sums_1[22]), "f"(value_39));
+                    sums_1[22] = _add_73;
+                    float value_40 = ((split_23 < num_splits) ? _vec_load_15[2] : 0.0f);
+                    float _add_74;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_74) : "f"(sums_1[14]), "f"(value_40));
+                    sums_1[14] = _add_74;
+                    float value_41 = ((split_23 < num_splits) ? _vec_load_15[3] : 0.0f);
+                    float _add_75;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_75) : "f"(sums_1[30]), "f"(value_41));
+                    sums_1[30] = _add_75;
 #else
                     float value_11_1 = ((split_2 < num_splits) ? _vec_load_15[0] : 0.0f);
                     sums_2[6] = value_11_1;
@@ -4345,7 +4254,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_16[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 16) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 16) + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 16) + 0);
 #endif
@@ -4355,14 +4264,22 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_16[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_15_1 = ((split_1 < num_splits) ? _vec_load_16[0] : 0.0f);
-                    sums_1[16] = value_15_1;
-                    float value_16_1 = ((split_1 < num_splits) ? _vec_load_16[1] : 0.0f);
-                    sums_1[17] = value_16_1;
-                    float value_17_2 = ((split_1 < num_splits) ? _vec_load_16[2] : 0.0f);
-                    sums_1[18] = value_17_2;
-                    float value_18_1 = ((split_1 < num_splits) ? _vec_load_16[3] : 0.0f);
-                    sums_1[19] = value_18_1;
+                    float value_42 = ((split_23 < num_splits) ? _vec_load_16[0] : 0.0f);
+                    float _add_77;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_77) : "f"(sums_1[1]), "f"(value_42));
+                    sums_1[1] = _add_77;
+                    float value_43 = ((split_23 < num_splits) ? _vec_load_16[1] : 0.0f);
+                    float _add_78;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_78) : "f"(sums_1[17]), "f"(value_43));
+                    sums_1[17] = _add_78;
+                    float value_44_1 = ((split_23 < num_splits) ? _vec_load_16[2] : 0.0f);
+                    float _add_79;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_79) : "f"(sums_1[9]), "f"(value_44_1));
+                    sums_1[9] = _add_79;
+                    float value_45 = ((split_23 < num_splits) ? _vec_load_16[3] : 0.0f);
+                    float _add_80;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_80) : "f"(sums_1[25]), "f"(value_45));
+                    sums_1[25] = _add_80;
 #else
                     float value_15_1 = ((split_2 < num_splits) ? _vec_load_16[0] : 0.0f);
                     sums_2[1] = value_15_1;
@@ -4376,7 +4293,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _vec_load_17[4];
                     {
 #if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_1 + 20) + 0);
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 20) + 0);
 #else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 20) + 0);
 #endif
@@ -4386,20 +4303,23 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         _vec_load_17[0 + 3] = _v4.w;
                     }
 #if __CUDA_ARCH__ == 1070
-                    float value_19_1 = ((split_1 < num_splits) ? _vec_load_17[0] : 0.0f);
-                    sums_1[20] = value_19_1;
-                    float value_20_1 = ((split_1 < num_splits) ? _vec_load_17[1] : 0.0f);
-                    sums_1[21] = value_20_1;
-                    float value_21_1 = ((split_1 < num_splits) ? _vec_load_17[2] : 0.0f);
-                    sums_1[22] = value_21_1;
-                    float value_22_1 = ((split_1 < num_splits) ? _vec_load_17[3] : 0.0f);
-                    sums_1[23] = value_22_1;
-                    float q_word_1 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_1 * 64 + (unsigned long long)(safe_split_1 * 64) + (unsigned long long)row_11];
-                    float q_value_1 = ((split_1 < num_splits) ? q_word_1 : 0.0f);
-                    sums_1[24] = q_value_1;
-                    unsigned int split_23_1 = lane_in_warp * 2 + 1;
-                    unsigned int safe_split_24_1 = ((split_23_1 < num_splits) ? split_23_1 : 0);
-                    unsigned long long record_25_1 = ((unsigned long long)first_task_1 + (unsigned long long)safe_split_24_1) * 1536 + (unsigned long long)(row_11 * 24);
+                    float value_46 = ((split_23 < num_splits) ? _vec_load_17[0] : 0.0f);
+                    float _add_82;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_82) : "f"(sums_1[5]), "f"(value_46));
+                    sums_1[5] = _add_82;
+                    float value_47 = ((split_23 < num_splits) ? _vec_load_17[1] : 0.0f);
+                    float _add_83;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_83) : "f"(sums_1[21]), "f"(value_47));
+                    sums_1[21] = _add_83;
+                    float value_48 = ((split_23 < num_splits) ? _vec_load_17[2] : 0.0f);
+                    float _add_84;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_84) : "f"(sums_1[13]), "f"(value_48));
+                    sums_1[13] = _add_84;
+                    float value_49 = ((split_23 < num_splits) ? _vec_load_17[3] : 0.0f);
+                    float _add_85;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_85) : "f"(sums_1[29]), "f"(value_49));
+                    sums_1[29] = _add_85;
+                    float q_word_50 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_1 * 64 + (unsigned long long)(safe_split_24 * 64) + (unsigned long long)row_11];
 #else
                     float value_19_1 = ((split_2 < num_splits) ? _vec_load_17[0] : 0.0f);
                     sums_2[5] = value_19_1;
@@ -4415,37 +4335,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     unsigned int split_23 = lane_in_warp * 2 + 1;
                     unsigned int safe_split_24 = ((split_23 < num_splits) ? split_23 : 0);
                     unsigned long long record_25 = ((unsigned long long)first_task_2 + (unsigned long long)safe_split_24) * 1536 + (unsigned long long)(row_12 * 24);
-#endif
                     float _vec_load_18[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_25_1 + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_25 + 0);
-#endif
                         _vec_load_18[0 + 0] = _v4.x;
                         _vec_load_18[0 + 1] = _v4.y;
                         _vec_load_18[0 + 2] = _v4.z;
                         _vec_load_18[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_26_2 = ((split_23_1 < num_splits) ? _vec_load_18[0] : 0.0f);
-                    float _add_106;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_106) : "f"(sums_1[0]), "f"(value_26_2));
-                    sums_1[0] = _add_106;
-                    float value_27_1 = ((split_23_1 < num_splits) ? _vec_load_18[1] : 0.0f);
-                    float _add_107;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_107) : "f"(sums_1[1]), "f"(value_27_1));
-                    sums_1[1] = _add_107;
-                    float value_28_1 = ((split_23_1 < num_splits) ? _vec_load_18[2] : 0.0f);
-                    float _add_108;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_108) : "f"(sums_1[2]), "f"(value_28_1));
-                    sums_1[2] = _add_108;
-                    float value_29_1 = ((split_23_1 < num_splits) ? _vec_load_18[3] : 0.0f);
-                    float _add_109;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_109) : "f"(sums_1[3]), "f"(value_29_1));
-                    sums_1[3] = _add_109;
-#else
                     float value_26_1 = ((split_23 < num_splits) ? _vec_load_18[0] : 0.0f);
                     float _add_181;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_181) : "f"(sums_2[0]), "f"(value_26_1));
@@ -4462,37 +4359,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_184;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_184) : "f"(sums_2[24]), "f"(value_29));
                     sums_2[24] = _add_184;
-#endif
                     float _vec_load_19[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 4) + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 4) + 0);
-#endif
                         _vec_load_19[0 + 0] = _v4.x;
                         _vec_load_19[0 + 1] = _v4.y;
                         _vec_load_19[0 + 2] = _v4.z;
                         _vec_load_19[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_30_1 = ((split_23_1 < num_splits) ? _vec_load_19[0] : 0.0f);
-                    float _add_111;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_111) : "f"(sums_1[4]), "f"(value_30_1));
-                    sums_1[4] = _add_111;
-                    float value_31_1 = ((split_23_1 < num_splits) ? _vec_load_19[1] : 0.0f);
-                    float _add_112;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_112) : "f"(sums_1[5]), "f"(value_31_1));
-                    sums_1[5] = _add_112;
-                    float value_32_1 = ((split_23_1 < num_splits) ? _vec_load_19[2] : 0.0f);
-                    float _add_113;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_113) : "f"(sums_1[6]), "f"(value_32_1));
-                    sums_1[6] = _add_113;
-                    float value_33_1 = ((split_23_1 < num_splits) ? _vec_load_19[3] : 0.0f);
-                    float _add_114;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_114) : "f"(sums_1[7]), "f"(value_33_1));
-                    sums_1[7] = _add_114;
-#else
                     float value_30 = ((split_23 < num_splits) ? _vec_load_19[0] : 0.0f);
                     float _add_186;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_186) : "f"(sums_2[4]), "f"(value_30));
@@ -4509,37 +4383,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_189;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_189) : "f"(sums_2[28]), "f"(value_33));
                     sums_2[28] = _add_189;
-#endif
                     float _vec_load_20[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 8) + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 8) + 0);
-#endif
                         _vec_load_20[0 + 0] = _v4.x;
                         _vec_load_20[0 + 1] = _v4.y;
                         _vec_load_20[0 + 2] = _v4.z;
                         _vec_load_20[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_34_1 = ((split_23_1 < num_splits) ? _vec_load_20[0] : 0.0f);
-                    float _add_116;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_116) : "f"(sums_1[8]), "f"(value_34_1));
-                    sums_1[8] = _add_116;
-                    float value_35_1 = ((split_23_1 < num_splits) ? _vec_load_20[1] : 0.0f);
-                    float _add_117;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_117) : "f"(sums_1[9]), "f"(value_35_1));
-                    sums_1[9] = _add_117;
-                    float value_36_1 = ((split_23_1 < num_splits) ? _vec_load_20[2] : 0.0f);
-                    float _add_118;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_118) : "f"(sums_1[10]), "f"(value_36_1));
-                    sums_1[10] = _add_118;
-                    float value_37_1 = ((split_23_1 < num_splits) ? _vec_load_20[3] : 0.0f);
-                    float _add_119;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_119) : "f"(sums_1[11]), "f"(value_37_1));
-                    sums_1[11] = _add_119;
-#else
                     float value_34 = ((split_23 < num_splits) ? _vec_load_20[0] : 0.0f);
                     float _add_191;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_191) : "f"(sums_2[2]), "f"(value_34));
@@ -4556,37 +4407,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_194;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_194) : "f"(sums_2[26]), "f"(value_37));
                     sums_2[26] = _add_194;
-#endif
                     float _vec_load_21[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 12) + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 12) + 0);
-#endif
                         _vec_load_21[0 + 0] = _v4.x;
                         _vec_load_21[0 + 1] = _v4.y;
                         _vec_load_21[0 + 2] = _v4.z;
                         _vec_load_21[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_38_1 = ((split_23_1 < num_splits) ? _vec_load_21[0] : 0.0f);
-                    float _add_121;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_121) : "f"(sums_1[12]), "f"(value_38_1));
-                    sums_1[12] = _add_121;
-                    float value_39_1 = ((split_23_1 < num_splits) ? _vec_load_21[1] : 0.0f);
-                    float _add_122;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_122) : "f"(sums_1[13]), "f"(value_39_1));
-                    sums_1[13] = _add_122;
-                    float value_40_1 = ((split_23_1 < num_splits) ? _vec_load_21[2] : 0.0f);
-                    float _add_123;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_123) : "f"(sums_1[14]), "f"(value_40_1));
-                    sums_1[14] = _add_123;
-                    float value_41_1 = ((split_23_1 < num_splits) ? _vec_load_21[3] : 0.0f);
-                    float _add_124;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_124) : "f"(sums_1[15]), "f"(value_41_1));
-                    sums_1[15] = _add_124;
-#else
                     float value_38 = ((split_23 < num_splits) ? _vec_load_21[0] : 0.0f);
                     float _add_196;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_196) : "f"(sums_2[6]), "f"(value_38));
@@ -4603,37 +4431,14 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_199;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_199) : "f"(sums_2[30]), "f"(value_41));
                     sums_2[30] = _add_199;
-#endif
                     float _vec_load_22[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 16) + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 16) + 0);
-#endif
                         _vec_load_22[0 + 0] = _v4.x;
                         _vec_load_22[0 + 1] = _v4.y;
                         _vec_load_22[0 + 2] = _v4.z;
                         _vec_load_22[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_42_1 = ((split_23_1 < num_splits) ? _vec_load_22[0] : 0.0f);
-                    float _add_126;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_126) : "f"(sums_1[16]), "f"(value_42_1));
-                    sums_1[16] = _add_126;
-                    float value_43_1 = ((split_23_1 < num_splits) ? _vec_load_22[1] : 0.0f);
-                    float _add_127;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_127) : "f"(sums_1[17]), "f"(value_43_1));
-                    sums_1[17] = _add_127;
-                    float value_44_2 = ((split_23_1 < num_splits) ? _vec_load_22[2] : 0.0f);
-                    float _add_128;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_128) : "f"(sums_1[18]), "f"(value_44_2));
-                    sums_1[18] = _add_128;
-                    float value_45_1 = ((split_23_1 < num_splits) ? _vec_load_22[3] : 0.0f);
-                    float _add_129;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_129) : "f"(sums_1[19]), "f"(value_45_1));
-                    sums_1[19] = _add_129;
-#else
                     float value_42 = ((split_23 < num_splits) ? _vec_load_22[0] : 0.0f);
                     float _add_201;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_201) : "f"(sums_2[1]), "f"(value_42));
@@ -4650,191 +4455,16 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_204;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_204) : "f"(sums_2[25]), "f"(value_45));
                     sums_2[25] = _add_204;
-#endif
                     float _vec_load_23[4];
                     {
-#if __CUDA_ARCH__ == 1070
-                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 20) + 0);
-#else
                         float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25 + 20) + 0);
-#endif
                         _vec_load_23[0 + 0] = _v4.x;
                         _vec_load_23[0 + 1] = _v4.y;
                         _vec_load_23[0 + 2] = _v4.z;
                         _vec_load_23[0 + 3] = _v4.w;
                     }
-#if __CUDA_ARCH__ == 1070
-                    float value_46_1 = ((split_23_1 < num_splits) ? _vec_load_23[0] : 0.0f);
-                    float _add_131;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_131) : "f"(sums_1[20]), "f"(value_46_1));
-                    sums_1[20] = _add_131;
-                    float value_47_1 = ((split_23_1 < num_splits) ? _vec_load_23[1] : 0.0f);
-                    float _add_132;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_132) : "f"(sums_1[21]), "f"(value_47_1));
-                    sums_1[21] = _add_132;
-                    float value_48_1 = ((split_23_1 < num_splits) ? _vec_load_23[2] : 0.0f);
-                    float _add_133;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_133) : "f"(sums_1[22]), "f"(value_48_1));
-                    sums_1[22] = _add_133;
-                    float value_49_1 = ((split_23_1 < num_splits) ? _vec_load_23[3] : 0.0f);
-                    float _add_134;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_134) : "f"(sums_1[23]), "f"(value_49_1));
-                    sums_1[23] = _add_134;
-                    float q_word_50_1 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_1 * 64 + (unsigned long long)(safe_split_24_1 * 64) + (unsigned long long)row_11];
-                    float q_value_51_1 = ((split_23_1 < num_splits) ? q_word_50_1 : 0.0f);
-                    float _add_135;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_135) : "f"(sums_1[24]), "f"(q_value_51_1));
-                    sums_1[24] = _add_135;
-                    float _shfl_xor_sync_137 = __shfl_xor_sync(0xFFFFFFFF, sums_1[0], 1);
-                    float _add_136;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_136) : "f"(sums_1[0]), "f"(_shfl_xor_sync_137));
-                    sums_1[0] = _add_136;
-                    float _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, sums_1[1], 1);
-                    float _add_138;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_138) : "f"(sums_1[1]), "f"(_shfl_xor_sync_139));
-                    sums_1[1] = _add_138;
-                    float _shfl_xor_sync_141 = __shfl_xor_sync(0xFFFFFFFF, sums_1[2], 1);
-                    float _add_140;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_140) : "f"(sums_1[2]), "f"(_shfl_xor_sync_141));
-                    sums_1[2] = _add_140;
-                    float _shfl_xor_sync_143 = __shfl_xor_sync(0xFFFFFFFF, sums_1[3], 1);
-                    float _add_142;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_142) : "f"(sums_1[3]), "f"(_shfl_xor_sync_143));
-                    sums_1[3] = _add_142;
-                    float _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, sums_1[4], 1);
-                    float _add_144;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_144) : "f"(sums_1[4]), "f"(_shfl_xor_sync_145));
-                    sums_1[4] = _add_144;
-                    float _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, sums_1[5], 1);
-                    float _add_146;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_146) : "f"(sums_1[5]), "f"(_shfl_xor_sync_147));
-                    sums_1[5] = _add_146;
-                    float _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, sums_1[6], 1);
-                    float _add_148;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_148) : "f"(sums_1[6]), "f"(_shfl_xor_sync_149));
-                    sums_1[6] = _add_148;
-                    float _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, sums_1[7], 1);
-                    float _add_150;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_150) : "f"(sums_1[7]), "f"(_shfl_xor_sync_151));
-                    sums_1[7] = _add_150;
-                    float _shfl_xor_sync_153 = __shfl_xor_sync(0xFFFFFFFF, sums_1[8], 1);
-                    float _add_152;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_152) : "f"(sums_1[8]), "f"(_shfl_xor_sync_153));
-                    sums_1[8] = _add_152;
-                    float _shfl_xor_sync_155 = __shfl_xor_sync(0xFFFFFFFF, sums_1[9], 1);
-                    float _add_154;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_154) : "f"(sums_1[9]), "f"(_shfl_xor_sync_155));
-                    sums_1[9] = _add_154;
-                    float _shfl_xor_sync_157 = __shfl_xor_sync(0xFFFFFFFF, sums_1[10], 1);
-                    float _add_156;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_156) : "f"(sums_1[10]), "f"(_shfl_xor_sync_157));
-                    sums_1[10] = _add_156;
-                    float _shfl_xor_sync_159 = __shfl_xor_sync(0xFFFFFFFF, sums_1[11], 1);
-                    float _add_158;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_158) : "f"(sums_1[11]), "f"(_shfl_xor_sync_159));
-                    sums_1[11] = _add_158;
-                    float _shfl_xor_sync_161 = __shfl_xor_sync(0xFFFFFFFF, sums_1[12], 1);
-                    float _add_160;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_160) : "f"(sums_1[12]), "f"(_shfl_xor_sync_161));
-                    sums_1[12] = _add_160;
-                    float _shfl_xor_sync_163 = __shfl_xor_sync(0xFFFFFFFF, sums_1[13], 1);
-                    float _add_162;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_162) : "f"(sums_1[13]), "f"(_shfl_xor_sync_163));
-                    sums_1[13] = _add_162;
-                    float _shfl_xor_sync_165 = __shfl_xor_sync(0xFFFFFFFF, sums_1[14], 1);
-                    float _add_164;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_164) : "f"(sums_1[14]), "f"(_shfl_xor_sync_165));
-                    sums_1[14] = _add_164;
-                    float _shfl_xor_sync_167 = __shfl_xor_sync(0xFFFFFFFF, sums_1[15], 1);
-                    float _add_166;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_166) : "f"(sums_1[15]), "f"(_shfl_xor_sync_167));
-                    sums_1[15] = _add_166;
-                    float _shfl_xor_sync_169 = __shfl_xor_sync(0xFFFFFFFF, sums_1[16], 1);
-                    float _add_168;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_168) : "f"(sums_1[16]), "f"(_shfl_xor_sync_169));
-                    sums_1[16] = _add_168;
-                    float _shfl_xor_sync_171 = __shfl_xor_sync(0xFFFFFFFF, sums_1[17], 1);
-                    float _add_170;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_170) : "f"(sums_1[17]), "f"(_shfl_xor_sync_171));
-                    sums_1[17] = _add_170;
-                    float _shfl_xor_sync_173 = __shfl_xor_sync(0xFFFFFFFF, sums_1[18], 1);
-                    float _add_172;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_172) : "f"(sums_1[18]), "f"(_shfl_xor_sync_173));
-                    sums_1[18] = _add_172;
-                    float _shfl_xor_sync_175 = __shfl_xor_sync(0xFFFFFFFF, sums_1[19], 1);
-                    float _add_174;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_174) : "f"(sums_1[19]), "f"(_shfl_xor_sync_175));
-                    sums_1[19] = _add_174;
-                    float _shfl_xor_sync_177 = __shfl_xor_sync(0xFFFFFFFF, sums_1[20], 1);
-                    float _add_176;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_176) : "f"(sums_1[20]), "f"(_shfl_xor_sync_177));
-                    sums_1[20] = _add_176;
-                    float _shfl_xor_sync_179 = __shfl_xor_sync(0xFFFFFFFF, sums_1[21], 1);
-                    float _add_178;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_178) : "f"(sums_1[21]), "f"(_shfl_xor_sync_179));
-                    sums_1[21] = _add_178;
-                    float _shfl_xor_sync_181 = __shfl_xor_sync(0xFFFFFFFF, sums_1[22], 1);
-                    float _add_180;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_180) : "f"(sums_1[22]), "f"(_shfl_xor_sync_181));
-                    sums_1[22] = _add_180;
-                    float _shfl_xor_sync_183 = __shfl_xor_sync(0xFFFFFFFF, sums_1[23], 1);
-                    float _add_182;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_182) : "f"(sums_1[23]), "f"(_shfl_xor_sync_183));
-                    sums_1[23] = _add_182;
-                    float _shfl_xor_sync_185 = __shfl_xor_sync(0xFFFFFFFF, sums_1[24], 1);
-                    float _add_184;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_184) : "f"(sums_1[24]), "f"(_shfl_xor_sync_185));
-                    sums_1[24] = _add_184;
-                    float _shfl_xor_sync_187 = __shfl_xor_sync(0xFFFFFFFF, sums_1[0], 2);
-                    float _add_186;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_186) : "f"(sums_1[0]), "f"(_shfl_xor_sync_187));
-                    sums_1[0] = _add_186;
-                    float _shfl_xor_sync_189 = __shfl_xor_sync(0xFFFFFFFF, sums_1[1], 2);
-                    float _add_188;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_188) : "f"(sums_1[1]), "f"(_shfl_xor_sync_189));
-                    sums_1[1] = _add_188;
-                    float _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, sums_1[2], 2);
-                    float _add_190;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_190) : "f"(sums_1[2]), "f"(_shfl_xor_sync_191));
-                    sums_1[2] = _add_190;
-                    float _shfl_xor_sync_193 = __shfl_xor_sync(0xFFFFFFFF, sums_1[3], 2);
-                    float _add_192;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_192) : "f"(sums_1[3]), "f"(_shfl_xor_sync_193));
-                    sums_1[3] = _add_192;
-                    float _shfl_xor_sync_195 = __shfl_xor_sync(0xFFFFFFFF, sums_1[4], 2);
-                    float _add_194;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_194) : "f"(sums_1[4]), "f"(_shfl_xor_sync_195));
-                    sums_1[4] = _add_194;
-                    float _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, sums_1[5], 2);
-                    float _add_196;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_196) : "f"(sums_1[5]), "f"(_shfl_xor_sync_197));
-                    sums_1[5] = _add_196;
-                    float _shfl_xor_sync_199 = __shfl_xor_sync(0xFFFFFFFF, sums_1[6], 2);
-                    float _add_198;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_198) : "f"(sums_1[6]), "f"(_shfl_xor_sync_199));
-                    sums_1[6] = _add_198;
-                    float _shfl_xor_sync_201 = __shfl_xor_sync(0xFFFFFFFF, sums_1[7], 2);
-                    float _add_200;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_200) : "f"(sums_1[7]), "f"(_shfl_xor_sync_201));
-                    sums_1[7] = _add_200;
-                    float _shfl_xor_sync_203 = __shfl_xor_sync(0xFFFFFFFF, sums_1[8], 2);
-                    float _add_202;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_202) : "f"(sums_1[8]), "f"(_shfl_xor_sync_203));
-                    sums_1[8] = _add_202;
-                    float _shfl_xor_sync_205 = __shfl_xor_sync(0xFFFFFFFF, sums_1[9], 2);
-                    float _add_204;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_204) : "f"(sums_1[9]), "f"(_shfl_xor_sync_205));
-                    sums_1[9] = _add_204;
-                    float _shfl_xor_sync_207 = __shfl_xor_sync(0xFFFFFFFF, sums_1[10], 2);
-#else
                     float value_46 = ((split_23 < num_splits) ? _vec_load_23[0] : 0.0f);
-#endif
                     float _add_206;
-#if __CUDA_ARCH__ == 1070
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_206) : "f"(sums_1[10]), "f"(_shfl_xor_sync_207));
-                    sums_1[10] = _add_206;
-                    float _shfl_xor_sync_209 = __shfl_xor_sync(0xFFFFFFFF, sums_1[11], 2);
-#else
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_206) : "f"(sums_2[5]), "f"(value_46));
                     sums_2[5] = _add_206;
                     float value_47 = ((split_23 < num_splits) ? _vec_load_23[1] : 0.0f);
@@ -4842,13 +4472,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_207) : "f"(sums_2[21]), "f"(value_47));
                     sums_2[21] = _add_207;
                     float value_48_1 = ((split_23 < num_splits) ? _vec_load_23[2] : 0.0f);
-#endif
                     float _add_208;
-#if __CUDA_ARCH__ == 1070
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_208) : "f"(sums_1[11]), "f"(_shfl_xor_sync_209));
-                    sums_1[11] = _add_208;
-                    float _shfl_xor_sync_211 = __shfl_xor_sync(0xFFFFFFFF, sums_1[12], 2);
-#else
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_208) : "f"(sums_2[13]), "f"(value_48_1));
                     sums_2[13] = _add_208;
                     float value_49 = ((split_23 < num_splits) ? _vec_load_23[3] : 0.0f);
@@ -4856,480 +4480,116 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_209) : "f"(sums_2[29]), "f"(value_49));
                     sums_2[29] = _add_209;
                     float q_word_50 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_2 * 64 + (unsigned long long)(safe_split_24 * 64) + (unsigned long long)row_12];
-                    float q_value_51 = ((split_23 < num_splits) ? q_word_50 : 0.0f);
 #endif
-                    float _add_210;
+                    float q_value_51 = ((split_23 < num_splits) ? q_word_50 : 0.0f);
 #if __CUDA_ARCH__ == 1070
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_210) : "f"(sums_1[12]), "f"(_shfl_xor_sync_211));
-                    sums_1[12] = _add_210;
-                    float _shfl_xor_sync_213 = __shfl_xor_sync(0xFFFFFFFF, sums_1[13], 2);
-                    float _add_212;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_212) : "f"(sums_1[13]), "f"(_shfl_xor_sync_213));
-                    sums_1[13] = _add_212;
-                    float _shfl_xor_sync_215 = __shfl_xor_sync(0xFFFFFFFF, sums_1[14], 2);
-                    float _add_214;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_214) : "f"(sums_1[14]), "f"(_shfl_xor_sync_215));
-                    sums_1[14] = _add_214;
-                    float _shfl_xor_sync_217 = __shfl_xor_sync(0xFFFFFFFF, sums_1[15], 2);
-                    float _add_216;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_216) : "f"(sums_1[15]), "f"(_shfl_xor_sync_217));
-                    sums_1[15] = _add_216;
-                    float _shfl_xor_sync_219 = __shfl_xor_sync(0xFFFFFFFF, sums_1[16], 2);
-                    float _add_218;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_218) : "f"(sums_1[16]), "f"(_shfl_xor_sync_219));
-                    sums_1[16] = _add_218;
-                    float _shfl_xor_sync_221 = __shfl_xor_sync(0xFFFFFFFF, sums_1[17], 2);
-                    float _add_220;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_220) : "f"(sums_1[17]), "f"(_shfl_xor_sync_221));
-                    sums_1[17] = _add_220;
-                    float _shfl_xor_sync_223 = __shfl_xor_sync(0xFFFFFFFF, sums_1[18], 2);
-                    float _add_222;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_222) : "f"(sums_1[18]), "f"(_shfl_xor_sync_223));
-                    sums_1[18] = _add_222;
-                    float _shfl_xor_sync_225 = __shfl_xor_sync(0xFFFFFFFF, sums_1[19], 2);
-                    float _add_224;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_224) : "f"(sums_1[19]), "f"(_shfl_xor_sync_225));
-                    sums_1[19] = _add_224;
-                    float _shfl_xor_sync_227 = __shfl_xor_sync(0xFFFFFFFF, sums_1[20], 2);
-                    float _add_226;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_226) : "f"(sums_1[20]), "f"(_shfl_xor_sync_227));
-                    sums_1[20] = _add_226;
-                    float _shfl_xor_sync_229 = __shfl_xor_sync(0xFFFFFFFF, sums_1[21], 2);
-                    float _add_228;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_228) : "f"(sums_1[21]), "f"(_shfl_xor_sync_229));
-                    sums_1[21] = _add_228;
-                    float _shfl_xor_sync_231 = __shfl_xor_sync(0xFFFFFFFF, sums_1[22], 2);
-                    float _add_230;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_230) : "f"(sums_1[22]), "f"(_shfl_xor_sync_231));
-                    sums_1[22] = _add_230;
-                    float _shfl_xor_sync_233 = __shfl_xor_sync(0xFFFFFFFF, sums_1[23], 2);
-                    float _add_232;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_232) : "f"(sums_1[23]), "f"(_shfl_xor_sync_233));
-                    sums_1[23] = _add_232;
-                    float _shfl_xor_sync_235 = __shfl_xor_sync(0xFFFFFFFF, sums_1[24], 2);
-                    float _add_234;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_234) : "f"(sums_1[24]), "f"(_shfl_xor_sync_235));
-                    sums_1[24] = _add_234;
-                    float _shfl_xor_sync_237 = __shfl_xor_sync(0xFFFFFFFF, sums_1[0], 4);
-                    float _add_236;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_236) : "f"(sums_1[0]), "f"(_shfl_xor_sync_237));
-                    sums_1[0] = _add_236;
-                    float _shfl_xor_sync_239 = __shfl_xor_sync(0xFFFFFFFF, sums_1[1], 4);
-                    float _add_238;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_238) : "f"(sums_1[1]), "f"(_shfl_xor_sync_239));
-                    sums_1[1] = _add_238;
-                    float _shfl_xor_sync_241 = __shfl_xor_sync(0xFFFFFFFF, sums_1[2], 4);
-                    float _add_240;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_240) : "f"(sums_1[2]), "f"(_shfl_xor_sync_241));
-                    sums_1[2] = _add_240;
-                    float _shfl_xor_sync_243 = __shfl_xor_sync(0xFFFFFFFF, sums_1[3], 4);
-                    float _add_242;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_242) : "f"(sums_1[3]), "f"(_shfl_xor_sync_243));
-                    sums_1[3] = _add_242;
-                    float _shfl_xor_sync_245 = __shfl_xor_sync(0xFFFFFFFF, sums_1[4], 4);
-                    float _add_244;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_244) : "f"(sums_1[4]), "f"(_shfl_xor_sync_245));
-                    sums_1[4] = _add_244;
-                    float _shfl_xor_sync_247 = __shfl_xor_sync(0xFFFFFFFF, sums_1[5], 4);
-                    float _add_246;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_246) : "f"(sums_1[5]), "f"(_shfl_xor_sync_247));
-                    sums_1[5] = _add_246;
-                    float _shfl_xor_sync_249 = __shfl_xor_sync(0xFFFFFFFF, sums_1[6], 4);
-                    float _add_248;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_248) : "f"(sums_1[6]), "f"(_shfl_xor_sync_249));
-                    sums_1[6] = _add_248;
-                    float _shfl_xor_sync_251 = __shfl_xor_sync(0xFFFFFFFF, sums_1[7], 4);
-                    float _add_250;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_250) : "f"(sums_1[7]), "f"(_shfl_xor_sync_251));
-                    sums_1[7] = _add_250;
-                    float _shfl_xor_sync_253 = __shfl_xor_sync(0xFFFFFFFF, sums_1[8], 4);
-                    float _add_252;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_252) : "f"(sums_1[8]), "f"(_shfl_xor_sync_253));
-                    sums_1[8] = _add_252;
-                    float _shfl_xor_sync_255 = __shfl_xor_sync(0xFFFFFFFF, sums_1[9], 4);
-                    float _add_254;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_254) : "f"(sums_1[9]), "f"(_shfl_xor_sync_255));
-                    sums_1[9] = _add_254;
-                    float _shfl_xor_sync_257 = __shfl_xor_sync(0xFFFFFFFF, sums_1[10], 4);
-                    float _add_256;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_256) : "f"(sums_1[10]), "f"(_shfl_xor_sync_257));
-                    sums_1[10] = _add_256;
-                    float _shfl_xor_sync_259 = __shfl_xor_sync(0xFFFFFFFF, sums_1[11], 4);
-                    float _add_258;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_258) : "f"(sums_1[11]), "f"(_shfl_xor_sync_259));
-                    sums_1[11] = _add_258;
-                    float _shfl_xor_sync_261 = __shfl_xor_sync(0xFFFFFFFF, sums_1[12], 4);
-                    float _add_260;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_260) : "f"(sums_1[12]), "f"(_shfl_xor_sync_261));
-                    sums_1[12] = _add_260;
-                    float _shfl_xor_sync_263 = __shfl_xor_sync(0xFFFFFFFF, sums_1[13], 4);
-                    float _add_262;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_262) : "f"(sums_1[13]), "f"(_shfl_xor_sync_263));
-                    sums_1[13] = _add_262;
-                    float _shfl_xor_sync_265 = __shfl_xor_sync(0xFFFFFFFF, sums_1[14], 4);
-                    float _add_264;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_264) : "f"(sums_1[14]), "f"(_shfl_xor_sync_265));
-                    sums_1[14] = _add_264;
-                    float _shfl_xor_sync_267 = __shfl_xor_sync(0xFFFFFFFF, sums_1[15], 4);
-                    float _add_266;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_266) : "f"(sums_1[15]), "f"(_shfl_xor_sync_267));
-                    sums_1[15] = _add_266;
-                    float _shfl_xor_sync_269 = __shfl_xor_sync(0xFFFFFFFF, sums_1[16], 4);
-                    float _add_268;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_268) : "f"(sums_1[16]), "f"(_shfl_xor_sync_269));
-                    sums_1[16] = _add_268;
-                    float _shfl_xor_sync_271 = __shfl_xor_sync(0xFFFFFFFF, sums_1[17], 4);
-                    float _add_270;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_270) : "f"(sums_1[17]), "f"(_shfl_xor_sync_271));
-                    sums_1[17] = _add_270;
-                    float _shfl_xor_sync_273 = __shfl_xor_sync(0xFFFFFFFF, sums_1[18], 4);
-                    float _add_272;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_272) : "f"(sums_1[18]), "f"(_shfl_xor_sync_273));
-                    sums_1[18] = _add_272;
-                    float _shfl_xor_sync_275 = __shfl_xor_sync(0xFFFFFFFF, sums_1[19], 4);
-                    float _add_274;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_274) : "f"(sums_1[19]), "f"(_shfl_xor_sync_275));
-                    sums_1[19] = _add_274;
-                    float _shfl_xor_sync_277 = __shfl_xor_sync(0xFFFFFFFF, sums_1[20], 4);
-                    float _add_276;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_276) : "f"(sums_1[20]), "f"(_shfl_xor_sync_277));
-                    sums_1[20] = _add_276;
-                    float _shfl_xor_sync_279 = __shfl_xor_sync(0xFFFFFFFF, sums_1[21], 4);
-                    float _add_278;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_278) : "f"(sums_1[21]), "f"(_shfl_xor_sync_279));
-                    sums_1[21] = _add_278;
-                    float _shfl_xor_sync_281 = __shfl_xor_sync(0xFFFFFFFF, sums_1[22], 4);
-                    float _add_280;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_280) : "f"(sums_1[22]), "f"(_shfl_xor_sync_281));
-                    sums_1[22] = _add_280;
-                    float _shfl_xor_sync_283 = __shfl_xor_sync(0xFFFFFFFF, sums_1[23], 4);
-                    float _add_282;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_282) : "f"(sums_1[23]), "f"(_shfl_xor_sync_283));
-                    sums_1[23] = _add_282;
-                    float _shfl_xor_sync_285 = __shfl_xor_sync(0xFFFFFFFF, sums_1[24], 4);
-                    float _add_284;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_284) : "f"(sums_1[24]), "f"(_shfl_xor_sync_285));
-                    sums_1[24] = _add_284;
-                    float _shfl_xor_sync_287 = __shfl_xor_sync(0xFFFFFFFF, sums_1[0], 8);
-                    float _add_286;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_286) : "f"(sums_1[0]), "f"(_shfl_xor_sync_287));
-                    sums_1[0] = _add_286;
-                    float _shfl_xor_sync_289 = __shfl_xor_sync(0xFFFFFFFF, sums_1[1], 8);
-                    float _add_288;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_288) : "f"(sums_1[1]), "f"(_shfl_xor_sync_289));
-                    sums_1[1] = _add_288;
-                    float _shfl_xor_sync_291 = __shfl_xor_sync(0xFFFFFFFF, sums_1[2], 8);
-                    float _add_290;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_290) : "f"(sums_1[2]), "f"(_shfl_xor_sync_291));
-                    sums_1[2] = _add_290;
-                    float _shfl_xor_sync_293 = __shfl_xor_sync(0xFFFFFFFF, sums_1[3], 8);
-                    float _add_292;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_292) : "f"(sums_1[3]), "f"(_shfl_xor_sync_293));
-                    sums_1[3] = _add_292;
-                    float _shfl_xor_sync_295 = __shfl_xor_sync(0xFFFFFFFF, sums_1[4], 8);
-                    float _add_294;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_294) : "f"(sums_1[4]), "f"(_shfl_xor_sync_295));
-                    sums_1[4] = _add_294;
-                    float _shfl_xor_sync_297 = __shfl_xor_sync(0xFFFFFFFF, sums_1[5], 8);
-                    float _add_296;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_296) : "f"(sums_1[5]), "f"(_shfl_xor_sync_297));
-                    sums_1[5] = _add_296;
-                    float _shfl_xor_sync_299 = __shfl_xor_sync(0xFFFFFFFF, sums_1[6], 8);
-                    float _add_298;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_298) : "f"(sums_1[6]), "f"(_shfl_xor_sync_299));
-                    sums_1[6] = _add_298;
-                    float _shfl_xor_sync_301 = __shfl_xor_sync(0xFFFFFFFF, sums_1[7], 8);
-                    float _add_300;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_300) : "f"(sums_1[7]), "f"(_shfl_xor_sync_301));
-                    sums_1[7] = _add_300;
-                    float _shfl_xor_sync_303 = __shfl_xor_sync(0xFFFFFFFF, sums_1[8], 8);
-                    float _add_302;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_302) : "f"(sums_1[8]), "f"(_shfl_xor_sync_303));
-                    sums_1[8] = _add_302;
-                    float _shfl_xor_sync_305 = __shfl_xor_sync(0xFFFFFFFF, sums_1[9], 8);
-                    float _add_304;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_304) : "f"(sums_1[9]), "f"(_shfl_xor_sync_305));
-                    sums_1[9] = _add_304;
-                    float _shfl_xor_sync_307 = __shfl_xor_sync(0xFFFFFFFF, sums_1[10], 8);
-                    float _add_306;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_306) : "f"(sums_1[10]), "f"(_shfl_xor_sync_307));
-                    sums_1[10] = _add_306;
-                    float _shfl_xor_sync_309 = __shfl_xor_sync(0xFFFFFFFF, sums_1[11], 8);
-                    float _add_308;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_308) : "f"(sums_1[11]), "f"(_shfl_xor_sync_309));
-                    sums_1[11] = _add_308;
-                    float _shfl_xor_sync_311 = __shfl_xor_sync(0xFFFFFFFF, sums_1[12], 8);
-                    float _add_310;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_310) : "f"(sums_1[12]), "f"(_shfl_xor_sync_311));
-                    sums_1[12] = _add_310;
-                    float _shfl_xor_sync_313 = __shfl_xor_sync(0xFFFFFFFF, sums_1[13], 8);
-                    float _add_312;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_312) : "f"(sums_1[13]), "f"(_shfl_xor_sync_313));
-                    sums_1[13] = _add_312;
-                    float _shfl_xor_sync_315 = __shfl_xor_sync(0xFFFFFFFF, sums_1[14], 8);
-                    float _add_314;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_314) : "f"(sums_1[14]), "f"(_shfl_xor_sync_315));
-                    sums_1[14] = _add_314;
-                    float _shfl_xor_sync_317 = __shfl_xor_sync(0xFFFFFFFF, sums_1[15], 8);
-                    float _add_316;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_316) : "f"(sums_1[15]), "f"(_shfl_xor_sync_317));
-                    sums_1[15] = _add_316;
-                    float _shfl_xor_sync_319 = __shfl_xor_sync(0xFFFFFFFF, sums_1[16], 8);
-                    float _add_318;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_318) : "f"(sums_1[16]), "f"(_shfl_xor_sync_319));
-                    sums_1[16] = _add_318;
-                    float _shfl_xor_sync_321 = __shfl_xor_sync(0xFFFFFFFF, sums_1[17], 8);
-                    float _add_320;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_320) : "f"(sums_1[17]), "f"(_shfl_xor_sync_321));
-                    sums_1[17] = _add_320;
-                    float _shfl_xor_sync_323 = __shfl_xor_sync(0xFFFFFFFF, sums_1[18], 8);
-                    float _add_322;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_322) : "f"(sums_1[18]), "f"(_shfl_xor_sync_323));
-                    sums_1[18] = _add_322;
-                    float _shfl_xor_sync_325 = __shfl_xor_sync(0xFFFFFFFF, sums_1[19], 8);
-                    float _add_324;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_324) : "f"(sums_1[19]), "f"(_shfl_xor_sync_325));
-                    sums_1[19] = _add_324;
-                    float _shfl_xor_sync_327 = __shfl_xor_sync(0xFFFFFFFF, sums_1[20], 8);
-                    float _add_326;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_326) : "f"(sums_1[20]), "f"(_shfl_xor_sync_327));
-                    sums_1[20] = _add_326;
-                    float _shfl_xor_sync_329 = __shfl_xor_sync(0xFFFFFFFF, sums_1[21], 8);
-                    float _add_328;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_328) : "f"(sums_1[21]), "f"(_shfl_xor_sync_329));
-                    sums_1[21] = _add_328;
-                    float _shfl_xor_sync_331 = __shfl_xor_sync(0xFFFFFFFF, sums_1[22], 8);
-                    float _add_330;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_330) : "f"(sums_1[22]), "f"(_shfl_xor_sync_331));
-                    sums_1[22] = _add_330;
-                    float _shfl_xor_sync_333 = __shfl_xor_sync(0xFFFFFFFF, sums_1[23], 8);
-                    float _add_332;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_332) : "f"(sums_1[23]), "f"(_shfl_xor_sync_333));
-                    sums_1[23] = _add_332;
-                    float _shfl_xor_sync_335 = __shfl_xor_sync(0xFFFFFFFF, sums_1[24], 8);
-                    float _add_334;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_334) : "f"(sums_1[24]), "f"(_shfl_xor_sync_335));
-                    sums_1[24] = _add_334;
-                    float _shfl_xor_sync_337 = __shfl_xor_sync(0xFFFFFFFF, sums_1[0], 16);
-                    float _add_336;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_336) : "f"(sums_1[0]), "f"(_shfl_xor_sync_337));
-                    sums_1[0] = _add_336;
-                    float _shfl_xor_sync_339 = __shfl_xor_sync(0xFFFFFFFF, sums_1[1], 16);
-                    float _add_338;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_338) : "f"(sums_1[1]), "f"(_shfl_xor_sync_339));
-                    sums_1[1] = _add_338;
-                    float _shfl_xor_sync_341 = __shfl_xor_sync(0xFFFFFFFF, sums_1[2], 16);
-                    float _add_340;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_340) : "f"(sums_1[2]), "f"(_shfl_xor_sync_341));
-                    sums_1[2] = _add_340;
-                    float _shfl_xor_sync_343 = __shfl_xor_sync(0xFFFFFFFF, sums_1[3], 16);
-                    float _add_342;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_342) : "f"(sums_1[3]), "f"(_shfl_xor_sync_343));
-                    sums_1[3] = _add_342;
-                    float _shfl_xor_sync_345 = __shfl_xor_sync(0xFFFFFFFF, sums_1[4], 16);
-                    float _add_344;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_344) : "f"(sums_1[4]), "f"(_shfl_xor_sync_345));
-                    sums_1[4] = _add_344;
-                    float _shfl_xor_sync_347 = __shfl_xor_sync(0xFFFFFFFF, sums_1[5], 16);
-                    float _add_346;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_346) : "f"(sums_1[5]), "f"(_shfl_xor_sync_347));
-                    sums_1[5] = _add_346;
-                    float _shfl_xor_sync_349 = __shfl_xor_sync(0xFFFFFFFF, sums_1[6], 16);
-                    float _add_348;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_348) : "f"(sums_1[6]), "f"(_shfl_xor_sync_349));
-                    sums_1[6] = _add_348;
-                    float _shfl_xor_sync_351 = __shfl_xor_sync(0xFFFFFFFF, sums_1[7], 16);
-                    float _add_350;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_350) : "f"(sums_1[7]), "f"(_shfl_xor_sync_351));
-                    sums_1[7] = _add_350;
-                    float _shfl_xor_sync_353 = __shfl_xor_sync(0xFFFFFFFF, sums_1[8], 16);
-                    float _add_352;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_352) : "f"(sums_1[8]), "f"(_shfl_xor_sync_353));
-                    sums_1[8] = _add_352;
-                    float _shfl_xor_sync_355 = __shfl_xor_sync(0xFFFFFFFF, sums_1[9], 16);
-                    float _add_354;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_354) : "f"(sums_1[9]), "f"(_shfl_xor_sync_355));
-                    sums_1[9] = _add_354;
-                    float _shfl_xor_sync_357 = __shfl_xor_sync(0xFFFFFFFF, sums_1[10], 16);
-                    float _add_356;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_356) : "f"(sums_1[10]), "f"(_shfl_xor_sync_357));
-                    sums_1[10] = _add_356;
-                    float _shfl_xor_sync_359 = __shfl_xor_sync(0xFFFFFFFF, sums_1[11], 16);
-                    float _add_358;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_358) : "f"(sums_1[11]), "f"(_shfl_xor_sync_359));
-                    sums_1[11] = _add_358;
-                    float _shfl_xor_sync_361 = __shfl_xor_sync(0xFFFFFFFF, sums_1[12], 16);
-                    float _add_360;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_360) : "f"(sums_1[12]), "f"(_shfl_xor_sync_361));
-                    sums_1[12] = _add_360;
-                    float _shfl_xor_sync_363 = __shfl_xor_sync(0xFFFFFFFF, sums_1[13], 16);
-                    float _add_362;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_362) : "f"(sums_1[13]), "f"(_shfl_xor_sync_363));
-                    sums_1[13] = _add_362;
-                    float _shfl_xor_sync_365 = __shfl_xor_sync(0xFFFFFFFF, sums_1[14], 16);
-                    float _add_364;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_364) : "f"(sums_1[14]), "f"(_shfl_xor_sync_365));
-                    sums_1[14] = _add_364;
-                    float _shfl_xor_sync_367 = __shfl_xor_sync(0xFFFFFFFF, sums_1[15], 16);
-                    float _add_366;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_366) : "f"(sums_1[15]), "f"(_shfl_xor_sync_367));
-                    sums_1[15] = _add_366;
-                    float _shfl_xor_sync_369 = __shfl_xor_sync(0xFFFFFFFF, sums_1[16], 16);
-                    float _add_368;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_368) : "f"(sums_1[16]), "f"(_shfl_xor_sync_369));
-                    sums_1[16] = _add_368;
-                    float _shfl_xor_sync_371 = __shfl_xor_sync(0xFFFFFFFF, sums_1[17], 16);
-                    float _add_370;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_370) : "f"(sums_1[17]), "f"(_shfl_xor_sync_371));
-                    sums_1[17] = _add_370;
-                    float _shfl_xor_sync_373 = __shfl_xor_sync(0xFFFFFFFF, sums_1[18], 16);
-                    float _add_372;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_372) : "f"(sums_1[18]), "f"(_shfl_xor_sync_373));
-                    sums_1[18] = _add_372;
-                    float _shfl_xor_sync_375 = __shfl_xor_sync(0xFFFFFFFF, sums_1[19], 16);
-                    float _add_374;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_374) : "f"(sums_1[19]), "f"(_shfl_xor_sync_375));
-                    sums_1[19] = _add_374;
-                    float _shfl_xor_sync_377 = __shfl_xor_sync(0xFFFFFFFF, sums_1[20], 16);
-                    float _add_376;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_376) : "f"(sums_1[20]), "f"(_shfl_xor_sync_377));
-                    sums_1[20] = _add_376;
-                    float _shfl_xor_sync_379 = __shfl_xor_sync(0xFFFFFFFF, sums_1[21], 16);
-                    float _add_378;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_378) : "f"(sums_1[21]), "f"(_shfl_xor_sync_379));
-                    sums_1[21] = _add_378;
-                    float _shfl_xor_sync_381 = __shfl_xor_sync(0xFFFFFFFF, sums_1[22], 16);
-                    float _add_380;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_380) : "f"(sums_1[22]), "f"(_shfl_xor_sync_381));
-                    sums_1[22] = _add_380;
-                    float _shfl_xor_sync_383 = __shfl_xor_sync(0xFFFFFFFF, sums_1[23], 16);
-                    float _add_382;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_382) : "f"(sums_1[23]), "f"(_shfl_xor_sync_383));
-                    sums_1[23] = _add_382;
-                    float _shfl_xor_sync_385 = __shfl_xor_sync(0xFFFFFFFF, sums_1[24], 16);
-                    float _add_384;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_384) : "f"(sums_1[24]), "f"(_shfl_xor_sync_385));
-                    sums_1[24] = _add_384;
-                    float s_52 = 0.0f;
-                    s_52 = ((lane_in_warp == 0) ? sums_1[0] : s_52);
-                    s_52 = ((lane_in_warp == 1) ? sums_1[1] : s_52);
-                    s_52 = ((lane_in_warp == 2) ? sums_1[2] : s_52);
-                    s_52 = ((lane_in_warp == 3) ? sums_1[3] : s_52);
-                    s_52 = ((lane_in_warp == 4) ? sums_1[4] : s_52);
-                    s_52 = ((lane_in_warp == 5) ? sums_1[5] : s_52);
-                    s_52 = ((lane_in_warp == 6) ? sums_1[6] : s_52);
-                    s_52 = ((lane_in_warp == 7) ? sums_1[7] : s_52);
-                    s_52 = ((lane_in_warp == 8) ? sums_1[8] : s_52);
-                    s_52 = ((lane_in_warp == 9) ? sums_1[9] : s_52);
-                    s_52 = ((lane_in_warp == 10) ? sums_1[10] : s_52);
-                    s_52 = ((lane_in_warp == 11) ? sums_1[11] : s_52);
-                    s_52 = ((lane_in_warp == 12) ? sums_1[12] : s_52);
-                    s_52 = ((lane_in_warp == 13) ? sums_1[13] : s_52);
-                    s_52 = ((lane_in_warp == 14) ? sums_1[14] : s_52);
-                    s_52 = ((lane_in_warp == 15) ? sums_1[15] : s_52);
-                    s_52 = ((lane_in_warp == 16) ? sums_1[16] : s_52);
-                    s_52 = ((lane_in_warp == 17) ? sums_1[17] : s_52);
-                    s_52 = ((lane_in_warp == 18) ? sums_1[18] : s_52);
-                    s_52 = ((lane_in_warp == 19) ? sums_1[19] : s_52);
-                    s_52 = ((lane_in_warp == 20) ? sums_1[20] : s_52);
-                    s_52 = ((lane_in_warp == 21) ? sums_1[21] : s_52);
-                    s_52 = ((lane_in_warp == 22) ? sums_1[22] : s_52);
-                    s_52 = ((lane_in_warp == 23) ? sums_1[23] : s_52);
-                    float q_53 = sums_1[24];
-                    s = s_52;
-                    q = q_53;
-                }
-                float _fma_387;
-                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_387) : "f"(q), "f"(6.1035156e-05f), "f"(hc_norm_eps));
-                float _sqrt_386;
-                asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_386) : "f"(_fma_387));
-                float r = __frcp_rn(_sqrt_386);
-                float z;
-                asm("mul.rn.f32 %0, %1, %2;" : "=f"(z) : "f"(r), "f"(s));
-                float a_map;
-                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(a_map) : "f"(z), "f"(sc), "f"(bs));
-                float a = ((lane_in_warp < 24) ? a_map : 0.0f);
-                float _sub_388;
-                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_388) : "f"(0.0f), "f"(fabsf(a)));
-                float _exp_0 = __nv_expf(_sub_388);
-                float _add_36_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_36_1) : "f"(1.0f), "f"(_exp_0));
-                float _fdiv_rn_0 = __fdiv_rn(1.0f, _add_36_1);
-                float _fdiv_rn_1 = __fdiv_rn(_exp_0, _add_36_1);
-                float sig = ((a >= 0.0f) ? _fdiv_rn_0 : _fdiv_rn_1);
-                float sneg = ((a >= 0.0f) ? _fdiv_rn_1 : _fdiv_rn_0);
-                float _add_37_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37_1) : "f"(sig), "f"(hc_pre_eps));
-                float _mul_0;
-                asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(hc_post_scale), "f"(sig));
-                float logit = ((lane_in_warp >= 8 && lane_in_warp < 24) ? a : 0.0f);
-                float _shfl_xor_sync_390 = __shfl_xor_sync(0xFFFFFFFF, logit, 1);
-                float _shfl_xor_sync_391 = __shfl_xor_sync(0xFFFFFFFF, logit, 2);
-                float _shfl_xor_sync_392 = __shfl_xor_sync(0xFFFFFFFF, logit, 3);
-                float _sub_389;
-                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_389) : "f"(logit), "f"(fmaxf(fmaxf(logit, _shfl_xor_sync_390), fmaxf(_shfl_xor_sync_391, _shfl_xor_sync_392))));
-                float _exp_1 = __nv_expf(_sub_389);
-                float _shfl_xor_sync_396 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 1);
-                float _add_395;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_395) : "f"(_exp_1), "f"(_shfl_xor_sync_396));
-                float _shfl_xor_sync_398 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 2);
-                float _shfl_xor_sync_399 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 3);
-                float _add_397;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_397) : "f"(_shfl_xor_sync_398), "f"(_shfl_xor_sync_399));
-                float _add_394;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_394) : "f"(_add_395), "f"(_add_397));
-                float _fdiv_393 = __fdiv_rn(_exp_1, _add_394);
-                float C;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(C) : "f"(_fdiv_393), "f"(sinkhorn_eps));
-                float _shfl_xor_sync_404 = __shfl_xor_sync(0xFFFFFFFF, C, 4);
-                float _add_403;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_403) : "f"(C), "f"(_shfl_xor_sync_404));
-                float _shfl_xor_sync_406 = __shfl_xor_sync(0xFFFFFFFF, C, 24);
-                float _shfl_xor_sync_407 = __shfl_xor_sync(0xFFFFFFFF, C, 28);
-                float _add_405;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_405) : "f"(_shfl_xor_sync_406), "f"(_shfl_xor_sync_407));
-                float _add_402;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_402) : "f"(_add_403), "f"(_add_405));
-                float _add_401;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_401) : "f"(_add_402), "f"(sinkhorn_eps));
-                float _fdiv_400 = __fdiv_rn(C, _add_401);
-                C = _fdiv_400;
-                #pragma unroll 1
-                for (unsigned int iteration = 1; iteration < num_sinkhorn_iters; iteration++) {
-                    float _shfl_xor_sync_412 = __shfl_xor_sync(0xFFFFFFFF, C, 1);
-                    float _add_411;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_411) : "f"(C), "f"(_shfl_xor_sync_412));
-                    float _shfl_xor_sync_414 = __shfl_xor_sync(0xFFFFFFFF, C, 2);
-                    float _shfl_xor_sync_415 = __shfl_xor_sync(0xFFFFFFFF, C, 3);
-                    float _add_413;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_413) : "f"(_shfl_xor_sync_414), "f"(_shfl_xor_sync_415));
-                    float _add_410;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_410) : "f"(_add_411), "f"(_add_413));
-                    float _add_409;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_409) : "f"(_add_410), "f"(sinkhorn_eps));
-                    float _fdiv_408 = __fdiv_rn(C, _add_409);
-                    C = _fdiv_408;
-                    float _shfl_xor_sync_420 = __shfl_xor_sync(0xFFFFFFFF, C, 4);
-                    float _add_419;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_419) : "f"(C), "f"(_shfl_xor_sync_420));
-                    float _shfl_xor_sync_422 = __shfl_xor_sync(0xFFFFFFFF, C, 24);
-                    float _shfl_xor_sync_423 = __shfl_xor_sync(0xFFFFFFFF, C, 28);
-                    float _add_421;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_421) : "f"(_shfl_xor_sync_422), "f"(_shfl_xor_sync_423));
-                    float _add_418;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_418) : "f"(_add_419), "f"(_add_421));
-                    float _add_417;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_417) : "f"(_add_418), "f"(sinkhorn_eps));
-                    float _fdiv_416 = __fdiv_rn(C, _add_417);
-                    C = _fdiv_416;
-                }
-                if (lane_in_warp >= 8) {
-                    if (lane_in_warp < 24) {
-                        new_comb_res_mix[(unsigned long long)token * 16 + (unsigned long long)(lane_in_warp - 8)] = C;
+                    float _add_86;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_86) : "f"(sums_1[3]), "f"(q_value_51));
+                    sums_1[3] = _add_86;
 #else
+                    float _add_210;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_210) : "f"(sums_2[3]), "f"(q_value_51));
                     sums_2[3] = _add_210;
+#endif
                     float fold_level1[16];
+#if __CUDA_ARCH__ == 1070
+                    float keep_1 = ((lane_in_warp % 2 == 1) ? sums_1[16] : sums_1[0]);
+                    float send_1 = ((lane_in_warp % 2 == 1) ? sums_1[0] : sums_1[16]);
+                    float _shfl_xor_sync_88 = __shfl_xor_sync(0xFFFFFFFF, send_1, 1);
+                    float _add_87;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_87) : "f"(keep_1), "f"(_shfl_xor_sync_88));
+                    fold_level1[0] = _add_87;
+                    float keep_52_1 = ((lane_in_warp % 2 == 1) ? sums_1[17] : sums_1[1]);
+                    float send_53_1 = ((lane_in_warp % 2 == 1) ? sums_1[1] : sums_1[17]);
+                    float _shfl_xor_sync_90 = __shfl_xor_sync(0xFFFFFFFF, send_53_1, 1);
+                    float _add_89;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_89) : "f"(keep_52_1), "f"(_shfl_xor_sync_90));
+                    fold_level1[1] = _add_89;
+                    float keep_54_1 = ((lane_in_warp % 2 == 1) ? sums_1[18] : sums_1[2]);
+                    float send_55_1 = ((lane_in_warp % 2 == 1) ? sums_1[2] : sums_1[18]);
+                    float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, send_55_1, 1);
+                    float _add_91;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_91) : "f"(keep_54_1), "f"(_shfl_xor_sync_92));
+                    fold_level1[2] = _add_91;
+                    float keep_56 = ((lane_in_warp % 2 == 1) ? sums_1[19] : sums_1[3]);
+                    float send_57 = ((lane_in_warp % 2 == 1) ? sums_1[3] : sums_1[19]);
+                    float _shfl_xor_sync_94 = __shfl_xor_sync(0xFFFFFFFF, send_57, 1);
+                    float _add_93;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_93) : "f"(keep_56), "f"(_shfl_xor_sync_94));
+                    fold_level1[3] = _add_93;
+                    float keep_58 = ((lane_in_warp % 2 == 1) ? sums_1[20] : sums_1[4]);
+                    float send_59 = ((lane_in_warp % 2 == 1) ? sums_1[4] : sums_1[20]);
+                    float _shfl_xor_sync_96 = __shfl_xor_sync(0xFFFFFFFF, send_59, 1);
+                    float _add_95;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_95) : "f"(keep_58), "f"(_shfl_xor_sync_96));
+                    fold_level1[4] = _add_95;
+                    float keep_60 = ((lane_in_warp % 2 == 1) ? sums_1[21] : sums_1[5]);
+                    float send_61 = ((lane_in_warp % 2 == 1) ? sums_1[5] : sums_1[21]);
+                    float _shfl_xor_sync_98 = __shfl_xor_sync(0xFFFFFFFF, send_61, 1);
+                    float _add_97;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_97) : "f"(keep_60), "f"(_shfl_xor_sync_98));
+                    fold_level1[5] = _add_97;
+                    float keep_62 = ((lane_in_warp % 2 == 1) ? sums_1[22] : sums_1[6]);
+                    float send_63 = ((lane_in_warp % 2 == 1) ? sums_1[6] : sums_1[22]);
+                    float _shfl_xor_sync_100 = __shfl_xor_sync(0xFFFFFFFF, send_63, 1);
+                    float _add_99;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_99) : "f"(keep_62), "f"(_shfl_xor_sync_100));
+                    fold_level1[6] = _add_99;
+                    float keep_64 = ((lane_in_warp % 2 == 1) ? sums_1[23] : sums_1[7]);
+                    float send_65 = ((lane_in_warp % 2 == 1) ? sums_1[7] : sums_1[23]);
+                    float _shfl_xor_sync_102 = __shfl_xor_sync(0xFFFFFFFF, send_65, 1);
+                    float _add_101;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_101) : "f"(keep_64), "f"(_shfl_xor_sync_102));
+                    fold_level1[7] = _add_101;
+                    float keep_66 = ((lane_in_warp % 2 == 1) ? sums_1[24] : sums_1[8]);
+                    float send_67 = ((lane_in_warp % 2 == 1) ? sums_1[8] : sums_1[24]);
+                    float _shfl_xor_sync_104 = __shfl_xor_sync(0xFFFFFFFF, send_67, 1);
+                    float _add_103;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_103) : "f"(keep_66), "f"(_shfl_xor_sync_104));
+                    fold_level1[8] = _add_103;
+                    float keep_68 = ((lane_in_warp % 2 == 1) ? sums_1[25] : sums_1[9]);
+                    float send_69 = ((lane_in_warp % 2 == 1) ? sums_1[9] : sums_1[25]);
+                    float _shfl_xor_sync_106 = __shfl_xor_sync(0xFFFFFFFF, send_69, 1);
+                    float _add_105;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_105) : "f"(keep_68), "f"(_shfl_xor_sync_106));
+                    fold_level1[9] = _add_105;
+                    float keep_70 = ((lane_in_warp % 2 == 1) ? sums_1[26] : sums_1[10]);
+                    float send_71 = ((lane_in_warp % 2 == 1) ? sums_1[10] : sums_1[26]);
+                    float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, send_71, 1);
+                    float _add_107;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_107) : "f"(keep_70), "f"(_shfl_xor_sync_108));
+                    fold_level1[10] = _add_107;
+                    float keep_72 = ((lane_in_warp % 2 == 1) ? sums_1[27] : sums_1[11]);
+                    float send_73 = ((lane_in_warp % 2 == 1) ? sums_1[11] : sums_1[27]);
+                    float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, send_73, 1);
+                    float _add_109;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_109) : "f"(keep_72), "f"(_shfl_xor_sync_110));
+                    fold_level1[11] = _add_109;
+                    float keep_74 = ((lane_in_warp % 2 == 1) ? sums_1[28] : sums_1[12]);
+                    float send_75 = ((lane_in_warp % 2 == 1) ? sums_1[12] : sums_1[28]);
+                    float _shfl_xor_sync_112 = __shfl_xor_sync(0xFFFFFFFF, send_75, 1);
+                    float _add_111;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_111) : "f"(keep_74), "f"(_shfl_xor_sync_112));
+                    fold_level1[12] = _add_111;
+                    float keep_76 = ((lane_in_warp % 2 == 1) ? sums_1[29] : sums_1[13]);
+                    float send_77 = ((lane_in_warp % 2 == 1) ? sums_1[13] : sums_1[29]);
+                    float _shfl_xor_sync_114 = __shfl_xor_sync(0xFFFFFFFF, send_77, 1);
+                    float _add_113;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_113) : "f"(keep_76), "f"(_shfl_xor_sync_114));
+                    fold_level1[13] = _add_113;
+                    float keep_78 = ((lane_in_warp % 2 == 1) ? sums_1[30] : sums_1[14]);
+                    float send_79 = ((lane_in_warp % 2 == 1) ? sums_1[14] : sums_1[30]);
+                    float _shfl_xor_sync_116 = __shfl_xor_sync(0xFFFFFFFF, send_79, 1);
+                    float _add_115;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_115) : "f"(keep_78), "f"(_shfl_xor_sync_116));
+                    fold_level1[14] = _add_115;
+                    float keep_80 = ((lane_in_warp % 2 == 1) ? sums_1[31] : sums_1[15]);
+                    float send_81 = ((lane_in_warp % 2 == 1) ? sums_1[15] : sums_1[31]);
+                    float _shfl_xor_sync_118 = __shfl_xor_sync(0xFFFFFFFF, send_81, 1);
+                    float _add_117;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_117) : "f"(keep_80), "f"(_shfl_xor_sync_118));
+                    fold_level1[15] = _add_117;
+#else
                     float keep_2 = ((lane_in_warp % 2 == 1) ? sums_2[16] : sums_2[0]);
                     float send_2 = ((lane_in_warp % 2 == 1) ? sums_2[0] : sums_2[16]);
                     float _shfl_xor_sync_212 = __shfl_xor_sync(0xFFFFFFFF, send_2, 1);
@@ -5426,15 +4686,35 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_241;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_241) : "f"(keep_80), "f"(_shfl_xor_sync_242));
                     fold_level1[15] = _add_241;
+#endif
                     float fold_level2[8];
                     float keep_82 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[8] : fold_level1[0]);
                     float send_83 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[0] : fold_level1[8]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_120 = __shfl_xor_sync(0xFFFFFFFF, send_83, 2);
+                    float _add_119;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_119) : "f"(keep_82), "f"(_shfl_xor_sync_120));
+                    fold_level2[0] = _add_119;
+#else
                     float _shfl_xor_sync_244 = __shfl_xor_sync(0xFFFFFFFF, send_83, 2);
                     float _add_243;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_243) : "f"(keep_82), "f"(_shfl_xor_sync_244));
                     fold_level2[0] = _add_243;
+#endif
                     float keep_84 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[9] : fold_level1[1]);
                     float send_85 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[1] : fold_level1[9]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_122 = __shfl_xor_sync(0xFFFFFFFF, send_85, 2);
+                    float _add_121;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_121) : "f"(keep_84), "f"(_shfl_xor_sync_122));
+                    fold_level2[1] = _add_121;
+                    float keep_86 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[10] : fold_level1[2]);
+                    float send_87 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[2] : fold_level1[10]);
+                    float _shfl_xor_sync_124 = __shfl_xor_sync(0xFFFFFFFF, send_87, 2);
+                    float _add_123;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_123) : "f"(keep_86), "f"(_shfl_xor_sync_124));
+                    fold_level2[2] = _add_123;
+#else
                     float _shfl_xor_sync_246 = __shfl_xor_sync(0xFFFFFFFF, send_85, 2);
                     float _add_245;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_245) : "f"(keep_84), "f"(_shfl_xor_sync_246));
@@ -5445,51 +4725,113 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_247;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_247) : "f"(keep_86_1), "f"(_shfl_xor_sync_248));
                     fold_level2[2] = _add_247;
+#endif
                     float keep_88 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[11] : fold_level1[3]);
                     float send_89 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[3] : fold_level1[11]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_126 = __shfl_xor_sync(0xFFFFFFFF, send_89, 2);
+                    float _add_125;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_125) : "f"(keep_88), "f"(_shfl_xor_sync_126));
+                    fold_level2[3] = _add_125;
+#else
                     float _shfl_xor_sync_250 = __shfl_xor_sync(0xFFFFFFFF, send_89, 2);
                     float _add_249;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_249) : "f"(keep_88), "f"(_shfl_xor_sync_250));
                     fold_level2[3] = _add_249;
+#endif
                     float keep_90 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[12] : fold_level1[4]);
                     float send_91 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[4] : fold_level1[12]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_128 = __shfl_xor_sync(0xFFFFFFFF, send_91, 2);
+                    float _add_127;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_127) : "f"(keep_90), "f"(_shfl_xor_sync_128));
+                    fold_level2[4] = _add_127;
+#else
                     float _shfl_xor_sync_252 = __shfl_xor_sync(0xFFFFFFFF, send_91, 2);
                     float _add_251;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_251) : "f"(keep_90), "f"(_shfl_xor_sync_252));
                     fold_level2[4] = _add_251;
+#endif
                     float keep_92 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[13] : fold_level1[5]);
                     float send_93 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[5] : fold_level1[13]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_130 = __shfl_xor_sync(0xFFFFFFFF, send_93, 2);
+                    float _add_129;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_129) : "f"(keep_92), "f"(_shfl_xor_sync_130));
+                    fold_level2[5] = _add_129;
+#else
                     float _shfl_xor_sync_254 = __shfl_xor_sync(0xFFFFFFFF, send_93, 2);
                     float _add_253;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_253) : "f"(keep_92), "f"(_shfl_xor_sync_254));
                     fold_level2[5] = _add_253;
+#endif
                     float keep_94 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[14] : fold_level1[6]);
                     float send_95 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[6] : fold_level1[14]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_132 = __shfl_xor_sync(0xFFFFFFFF, send_95, 2);
+                    float _add_131;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_131) : "f"(keep_94), "f"(_shfl_xor_sync_132));
+                    fold_level2[6] = _add_131;
+#else
                     float _shfl_xor_sync_256 = __shfl_xor_sync(0xFFFFFFFF, send_95, 2);
                     float _add_255;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_255) : "f"(keep_94), "f"(_shfl_xor_sync_256));
                     fold_level2[6] = _add_255;
+#endif
                     float keep_96 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[15] : fold_level1[7]);
                     float send_97 = ((lane_in_warp / 2 % 2 == 1) ? fold_level1[7] : fold_level1[15]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_134 = __shfl_xor_sync(0xFFFFFFFF, send_97, 2);
+                    float _add_133;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_133) : "f"(keep_96), "f"(_shfl_xor_sync_134));
+                    fold_level2[7] = _add_133;
+#else
                     float _shfl_xor_sync_258 = __shfl_xor_sync(0xFFFFFFFF, send_97, 2);
                     float _add_257;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_257) : "f"(keep_96), "f"(_shfl_xor_sync_258));
                     fold_level2[7] = _add_257;
+#endif
                     float fold_level3[4];
                     float keep_98 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[4] : fold_level2[0]);
                     float send_99 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[0] : fold_level2[4]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_136 = __shfl_xor_sync(0xFFFFFFFF, send_99, 4);
+                    float _add_135;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_135) : "f"(keep_98), "f"(_shfl_xor_sync_136));
+                    fold_level3[0] = _add_135;
+#else
                     float _shfl_xor_sync_260 = __shfl_xor_sync(0xFFFFFFFF, send_99, 4);
                     float _add_259;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_259) : "f"(keep_98), "f"(_shfl_xor_sync_260));
                     fold_level3[0] = _add_259;
+#endif
                     float keep_100 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[5] : fold_level2[1]);
                     float send_101 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[1] : fold_level2[5]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_138 = __shfl_xor_sync(0xFFFFFFFF, send_101, 4);
+                    float _add_137;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_137) : "f"(keep_100), "f"(_shfl_xor_sync_138));
+                    fold_level3[1] = _add_137;
+#else
                     float _shfl_xor_sync_262 = __shfl_xor_sync(0xFFFFFFFF, send_101, 4);
                     float _add_261;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_261) : "f"(keep_100), "f"(_shfl_xor_sync_262));
                     fold_level3[1] = _add_261;
+#endif
                     float keep_102 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[6] : fold_level2[2]);
                     float send_103 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[2] : fold_level2[6]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_140 = __shfl_xor_sync(0xFFFFFFFF, send_103, 4);
+                    float _add_139;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_139) : "f"(keep_102), "f"(_shfl_xor_sync_140));
+                    fold_level3[2] = _add_139;
+                    float keep_104 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[7] : fold_level2[3]);
+                    float send_105 = ((lane_in_warp / 4 % 2 == 1) ? fold_level2[3] : fold_level2[7]);
+                    float _shfl_xor_sync_142 = __shfl_xor_sync(0xFFFFFFFF, send_105, 4);
+                    float _add_141;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_141) : "f"(keep_104), "f"(_shfl_xor_sync_142));
+                    fold_level3[3] = _add_141;
+#else
                     float _shfl_xor_sync_264 = __shfl_xor_sync(0xFFFFFFFF, send_103, 4);
                     float _add_263;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_263) : "f"(keep_102), "f"(_shfl_xor_sync_264));
@@ -5500,32 +4842,69 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_265;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_265) : "f"(keep_104_1), "f"(_shfl_xor_sync_266));
                     fold_level3[3] = _add_265;
+#endif
                     float fold_level4[2];
                     float keep_106 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[2] : fold_level3[0]);
                     float send_107 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[0] : fold_level3[2]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_144 = __shfl_xor_sync(0xFFFFFFFF, send_107, 8);
+                    float _add_143;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_143) : "f"(keep_106), "f"(_shfl_xor_sync_144));
+                    fold_level4[0] = _add_143;
+#else
                     float _shfl_xor_sync_268 = __shfl_xor_sync(0xFFFFFFFF, send_107, 8);
                     float _add_267;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_267) : "f"(keep_106), "f"(_shfl_xor_sync_268));
                     fold_level4[0] = _add_267;
+#endif
                     float keep_108 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[3] : fold_level3[1]);
                     float send_109 = ((lane_in_warp / 8 % 2 == 1) ? fold_level3[1] : fold_level3[3]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, send_109, 8);
+                    float _add_145;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_145) : "f"(keep_108), "f"(_shfl_xor_sync_146));
+                    fold_level4[1] = _add_145;
+#else
                     float _shfl_xor_sync_270 = __shfl_xor_sync(0xFFFFFFFF, send_109, 8);
                     float _add_269;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_269) : "f"(keep_108), "f"(_shfl_xor_sync_270));
                     fold_level4[1] = _add_269;
+#endif
                     float fold_level5[1];
                     float keep_110 = ((lane_in_warp / 16 % 2 == 1) ? fold_level4[1] : fold_level4[0]);
                     float send_111 = ((lane_in_warp / 16 % 2 == 1) ? fold_level4[0] : fold_level4[1]);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, send_111, 16);
+                    float _add_147;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_147) : "f"(keep_110), "f"(_shfl_xor_sync_148));
+                    fold_level5[0] = _add_147;
+#else
                     float _shfl_xor_sync_272 = __shfl_xor_sync(0xFFFFFFFF, send_111, 16);
                     float _add_271;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_271) : "f"(keep_110), "f"(_shfl_xor_sync_272));
                     fold_level5[0] = _add_271;
+#endif
                     float total_2 = fold_level5[0];
                     float s_112 = ((lane_in_warp < 24) ? total_2 : 0.0f);
                     float q_113 = __shfl_sync(0xFFFFFFFF, total_2, 24);
                     s = s_112;
                     q = q_113;
                 } else {
+#if __CUDA_ARCH__ == 1070
+                    unsigned int row_12 = token % 64;
+                    unsigned int first_task_2 = mb_1 * num_splits;
+                    float sums_2[25];
+                    unsigned int split_2 = lane_in_warp * 2;
+                    unsigned int safe_split_2 = ((split_2 < num_splits) ? split_2 : 0);
+                    unsigned long long record_2 = ((unsigned long long)first_task_2 + (unsigned long long)safe_split_2) * 1536 + (unsigned long long)(row_12 * 24);
+                    float _vec_load_18[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_2 + 0);
+                        _vec_load_18[0 + 0] = _v4.x;
+                        _vec_load_18[0 + 1] = _v4.y;
+                        _vec_load_18[0 + 2] = _v4.z;
+                        _vec_load_18[0 + 3] = _v4.w;
+#else
                     float s_0 = 0.0f;
                     float q_1 = 0.0f;
                     if (num_splits > 22) {
@@ -9428,27 +8807,810 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
 #endif
                     }
 #if __CUDA_ARCH__ == 1070
-                } else if (lane_in_warp >= 4) {
-                    new_post_mix[(unsigned long long)token * 4 + (unsigned long long)(lane_in_warp - 4)] = _mul_0;
+                    float value_50 = ((split_2 < num_splits) ? _vec_load_18[0] : 0.0f);
+                    sums_2[0] = value_50;
+                    float value_0_2 = ((split_2 < num_splits) ? _vec_load_18[1] : 0.0f);
+                    sums_2[1] = value_0_2;
+                    float value_1_3 = ((split_2 < num_splits) ? _vec_load_18[2] : 0.0f);
+                    sums_2[2] = value_1_3;
+                    float value_2_2 = ((split_2 < num_splits) ? _vec_load_18[3] : 0.0f);
+                    sums_2[3] = value_2_2;
+                    float _vec_load_19[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 4) + 0);
+                        _vec_load_19[0 + 0] = _v4.x;
+                        _vec_load_19[0 + 1] = _v4.y;
+                        _vec_load_19[0 + 2] = _v4.z;
+                        _vec_load_19[0 + 3] = _v4.w;
+                    }
+                    float value_3_2 = ((split_2 < num_splits) ? _vec_load_19[0] : 0.0f);
+                    sums_2[4] = value_3_2;
+                    float value_4_2 = ((split_2 < num_splits) ? _vec_load_19[1] : 0.0f);
+                    sums_2[5] = value_4_2;
+                    float value_5_2 = ((split_2 < num_splits) ? _vec_load_19[2] : 0.0f);
+                    sums_2[6] = value_5_2;
+                    float value_6_2 = ((split_2 < num_splits) ? _vec_load_19[3] : 0.0f);
+                    sums_2[7] = value_6_2;
+                    float _vec_load_20[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 8) + 0);
+                        _vec_load_20[0 + 0] = _v4.x;
+                        _vec_load_20[0 + 1] = _v4.y;
+                        _vec_load_20[0 + 2] = _v4.z;
+                        _vec_load_20[0 + 3] = _v4.w;
+                    }
+                    float value_7_2 = ((split_2 < num_splits) ? _vec_load_20[0] : 0.0f);
+                    sums_2[8] = value_7_2;
+                    float value_8_3 = ((split_2 < num_splits) ? _vec_load_20[1] : 0.0f);
+                    sums_2[9] = value_8_3;
+                    float value_9_2 = ((split_2 < num_splits) ? _vec_load_20[2] : 0.0f);
+                    sums_2[10] = value_9_2;
+                    float value_10_2 = ((split_2 < num_splits) ? _vec_load_20[3] : 0.0f);
+                    sums_2[11] = value_10_2;
+                    float _vec_load_21[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 12) + 0);
+                        _vec_load_21[0 + 0] = _v4.x;
+                        _vec_load_21[0 + 1] = _v4.y;
+                        _vec_load_21[0 + 2] = _v4.z;
+                        _vec_load_21[0 + 3] = _v4.w;
+                    }
+                    float value_11_2 = ((split_2 < num_splits) ? _vec_load_21[0] : 0.0f);
+                    sums_2[12] = value_11_2;
+                    float value_12_1 = ((split_2 < num_splits) ? _vec_load_21[1] : 0.0f);
+                    sums_2[13] = value_12_1;
+                    float value_13_1 = ((split_2 < num_splits) ? _vec_load_21[2] : 0.0f);
+                    sums_2[14] = value_13_1;
+                    float value_14_2 = ((split_2 < num_splits) ? _vec_load_21[3] : 0.0f);
+                    sums_2[15] = value_14_2;
+                    float _vec_load_22[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 16) + 0);
+                        _vec_load_22[0 + 0] = _v4.x;
+                        _vec_load_22[0 + 1] = _v4.y;
+                        _vec_load_22[0 + 2] = _v4.z;
+                        _vec_load_22[0 + 3] = _v4.w;
+                    }
+                    float value_15_2 = ((split_2 < num_splits) ? _vec_load_22[0] : 0.0f);
+                    sums_2[16] = value_15_2;
+                    float value_16_2 = ((split_2 < num_splits) ? _vec_load_22[1] : 0.0f);
+                    sums_2[17] = value_16_2;
+                    float value_17_3 = ((split_2 < num_splits) ? _vec_load_22[2] : 0.0f);
+                    sums_2[18] = value_17_3;
+                    float value_18_2 = ((split_2 < num_splits) ? _vec_load_22[3] : 0.0f);
+                    sums_2[19] = value_18_2;
+                    float _vec_load_23[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_2 + 20) + 0);
+                        _vec_load_23[0 + 0] = _v4.x;
+                        _vec_load_23[0 + 1] = _v4.y;
+                        _vec_load_23[0 + 2] = _v4.z;
+                        _vec_load_23[0 + 3] = _v4.w;
+                    }
+                    float value_19_2 = ((split_2 < num_splits) ? _vec_load_23[0] : 0.0f);
+                    sums_2[20] = value_19_2;
+                    float value_20_2 = ((split_2 < num_splits) ? _vec_load_23[1] : 0.0f);
+                    sums_2[21] = value_20_2;
+                    float value_21_2 = ((split_2 < num_splits) ? _vec_load_23[2] : 0.0f);
+                    sums_2[22] = value_21_2;
+                    float value_22_2 = ((split_2 < num_splits) ? _vec_load_23[3] : 0.0f);
+                    sums_2[23] = value_22_2;
+                    float q_word_2 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_2 * 64 + (unsigned long long)(safe_split_2 * 64) + (unsigned long long)row_12];
+                    float q_value_2 = ((split_2 < num_splits) ? q_word_2 : 0.0f);
+                    sums_2[24] = q_value_2;
+                    unsigned int split_23_1 = lane_in_warp * 2 + 1;
+                    unsigned int safe_split_24_1 = ((split_23_1 < num_splits) ? split_23_1 : 0);
+                    unsigned long long record_25_1 = ((unsigned long long)first_task_2 + (unsigned long long)safe_split_24_1) * 1536 + (unsigned long long)(row_12 * 24);
+                    float _vec_load_24[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_25_1 + 0);
+                        _vec_load_24[0 + 0] = _v4.x;
+                        _vec_load_24[0 + 1] = _v4.y;
+                        _vec_load_24[0 + 2] = _v4.z;
+                        _vec_load_24[0 + 3] = _v4.w;
+                    }
+                    float value_26_2 = ((split_23_1 < num_splits) ? _vec_load_24[0] : 0.0f);
+                    float _add_156;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_156) : "f"(sums_2[0]), "f"(value_26_2));
+                    sums_2[0] = _add_156;
+                    float value_27_1 = ((split_23_1 < num_splits) ? _vec_load_24[1] : 0.0f);
+                    float _add_157;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_157) : "f"(sums_2[1]), "f"(value_27_1));
+                    sums_2[1] = _add_157;
+                    float value_28_1 = ((split_23_1 < num_splits) ? _vec_load_24[2] : 0.0f);
+                    float _add_158;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_158) : "f"(sums_2[2]), "f"(value_28_1));
+                    sums_2[2] = _add_158;
+                    float value_29_1 = ((split_23_1 < num_splits) ? _vec_load_24[3] : 0.0f);
+                    float _add_159;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_159) : "f"(sums_2[3]), "f"(value_29_1));
+                    sums_2[3] = _add_159;
+                    float _vec_load_25[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 4) + 0);
+                        _vec_load_25[0 + 0] = _v4.x;
+                        _vec_load_25[0 + 1] = _v4.y;
+                        _vec_load_25[0 + 2] = _v4.z;
+                        _vec_load_25[0 + 3] = _v4.w;
+                    }
+                    float value_30_1 = ((split_23_1 < num_splits) ? _vec_load_25[0] : 0.0f);
+                    float _add_161;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_161) : "f"(sums_2[4]), "f"(value_30_1));
+                    sums_2[4] = _add_161;
+                    float value_31_1 = ((split_23_1 < num_splits) ? _vec_load_25[1] : 0.0f);
+                    float _add_162;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_162) : "f"(sums_2[5]), "f"(value_31_1));
+                    sums_2[5] = _add_162;
+                    float value_32_1 = ((split_23_1 < num_splits) ? _vec_load_25[2] : 0.0f);
+                    float _add_163;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_163) : "f"(sums_2[6]), "f"(value_32_1));
+                    sums_2[6] = _add_163;
+                    float value_33_1 = ((split_23_1 < num_splits) ? _vec_load_25[3] : 0.0f);
+                    float _add_164;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_164) : "f"(sums_2[7]), "f"(value_33_1));
+                    sums_2[7] = _add_164;
+                    float _vec_load_26[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 8) + 0);
+                        _vec_load_26[0 + 0] = _v4.x;
+                        _vec_load_26[0 + 1] = _v4.y;
+                        _vec_load_26[0 + 2] = _v4.z;
+                        _vec_load_26[0 + 3] = _v4.w;
+                    }
+                    float value_34_1 = ((split_23_1 < num_splits) ? _vec_load_26[0] : 0.0f);
+                    float _add_166;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_166) : "f"(sums_2[8]), "f"(value_34_1));
+                    sums_2[8] = _add_166;
+                    float value_35_1 = ((split_23_1 < num_splits) ? _vec_load_26[1] : 0.0f);
+                    float _add_167;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_167) : "f"(sums_2[9]), "f"(value_35_1));
+                    sums_2[9] = _add_167;
+                    float value_36_1 = ((split_23_1 < num_splits) ? _vec_load_26[2] : 0.0f);
+                    float _add_168;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_168) : "f"(sums_2[10]), "f"(value_36_1));
+                    sums_2[10] = _add_168;
+                    float value_37_1 = ((split_23_1 < num_splits) ? _vec_load_26[3] : 0.0f);
+                    float _add_169;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_169) : "f"(sums_2[11]), "f"(value_37_1));
+                    sums_2[11] = _add_169;
+                    float _vec_load_27[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 12) + 0);
+                        _vec_load_27[0 + 0] = _v4.x;
+                        _vec_load_27[0 + 1] = _v4.y;
+                        _vec_load_27[0 + 2] = _v4.z;
+                        _vec_load_27[0 + 3] = _v4.w;
+                    }
+                    float value_38_1 = ((split_23_1 < num_splits) ? _vec_load_27[0] : 0.0f);
+                    float _add_171;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_171) : "f"(sums_2[12]), "f"(value_38_1));
+                    sums_2[12] = _add_171;
+                    float value_39_1 = ((split_23_1 < num_splits) ? _vec_load_27[1] : 0.0f);
+                    float _add_172;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_172) : "f"(sums_2[13]), "f"(value_39_1));
+                    sums_2[13] = _add_172;
+                    float value_40_1 = ((split_23_1 < num_splits) ? _vec_load_27[2] : 0.0f);
+                    float _add_173;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_173) : "f"(sums_2[14]), "f"(value_40_1));
+                    sums_2[14] = _add_173;
+                    float value_41_1 = ((split_23_1 < num_splits) ? _vec_load_27[3] : 0.0f);
+                    float _add_174;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_174) : "f"(sums_2[15]), "f"(value_41_1));
+                    sums_2[15] = _add_174;
+                    float _vec_load_28[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 16) + 0);
+                        _vec_load_28[0 + 0] = _v4.x;
+                        _vec_load_28[0 + 1] = _v4.y;
+                        _vec_load_28[0 + 2] = _v4.z;
+                        _vec_load_28[0 + 3] = _v4.w;
+                    }
+                    float value_42_1 = ((split_23_1 < num_splits) ? _vec_load_28[0] : 0.0f);
+                    float _add_176;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_176) : "f"(sums_2[16]), "f"(value_42_1));
+                    sums_2[16] = _add_176;
+                    float value_43_1 = ((split_23_1 < num_splits) ? _vec_load_28[1] : 0.0f);
+                    float _add_177;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_177) : "f"(sums_2[17]), "f"(value_43_1));
+                    sums_2[17] = _add_177;
+                    float value_44_2 = ((split_23_1 < num_splits) ? _vec_load_28[2] : 0.0f);
+                    float _add_178;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_178) : "f"(sums_2[18]), "f"(value_44_2));
+                    sums_2[18] = _add_178;
+                    float value_45_1 = ((split_23_1 < num_splits) ? _vec_load_28[3] : 0.0f);
+                    float _add_179;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_179) : "f"(sums_2[19]), "f"(value_45_1));
+                    sums_2[19] = _add_179;
+                    float _vec_load_29[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(scratch + (record_25_1 + 20) + 0);
+                        _vec_load_29[0 + 0] = _v4.x;
+                        _vec_load_29[0 + 1] = _v4.y;
+                        _vec_load_29[0 + 2] = _v4.z;
+                        _vec_load_29[0 + 3] = _v4.w;
+                    }
+                    float value_46_1 = ((split_23_1 < num_splits) ? _vec_load_29[0] : 0.0f);
+                    float _add_181;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_181) : "f"(sums_2[20]), "f"(value_46_1));
+                    sums_2[20] = _add_181;
+                    float value_47_1 = ((split_23_1 < num_splits) ? _vec_load_29[1] : 0.0f);
+                    float _add_182;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_182) : "f"(sums_2[21]), "f"(value_47_1));
+                    sums_2[21] = _add_182;
+                    float value_48_1 = ((split_23_1 < num_splits) ? _vec_load_29[2] : 0.0f);
+                    float _add_183;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_183) : "f"(sums_2[22]), "f"(value_48_1));
+                    sums_2[22] = _add_183;
+                    float value_49_1 = ((split_23_1 < num_splits) ? _vec_load_29[3] : 0.0f);
+                    float _add_184;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_184) : "f"(sums_2[23]), "f"(value_49_1));
+                    sums_2[23] = _add_184;
+                    float q_word_50_1 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_2 * 64 + (unsigned long long)(safe_split_24_1 * 64) + (unsigned long long)row_12];
+                    float q_value_51_1 = ((split_23_1 < num_splits) ? q_word_50_1 : 0.0f);
+                    float _add_185;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_185) : "f"(sums_2[24]), "f"(q_value_51_1));
+                    sums_2[24] = _add_185;
+                    float _shfl_xor_sync_187 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 1);
+                    float _add_186;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_186) : "f"(sums_2[0]), "f"(_shfl_xor_sync_187));
+                    sums_2[0] = _add_186;
+                    float _shfl_xor_sync_189 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 1);
+                    float _add_188;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_188) : "f"(sums_2[1]), "f"(_shfl_xor_sync_189));
+                    sums_2[1] = _add_188;
+                    float _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 1);
+                    float _add_190;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_190) : "f"(sums_2[2]), "f"(_shfl_xor_sync_191));
+                    sums_2[2] = _add_190;
+                    float _shfl_xor_sync_193 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 1);
+                    float _add_192;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_192) : "f"(sums_2[3]), "f"(_shfl_xor_sync_193));
+                    sums_2[3] = _add_192;
+                    float _shfl_xor_sync_195 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 1);
+                    float _add_194;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_194) : "f"(sums_2[4]), "f"(_shfl_xor_sync_195));
+                    sums_2[4] = _add_194;
+                    float _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, sums_2[5], 1);
+                    float _add_196;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_196) : "f"(sums_2[5]), "f"(_shfl_xor_sync_197));
+                    sums_2[5] = _add_196;
+                    float _shfl_xor_sync_199 = __shfl_xor_sync(0xFFFFFFFF, sums_2[6], 1);
+                    float _add_198;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_198) : "f"(sums_2[6]), "f"(_shfl_xor_sync_199));
+                    sums_2[6] = _add_198;
+                    float _shfl_xor_sync_201 = __shfl_xor_sync(0xFFFFFFFF, sums_2[7], 1);
+                    float _add_200;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_200) : "f"(sums_2[7]), "f"(_shfl_xor_sync_201));
+                    sums_2[7] = _add_200;
+                    float _shfl_xor_sync_203 = __shfl_xor_sync(0xFFFFFFFF, sums_2[8], 1);
+                    float _add_202;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_202) : "f"(sums_2[8]), "f"(_shfl_xor_sync_203));
+                    sums_2[8] = _add_202;
+                    float _shfl_xor_sync_205 = __shfl_xor_sync(0xFFFFFFFF, sums_2[9], 1);
+                    float _add_204;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_204) : "f"(sums_2[9]), "f"(_shfl_xor_sync_205));
+                    sums_2[9] = _add_204;
+                    float _shfl_xor_sync_207 = __shfl_xor_sync(0xFFFFFFFF, sums_2[10], 1);
+                    float _add_206;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_206) : "f"(sums_2[10]), "f"(_shfl_xor_sync_207));
+                    sums_2[10] = _add_206;
+                    float _shfl_xor_sync_209 = __shfl_xor_sync(0xFFFFFFFF, sums_2[11], 1);
+                    float _add_208;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_208) : "f"(sums_2[11]), "f"(_shfl_xor_sync_209));
+                    sums_2[11] = _add_208;
+                    float _shfl_xor_sync_211 = __shfl_xor_sync(0xFFFFFFFF, sums_2[12], 1);
+                    float _add_210;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_210) : "f"(sums_2[12]), "f"(_shfl_xor_sync_211));
+                    sums_2[12] = _add_210;
+                    float _shfl_xor_sync_213 = __shfl_xor_sync(0xFFFFFFFF, sums_2[13], 1);
+                    float _add_212;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_212) : "f"(sums_2[13]), "f"(_shfl_xor_sync_213));
+                    sums_2[13] = _add_212;
+                    float _shfl_xor_sync_215 = __shfl_xor_sync(0xFFFFFFFF, sums_2[14], 1);
+                    float _add_214;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_214) : "f"(sums_2[14]), "f"(_shfl_xor_sync_215));
+                    sums_2[14] = _add_214;
+                    float _shfl_xor_sync_217 = __shfl_xor_sync(0xFFFFFFFF, sums_2[15], 1);
+                    float _add_216;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_216) : "f"(sums_2[15]), "f"(_shfl_xor_sync_217));
+                    sums_2[15] = _add_216;
+                    float _shfl_xor_sync_219 = __shfl_xor_sync(0xFFFFFFFF, sums_2[16], 1);
+                    float _add_218;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_218) : "f"(sums_2[16]), "f"(_shfl_xor_sync_219));
+                    sums_2[16] = _add_218;
+                    float _shfl_xor_sync_221 = __shfl_xor_sync(0xFFFFFFFF, sums_2[17], 1);
+                    float _add_220;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_220) : "f"(sums_2[17]), "f"(_shfl_xor_sync_221));
+                    sums_2[17] = _add_220;
+                    float _shfl_xor_sync_223 = __shfl_xor_sync(0xFFFFFFFF, sums_2[18], 1);
+                    float _add_222;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_222) : "f"(sums_2[18]), "f"(_shfl_xor_sync_223));
+                    sums_2[18] = _add_222;
+                    float _shfl_xor_sync_225 = __shfl_xor_sync(0xFFFFFFFF, sums_2[19], 1);
+                    float _add_224;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_224) : "f"(sums_2[19]), "f"(_shfl_xor_sync_225));
+                    sums_2[19] = _add_224;
+                    float _shfl_xor_sync_227 = __shfl_xor_sync(0xFFFFFFFF, sums_2[20], 1);
+                    float _add_226;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_226) : "f"(sums_2[20]), "f"(_shfl_xor_sync_227));
+                    sums_2[20] = _add_226;
+                    float _shfl_xor_sync_229 = __shfl_xor_sync(0xFFFFFFFF, sums_2[21], 1);
+                    float _add_228;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_228) : "f"(sums_2[21]), "f"(_shfl_xor_sync_229));
+                    sums_2[21] = _add_228;
+                    float _shfl_xor_sync_231 = __shfl_xor_sync(0xFFFFFFFF, sums_2[22], 1);
+                    float _add_230;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_230) : "f"(sums_2[22]), "f"(_shfl_xor_sync_231));
+                    sums_2[22] = _add_230;
+                    float _shfl_xor_sync_233 = __shfl_xor_sync(0xFFFFFFFF, sums_2[23], 1);
+                    float _add_232;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_232) : "f"(sums_2[23]), "f"(_shfl_xor_sync_233));
+                    sums_2[23] = _add_232;
+                    float _shfl_xor_sync_235 = __shfl_xor_sync(0xFFFFFFFF, sums_2[24], 1);
+                    float _add_234;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_234) : "f"(sums_2[24]), "f"(_shfl_xor_sync_235));
+                    sums_2[24] = _add_234;
+                    float _shfl_xor_sync_237 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 2);
+                    float _add_236;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_236) : "f"(sums_2[0]), "f"(_shfl_xor_sync_237));
+                    sums_2[0] = _add_236;
+                    float _shfl_xor_sync_239 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 2);
+                    float _add_238;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_238) : "f"(sums_2[1]), "f"(_shfl_xor_sync_239));
+                    sums_2[1] = _add_238;
+                    float _shfl_xor_sync_241 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 2);
+                    float _add_240;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_240) : "f"(sums_2[2]), "f"(_shfl_xor_sync_241));
+                    sums_2[2] = _add_240;
+                    float _shfl_xor_sync_243 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 2);
+                    float _add_242;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_242) : "f"(sums_2[3]), "f"(_shfl_xor_sync_243));
+                    sums_2[3] = _add_242;
+                    float _shfl_xor_sync_245 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 2);
+                    float _add_244;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_244) : "f"(sums_2[4]), "f"(_shfl_xor_sync_245));
+                    sums_2[4] = _add_244;
+                    float _shfl_xor_sync_247 = __shfl_xor_sync(0xFFFFFFFF, sums_2[5], 2);
+                    float _add_246;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_246) : "f"(sums_2[5]), "f"(_shfl_xor_sync_247));
+                    sums_2[5] = _add_246;
+                    float _shfl_xor_sync_249 = __shfl_xor_sync(0xFFFFFFFF, sums_2[6], 2);
+                    float _add_248;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_248) : "f"(sums_2[6]), "f"(_shfl_xor_sync_249));
+                    sums_2[6] = _add_248;
+                    float _shfl_xor_sync_251 = __shfl_xor_sync(0xFFFFFFFF, sums_2[7], 2);
+                    float _add_250;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_250) : "f"(sums_2[7]), "f"(_shfl_xor_sync_251));
+                    sums_2[7] = _add_250;
+                    float _shfl_xor_sync_253 = __shfl_xor_sync(0xFFFFFFFF, sums_2[8], 2);
+                    float _add_252;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_252) : "f"(sums_2[8]), "f"(_shfl_xor_sync_253));
+                    sums_2[8] = _add_252;
+                    float _shfl_xor_sync_255 = __shfl_xor_sync(0xFFFFFFFF, sums_2[9], 2);
+                    float _add_254;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_254) : "f"(sums_2[9]), "f"(_shfl_xor_sync_255));
+                    sums_2[9] = _add_254;
+                    float _shfl_xor_sync_257 = __shfl_xor_sync(0xFFFFFFFF, sums_2[10], 2);
+                    float _add_256;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_256) : "f"(sums_2[10]), "f"(_shfl_xor_sync_257));
+                    sums_2[10] = _add_256;
+                    float _shfl_xor_sync_259 = __shfl_xor_sync(0xFFFFFFFF, sums_2[11], 2);
+                    float _add_258;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_258) : "f"(sums_2[11]), "f"(_shfl_xor_sync_259));
+                    sums_2[11] = _add_258;
+                    float _shfl_xor_sync_261 = __shfl_xor_sync(0xFFFFFFFF, sums_2[12], 2);
+                    float _add_260;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_260) : "f"(sums_2[12]), "f"(_shfl_xor_sync_261));
+                    sums_2[12] = _add_260;
+                    float _shfl_xor_sync_263 = __shfl_xor_sync(0xFFFFFFFF, sums_2[13], 2);
+                    float _add_262;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_262) : "f"(sums_2[13]), "f"(_shfl_xor_sync_263));
+                    sums_2[13] = _add_262;
+                    float _shfl_xor_sync_265 = __shfl_xor_sync(0xFFFFFFFF, sums_2[14], 2);
+                    float _add_264;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_264) : "f"(sums_2[14]), "f"(_shfl_xor_sync_265));
+                    sums_2[14] = _add_264;
+                    float _shfl_xor_sync_267 = __shfl_xor_sync(0xFFFFFFFF, sums_2[15], 2);
+                    float _add_266;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_266) : "f"(sums_2[15]), "f"(_shfl_xor_sync_267));
+                    sums_2[15] = _add_266;
+                    float _shfl_xor_sync_269 = __shfl_xor_sync(0xFFFFFFFF, sums_2[16], 2);
+                    float _add_268;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_268) : "f"(sums_2[16]), "f"(_shfl_xor_sync_269));
+                    sums_2[16] = _add_268;
+                    float _shfl_xor_sync_271 = __shfl_xor_sync(0xFFFFFFFF, sums_2[17], 2);
+                    float _add_270;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_270) : "f"(sums_2[17]), "f"(_shfl_xor_sync_271));
+                    sums_2[17] = _add_270;
+                    float _shfl_xor_sync_273 = __shfl_xor_sync(0xFFFFFFFF, sums_2[18], 2);
+                    float _add_272;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_272) : "f"(sums_2[18]), "f"(_shfl_xor_sync_273));
+                    sums_2[18] = _add_272;
+                    float _shfl_xor_sync_275 = __shfl_xor_sync(0xFFFFFFFF, sums_2[19], 2);
+                    float _add_274;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_274) : "f"(sums_2[19]), "f"(_shfl_xor_sync_275));
+                    sums_2[19] = _add_274;
+                    float _shfl_xor_sync_277 = __shfl_xor_sync(0xFFFFFFFF, sums_2[20], 2);
+                    float _add_276;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_276) : "f"(sums_2[20]), "f"(_shfl_xor_sync_277));
+                    sums_2[20] = _add_276;
+                    float _shfl_xor_sync_279 = __shfl_xor_sync(0xFFFFFFFF, sums_2[21], 2);
+                    float _add_278;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_278) : "f"(sums_2[21]), "f"(_shfl_xor_sync_279));
+                    sums_2[21] = _add_278;
+                    float _shfl_xor_sync_281 = __shfl_xor_sync(0xFFFFFFFF, sums_2[22], 2);
+                    float _add_280;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_280) : "f"(sums_2[22]), "f"(_shfl_xor_sync_281));
+                    sums_2[22] = _add_280;
+                    float _shfl_xor_sync_283 = __shfl_xor_sync(0xFFFFFFFF, sums_2[23], 2);
+                    float _add_282;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_282) : "f"(sums_2[23]), "f"(_shfl_xor_sync_283));
+                    sums_2[23] = _add_282;
+                    float _shfl_xor_sync_285 = __shfl_xor_sync(0xFFFFFFFF, sums_2[24], 2);
+                    float _add_284;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_284) : "f"(sums_2[24]), "f"(_shfl_xor_sync_285));
+                    sums_2[24] = _add_284;
+                    float _shfl_xor_sync_287 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 4);
+                    float _add_286;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_286) : "f"(sums_2[0]), "f"(_shfl_xor_sync_287));
+                    sums_2[0] = _add_286;
+                    float _shfl_xor_sync_289 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 4);
+                    float _add_288;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_288) : "f"(sums_2[1]), "f"(_shfl_xor_sync_289));
+                    sums_2[1] = _add_288;
+                    float _shfl_xor_sync_291 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 4);
+                    float _add_290;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_290) : "f"(sums_2[2]), "f"(_shfl_xor_sync_291));
+                    sums_2[2] = _add_290;
+                    float _shfl_xor_sync_293 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 4);
+                    float _add_292;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_292) : "f"(sums_2[3]), "f"(_shfl_xor_sync_293));
+                    sums_2[3] = _add_292;
+                    float _shfl_xor_sync_295 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 4);
+                    float _add_294;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_294) : "f"(sums_2[4]), "f"(_shfl_xor_sync_295));
+                    sums_2[4] = _add_294;
+                    float _shfl_xor_sync_297 = __shfl_xor_sync(0xFFFFFFFF, sums_2[5], 4);
+                    float _add_296;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_296) : "f"(sums_2[5]), "f"(_shfl_xor_sync_297));
+                    sums_2[5] = _add_296;
+                    float _shfl_xor_sync_299 = __shfl_xor_sync(0xFFFFFFFF, sums_2[6], 4);
+                    float _add_298;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_298) : "f"(sums_2[6]), "f"(_shfl_xor_sync_299));
+                    sums_2[6] = _add_298;
+                    float _shfl_xor_sync_301 = __shfl_xor_sync(0xFFFFFFFF, sums_2[7], 4);
+                    float _add_300;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_300) : "f"(sums_2[7]), "f"(_shfl_xor_sync_301));
+                    sums_2[7] = _add_300;
+                    float _shfl_xor_sync_303 = __shfl_xor_sync(0xFFFFFFFF, sums_2[8], 4);
+                    float _add_302;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_302) : "f"(sums_2[8]), "f"(_shfl_xor_sync_303));
+                    sums_2[8] = _add_302;
+                    float _shfl_xor_sync_305 = __shfl_xor_sync(0xFFFFFFFF, sums_2[9], 4);
+                    float _add_304;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_304) : "f"(sums_2[9]), "f"(_shfl_xor_sync_305));
+                    sums_2[9] = _add_304;
+                    float _shfl_xor_sync_307 = __shfl_xor_sync(0xFFFFFFFF, sums_2[10], 4);
+                    float _add_306;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_306) : "f"(sums_2[10]), "f"(_shfl_xor_sync_307));
+                    sums_2[10] = _add_306;
+                    float _shfl_xor_sync_309 = __shfl_xor_sync(0xFFFFFFFF, sums_2[11], 4);
+                    float _add_308;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_308) : "f"(sums_2[11]), "f"(_shfl_xor_sync_309));
+                    sums_2[11] = _add_308;
+                    float _shfl_xor_sync_311 = __shfl_xor_sync(0xFFFFFFFF, sums_2[12], 4);
+                    float _add_310;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_310) : "f"(sums_2[12]), "f"(_shfl_xor_sync_311));
+                    sums_2[12] = _add_310;
+                    float _shfl_xor_sync_313 = __shfl_xor_sync(0xFFFFFFFF, sums_2[13], 4);
+                    float _add_312;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_312) : "f"(sums_2[13]), "f"(_shfl_xor_sync_313));
+                    sums_2[13] = _add_312;
+                    float _shfl_xor_sync_315 = __shfl_xor_sync(0xFFFFFFFF, sums_2[14], 4);
+                    float _add_314;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_314) : "f"(sums_2[14]), "f"(_shfl_xor_sync_315));
+                    sums_2[14] = _add_314;
+                    float _shfl_xor_sync_317 = __shfl_xor_sync(0xFFFFFFFF, sums_2[15], 4);
+                    float _add_316;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_316) : "f"(sums_2[15]), "f"(_shfl_xor_sync_317));
+                    sums_2[15] = _add_316;
+                    float _shfl_xor_sync_319 = __shfl_xor_sync(0xFFFFFFFF, sums_2[16], 4);
+                    float _add_318;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_318) : "f"(sums_2[16]), "f"(_shfl_xor_sync_319));
+                    sums_2[16] = _add_318;
+                    float _shfl_xor_sync_321 = __shfl_xor_sync(0xFFFFFFFF, sums_2[17], 4);
+                    float _add_320;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_320) : "f"(sums_2[17]), "f"(_shfl_xor_sync_321));
+                    sums_2[17] = _add_320;
+                    float _shfl_xor_sync_323 = __shfl_xor_sync(0xFFFFFFFF, sums_2[18], 4);
+                    float _add_322;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_322) : "f"(sums_2[18]), "f"(_shfl_xor_sync_323));
+                    sums_2[18] = _add_322;
+                    float _shfl_xor_sync_325 = __shfl_xor_sync(0xFFFFFFFF, sums_2[19], 4);
+                    float _add_324;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_324) : "f"(sums_2[19]), "f"(_shfl_xor_sync_325));
+                    sums_2[19] = _add_324;
+                    float _shfl_xor_sync_327 = __shfl_xor_sync(0xFFFFFFFF, sums_2[20], 4);
+                    float _add_326;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_326) : "f"(sums_2[20]), "f"(_shfl_xor_sync_327));
+                    sums_2[20] = _add_326;
+                    float _shfl_xor_sync_329 = __shfl_xor_sync(0xFFFFFFFF, sums_2[21], 4);
+                    float _add_328;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_328) : "f"(sums_2[21]), "f"(_shfl_xor_sync_329));
+                    sums_2[21] = _add_328;
+                    float _shfl_xor_sync_331 = __shfl_xor_sync(0xFFFFFFFF, sums_2[22], 4);
+                    float _add_330;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_330) : "f"(sums_2[22]), "f"(_shfl_xor_sync_331));
+                    sums_2[22] = _add_330;
+                    float _shfl_xor_sync_333 = __shfl_xor_sync(0xFFFFFFFF, sums_2[23], 4);
+                    float _add_332;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_332) : "f"(sums_2[23]), "f"(_shfl_xor_sync_333));
+                    sums_2[23] = _add_332;
+                    float _shfl_xor_sync_335 = __shfl_xor_sync(0xFFFFFFFF, sums_2[24], 4);
+                    float _add_334;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_334) : "f"(sums_2[24]), "f"(_shfl_xor_sync_335));
+                    sums_2[24] = _add_334;
+                    float _shfl_xor_sync_337 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 8);
+                    float _add_336;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_336) : "f"(sums_2[0]), "f"(_shfl_xor_sync_337));
+                    sums_2[0] = _add_336;
+                    float _shfl_xor_sync_339 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 8);
+                    float _add_338;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_338) : "f"(sums_2[1]), "f"(_shfl_xor_sync_339));
+                    sums_2[1] = _add_338;
+                    float _shfl_xor_sync_341 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 8);
+                    float _add_340;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_340) : "f"(sums_2[2]), "f"(_shfl_xor_sync_341));
+                    sums_2[2] = _add_340;
+                    float _shfl_xor_sync_343 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 8);
+                    float _add_342;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_342) : "f"(sums_2[3]), "f"(_shfl_xor_sync_343));
+                    sums_2[3] = _add_342;
+                    float _shfl_xor_sync_345 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 8);
+                    float _add_344;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_344) : "f"(sums_2[4]), "f"(_shfl_xor_sync_345));
+                    sums_2[4] = _add_344;
+                    float _shfl_xor_sync_347 = __shfl_xor_sync(0xFFFFFFFF, sums_2[5], 8);
+                    float _add_346;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_346) : "f"(sums_2[5]), "f"(_shfl_xor_sync_347));
+                    sums_2[5] = _add_346;
+                    float _shfl_xor_sync_349 = __shfl_xor_sync(0xFFFFFFFF, sums_2[6], 8);
+                    float _add_348;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_348) : "f"(sums_2[6]), "f"(_shfl_xor_sync_349));
+                    sums_2[6] = _add_348;
+                    float _shfl_xor_sync_351 = __shfl_xor_sync(0xFFFFFFFF, sums_2[7], 8);
+                    float _add_350;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_350) : "f"(sums_2[7]), "f"(_shfl_xor_sync_351));
+                    sums_2[7] = _add_350;
+                    float _shfl_xor_sync_353 = __shfl_xor_sync(0xFFFFFFFF, sums_2[8], 8);
+                    float _add_352;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_352) : "f"(sums_2[8]), "f"(_shfl_xor_sync_353));
+                    sums_2[8] = _add_352;
+                    float _shfl_xor_sync_355 = __shfl_xor_sync(0xFFFFFFFF, sums_2[9], 8);
+                    float _add_354;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_354) : "f"(sums_2[9]), "f"(_shfl_xor_sync_355));
+                    sums_2[9] = _add_354;
+                    float _shfl_xor_sync_357 = __shfl_xor_sync(0xFFFFFFFF, sums_2[10], 8);
+                    float _add_356;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_356) : "f"(sums_2[10]), "f"(_shfl_xor_sync_357));
+                    sums_2[10] = _add_356;
+                    float _shfl_xor_sync_359 = __shfl_xor_sync(0xFFFFFFFF, sums_2[11], 8);
+                    float _add_358;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_358) : "f"(sums_2[11]), "f"(_shfl_xor_sync_359));
+                    sums_2[11] = _add_358;
+                    float _shfl_xor_sync_361 = __shfl_xor_sync(0xFFFFFFFF, sums_2[12], 8);
+                    float _add_360;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_360) : "f"(sums_2[12]), "f"(_shfl_xor_sync_361));
+                    sums_2[12] = _add_360;
+                    float _shfl_xor_sync_363 = __shfl_xor_sync(0xFFFFFFFF, sums_2[13], 8);
+                    float _add_362;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_362) : "f"(sums_2[13]), "f"(_shfl_xor_sync_363));
+                    sums_2[13] = _add_362;
+                    float _shfl_xor_sync_365 = __shfl_xor_sync(0xFFFFFFFF, sums_2[14], 8);
+                    float _add_364;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_364) : "f"(sums_2[14]), "f"(_shfl_xor_sync_365));
+                    sums_2[14] = _add_364;
+                    float _shfl_xor_sync_367 = __shfl_xor_sync(0xFFFFFFFF, sums_2[15], 8);
+                    float _add_366;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_366) : "f"(sums_2[15]), "f"(_shfl_xor_sync_367));
+                    sums_2[15] = _add_366;
+                    float _shfl_xor_sync_369 = __shfl_xor_sync(0xFFFFFFFF, sums_2[16], 8);
+                    float _add_368;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_368) : "f"(sums_2[16]), "f"(_shfl_xor_sync_369));
+                    sums_2[16] = _add_368;
+                    float _shfl_xor_sync_371 = __shfl_xor_sync(0xFFFFFFFF, sums_2[17], 8);
+                    float _add_370;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_370) : "f"(sums_2[17]), "f"(_shfl_xor_sync_371));
+                    sums_2[17] = _add_370;
+                    float _shfl_xor_sync_373 = __shfl_xor_sync(0xFFFFFFFF, sums_2[18], 8);
+                    float _add_372;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_372) : "f"(sums_2[18]), "f"(_shfl_xor_sync_373));
+                    sums_2[18] = _add_372;
+                    float _shfl_xor_sync_375 = __shfl_xor_sync(0xFFFFFFFF, sums_2[19], 8);
+                    float _add_374;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_374) : "f"(sums_2[19]), "f"(_shfl_xor_sync_375));
+                    sums_2[19] = _add_374;
+                    float _shfl_xor_sync_377 = __shfl_xor_sync(0xFFFFFFFF, sums_2[20], 8);
+                    float _add_376;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_376) : "f"(sums_2[20]), "f"(_shfl_xor_sync_377));
+                    sums_2[20] = _add_376;
+                    float _shfl_xor_sync_379 = __shfl_xor_sync(0xFFFFFFFF, sums_2[21], 8);
+                    float _add_378;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_378) : "f"(sums_2[21]), "f"(_shfl_xor_sync_379));
+                    sums_2[21] = _add_378;
+                    float _shfl_xor_sync_381 = __shfl_xor_sync(0xFFFFFFFF, sums_2[22], 8);
+                    float _add_380;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_380) : "f"(sums_2[22]), "f"(_shfl_xor_sync_381));
+                    sums_2[22] = _add_380;
+                    float _shfl_xor_sync_383 = __shfl_xor_sync(0xFFFFFFFF, sums_2[23], 8);
+                    float _add_382;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_382) : "f"(sums_2[23]), "f"(_shfl_xor_sync_383));
+                    sums_2[23] = _add_382;
+                    float _shfl_xor_sync_385 = __shfl_xor_sync(0xFFFFFFFF, sums_2[24], 8);
+                    float _add_384;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_384) : "f"(sums_2[24]), "f"(_shfl_xor_sync_385));
+                    sums_2[24] = _add_384;
+                    float _shfl_xor_sync_387 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 16);
+                    float _add_386;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_386) : "f"(sums_2[0]), "f"(_shfl_xor_sync_387));
+                    sums_2[0] = _add_386;
+                    float _shfl_xor_sync_389 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 16);
+                    float _add_388;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_388) : "f"(sums_2[1]), "f"(_shfl_xor_sync_389));
+                    sums_2[1] = _add_388;
+                    float _shfl_xor_sync_391 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 16);
+                    float _add_390;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_390) : "f"(sums_2[2]), "f"(_shfl_xor_sync_391));
+                    sums_2[2] = _add_390;
+                    float _shfl_xor_sync_393 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 16);
+                    float _add_392;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_392) : "f"(sums_2[3]), "f"(_shfl_xor_sync_393));
+                    sums_2[3] = _add_392;
+                    float _shfl_xor_sync_395 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 16);
+                    float _add_394;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_394) : "f"(sums_2[4]), "f"(_shfl_xor_sync_395));
+                    sums_2[4] = _add_394;
+                    float _shfl_xor_sync_397 = __shfl_xor_sync(0xFFFFFFFF, sums_2[5], 16);
+                    float _add_396;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_396) : "f"(sums_2[5]), "f"(_shfl_xor_sync_397));
+                    sums_2[5] = _add_396;
+                    float _shfl_xor_sync_399 = __shfl_xor_sync(0xFFFFFFFF, sums_2[6], 16);
+                    float _add_398;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_398) : "f"(sums_2[6]), "f"(_shfl_xor_sync_399));
+                    sums_2[6] = _add_398;
+                    float _shfl_xor_sync_401 = __shfl_xor_sync(0xFFFFFFFF, sums_2[7], 16);
+                    float _add_400;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_400) : "f"(sums_2[7]), "f"(_shfl_xor_sync_401));
+                    sums_2[7] = _add_400;
+                    float _shfl_xor_sync_403 = __shfl_xor_sync(0xFFFFFFFF, sums_2[8], 16);
+                    float _add_402;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_402) : "f"(sums_2[8]), "f"(_shfl_xor_sync_403));
+                    sums_2[8] = _add_402;
+                    float _shfl_xor_sync_405 = __shfl_xor_sync(0xFFFFFFFF, sums_2[9], 16);
+                    float _add_404;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_404) : "f"(sums_2[9]), "f"(_shfl_xor_sync_405));
+                    sums_2[9] = _add_404;
+                    float _shfl_xor_sync_407 = __shfl_xor_sync(0xFFFFFFFF, sums_2[10], 16);
+                    float _add_406;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_406) : "f"(sums_2[10]), "f"(_shfl_xor_sync_407));
+                    sums_2[10] = _add_406;
+                    float _shfl_xor_sync_409 = __shfl_xor_sync(0xFFFFFFFF, sums_2[11], 16);
+                    float _add_408;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_408) : "f"(sums_2[11]), "f"(_shfl_xor_sync_409));
+                    sums_2[11] = _add_408;
+                    float _shfl_xor_sync_411 = __shfl_xor_sync(0xFFFFFFFF, sums_2[12], 16);
+                    float _add_410;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_410) : "f"(sums_2[12]), "f"(_shfl_xor_sync_411));
+                    sums_2[12] = _add_410;
+                    float _shfl_xor_sync_413 = __shfl_xor_sync(0xFFFFFFFF, sums_2[13], 16);
+                    float _add_412;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_412) : "f"(sums_2[13]), "f"(_shfl_xor_sync_413));
+                    sums_2[13] = _add_412;
+                    float _shfl_xor_sync_415 = __shfl_xor_sync(0xFFFFFFFF, sums_2[14], 16);
+                    float _add_414;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_414) : "f"(sums_2[14]), "f"(_shfl_xor_sync_415));
+                    sums_2[14] = _add_414;
+                    float _shfl_xor_sync_417 = __shfl_xor_sync(0xFFFFFFFF, sums_2[15], 16);
+                    float _add_416;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_416) : "f"(sums_2[15]), "f"(_shfl_xor_sync_417));
+                    sums_2[15] = _add_416;
+                    float _shfl_xor_sync_419 = __shfl_xor_sync(0xFFFFFFFF, sums_2[16], 16);
+                    float _add_418;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_418) : "f"(sums_2[16]), "f"(_shfl_xor_sync_419));
+                    sums_2[16] = _add_418;
+                    float _shfl_xor_sync_421 = __shfl_xor_sync(0xFFFFFFFF, sums_2[17], 16);
+                    float _add_420;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_420) : "f"(sums_2[17]), "f"(_shfl_xor_sync_421));
+                    sums_2[17] = _add_420;
+                    float _shfl_xor_sync_423 = __shfl_xor_sync(0xFFFFFFFF, sums_2[18], 16);
+                    float _add_422;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_422) : "f"(sums_2[18]), "f"(_shfl_xor_sync_423));
+                    sums_2[18] = _add_422;
+                    float _shfl_xor_sync_425 = __shfl_xor_sync(0xFFFFFFFF, sums_2[19], 16);
+                    float _add_424;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_424) : "f"(sums_2[19]), "f"(_shfl_xor_sync_425));
+                    sums_2[19] = _add_424;
+                    float _shfl_xor_sync_427 = __shfl_xor_sync(0xFFFFFFFF, sums_2[20], 16);
+                    float _add_426;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_426) : "f"(sums_2[20]), "f"(_shfl_xor_sync_427));
+                    sums_2[20] = _add_426;
+                    float _shfl_xor_sync_429 = __shfl_xor_sync(0xFFFFFFFF, sums_2[21], 16);
+                    float _add_428;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_428) : "f"(sums_2[21]), "f"(_shfl_xor_sync_429));
+                    sums_2[21] = _add_428;
+                    float _shfl_xor_sync_431 = __shfl_xor_sync(0xFFFFFFFF, sums_2[22], 16);
+                    float _add_430;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_430) : "f"(sums_2[22]), "f"(_shfl_xor_sync_431));
+                    sums_2[22] = _add_430;
+                    float _shfl_xor_sync_433 = __shfl_xor_sync(0xFFFFFFFF, sums_2[23], 16);
+                    float _add_432;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_432) : "f"(sums_2[23]), "f"(_shfl_xor_sync_433));
+                    sums_2[23] = _add_432;
+                    float _shfl_xor_sync_435 = __shfl_xor_sync(0xFFFFFFFF, sums_2[24], 16);
+                    float _add_434;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_434) : "f"(sums_2[24]), "f"(_shfl_xor_sync_435));
+                    sums_2[24] = _add_434;
+                    float s_52 = 0.0f;
+                    s_52 = ((lane_in_warp == 0) ? sums_2[0] : s_52);
+                    s_52 = ((lane_in_warp == 1) ? sums_2[1] : s_52);
+                    s_52 = ((lane_in_warp == 2) ? sums_2[2] : s_52);
+                    s_52 = ((lane_in_warp == 3) ? sums_2[3] : s_52);
+                    s_52 = ((lane_in_warp == 4) ? sums_2[4] : s_52);
+                    s_52 = ((lane_in_warp == 5) ? sums_2[5] : s_52);
+                    s_52 = ((lane_in_warp == 6) ? sums_2[6] : s_52);
+                    s_52 = ((lane_in_warp == 7) ? sums_2[7] : s_52);
+                    s_52 = ((lane_in_warp == 8) ? sums_2[8] : s_52);
+                    s_52 = ((lane_in_warp == 9) ? sums_2[9] : s_52);
+                    s_52 = ((lane_in_warp == 10) ? sums_2[10] : s_52);
+                    s_52 = ((lane_in_warp == 11) ? sums_2[11] : s_52);
+                    s_52 = ((lane_in_warp == 12) ? sums_2[12] : s_52);
+                    s_52 = ((lane_in_warp == 13) ? sums_2[13] : s_52);
+                    s_52 = ((lane_in_warp == 14) ? sums_2[14] : s_52);
+                    s_52 = ((lane_in_warp == 15) ? sums_2[15] : s_52);
+                    s_52 = ((lane_in_warp == 16) ? sums_2[16] : s_52);
+                    s_52 = ((lane_in_warp == 17) ? sums_2[17] : s_52);
+                    s_52 = ((lane_in_warp == 18) ? sums_2[18] : s_52);
+                    s_52 = ((lane_in_warp == 19) ? sums_2[19] : s_52);
+                    s_52 = ((lane_in_warp == 20) ? sums_2[20] : s_52);
+                    s_52 = ((lane_in_warp == 21) ? sums_2[21] : s_52);
+                    s_52 = ((lane_in_warp == 22) ? sums_2[22] : s_52);
+                    s_52 = ((lane_in_warp == 23) ? sums_2[23] : s_52);
+                    float q_53 = sums_2[24];
+                    s = s_52;
+                    q = q_53;
 #else
                     s = s_0;
                     q = q_1;
 #endif
                 }
-#if __CUDA_ARCH__ == 1070
-                __syncwarp();
-#else
                 if (flag == 0) {
+#if __CUDA_ARCH__ == 1070
+                    float _fma_437;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_437) : "f"(q), "f"(6.1035156e-05f), "f"(hc_norm_eps));
+                    float _sqrt_436;
+                    asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_436) : "f"(_fma_437));
+                    float r = __frcp_rn(_sqrt_436);
+#else
                     float _fma_1273;
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_1273) : "f"(q), "f"(6.1035156e-05f), "f"(hc_norm_eps));
                     float _sqrt_1272;
                     asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_1272) : "f"(_fma_1273));
                     float r = __frcp_rn(_sqrt_1272);
+#endif
                     float z;
                     asm("mul.rn.f32 %0, %1, %2;" : "=f"(z) : "f"(r), "f"(s));
                     float a_map;
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(a_map) : "f"(z), "f"(sc), "f"(bs));
                     float a = ((lane_in_warp < 24) ? a_map : 0.0f);
+#if __CUDA_ARCH__ == 1070
+                    float _sub_438;
+                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_438) : "f"(0.0f), "f"(fabsf(a)));
+                    float _exp_0 = __nv_expf(_sub_438);
+                    float _add_36;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_36) : "f"(1.0f), "f"(_exp_0));
+                    float _fdiv_rn_0 = __fdiv_rn(1.0f, _add_36);
+                    float _fdiv_rn_1 = __fdiv_rn(_exp_0, _add_36);
+#else
                     float _sub_1274;
                     asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1274) : "f"(0.0f), "f"(fabsf(a)));
                     float _exp_0 = __nv_expf(_sub_1274);
@@ -9456,13 +9618,37 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_48_1) : "f"(1.0f), "f"(_exp_0));
                     float _fdiv_rn_0 = __fdiv_rn(1.0f, _add_48_1);
                     float _fdiv_rn_1 = __fdiv_rn(_exp_0, _add_48_1);
+#endif
                     float sig = ((a >= 0.0f) ? _fdiv_rn_0 : _fdiv_rn_1);
                     float sneg = ((a >= 0.0f) ? _fdiv_rn_1 : _fdiv_rn_0);
+#if __CUDA_ARCH__ == 1070
+                    float _add_37_1;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37_1) : "f"(sig), "f"(hc_pre_eps));
+#else
                     float _add_49_1;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_49_1) : "f"(sig), "f"(hc_pre_eps));
+#endif
                     float _mul_0;
                     asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(hc_post_scale), "f"(sig));
                     float logit = ((lane_in_warp >= 8 && lane_in_warp < 24) ? a : 0.0f);
+#if __CUDA_ARCH__ == 1070
+                    float _shfl_xor_sync_440 = __shfl_xor_sync(0xFFFFFFFF, logit, 1);
+                    float _shfl_xor_sync_441 = __shfl_xor_sync(0xFFFFFFFF, logit, 2);
+                    float _shfl_xor_sync_442 = __shfl_xor_sync(0xFFFFFFFF, logit, 3);
+                    float _sub_439;
+                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_439) : "f"(logit), "f"(fmaxf(fmaxf(logit, _shfl_xor_sync_440), fmaxf(_shfl_xor_sync_441, _shfl_xor_sync_442))));
+                    float _exp_1 = __nv_expf(_sub_439);
+                    float _shfl_xor_sync_446 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 1);
+                    float _add_445;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_445) : "f"(_exp_1), "f"(_shfl_xor_sync_446));
+                    float _shfl_xor_sync_448 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 2);
+                    float _shfl_xor_sync_449 = __shfl_xor_sync(0xFFFFFFFF, _exp_1, 3);
+                    float _add_447;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_447) : "f"(_shfl_xor_sync_448), "f"(_shfl_xor_sync_449));
+                    float _add_444;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_444) : "f"(_add_445), "f"(_add_447));
+                    float _fdiv_443 = __fdiv_rn(_exp_1, _add_444);
+#else
                     float _shfl_xor_sync_1276 = __shfl_xor_sync(0xFFFFFFFF, logit, 1);
                     float _shfl_xor_sync_1277 = __shfl_xor_sync(0xFFFFFFFF, logit, 2);
                     float _shfl_xor_sync_1278 = __shfl_xor_sync(0xFFFFFFFF, logit, 3);
@@ -9479,7 +9665,24 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     float _add_1280;
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1280) : "f"(_add_1281), "f"(_add_1283));
                     float _fdiv_1279 = __fdiv_rn(_exp_1, _add_1280);
+#endif
                     float C;
+#if __CUDA_ARCH__ == 1070
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(C) : "f"(_fdiv_443), "f"(sinkhorn_eps));
+                    float _shfl_xor_sync_454 = __shfl_xor_sync(0xFFFFFFFF, C, 4);
+                    float _add_453;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_453) : "f"(C), "f"(_shfl_xor_sync_454));
+                    float _shfl_xor_sync_456 = __shfl_xor_sync(0xFFFFFFFF, C, 24);
+                    float _shfl_xor_sync_457 = __shfl_xor_sync(0xFFFFFFFF, C, 28);
+                    float _add_455;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_455) : "f"(_shfl_xor_sync_456), "f"(_shfl_xor_sync_457));
+                    float _add_452;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_452) : "f"(_add_453), "f"(_add_455));
+                    float _add_451;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_451) : "f"(_add_452), "f"(sinkhorn_eps));
+                    float _fdiv_450 = __fdiv_rn(C, _add_451);
+                    C = _fdiv_450;
+#else
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(C) : "f"(_fdiv_1279), "f"(sinkhorn_eps));
                     float _shfl_xor_sync_1290 = __shfl_xor_sync(0xFFFFFFFF, C, 4);
                     float _add_1289;
@@ -9494,8 +9697,37 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1287) : "f"(_add_1288), "f"(sinkhorn_eps));
                     float _fdiv_1286 = __fdiv_rn(C, _add_1287);
                     C = _fdiv_1286;
+#endif
                     #pragma unroll 1
                     for (unsigned int iteration = 1; iteration < num_sinkhorn_iters; iteration++) {
+#if __CUDA_ARCH__ == 1070
+                        float _shfl_xor_sync_462 = __shfl_xor_sync(0xFFFFFFFF, C, 1);
+                        float _add_461;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_461) : "f"(C), "f"(_shfl_xor_sync_462));
+                        float _shfl_xor_sync_464 = __shfl_xor_sync(0xFFFFFFFF, C, 2);
+                        float _shfl_xor_sync_465 = __shfl_xor_sync(0xFFFFFFFF, C, 3);
+                        float _add_463;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_463) : "f"(_shfl_xor_sync_464), "f"(_shfl_xor_sync_465));
+                        float _add_460;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_460) : "f"(_add_461), "f"(_add_463));
+                        float _add_459;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_459) : "f"(_add_460), "f"(sinkhorn_eps));
+                        float _fdiv_458 = __fdiv_rn(C, _add_459);
+                        C = _fdiv_458;
+                        float _shfl_xor_sync_470 = __shfl_xor_sync(0xFFFFFFFF, C, 4);
+                        float _add_469;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_469) : "f"(C), "f"(_shfl_xor_sync_470));
+                        float _shfl_xor_sync_472 = __shfl_xor_sync(0xFFFFFFFF, C, 24);
+                        float _shfl_xor_sync_473 = __shfl_xor_sync(0xFFFFFFFF, C, 28);
+                        float _add_471;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_471) : "f"(_shfl_xor_sync_472), "f"(_shfl_xor_sync_473));
+                        float _add_468;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_468) : "f"(_add_469), "f"(_add_471));
+                        float _add_467;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_467) : "f"(_add_468), "f"(sinkhorn_eps));
+                        float _fdiv_466 = __fdiv_rn(C, _add_467);
+                        C = _fdiv_466;
+#else
                         float _shfl_xor_sync_1298 = __shfl_xor_sync(0xFFFFFFFF, C, 1);
                         float _add_1297;
                         asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1297) : "f"(C), "f"(_shfl_xor_sync_1298));
@@ -9522,6 +9754,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1303) : "f"(_add_1304), "f"(sinkhorn_eps));
                         float _fdiv_1302 = __fdiv_rn(C, _add_1303);
                         C = _fdiv_1302;
+#endif
                     }
                     if (lane_in_warp >= 8) {
                         if (lane_in_warp < 24) {
@@ -9532,7 +9765,6 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     }
                     __syncwarp();
                 }
-#endif
             }
         }
     }
@@ -9554,20 +9786,12 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 ticket = (unsigned int)bid + _atomic_fetch_add_0 * num_ctas;
                 if (ticket >= local_tokens) {
                     ticket = (unsigned int)num_tokens;
-#if __CUDA_ARCH__ == 1070
-                    unsigned int _atomic_fetch_add_1 = atomicAdd(&exhausted[shard], 0);
-#else
                     unsigned int _atomic_fetch_add_1 = atomicAdd(&exhausted[0], 0);
-#endif
                     if (_atomic_fetch_add_1 == 0) {
                         unsigned int _atomic_fetch_add_2 = atomicAdd(reinterpret_cast<unsigned int*>(split_barriers + (((unsigned long long)(unsigned int)(launch_epochs[bid] % 2) * 16 + (unsigned long long)shard) * 16)), 1);
                         ticket = local_tokens + _atomic_fetch_add_2 * 16 + shard;
                         if (ticket >= num_tokens) {
-#if __CUDA_ARCH__ == 1070
-                            atomicMax(&exhausted[shard], 1);
-#else
                             atomicMax(&exhausted[0], 1);
-#endif
                         }
                     }
                 }
@@ -9590,19 +9814,19 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(target_1)) >= static_cast<unsigned long long>(1));
                 }
 #if __CUDA_ARCH__ == 1070
-                unsigned int row_12 = token_1 % 64;
-                unsigned int first_task_2 = mb_2 * num_splits;
-                float sums_2[5];
-                unsigned int split_2 = lane_in_warp * 2;
-                unsigned int safe_split_2 = ((split_2 < num_splits) ? split_2 : 0);
-                unsigned long long record_2 = ((unsigned long long)first_task_2 + (unsigned long long)safe_split_2) * 1536 + (unsigned long long)(row_12 * 24);
-                float _vec_load_24[4];
+                unsigned int row_14 = token_1 % 64;
+                unsigned int first_task_3 = mb_2 * num_splits;
+                float sums_3[5];
+                unsigned int split_3 = lane_in_warp * 2;
+                unsigned int safe_split_3 = ((split_3 < num_splits) ? split_3 : 0);
+                unsigned long long record_3 = ((unsigned long long)first_task_3 + (unsigned long long)safe_split_3) * 1536 + (unsigned long long)(row_14 * 24);
+                float _vec_load_30[4];
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_2 + 0);
-                    _vec_load_24[0 + 0] = _v4.x;
-                    _vec_load_24[0 + 1] = _v4.y;
-                    _vec_load_24[0 + 2] = _v4.z;
-                    _vec_load_24[0 + 3] = _v4.w;
+                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_3 + 0);
+                    _vec_load_30[0 + 0] = _v4.x;
+                    _vec_load_30[0 + 1] = _v4.y;
+                    _vec_load_30[0 + 2] = _v4.z;
+                    _vec_load_30[0 + 3] = _v4.w;
 #else
                 float s_2 = 0.0f;
                 float q_3 = 0.0f;
@@ -10406,155 +10630,155 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
 #endif
                 }
 #if __CUDA_ARCH__ == 1070
-                float value_24 = ((split_2 < num_splits) ? _vec_load_24[0] : 0.0f);
-                sums_2[0] = value_24;
-                float value_0_2 = ((split_2 < num_splits) ? _vec_load_24[1] : 0.0f);
-                sums_2[1] = value_0_2;
-                float value_1_3 = ((split_2 < num_splits) ? _vec_load_24[2] : 0.0f);
-                sums_2[2] = value_1_3;
-                float value_2_2 = ((split_2 < num_splits) ? _vec_load_24[3] : 0.0f);
-                sums_2[3] = value_2_2;
-                float q_word_2 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_2 * 64 + (unsigned long long)(safe_split_2 * 64) + (unsigned long long)row_12];
-                float q_value_2 = ((split_2 < num_splits) ? q_word_2 : 0.0f);
-                sums_2[4] = q_value_2;
-                unsigned int split_3 = lane_in_warp * 2 + 1;
-                unsigned int safe_split_4 = ((split_3 < num_splits) ? split_3 : 0);
-                unsigned long long record_5 = ((unsigned long long)first_task_2 + (unsigned long long)safe_split_4) * 1536 + (unsigned long long)(row_12 * 24);
-                float _vec_load_25[4];
+                float value_51 = ((split_3 < num_splits) ? _vec_load_30[0] : 0.0f);
+                sums_3[0] = value_51;
+                float value_0_3 = ((split_3 < num_splits) ? _vec_load_30[1] : 0.0f);
+                sums_3[1] = value_0_3;
+                float value_1_4 = ((split_3 < num_splits) ? _vec_load_30[2] : 0.0f);
+                sums_3[2] = value_1_4;
+                float value_2_3 = ((split_3 < num_splits) ? _vec_load_30[3] : 0.0f);
+                sums_3[3] = value_2_3;
+                float q_word_3 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_3 * 64 + (unsigned long long)(safe_split_3 * 64) + (unsigned long long)row_14];
+                float q_value_3 = ((split_3 < num_splits) ? q_word_3 : 0.0f);
+                sums_3[4] = q_value_3;
+                unsigned int split_3_1 = lane_in_warp * 2 + 1;
+                unsigned int safe_split_4 = ((split_3_1 < num_splits) ? split_3_1 : 0);
+                unsigned long long record_5 = ((unsigned long long)first_task_3 + (unsigned long long)safe_split_4) * 1536 + (unsigned long long)(row_14 * 24);
+                float _vec_load_31[4];
                 {
                     float4 _v4 = *reinterpret_cast<const float4*>(scratch + record_5 + 0);
-                    _vec_load_25[0 + 0] = _v4.x;
-                    _vec_load_25[0 + 1] = _v4.y;
-                    _vec_load_25[0 + 2] = _v4.z;
-                    _vec_load_25[0 + 3] = _v4.w;
+                    _vec_load_31[0 + 0] = _v4.x;
+                    _vec_load_31[0 + 1] = _v4.y;
+                    _vec_load_31[0 + 2] = _v4.z;
+                    _vec_load_31[0 + 3] = _v4.w;
                 }
-                float value_6_2 = ((split_3 < num_splits) ? _vec_load_25[0] : 0.0f);
-                float _add_6_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6_1) : "f"(sums_2[0]), "f"(value_6_2));
-                sums_2[0] = _add_6_1;
-                float value_7_2 = ((split_3 < num_splits) ? _vec_load_25[1] : 0.0f);
+                float value_6_3 = ((split_3_1 < num_splits) ? _vec_load_31[0] : 0.0f);
+                float _add_6_2;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6_2) : "f"(sums_3[0]), "f"(value_6_3));
+                sums_3[0] = _add_6_2;
+                float value_7_3 = ((split_3_1 < num_splits) ? _vec_load_31[1] : 0.0f);
                 float _add_7_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7_2) : "f"(sums_2[1]), "f"(value_7_2));
-                sums_2[1] = _add_7_2;
-                float value_8_3 = ((split_3 < num_splits) ? _vec_load_25[2] : 0.0f);
-                float _add_8_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8_2) : "f"(sums_2[2]), "f"(value_8_3));
-                sums_2[2] = _add_8_2;
-                float value_9_2 = ((split_3 < num_splits) ? _vec_load_25[3] : 0.0f);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7_2) : "f"(sums_3[1]), "f"(value_7_3));
+                sums_3[1] = _add_7_2;
+                float value_8_4 = ((split_3_1 < num_splits) ? _vec_load_31[2] : 0.0f);
+                float _add_8_1;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8_1) : "f"(sums_3[2]), "f"(value_8_4));
+                sums_3[2] = _add_8_1;
+                float value_9_3 = ((split_3_1 < num_splits) ? _vec_load_31[3] : 0.0f);
                 float _add_9_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9_2) : "f"(sums_2[3]), "f"(value_9_2));
-                sums_2[3] = _add_9_2;
-                float q_word_10 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_2 * 64 + (unsigned long long)(safe_split_4 * 64) + (unsigned long long)row_12];
-                float q_value_11 = ((split_3 < num_splits) ? q_word_10 : 0.0f);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9_2) : "f"(sums_3[3]), "f"(value_9_3));
+                sums_3[3] = _add_9_2;
+                float q_word_10 = scratch[(unsigned long long)((num_tokens + 63) / 64 * num_splits) * 1536 + (unsigned long long)first_task_3 * 64 + (unsigned long long)(safe_split_4 * 64) + (unsigned long long)row_14];
+                float q_value_11 = ((split_3_1 < num_splits) ? q_word_10 : 0.0f);
                 float _add_10_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10_2) : "f"(sums_2[4]), "f"(q_value_11));
-                sums_2[4] = _add_10_2;
-                float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 1);
-                float _add_11_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11_2) : "f"(sums_2[0]), "f"(_shfl_xor_sync_12));
-                sums_2[0] = _add_11_2;
-                float _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 1);
-                float _add_13_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13_2) : "f"(sums_2[1]), "f"(_shfl_xor_sync_14));
-                sums_2[1] = _add_13_2;
-                float _shfl_xor_sync_16 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 1);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10_2) : "f"(sums_3[4]), "f"(q_value_11));
+                sums_3[4] = _add_10_2;
+                float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, sums_3[0], 1);
+                float _add_11_3;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11_3) : "f"(sums_3[0]), "f"(_shfl_xor_sync_12));
+                sums_3[0] = _add_11_3;
+                float _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, sums_3[1], 1);
+                float _add_13_1;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13_1) : "f"(sums_3[1]), "f"(_shfl_xor_sync_14));
+                sums_3[1] = _add_13_1;
+                float _shfl_xor_sync_16 = __shfl_xor_sync(0xFFFFFFFF, sums_3[2], 1);
                 float _add_15_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15_2) : "f"(sums_2[2]), "f"(_shfl_xor_sync_16));
-                sums_2[2] = _add_15_2;
-                float _shfl_xor_sync_18 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 1);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15_2) : "f"(sums_3[2]), "f"(_shfl_xor_sync_16));
+                sums_3[2] = _add_15_2;
+                float _shfl_xor_sync_18 = __shfl_xor_sync(0xFFFFFFFF, sums_3[3], 1);
                 float _add_17_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17_2) : "f"(sums_2[3]), "f"(_shfl_xor_sync_18));
-                sums_2[3] = _add_17_2;
-                float _shfl_xor_sync_20 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 1);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17_2) : "f"(sums_3[3]), "f"(_shfl_xor_sync_18));
+                sums_3[3] = _add_17_2;
+                float _shfl_xor_sync_20_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[4], 1);
                 float _add_19_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19_2) : "f"(sums_2[4]), "f"(_shfl_xor_sync_20));
-                sums_2[4] = _add_19_2;
-                float _shfl_xor_sync_22 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 2);
-                float _add_21_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21_1) : "f"(sums_2[0]), "f"(_shfl_xor_sync_22));
-                sums_2[0] = _add_21_1;
-                float _shfl_xor_sync_24 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 2);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19_2) : "f"(sums_3[4]), "f"(_shfl_xor_sync_20_1));
+                sums_3[4] = _add_19_2;
+                float _shfl_xor_sync_22_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[0], 2);
+                float _add_21_2;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21_2) : "f"(sums_3[0]), "f"(_shfl_xor_sync_22_1));
+                sums_3[0] = _add_21_2;
+                float _shfl_xor_sync_24_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[1], 2);
                 float _add_23_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23_2) : "f"(sums_2[1]), "f"(_shfl_xor_sync_24));
-                sums_2[1] = _add_23_2;
-                float _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 2);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23_2) : "f"(sums_3[1]), "f"(_shfl_xor_sync_24_1));
+                sums_3[1] = _add_23_2;
+                float _shfl_xor_sync_26_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[2], 2);
                 float _add_25_3;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25_3) : "f"(sums_2[2]), "f"(_shfl_xor_sync_26));
-                sums_2[2] = _add_25_3;
-                float _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 2);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25_3) : "f"(sums_3[2]), "f"(_shfl_xor_sync_26_1));
+                sums_3[2] = _add_25_3;
+                float _shfl_xor_sync_28_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[3], 2);
                 float _add_27_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27_2) : "f"(sums_2[3]), "f"(_shfl_xor_sync_28));
-                sums_2[3] = _add_27_2;
-                float _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 2);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27_2) : "f"(sums_3[3]), "f"(_shfl_xor_sync_28_1));
+                sums_3[3] = _add_27_2;
+                float _shfl_xor_sync_30_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[4], 2);
                 float _add_29_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29_2) : "f"(sums_2[4]), "f"(_shfl_xor_sync_30));
-                sums_2[4] = _add_29_2;
-                float _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 4);
-                float _add_31_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_31_1) : "f"(sums_2[0]), "f"(_shfl_xor_sync_32));
-                sums_2[0] = _add_31_1;
-                float _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 4);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29_2) : "f"(sums_3[4]), "f"(_shfl_xor_sync_30_1));
+                sums_3[4] = _add_29_2;
+                float _shfl_xor_sync_32_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[0], 4);
+                float _add_31_2;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_31_2) : "f"(sums_3[0]), "f"(_shfl_xor_sync_32_1));
+                sums_3[0] = _add_31_2;
+                float _shfl_xor_sync_34_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[1], 4);
                 float _add_33_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33_2) : "f"(sums_2[1]), "f"(_shfl_xor_sync_34));
-                sums_2[1] = _add_33_2;
-                float _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 4);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33_2) : "f"(sums_3[1]), "f"(_shfl_xor_sync_34_1));
+                sums_3[1] = _add_33_2;
+                float _shfl_xor_sync_36_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[2], 4);
                 float _add_35_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35_2) : "f"(sums_2[2]), "f"(_shfl_xor_sync_36));
-                sums_2[2] = _add_35_2;
-                float _shfl_xor_sync_38_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 4);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35_2) : "f"(sums_3[2]), "f"(_shfl_xor_sync_36_1));
+                sums_3[2] = _add_35_2;
+                float _shfl_xor_sync_38_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[3], 4);
                 float _add_37_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37_2) : "f"(sums_2[3]), "f"(_shfl_xor_sync_38_1));
-                sums_2[3] = _add_37_2;
-                float _shfl_xor_sync_40_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 4);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37_2) : "f"(sums_3[3]), "f"(_shfl_xor_sync_38_1));
+                sums_3[3] = _add_37_2;
+                float _shfl_xor_sync_40_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[4], 4);
                 float _add_39_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_39_2) : "f"(sums_2[4]), "f"(_shfl_xor_sync_40_1));
-                sums_2[4] = _add_39_2;
-                float _shfl_xor_sync_42_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 8);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_39_2) : "f"(sums_3[4]), "f"(_shfl_xor_sync_40_1));
+                sums_3[4] = _add_39_2;
+                float _shfl_xor_sync_42_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[0], 8);
                 float _add_41_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_41_1) : "f"(sums_2[0]), "f"(_shfl_xor_sync_42_1));
-                sums_2[0] = _add_41_1;
-                float _shfl_xor_sync_44_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 8);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_41_1) : "f"(sums_3[0]), "f"(_shfl_xor_sync_42_1));
+                sums_3[0] = _add_41_1;
+                float _shfl_xor_sync_44_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[1], 8);
                 float _add_43_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_43_1) : "f"(sums_2[1]), "f"(_shfl_xor_sync_44_1));
-                sums_2[1] = _add_43_1;
-                float _shfl_xor_sync_46_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 8);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_43_1) : "f"(sums_3[1]), "f"(_shfl_xor_sync_44_1));
+                sums_3[1] = _add_43_1;
+                float _shfl_xor_sync_46_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[2], 8);
                 float _add_45_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_45_1) : "f"(sums_2[2]), "f"(_shfl_xor_sync_46_1));
-                sums_2[2] = _add_45_1;
-                float _shfl_xor_sync_48_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 8);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_45_1) : "f"(sums_3[2]), "f"(_shfl_xor_sync_46_1));
+                sums_3[2] = _add_45_1;
+                float _shfl_xor_sync_48_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[3], 8);
                 float _add_47_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47_1) : "f"(sums_2[3]), "f"(_shfl_xor_sync_48_1));
-                sums_2[3] = _add_47_1;
-                float _shfl_xor_sync_50_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 8);
-                float _add_49_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_49_1) : "f"(sums_2[4]), "f"(_shfl_xor_sync_50_1));
-                sums_2[4] = _add_49_1;
-                float _shfl_xor_sync_52_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[0], 16);
-                float _add_51_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_51_1) : "f"(sums_2[0]), "f"(_shfl_xor_sync_52_1));
-                sums_2[0] = _add_51_1;
-                float _shfl_xor_sync_54_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[1], 16);
-                float _add_53_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_53_2) : "f"(sums_2[1]), "f"(_shfl_xor_sync_54_1));
-                sums_2[1] = _add_53_2;
-                float _shfl_xor_sync_56_2 = __shfl_xor_sync(0xFFFFFFFF, sums_2[2], 16);
-                float _add_55_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_55_1) : "f"(sums_2[2]), "f"(_shfl_xor_sync_56_2));
-                sums_2[2] = _add_55_1;
-                float _shfl_xor_sync_58_2 = __shfl_xor_sync(0xFFFFFFFF, sums_2[3], 16);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_47_1) : "f"(sums_3[3]), "f"(_shfl_xor_sync_48_1));
+                sums_3[3] = _add_47_1;
+                float _shfl_xor_sync_50 = __shfl_xor_sync(0xFFFFFFFF, sums_3[4], 8);
+                float _add_49;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_49) : "f"(sums_3[4]), "f"(_shfl_xor_sync_50));
+                sums_3[4] = _add_49;
+                float _shfl_xor_sync_52 = __shfl_xor_sync(0xFFFFFFFF, sums_3[0], 16);
+                float _add_51;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_51) : "f"(sums_3[0]), "f"(_shfl_xor_sync_52));
+                sums_3[0] = _add_51;
+                float _shfl_xor_sync_54 = __shfl_xor_sync(0xFFFFFFFF, sums_3[1], 16);
+                float _add_53_1;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_53_1) : "f"(sums_3[1]), "f"(_shfl_xor_sync_54));
+                sums_3[1] = _add_53_1;
+                float _shfl_xor_sync_56_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[2], 16);
+                float _add_55;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_55) : "f"(sums_3[2]), "f"(_shfl_xor_sync_56_1));
+                sums_3[2] = _add_55;
+                float _shfl_xor_sync_58_1 = __shfl_xor_sync(0xFFFFFFFF, sums_3[3], 16);
                 float _add_57_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_57_1) : "f"(sums_2[3]), "f"(_shfl_xor_sync_58_2));
-                sums_2[3] = _add_57_1;
-                float _shfl_xor_sync_60_1 = __shfl_xor_sync(0xFFFFFFFF, sums_2[4], 16);
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_57_1) : "f"(sums_3[3]), "f"(_shfl_xor_sync_58_1));
+                sums_3[3] = _add_57_1;
+                float _shfl_xor_sync_60 = __shfl_xor_sync(0xFFFFFFFF, sums_3[4], 16);
                 float _add_59_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_59_1) : "f"(sums_2[4]), "f"(_shfl_xor_sync_60_1));
-                sums_2[4] = _add_59_1;
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_59_1) : "f"(sums_3[4]), "f"(_shfl_xor_sync_60));
+                sums_3[4] = _add_59_1;
                 float s_1 = 0.0f;
-                s_1 = ((lane_in_warp == 0) ? sums_2[0] : s_1);
-                s_1 = ((lane_in_warp == 1) ? sums_2[1] : s_1);
-                s_1 = ((lane_in_warp == 2) ? sums_2[2] : s_1);
-                s_1 = ((lane_in_warp == 3) ? sums_2[3] : s_1);
-                float q_1 = sums_2[4];
+                s_1 = ((lane_in_warp == 0) ? sums_3[0] : s_1);
+                s_1 = ((lane_in_warp == 1) ? sums_3[1] : s_1);
+                s_1 = ((lane_in_warp == 2) ? sums_3[2] : s_1);
+                s_1 = ((lane_in_warp == 3) ? sums_3[3] : s_1);
+                float q_1 = sums_3[4];
                 float _fma_62;
                 asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_62) : "f"(q_1), "f"(6.1035156e-05f), "f"(hc_norm_eps));
                 float _sqrt_61;
@@ -10617,7 +10841,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 float values_1[8];
                 float _shfl_0 = __shfl_sync(0xFFFFFFFF, coeff_1, 0);
 #if __CUDA_ARCH__ == 1070
-                float _vec_load_26[8];
+                float _vec_load_32[8];
 #else
                 float _vec_load_52[8];
 #endif
@@ -10642,8 +10866,8 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                            (&_vec_load_26[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_64[_pair]) << 16);
-                            (&_vec_load_26[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_64[_pair]) & 0xffff0000u);
+                            (&_vec_load_32[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_64[_pair]) << 16);
+                            (&_vec_load_32[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_64[_pair]) & 0xffff0000u);
 #else
                             (&_vec_load_52[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_206[_pair]) << 16);
                             (&_vec_load_52[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_206[_pair]) & 0xffff0000u);
@@ -10653,7 +10877,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 }
 #if __CUDA_ARCH__ == 1070
                 float2 _f32x2_mul_a_65 = make_float2(_shfl_0, _shfl_0);
-                float2 _f32x2_mul_b_66 = make_float2(_vec_load_26[0], _vec_load_26[1]);
+                float2 _f32x2_mul_b_66 = make_float2(_vec_load_32[0], _vec_load_32[1]);
 #else
                 float2 _f32x2_mul_a_207 = make_float2(_shfl_0, _shfl_0);
                 float2 _f32x2_mul_b_208 = make_float2(_vec_load_52[0], _vec_load_52[1]);
@@ -10668,7 +10892,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[1] = pair_2.y;
 #if __CUDA_ARCH__ == 1070
                 float2 _f32x2_mul_a_67 = make_float2(_shfl_0, _shfl_0);
-                float2 _f32x2_mul_b_68 = make_float2(_vec_load_26[2], _vec_load_26[3]);
+                float2 _f32x2_mul_b_68 = make_float2(_vec_load_32[2], _vec_load_32[3]);
 #else
                 float2 _f32x2_mul_a_209 = make_float2(_shfl_0, _shfl_0);
                 float2 _f32x2_mul_b_210 = make_float2(_vec_load_52[2], _vec_load_52[3]);
@@ -10683,7 +10907,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[3] = pair_0.y;
 #if __CUDA_ARCH__ == 1070
                 float2 _f32x2_mul_a_69 = make_float2(_shfl_0, _shfl_0);
-                float2 _f32x2_mul_b_70 = make_float2(_vec_load_26[4], _vec_load_26[5]);
+                float2 _f32x2_mul_b_70 = make_float2(_vec_load_32[4], _vec_load_32[5]);
 #else
                 float2 _f32x2_mul_a_211 = make_float2(_shfl_0, _shfl_0);
                 float2 _f32x2_mul_b_212 = make_float2(_vec_load_52[4], _vec_load_52[5]);
@@ -10698,7 +10922,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[5] = pair_1_1.y;
 #if __CUDA_ARCH__ == 1070
                 float2 _f32x2_mul_a_71 = make_float2(_shfl_0, _shfl_0);
-                float2 _f32x2_mul_b_72 = make_float2(_vec_load_26[6], _vec_load_26[7]);
+                float2 _f32x2_mul_b_72 = make_float2(_vec_load_32[6], _vec_load_32[7]);
 #else
                 float2 _f32x2_mul_a_213 = make_float2(_shfl_0, _shfl_0);
                 float2 _f32x2_mul_b_214 = make_float2(_vec_load_52[6], _vec_load_52[7]);
@@ -10713,7 +10937,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[7] = pair_2_1.y;
                 float _shfl_1 = __shfl_sync(0xFFFFFFFF, coeff_1, 1);
 #if __CUDA_ARCH__ == 1070
-                float _vec_load_27[8];
+                float _vec_load_33[8];
 #else
                 float _vec_load_53[8];
 #endif
@@ -10738,8 +10962,8 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                            (&_vec_load_27[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_73[_pair]) << 16);
-                            (&_vec_load_27[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_73[_pair]) & 0xffff0000u);
+                            (&_vec_load_33[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_73[_pair]) << 16);
+                            (&_vec_load_33[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_73[_pair]) & 0xffff0000u);
 #else
                             (&_vec_load_53[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_215[_pair]) << 16);
                             (&_vec_load_53[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_215[_pair]) & 0xffff0000u);
@@ -10748,28 +10972,28 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     }
                 }
 #if __CUDA_ARCH__ == 1070
-                float2 pair_3 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[0], _vec_load_27[1]), make_float2(values_1[0], values_1[1]));
+                float2 pair_3 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_33[0], _vec_load_33[1]), make_float2(values_1[0], values_1[1]));
 #else
                 float2 pair_3 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[0], _vec_load_53[1]), make_float2(values_1[0], values_1[1]));
 #endif
                 values_1[0] = pair_3.x;
                 values_1[1] = pair_3.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_4 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[2], _vec_load_27[3]), make_float2(values_1[2], values_1[3]));
+                float2 pair_4 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_33[2], _vec_load_33[3]), make_float2(values_1[2], values_1[3]));
 #else
                 float2 pair_4 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[2], _vec_load_53[3]), make_float2(values_1[2], values_1[3]));
 #endif
                 values_1[2] = pair_4.x;
                 values_1[3] = pair_4.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_5_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[4], _vec_load_27[5]), make_float2(values_1[4], values_1[5]));
+                float2 pair_5_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_33[4], _vec_load_33[5]), make_float2(values_1[4], values_1[5]));
 #else
                 float2 pair_5_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[4], _vec_load_53[5]), make_float2(values_1[4], values_1[5]));
 #endif
                 values_1[4] = pair_5_1.x;
                 values_1[5] = pair_5_1.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_6 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[6], _vec_load_27[7]), make_float2(values_1[6], values_1[7]));
+                float2 pair_6 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_33[6], _vec_load_33[7]), make_float2(values_1[6], values_1[7]));
 #else
                 float2 pair_6 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[6], _vec_load_53[7]), make_float2(values_1[6], values_1[7]));
 #endif
@@ -10777,7 +11001,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[7] = pair_6.y;
                 float _shfl_2 = __shfl_sync(0xFFFFFFFF, coeff_1, 2);
 #if __CUDA_ARCH__ == 1070
-                float _vec_load_28[8];
+                float _vec_load_34[8];
 #else
                 float _vec_load_54[8];
 #endif
@@ -10802,8 +11026,8 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                            (&_vec_load_28[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_74[_pair]) << 16);
-                            (&_vec_load_28[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_74[_pair]) & 0xffff0000u);
+                            (&_vec_load_34[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_74[_pair]) << 16);
+                            (&_vec_load_34[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_74[_pair]) & 0xffff0000u);
 #else
                             (&_vec_load_54[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_216[_pair]) << 16);
                             (&_vec_load_54[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_216[_pair]) & 0xffff0000u);
@@ -10812,28 +11036,28 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     }
                 }
 #if __CUDA_ARCH__ == 1070
-                float2 pair_7 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[0], _vec_load_28[1]), make_float2(values_1[0], values_1[1]));
+                float2 pair_7 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_34[0], _vec_load_34[1]), make_float2(values_1[0], values_1[1]));
 #else
                 float2 pair_7 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[0], _vec_load_54[1]), make_float2(values_1[0], values_1[1]));
 #endif
                 values_1[0] = pair_7.x;
                 values_1[1] = pair_7.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_8_1 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[2], _vec_load_28[3]), make_float2(values_1[2], values_1[3]));
+                float2 pair_8_1 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_34[2], _vec_load_34[3]), make_float2(values_1[2], values_1[3]));
 #else
                 float2 pair_8_1 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[2], _vec_load_54[3]), make_float2(values_1[2], values_1[3]));
 #endif
                 values_1[2] = pair_8_1.x;
                 values_1[3] = pair_8_1.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_9 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[4], _vec_load_28[5]), make_float2(values_1[4], values_1[5]));
+                float2 pair_9 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_34[4], _vec_load_34[5]), make_float2(values_1[4], values_1[5]));
 #else
                 float2 pair_9 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[4], _vec_load_54[5]), make_float2(values_1[4], values_1[5]));
 #endif
                 values_1[4] = pair_9.x;
                 values_1[5] = pair_9.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_10 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[6], _vec_load_28[7]), make_float2(values_1[6], values_1[7]));
+                float2 pair_10 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_34[6], _vec_load_34[7]), make_float2(values_1[6], values_1[7]));
 #else
                 float2 pair_10 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[6], _vec_load_54[7]), make_float2(values_1[6], values_1[7]));
 #endif
@@ -10841,7 +11065,7 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                 values_1[7] = pair_10.y;
                 float _shfl_3 = __shfl_sync(0xFFFFFFFF, coeff_1, 3);
 #if __CUDA_ARCH__ == 1070
-                float _vec_load_29[8];
+                float _vec_load_35[8];
 #else
                 float _vec_load_55[8];
 #endif
@@ -10866,8 +11090,8 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                            (&_vec_load_29[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_75[_pair]) << 16);
-                            (&_vec_load_29[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_75[_pair]) & 0xffff0000u);
+                            (&_vec_load_35[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_75[_pair]) << 16);
+                            (&_vec_load_35[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_75[_pair]) & 0xffff0000u);
 #else
                             (&_vec_load_55[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_217[_pair]) << 16);
                             (&_vec_load_55[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_217[_pair]) & 0xffff0000u);
@@ -10876,28 +11100,28 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
                     }
                 }
 #if __CUDA_ARCH__ == 1070
-                float2 pair_11 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[0], _vec_load_29[1]), make_float2(values_1[0], values_1[1]));
+                float2 pair_11 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_35[0], _vec_load_35[1]), make_float2(values_1[0], values_1[1]));
 #else
                 float2 pair_11 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[0], _vec_load_55[1]), make_float2(values_1[0], values_1[1]));
 #endif
                 values_1[0] = pair_11.x;
                 values_1[1] = pair_11.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_12 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[2], _vec_load_29[3]), make_float2(values_1[2], values_1[3]));
+                float2 pair_12 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_35[2], _vec_load_35[3]), make_float2(values_1[2], values_1[3]));
 #else
                 float2 pair_12 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[2], _vec_load_55[3]), make_float2(values_1[2], values_1[3]));
 #endif
                 values_1[2] = pair_12.x;
                 values_1[3] = pair_12.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_13 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[4], _vec_load_29[5]), make_float2(values_1[4], values_1[5]));
+                float2 pair_13 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_35[4], _vec_load_35[5]), make_float2(values_1[4], values_1[5]));
 #else
                 float2 pair_13 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[4], _vec_load_55[5]), make_float2(values_1[4], values_1[5]));
 #endif
                 values_1[4] = pair_13.x;
                 values_1[5] = pair_13.y;
 #if __CUDA_ARCH__ == 1070
-                float2 pair_14 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[6], _vec_load_29[7]), make_float2(values_1[6], values_1[7]));
+                float2 pair_14 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_35[6], _vec_load_35[7]), make_float2(values_1[6], values_1[7]));
 #else
                 float2 pair_14 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[6], _vec_load_55[7]), make_float2(values_1[6], values_1[7]));
 #endif
@@ -10946,9 +11170,9 @@ kernel_cake_mega_mhc_f24c2f3f98bfe3356398(const __grid_constant__ CUtensorMap re
             float _add_39_3;
             asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_39_3) : "f"(row_sum), "f"(_shfl_xor_sync_77));
             float _shfl_xor_sync_79 = __shfl_xor_sync(0xFFFFFFFF, _add_39_3, 1);
-            float _add_78;
-            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_78) : "f"(_add_39_3), "f"(_shfl_xor_sync_79));
-            row_sum = _add_78;
+            float _add_78_1;
+            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_78_1) : "f"(_add_39_3), "f"(_shfl_xor_sync_79));
+            row_sum = _add_78_1;
             float _shfl_sync_80 = __shfl_sync(0xFFFFFFFF, row_sum, 0);
             row_sum = _shfl_sync_80;
             float _fma_83;
