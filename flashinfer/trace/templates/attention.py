@@ -5211,6 +5211,75 @@ def _make_dsv4_sparse_mla_hca_trace(kv_form: str):
     )
 
 
+def _make_dsv4_sparse_mla_hca_page_aligned_trace(kv_form: str):
+    query_dims, output_dims, query_axes, _, rows = _dsv4_query_io(False)
+    return TraceTemplate(
+        op_type="sparse_mla_dsv4",
+        name_prefix=f"sparse_mla_dsv4_hca_page_aligned_{kv_form}",
+        description=(
+            "DeepSeek-V4 sparse MLA decode through the CuTe DSL HCA kernel "
+            "(backend='cute-dsl', SM100/SM103) from TRTLLM-GEN combined "
+            "metadata. With hca_sparse_indices_format='compressed-page-aligned' "
+            "the call validates the combined table, derives the HCA gather "
+            "indices, compressed block table, hca_seq_lens and swa_topk_lens, "
+            "synchronizes the device and launches the decode. Not CUDA Graph "
+            "capture safe. Dense FP8 E4M3 query and KV pools, BF16 output."
+        ),
+        axes={
+            **query_axes,
+            **_DSV4_HEAD_AXES,
+            **_dsv4_kv_cache_axes(kv_form, "swa", extract=False),
+            **_dsv4_kv_cache_axes(kv_form, "compressed", extract=False),
+            "num_index_rows": Var(description="Metadata rows (batch_size * q_len)."),
+            "sparse_topk": Const(abbrev="topk"),
+            "workspace_bytes": Var(),
+        },
+        inputs={
+            "query": Tensor(query_dims),
+            "swa_kv_cache": _dsv4_kv_cache_input(kv_form, "swa", optional=False),
+            "workspace_buffer": Tensor(["workspace_bytes"], dtype="uint8"),
+            "sparse_indices": Tensor(
+                ["num_index_rows", "sparse_topk"],
+                dtype="int32",
+                description=(
+                    "Combined table: absolute SWA token rows, then the "
+                    "canonical page_id * page_size + page_offset expansion of "
+                    "the compressed segment."
+                ),
+            ),
+            "compressed_kv_cache": _dsv4_kv_cache_input(
+                kv_form, "compressed", optional=False
+            ),
+            "sparse_topk_lens": Tensor(
+                ["num_index_rows"],
+                dtype="int32",
+                description="128 + floor(visible_raw_len / 128) per row.",
+            ),
+            "seq_lens": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                description="Original KV lengths; at least q_len_per_request.",
+            ),
+            "backend": Scalar("string", description="Always 'cute-dsl'."),
+            "hca_sparse_indices_format": Scalar(
+                "string", description="Always 'compressed-page-aligned'."
+            ),
+            "hca_is_causal": Scalar("bool", optional=True),
+            "hca_use_persistent": Scalar("bool", optional=True),
+            **_DSV4_SCALE_INPUTS,
+        },
+        outputs={"output": Tensor(output_dims, dtype="bfloat16", param="out")},
+        constraints=[
+            "head_dim == 512",
+            "num_heads in (8, 16, 32, 64, 128)",
+            f"num_index_rows == {rows}",
+            "sparse_topk >= 128",
+            "sparse_topk % 4 == 0",
+        ],
+        tags=[*_DSV4_TAGS, "route:hca_page_aligned", "backend:cute-dsl"],
+    )
+
+
 _DSV4_SPARSE_MLA_TRACES = {
     (ragged, kv_form, rope_quant): _make_dsv4_sparse_mla_trace(
         ragged, kv_form, rope_quant
@@ -5221,6 +5290,10 @@ _DSV4_SPARSE_MLA_TRACES = {
 }
 _DSV4_SPARSE_MLA_HCA_TRACES = {
     kv_form: _make_dsv4_sparse_mla_hca_trace(kv_form) for kv_form in _DSV4_KV_CACHE_DIMS
+}
+_DSV4_SPARSE_MLA_HCA_PAGE_ALIGNED_TRACES = {
+    kv_form: _make_dsv4_sparse_mla_hca_page_aligned_trace(kv_form)
+    for kv_form in _DSV4_KV_CACHE_DIMS
 }
 
 
@@ -5233,13 +5306,12 @@ def trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch(**kwargs):
     else:
         kv_form = "nhd" if kwargs.get("kv_layout") == "NHD" else "hnd"
     ragged = kwargs.get("cum_seq_lens_q") is not None
-    if (
-        kwargs.get("backend") == "cute-dsl"
-        and kwargs.get("hca_sparse_indices_format") is None
-    ):
+    if kwargs.get("backend") == "cute-dsl":
         if ragged:
             raise NotImplementedError("HCA DSv4 sparse MLA accepts dense queries only")
-        return _DSV4_SPARSE_MLA_HCA_TRACES[kv_form]
+        if kwargs.get("hca_sparse_indices_format") is None:
+            return _DSV4_SPARSE_MLA_HCA_TRACES[kv_form]
+        return _DSV4_SPARSE_MLA_HCA_PAGE_ALIGNED_TRACES[kv_form]
     rope_quant = kwargs.get("dsv4_inv_rope_cos_sin_cache") is not None
     return _DSV4_SPARSE_MLA_TRACES[(ragged, kv_form, rope_quant)]
 
@@ -5247,6 +5319,7 @@ def trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch(**kwargs):
 trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch.templates = [  # type: ignore[attr-defined]
     *_DSV4_SPARSE_MLA_TRACES.values(),
     *_DSV4_SPARSE_MLA_HCA_TRACES.values(),
+    *_DSV4_SPARSE_MLA_HCA_PAGE_ALIGNED_TRACES.values(),
 ]
 
 

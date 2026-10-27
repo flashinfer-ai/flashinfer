@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import inspect
 import json
+from unittest.mock import ANY
 
 import pytest
 import torch
@@ -65,8 +67,9 @@ def test_sparse_mla_dsv4_trace_registration():
         "sparse_mla_dsv4_ragged_3d",
         "sparse_mla_dsv4_dense_nhd_rope_quant",
         "sparse_mla_dsv4_hca_hnd",
+        "sparse_mla_dsv4_hca_page_aligned_nhd",
     } <= labels
-    assert len(labels) == 15
+    assert len(labels) == 18
 
 
 def test_sparse_mla_dsv4_trace_trtllm_gen_combined_table(tmp_path):
@@ -173,6 +176,42 @@ def test_sparse_mla_dsv4_trace_hca():
                 "cum_seq_lens_q": _empty(B + 1, dtype=torch.int32),
             }
         )
+
+
+def test_sparse_mla_dsv4_trace_hca_compressed_page_aligned():
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    from flashinfer.trace_apply.adapt import build_candidate_kwargs
+
+    kwargs = _trtllm_gen_kwargs(
+        query=_empty(B, Q, H, D, dtype=torch.float8_e4m3fn),
+        backend="cute-dsl",
+        hca_sparse_indices_format="compressed-page-aligned",
+        hca_use_persistent=True,
+    )
+    definition = run.fi_trace(**kwargs)
+    default_name = run.fi_trace(**_trtllm_gen_kwargs())["name"]
+    assert definition["name"] == default_name.replace(
+        "sparse_mla_dsv4_dense_hnd_", "sparse_mla_dsv4_hca_page_aligned_hnd_"
+    )
+    inputs = definition["inputs"]
+    for name in ("backend", "hca_sparse_indices_format"):
+        assert inputs[name] == {"shape": None, "dtype": "string", "description": ANY}
+    for name in ("hca_is_causal", "hca_use_persistent"):
+        assert inputs[name]["optional"] is True
+    for name in ("sparse_indices", "sparse_topk_lens", "seq_lens"):
+        assert "optional" not in inputs[name]
+    assert not {
+        "hca_swa_indices",
+        "hca_compressed_block_tables",
+        "hca_seq_lens",
+        "swa_topk_lens",
+    } & set(inputs)
+
+    dispatch = _TRACE_DISPATCHERS[inspect.unwrap(run)]
+    replayed = build_candidate_kwargs(dispatch(**kwargs), kwargs)
+    assert replayed["hca_sparse_indices_format"] == "compressed-page-aligned"
+    assert replayed["backend"] == "cute-dsl"
+    assert replayed["hca_use_persistent"] is True
 
 
 def test_sparse_mla_dsv4_trace_autodump(tmp_path, monkeypatch):
