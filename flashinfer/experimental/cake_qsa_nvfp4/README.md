@@ -187,9 +187,12 @@ tile and split counts alone.
 counters uint32 `[rows * num_kv_heads]`. With `workspace_buffer` (a
 contiguous uint8 tensor on the device of `q`, of at least
 `qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)` bytes,
-256-byte aligned; checked on every call that passes one) they are carved
-from the caller's buffer: the call allocates nothing and is CUDA-graph
-capturable with a replay-stable layout. The counters are zeroed once, the
+256-byte aligned) they are carved from the caller's buffer -- checked (and,
+above one split, carved) on a tensor's first call, and from its second call
+on once per call shape into a plan that every later call passing the same
+tensor reuses (a tensor that dies or is rebound to other bytes, or
+`reset_workspace`, drops the plan): the call
+allocates nothing and is CUDA-graph capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a

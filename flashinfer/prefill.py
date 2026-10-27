@@ -8837,6 +8837,18 @@ def trtllm_batch_context_with_kv_cache(
         lse_stride_tokens = 0
         lse_stride_heads = 0
 
+    if backend == "cake" and (query.size(0) == 0 or max_q_len == 0 or batch_size == 0):
+        # No request has a query token: there is nothing to attend or write,
+        # so return before choosing a route or launching a kernel.
+        empty_out = (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
+        if return_lse:
+            return empty_out, lse
+        return empty_out
+
     if backend == "cake":
         from .cake_fmha import (
             get_cake_fmha_context_module,
@@ -8874,13 +8886,20 @@ def trtllm_batch_context_with_kv_cache(
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # All context adapters consume host scalar scales. Device scalar
-        # values are resolved only after exact route selection, preserving
-        # their public value while converting bmm1 back from log2 form.
-        if isinstance(bmm1_scale, torch.Tensor):
-            bmm1_scale = float(bmm1_scale.item()) / log2e
-        if isinstance(bmm2_scale, torch.Tensor):
-            bmm2_scale = float(bmm2_scale.item())
+        # A device-scale program reads both scales through device pointers
+        # (bmm1 in log2 form). The other context adapters consume host scalar
+        # scales: device scalar values are resolved only after route
+        # selection, preserving their public value while converting bmm1 back
+        # from log2 form.
+        if (
+            cake_route is None
+            or cake_route.program is None
+            or not cake_route.device_scales
+        ):
+            if isinstance(bmm1_scale, torch.Tensor):
+                bmm1_scale = float(bmm1_scale.item()) / log2e
+            if isinstance(bmm2_scale, torch.Tensor):
+                bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(
             query.device, cake_route
         ).cake_paged_attention_context
