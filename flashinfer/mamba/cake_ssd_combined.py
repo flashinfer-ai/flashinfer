@@ -130,7 +130,8 @@ class _Program:
     sm_107a varlen ring program that draws its work items at run time,
     :func:`claim_selected`) or ``"ibulk"`` (the two-kernel family's sm_107a
     packed-varlen ring program loading a work item's initial state as one
-    bulk copy, :func:`ibulk_selected`).
+    bulk copy, :func:`ibulk_selected`; the fused family's sm_107a
+    packed-varlen ring program doing the same, :func:`fused_ibulk_selected`).
     """
 
     family: str
@@ -301,7 +302,9 @@ _EXACTONE_MODULES = {
 # table in-kernel.  The two-kernel claim programs
 # (``exactpre_<state>_varlen_claim``, :func:`claim_selected`) and
 # initial-state bulk programs (``exactpre_<state>_varlen_ibulk``,
-# :func:`ibulk_selected`) exist on sm_107a only (``_SM107_ONLY_PROGRAMS``):
+# :func:`ibulk_selected`) exist on sm_107a only (``_SM107_ONLY_PROGRAMS``),
+# as do the fused initial-state bulk programs
+# (``exactfused_<state>_varlen_ibulk``, :func:`fused_ibulk_selected`):
 # their entries are their sole sources (no fold module, never built for
 # another architecture).
 _SM107_MODULES = {
@@ -355,6 +358,8 @@ _SM107_MODULES = {
     "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_8cc806049c",
     "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_19ced571a6",
     "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_672a508390",
+    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_d07d9a54d2",
+    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_1d8953d439",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -444,6 +449,11 @@ _EXACTPRE_CLAIM_SMEM_BYTES = 232448
 # initial-state bulk copy's); the Cake export reads it for the launch of the
 # ``exactpre_*_ibulk`` table entries.
 _EXACTPRE_IBULK_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a fused initial-state bulk programs
+# (``exactfused_*_ibulk``: the fused varlen ring programs with the
+# initial-state bulk copy's mbarrier); the Cake export reads it for the launch
+# of the ``exactfused_*_ibulk`` table entries.
+_EXACTFUSED_IBULK_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -719,6 +729,7 @@ _VARIANT_SMEM_BYTES = {
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
     ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
+    ("exactfused", "ibulk"): _EXACTFUSED_IBULK_SMEM_BYTES,
     ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
     ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
 }
@@ -781,10 +792,11 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
-# The sm_107a-only programs (the claim and initial-state bulk programs): their
-# ``_SM107_MODULES`` entry is their main module on every architecture; only
-# capability (10, 7) routes to them (:func:`claim_selected`,
-# :func:`ibulk_selected`).
+# The sm_107a-only programs (the claim and initial-state bulk programs, and
+# the one-launch programs' table forms): their ``_SM107_MODULES`` entry is
+# their main module on every architecture; only capability (10, 7) routes to
+# them (:func:`claim_selected`, :func:`ibulk_selected`,
+# :func:`fused_ibulk_selected`, :func:`exactone_table_variant`).
 _SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
 _PROGRAMS.update(
     (name, _program(name, _SM107_MODULES[name]))
@@ -799,7 +811,8 @@ def _program_name(
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
     one, ``"tail"``, ``"claim"`` or ``"ibulk"`` for the two-kernel exact-scan
-    family, ``"tablefirst"`` or ``"tableroles"`` for the one-launch family)."""
+    family, ``"ibulk"`` for the fused one, ``"tablefirst"`` or ``"tableroles"``
+    for the one-launch family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1904,6 +1917,45 @@ def ibulk_selected(
         total_work >= _IBULK_MIN_ITEMS_PER_SM * sm_count
         and chunks_per_item <= _IBULK_MAX_CHUNKS_PER_ITEM
     )
+
+
+# sm_107a: packed-varlen fused ring calls (``exactfused_*`` varlen: the
+# cu_seqlens form and the seq_idx triple form with a caller
+# ``seq_chunk_cumsum``) with initial states, items of one host-known chunk
+# and more (sequence, head) items than SMs take the fused ``_ibulk`` program
+# (``exactfused_*_varlen_ibulk``, bf16 / f16 state): its pre_inter warps
+# read each work item's initial state as one 16 KB bulk copy through the
+# state stage -- the CTA's first item's at role start, every later item's
+# while the previous item's last chunk runs -- instead of 64 scalar global
+# loads per thread.  Same outputs bit for bit as the ring program.  Calls
+# with at most one item per SM (no CTA runs a second item), items of several
+# chunks and calls without initial states keep the ring program (no gain
+# measured).
+_FUSED_IBULK_CAPABILITIES = frozenset({(10, 7)})
+_FUSED_IBULK_MAX_CHUNKS_PER_ITEM = 1
+
+
+def fused_ibulk_selected(
+    *,
+    capability: tuple[int, int],
+    state_dtype: torch.dtype,
+    has_initial_states: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+) -> bool:
+    """Whether a packed-varlen fused ring call (``exactfused``, variant
+    ``""``) takes the fused ``_ibulk`` program: on a
+    ``_FUSED_IBULK_CAPABILITIES`` device, with a ``_IBULK_STATE_DTYPES``
+    state, initial states, more than ``sm_count`` (sequence, head) items and
+    at most ``_FUSED_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks per item
+    (:func:`host_chunks_per_item`)."""
+
+    if (int(capability[0]), int(capability[1])) not in _FUSED_IBULK_CAPABILITIES:
+        return False
+    if not has_initial_states or state_dtype not in _IBULK_STATE_DTYPES:
+        return False
+    return total_work > sm_count and chunks_per_item <= _FUSED_IBULK_MAX_CHUNKS_PER_ITEM
 
 
 # sm_107a: the one-launch ring programs (``exactone_<state>_varlen``) in
@@ -3052,6 +3104,25 @@ class CakeSSDCombined:
                 if one_launch
                 else "exactfused"
             )
+            if (
+                program_family == "exactfused"
+                and self.has_varlen
+                and not variant
+                and fused_ibulk_selected(
+                    capability=capability,
+                    state_dtype=self.state_dtype,
+                    has_initial_states=self.has_initial_states,
+                    total_work=num_sequences * self.nheads,
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=True,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen,
+                    ),
+                    sm_count=sm_count,
+                )
+            ):
+                variant = "ibulk"
         else:
             program_family = two_kernel_family(
                 mode_varlen=self.has_varlen,

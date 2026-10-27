@@ -4792,7 +4792,9 @@ def test_source_program_table_names_shipped_sources():
         for state in ("bf16", "f16", "f32")
         if (variant, state) != ("_noring", "f32")
     } | {"exactpre_bf16_varlen_claim", "exactpre_f32_varlen_claim"} | {
-        f"exactpre_{state}_varlen_ibulk" for state in ("bf16", "f16")
+        f"{family}_{state}_varlen_ibulk"
+        for family in ("exactpre", "exactfused")
+        for state in ("bf16", "f16")
     } | {
         "exactone_bf16_varlen_tablefirst",
         "exactone_bf16_varlen_tableroles",
@@ -4801,14 +4803,17 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f32_varlen_tablefirst",
         "exactone_f32_varlen_tableroles",
     }
-    # The sm_107a-only programs (the claim and initial-state bulk programs and the
-    # one-launch programs in the tablefirst / tableroles prologue forms): their
-    # ``_SM107_MODULES`` entry is their sole source.
+    # The sm_107a-only programs (the claim programs, the two-kernel and fused
+    # initial-state bulk programs and the one-launch programs in the
+    # tablefirst / tableroles prologue forms): their ``_SM107_MODULES`` entry
+    # is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
         "exactpre_f32_varlen_claim",
         "exactpre_bf16_varlen_ibulk",
         "exactpre_f16_varlen_ibulk",
+        "exactfused_bf16_varlen_ibulk",
+        "exactfused_f16_varlen_ibulk",
         "exactone_bf16_varlen_tablefirst",
         "exactone_bf16_varlen_tableroles",
         "exactone_f16_varlen_tablefirst",
@@ -4844,7 +4849,9 @@ def test_source_program_table_names_shipped_sources():
         module._EXACTFUSED_MODULES.values()
     )
     assert set(module._EXACTFUSED_MODULES) == {
-        name for name in module._PROGRAMS if name.startswith("exactfused_")
+        name
+        for name in module._PROGRAMS
+        if name.startswith("exactfused_") and name not in module._SM107_ONLY_PROGRAMS
     }
     assert (
         set(module._EXACTPRE_MODULES)
@@ -4887,7 +4894,7 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 50
+    assert len(module._SM107_MODULES) == 52
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
@@ -4972,8 +4979,10 @@ def test_source_program_table_names_shipped_sources():
                 "exactone",
                 "exactpre",
             )
-            if variant_name in ("tail", "claim", "ibulk"):
+            if variant_name in ("tail", "claim"):
                 assert family == "exactpre"
+            if variant_name == "ibulk":
+                assert family in ("exactpre", "exactfused")
             if variant_name == "claim":
                 assert (state_key, mode) in (("bf16", "varlen"), ("f32", "varlen"))
             if variant_name == "ibulk":
@@ -4996,6 +5005,7 @@ def test_source_program_table_names_shipped_sources():
                     ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
                     ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
                     ("exactpre", "ibulk"): module._EXACTPRE_IBULK_SMEM_BYTES,
+                    ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
                 }[(family, variant_name)]
             )
         assert program.variant == (variant[0] if variant else "")
@@ -7176,10 +7186,11 @@ def test_source_exact_scan_variant_programs():
                 assert b.main_smem_bytes == noring_smem
                 assert a.main.module != b.main.module
     # the retained and the fused family: six ring programs and the five
-    # ``_noring`` programs the variant rule can select
+    # ``_noring`` programs the variant rule can select; the fused family also
+    # the two sm_107a-only ``_ibulk`` programs
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 11
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 11
+        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 13
     )
     # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
     # and the sm_107a-only programs: two ``_claim`` and two ``_ibulk``
@@ -7202,7 +7213,7 @@ def test_source_exact_scan_variant_programs():
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 11
     )
-    assert len(module._PROGRAMS) == 66
+    assert len(module._PROGRAMS) == 68
 
 
 @pytest.mark.parametrize(
@@ -7635,10 +7646,11 @@ def test_source_sm107_no_z_calls_take_the_fused_program(
     ((name, _launch),) = calls
     mode = "varlen" if varlen else "batched"
     if arch == "sm_107a":
-        # a two-kernel packed-varlen call without z of these 512 one-chunk
-        # items runs the initial-state bulk form of the ring program
-        # (ibulk_selected; a call with z needs 8 items per SM)
-        ibulk = sm107_family == "exactpre" and varlen and not has_z
+        # a packed-varlen call without z of these 512 one-chunk items with
+        # initial states runs the initial-state bulk form of its family's ring
+        # program (two-kernel: ibulk_selected, a call with z needs 8 items per
+        # SM; fused: fused_ibulk_selected)
+        ibulk = varlen and not has_z
         assert name == f"{sm107_family}_bf16_{mode}" + ("_ibulk" if ibulk else "")
     else:
         # SM103: the seed window; one-chunk two-kernel calls keep the
@@ -7821,7 +7833,18 @@ def test_source_sm107_short_item_calls_take_the_ibulk_program(
         assert not name.endswith("_ibulk"), name
 
 
-def test_source_sm107_ibulk_program_binds_aligned_initial_states(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_seqs", "expected"),
+    (
+        # 256 one-chunk sequences x 8 heads: the two-kernel ``_ibulk`` program
+        (256, "exactpre_bf16_varlen_ibulk"),
+        # 64 one-chunk sequences x 8 heads: the fused ``_ibulk`` program
+        (64, "exactfused_bf16_varlen_ibulk"),
+    ),
+)
+def test_source_sm107_ibulk_program_binds_aligned_initial_states(
+    monkeypatch, num_seqs, expected
+):
     """The ``_ibulk`` programs read an item's initial state with one bulk
     copy: a contiguous ``initial_states`` at an address that is not 16-byte
     aligned is bound through the workspace's packed copy (the same values),
@@ -7840,7 +7863,7 @@ def test_source_sm107_ibulk_program_binds_aligned_initial_states(monkeypatch):
         arch="sm_107a",
     )
     monkeypatch.setattr(module, "_sm_count", lambda _: 212)
-    num_seqs, tokens = 256, 128
+    tokens = 128
     seqlen = num_seqs * tokens
     x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
     dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
@@ -7855,11 +7878,178 @@ def test_source_sm107_ibulk_program_binds_aligned_initial_states(monkeypatch):
         assert initial.is_contiguous()
         runner.run(x, dt, A, B, C, initial_states=initial, cu_seqlens=cu_seqlens)
         name, launch = calls.pop()
-        assert name == "exactpre_bf16_varlen_ibulk"
+        assert name == expected
         bound = launch["main"]["initial_states"]
         assert bound.data_ptr() % 16 == 0
         assert (bound is initial) == (initial.data_ptr() % 16 == 0)
         assert torch.equal(bound, initial)
+
+
+def _varlen_metadata_cpu(lengths):
+    """CPU ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` /
+    ``seq_chunk_cumsum`` of a packed batch of non-empty sequences (the values
+    :func:`_varlen_metadata` and :func:`_seq_chunk_cumsum` build on the
+    device)."""
+
+    seq_idx = torch.arange(len(lengths), dtype=torch.int32).repeat_interleave(
+        torch.tensor(lengths)
+    )[None]
+    total = sum(lengths)
+    chunk_indices, chunk_offsets = [], []
+    for chunk in range(-(-total // 128)):
+        values = seq_idx[0, chunk * 128 : (chunk + 1) * 128]
+        previous = torch.cat((values[:1] - 1, values[:-1]))
+        for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
+            chunk_indices.append(chunk)
+            chunk_offsets.append(offset)
+    cumsum, start = [0], 0
+    for length in lengths:
+        end = start + length
+        cumsum.append(cumsum[-1] + (-(-end // 128) - start // 128))
+        start = end
+    return (
+        seq_idx,
+        torch.tensor(chunk_indices, dtype=torch.int32),
+        torch.tensor(chunk_offsets, dtype=torch.int32),
+        torch.tensor(cumsum, dtype=torch.int32),
+    )
+
+
+def test_source_sm107_fused_ibulk_rule():
+    """``fused_ibulk_selected``: on SM107 a packed-varlen fused ring call
+    with a bf16 / f16 state and initial states takes the fused ``_ibulk``
+    program with more (sequence, head) items than SMs of one host-known
+    chunk; calls without initial states, an f32 state, items of several
+    chunks, at most one item per SM and other capabilities never do."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert frozenset({(10, 7)}) == module._FUSED_IBULK_CAPABILITIES
+    assert module._FUSED_IBULK_MAX_CHUNKS_PER_ITEM == 1
+
+    def sel(
+        items,
+        chunks=1,
+        init=True,
+        state=torch.bfloat16,
+        capability=(10, 7),
+    ):
+        return module.fused_ibulk_selected(
+            capability=capability,
+            state_dtype=state,
+            has_initial_states=init,
+            total_work=items,
+            chunks_per_item=chunks,
+            sm_count=212,
+        )
+
+    # 32 / 64 one-chunk sequences x 8 heads (perf_varlen_32x1 / 64x1)
+    assert sel(256) and sel(512)
+    assert sel(512, state=torch.float16)
+    # bound: more items than SMs
+    assert sel(213) and not sel(212)
+    # 1 / 4 / 8 sequences x 8 heads (perf_varlen_1x1 / 4x1 / 8x1)
+    assert not sel(8) and not sel(32) and not sel(64)
+    # items of two or eight chunks (perf_varlen_4x8 / 8x8: 8 chunks)
+    assert not sel(256, chunks=2)
+    assert not sel(64, chunks=8)
+    # no initial states, an f32 state and the other capabilities
+    assert not sel(512, init=False)
+    assert not sel(512, state=torch.float32)
+    for capability in ((10, 0), (10, 3)):
+        assert not sel(512, capability=capability)
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("form", "num_seqs", "nheads", "tokens", "has_z", "init", "state", "ibulk"),
+    (
+        # perf_varlen_64x1 / 32x1: 512 / 256 one-chunk items
+        ("caller", 64, 8, 128, False, True, torch.bfloat16, True),
+        ("caller", 32, 8, 128, False, True, torch.bfloat16, True),
+        ("cu_seqlens", 64, 8, 128, False, True, torch.bfloat16, True),
+        ("cu_seqlens", 64, 8, 128, False, True, torch.float16, True),
+        # 64-token sequences (partial segments): one host-known chunk per item
+        ("caller", 64, 8, 64, False, True, torch.bfloat16, True),
+        # 2 sequences x 128 heads with z: 256 one-chunk items (seed window)
+        ("caller", 2, 128, 128, True, True, torch.bfloat16, True),
+        # perf_varlen_8x1: 64 items, at most one per SM
+        ("caller", 8, 8, 128, False, True, torch.bfloat16, False),
+        # perf_varlen_4x8: 32 items of 8 chunks
+        ("caller", 4, 8, 1024, False, True, torch.bfloat16, False),
+        # 32 sequences x 2 chunks: 256 items of 2 chunks
+        ("caller", 32, 8, 256, False, True, torch.bfloat16, False),
+        # no initial states, an f32 state
+        ("caller", 64, 8, 128, False, False, torch.bfloat16, False),
+        ("caller", 64, 8, 128, False, True, torch.float32, False),
+        # the triple form deriving its table takes the one-launch program
+        ("derived", 32, 8, 128, False, True, torch.bfloat16, False),
+    ),
+)
+def test_source_sm107_one_chunk_fused_calls_take_the_ibulk_program(
+    monkeypatch, arch, form, num_seqs, nheads, tokens, has_z, init, state, ibulk
+):
+    """On SM107 a packed-varlen call the fused ring program serves with one
+    host-known chunk per item, initial states, a bf16 / f16 state and more
+    items than SMs runs the fused ``_ibulk`` program of its state; SM103,
+    fewer items, longer items, calls without initial states, an f32 state and
+    the one-launch triple form keep their program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=nheads,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=init,
+        has_z=has_z,
+        state_dtype=state,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {}
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if init:
+        kwargs["initial_states"] = torch.empty((num_seqs, nheads, 64, 128), dtype=state)
+    if form == "cu_seqlens":
+        kwargs["cu_seqlens"] = torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        )
+    else:
+        lengths = [tokens] * num_seqs
+        seq_idx, chunk_indices, chunk_offsets, cumsum = _varlen_metadata_cpu(lengths)
+        kwargs.update(
+            seq_idx=seq_idx, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets
+        )
+        if form == "caller":
+            kwargs["seq_chunk_cumsum"] = cumsum
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    key = module._STATE_DTYPE_KEYS[state]
+    if arch == "sm_107a" and ibulk:
+        assert name == f"exactfused_{key}_varlen_ibulk"
+    else:
+        assert not name.endswith("_ibulk"), name
+        if form == "derived" and arch == "sm_107a":
+            # the one-launch program in the prologue form of its launch grid
+            table_form = module.exactone_table_variant(
+                capability=(10, 7),
+                variant="",
+                state_dtype=state,
+                grid=module._persistent_grid_size(
+                    total_work=num_seqs * nheads, sm_count=212
+                ),
+            )
+            assert name == f"exactone_{key}_varlen_{table_form}"
 
 
 def test_source_fused_route_mirrors_the_seed_rule():
