@@ -12,7 +12,9 @@ own device unit and host binding under ``csrc/kda/prefill/``) and
 ``_RENDERED_WORK_BIN_ROUTES`` names the programs built with work bins that
 launches asking for work bins take instead, ``_RENDERED_OWNER_HELPER_ROUTES``
 the owner/helper program a call takes when the device holds its grid, and
-``_RENDERED_OWNER_HELPER_POOL_ROUTES`` its pooled program.
+``_RENDERED_OWNER_HELPER_POOL_ROUTES`` its pooled program;
+``_RENDERED_MAP_FOLD_ROUTES`` names the chain main bodies that also write the
+window maps, which the chain composite launches instead of the map pass.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -47,6 +49,7 @@ from flashinfer import (
 from flashinfer.cake_kda_tf32_runtime import (
     _MAP_FIRST_MODULES,
     _affine_pair_map_fold_enabled,
+    _chain_map_fold_enabled,
 )
 
 ROOT = Path(registry.__file__).resolve().parents[2]
@@ -149,6 +152,14 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_MAP_FOLD_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_MAP_FOLD_ROUTES.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -191,6 +202,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_OWNER_HELPER_ROUTES[arch].items(),
             *registry._RENDERED_OWNER_HELPER_POOL_ROUTES[arch].items(),
             *registry._RENDERED_FOLD_ROUTES[arch].items(),
+            *registry._RENDERED_MAP_FOLD_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -593,6 +605,35 @@ def test_pair_map_fold_builds_take_the_main_bodys_plan():
             assert not FOLD_BARRIER.search(text), routed
 
 
+MAP_FOLD_MODULES = (
+    "cake_kda_bf16_4ab394a09c63f264d7bd",
+    "cake_kda_bf16_50c0f288f4c8d7ca03a8",
+)
+MAP_FOLD_BARRIER = re.compile(r"\bmap_fold_inp_ready_addr\b")
+
+
+@requires_programs
+def test_chain_map_fold_builds_take_the_main_bodys_plan():
+    """The chain route's main modules have map-fold builds
+    (``_RENDERED_MAP_FOLD_ROUTES``): generated programs of their own, never the
+    module's routed program, with the routed program's argument plan (the
+    composite binds the map states to the plan's ``tape_e``)."""
+    assert set(registry._RENDERED_MAP_FOLD_ROUTES) == set(registry.ARCHES)
+    for arch, folding in registry._RENDERED_MAP_FOLD_ROUTES.items():
+        assert sorted(folding) == list(MAP_FOLD_MODULES), arch
+        for module, name in folding.items():
+            routed = registry._RENDERED_ROUTES[arch][module]
+            assert name in GENERATED and name != routed, (arch, module)
+            record = registry._RENDERED_MODULES[name]
+            assert arch in record["arches"]
+            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            assert "tape_e" in {slot for _, slot in record["arg_plan"]}, name
+            text = (ROOT / record["sources"][0]).read_text()
+            assert MAP_FOLD_BARRIER.search(text), name
+            text = (ROOT / registry._RENDERED_MODULES[routed]["sources"][0]).read_text()
+            assert not MAP_FOLD_BARRIER.search(text), routed
+
+
 # ---------------------------------------------------------------- GPU numerics
 
 LAYER_CASES = [
@@ -857,6 +898,7 @@ def unrouted(monkeypatch):
             "_RENDERED_OWNER_HELPER_ROUTES",
             "_RENDERED_OWNER_HELPER_POOL_ROUTES",
             "_RENDERED_FOLD_ROUTES",
+            "_RENDERED_MAP_FOLD_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1011,6 +1053,47 @@ def test_pair_map_fold_is_bitwise_the_pair_map_producer(lengths, heads, monkeypa
     assert not _modules(producer.prepared) & set(folding.values())
     assert "_pairfold" not in str(producer.prepared.schedule)
     _assert_bitwise(folded_result, producer_result, "folded vs pair-map producer")
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+
+
+MAP_FOLD_ROWS = [
+    pytest.param([8192], 12, id="8192-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+    pytest.param([8128, 64, 8128, 64], 12, id="8128+64x4-h12"),
+    pytest.param([16384], 16, id="16384-h16"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", MAP_FOLD_ROWS)
+def test_chain_map_fold_is_bitwise_the_map_pass(lengths, heads, monkeypatch):
+    """A chain composite whose main body writes the window maps equals, bit for
+    bit, the composite that launches the map pass (the loader without map-fold
+    builds): output, pool slots and checkpoint rows, every element written over
+    NaN, the other pool slots untouched."""
+    arch = registry.device_arch()
+    folding = registry._RENDERED_MAP_FOLD_ROUTES[arch]
+    d = _inputs(lengths, heads)
+    untouched = torch.ones(d["state"].shape[0], dtype=torch.bool, device="cuda")
+    untouched[d["state_indices"].long()] = False
+
+    folded = _Call(d, -5.0)
+    folded_result = folded.run()
+    fold = bool(_modules(folded.prepared) & set(folding.values()))
+    assert fold == ("_mapfold" in str(folded.prepared.schedule))
+    if _chain_map_fold_enabled() and lengths in ([8192], [3000, 13384]):
+        assert fold, "the chain composite launched the map pass"
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+    _assert_bitwise(folded.run(), folded_result, "folded repeat")
+
+    monkeypatch.setattr(
+        registry, "_RENDERED_MAP_FOLD_ROUTES", {name: {} for name in registry.ARCHES}
+    )
+    mapped = _Call(d, -5.0)
+    mapped_result = mapped.run()
+    assert not _modules(mapped.prepared) & set(folding.values())
+    assert "_mapfold" not in str(mapped.prepared.schedule)
+    _assert_bitwise(folded_result, mapped_result, "folded vs map pass")
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
