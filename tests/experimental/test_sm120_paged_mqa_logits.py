@@ -1031,6 +1031,11 @@ def test_sm120_sequence_programs_share_one_text_per_atom_variant():
     # Device routes (tuned per-device programs) reference their own units.
     for route in catalog["device_routes"].values():
         referenced.update(catalog["programs"][route["sequence"]]["sources"])
+    # A scheduler the device-route sequences share ships as a module record
+    # that is not standalone; its binding is referenced by that record.
+    for record in catalog["programs"].values():
+        if record.get("kind") == "module" and record.get("standalone") is False:
+            referenced.update(record["sources"])
     generated_dir = csrc / generated.removeprefix("csrc/")
     orphans = sorted(
         p.name

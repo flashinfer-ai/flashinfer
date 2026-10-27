@@ -502,10 +502,12 @@ def program_names(route=None):
 def program_spec(arch, name):
     """FlashInfer JIT build specification of one generated program.
 
-    The CTA budget is the launch grid, never a definition.  The only
-    compile-line definitions are a route's page size and ``next_n`` for the
-    texts several routes share (``-DPAGE_KV`` / ``-DNEXT_N`` in the record's
-    ``compile_flags``).  The architecture is part of the spec name so two
+    The CTA budget is the launch grid, never a definition.  The compile-line
+    definitions in the record's ``compile_flags`` only select within a shared
+    text: a default route's page size and ``next_n`` (``-DPAGE_KV`` /
+    ``-DNEXT_N``) and a device route's logits kernel symbol and host-shim
+    namespace in a shared binding (``-DCAKE_LOGITS_KERNEL`` /
+    ``-DCAKE_LOGITS_SHIM``).  The architecture is part of the spec name so two
     architectures never share one cached library.
     """
     from flashinfer.jit import env

@@ -8,7 +8,9 @@ entry uses.  The committed catalog and a synthetic catalog with populated
 tables both run through the same checks.  The synthetic static device routes
 reuse shipped sequences, so the GPU checks launch them on an SM120 device (with
 the device SM count monkeypatched to the table's key); the synthetic ``dyn``
-route checks the plan-private schedule binding without a launch.
+route checks the plan-private schedule binding without a launch.  Every
+committed device route also launches, driven by one of its table entries, and
+must score the default route's bits.
 """
 
 import copy
@@ -71,6 +73,7 @@ def _synthetic_catalog():
     catalog = copy.deepcopy(_runtime._catalog())
     routes, programs = catalog["routes"], catalog["programs"]
     device = catalog["device_routes"]
+    device.clear()  # the synthetic routes replace the committed ones
     device[T0] = {**routes["sm120:fp8:h32:p64:n4:a2"], "schedule": {"kind": "static"}}
     device[T1] = dict(routes["sm120:fp8:h32:p64:n4:a4"])
     device[T2] = dict(routes["sm120:fp8:h64:p64:n5:a2"])
@@ -460,7 +463,7 @@ def test_schedule_atoms_and_the_metadata_num_heads_rule(catalog):
     counts disagree on the atom count; with no table entry this is the
     default rule (:func:`next_n_atoms` without device arguments).
     """
-    synthetic = bool(catalog["device_routes"])
+    synthetic = catalog["policy"]["device_rule"]["tables"] == SYNTHETIC_TABLES
     geometries, batches, hints, devices = _grid(catalog)
     pages = sorted(_runtime.exported_page_sizes())
     for next_n in _runtime.exported_next_n():
@@ -797,3 +800,71 @@ def test_dyn_route_binds_the_private_schedule(monkeypatch):
             schedule_meta=torch.zeros((1694, 2), dtype=torch.int32, device="cuda"),
             max_context_hint=HINT_C16K,
         )
+
+
+def _committed_route_cases():
+    """One table entry per committed device route: ``(route, sms, key, batch)``."""
+    rule = _runtime._catalog()["policy"]["device_rule"]
+    cases = {}
+    for sms, table in sorted(rule["tables"].items()):
+        for key, entries in sorted(table.items()):
+            for batch, route in entries:
+                if route is not None and route not in cases:
+                    cases[route] = (route, int(sms), key, int(batch))
+    return [cases[route] for route in sorted(cases)]
+
+
+@pytest.mark.parametrize(
+    "case",
+    _committed_route_cases()
+    or [pytest.param(None, marks=pytest.mark.skip(reason="no committed device route"))],
+    ids=lambda case: case[0] if case else "none",
+)
+def test_committed_device_route_matches_the_default_route(monkeypatch, case):
+    """Every committed device route, driven by its table entry, scores the default route's bits.
+
+    The device SM count is monkeypatched to the table's key and the hint is the
+    window's lower bound, so the route runs on either SM120 device; contexts
+    stay small.  A ``dyn`` route also runs twice to the same bits and leaves
+    the caller's ``schedule_meta`` unwritten.
+    """
+    route, sms, key, batch = case
+    arch = _sm120_arch()
+    monkeypatch.setattr(_runtime, "device_facts", lambda index: (arch, sms))
+    heads, page_kv, next_n, _atom, window = TABLE_KEY.match(key).groups()
+    heads, page_kv, next_n = int(heads), int(page_kv), int(next_n)
+    hint = int(_runtime.device_rule()["ctx_windows"][window][0])
+    data = _inputs(heads, page_kv, next_n, batch, 256, seed=53)
+    caller = torch.full((sms + 1, 2), -7, dtype=torch.int32, device="cuda")
+    args = (
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        data["max_context_len"],
+    )
+    plan = prepare_sm120_paged_mqa_logits(
+        *args, schedule_meta=caller, max_context_hint=hint
+    )
+    record = _runtime.route_record(route)
+    assert plan.route_name == route and plan.route is record
+    assert plan.program_names == [record["sequence"]]
+    assert plan.launch_count == 1 and plan.kernel_launches == 2
+    default = prepare_sm120_paged_mqa_logits(*args)
+    assert default.route_name == _runtime.route_name(heads, page_kv, next_n, batch)
+    plan.output.fill_(float("nan"))
+    default.output.fill_(float("nan"))
+    plan.run()
+    default.run()
+    torch.cuda.synchronize()
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    inside = _inside(data)
+    assert torch.equal(plan.logical_output[inside], default.logical_output[inside])
+    if plan.schedule["kind"] == "dyn":
+        first = plan.logical_output.clone()
+        plan.output.fill_(float("nan"))
+        plan.run()
+        torch.cuda.synchronize()
+        assert torch.equal(plan.logical_output[inside], first[inside])
+        assert bool((caller == -7).all())

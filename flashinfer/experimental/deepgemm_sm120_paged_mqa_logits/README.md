@@ -90,8 +90,10 @@ program is shared by every route (route `sm120:metadata`).
 
 The launch grid of the logits program **is** the CTA budget: no compile-line
 definition carries an SM count, so one delivered text serves every SM count and
-every `sm_count` override. The only compile-line definitions are the page size
-and `next_n` of the texts that several routes share (see "Layout").
+every `sm_count` override. The compile-line definitions only select between
+texts that several routes share: the page size and `next_n` of a shared default
+route text, and the kernel symbol and host-shim namespace of a shared device
+route binding (see "Layout").
 
 ## Device routes
 
@@ -288,13 +290,20 @@ definition set preprocesses to the kernel it replaced. Each definition set also
 keeps the kernel symbol and host-shim namespace of the unit it replaced (the
 `CAKE_PROGRAM_KERNEL` / `CAKE_PROGRAM_SHIM` ladder at the top of the text), so
 every JIT module exports its own symbols although the modules share one
-process. The runtime and the
+process. Device-route programs have one device source each; their sequence
+bindings export `run` (the records' `ffi_entry`), and the bindings that differ
+only in the logits kernel symbol and the host-shim namespace are one file: each
+record that lists it carries `-DCAKE_LOGITS_KERNEL=<its kernel>` and
+`-DCAKE_LOGITS_SHIM=<its namespace>` in `compile_flags`, and the values written
+in the file are those of the program it was exported for. The runtime and the
 program/route catalog are in this directory; the public API is
 `flashinfer/sm120_paged_mqa_logits.py`.
 
 ```bash
 pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
+pytest tests/experimental/test_cake_sm120_paged_mqa_device_routes.py -q
 python benchmarks/bench_sm120_paged_mqa_logits.py
+python benchmarks/bench_sm120_paged_mqa_logits.py --hint none  # default routes only
 ```
 
 The test covers every shipped `(heads, page_kv, next_n, atom)` program — both
