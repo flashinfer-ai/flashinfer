@@ -25,7 +25,7 @@
 // TMA lands the fp8 weight tile and the 16-bit activation tile in smem, each consumer
 // warpgroup pulls its 64 weight rows into registers, converts them (w8a16_convert.hpp) and
 // issues wgmma with A from registers and B from smem.  The operand mapping, the fused
-// epilogue and the host-side lifecycle (arguments, workspace, run) are in w8a16_host.hpp.
+// epilogue and the host-side lifecycle (arguments, workspace, run) are in w8a16_dispatch.hpp.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -47,7 +47,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
 #include "flashinfer/gemm/w8a16_convert.hpp"
-#include "flashinfer/gemm/w8a16_host.hpp"
+#include "flashinfer/gemm/w8a16_dispatch.hpp"
 #include "flashinfer/gemm/w8a16_sm90/scheduler.hpp"
 #include "flashinfer/gemm/w8a16_sm90/tile_order.hpp"
 
@@ -184,7 +184,7 @@ struct W8A16Sm90Gemm {
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
 
-  // The shared arguments (w8a16_host.hpp) plus the tile walk order (tile_order.hpp): raster
+  // The shared arguments (w8a16_dispatch.hpp) plus the tile walk order (tile_order.hpp): raster
   // "m" everywhere; the grouped scheduler takes its L2 group size through max_swizzle_size,
   // CUTLASS's own schedulers get 1 (no grouping, no padding).
   static typename Gemm::Arguments MakeArguments(const T* act, const __nv_fp8_e4m3* weight,

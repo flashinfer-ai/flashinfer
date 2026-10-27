@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_GEMM_W8A16_HOST_HPP_
-#define FLASHINFER_GEMM_W8A16_HOST_HPP_
+#ifndef FLASHINFER_GEMM_W8A16_DISPATCH_HPP_
+#define FLASHINFER_GEMM_W8A16_DISPATCH_HPP_
 
 // Host-side lifecycle shared by the Hopper and Blackwell W8A16 kernel variants: the CUTLASS
 // problem arguments common to both, the workspace size, and the run sequence.  A variant
@@ -188,4 +188,4 @@ cudaError_t W8A16RunVariant(const T* act, const __nv_fp8_e4m3* weight, const flo
 
 }  // namespace flashinfer::gemm
 
-#endif  // FLASHINFER_GEMM_W8A16_HOST_HPP_
+#endif  // FLASHINFER_GEMM_W8A16_DISPATCH_HPP_

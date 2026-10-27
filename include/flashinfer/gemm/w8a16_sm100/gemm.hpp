@@ -31,7 +31,7 @@
 // (w8a16_convert.hpp) and write the 16-bit copy to TMEM, or to smem for the tile whose
 // accumulators take all of TMEM (AInSmem below); the MMA warp issues tcgen05.mma with A from
 // there and B (the activation) from smem.  The operand mapping, the fused epilogue and the
-// host-side lifecycle (arguments, workspace, run) are in w8a16_host.hpp.
+// host-side lifecycle (arguments, workspace, run) are in w8a16_dispatch.hpp.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -53,7 +53,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
 #include "flashinfer/gemm/w8a16_convert.hpp"
-#include "flashinfer/gemm/w8a16_host.hpp"
+#include "flashinfer/gemm/w8a16_dispatch.hpp"
 #include "flashinfer/gemm/w8a16_sm100/builder.hpp"
 #include "flashinfer/gemm/w8a16_sm100/collective.hpp"
 #include "flashinfer/gemm/w8a16_sm100/kernel.hpp"
@@ -178,7 +178,7 @@ struct W8A16Sm100Gemm {
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
 
-  // The shared arguments (w8a16_host.hpp) plus the tile order (tile_order.hpp): how many
+  // The shared arguments (w8a16_dispatch.hpp) plus the tile order (tile_order.hpp): how many
   // tiles the in-flight clusters group along the fast axis (L2 reuse of a weight band x
   // activation band instead of a line of tiles), which axis walks fastest, and the TMA
   // loads' L2 eviction priority.
