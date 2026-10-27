@@ -164,7 +164,10 @@ def test_bf16_unmeasured_shapes_have_bounded_candidates(
     moe.runtime.clear_artifact_cache()
     try:
         first, second = moe._selected_kernels(17, 512, 768, 16, 4, "cpu", SwiGLU())
-        assert 1 <= len(first) <= heuristics.STAGE_BUDGET
+        grouped = tuple(k for k in first if not k.gathers_input)
+        gathered = tuple(k for k in first if k.gathers_input)
+        assert 1 <= len(grouped) <= heuristics.STAGE_BUDGET
+        assert len(gathered) <= heuristics.STAGE_BUDGET
         assert 1 <= len(second) <= heuristics.STAGE_BUDGET
         assert all(kernel.arch == arch for kernel in (*first, *second))
     finally:
@@ -240,7 +243,8 @@ def test_unmeasured_shapes_all_dtypes_and_activations_graph(
 
     with autotune():
         choices = runner.get_valid_tactics(inputs, None)
-    assert len(choices) <= 4
+    # Two grouped FC1 finalists and one GATHER finalist pair with two FC2s.
+    assert len(choices) <= 6
     output = runner.forward(inputs, choices[0])
     reference = _bf16_moe_reference(act, weights, activation)
     assert (output.float() - reference.float()).norm() / reference.float().norm() < 0.01

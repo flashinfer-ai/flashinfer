@@ -122,10 +122,11 @@ def select_kernels(
     experts,
     topk,
     sm_count,
+    cluster_capacities=(),
 ):
     """Use measured choices or bound the unmeasured search for every dtype."""
     from .heuristics import select_stages
-    from .shortlist import select_profiles
+    from .shortlist import CompleteChoices, select_profiles
 
     if not first or not second:
         return (), ()
@@ -137,7 +138,7 @@ def select_kernels(
     # validated when reading the shortlist; rank the remaining legal pool.
     if choices is None or any(
         not set(identities) <= {kernel.artifact_id for kernel in pool}
-        for pool, identities in zip((first, second), choices, strict=True)
+        for pool, identities in zip((first + fused, second), choices, strict=True)
     ):
         return select_stages(
             first,
@@ -149,7 +150,55 @@ def select_kernels(
             experts=experts,
             topk=topk,
             sm_count=sm_count,
+            cluster_capacities=cluster_capacities,
         )
+    if isinstance(choices, CompleteChoices) or any(
+        kernel.artifact_id in choices[0] for kernel in fused
+    ):
+        # Complete offline profiles include input routing, output quantization
+        # and reduction choices; retain their measured end-to-end candidate set.
+        return select_profiles(profiles, tokens, first + fused, second)
+    # Old offline profiles predate fused FC2. Preserve those choices and let
+    # stage tuning compare them with the bounded, independently legal COMBINE pool.
+    from .heuristics import stage_candidates
+
+    combine = stage_candidates(
+        tuple(k for k in second if getattr(k, "combines_output", False)),
+        rows=tokens * topk,
+        n=hidden,
+        k=intermediate,
+        experts=experts,
+        sm_count=sm_count,
+        cluster_capacities=cluster_capacities,
+        budget=2,
+    )
+    gather = stage_candidates(
+        tuple(k for k in first if getattr(k, "gathers_input", False)),
+        rows=tokens * topk,
+        n=intermediate,
+        k=hidden,
+        experts=experts,
+        sm_count=sm_count,
+        cluster_capacities=cluster_capacities,
+        budget=2,
+    )
     first, second = select_profiles(profiles, tokens, first, second)
-    tiles = {kernel.tactic_metadata["tile"] for kernel in first}
-    return first + tuple(k for k in fused if k.tactic_metadata["tile"] in tiles), second
+    first += tuple(k for k in gather if k not in first)
+    second += tuple(k for k in combine if k not in second)
+    tiles = {
+        gather: {
+            kernel.tactic_metadata["tile"]
+            for kernel in first
+            if getattr(kernel, "gathers_input", False) == gather
+        }
+        for gather in (False, True)
+    }
+    return (
+        first
+        + tuple(
+            k
+            for k in fused
+            if k.tactic_metadata["tile"] in tiles[getattr(k, "gathers_input", False)]
+        ),
+        second,
+    )

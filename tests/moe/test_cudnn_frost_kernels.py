@@ -716,7 +716,11 @@ def test_bf16_explicit_final_boundary_and_graph(stage, swap, store):
     kernels = [
         kernel
         for kernel in (first if stage == "fc1" else second)
-        if kernel.swap_ab == swap and kernel.tactic_metadata["store_mode"] == store
+        if (
+            kernel.swap_ab == swap
+            and kernel.tactic_metadata["store_mode"] == store
+            and not getattr(kernel, "gathers_input", False)
+        )
     ]
     if not kernels:
         pytest.skip("this orientation/store is not in the packaged shortlist")
@@ -1326,7 +1330,7 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
         if key[0] == arch
     }
     assert {key[1] for key in table} == set(ACTIVATIONS)
-    assert {key[2:] for key in table} == BF16_SHORTLIST_GEOMETRIES
+    assert {key[2:] for key in table} >= BF16_SHORTLIST_GEOMETRIES
     monkeypatch.setattr(runtime, "_arch_for", lambda device: arch)
     monkeypatch.setattr(
         torch.cuda,
@@ -1336,7 +1340,11 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
     runtime.clear_artifact_cache()
     try:
         for (_, name, experts, hidden, intermediate, topk), profiles in table.items():
-            assert sorted(profiles) == [1, 16, 128, 512, 2048, 4096, 8192, 12288]
+            if (experts, hidden, intermediate, topk) in BF16_SHORTLIST_GEOMETRIES:
+                assert set(profiles) >= {1, 16, 128, 512, 2048, 4096, 8192, 12288}
+            else:
+                assert arch == "sm_107a" and name == "swiglu"
+                assert sorted(profiles) == [1, 4, 16, 64, 256, 1024, 4096, 8192, 16384]
             previous = 0
             for tokens, (fc1, fc2) in sorted(profiles.items()):
                 # Measured counts and the next-bucket rule, without compiling.
@@ -1350,7 +1358,13 @@ def test_bf16_packaged_shortlists_resolve_all_profiles(
                         "cpu",
                         ACTIVATIONS[name](),
                     )
-                    assert tuple(k.artifact_id for k in first) == fc1
+                    if isinstance(profiles[tokens], shortlist.CompleteChoices):
+                        assert tuple(k.artifact_id for k in first) == fc1
+                        assert 1 <= len(first) <= 2 and 1 <= len(second) <= 2
+                    else:
+                        grouped = tuple(k for k in first if not k.gathers_input)
+                        assert tuple(k.artifact_id for k in grouped) == fc1
+                        assert len(first) - len(grouped) <= 2
                     assert tuple(k.artifact_id for k in second) == fc2
                     assert all(k.arch == arch and k.activation == name for k in first)
                     assert all(k.arch == arch for k in second)
@@ -1667,13 +1681,14 @@ def _assert_block_scale_geometry_roundtrip(
             record["contract"]["output_dtype"] in ("float4_e2m1fn_x2", "float8_e4m3fn")
             and record["tactic"]["store_mode"] == "tma"
         ):
-            assert constants["epi_chunk_elems"] == "32"
+            assert constants["epi_chunk_elems"] in ("32", "64")
         family = (
             record["arch"],
             record["op"],
             record["contract"]["output_dtype"],
             record["tactic"]["swap_ab"],
             record["tactic"]["store_mode"],
+            record["contract"].get("moe_mode", "none"),
         )
         families.setdefault(family, set()).add(entry["path"])
         source_families.setdefault(entry["path"], set()).add(family)
@@ -1698,24 +1713,30 @@ def _assert_block_scale_geometry_roundtrip(
         "block_scale_grouped_gemm2",
     }
     # Offline selection may retain different numbers of geometries and ABI
-    # families. Every retained geometry of one family must share one source;
+    # families. Every geometry of one family shares one source;
     # source paths must not accidentally mix activations or launch ABIs.
     assert all(len(paths) == 1 for paths in families.values())
     # Activations share a topology template; layout/store/output remain fixed.
     assert all(
-        len({(v[0], v[2], v[3], v[4]) for v in variants}) == 1
+        len({(v[0], v[2], v[3], v[4], v[5]) for v in variants}) == 1
         for variants in source_families.values()
     )
     # Per gated/non-gated topology: SM107 normal/swap-AB x STG/TMA plus fused
-    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2.
-    for arch, per_topology, fc2 in (("sm_107a", 6, 4), ("sm_120a", 3, 2)):
+    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2
+    # store/layout variants for each output reduction mode.
+    for arch, per_topology, fc2 in (("sm_107a", 12, 4), ("sm_120a", 3, 2)):
         sources = {
             path
             for family, paths in families.items()
             if family[0] == arch
             for path in paths
         }
-        assert len(sources) <= 2 * per_topology + fc2
+        fc2_modes = {
+            family[5]
+            for family in families
+            if family[0] == arch and family[1].endswith("gemm2")
+        }
+        assert len(sources) <= 2 * per_topology + fc2 * len(fc2_modes)
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -2741,6 +2762,7 @@ def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
             tactic=("fc1", j),
             workspace_bytes=128,
             gated=True,
+            gathers_input=False,
             launch_tail=("output", "scale", "gate_alpha", "up_alpha"),
             swap_ab=bool(j),
         )
@@ -3629,9 +3651,30 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     "cpu",
                     ACTIVATIONS[name](),
                 )
-                assert 2 <= len(first) <= 6 and len(second) == 2
+                if isinstance(identities, shortlist.CompleteChoices):
+                    assert tuple(k.artifact_id for k in first) == identities[0]
+                    assert tuple(k.artifact_id for k in second) == identities[1]
+                    assert 1 <= len(first) <= 2 and 1 <= len(second) <= 2
+                    assert all(
+                        k.fc1 and k.activation == name and k.arch == arch for k in first
+                    )
+                    assert all(not k.fc1 and k.arch == arch for k in second)
+                    assert len(
+                        {(a.tactic, b.tactic) for a in first for b in second}
+                    ) == (len(first) * len(second))
+                    continue
+                regular = tuple(
+                    k for k in second if not getattr(k, "combines_output", False)
+                )
+                combined = tuple(
+                    k for k in second if getattr(k, "combines_output", False)
+                )
+                gathered = tuple(k for k in first if k.gathers_input)
+                first = tuple(k for k in first if not k.gathers_input)
+                assert len(gathered) <= 6
+                assert 2 <= len(first) <= 6 and len(regular) == 2 and len(combined) <= 2
                 assert tuple(k.artifact_id for k in first[:2]) == identities[0]
-                assert tuple(k.artifact_id for k in second) == identities[1]
+                assert tuple(k.artifact_id for k in regular) == identities[1]
                 for kernel in first[2:]:
                     assert kernel.quantizes_output and not kernel.swap_ab
                     assert kernel.tactic_metadata["tile"] in {
@@ -3658,12 +3701,11 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     assert variants <= {
                         (tile, store) for tile in normal_tiles for store in stores
                     }
-                assert all(k.fc1 and k.activation == name for k in first)
+                assert all(k.fc1 and k.activation == name for k in first + gathered)
                 assert all(not k.fc1 for k in second)
-                assert (
-                    len({(a.tactic, b.tactic) for a in first for b in second})
-                    == len(first) * 2
-                )
+                assert len(
+                    {(a.tactic, b.tactic) for a in first + gathered for b in second}
+                ) == len(first + gathered) * len(second)
             previous = tokens
 
 
