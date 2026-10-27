@@ -14,6 +14,8 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+qsa_forward_h12_kv1_d256.json
+qsa_indexed_forward_h12_kv1_d256.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -479,6 +481,37 @@ flashinfer.apply_rope_with_cos_sin_cache(
 flashinfer.apply_rope_with_cos_sin_cache_inplace(
     rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
 )
+
+
+def example_qsa():
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        print("Skipping QSA examples: requires SM100/SM103/SM107")
+        return
+    q = torch.randn(8, 12, 256, dtype=torch.bfloat16, device=device)
+    k = torch.randn(8, 1, 256, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    token = torch.arange(8, device=device, dtype=torch.int32)
+    zeros = torch.zeros_like(token)
+    first = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    flashinfer.qsa_forward(
+        q,
+        k,
+        v,
+        torch.ones(8, 2, device=device, dtype=torch.uint8),
+        zeros,
+        token,
+        zeros,
+        zeros,
+        first,
+        first + 3,
+    )
+    if capability in ((10, 0), (10, 3)):
+        indices = torch.where(token[None, :] <= token[:, None], token[None, :], -1)
+        flashinfer.qsa_indexed_forward(q, k, v, indices)
+
+
+example_qsa()
 
 
 def example_dsv41_fp4_cache():
