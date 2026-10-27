@@ -6228,3 +6228,95 @@ cute_dsl_batch_prefill_run_trace = TraceTemplate(
     tags=["status:verified", "stage:prefill", "backend:cute-dsl"],
     reference=_cute_dsl_batch_prefill_run_reference,
 )
+
+
+# ---------------------------------------------------------------------------
+# PrimTS DSA (GLM-5.3 / DeepSeek-V3.2) token-sparse MLA decode, 1CTA
+# ---------------------------------------------------------------------------
+
+
+def _dsa_sparse_mla_axes() -> dict[str, Var | Const]:
+    return {
+        "total_q": Var(description="Packed query-token count T."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", value=576),
+        "v_dim": Const(abbrev="", value=512),
+        "pool_rows": Var(description="Token rows in the flat KV pool."),
+        "sparse_mla_top_k": Const(abbrev="k"),
+        "batch_size": Var(
+            description="Requests of the trtllm-gen parity placeholders."
+        ),
+        "batch_size_plus_1": Var(description="Length of cum_seq_lens_q."),
+    }
+
+
+def _dsa_sparse_mla_inputs() -> dict[str, Tensor | Scalar]:
+    return {
+        "query": Tensor(["total_q", "num_heads", "head_dim"]),
+        "block_tables": Tensor(
+            ["total_q", "sparse_mla_top_k"],
+            dtype="int32",
+            description=(
+                "Flat token-row indices (page_id * page_size + offset) of the "
+                "routed KV rows; -1 marks an empty slot anywhere in the row."
+            ),
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            optional=True,
+            description="Interface parity with trtllm-gen; not read by the kernel.",
+        ),
+        "cum_seq_lens_q": Tensor(
+            ["batch_size_plus_1"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Interface parity with trtllm-gen (prefix sums, batch_size + 1 "
+                "entries); not read by the kernel."
+            ),
+        ),
+        "sparse_mla_top_k_lens": Tensor(
+            ["total_q"],
+            dtype="int32",
+            optional=True,
+            description="Active routing prefix per query token (defaults to the full width).",
+        ),
+        "bmm1_scale": Scalar("float32", optional=True),
+        "bmm2_scale": Scalar("float32", optional=True),
+        "skip_corr_threshold": Scalar(
+            "float32",
+            optional=True,
+            description="E4M3 skip-correction threshold in log2 units, in [0, 8].",
+        ),
+    }
+
+
+_DSA_SPARSE_MLA_CONSTRAINTS = [
+    "num_heads in (64, 128)",
+    "head_dim == 576",
+    "sparse_mla_top_k >= 4",
+    "sparse_mla_top_k % 4 == 0",
+]
+
+prims_ts_dsa_sparse_mla_fp8_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsa_sparse_mla_fp8",
+    description=(
+        "PrimTS 1CTA DSA sparse MLA decode: packed E4M3 queries attend to the "
+        "top-k rows of a flat E4M3 [N, 576] KV pool selected per query token; "
+        "BF16 output."
+    ),
+    axes=_dsa_sparse_mla_axes(),
+    inputs={
+        **_dsa_sparse_mla_inputs(),
+        "kv_cache": Tensor(["pool_rows", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["total_q", "num_heads", "v_dim"], dtype="bfloat16", param="out"
+        ),
+    },
+    constraints=_DSA_SPARSE_MLA_CONSTRAINTS,
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsa"],
+)

@@ -35,6 +35,7 @@ from ...tensor_map import (
     create_tensor_map_tiled_from_view,
 )
 from cutlass.experimental import cuda
+from cutlass._mlir.dialects import llvm
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
@@ -99,6 +100,7 @@ from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BA
 from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
+    runtime_request_publishes,
     runtime_query_tile_is_active,
     runtime_split_pruning_is_profitable,
     runtime_split_tile_is_active,
@@ -453,6 +455,32 @@ def _make_clc_work_queue_and_throttle(
     )
 
 
+def _gmem_pointer_to_generic(gmem_ptr, *, loc=None, ip=None):
+    """Cast a runtime GMEM tensor-map address for ``prefetch.tensormap``."""
+
+    if gmem_ptr.memspace == cutlass.AddressSpace.generic:
+        return gmem_ptr
+    if gmem_ptr.memspace != cutlass.AddressSpace.gmem:
+        raise ValueError(
+            "tensor-map prefetch expects a GMEM or generic pointer, got "
+            f"{gmem_ptr.memspace}"
+        )
+    llvm_ptr = gmem_ptr.to_llvm_ptr(loc=loc, ip=ip)
+    generic_llvm_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(cutlass.AddressSpace.generic),
+        llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_ptr(
+        gmem_ptr.value_type,
+        generic_llvm_ptr,
+        mem_space=cutlass.AddressSpace.generic,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def build_throughput_latency_mla_task_manager(
     cfg: MlaConfig,
     *,
@@ -464,6 +492,7 @@ def build_throughput_latency_mla_task_manager(
     tma_desc_c_rope=None,
     tma_desc_v=None,
     c_rope_tensor=None,
+    raw_gather4_descs=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -516,6 +545,7 @@ def build_throughput_latency_mla_task_manager(
             tma_desc_c_rope=tma_desc_c_rope,
             tma_desc_v=tma_desc_v,
             c_rope_tensor=c_rope_tensor,
+            raw_gather4_descs=raw_gather4_descs,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
@@ -725,6 +755,7 @@ def build_throughput_latency_mla_task_manager(
         tma_desc_v=tma_desc_v,
         tma_desc_bulk_extra=tma_desc_q_rope,
         c_rope_tensor=c_rope_tensor,
+        raw_gather4_descs=raw_gather4_descs,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1155,6 +1186,7 @@ def _make_single_kv_pipe_task_graph(
     tma_desc_c_rope=None,
     tma_desc_v=None,
     c_rope_tensor=None,
+    raw_gather4_descs=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -1344,6 +1376,7 @@ def _make_single_kv_pipe_task_graph(
         tma_desc_v=tma_desc_v,
         tma_desc_bulk_extra=tma_desc_q_rope,
         c_rope_tensor=c_rope_tensor,
+        raw_gather4_descs=raw_gather4_descs,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1362,6 +1395,7 @@ def _make_single_kv_pipe_task_graph(
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
         cache_seqs=cache_seqs,
+        page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
         batch_idx=batch_idx,
@@ -1407,7 +1441,7 @@ def _make_single_kv_pipe_task_graph(
 
     local_resource = (
         SmemSoftmaxLocalResource
-        if cfg.num_tokens_per_page == 1
+        if cfg.native_sparse_pages
         else TmemSoftmaxLocalResource
     )
     local = local_resource(
@@ -1515,7 +1549,25 @@ def _make_single_kv_pipe_task_graph(
             ),
         ]
     )
-    if not use_clc_dynamic:
+    if cfg.is_dynamic_token_sparse:
+        # The token-sparse layout moves the loader to W12-15 with page
+        # offsets on W10; pad W11 unless it loads or stages page offsets, and
+        # whichever of warps 9-10 stays unused.
+        used = set(range(cfg.load_warp_idx, cfg.load_warp_idx + cfg.load_num_warps))
+        used.add(cfg.page_offsets_warp_idx)
+        pad_warps = [11] if not use_clc_dynamic and 11 not in used else []
+        pad_warps += [w for w in (9, 10) if w not in used]
+        for pad_warp in pad_warps:
+            tasks.append(
+                create_padding_task(
+                    cfg,
+                    work_queue,
+                    warp_idx=pad_warp,
+                    num_warps=1,
+                    task_class=MlaDecodeTask,
+                )
+            )
+    elif not use_clc_dynamic:
         tasks.append(
             create_padding_task(
                 cfg,
@@ -1545,7 +1597,7 @@ def _make_single_kv_pipe_task_graph(
             )
         )
 
-    if cfg.load_warp_idx == 12:
+    if cfg.load_warp_idx == 12 and not cfg.is_dynamic_token_sparse:
         idle = create_padding_task(
             cfg, work_queue, warp_idx=9, num_warps=1, task_class=MlaDecodeTask
         )
@@ -1613,7 +1665,6 @@ def _make_single_kv_pipe_task_graph(
             )
         },
     }
-
     smem_allocator = SmemAllocator()
     if isinstance(work_queue, ThroughputLatencyMlaClcWorkQueue):
         work_queue._response_allocator = smem_allocator
@@ -1681,6 +1732,7 @@ class ThroughputLatencyMlaDecodeTs:
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
+        is_dynamic_token_sparse: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1703,6 +1755,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.profile = profile
         self.persistent_wave_sm_count = persistent_wave_sm_count
         self.reduction_mode = reduction_mode
+        self.is_dynamic_token_sparse = bool(is_dynamic_token_sparse)
         self.logical_num_heads = logical_num_heads
         self.logical_seq_len_q = logical_seq_len_q
         self.tile_size_q = tile_size_q
@@ -1857,6 +1910,7 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
             softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
+            is_dynamic_token_sparse=self.is_dynamic_token_sparse,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
@@ -1941,10 +1995,15 @@ class ThroughputLatencyMlaDecodeTs:
         block_split_kvs: object,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
+        raw_tma_descriptors: cute.Tensor | None,
         stream: object,
         output_quant_args=None,
     ):
-        """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
+        """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q.
+
+        ``raw_tma_descriptors`` is only read by the token-sparse configuration:
+        the two encoded Gather4 ``CUtensorMap``s (latent and RoPE maps).
+        """
         cfg = self._make_config()
 
         # Public fixed tensors use [H,D,SQ,B]/[H,SQ,B]; compact ragged tensors
@@ -2102,7 +2161,7 @@ class ThroughputLatencyMlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+        if cutlass.const_expr(cfg.native_sparse_pages):
             # Sparse routes address individual rows; the unused D512 RoPE
             # descriptor slot carries the independent compressed-pool map.
             c_rows = cute.make_tensor(
@@ -2157,11 +2216,11 @@ class ThroughputLatencyMlaDecodeTs:
                 swizzle=c_rope_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
-        elif cutlass.const_expr(cfg.num_tokens_per_page != 1):
+        elif cutlass.const_expr(not cfg.native_sparse_pages):
             tma_desc_c_rope = tma_desc_c_latent
 
         tma_desc_v = tma_desc_c_latent
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+        if cutlass.const_expr(cfg.native_sparse_pages):
             # D512 does not use Q-rope; reuse its descriptor slot for the
             # second pool's contiguous-run map. Gather maps stay separate.
             rows_per_issuer = 32
@@ -2259,6 +2318,7 @@ class ThroughputLatencyMlaDecodeTs:
             output_scale,
             tile_sched_params,
             block_split_kvs,
+            raw_tma_descriptors,
             output_quant_args,
         ).launch(
             grid=grid,
@@ -2373,10 +2433,17 @@ class ThroughputLatencyMlaDecodeTs:
         output_scale: cutlass.Float32,
         tile_sched_params: object,
         sparse_inputs: object,
+        raw_tma_descriptors: cute.Tensor | None,
         output_quant_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse and acc_o is not None):
+            # Split-KV launches use PDL (for the reducer); wait for the
+            # upstream grid before reading Q / routes / pools in case the
+            # producer of those inputs (e.g. the top-k indexer) releases its
+            # dependents early.  No-op when it does not.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
@@ -2455,7 +2522,7 @@ class ThroughputLatencyMlaDecodeTs:
             # An empty request publishes neither O/LSE nor split scratch.
             # Cluster peers agree on this batch-owned predicate.
             query_tile_is_active = query_tile_is_active & (
-                cache_seqs[batch_idx] > Int32(0)
+                runtime_request_publishes(cfg, cache_seqs, batch_idx)
             )
             run_task_graph = query_tile_is_active and split_tile_is_active
         if cutlass.const_expr(tile_sched_params is not None):
@@ -2488,6 +2555,14 @@ class ThroughputLatencyMlaDecodeTs:
                     cute.arch.inline_ptx(
                         "prefetch.global.L2 [{$r0}];", read_only_args=[address]
                     )
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                # The Gather4 latent / RoPE maps at bytes 0 / 128.
+                prims.prefetch_tensormap(
+                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator)
+                )
+                prims.prefetch_tensormap(
+                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator + Int64(128))
+                )
 
         clc_response_ptr = None
 
@@ -2501,6 +2576,7 @@ class ThroughputLatencyMlaDecodeTs:
             tma_desc_c_rope=tma_desc_c_rope.get_ptr(),
             tma_desc_v=tma_desc_v.get_ptr(),
             c_rope_tensor=c_rope,
+            raw_gather4_descs=raw_tma_descriptors,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,

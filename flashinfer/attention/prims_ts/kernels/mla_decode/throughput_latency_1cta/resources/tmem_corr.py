@@ -60,8 +60,8 @@ from ...helpers.layout import (
     smem_array,
 )
 from ...helpers.math import (
-    neg_max_f32,
     ceil_div,
+    neg_max_f32,
     fadd2,
     ffma2,
     fmul2,
@@ -143,7 +143,7 @@ class TmemCorrResource(MlaResource):
     def _keeps_direct_output(self):
         return (
             self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page == 1
+            and self.cfg.native_sparse_pages
             and self.cfg.use_cluster_reduction != 1
         )
 
@@ -507,7 +507,7 @@ class TmemCorrResource(MlaResource):
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
             should_store_lse = lane_idx < Int32(16)
-            local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+            local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (lane_idx & Int32(0xF))
             head_idx = head_base_idx + local_row_idx
             scale_idx = Int32(0)
         else:
@@ -521,7 +521,7 @@ class TmemCorrResource(MlaResource):
             )
             head_idx = head_base_idx + local_row_idx
         if cutlass.const_expr(
-            self.cfg.num_tokens_per_page == 1 and self.cfg.use_cluster_reduction != 1
+            self.cfg.native_sparse_pages and self.cfg.use_cluster_reduction != 1
         ):
             should_store_lse = should_store_lse and cta_idx_head_dim_v == Int32(0)
         if should_store_lse:
@@ -553,8 +553,9 @@ class TmemCorrResource(MlaResource):
                         selected_max = final_max[group]
                 lse_sum = selected_sum
                 if cutlass.const_expr(self.cfg.is_fp8_qkv()):
-                    # P and the online sum use the same FP8 quantization scale.
-                    # Undo that scale for the externally visible log-sum-exp.
+                    # FP8 P is quantized as 448 * softmax(P) for BMM2 (1.75 *
+                    # softmax(P) with skip correction).  The online sum tracks
+                    # the same scale, so undo it for the visible log-sum-exp.
                     lse_sum = lse_sum * fp8_p_scale_rcp(self.cfg)
                 lse_val = (
                     cute.math.log2(lse_sum, fastmath=True)
@@ -1528,7 +1529,7 @@ class TmemCorrResource(MlaResource):
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         # Keeps-MMA-AB stores one head row per half-warp.  The low 16 lanes own
         # the row index; the upper lane bit selects the head-dim half.
-        local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+        local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (lane_idx & Int32(0xF))
         global_head_idx = head_base_idx + local_row_idx
         storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
             global_head_idx,

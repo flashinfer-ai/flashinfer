@@ -125,6 +125,10 @@ class TmemSResource(MlaResource):
     cta_idx_q: object = None
     cta_idx_kv: object = None
     sync_barrier_id: cutlass.Constexpr[int] = 0
+    # Token-sparse: the page-offset resource whose allocation carries the
+    # per-tile validity ring (see ``SPARSE_MASK_SLOTS`` in smem_resources).
+    page_offsets_kv: object = None
+    _sparse_mask_words: object = None
     q_desc_current: object = None
     q_desc_rope_current: object = None
     new_max_state: object = None
@@ -164,10 +168,7 @@ class TmemSResource(MlaResource):
 
     def get_smem_requirements(self):
         """Return the softmax scratch SMEM allocation."""
-        if (
-            self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page == 1
-        ):
+        if self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.native_sparse_pages:
             return []
         if self._scratch_alloc is None:
             self._scratch_alloc = SmemAllocation(
@@ -242,7 +243,7 @@ class TmemSResource(MlaResource):
         if cutlass.const_expr(
             not (
                 self.cfg.kernel_variant == "keeps_mma_ab"
-                and self.cfg.num_tokens_per_page == 1
+                and self.cfg.native_sparse_pages
             )
         ):
             self._softmax_scratch = smem_array(
@@ -251,9 +252,15 @@ class TmemSResource(MlaResource):
                 Uint32,
                 softmax_scratch_words(self.cfg),
             )
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            self._sparse_mask_words = smem_array(
+                context,
+                self.page_offsets_kv._alloc,
+                Int32,
+                self.page_offsets_kv.total_words,
+            )
         if cutlass.const_expr(
-            self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page != 1
+            self.cfg.kernel_variant == "keeps_mma_ab" and not self.cfg.keeps_ilp_softmax
         ):
             thread_idx = cute.arch.thread_idx()[0]
             state_ptr = self._softmax_scratch.data_ptr(thread_idx)
@@ -448,7 +455,7 @@ class TmemSResource(MlaResource):
 
         for idx in cutlass.range_constexpr(num_scale_groups):
             if cutlass.const_expr(
-                cfg.kernel_variant == "keeps_mma_ab" and cfg.num_tokens_per_page != 1
+                cfg.kernel_variant == "keeps_mma_ab" and not cfg.keeps_ilp_softmax
             ):
                 state_ptr = self._softmax_scratch.data_ptr(warp_grp_thread_idx)
                 old_max_vals[idx] = u32_bits_to_float(
@@ -496,7 +503,7 @@ class TmemSResource(MlaResource):
                 tile_size_kv=cfg.tile_size_kv,
             )
             if cutlass.const_expr(
-                cfg.num_tokens_per_page == 1 and cfg.logical_seq_len_q == 1
+                cfg.native_sparse_pages and cfg.logical_seq_len_q == 1
             )
             else raw_mask_routes
         )
@@ -515,8 +522,8 @@ class TmemSResource(MlaResource):
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
             loaded = tcgen05_ld_16x32bx2_f32(
                 prims.make_tmem_ptr(base_addr, Float32),
-                num=cfg.tile_size_kv // 2,
-                offset=Int32(cfg.tile_size_kv // 2),
+                num=num_s_regs_per_thread(cfg),
+                offset=Int32(num_s_regs_per_thread(cfg)),
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
@@ -547,6 +554,10 @@ class TmemSResource(MlaResource):
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Every tile may carry -1 (empty) slots; the validity ring is
+            # consulted unconditionally.
+            should_apply_dense_mask = cutlass.Boolean(True)
         needs_row_causal_mask = cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
         )
@@ -562,7 +573,7 @@ class TmemSResource(MlaResource):
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
             )
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+        if cutlass.const_expr(cfg.native_sparse_pages):
             if cutlass.const_expr(cfg.logical_seq_len_q == 1):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
@@ -576,8 +587,12 @@ class TmemSResource(MlaResource):
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
-                local_col_base = (lane_idx >> Int32(4)) * Int32(cfg.tile_size_kv // 2)
-                local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
+                local_col_base = (lane_idx >> Int32(4)) * Int32(
+                    num_s_regs_per_thread(cfg)
+                )
+                local_row_idx = (warp_idx & Int32(3)) * Int32(16) + (
+                    lane_idx & Int32(0xF)
+                )
                 row_seq_len_kv = seq_len_kv
                 if cutlass.const_expr(needs_row_causal_mask):
                     row_seq_len_kv = runtime_seq_len_kv_for_query_row(
@@ -588,16 +603,80 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
-                for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
-                    token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
-                    if invalid_sparse_token(
-                        token_idx,
-                        row_seq_len_kv,
-                        mask_routes,
-                        batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                fp8_token_sparse = cutlass.const_expr(
+                    cfg.is_dynamic_token_sparse and not needs_row_causal_mask
+                )
+                if cutlass.const_expr(fp8_token_sparse):
+                    # E4M3 token-sparse: this thread's 64 columns are tokens
+                    # [local_col_base, + 64) of the tile, validity words
+                    # (local_col_base >> 5) + {0, 1}.  One test covers the
+                    # common all-valid span; only a span that crosses the
+                    # token length or holds a -1 slot masks per column (the
+                    # per-column selects cost ~3x the softmax ALU work).
+                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
+
+                    fp8_mask_base = (
+                        Int32(self.page_offsets_kv.sparse_mask_word_base)
+                        + (tile_idx % Int32(SPARSE_MASK_SLOTS))
+                        * Int32(SPARSE_MASK_WORDS)
+                        + (local_col_base >> Int32(5))
+                    )
+                    fp8_word_a = Int32(self._sparse_mask_words[fp8_mask_base])
+                    fp8_word_b = Int32(
+                        self._sparse_mask_words[fp8_mask_base + Int32(1)]
+                    )
+                    span_end = (
+                        tile_offset_k
+                        + local_col_base
+                        + Int32(num_s_regs_per_thread(cfg))
+                    )
+                    if ((fp8_word_a & fp8_word_b) != Int32(-1)) | (
+                        span_end > row_seq_len_kv
                     ):
-                        s_vals[reg_idx] = neg_max_f32()
+                        for reg_idx in cutlass.range_constexpr(
+                            num_s_regs_per_thread(cfg)
+                        ):
+                            token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
+                            mask_word = fp8_word_b if reg_idx >= 32 else fp8_word_a
+                            if (token_idx >= row_seq_len_kv) | (
+                                ((mask_word >> Int32(reg_idx & 31)) & Int32(1))
+                                == Int32(0)
+                            ):
+                                s_vals[reg_idx] = neg_max_f32()
+                if cutlass.const_expr(not fp8_token_sparse):
+                    for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
+                        token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
+                        if invalid_sparse_token(
+                            token_idx,
+                            row_seq_len_kv,
+                            mask_routes,
+                            batch_idx,
+                            sparse=cfg.native_sparse_pages,
+                        ):
+                            s_vals[reg_idx] = neg_max_f32()
+                if cutlass.const_expr(
+                    cfg.is_dynamic_token_sparse and not fp8_token_sparse
+                ):
+                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
+
+                    half_cols = cfg.tile_size_kv // 2
+                    hi_half = local_col_base >= Int32(half_cols)
+                    mask_base = Int32(self.page_offsets_kv.sparse_mask_word_base) + (
+                        tile_idx % Int32(SPARSE_MASK_SLOTS)
+                    ) * Int32(SPARSE_MASK_WORDS)
+                    mask_w0 = Int32(self._sparse_mask_words[mask_base])
+                    mask_w1 = Int32(self._sparse_mask_words[mask_base + Int32(1)])
+                    mask_w2 = Int32(self._sparse_mask_words[mask_base + Int32(2)])
+                    mask_w3 = Int32(self._sparse_mask_words[mask_base + Int32(3)])
+                    # Word w covers tokens 32w .. 32w+31 (bit = token & 31).
+                    # ``local_col_base`` is 0 or 64, so this thread's 64 tokens
+                    # use words (local_col_base >> 5) + {0, 1}.
+                    word_a = mask_w2 if hi_half else mask_w0
+                    word_b = mask_w3 if hi_half else mask_w1
+                    for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
+                        mask_word = word_b if reg_idx >= 32 else word_a
+                        if ((mask_word >> Int32(reg_idx & 31)) & Int32(1)) == Int32(0):
+                            s_vals[reg_idx] = neg_max_f32()
             else:
                 local_idx_k0 = warp_idx * Int32(WARP_LANES) + (
                     lane_idx >> Int32(QUAD_LANE_SHIFT)
@@ -641,7 +720,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_base + 0] = neg_max_f32()
                     if invalid_sparse_token(
@@ -649,7 +728,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_base + 1] = neg_max_f32()
                     token_idx = (
@@ -660,7 +739,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_base + 2] = neg_max_f32()
                     if invalid_sparse_token(
@@ -668,7 +747,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_base + 3] = neg_max_f32()
                     token_idx = (
@@ -681,7 +760,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_second_panel_base + 0] = neg_max_f32()
                     if invalid_sparse_token(
@@ -689,7 +768,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_second_panel_base + 1] = neg_max_f32()
                     token_idx = (
@@ -702,7 +781,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_second_panel_base + 2] = neg_max_f32()
                     if invalid_sparse_token(
@@ -710,7 +789,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.num_tokens_per_page == 1,
+                        sparse=cfg.native_sparse_pages,
                     ):
                         s_vals[s_second_panel_base + 3] = neg_max_f32()
 
@@ -718,7 +797,7 @@ class TmemSResource(MlaResource):
             # Keeps-MMA-AB keeps the softmax state in scratch words indexed by
             # CTA thread, so only a warp-level max is needed here.
             local_max = old_max_vals[0]
-            if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+            if cutlass.const_expr(cfg.keeps_ilp_softmax):
                 max0 = local_max
                 max1 = neg_max_f32()
                 max2 = neg_max_f32()
@@ -903,8 +982,7 @@ class TmemSResource(MlaResource):
         # published local_sum_arr.  It updates the running denominator for the
         # next score tile without consuming a new score payload.
         if cutlass.const_expr(
-            self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page == 1
+            self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.keeps_ilp_softmax
         ):
             old_max = old_max_arr[0]
             new_max = new_max_arr[0]

@@ -30,6 +30,7 @@ from .decode import (
     suggest_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size,
 )
+from .dsa import prims_ts_dsa_sparse_mla_fp8
 from .context import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
@@ -87,6 +88,7 @@ __all__ = [
     "QTokenKvBlockSparsePagedTSWrapper",
     "get_q_token_kv_block_sparse_workspace_size",
     "q_token_kv_block_sparse_attention_with_paged_kv_cache",
+    "prims_ts_dsa_sparse_mla_fp8",
     "BatchMLADecodePagedTSWrapper",
     "MLAAttentionTuning",
     "batch_mla_decode_with_paged_kv_cache",
