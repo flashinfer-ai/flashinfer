@@ -91,14 +91,24 @@ def allreduce_mhc_post_prenorm(
 
     Notes
     -----
-    Every rank of the group must make the same call. Before capturing a CUDA graph that contains
-    this call, call :func:`allreduce_mhc_post_prenorm_prepare` outside capture: a call made during
-    capture never builds the module, and without it the composable path is captured instead.
+    Every rank of the group must make the same call. Each rank chooses its path on its own (a rank
+    that cannot load the fused module takes the composable path); inside the fused kernel's
+    surface the composable path all-reduces with the stock one-shot kernel, the protocol of the
+    fused kernel, so the call completes on every rank whatever each rank chose. Before capturing
+    a CUDA graph that contains this call, call :func:`allreduce_mhc_post_prenorm_prepare` outside
+    capture: a call made during capture never builds the module, and without it the composable
+    path is captured instead.
 
-    Any strides are accepted. The fused kernel reads and writes dense row-major tensors, so a
-    strided input (e.g. ``post_layer_mix`` / ``comb_res_mix`` sliced from one packed mix tensor)
-    is copied first and a strided preallocated output receives a copy of the result; contiguous
-    tensors are used as they are. Tensors outside the dtypes above take the composable path.
+    Any strides are accepted on both paths. The fused kernel reads and writes dense row-major
+    tensors, so a strided input (e.g. ``post_layer_mix`` / ``comb_res_mix`` sliced from one
+    packed mix tensor) is copied first and a strided preallocated output receives a copy of the
+    result; contiguous tensors are used as they are. ``residual_out`` may be ``residual`` (an
+    in-place update). Tensors outside the dtypes above take the composable path.
+
+    With ``launch_with_pdl`` the fused kernel loads ``fn`` before it waits on the preceding
+    kernel, as it would a weight: ``fn`` must not be written by the kernel launched right before
+    this call. A non-contiguous ``fn`` is copied, and that call launches without programmatic
+    dependent launch.
     """
     from ..experimental.allreduce_mhc_post_prenorm.backend import run
 

@@ -43,6 +43,10 @@ NUM_SPLITS = 8  # contiguous hidden splits of the split-K partials
 MAX_TOKENS = 32
 DTYPE = torch.bfloat16
 COMPUTE_CAPABILITY_MAJORS = frozenset({10})  # SM100 / SM103
+# From this token count every residual element is read and written by the same thread. Below it
+# several CTAs read the residual slice that one of them overwrites, so an in-place update
+# (residual_out sharing memory with residual) goes through a separate buffer.
+IN_PLACE_MIN_TOKENS = 5
 
 _lock = threading.Lock()
 _module: Optional[Any] = None
@@ -165,9 +169,13 @@ def _composable(
     fn: torch.Tensor,
     workspace: MNNVLAllReduceFusionWorkspace,
     launch_with_pdl: bool,
+    strategy: MNNVLAllreduceFusionStrategy,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The stock MNNVL all-reduce, then the epilogue in fp32 (post-map) and fp64 (partials)."""
-    x = trtllm_mnnvl_allreduce(input, workspace, launch_with_pdl)
+    # The stock all-reduce reads dense rows.
+    x = trtllm_mnnvl_allreduce(
+        input.contiguous(), workspace, launch_with_pdl, strategy=strategy
+    )
     num_tokens, hc_mult, hidden_size = residual.shape
     mix = fn.shape[0]
     new_r = post_layer_mix.float().unsqueeze(-1) * x.float().unsqueeze(1)
@@ -205,9 +213,28 @@ def _dtypes_supported(
     )
 
 
-def _dense_output(out: torch.Tensor) -> torch.Tensor:
-    """``out`` if the kernel can write it directly, else a contiguous buffer of its shape."""
-    if out.is_contiguous():
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the memory spans of ``a`` and ``b`` intersect (conservative for strided views)."""
+    if a.numel() == 0 or b.numel() == 0 or a.device != b.device:
+        return False
+
+    def span(t: torch.Tensor) -> Tuple[int, int]:
+        last = sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True))
+        return t.data_ptr(), t.data_ptr() + (last + 1) * t.element_size()
+
+    a_begin, a_end = span(a)
+    b_begin, b_end = span(b)
+    return a_begin < b_end and b_begin < a_end
+
+
+def _dense_output(
+    out: torch.Tensor, avoid: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """``out`` if the kernel can write it directly, else a contiguous buffer of its shape.
+
+    With ``avoid``, an ``out`` that shares memory with it also gets a separate buffer.
+    """
+    if out.is_contiguous() and (avoid is None or not _overlaps(out, avoid)):
         return out
     return torch.empty_like(out, memory_format=torch.contiguous_format)
 
@@ -252,15 +279,23 @@ def run(
         # sliced from one packed mix tensor) are copied; contiguous ones pass through.
         # Strided preallocated outputs get a dense buffer and receive a copy of the result.
         # Both copies are plain stream work and are valid during CUDA-graph capture.
+        residual_in = residual.contiguous()
+        fn_in = fn.contiguous()
         yp_dense = _dense_output(yp)
         rp_dense = _dense_output(rp)
-        residual_out_dense = _dense_output(residual_out)
+        residual_out_dense = _dense_output(
+            residual_out,
+            avoid=residual_in if num_tokens < IN_PLACE_MIN_TOKENS else None,
+        )
+        # The kernel loads fn before griddepcontrol.wait, as a weight independent of the
+        # preceding kernel. A copied fn is written by the kernel right before the launch, so
+        # that launch goes without programmatic dependent launch.
         module.allreduce_mhc_post_prenorm(
             input.contiguous(),
-            residual.contiguous(),
+            residual_in,
             post_flat.contiguous(),
             comb_res_mix.contiguous(),
-            fn.contiguous(),
+            fn_in,
             yp_dense,
             rp_dense,
             residual_out_dense,
@@ -269,7 +304,7 @@ def run(
             workspace.buffer_flags,
             workspace.tp_size,
             workspace.rank,
-            launch_with_pdl,
+            launch_with_pdl and fn_in is fn,
         )
         for out, dense in (
             (yp, yp_dense),
@@ -292,8 +327,25 @@ def run(
         return yp, rp, residual_out
 
     _stats["fallback_count"] += 1
+    # Each rank decides on its own: a rank whose module failed to load takes this path while the
+    # others launch the fused one-shot kernel. Inside the fused kernel's surface this path
+    # all-reduces with the stock one-shot kernel too, so every rank runs the same protocol on the
+    # workspace whatever it chose; outside it every rank is here and the stock choice applies.
+    if _shape_supported(
+        workspace, num_tokens, hidden_size, hc_mult, input.dtype, input.device
+    ):
+        strategy = MNNVLAllreduceFusionStrategy.ONESHOT
+    else:
+        strategy = MNNVLAllreduceFusionStrategy.AUTO
     ref_yp, ref_rp, ref_res = _composable(
-        input, residual, post_flat, comb_res_mix, fn, workspace, launch_with_pdl
+        input,
+        residual,
+        post_flat,
+        comb_res_mix,
+        fn,
+        workspace,
+        launch_with_pdl,
+        strategy,
     )
     yp.copy_(ref_yp)
     rp.copy_(ref_rp)

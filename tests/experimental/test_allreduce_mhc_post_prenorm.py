@@ -268,7 +268,9 @@ def test_composable_path_matches_reference(monkeypatch, num_tokens):
     # the epilogue in PyTorch; an identity all-reduce checks the epilogue and the preallocated
     # output contract without GPUs.
     monkeypatch.setattr(backend, "is_supported", lambda *args: False)
-    monkeypatch.setattr(backend, "trtllm_mnnvl_allreduce", lambda x, ws, pdl: x)
+    monkeypatch.setattr(
+        backend, "trtllm_mnnvl_allreduce", lambda x, ws, pdl, strategy: x
+    )
     inputs = _make_inputs(num_tokens, hidden_size=256, device="cpu", seed=num_tokens)
     yp = torch.empty(N_SPLITS, num_tokens, MIX)
     rp = torch.empty(N_SPLITS, num_tokens)
@@ -327,6 +329,8 @@ class _ContiguityCheckingModule:
 
     def __init__(self):
         self.seen = None
+        self.ptrs = None
+        self.launch_with_pdl = None
 
     def allreduce_mhc_post_prenorm(
         self, input, residual, post, comb, fn, yp, rp, residual_out, *rest
@@ -345,6 +349,8 @@ class _ContiguityCheckingModule:
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
         self.seen = {name: tensor.clone() for name, tensor in tensors.items()}
+        self.ptrs = {name: tensor.data_ptr() for name, tensor in tensors.items()}
+        self.launch_with_pdl = rest[-1]
         yp.fill_(1.0)
         rp.fill_(2.0)
         residual_out.fill_(3.0)
@@ -399,7 +405,9 @@ def test_off_contract_dtypes_take_the_composable_path(monkeypatch):
     # The support query only sees the input dtype; a mix tensor in another dtype must fall
     # back to the composable path instead of reaching the binding's dtype check.
     module, workspace = _fused_stub(monkeypatch)
-    monkeypatch.setattr(backend, "trtllm_mnnvl_allreduce", lambda x, ws, pdl: x)
+    monkeypatch.setattr(
+        backend, "trtllm_mnnvl_allreduce", lambda x, ws, pdl, strategy: x
+    )
     inputs = _make_inputs(2, hidden_size=256, device="cpu", seed=7)
     inputs["post_layer_mix"] = inputs["post_layer_mix"].to(torch.bfloat16)
     before = backend.stats()["fallback_count"]
@@ -411,6 +419,135 @@ def test_off_contract_dtypes_take_the_composable_path(monkeypatch):
     x = inputs.pop("input")
     for got, want in zip(out, _reference(x, **inputs), strict=True):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def _recording_allreduce(calls):
+    """Identity all-reduce that records the layout of its input and the strategy."""
+
+    def allreduce(x, ws, pdl, strategy):
+        calls.append((x.is_contiguous(), strategy))
+        return x
+
+    return allreduce
+
+
+def test_composable_path_passes_a_dense_input(monkeypatch):
+    # The stock all-reduce reads dense rows: a strided input reaches it as a contiguous copy.
+    calls = []
+    monkeypatch.setattr(backend, "is_supported", lambda *args: False)
+    monkeypatch.setattr(backend, "trtllm_mnnvl_allreduce", _recording_allreduce(calls))
+    num_tokens, hidden = 3, 256
+    inputs = _make_inputs(num_tokens, hidden_size=hidden, device="cpu", seed=11)
+    wide = torch.zeros(num_tokens, 2 * hidden, dtype=torch.bfloat16)
+    wide[:, :hidden] = inputs["input"]
+    inputs["input"] = wide[:, :hidden]
+    assert not inputs["input"].is_contiguous()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        out = comm.allreduce_mhc_post_prenorm(**inputs, workspace=_stub_workspace())
+    assert [contiguous for contiguous, _ in calls] == [True]
+    x = inputs.pop("input")
+    for got, want in zip(out, _reference(x, **inputs), strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, hidden, strategy",
+    [
+        (1, HIDDEN, MNNVLAllreduceFusionStrategy.ONESHOT),
+        (16, HIDDEN, MNNVLAllreduceFusionStrategy.ONESHOT),
+        (17, HIDDEN, MNNVLAllreduceFusionStrategy.ONESHOT),
+        (32, HIDDEN, MNNVLAllreduceFusionStrategy.ONESHOT),
+        (33, HIDDEN, MNNVLAllreduceFusionStrategy.AUTO),
+        (17, 256, MNNVLAllreduceFusionStrategy.AUTO),
+    ],
+)
+def test_fallback_all_reduce_matches_the_fused_protocol(
+    sm10x, monkeypatch, num_tokens, hidden, strategy
+):
+    # A rank whose module failed to load falls back while the other ranks launch the fused
+    # one-shot kernel, so inside the surface its all-reduce is the one-shot kernel too, also
+    # where the stock choice is two-shot (17 to 32 tokens). Outside it the stock choice applies.
+    calls = []
+    shape_supported = backend._shape_supported
+    monkeypatch.setattr(
+        backend,
+        "_shape_supported",
+        lambda ws, m, h, hc, dtype, device: shape_supported(
+            ws, m, h, hc, dtype, torch.device("cuda", 0)
+        ),
+    )
+    monkeypatch.setattr(backend, "_module", None)
+    monkeypatch.setattr(backend, "_stats", dict(backend._stats, load_error="failed"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(backend, "trtllm_mnnvl_allreduce", _recording_allreduce(calls))
+    inputs = _make_inputs(num_tokens, hidden_size=hidden, device="cpu", seed=13)
+    before = backend.stats()["fallback_count"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        comm.allreduce_mhc_post_prenorm(**inputs, workspace=_stub_workspace())
+    assert calls == [(True, strategy)]
+    assert backend.stats()["fallback_count"] == before + 1
+
+
+def test_overlap_check():
+    buf = torch.empty(2, 3, 4, 8)
+    assert backend._overlaps(buf[0], buf[0])
+    assert backend._overlaps(buf[0], buf[0, 1:])
+    assert backend._overlaps(buf[:, 0], buf[:, 1])  # interleaved spans: conservative
+    assert not backend._overlaps(buf[0], buf[1])
+    assert not backend._overlaps(buf[0], torch.empty(3, 4, 8))
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 32])
+def test_in_place_residual_update(monkeypatch, num_tokens):
+    # residual_out may be residual. In the 1- to 4-token kernels several CTAs read the residual
+    # slice that one of them overwrites, so they get a separate output that is copied back; from
+    # 5 tokens the kernel updates residual in place.
+    module, workspace = _fused_stub(monkeypatch)
+    inputs = _make_inputs(num_tokens, hidden_size=256, device="cpu", seed=num_tokens)
+    residual = inputs["residual"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        out = comm.allreduce_mhc_post_prenorm(
+            **inputs, workspace=workspace, residual_out=residual
+        )
+    assert out[2] is residual and bool((residual == 3.0).all())
+    assert module.ptrs["residual"] == residual.data_ptr()
+    in_place = module.ptrs["residual_out"] == residual.data_ptr()
+    assert in_place == (num_tokens >= backend.IN_PLACE_MIN_TOKENS)
+
+
+def test_disjoint_residual_out_in_the_same_buffer_is_written_directly(monkeypatch):
+    module, workspace = _fused_stub(monkeypatch)
+    inputs = _make_inputs(1, hidden_size=256, device="cpu", seed=3)
+    buf = torch.empty((2, *inputs["residual"].shape), dtype=torch.bfloat16)
+    buf[0] = inputs["residual"]
+    inputs["residual"] = buf[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        comm.allreduce_mhc_post_prenorm(
+            **inputs, workspace=workspace, residual_out=buf[1]
+        )
+    assert module.ptrs["residual_out"] == buf[1].data_ptr()
+
+
+@pytest.mark.parametrize("strided_fn", [False, True])
+def test_copied_fn_launches_without_pdl(monkeypatch, strided_fn):
+    # The kernel loads fn before griddepcontrol.wait. A copy of fn is written by the kernel
+    # launched right before, so that launch must not start early.
+    module, workspace = _fused_stub(monkeypatch)
+    inputs = _make_inputs(2, hidden_size=256, device="cpu", seed=5)
+    if strided_fn:
+        inputs["fn"] = inputs["fn"].t().contiguous().t()  # same values, non-contiguous
+        assert not inputs["fn"].is_contiguous()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        comm.allreduce_mhc_post_prenorm(
+            **inputs, workspace=workspace, launch_with_pdl=True
+        )
+    assert module.launch_with_pdl is (not strided_fn)
+    assert torch.equal(module.seen["fn"], inputs["fn"])
 
 
 # ---------------------------------------------------------------------------
@@ -543,8 +680,9 @@ def test_fused_matches_stock_allreduce_and_reference(mnnvl_workspace, num_tokens
 
 @pytest.mark.parametrize("num_tokens", [2, 5, 17, 32])
 def test_fused_accepts_packed_mix_and_strided_outputs(mnnvl_workspace, num_tokens):
-    # post / comb as views into one packed [T, 24] mix tensor and strided preallocated outputs
-    # take the fused path and give exactly the results of the contiguous call.
+    # post / comb as views into one packed [T, 24] mix tensor, a strided input and fn, and
+    # strided preallocated outputs take the fused path and give exactly the results of the
+    # contiguous call.
     workspace, rank = mnnvl_workspace
 
     def body():
@@ -557,10 +695,15 @@ def test_fused_accepts_packed_mix_and_strided_outputs(mnnvl_workspace, num_token
         strided = dict(epi)
         strided["post_layer_mix"] = packed[:, HC : 2 * HC].unsqueeze(-1)
         strided["comb_res_mix"] = packed[:, 2 * HC :].view(num_tokens, HC, HC)
+        strided["fn"] = epi["fn"].t().contiguous().t()
+        x_wide = torch.zeros(
+            num_tokens, 2 * HIDDEN, dtype=torch.bfloat16, device="cuda"
+        )
+        x_wide[:, :HIDDEN] = x_local
         yp, rp, residual_out = _strided_outputs(num_tokens, HIDDEN, device="cuda")
         before = backend.stats()["dispatch_count"]
         out = comm.allreduce_mhc_post_prenorm(
-            x_local,
+            x_wide[:, :HIDDEN],
             workspace=workspace,
             yp=yp,
             rp=rp,
@@ -597,17 +740,73 @@ def test_interleaves_with_stock_allreduce(mnnvl_workspace):
     _run_ranks(body)
 
 
-def test_composable_path_on_ranks(mnnvl_workspace, monkeypatch):
-    # Outside the supported surface: the stock all-reduce (bit-exact) and the PyTorch epilogue.
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 32])
+def test_in_place_residual_update_on_ranks(mnnvl_workspace, num_tokens):
+    # residual_out = residual gives exactly the results of the out-of-place call.
+    workspace, rank = mnnvl_workspace
+
+    def body():
+        parts, epi = _rank_inputs(num_tokens, rank, seed=5000 + num_tokens)
+        x_local = parts[rank].contiguous()
+        dense = comm.allreduce_mhc_post_prenorm(x_local, workspace=workspace, **epi)
+        for _ in range(10):
+            in_place = dict(epi, residual=epi["residual"].clone())
+            out = comm.allreduce_mhc_post_prenorm(
+                x_local,
+                workspace=workspace,
+                residual_out=in_place["residual"],
+                **in_place,
+            )
+            torch.cuda.synchronize()
+            assert out[2] is in_place["residual"]
+            for got, want in zip(out, dense, strict=True):
+                assert torch.equal(got, want)
+
+    _run_ranks(body)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 17, 32])
+def test_fallback_rank_completes_with_fused_ranks(
+    mnnvl_workspace, monkeypatch, num_tokens
+):
+    # One rank cannot load the module and takes the composable path while the others launch the
+    # fused kernel: the call completes on every rank with the same all-reduce, also from 17
+    # tokens, where the stock all-reduce would choose two-shot.
+    workspace, rank = mnnvl_workspace
+    fallback_rank = 3
+    if rank == fallback_rank:
+        monkeypatch.setattr(backend, "_get_module", lambda allow_build: None)
+
+    def body():
+        parts, epi = _rank_inputs(num_tokens, rank, seed=6000 + num_tokens)
+        before = backend.stats()["dispatch_count"]
+        out = comm.allreduce_mhc_post_prenorm(
+            parts[rank].contiguous(), workspace=workspace, **epi
+        )
+        torch.cuda.synchronize()
+        dispatched = backend.stats()["dispatch_count"] - before
+        assert dispatched == (0 if rank == fallback_rank else 1)
+        _check_epilogue(out, _reference(_rank_order_allreduce(parts), **epi))
+
+    _run_ranks(body)
+
+
+@pytest.mark.parametrize("strided_input", [False, True])
+def test_composable_path_on_ranks(mnnvl_workspace, monkeypatch, strided_input):
+    # Outside the supported surface: the stock all-reduce (bit-exact) and the PyTorch epilogue,
+    # also for a strided input.
     workspace, rank = mnnvl_workspace
     monkeypatch.setattr(backend, "is_supported", lambda *args: False)
 
     def body():
         parts, epi = _rank_inputs(2, rank, seed=3000)
+        x_local = parts[rank].contiguous()
+        if strided_input:
+            x_wide = torch.zeros(2, 2 * HIDDEN, dtype=torch.bfloat16, device="cuda")
+            x_wide[:, :HIDDEN] = x_local
+            x_local = x_wide[:, :HIDDEN]
         before = backend.stats()["dispatch_count"]
-        out = comm.allreduce_mhc_post_prenorm(
-            parts[rank].contiguous(), workspace=workspace, **epi
-        )
+        out = comm.allreduce_mhc_post_prenorm(x_local, workspace=workspace, **epi)
         torch.cuda.synchronize()
         assert backend.stats()["dispatch_count"] == before
         ref = _reference(_rank_order_allreduce(parts), **epi)

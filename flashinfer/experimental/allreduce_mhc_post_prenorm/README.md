@@ -80,7 +80,16 @@ The fused kernel runs when all of these hold; `allreduce_mhc_post_prenorm_suppor
 Anywhere else `allreduce_mhc_post_prenorm` takes a composable path with the same outputs: the
 stock MNNVL all-reduce, then the epilogue in PyTorch (fp32 post-map, fp64 partials). It is a
 correctness fallback, not a fast path; callers that have their own unfused path should take it
-when the support query returns False.
+when the support query returns False. Each rank chooses its path on its own, so inside the
+surface (e.g. a rank whose module failed to build) the composable path all-reduces with the stock
+one-shot kernel, the fused kernel's protocol: a group whose ranks chose differently still
+completes the call, the ranks' epilogue results then differing in rounding only.
+
+Inputs and preallocated outputs may have any strides on both paths, and `residual_out` may be
+`residual` (an in-place update). With programmatic dependent launch the kernel loads `fn` before
+it waits on the preceding kernel, as it would a weight, so `fn` must not be written by the kernel
+launched right before the call; a non-contiguous `fn` is copied and that call launches without
+programmatic dependent launch.
 
 The API takes no part in automatic routing: there is no `backend="auto"` selection, autotuning
 or trace-apply for it, and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` does not affect it. It
@@ -107,7 +116,10 @@ an unscheduled CTA:
 | 5-8, 9-16, 17-32 | `arMhcPostPrenormKernel` | 4-CTA hidden-split clusters with 2-, 4- and 8-token tiles, combined through distributed shared memory in fixed order |
 
 The post-map runs as packed `mul.rn.f32x2` / `fma.rn.f32x2` with the scalar operation order. With
-programmatic dependent launch only `fn` (a weight) is read before `griddepcontrol.wait`.
+programmatic dependent launch only `fn` (a weight) is read before `griddepcontrol.wait`. In the
+1- to 4-token kernels several CTAs read the residual slice that one of them overwrites, so an
+in-place call passes those kernels a separate `residual_out` buffer and copies it back; from 5
+tokens every residual element is read and written by the same thread and the call stays in place.
 
 Built with CUDA 13.0 for `sm_103a` (`ptxas`): 72, 72, 96, 100, 106, 110 and 169 registers for
 1, 2, 3, 4, 5-8, 9-16 and 17-32 tokens, no spills, at most 17,416 bytes of static shared memory.
