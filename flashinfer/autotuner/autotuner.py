@@ -1347,7 +1347,9 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
     All startup gates use this envelope so a nested operation meeting its
     parent's preparation gate fails coherently rather than reducing different
     tensor sizes. Rank-local shapes and cache roots are deliberately excluded
-    by callers; they need not match in an expert-parallel deployment.
+    by callers; they need not match in an expert-parallel deployment. The
+    process-wide batch-invariant setting is part of the selection fingerprint
+    because it changes which tactics may be selected or served from cache.
     """
     if torch.cuda.is_current_stream_capturing():
         raise _TuningGroupError(
@@ -1366,7 +1368,7 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
 
     phase_digest = digest(phase)
     try:
-        selection_digest = digest(selection)
+        selection_digest = digest((_batch_invariant, selection))
     except Exception as exc:
         selection_digest = bytes(32)
         status = 2
@@ -1400,7 +1402,8 @@ def _check_tuning_group_phase(phase, selection=(), error=None):
     _, agreed = _tuning_group_agreement(phase, selection, 2 if error else 0, error)
     if not agreed:
         raise _TuningGroupError(
-            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}, "
+            f"batch_invariant={_batch_invariant}"
         )
 
 
@@ -1417,7 +1420,8 @@ def _sync_oom_across_tune_group(
         return True
     if not agreed:
         raise _TuningGroupError(
-            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}"
+            f"Autotune group plan mismatch at {phase!r}: local selection={repr(selection)[:512]}, "
+            f"batch_invariant={_batch_invariant}"
         )
     return False
 

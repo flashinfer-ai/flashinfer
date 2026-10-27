@@ -304,6 +304,11 @@ class Split(TunableRunner):
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         return inputs[0]
 
+class Plain(Split):
+    # Every candidate is invariant: the mode leaves the plan unchanged.
+    def get_valid_tactics(self, inputs, profile):
+        return [0, 2]
+
 def profile(self, runner, inputs, tactic, config, **kwargs):
     t = torch.tensor([{0: 5.0, 1: 1.0, 2: 3.0}[tactic]], dtype=torch.float64)
     dist.all_reduce(t)
@@ -312,19 +317,23 @@ def profile(self, runner, inputs, tactic, config, **kwargs):
 AutoTuner._profile_single_kernel = profile
 config = TuningConfig(use_cold_l2_cache=False)
 try:
-    for case, modes in (("same", (True, True)), ("mixed", (False, True))):
+    for case, modes, runner in (
+        ("same", (True, True), Split),
+        ("mixed", (False, True), Split),
+        ("mixed_plain", (False, True), Plain),
+    ):
         set_autotune_batch_invariant(modes[rank])
         tuner = AutoTuner()
         AutoTuner._instance = tuner
         failed = False
         try:
             with autotune(True):
-                tactic = tuner.choose_one("op", [Split()], config, [torch.ones(2, 4)])[1]
+                tactic = tuner.choose_one(case, [runner()], config, [torch.ones(2, 4)])[1]
             assert tactic == 2, tactic
         except _TuningGroupError as exc:
             failed = True
             assert "mismatch" in str(exc), str(exc)
-        assert failed == (case == "mixed"), (rank, case)
+        assert failed == case.startswith("mixed"), (rank, case)
         dist.barrier()
         print("OK", rank, case, flush=True)
 finally:
@@ -355,7 +364,8 @@ def test_distributed_ranks_must_agree_on_mode(tmp_path):
         for rank, proc in enumerate(procs):
             out, _ = proc.communicate(timeout=120)
             assert proc.returncode == 0, f"rank {rank}:\n{out}"
-            assert f"OK {rank} same" in out and f"OK {rank} mixed" in out, out
+            for case in ("same", "mixed", "mixed_plain"):
+                assert f"OK {rank} {case}\n" in out, out
     finally:
         for proc in procs:
             if proc.poll() is None:
