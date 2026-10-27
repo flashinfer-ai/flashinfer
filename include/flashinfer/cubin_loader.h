@@ -47,8 +47,13 @@ extern "C" void FlashInferSetCurrentCubin(const char* binary, int size) {
   current_cubin = std::string(binary, size);
 }
 
-// Get the cubin from the python callback.
-// This is the API for the native library to use.
+/**
+ * Get the cubin from the python callback. This is the API for the native library to use.
+ *
+ * @param name The artifact path of the cubin.
+ * @param sha256 The expected checksum, passed through to the callback.
+ * @return The cubin bytes; throws when the callback delivered nothing.
+ */
 std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");

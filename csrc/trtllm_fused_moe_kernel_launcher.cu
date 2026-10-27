@@ -23,10 +23,12 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "flashinfer/fused_moe/da_moe.cuh"
@@ -1123,10 +1125,41 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   return {tile_N, config};
 }
 
-// When the default tactic is requested and the heuristic tile has no config whose cubin loads
-// on this driver (cubinLoads() in trtllm_batched_gemm_runner.cu), pick the nearest tile that has
-// one: larger tiles first (they hold the two-CTA kernels), then smaller ones. In every other case
-// tile_N is returned unchanged, so behaviour is identical where every cubin loads.
+/**
+ * Reports a tile_N fallback once per (device, tile) pair on stderr; token-by-token inference
+ * would otherwise print the same line on every launch.
+ *
+ * @param tile_N The tile the heuristic chose, which has no loadable default config.
+ * @param chosen The tile used instead.
+ */
+inline void reportTileFallbackOnce(int64_t tile_N, int64_t chosen) {
+  static std::mutex reported_mutex;
+  static std::set<std::pair<int, int64_t>> reported;
+  int device = -1;
+  cudaGetDevice(&device);
+  {
+    std::lock_guard<std::mutex> lock(reported_mutex);
+    if (!reported.insert({device, tile_N}).second) {
+      return;
+    }
+  }
+  std::fprintf(stderr,
+               "[FlashInfer] tile_N %lld has no trtllm-gen kernel that loads on this driver; "
+               "using tile_N %lld (GitHub #5322)\n",
+               static_cast<long long>(tile_N), static_cast<long long>(chosen));
+}
+
+/**
+ * When the default tactic is requested and the heuristic tile has no config whose cubin loads
+ * on this driver (cubinLoads() in trtllm_batched_gemm_runner.cu), pick the nearest tile that has
+ * one: larger tiles first (they hold the two-CTA kernels), then smaller ones. In every other case
+ * tile_N is returned unchanged, so behaviour is identical where every cubin loads.
+ *
+ * @param tile_N The tile resolved from the tactic or the heuristic.
+ * @param config The config index of the tactic; -1 requests the default tactic.
+ * @param launchers The per-tile launchers of this MoE entry.
+ * @return The tile to use.
+ */
 template <typename LauncherMap>
 int64_t pickTileWithDefaultConfig(int64_t tile_N, int64_t config, LauncherMap const& launchers) {
   if (config != -1) {
@@ -1157,10 +1190,7 @@ int64_t pickTileWithDefaultConfig(int64_t tile_N, int64_t config, LauncherMap co
   }
   for (auto t : order) {
     if (hasDefault(t)) {
-      std::fprintf(stderr,
-                   "[FlashInfer] tile_N %lld has no trtllm-gen kernel that loads on this driver; "
-                   "using tile_N %lld (GitHub #5322)\n",
-                   static_cast<long long>(tile_N), static_cast<long long>(t));
+      reportTileFallbackOnce(tile_N, t);
       return t;
     }
   }

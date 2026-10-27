@@ -333,6 +333,13 @@ dll_cubin_handlers = {}
 
 
 def setup_cubin_loader(dll_path: str) -> None:
+    """Register the Python cubin callback with a loaded native module.
+
+    Parameters
+    ----------
+    dll_path : str
+        Path of the native module that exports FlashInferSetCubinCallback.
+    """
     if dll_path in dll_cubin_handlers:
         return
 
@@ -342,6 +349,7 @@ def setup_cubin_loader(dll_path: str) -> None:
     CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
 
     def get_cubin_callback(name: bytes, sha256: bytes):
+        """Deliver the cubin bytes for ``name`` to the native side; never raises into native code."""
         # Both name and sha256 are bytes (c_char_p). A ctypes callback cannot
         # propagate an exception: log it and set nothing, so the native side
         # sees an empty cubin and raises (getCubin in cubin_loader.h).

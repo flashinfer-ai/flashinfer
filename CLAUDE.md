@@ -685,6 +685,7 @@ CI `docker run --rm` boundary provides final cleanup for those processes.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_CUBIN_DIR` | `<FLASHINFER_WORKSPACE_BASE>/.cache/flashinfer/cubins` | `flashinfer/jit/env.py` (exposed via `flashinfer/__main__.py show-config`) | Local directory used to cache downloaded cubins. Override to share a cache between users. |
+| `FLASHINFER_TRTLLM_GEN_SKIP_UNLOADABLE_CUBINS` | `1` on Windows, `0` elsewhere | `csrc/trtllm_batched_gemm_runner.cu` | `1` probes each trtllm-gen batched-GEMM cubin once per CUDA context with checked `cuModuleLoadData` / `cuModuleGetFunction` and drops the configs whose cubin does not load from the tactic list (a skipped cubin is reported once on stderr); `0` keeps every config and a failed load raises before the launch. On by default on Windows because some Windows arm64 drivers reject the sm100f cubins (GitHub #5322). |
 | `FLASHINFER_CUBINS_REPOSITORY` | `https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local` | `flashinfer/jit/cubin_loader.py` | Base URL the loader downloads cubins from. Point to a mirror for offline or air-gapped setups. |
 | `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | unset | `flashinfer/jit/cubin_loader.py` | If set, skip SHA checksum verification of downloaded cubins. Debug aid only. |
 | `FLASHINFER_CUBIN_DOWNLOAD_THREADS` | `4` | `flashinfer/artifacts.py` | Thread-pool size used by `flashinfer artifacts download`. |
