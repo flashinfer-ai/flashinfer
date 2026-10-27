@@ -45,6 +45,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 i
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
+    supports_nonpaged_d128_thd_pack_gqa,
     supports_thd_split,
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
@@ -74,7 +75,16 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 i
     SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
 )
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120 import D512_FLAVOR
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120 import (
+    D512_FLAVOR,
+    GENERAL_HEAD_TILE_MAX as _SM120_GENERAL_HEAD_TILE_MAX,
+    HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
+    SEQ_Q_TILES as _SM120_SEQ_Q_TILES,
+    decode_kv_stage as _sm120_decode_kv_stage,
+    head_tiles as _sm120_head_tiles,
+    is_decode_tile as _sm120_is_decode_tile,
+    tile_domain as _sm120_tile_domain,
+)
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
 # support-check ones: importing them here would drag the CuTe DSL (~1.0 s, 357
@@ -409,7 +419,8 @@ class Capabilities:
     # group does not divide tile_m (partial PackGQA: 96/8 packs 4 of its 12
     # heads per token row-group, 48/8 packs 2; config_sm100.pack_gqa_group_size).
     # None = every flavor keeps the full-ratio contract (the group must divide
-    # tile_m, or PACK_GQA=1 is declined).  Native on the SM100 d128 / d256 f16
+    # tile_m, or PACK_GQA=1 is declined; SM120 packs any group up to tile_m:
+    # pack_gqa_requires_divisible).  Native on the SM100 d128 / d256 f16
     # kernels; the d192x128 / d512 kernels pack HEADS_PER_TILE = G.
     # APPENDED after the epilogue-gate fields (append-only contract above):
     # test_capabilities_positional_prefix_is_append_only pins the tail.
@@ -508,6 +519,12 @@ class Capabilities:
     # adapter's twin), the d128 rendering of the same file keeps 128.  APPENDED after
     # kv_mask_dtypes (append-only contract above).
     tile_ns_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    # Whether PackGQA requires tile_m to be divisible by the GQA ratio G (or, on
+    # a partial flavor, to share a factor with it).  False on the SM120 rows:
+    # any G up to tile_m packs, tile_m % G != 0 included
+    # (config_sm100.pack_gqa_group_size).  APPENDED after tile_ns_by_d_shape
+    # (append-only contract above).
+    pack_gqa_requires_divisible: bool = True
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -921,6 +938,42 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
+def sm120_decode_tile(capabilities: Capabilities, tile_m: Optional[int]) -> bool:
+    """Whether ``tile_m`` runs the SM120 half DECODE tile (sm120/decode_f16.py):
+    the f16/bf16 SM120 row with ``tile_m`` 16 or 32."""
+    return capabilities.sm_lo == 120 and not (capabilities.is_fp8 or capabilities.is_mxfp8) and tile_m is not None and _sm120_is_decode_tile(tile_m)
+
+
+def _sm120_tile_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> Optional[str]:
+    """Why the SM120 kernel table has no CTA tile for ``knobs`` at this graph's
+    head dims (None when it has one, or on any other row). ``tile_m`` and
+    ``tile_n`` each pass their own domain in ``mismatch``; the template serving
+    the head dims takes only the pairs ``config_sm120.tile_domain`` lists, and
+    the decode tile (tile_m 16 / 32) adds its own graph conditions. Twin of the
+    tile lines of ``api_dsl.SdpaFwdDslSm120.check_support``."""
+    if capabilities.sm_lo != 120 or (knobs.tile_m is None and knobs.tile_n is None):
+        return None
+    if sm120_decode_tile(capabilities, knobs.tile_m):
+        if facts.thd:
+            return "the SM120 decode tile (tile_m 16 / 32) is dense-only; THD graphs run the prefill templates"
+        if max(facts.d_qk, facts.d_v) > _SM120_GENERAL_HEAD_TILE_MAX:
+            return f"the SM120 decode tile serves head dims up to {_SM120_GENERAL_HEAD_TILE_MAX}; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        stage = _sm120_decode_kv_stage(*_sm120_head_tiles(facts.d_qk, facts.d_v, _SM120_HEAD_TILE_GRANULE))
+        if knobs.tile_n is not None and knobs.tile_n != stage:
+            return f"the SM120 decode tile streams {stage}-key K/V stages at D=({facts.d_qk}, {facts.d_v}); requested tile_n={knobs.tile_n}"
+        return None
+    domain = _sm120_tile_domain(facts.d_qk, facts.d_v, capabilities.is_fp8 or capabilities.is_mxfp8)
+    # An unset tile_m runs the first sequence Q tile the table lists, else the
+    # table's largest; an unset tile_n is picked from the table by SMEM fit.
+    tile_m = knobs.tile_m
+    if tile_m is None:
+        tile_m = _SM120_SEQ_Q_TILES[0] if any(m == _SM120_SEQ_Q_TILES[0] for m, _ in domain) else max(m for m, _ in domain)
+    served = (tile_m, knobs.tile_n) in domain if knobs.tile_n is not None else any(m == tile_m for m, _ in domain)
+    if not served:
+        return f"the SM120 kernel for D=({facts.d_qk}, {facts.d_v}) has no tile_m={knobs.tile_m}, tile_n={knobs.tile_n} tile; it takes {sorted(domain)}"
+    return None
+
+
 def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """Whether the flavor this graph lowers onto packs a proper divisor of a
     GQA group that does not divide tile_m (``pack_gqa_partial_d_shapes``)."""
@@ -934,8 +987,11 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     for the selected flavor replaces it. That is what lets one Rubin row serve a
     d256 kernel that honours LPT next to flavors that do not.  ``knobs`` (when
     the caller has them) route a dense-only tile's non-dense legs to the flavor
-    that carries them (``_selected_d_shape``).
+    that carries them (``_selected_d_shape``), and name the SM120 decode tile,
+    which walks its units in launch order (SCHED_NATURAL only).
     """
+    if knobs is not None and sm120_decode_tile(capabilities, knobs.tile_m):
+        return frozenset({SCHED_NATURAL})
     selected = _selected_d_shape(capabilities, facts, knobs)
     if selected is not None:
         for shape, shape_domain in capabilities.sched_policies_by_d_shape:
@@ -1350,12 +1406,24 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         grid_reason = launch_grid_mismatch(capabilities, facts, knobs)
         if grid_reason is not None:
             return grid_reason
+        sm120_tile_reason = _sm120_tile_mismatch(capabilities, facts, knobs)
+        if sm120_tile_reason is not None:
+            return sm120_tile_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
         # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
         # Other ragged graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = packed_thd_split(capabilities, facts, knobs)
+        ragged_pack = knobs.pack_gqa and supports_nonpaged_d128_thd_pack_gqa(
+            (facts.d_qk, facts.d_v),
+            device_cc=facts.device_cc,
+            fp8=facts.is_fp8 or facts.is_mxfp8,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            cga=knobs.cga,
+            split_kv=knobs.split_kv or 1,
+        )
         # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
         # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
         # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever
@@ -1374,19 +1442,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not packed_split
             and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
+            and not ragged_pack
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, an unsplit dense or ragged D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
             and facts.thd
-            and (packed_split or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
+            and (packed_split or ragged_pack or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
         ):
-            # Packed splits and the D192 single-CTA leg load shared SM100
+            # Packed splits, unsplit D128 packing and the D192 single-CTA leg load shared SM100
             # bodies, which apply the scale in-kernel. Rubin's native unsplit
             # prefill siblings serve the pre-folded scale.
-            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D192 single-Q)"
+            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D128 packing / D192 single-Q)"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -1566,16 +1635,26 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 # Not on the d256 decode tile's split: its gate is applied by
                 # the combine, element-wise on the real O.
                 return "PackGQA cannot ride the fused epilogue gate (only the d256 decode tile's split applies the gate in its combine)"
-            _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
-            _partial = pack_gqa_partial(capabilities, facts)
+            if knobs.tile_m is not None:
+                _pg_tile_m = knobs.tile_m
+            elif capabilities.sm_lo == _BLACKWELL_GEFORCE[0]:
+                # The adapter's own Q tile: the flavor's largest (one 64-row tile on the D=512 templates).
+                _pg_tile_m = max(m for m, _ in _sm120_tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8))
+            else:
+                _pg_tile_m = max(capabilities.tile_ms)
+            _partial = pack_gqa_partial(capabilities, facts) or ragged_pack
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
             # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin
             # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
             # keeps the rule as is: its partial PackGQA already admits such groups on the prefill tile.
             _decode_packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
-            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial) and not _decode_packs_whole_group:
+            _requires_divisible = capabilities.pack_gqa_requires_divisible
+            if (
+                not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial, requires_divisible=_requires_divisible)
+                and not _decode_packs_whole_group
+            ):
                 return (
-                    f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
+                    f"PackGQA requires h_q/h_kv to {'not exceed' if not _requires_divisible else 'share a factor with' if _partial else 'divide'} tile_m: "
                     f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
                 )
         if facts.has_score_max or facts.has_score_sum_exp:
@@ -2917,11 +2996,16 @@ def _sm120_spec() -> EngineSpec:
             # backstop bars a split under the LPT remaps, so the heuristic's
             # split sets ride SCHED_NATURAL.
             split_kv_supported=True,
-            tile_ms=frozenset({64, 128}),
-            # 32 is the d512 flavor's KV tile alone (config_sm120.tile_domain).
-            tile_ns=frozenset({32, 64, 128}),
+            # 16 / 32 are the half DECODE tile (sm120/decode_f16.py, packed rows
+            # x the warps on the key axis), whose tile_n is its K/V stage width
+            # (config_sm120.decode_kv_stage: 64 keys at head tiles up to 32, 32
+            # at 48 and 64, 16 above; config_sm120.tile_domain).
+            tile_ms=frozenset({16, 32, 64, 128}),
+            # 32 is also the d512 flavor's KV tile (config_sm120.tile_domain).
+            tile_ns=frozenset({16, 32, 64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_requires_divisible=False,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -3513,6 +3597,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_requires_divisible=False,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -3560,6 +3645,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             tile_ns=frozenset({64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_requires_divisible=False,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )

@@ -1231,7 +1231,9 @@ def _program_identity(kernel_text, binding_text, definitions):
     if kernel is None and binding is None:
         symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
         shim = re.search(
-            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+            r"^namespace (cake_host_shim_[0-9a-f]{16}|cake_binding_kernel_cake_deepgemm_dense_mqa_[0-9a-f]{20}) \{",
+            binding_text,
+            re.MULTILINE,
         ).group(1)
         return symbol, shim
     assert kernel is not None and binding is not None and kernel[0] == binding[0], (
