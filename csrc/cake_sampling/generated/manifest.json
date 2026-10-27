@@ -107,6 +107,8 @@
     "kernel_cake_radix_topk_c8_e16s_sp_lp_nt",
     "kernel_cake_radix_topk_c4_e32s_sp_lp_nt",
     "kernel_cake_radix_topk_c8_e32s_sp_lp_nt",
+    "kernel_cake_radix_topk_c1_e32s_bt_sp",
+    "kernel_cake_radix_topk_c1_e32s_bt_sp_tia",
     "kernel_cake_sparse_topp_sample_t32_i2",
     "kernel_cake_sparse_topp_sample_t64_i2",
     "kernel_cake_sparse_topp_sample_t128_i2",
@@ -140,7 +142,8 @@
     "cake_sampling_kernels_part8.cuh",
     "cake_sampling_kernels_part9.cuh",
     "cake_sampling_kernels_part10.cuh",
-    "cake_sampling_kernels_part11.cuh"
+    "cake_sampling_kernels_part11.cuh",
+    "cake_sampling_kernels_part12.cuh"
   ],
   "stage1": [
     {
@@ -2014,6 +2017,42 @@
       "spec_sample": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c8_e32s_sp_lp_nt"
+    },
+    {
+      "block_threads": 512,
+      "cluster": 1,
+      "coarse_push": false,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": true,
+      "fused_tail": true,
+      "int_tail": false,
+      "leader_push": false,
+      "local_select": false,
+      "no_tail": false,
+      "slab_tail": false,
+      "spec_sample": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e32s_bt_sp"
+    },
+    {
+      "block_threads": 512,
+      "cluster": 1,
+      "coarse_push": false,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": true,
+      "fused_tail": true,
+      "int_tail": true,
+      "leader_push": false,
+      "local_select": false,
+      "no_tail": false,
+      "slab_tail": false,
+      "spec_sample": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e32s_bt_sp_tia"
     }
   ],
   "stage23": [

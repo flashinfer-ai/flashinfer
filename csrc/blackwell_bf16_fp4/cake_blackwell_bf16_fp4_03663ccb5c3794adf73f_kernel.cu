@@ -284,7 +284,7 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (256 columns, 256 used)
