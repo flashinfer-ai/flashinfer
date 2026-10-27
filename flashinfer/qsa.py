@@ -146,6 +146,10 @@ def qsa_indexed_forward(
     Outputs and scratch are allocated by cuDNN on the input device's current
     CUDA stream. Warm up before capture; replay rereads the indices.
     This explicit forward call does not register autograd.
+
+    Results are not bitwise repeatable. cuDNN's parallel index compaction can
+    change the accumulation order, including BF16 output values. Sorting
+    caller indices does not remove this internal ordering variation.
     """
     result = _cudnn_ops().qsa_indexed_forward(q, k, v, indices, scale)
     return result["out"], result["out_fp32"], result["lse"]

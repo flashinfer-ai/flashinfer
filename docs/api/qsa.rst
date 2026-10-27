@@ -36,6 +36,12 @@ the query's own sequence. Width must be divisible by four and at most 2052.
 It avoids the bitmap API's int32 ``[T, NB]`` compact-index scratch, which alone
 uses 16 GiB at 128K tokens and 32K blocks.
 
+Indexed forward is not bitwise repeatable: cuDNN's parallel index compaction
+can change the attention accumulation order, including BF16 output values.
+Sorting caller indices does not remove this internal ordering variation.
+This API has no deterministic mode; account for this in reproducibility-sensitive
+workloads, including reinforcement learning.
+
 cuDNN allocates outputs and scratch and uses the input device's current CUDA
 stream. Warm up each required configuration before CUDA graph capture.
 Replay reads current selection tensors; no implicit selection cache is kept.

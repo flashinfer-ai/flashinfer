@@ -95,8 +95,9 @@ def supported_gpu():
 
 
 @pytest.mark.parametrize("heads", [12, 24])
-@pytest.mark.parametrize("scale", [1 / 16, -0.1])
-@pytest.mark.parametrize("lengths", [(3, 5, 9), (65, 129)])
+@pytest.mark.parametrize("scale", [1 / 16, 0.0, -0.1])
+# FE 1.32 selects its gated bitmap launcher above 512 tokens.
+@pytest.mark.parametrize("lengths", [(3, 5, 9), (65, 129), (255, 257), (255, 258)])
 def test_bitmap_forward(supported_gpu, heads, scale, lengths):
     data = _inputs(lengths=lengths, heads=heads)
     actual = flashinfer.qsa_forward(**data, scale=scale)

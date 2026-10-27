@@ -277,6 +277,51 @@ def test_every_reachable_bf16_quantizer_shape_has_a_program(arch, sm_count):
     assert shapes <= set(KERNELS[arch])
 
 
+def test_quantizer_alone_cluster_split_rows():
+    """The quantizer alone (``quant_plan(..., alone=True)``, the public per-token quantize
+    entries) splits bf16 rows over the clusters of QUANT_ALONE_CLUSTER_SPLIT at the measured
+    SM count of each architecture, with a generated program; everywhere else (other token
+    counts and row lengths, the other SM count, fp16 activations) it takes the chain's
+    plan, :func:`quant_cluster_split`."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, table in cb.QUANT_ALONE_CLUSTER_SPLIT.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        served = set()
+        for k in sorted(set(REACHABLE_K) | set(table)):
+            for m in REACHABLE_M:
+                for fold in (False, True):
+                    chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
+                    alone = _registered(
+                        cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True),
+                        arch,
+                    )
+                    want = next(
+                        (c for lo, hi, c in table.get(k, ()) if lo <= m <= hi), None
+                    )
+                    if want is None:
+                        assert alone == chain, (arch, k, m, fold)
+                        continue
+                    served.add((k, m))
+                    assert alone.cluster_split == want, (arch, k, m, fold)
+                    assert alone.kernel_key.endswith(f"_cs{want}"), alone.kernel_key
+                    assert alone.grid % want == 0 and alone.grid >= m * want
+                    sms = other[arch]
+                    assert cb.quant_plan(
+                        m, k, True, fold, arch, sms, alone=True
+                    ) == cb.quant_plan(m, k, True, fold, arch, sms), (arch, sms, k, m)
+                    assert cb.quant_plan(
+                        m, k, False, fold, arch, sm_count, alone=True
+                    ) == cb.quant_plan(m, k, False, fold, arch, sm_count)
+        listed = {
+            (k, m)
+            for k, ranges in table.items()
+            for lo, hi, _ in ranges
+            for m in REACHABLE_M
+            if lo <= m <= hi
+        }
+        assert served == listed, (arch, sorted(listed - served))
+
+
 def test_f16_quantizer_shapes_match_the_validated_f16_rows():
     """fp16 activations are generated for the validated fp16 rows (K = 7168 at
     256 threads, scale not folded); every other fp16 shape names its missing
@@ -735,6 +780,43 @@ def test_quantize_matches_reference_and_cute_dsl(m, k, dtype, fold):
         assert torch.equal(p_fp4, fp4)
         assert torch.equal(p_sf.reshape(-1), sf.reshape(-1))
         assert torch.equal(p_scale, scale)
+
+
+# The quantizer alone's cluster-split cells (QUANT_ALONE_CLUSTER_SPLIT) of every architecture,
+# with and without the folded out_scale.
+_ALONE_SPLIT_CASES = sorted(
+    {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_CLUSTER_SPLIT.values()
+        for k, ranges in table.items()
+        for lo, hi, _ in ranges
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _ALONE_SPLIT_CASES)
+def test_quantizer_alone_split_matches_the_chain_quantizer(k, m, fold):
+    """The public quantizer's cluster split writes the same codes, block scales and
+    per-token scales as the quantize + GEMM chain's quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(3000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
 
 
 # K = 2688 / 4096 are covered at M = 1 only: a single row has no stride, so it keeps the
