@@ -44,7 +44,7 @@ inline int64_t WorkspaceSize(const Shape& shape, const Schedule&) {
     case 4: return 1795840;
     case 5: return 2244608;
     case 6: return 2693376;
-    case 7: return 3142400;
+    case 7: return 3142144;
     case 8: return 3590912;
     case 9: return 4039680;
     case 10: return 4488704;
@@ -123,11 +123,11 @@ inline ManifestStatus PrepareWorkspace(const Invocation& inv, const Schedule& sc
       initializers.push_back({2693120u, {1152}});
       break;
     case 7:
-      initializers.push_back({387328u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6}});
-      initializers.push_back({388864u, {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 209, 217, 225, 233, 241, 249, 257, 265, 273, 281, 289, 297, 305, 313, 321, 329}});
-      initializers.push_back({389120u, {42}});
-      initializers.push_back({389376u, {1344}});
-      initializers.push_back({3142144u, {1344}});
+      initializers.push_back({387072u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6}});
+      initializers.push_back({388608u, {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193, 201, 209, 217, 225, 233, 241, 249, 257, 265, 273, 281, 289, 297, 305, 313, 321, 329}});
+      initializers.push_back({388864u, {42}});
+      initializers.push_back({389120u, {1344}});
+      initializers.push_back({3141888u, {1344}});
       break;
     case 8:
       initializers.push_back({442624u, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7}});
@@ -1516,173 +1516,163 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 7: {
-    Args_device_08 args_0{};
-    args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_0.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    args_0.route_count = static_cast<int>(42);
-    Args_device_02 args_1{};
+    Args_device_13 args_0{};
     {
       CUtensorMap encoded{};
-      const uint64_t map_48_dims[] = {128ull, 4096ull, 16ull, 256ull};
-      const uint64_t map_48_strides[] = {2048ull, 128ull, 8388608ull};
-      const uint32_t map_48_box[] = {128u, 128u, 1u, 1u};
-      const uint32_t map_48_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3d7x0_dims[] = {128ull, 4096ull, 16ull, 256ull};
+      const uint64_t map_c3d7x0_strides[] = {2048ull, 128ull, 8388608ull};
+      const uint32_t map_c3d7x0_box[] = {128u, 128u, 1u, 1u};
+      const uint32_t map_c3d7x0_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_48_dims, map_48_strides, map_48_box, map_48_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights)) + 0) + 0, map_c3d7x0_dims, map_c3d7x0_strides, map_c3d7x0_box, map_c3d7x0_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.A) == sizeof(encoded));
+      std::memcpy(&args_0.A, &encoded, sizeof(encoded));
+    }
+    args_0.B = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q)) + 0));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x1_dims[] = {256ull, 2ull, 64ull, 8192ull};
+      const uint64_t map_c3d7x1_strides[] = {256ull, 512ull, 32768ull};
+      const uint32_t map_c3d7x1_box[] = {256u, 2u, 8u, 1u};
+      const uint32_t map_c3d7x1_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_c3d7x1_dims, map_c3d7x1_strides, map_c3d7x1_box, map_c3d7x1_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.SFA) == sizeof(encoded));
+      std::memcpy(&args_0.SFA, &encoded, sizeof(encoded));
+    }
+    args_0.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale)) + 0));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x2_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
+      const uint64_t map_c3d7x2_strides[] = {1024ull, 17179868160ull, 1024ull};
+      const uint32_t map_c3d7x2_box[] = {64u, 8u, 1u, 1u};
+      const uint32_t map_c3d7x2_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4,
+          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_c3d7x2_dims, map_c3d7x2_strides, map_c3d7x2_box, map_c3d7x2_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_0.C) == sizeof(encoded));
+      std::memcpy(&args_0.C, &encoded, sizeof(encoded));
+    }
+    args_0.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 344064u));
+    args_0.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 387072u));
+    args_0.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_0.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388608u));
+    args_0.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
+    args_0.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
+    args_0.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_scalar)) + 0));
+    args_0.scale_gate = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_gate_scalar)) + 0));
+    args_0.clamp_limit = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_clamp_limit)) + 0));
+    args_0.act_alpha = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_alpha)) + 0));
+    args_0.act_beta = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_beta)) + 0));
+    args_0.M_out = static_cast<int>(2048);
+    args_0.K = static_cast<int>(4096);
+    args_0.grid_m = static_cast<int>(32);
+    args_0.grid_n = static_cast<int>(42);
+    args_0.K_tiles = static_cast<int>(8);
+    Args_device_07 args_1{};
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x3_dims[] = {2048ull, 4096ull, 256ull};
+      const uint64_t map_c3d7x3_strides[] = {1024ull, 4194304ull};
+      const uint32_t map_c3d7x3_box[] = {256u, 128u, 1u};
+      const uint32_t map_c3d7x3_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_c3d7x3_dims, map_c3d7x3_strides, map_c3d7x3_box, map_c3d7x3_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.A) == sizeof(encoded));
       std::memcpy(&args_1.A, &encoded, sizeof(encoded));
     }
-    args_1.B = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_49_dims[] = {256ull, 2ull, 64ull, 8192ull};
-      const uint64_t map_49_strides[] = {256ull, 512ull, 32768ull};
-      const uint32_t map_49_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_49_elem[] = {1u, 1u, 1u, 1u};
+      const uint64_t map_c3d7x4_dims[] = {2048ull, 8ull, 42ull};
+      const uint64_t map_c3d7x4_strides[] = {1024ull, 8192ull};
+      const uint32_t map_c3d7x4_box[] = {256u, 8u, 1u};
+      const uint32_t map_c3d7x4_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
+          (static_cast<uint8_t*>(inv.workspace) + 0u) + 0, map_c3d7x4_dims, map_c3d7x4_strides, map_c3d7x4_box, map_c3d7x4_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_1.B) == sizeof(encoded));
+      std::memcpy(&args_1.B, &encoded, sizeof(encoded));
+    }
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x5_dims[] = {256ull, 2ull, 32ull, 8192ull};
+      const uint64_t map_c3d7x5_strides[] = {256ull, 512ull, 16384ull};
+      const uint32_t map_c3d7x5_box[] = {256u, 2u, 8u, 1u};
+      const uint32_t map_c3d7x5_elem[] = {1u, 1u, 1u, 1u};
       const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0) + 0, map_49_dims, map_49_strides, map_49_box, map_49_elem,
+          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_c3d7x5_dims, map_c3d7x5_strides, map_c3d7x5_box, map_c3d7x5_elem,
           CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
       static_assert(sizeof(args_1.SFA) == sizeof(encoded));
       std::memcpy(&args_1.SFA, &encoded, sizeof(encoded));
     }
-    args_1.SFB = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale)) + 0));
     {
       CUtensorMap encoded{};
-      const uint64_t map_50_dims[] = {2048ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_50_strides[] = {1024ull, 17179868160ull, 1024ull};
-      const uint32_t map_50_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_50_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_50_dims, map_50_strides, map_50_box, map_50_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      const uint64_t map_c3d7x6_dims[] = {32ull, 32ull, 42ull};
+      const uint64_t map_c3d7x6_strides[] = {32ull, 1024ull};
+      const uint32_t map_c3d7x6_box[] = {32u, 8u, 1u};
+      const uint32_t map_c3d7x6_elem[] = {1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
+          (static_cast<uint8_t*>(inv.workspace) + 344064u) + 0, map_c3d7x6_dims, map_c3d7x6_strides, map_c3d7x6_box, map_c3d7x6_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_1.C) == sizeof(encoded));
-      std::memcpy(&args_1.C, &encoded, sizeof(encoded));
+      static_assert(sizeof(args_1.SFB) == sizeof(encoded));
+      std::memcpy(&args_1.SFB, &encoded, sizeof(encoded));
     }
-    args_1.SFC = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 344320u));
-    args_1.route_map = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 387328u));
+    {
+      CUtensorMap encoded{};
+      const uint64_t map_c3d7x7_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
+      const uint64_t map_c3d7x7_strides[] = {8192ull, 68719468544ull, 8192ull};
+      const uint32_t map_c3d7x7_box[] = {64u, 8u, 1u, 1u};
+      const uint32_t map_c3d7x7_elem[] = {1u, 1u, 1u, 1u};
+      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
+          (static_cast<uint8_t*>(inv.workspace) + 389376u) + 0, map_c3d7x7_dims, map_c3d7x7_strides, map_c3d7x7_box, map_c3d7x7_elem,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
+      static_assert(sizeof(args_1.C_tma) == sizeof(encoded));
+      std::memcpy(&args_1.C_tma, &encoded, sizeof(encoded));
+    }
+    args_1.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
+    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
     args_1.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
-    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
-    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
-    args_1.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_scalar)) + 0));
-    args_1.scale_gate = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output1_scale_gate_scalar)) + 0));
-    args_1.clamp_limit = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_clamp_limit)) + 0));
-    args_1.act_alpha = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_alpha)) + 0));
-    args_1.act_beta = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_beta)) + 0));
-    args_1.M_out = static_cast<int>(2048);
-    args_1.K = static_cast<int>(4096);
+    args_1.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388608u));
+    args_1.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
+    args_1.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3141888u));
+    args_1.M = static_cast<int>(4096);
+    args_1.K = static_cast<int>(2048);
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(42);
-    args_1.K_tiles = static_cast<int>(8);
-    args_1.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    Args_device_07 args_2{};
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_51_dims[] = {2048ull, 4096ull, 256ull};
-      const uint64_t map_51_strides[] = {1024ull, 4194304ull};
-      const uint32_t map_51_box[] = {256u, 128u, 1u};
-      const uint32_t map_51_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights)) + 0) + 0, map_51_dims, map_51_strides, map_51_box, map_51_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.A) == sizeof(encoded));
-      std::memcpy(&args_2.A, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_52_dims[] = {2048ull, 8ull, 42ull};
-      const uint64_t map_52_strides[] = {1024ull, 8192ull};
-      const uint32_t map_52_box[] = {256u, 8u, 1u};
-      const uint32_t map_52_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 256u) + 0, map_52_dims, map_52_strides, map_52_box, map_52_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.B) == sizeof(encoded));
-      std::memcpy(&args_2.B, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_53_dims[] = {256ull, 2ull, 32ull, 8192ull};
-      const uint64_t map_53_strides[] = {256ull, 512ull, 16384ull};
-      const uint32_t map_53_box[] = {256u, 2u, 8u, 1u};
-      const uint32_t map_53_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
-          (static_cast<uint8_t*>(const_cast<void*>(inv.gemm2_weights_scale)) + 0) + 0, map_53_dims, map_53_strides, map_53_box, map_53_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFA) == sizeof(encoded));
-      std::memcpy(&args_2.SFA, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_54_dims[] = {32ull, 32ull, 42ull};
-      const uint64_t map_54_strides[] = {32ull, 1024ull};
-      const uint32_t map_54_box[] = {32u, 8u, 1u};
-      const uint32_t map_54_elem[] = {1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          (static_cast<uint8_t*>(inv.workspace) + 344320u) + 0, map_54_dims, map_54_strides, map_54_box, map_54_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.SFB) == sizeof(encoded));
-      std::memcpy(&args_2.SFB, &encoded, sizeof(encoded));
-    }
-    {
-      CUtensorMap encoded{};
-      const uint64_t map_55_dims[] = {4096ull, 8ull, 2147483648ull, 2147483648ull};
-      const uint64_t map_55_strides[] = {8192ull, 68719468544ull, 8192ull};
-      const uint32_t map_55_box[] = {64u, 8u, 1u, 1u};
-      const uint32_t map_55_elem[] = {1u, 1u, 1u, 1u};
-      const CUresult status = cuTensorMapEncodeTiled(&encoded, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-          (static_cast<uint8_t*>(inv.workspace) + 389632u) + 0, map_55_dims, map_55_strides, map_55_box, map_55_elem,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (status != CUDA_SUCCESS) throw std::runtime_error("clamped E256 tensor map encoding failed");
-      static_assert(sizeof(args_2.C_tma) == sizeof(encoded));
-      std::memcpy(&args_2.C_tma, &encoded, sizeof(encoded));
-    }
-    args_2.C = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389632u));
-    args_2.scale_c = reinterpret_cast<float*>((static_cast<uint8_t*>(const_cast<void*>(inv.output2_scale_scalar)) + 0));
-    args_2.tile_expert = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
-    args_2.tile_mn_limit = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 388864u));
-    args_2.num_non_exiting_ctas = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 389120u));
-    args_2.work_counter = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 3142144u));
+    args_1.K_tiles = static_cast<int>(4);
+    Args_device_04 args_2{};
+    args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
+    args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
+    args_2.output = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.output)) + 0));
+    args_2.num_tokens = static_cast<int>(7);
+    args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
-    args_2.K = static_cast<int>(2048);
-    args_2.grid_m = static_cast<int>(32);
-    args_2.grid_n = static_cast<int>(42);
-    args_2.K_tiles = static_cast<int>(4);
-    Args_device_04 args_3{};
-    args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389632u));
-    args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
-    args_3.output = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.output)) + 0));
-    args_3.num_tokens = static_cast<int>(7);
-    args_3.route_stride = static_cast<int>(32768);
-    args_3.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
-      128u, true, false, false,
-      &Submit_device_08, &args_0, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      199040u, true, false, false,
+      &Submit_device_13, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      199040u, true, false, false,
-      &Submit_device_02, &args_1, -1};
-    visitor(launch_1, context);
-    KernelLaunch launch_2{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       81536u, true, false, false,
-      &Submit_device_07, &args_2, 100};
-    visitor(launch_2, context);
-    KernelLaunch launch_3{
+      &Submit_device_07, &args_1, 100};
+    visitor(launch_1, context);
+    KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 7, 1), dim3(128, 1, 1), dim3(1, 1, 1),
       0u, true, false, false,
-      &Submit_device_04, &args_3, -1};
-    visitor(launch_3, context);
+      &Submit_device_04, &args_2, -1};
+    visitor(launch_2, context);
     return;
   }
   case 8: {

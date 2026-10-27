@@ -522,7 +522,7 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   if (IsGeometry(shape, 4096, 2048, 256, 6)) {
     // Fixed top-k6 finalizers do not use the generic unroll/workfeed fields.
     if (shape.num_tokens <= 8) {
-      const bool ordered = shape.num_tokens >= 7;
+      const bool ordered = shape.num_tokens >= 8;
       return {true,
               Geometry::kH4096I2048E256K6,
               RouteLayout::kDirect,
