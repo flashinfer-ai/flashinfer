@@ -538,6 +538,27 @@ def test_tinygemm_bf16_unaligned_out_bitwise(has_bias):
     assert torch.equal(out, out_ref)
 
 
+@pytest.mark.parametrize("program", ["ACCUMULATORS", "ACCUMULATORS_NOBIAS_PDL"])
+def test_tinygemm2_tcgen05_op_rejects_unaligned_out(program):
+    """Called directly, an ACCUMULATORS program refuses an output that is not
+    32-byte aligned and launches nothing."""
+    _target()
+    from flashinfer.gemm.routergemm import get_tinygemm2_tcgen05_op
+
+    input, weight, bias = _make_case(64, 4096, 4096)
+    if "_NOBIAS" in program:
+        bias = None
+    storage = torch.full(
+        (64 * 4096 + 8,), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    out = storage[8:].view(64, 4096)
+    assert out.data_ptr() % 32 != 0
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        get_tinygemm2_tcgen05_op()(program, input, weight, bias, out)
+    torch.cuda.synchronize()
+    assert torch.isnan(storage).all()
+
+
 @pytest.mark.parametrize(
     "batch_size,output_features,input_features",
     sorted({route[1:4] for route in ROUTES}),

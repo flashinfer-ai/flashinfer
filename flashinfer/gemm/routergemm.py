@@ -1229,6 +1229,11 @@ def get_tinygemm2_tcgen05_op():
     ) -> None:
         record = getattr(programs, program)
         tile = program.removesuffix("_PDL").removesuffix("_NOBIAS")
+        # A misaligned 32-byte store faults the CUDA context: refuse the call instead.
+        if tile == "ACCUMULATORS" and out.data_ptr() % 32 != 0:
+            raise ValueError(
+                f"{program} needs a 32-byte aligned out, got {out.data_ptr():#x}"
+            )
         features, rows = _TINYGEMM2_TCGEN05_TILES[tile]
         batch, in_features = input.shape
         out_features = weight.shape[0]
