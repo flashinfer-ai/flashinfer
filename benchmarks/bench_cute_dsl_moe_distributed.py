@@ -258,6 +258,8 @@ def _profile_worker_arguments(args, num_tokens):
         arguments.append("--apply-routing-weights-before-fc2")
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
+    if args.swap_ab:
+        arguments.append("--swap-ab")
     if not args.use_fused_finalize:
         arguments.append("--no-fused-finalize")
     if not args.enable_pdl:
@@ -720,7 +722,7 @@ def _distributed_moe_config(
             local_expert_offset=local_expert_offset,
             local_num_experts=num_local_experts,
         ),
-        backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=args.swap_ab),)),
         execution=ExecutionConfig(
             enable_pdl=args.enable_pdl,
             tune_max_num_tokens=tune_max_num_tokens,
@@ -756,12 +758,15 @@ def _create_distributed_weights(num_local_experts, intermediate_size, rank, devi
     return w13, w2
 
 
-def _create_shared_ep_weights(rank, world_size, device):
+def _create_shared_ep_weights(rank, world_size, device, swap_ab=False):
     """Quantize once, then permute the same bytes into each backend's layout."""
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
     from flashinfer.fused_moe import MoEWeightPack
-    from flashinfer.fused_moe.prepare import _interleave_linear_and_gate
+    from flashinfer.fused_moe.prepare import (
+        _cute_dsl_gated_weight_group_size,
+        _interleave_linear_and_gate,
+    )
     from flashinfer.moe_ep import PrequantizedMoEWeights
 
     num_local_experts = CFG.num_experts // world_size
@@ -807,19 +812,23 @@ def _create_shared_ep_weights(rank, world_size, device):
 
     # MegaMoE's canonical halves are [gate, up]. The split W4A16 epilogue
     # applies the gated activation to each interleaved pair (up, gate),
-    # so exchange the halves before its 64-row interleave. These are byte
+    # so exchange the halves before its architecture-specific interleave. These are byte
     # permutations only: neither path rounds or re-quantizes the weights.
     def up_gate(tensor):
         return torch.cat((tensor[:, intermediate:], tensor[:, :intermediate]), dim=1)
 
-    w13_split = _interleave_linear_and_gate(up_gate(w13_q), group_size=64, dim=1)
+    group_size = _cute_dsl_gated_weight_group_size(w13_q.device, swap_ab=swap_ab)
+    w13_split = _interleave_linear_and_gate(
+        up_gate(w13_q), group_size=group_size, dim=1
+    )
     w13_sf_split = _interleave_linear_and_gate(
-        up_gate(w13_sf.view(torch.uint8)), group_size=64, dim=1
+        up_gate(w13_sf.view(torch.uint8)), group_size=group_size, dim=1
     )
     split = MoEWeightPack()
     split.prepare_for(
         "cute_dsl",
         {
+            "swap_ab": swap_ab,
             "w1_weight": w13_split,
             "w1_weight_sf": split_scale(w13_sf_split, 2 * intermediate, hidden),
             "w1_alpha": alpha,
@@ -1495,6 +1504,7 @@ def _create_distributed_moe_layer(
             w13,
             w2,
             quant=moe_config.quant,
+            swap_ab=args.swap_ab,
             num_local_experts=num_local_experts,
             hidden_size=CFG.hidden_size,
             intermediate_size=intermediate_size,
@@ -1532,7 +1542,7 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
         0,
         device,
         prepared_weights=(
-            _create_shared_ep_weights(0, args.num_gpus, device)[0]
+            _create_shared_ep_weights(0, args.num_gpus, device, swap_ab=args.swap_ab)[0]
             if mode == "ep"
             and any(v.use_megamoe for v in _selected_variants(args, mode))
             else None
@@ -1827,7 +1837,7 @@ def _run_parallel_mode(
     for num_tokens in token_counts:
         row = {}
         shared_weights = (
-            _create_shared_ep_weights(rank, world_size, device)
+            _create_shared_ep_weights(rank, world_size, device, swap_ab=args.swap_ab)
             if shared_weight_comparison
             else None
         )
@@ -2108,6 +2118,11 @@ def main():
         "--use-per-token-activation",
         action="store_true",
         help="Use per-token NVFP4 activation scaling for split W4A4 (unsupported by W4A4 MegaMoE).",
+    )
+    parser.add_argument(
+        "--swap-ab",
+        action="store_true",
+        help="Use the Blackwell activations-on-B split kernels and weight layout.",
     )
     parser.add_argument(
         "--no-fused-finalize",

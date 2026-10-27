@@ -823,6 +823,7 @@ def create_moe_tensors(
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
     vary_block_scales: bool = False,
+    swap_ab: bool = False,
 ):
     """Create properly quantized MoE tensors for testing.
 
@@ -917,11 +918,16 @@ def create_moe_tensors(
     if vary_block_scales:
         w1_bf16 = w1_bf16 * _block_scale_ramp(fc1_rows, 1, device)[None, :, None]
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_for_quant = (
-        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
-        if gated and interleave_gated_weights
-        else w1_bf16
-    )
+    if gated and interleave_gated_weights:
+        from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
+
+        w1_for_quant = interleave_linear_and_gate(
+            w1_bf16,
+            group_size=_cute_dsl_gated_weight_group_size(w1_bf16.device, swap_ab=swap_ab),
+            dim=1,
+        )
+    else:
+        w1_for_quant = w1_bf16
     w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_for_quant, w1_gs, sf_vec_size)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,

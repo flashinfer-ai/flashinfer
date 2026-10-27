@@ -166,6 +166,7 @@ class PipelineTmaUmma(PipelineAsync):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         mcast_mode_mn: tuple[int, int] = (1, 1),
+        defer_sync: bool = False,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
@@ -178,6 +179,7 @@ class PipelineTmaUmma(PipelineAsync):
             tx_count (int): Number of bytes expected to be written to the transaction barrier for one stage.
             cta_layout_vmnk (cute.Layout | None): Layout of the cluster shape.
             mcast_mode_mn (tuple[int, int]): Tuple of two integers, specifying whether mcast is enabled for the m and n modes. At least one of the two integers must be 1.
+            defer_sync (bool): Defer the barrier initialization fence to the caller.
 
         Returns:
             PipelineTmaUmma: An instance of PipelineTmaUmma with all necessary attributes computed.
@@ -223,7 +225,8 @@ class PipelineTmaUmma(PipelineAsync):
 
         consumer_mask = producer_mask
 
-        pipeline_init_wait(cta_layout_vmnk)
+        if not defer_sync:
+            pipeline_init_wait(cta_layout_vmnk)
 
         return PipelineTmaUmma(
             sync_object_full,
@@ -317,6 +320,7 @@ class PipelineUmmaAsync(PipelineAsync):
         consumer_group: CooperativeGroup,
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
+        defer_sync: bool = False,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineUmmaAsync.
@@ -327,6 +331,7 @@ class PipelineUmmaAsync(PipelineAsync):
             producer_group (CooperativeGroup): CooperativeGroup for the producer agent.
             consumer_group (CooperativeGroup): CooperativeGroup for the consumer agent.
             cta_layout_vmnk (cute.Layout or None): Layout of the cluster shape.
+            defer_sync (bool): Defer the barrier initialization fence to the caller.
 
         Returns:
             PipelineUmmaAsync: An instance of PipelineUmmaAsync.
@@ -371,7 +376,8 @@ class PipelineUmmaAsync(PipelineAsync):
             else cute.nvgpu.tcgen05.CtaGroup.TWO
         )
 
-        pipeline_init_wait(cta_layout_vmnk)
+        if not defer_sync:
+            pipeline_init_wait(cta_layout_vmnk)
 
         return PipelineUmmaAsync(
             sync_object_full,
@@ -471,8 +477,15 @@ class PipelineCpAsyncUmma(PipelineAsync):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         defer_sync: bool = False,
+        empty_owner: Optional[PipelineAsync] = None,
     ):
         """Creates and initializes a new PipelineCpAsyncUmma instance.
+
+        With ``empty_owner``, both pipelines must use matching stage indices,
+        phases, UMMA consumer groups, and empty-arrival masks. Only the owner
+        releases a stage after all shared operands are consumed and drains it
+        with ``producer_tail`` before teardown. This pipeline retains its own
+        full-barrier commits and waits.
 
         :param num_stages: Number of buffer stages for this pipeline
         :type num_stages: int
@@ -484,6 +497,8 @@ class PipelineCpAsyncUmma(PipelineAsync):
         :type barrier_storage: cute.Pointer, optional
         :param cta_layout_vmnk: Layout of the cluster shape
         :type cta_layout_vmnk: cute.Layout, optional
+        :param empty_owner: Existing pipeline owning the shared operand empty ring.
+        :type empty_owner: PipelineAsync, optional
         :param defer_sync: Whether to defer the sync
         :type defer_sync: bool, optional
         :raises ValueError: If barrier_storage is not a cute.Pointer instance
@@ -508,11 +523,18 @@ class PipelineCpAsyncUmma(PipelineAsync):
         )
         # Directly create MbarrierArray for TCGen05Mma consumer, since
         # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
-        sync_object_empty = MbarrierArray(
-            barrier_storage=barrier_storage.align(min_align=8) + num_stages,
-            num_stages=num_stages,
-            agent=consumer,
-        )
+        if empty_owner is None:
+            sync_object_empty = MbarrierArray(
+                barrier_storage=barrier_storage.align(min_align=8) + num_stages,
+                num_stages=num_stages,
+                agent=consumer,
+            )
+        else:
+            if empty_owner.num_stages != num_stages:
+                raise ValueError("Shared empty ring must have the same stage count")
+            if empty_owner.sync_object_empty.op_type is not PipelineOp.TCGen05Mma:
+                raise ValueError("Shared empty ring must be released by UMMA")
+            sync_object_empty = empty_owner.sync_object_empty
 
         cta_v_size = (
             cute.size(cta_layout_vmnk, mode=[0]) if cta_layout_vmnk is not None else 1

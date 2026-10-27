@@ -99,6 +99,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -4975,9 +4976,8 @@ class CuteDslRunner(MoERunner):
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
-        # MXFP8 activations: _check_support() rejects SiTU.
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
         (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
     }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
@@ -4985,8 +4985,23 @@ class CuteDslRunner(MoERunner):
     # the per-token path, the only one that runs that quantizer.
     supports_nvfp4_4over6 = True
 
+    @property
+    def swap_ab(self) -> bool:
+        candidates = [
+            backend
+            for backend in self.config.backend
+            if isinstance(backend, CuteDslConfig)
+        ]
+        if len(candidates) != 1:
+            raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
+        return candidates[0].swap_ab
+
     def _check_support(self) -> None:
         super()._check_support()
+        if self.swap_ab and hasattr(self, "device"):
+            from .prepare import _cute_dsl_gated_weight_group_size
+
+            _cute_dsl_gated_weight_group_size(self.device, self.swap_ab)
         if self.config.quant.swizzled_scale_factors is True:
             raise NotImplementedError(
                 f"{type(self).__name__} consumes only the linear activation "
@@ -5023,10 +5038,11 @@ class CuteDslRunner(MoERunner):
             if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
             else "W4A8"
         )
-        if mxfp8_act and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
-        if mxfp8_act and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
+        if mxfp8_act and not self.swap_ab:
+            if isinstance(self.config.activation, SiTU):
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
+            if not self.config.finalize.use_fused_finalize:
+                raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
         if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
@@ -5151,6 +5167,7 @@ class CuteDslRunner(MoERunner):
                     (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
                     (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
                 }[self.config.quant.pair],
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5161,6 +5178,7 @@ class CuteDslRunner(MoERunner):
                 local_expert_offset=experts.local_expert_offset,
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         else:
@@ -5188,6 +5206,7 @@ class CuteDslRunner(MoERunner):
         return super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
+            self.swap_ab,
         )
 
     def forward(
@@ -5221,6 +5240,13 @@ class CuteDslRunner(MoERunner):
         self._require_built()
         self._validate_pack_contract(act)
         v = weights.get_view(self.backend_key)
+        # Untagged views use the original 64-row contract.
+        prepared_swap_ab = v["swap_ab"] if "swap_ab" in v else False
+        if not isinstance(prepared_swap_ab, bool) or prepared_swap_ab != self.swap_ab:
+            raise ValueError(
+                "CuTe DSL weights and CuteDslConfig must use the same swap_ab; "
+                "prepare the weights with the selected mode."
+            )
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a

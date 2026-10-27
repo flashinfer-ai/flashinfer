@@ -1766,7 +1766,10 @@ class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("use_wrapper", [False, True])
-    def test_weight_scale_update(self, use_wrapper: bool):
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_weight_scale_update(self, use_wrapper: bool, swap_ab: bool):
+        if swap_ab and is_sm107():
+            pytest.skip("swap_ab requires Blackwell SM100 or SM103")
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
@@ -1781,6 +1784,7 @@ class TestCuteDslMoeW4A16:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            swap_ab=swap_ab,
         )
         kwargs = {
             "x": tensors["x_bf16"],
@@ -1803,6 +1807,7 @@ class TestCuteDslMoeW4A16:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=False,
                 quant_mode="w4a16",
+                swap_ab=swap_ab,
                 use_fused_finalize=False,
             )
         else:
@@ -1816,13 +1821,16 @@ class TestCuteDslMoeW4A16:
                 num_experts=num_experts,
                 top_k=top_k,
                 quant_mode="w4a16",
+                swap_ab=swap_ab,
                 use_fused_finalize=False,
             )
 
         # Weight scales are serving-owned tensors and may be updated in place.
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
-        assert_w4a16_bits(result, split_w4a16_reference_from_tensors(tensors))
+        assert_w4a16_bits(
+            result, split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab)
+        )
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
         updated = run()
@@ -1901,6 +1909,7 @@ class TestCuteDslMoeW4A16:
             token_final_scales=None,
             enable_pdl=False,
             tactic=tactic,
+            swap_ab=False,
         )
 
         expected = torch.zeros_like(output)
@@ -2099,6 +2108,7 @@ class TestCuteDslFusedMoeFunctional:
             ),
         ],
     )
+    @pytest.mark.parametrize("swap_ab", [False, True])
     def test_deterministic_finalize_numerical_accuracy(
         self,
         quant_mode: str,
@@ -2109,7 +2119,10 @@ class TestCuteDslFusedMoeFunctional:
         intermediate_size: int,
         num_experts: int,
         use_per_token_activation: bool,
+        swap_ab: bool,
     ):
+        if swap_ab and is_sm107():
+            pytest.skip("swap_ab requires Blackwell SM100 or SM103")
         self._run_numerical_accuracy(
             activation_type,
             num_tokens,
@@ -2120,6 +2133,7 @@ class TestCuteDslFusedMoeFunctional:
             quant_mode,
             use_per_token_activation,
             use_fused_finalize=False,
+            swap_ab=swap_ab,
         )
 
     @pytest.mark.parametrize(
@@ -2190,6 +2204,7 @@ class TestCuteDslFusedMoeFunctional:
         quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
+        swap_ab: bool = False,
     ):
         from flashinfer import cute_dsl_fused_moe
 
@@ -2204,6 +2219,7 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_local_experts,
             top_k=top_k,
             gated=gated,
+            swap_ab=swap_ab,
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
@@ -2225,6 +2241,7 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=activation_type,
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
+            swap_ab=swap_ab,
             **api_inputs,
         )
 
@@ -5282,3 +5299,173 @@ def test_cute_dsl_pinned_recipe_matches_env(recipe):
         assert not torch.equal(env_on[leg], env_off[leg])
         assert torch.equal(pinned_under_env_off[leg], env_on[leg])
         assert torch.equal(none_under_env_on[leg], env_off[leg])
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("k", [64, 128, 192, 256, 384, 512])
+@pytest.mark.parametrize("num_tokens", [1, 17])
+@pytest.mark.parametrize("tile_n", [16, 32, 64, 128, 256])
+def test_swap_ab_gemm_k_tail(k, num_tokens, tile_n):
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Requires Blackwell SM100 or SM103")
+
+    from flashinfer.fused_moe.cute_dsl.blackwell.moe_swap_ab import (
+        launch_gather_gemm,
+    )
+
+    device = "cuda"
+    n = 256
+    # Two FP4 ones per byte. An extra row keeps the old kernel's tail reads
+    # inside allocated storage, so a failure cannot poison the CUDA context.
+    a_storage = torch.full(
+        (num_tokens + 1, k // 2), 0x22, dtype=torch.uint8, device=device
+    )
+    a = a_storage[:num_tokens]
+    # E4M3 1.0 = 0x38; 0x7f is NaN. Reading the extra scale row must not
+    # contaminate the last real row, even though the weight K tail is zero.
+    scale_storage = torch.full(
+        (num_tokens + 1, k // 16), 0x7F, dtype=torch.uint8, device=device
+    )
+    a_scale = scale_storage[:num_tokens]
+    a_scale.fill_(0x38)
+    b = torch.full((1, n, k // 2), 0x22, dtype=torch.uint8, device=device)
+    b_scale = torch.full(
+        (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
+    )
+    num_tiles = (num_tokens + tile_n - 1) // tile_n
+    mapping = torch.full((num_tiles * tile_n,), -1, dtype=torch.int32, device=device)
+    mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
+
+    output, _ = launch_gather_gemm(
+        a=a,
+        b=b,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        alpha=torch.full((1,), 1.0 / k, device=device),
+        tile_idx_to_expert_idx=torch.zeros(num_tiles, dtype=torch.int32, device=device),
+        tile_idx_to_mn_limit=torch.full(
+            (num_tiles,), num_tokens, dtype=torch.int32, device=device
+        ),
+        token_id_mapping=mapping,
+        num_non_exiting_tiles=torch.tensor(
+            [num_tiles], dtype=torch.int32, device=device
+        ),
+        topk=1,
+        c_dtype="bfloat16",
+        mma_tiler_mn=(128, tile_n),
+        cluster_shape_mn=(1, 1),
+        enable_pdl=False,
+    )
+    # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
+    expected = torch.full_like(
+        output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
+    )
+    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
+
+
+@cute_dsl_available
+@mxfp8_required
+@pytest.mark.parametrize("quant_mode", ["w4a8", "mxfp8"])
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [(None, None), (1.75, None), (0.8, 1.5)],
+    ids=["swiglu", "situ-gate", "situ-gate-and-up"],
+)
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        (16, ((128, 16), (1, 1), False), ((128, 16), (1, 1), False)),
+        (128, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False)),
+    ],
+    ids=["n16", "n128-two-cta"],
+)
+def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_beta):
+    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe, mxfp8_quantize
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    tokens, hidden, intermediate, experts, top_k = 17, 256, 128, 2, 2
+    x_bf16 = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) / 2
+    x, x_sf = mxfp8_quantize(
+        x_bf16, is_sf_swizzled_layout=False, alignment=128, backend="cuda"
+    )
+    x_sf = x_sf.view(torch.uint8).reshape(tokens, hidden // 32)
+    if quant_mode == "w4a8":
+        weight_format = QuantFormat.MXFP4
+    elif quant_mode == "mxfp8":
+        weight_format = QuantFormat.MXFP8
+    else:
+        raise ValueError(quant_mode)
+    weights = CuteDslConfig.prepare_weights(
+        torch.randn(
+            experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16
+        )
+        / 4,
+        torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16)
+        / 4,
+        quant=QuantConfig(weight_format, QuantFormat.MXFP8),
+        swap_ab=True,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    weights.pop("swap_ab")
+    inputs = dict(
+        x=x,
+        x_sf=x_sf,
+        token_selected_experts=torch.arange(experts, device=device, dtype=torch.int32)
+        .expand(tokens, top_k)
+        .contiguous(),
+        token_final_scales=torch.full(
+            (tokens, top_k), 1 / top_k, dtype=torch.float32, device=device
+        ),
+        fc2_input_scale=None,
+        **weights,
+    )
+    config = dict(
+        num_experts=experts,
+        top_k=top_k,
+        quant_mode=quant_mode,
+        swap_ab=True,
+        use_fused_finalize=False,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    expected = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
+    wrapper = CuteDslMoEWrapper(
+        **config,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        use_cuda_graph=True,
+        autotune_use_cuda_graph=True,
+    )
+    actual = wrapper.run(**inputs, tactic=tactic)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert wrapper._runner.use_cuda_graph
+
+    if situ_beta is not None:
+        from flashinfer.trace.templates.moe import _cute_dsl_fused_moe_reference
+
+        reference = _cute_dsl_fused_moe_reference(**inputs, **config)
+        swiglu_reference = _cute_dsl_fused_moe_reference(
+            **inputs, **dict(config, situ_beta=None, situ_linear_beta=None)
+        )
+        passed, percent_within, atol = check_accuracy(actual, reference)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+        situ_error = torch.mean(torch.abs(actual.float() - reference.float()))
+        swiglu_error = torch.mean(torch.abs(actual.float() - swiglu_reference.float()))
+        assert situ_error < swiglu_error
+
+    invalid = dict(inputs, w1_weight=inputs["w1_weight"].to(torch.bfloat16))
+    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+        wrapper.run(**invalid, tactic=tactic)
+    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+        cute_dsl_fused_moe(**invalid, **config, tactic=tactic)

@@ -2492,6 +2492,24 @@ def prepare_cutlass_humming_weights(
     }
 
 
+def _cute_dsl_gated_weight_group_size(
+    device: torch.device, swap_ab: bool = False
+) -> int:
+    """Resolve the gated row layout and reject unsupported swap-AB targets."""
+    if not isinstance(swap_ab, bool):
+        raise TypeError("swap_ab must be a bool")
+    arch = get_compute_capability(torch.device(device))
+    if swap_ab:
+        if arch not in ((10, 0), (10, 3)):
+            raise ValueError("CuTe DSL MoE swap_ab=True requires SM100 or SM103")
+        return 16
+    if arch in ((10, 0), (10, 3), (10, 7)):
+        return 64
+    raise ValueError(
+        f"Split CuTe DSL MoE weight preparation does not support SM{arch[0]}{arch[1]}"
+    )
+
+
 def _interleave_linear_and_gate(
     x: torch.Tensor, group_size: int = 64, dim: int = -1
 ) -> torch.Tensor:
@@ -2506,6 +2524,38 @@ def _interleave_linear_and_gate(
     return x
 
 
+def interleave_cute_dsl_moe_weights(
+    weight: torch.Tensor, block_scales: torch.Tensor, swap_ab: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Interleave gated FC1 weights and row-major scales for split CuTe DSL MoE.
+
+    Inputs have shape ``[experts, 2 * intermediate_size, packed_k]`` and
+    ``[experts, 2 * intermediate_size, scale_k]``, with contiguous ``[up, gate]``
+    halves. ``swap_ab`` must match the execution API: False uses 64-row groups;
+    True uses 16-row groups on SM100/SM103. Use this before scale swizzling
+    and MMA-layout conversion, once per checkpoint load.
+
+    Returns tensors with the same shapes and dtypes. This only permutes rows;
+    it does not requantize weights or change global/input scales. It applies to
+    gated FC1 in W4A4, W4A8, W4A16 and MXFP8 modes, not FC2 or non-gated FC1.
+    """
+    if weight.ndim != 3 or block_scales.ndim != 3:
+        raise ValueError("Expected 3D expert weights and row-major block scales")
+    if weight.shape[:2] != block_scales.shape[:2]:
+        raise ValueError(
+            "Weights and block scales must have matching expert/row dimensions"
+        )
+    if weight.device != block_scales.device:
+        raise ValueError("Weights and block scales must be on the same device")
+    group_size = _cute_dsl_gated_weight_group_size(weight.device, swap_ab)
+    if weight.shape[1] % (2 * group_size):
+        raise ValueError(f"Each up/gate half must have a multiple of {group_size} rows")
+    return (
+        _interleave_linear_and_gate(weight, group_size=group_size, dim=1),
+        _interleave_linear_and_gate(block_scales, group_size=group_size, dim=1),
+    )
+
+
 def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -2517,11 +2567,14 @@ def prepare_cute_dsl_weights(
     activation=None,
     device: Optional[torch.device] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = None,
-) -> Dict[str, torch.Tensor]:
+    swap_ab: bool = False,
+) -> Dict[str, Union[torch.Tensor, bool]]:
     """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
+    The default preserves 64-row up/gate groups. ``swap_ab=True`` selects
+    16-row groups on SM100/SM103 and must match the execution configuration.
     ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
     (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
@@ -2535,6 +2588,8 @@ def prepare_cute_dsl_weights(
         Expert geometry.
     device : torch.device, optional
         Target device; defaults to ``w1_bf16.device``.
+    swap_ab : bool
+        Select the Blackwell activations-on-B layout; defaults to False.
     nvfp4_4over6 : NVFP44Over6Config or None
         The 4over6 recipe the runtime activation quantizer will be given.
         Selects ``fc2_input_scale`` only (``1 / (6 * e4m3_max)``, the value
@@ -2547,7 +2602,8 @@ def prepare_cute_dsl_weights(
     dict
         Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
-        ``w2_weight_sf``, ``w2_alpha``.
+        ``w2_weight_sf``, ``w2_alpha``. The swap-AB view also carries
+        ``swap_ab=True``; untagged views retain the original layout.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
@@ -2565,6 +2621,7 @@ def prepare_cute_dsl_weights(
 
     if device is None:
         device = w1_bf16.device
+    group_size = _cute_dsl_gated_weight_group_size(device, swap_ab)
     # Honor the documented device target (no-op if already resident); avoids
     # mixed-device ops when canonical weights are on CPU.
     w1_bf16 = w1_bf16.to(device)
@@ -2597,7 +2654,9 @@ def prepare_cute_dsl_weights(
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_interleaved = (
-        _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        _interleave_linear_and_gate(
+            w1_bf16, group_size=group_size, dim=1
+        )
         if activation.is_gated
         else w1_bf16
     )
@@ -2636,6 +2695,8 @@ def prepare_cute_dsl_weights(
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
     }
+    if swap_ab:
+        view["swap_ab"] = True
     if not (is_mxfp4 or is_mxfp8):
         # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
         # w2_bf16 is passed for its device only.

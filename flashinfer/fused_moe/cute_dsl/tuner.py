@@ -518,6 +518,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
+        swap_ab: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -547,6 +548,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
+        self.swap_ab = swap_ab
         self.use_cuda_graph = use_cuda_graph
         self.localized_weights = localized_weights
         self.localized_streams = localized_streams
@@ -711,6 +713,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.situ_linear_beta,
                 self.use_per_token_activation,
                 self.quant_mode,
+                self.swap_ab,
                 self.use_cuda_graph,
                 self._localization_signature(),
             )
@@ -731,6 +734,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.output_dtype,
             self.enable_pdl,
         )
+        if self.swap_ab:
+            extras += ("swap_ab", "blockscaled_route_n_v5")
         if self.use_cuda_graph:
             extras += ("cuda_graph",)
         return extras + self._localization_signature()
@@ -754,6 +759,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         can_implement methods using the actual problem dimensions from inputs.
         Supports both Blackwell and Rubin architectures.
         """
+        if self.swap_ab:
+            from .blackwell.moe_swap_ab_tuner import get_valid_swap_ab_tactics
+
+            return get_valid_swap_ab_tactics(self, inputs)
+
         import cutlass
         from ...cute_dsl.utils import torch_to_cutlass_dtype
         from .moe_utils import get_max_num_permuted_tokens
@@ -987,16 +997,31 @@ class CuteDslFusedMoERunner(TunableRunner):
         Returns:
             Output tensor from the MoE computation.
         """
-        if tactic is None or tactic == -1:
-            tactic = (
-                DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode in ("w4a8", "mxfp8")
-                else _get_default_tactic()
+        if self.swap_ab:
+            from .blackwell.moe_swap_ab_tuner import (
+                DEFAULT_SWAP_AB_MOE_TACTIC,
+                extract_swap_ab_tactic_params,
             )
-        elif self.quant_mode in ("w4a8", "mxfp8"):
-            tactic = canonicalize_w4a8_tactic(tactic)
 
-        params = _extract_tactic_params(tactic)
+            if tactic is None or tactic == -1:
+                tactic = DEFAULT_SWAP_AB_MOE_TACTIC
+            params = extract_swap_ab_tactic_params(tactic)
+            kwargs.update(
+                gemm1_k_steps=params["gemm1_k_steps"],
+                gemm2_k_steps=params["gemm2_k_steps"],
+                gemm1_use_clc_scheduler=params["gemm1_use_clc_scheduler"],
+                gemm2_use_clc_scheduler=params["gemm2_use_clc_scheduler"],
+            )
+        else:
+            if tactic is None or tactic == -1:
+                tactic = (
+                    DEFAULT_BLACKWELL_MOE_TACTIC
+                    if self.quant_mode in ("w4a8", "mxfp8")
+                    else _get_default_tactic()
+                )
+            elif self.quant_mode in ("w4a8", "mxfp8"):
+                tactic = canonicalize_w4a8_tactic(tactic)
+            params = _extract_tactic_params(tactic)
 
         (
             x,
@@ -1068,6 +1093,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            swap_ab=self.swap_ab,
             **kwargs,
         )
 
@@ -1142,6 +1168,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swap_ab: bool = False,
     ):
         activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -1160,6 +1187,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.swap_ab = swap_ab
         # Match production EP routing density while retaining seeded load
         # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
@@ -1229,6 +1257,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.swiglu_limit,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.swap_ab,
             )
         )
 
@@ -1247,6 +1276,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.swap_ab,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -1361,6 +1391,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
             tactic=None if tactic is None or tactic == -1 else tactic,
+            swap_ab=self.swap_ab,
         )
 
 

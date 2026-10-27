@@ -48,7 +48,7 @@ Blackwell (SM100) specific kernel utilities.
 
 Re-exports shared utilities from common/kernel_utils.py (pointer helpers, the
 f32 activation functions, fmin) and adds Blackwell-specific functions:
-blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
+blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16, and PDL publication.
 """
 
 from cutlass._mlir.dialects import llvm
@@ -78,6 +78,12 @@ from ..common.kernel_utils import (  # noqa: F401
 # ============================================================================
 # Blackwell-specific functions
 # ============================================================================
+
+
+@dsl_user_op
+def release_gpu(loc=None, ip=None):
+    """Publish completed writes before triggering the dependent grid."""
+    llvm.fence(llvm.AtomicOrdering.release, syncscope="device", loc=loc, ip=ip)
 
 
 @dsl_user_op
