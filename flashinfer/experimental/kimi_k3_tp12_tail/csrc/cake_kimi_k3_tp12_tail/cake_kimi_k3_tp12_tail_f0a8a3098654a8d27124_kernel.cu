@@ -53,18 +53,18 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_REDUCE_SCRATCH_STAGE_BYTES 128
 #define SMEM_REDUCE_SCRATCH_STRIDE 128
 #define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 3840
-#define SMEM_PARTIALS_STRIDE 3840
-#define SMEM_TOTAL 3840
+#define SMEM_PARTIALS_STAGE_BYTES 1920
+#define SMEM_PARTIALS_STRIDE 1920
+#define SMEM_TOTAL 1920
 #define THREADS 448
-#define K23_CAPACITY 8
+#define K23_CAPACITY 4
 
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(448) void
-kernel_cake_kimi_k3_tp12_tail_38c7cf8d80dac9c8664a(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* y, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ w_slice, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, int my_col_begin, int k23_ctas, float epsilon)
+kernel_cake_kimi_k3_tp12_tail_f0a8a3098654a8d27124(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* y, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ w_slice, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, int my_col_begin, int k23_ctas, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1810,7 +1810,7 @@ kernel_cake_kimi_k3_tp12_tail_38c7cf8d80dac9c8664a(__nv_bfloat16* __restrict__ r
         asm volatile("barrier.sync 1, 448;" ::: "memory");
         __syncwarp();
         float acc[8];
-        unsigned int ycache[32];
+        unsigned int ycache[16];
         for (int m = 0; m < K23_CAPACITY; m++) {
             if (m < num_tokens) {
                 unsigned int _vec_load_8[4];
@@ -1827,7 +1827,7 @@ kernel_cake_kimi_k3_tp12_tail_38c7cf8d80dac9c8664a(__nv_bfloat16* __restrict__ r
             }
         }
         float accg[32];
-        for (int g = 0; g < 2; g++) {
+        for (int g = 0; g < 1; g++) {
             int mq = g * 4;
             if (mq + 4 <= num_tokens) {
                 for (int j = 0; j < 4; j++) {
