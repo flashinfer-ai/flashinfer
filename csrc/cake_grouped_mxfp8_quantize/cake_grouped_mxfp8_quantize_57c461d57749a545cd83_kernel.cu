@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89 (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_57c461d57749a545cd83 (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_57c461d57749a545cd83
 #endif
 
 typedef signed char        int8_t;
