@@ -58,7 +58,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_FLAG_OFF 256
 #define SMEM_FLAG_STAGE_BYTES 16
 #define SMEM_FLAG_STRIDE 16
-#define SMEM_TOTAL 384
+#define SMEM_SENT_TAB_OFF 272
+#define SMEM_SENT_TAB_STAGE_BYTES 2048
+#define SMEM_SENT_TAB_STRIDE 2048
+#define SMEM_TOTAL 2432
 #define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -67,7 +70,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
-kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int slots, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, int* __restrict__ gen, float* __restrict__ part, unsigned int* __restrict__ ctr, unsigned long long r_mcast)
+kernel_cake_tp_moe_finalize_rmsnorm_a518b8ead2e395b00eeb(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int slots, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, int* __restrict__ gen, float* __restrict__ part, unsigned int* __restrict__ ctr, unsigned long long r_mcast)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -98,6 +101,8 @@ kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restri
     const int cta_tab_addr = smem + 128;
     unsigned int* flag = reinterpret_cast<unsigned int*>(smem_raw + 256);
     const int flag_addr = smem + 256;
+    unsigned int* sent_tab = reinterpret_cast<unsigned int*>(smem_raw + 272);
+    const int sent_tab_addr = smem + 272;
 
     // === Task calls (declaration order) ===
     int band = blockIdx.x;
@@ -125,6 +130,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restri
     long long old_slot = (long long)gn_old * (long long)slots + slot64;
     long long a_cur = cur_slot * 131072 + col64;
     long long a_old = old_slot * 131072 + col64;
+    long long a_old_cta = old_slot * 131072 + (long long)(band * 128 * 8);
     long long r_cur = cur_slot * 16384 + col64;
     long long r_old = old_slot * 16384 + col64;
     long long a_local_addr = peer_table[rank];
@@ -187,6 +193,9 @@ kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restri
     sent4[1] = 2147516416;
     sent4[2] = 2147516416;
     sent4[3] = 2147516416;
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(sent_tab_addr + (unsigned int)(tid * 16)), "r"(2147516416u), "r"(2147516416u), "r"(2147516416u), "r"(2147516416u) : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
     {
         auto _gst_3 = r_local + (r_old + dest64 * 4096);
         __builtin_assume(__isGlobal(_gst_3));
@@ -468,45 +477,66 @@ kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restri
         }
     }
     long long q_own = (long long)d * 8;
-    {
-        auto _gst_28 = a_local + (a_old + q_own * 4096);
-        __builtin_assume(__isGlobal(_gst_28));
-        reinterpret_cast<int4*>(_gst_28)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_29 = a_local + (a_old + (q_own + 1) * 4096);
-        __builtin_assume(__isGlobal(_gst_29));
-        reinterpret_cast<int4*>(_gst_29)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_30 = a_local + (a_old + (q_own + 2) * 4096);
-        __builtin_assume(__isGlobal(_gst_30));
-        reinterpret_cast<int4*>(_gst_30)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_31 = a_local + (a_old + (q_own + 3) * 4096);
-        __builtin_assume(__isGlobal(_gst_31));
-        reinterpret_cast<int4*>(_gst_31)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_32 = a_local + (a_old + (q_own + 4) * 4096);
-        __builtin_assume(__isGlobal(_gst_32));
-        reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_33 = a_local + (a_old + (q_own + 5) * 4096);
-        __builtin_assume(__isGlobal(_gst_33));
-        reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_34 = a_local + (a_old + (q_own + 6) * 4096);
-        __builtin_assume(__isGlobal(_gst_34));
-        reinterpret_cast<int4*>(_gst_34)[0] = reinterpret_cast<int4*>(sent4)[0];
-    }
-    {
-        auto _gst_35 = a_local + (a_old + (q_own + 7) * 4096);
-        __builtin_assume(__isGlobal(_gst_35));
-        reinterpret_cast<int4*>(_gst_35)[0] = reinterpret_cast<int4*>(sent4)[0];
+    if (tid < 32) {
+        if (lane == 0) {
+            {
+                void* _cpbulk_dst_28 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 0) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_28), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_29 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 1) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_29), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_30 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 2) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_30), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_31 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 3) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_31), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_32 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 4) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_32), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_33 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 5) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_33), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_34 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 6) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_34), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            {
+                void* _cpbulk_dst_35 = reinterpret_cast<void*>(a_local + (a_old_cta + (q_own + 7) * 4096));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                    :: "l"(_cpbulk_dst_35), "r"(sent_tab_addr), "r"((uint32_t)(2048))
+                    : "memory");
+            }
+            asm volatile("cp.async.bulk.commit_group;");
+        }
     }
     if (d == 0 && tok_own < n_tok) {
         long long xf = 0;
@@ -2464,6 +2494,11 @@ kernel_cake_tp_moe_finalize_rmsnorm_37c457efef613ba3d1b9(__nv_bfloat16* __restri
         row4[2] = _sysv_poll_group_2[2];
         row4[3] = _sysv_poll_group_2[3];
         reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(output + ((long long)tok_push * 4096 + col64)))[0] = reinterpret_cast<int4*>(row4)[0];
+    }
+    if (tid < 32) {
+        if (lane == 0) {
+            asm volatile("cp.async.bulk.wait_group 0;");
+        }
     }
     int gn_next = ((gn == 2) ? 0 : gn + 1);
     if (tid == 0 && cta_rank_0 == 0) {
