@@ -2382,9 +2382,10 @@ def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_outp
 
 
 @frost_gpu
+@pytest.mark.parametrize("zero_scale_routes", [False, True])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("tokens", [1, 4])
-def test_legacy_mx_fma_shared_pipeline(mixed, tokens, monkeypatch):
+def test_legacy_mx_fma_shared_pipeline(mixed, tokens, zero_scale_routes, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("legacy FMA admission is SM107 only")
     _assert_mxfp8_moe_full_pipeline_and_graph(
@@ -2394,6 +2395,7 @@ def test_legacy_mx_fma_shared_pipeline(mixed, tokens, monkeypatch):
         mixed=mixed,
         geometry=(tokens, 2048, 1408, 64, 6),
         require_fma=True,
+        zero_scale_routes=zero_scale_routes,
     )
 
 
@@ -2405,6 +2407,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     fc1_output="bf16",
     geometry=(17, 256, 256, 4, 2),
     require_fma=False,
+    zero_scale_routes=False,
 ):
     from flashinfer.fused_moe import (
         CutlassMxfp8Config,
@@ -2466,9 +2469,12 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
         torch.tensor([1.5, -0.75, 0.0, 0.5], device="cuda").repeat(e // 4)
     )
     ids = torch.randint(0, e // 2, (t, k), device="cuda", dtype=torch.int32)
-    if require_fma and t == 1:
-        # Even experts have a zero FC1 or FC2 input scale. Cover both zero- and
-        # nonzero-scale routes instead of relying on a one-token random draw.
+    # Even experts have a zero FC1 or FC2 input scale. Preserve zero-scale
+    # routes while keeping a nonzero reference, including for a single token.
+    if zero_scale_routes:
+        ids.zero_()
+        ids[0, 0] = 1
+    else:
         ids[0] = torch.arange(k, device=ids.device, dtype=ids.dtype)
     scores = torch.rand(t, k, device="cuda")
     scores /= scores.sum(-1, keepdim=True)
