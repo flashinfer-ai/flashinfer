@@ -36,6 +36,7 @@ from .cake_chain import (
     ScanPlan,
     SegmentTable,
     StageSet,
+    StreamGroups,
     build_chunk_meta,
     build_chunk_meta_from_cu_seqlens,
     choose_scan_plan,
@@ -48,7 +49,9 @@ from .cake_chain import (
     lpt_walk,
     make_options,
     scan_plans,
+    sequence_groups,
     stage_set,
+    two_stream_split,
     use_prep_tma,
 )
 
@@ -65,6 +68,7 @@ __all__ = [
     "ScanPlan",
     "SegmentTable",
     "StageSet",
+    "StreamGroups",
     "build_chunk_meta",
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
@@ -77,6 +81,8 @@ __all__ = [
     "lpt_walk",
     "make_options",
     "scan_plans",
+    "sequence_groups",
     "stage_set",
+    "two_stream_split",
     "use_prep_tma",
 ]

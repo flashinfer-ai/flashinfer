@@ -5,7 +5,9 @@ DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  Every launch is a plain
 stream-ordered kernel: no atomics, no data-dependent ordering, so the outputs
 and every gradient are bitwise the same run to run for one layout and one
-plan.
+plan.  Some stages run as two groups of sequences on the caller's stream and a
+side stream; the groups write disjoint outputs, so this holds with one or two
+streams.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the supported
@@ -76,6 +78,24 @@ CTA computes what it computes in the caller's order, so the outputs and the
 gradients are bitwise the same with `lpt=False`.  The device route keeps the
 caller's order.
 
+A serial scan runs one CTA per (sequence, value head) with one CTA per SM, so
+its last round can leave SMs idle.  On the host-table route such a scan can
+run as two contiguous groups of sequences.  With `n` sequences, `HV` value
+heads and `SMs` multiprocessors, `idle(c) = ceil(c / SMs) x SMs - c` counts the
+idle slots of `c` CTAs; `k` in `[1, n)` minimizes `idle(k x HV)` (ties to the
+larger `k`).  The scan is split only if `idle(k x HV) < idle(n x HV)`; a scan
+with `n < 2` or `n x HV <= SMs` is never split.  The groups follow the table
+order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
+value-head group of two runs the first `k` sequences on the caller's stream,
+then their fused tail while a side stream scans the rest.  The forward runs
+`wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream; once
+that `wy_tc` is done, the caller's stream runs those of the last `k`.  The side
+stream is a stream of PyTorch's pool with the device's greatest priority, one
+per caller stream; it is forked from the caller's stream with events and joined
+before the stage returns (also when a launch raises), so the call can be
+captured in a CUDA graph (warm it up first, like any captured call).
+`streams=1` keeps every launch on the caller's stream; the bits are the same.
+
 ## Plan pins (keyword-only)
 
 | keyword | default | effect |
@@ -89,6 +109,7 @@ caller's order.
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
 | `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order (the same bits) |
+| `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream (the same bits) |
 
 ## Limitations
 
