@@ -19,6 +19,12 @@ from ..jit.cake_grouped_mxfp8_quantize import (
     F16 as _CAKE_GROUPED_MXFP8_F16,
     TILED_BF16 as _CAKE_GROUPED_MXFP8_TILED_BF16,
     TILED_F16 as _CAKE_GROUPED_MXFP8_TILED_F16,
+    TILED_K2048_BF16 as _CAKE_GROUPED_MXFP8_TILED_K2048_BF16,
+    TILED_K2048_F16 as _CAKE_GROUPED_MXFP8_TILED_K2048_F16,
+    TILED_K4096_BF16 as _CAKE_GROUPED_MXFP8_TILED_K4096_BF16,
+    TILED_K4096_F16 as _CAKE_GROUPED_MXFP8_TILED_K4096_F16,
+    TILED_WIDE_BF16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    TILED_WIDE_F16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
 )
 from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
@@ -474,7 +480,7 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
-# Generated Cake programs of the grouped MXFP8 quantizer: three kernels per
+# Generated Cake programs of the grouped MXFP8 quantizer: six programs per
 # input dtype, all writing the same bytes.  Every program reads two-byte
 # elements through one bfloat16 pointer (the float16 programs widen with their
 # own conversion), so the host selects the program by dtype and shape and
@@ -503,12 +509,41 @@ _CAKE_GROUPED_MXFP8_TILED_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
     torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_BF16,
     torch.float16: _CAKE_GROUPED_MXFP8_TILED_F16,
 }
+# The tiled programs below are builds of the same kernel for one K each.  They
+# write the same bytes; they differ in the CTA width and in how a thread holds
+# a block, computes its scale byte and forms its addresses.
+#
+# K = 7168: 224-thread CTAs, so a row of 224 blocks is one CTA instead of two
+# and the grid has half the CTAs; the scale byte from integer operations.
+_CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_WIDE_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
+}
+# K = 4096: 256-thread CTAs, each holding two rows of 128 blocks side by side;
+# packed two-byte pairs, the integer scale byte, one row address stepped per
+# row and a launch bound of five CTAs per SM.
+_CAKE_GROUPED_MXFP8_TILED_K4096_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_K4096_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_K4096_F16,
+}
+# K = 2048: 128-thread CTAs with the packed pairs, the integer scale byte and
+# the stepped row address.
+_CAKE_GROUPED_MXFP8_TILED_K2048_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_TILED_K2048_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_TILED_K2048_F16,
+}
 # Problems of at most this many input bytes take the bulk kernel.
 _CAKE_BULK_MAX_INPUT_BYTES = 4 << 20
-# Problems of at least this many rows (B * M) take the tiled kernel, at
-# _CAKE_TILED_ROWS rows per thread.
+# Problems of at least this many rows (B * M) take a tiled kernel, at
+# _CAKE_TILED_ROWS rows per thread: the one _CAKE_TILED_PROGRAMS_BY_K names
+# for K, else the 128-thread one.
 _CAKE_TILED_MIN_ROWS = 16384
 _CAKE_TILED_ROWS = 2
+_CAKE_TILED_PROGRAMS_BY_K: Dict[int, Dict[torch.dtype, CakeProgram]] = {
+    7168: _CAKE_GROUPED_MXFP8_TILED_WIDE_PROGRAMS,
+    4096: _CAKE_GROUPED_MXFP8_TILED_K4096_PROGRAMS,
+    2048: _CAKE_GROUPED_MXFP8_TILED_K2048_PROGRAMS,
+}
 _CAKE_QUANT_BLOCK = 32
 # One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
 _CAKE_MAX_GRID_YZ = 65535
@@ -569,7 +604,7 @@ def cake_grouped_mxfp8_quantize_program(
     programs = (
         _CAKE_GROUPED_MXFP8_PROGRAMS,
         _CAKE_GROUPED_MXFP8_BULK_PROGRAMS,
-        _CAKE_GROUPED_MXFP8_TILED_PROGRAMS,
+        _CAKE_TILED_PROGRAMS_BY_K.get(k, _CAKE_GROUPED_MXFP8_TILED_PROGRAMS),
     )
     if dtype not in _CAKE_GROUPED_MXFP8_PROGRAMS:
         raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {dtype}")

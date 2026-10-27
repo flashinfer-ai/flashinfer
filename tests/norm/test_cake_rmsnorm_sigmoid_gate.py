@@ -160,15 +160,19 @@ def test_every_window_matches_the_reference(heads, eps, enable_pdl):
                 assert gate.stride(0) == projection.stride(0)
             expected = _reference(x, gate, eps)
             if not _admits(heads, tokens, enable_pdl):
-                # a gap of the PDL route: the package refuses the call and ``auto`` runs the CuTe DSL kernel
-                assert enable_pdl
+                # a declared gap of the route (the PDL route's, or the plain route's where its table leaves the
+                # token count to the CuTe DSL kernel): the package refuses the call and ``auto`` runs that kernel
                 with pytest.raises(
                     ValueError, match=f"admits {tokens} tokens of {heads} heads"
                 ):
-                    rmsnorm_sigmoid_gate(x, gate, eps, enable_pdl=True, backend="cake")
+                    rmsnorm_sigmoid_gate(
+                        x, gate, eps, enable_pdl=enable_pdl, backend="cake"
+                    )
                 if _cute_available():
                     before = len(launched)
-                    rmsnorm_sigmoid_gate(x, gate, eps, enable_pdl=True, backend="auto")
+                    rmsnorm_sigmoid_gate(
+                        x, gate, eps, enable_pdl=enable_pdl, backend="auto"
+                    )
                     torch.cuda.synchronize()
                     torch.testing.assert_close(x, expected, atol=ATOL, rtol=RTOL)
                     assert len(launched) == before
@@ -273,7 +277,9 @@ def test_the_pdl_route_admits_every_token_count_the_plain_route_admits_but_its_g
     route names: an explicit ``"cake"`` call under PDL runs a Cake program wherever ``enable_pdl=False`` does,
     from the launch form the window names (its PDL build, its late-signal PDL build or the plain build without
     the attribute) -- except in a gap, where the predicate answers False and the package refuses the call
-    (``auto`` keeps the CuTe DSL kernel under PDL there)."""
+    (``auto`` keeps the CuTe DSL kernel under PDL there).  Where the plain route itself declares a gap (a table
+    may leave token counts to the CuTe DSL kernel on both routes), its predicate answers False too; the PDL
+    table still partitions every positive token count into windows and declared gaps."""
     _skip_without_pdl_route()
     launched = []
     original = pkg._launch
@@ -293,7 +299,6 @@ def test_the_pdl_route_admits_every_token_count_the_plain_route_admits_but_its_g
                 {1, 2, 7, 8, 9, 64, 65, 255, 256, 257, 1023, 1024, 1025, 4096} | edges
             ):
                 in_gap = any(low < tokens <= high for low, high in gaps)
-                assert _admits(heads, tokens, False) is True, (heads, tokens)
                 assert _admits(heads, tokens, True) is (not in_gap), (heads, tokens)
             for tokens in (2, 258, 1025):
                 assert _admits(heads, tokens, True), (heads, tokens)
@@ -323,7 +328,12 @@ def test_the_pdl_route_admits_every_token_count_the_plain_route_admits_but_its_g
 
 
 def test_contiguous_gate_and_differing_token_strides():
-    x, gate, _ = _inputs(300, 32, seed=11)
+    # the first token count from 300 the plain route admits at 32 heads on this device (a table may leave 300
+    # to the CuTe DSL kernel)
+    tokens = next((t for t in range(300, 4097) if _admits(32, t, False)), None)
+    if tokens is None:
+        pytest.skip("the plain route admits no token count in 300..4096 at 32 heads")
+    x, gate, _ = _inputs(tokens, 32, seed=11)
     dense = gate.contiguous()
     expected = _reference(x, dense, 1e-5)
     strided, contiguous = x.clone(), x.clone()

@@ -71,7 +71,7 @@ class WarpGroupedProjection:
         ):
             raise ValueError("Unsupported grouped SM120 projection tactic")
         if tile_k >= 128 and stages == 8:
-            raise ValueError("K128/K256 require at most four stages")
+            raise ValueError("K128 and larger require at most four stages")
         self.fc1 = fc1
         self.split_gate = fc1 and gated
         self.group_size = group_size

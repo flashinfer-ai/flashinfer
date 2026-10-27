@@ -763,8 +763,8 @@ def rmsnorm_sigmoid_gate_variant(enable_pdl: bool = False) -> str:
 def rmsnorm_sigmoid_gate_route(enable_pdl: bool = False) -> str:
     """The route a sigmoid gate call launches from (its variant's).  A window of the ``_pdl`` route names the PDL
     build of a program, its late-signal PDL build or its plain build (launched without the attribute where the PDL
-    build measured slower); the route covers every token count the plain route covers.  The package ships that
-    route on the Blackwell architectures alone."""
+    build measured slower); the route covers every token count the plain route covers but for its declared gaps,
+    where the facade keeps the CuTe DSL kernel under PDL."""
     return route_key(RMSNORM_SIGMOID_GATE, rmsnorm_sigmoid_gate_variant(enable_pdl))
 
 

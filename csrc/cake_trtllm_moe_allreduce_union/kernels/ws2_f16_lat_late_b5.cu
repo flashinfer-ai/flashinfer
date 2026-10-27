@@ -64,6 +64,36 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+
+
+
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
@@ -82,6 +112,9 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
+    const int mbar_base = smem + 168;
+    #define rms_exchange_addr (mbar_base + 0)
+
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
     const unsigned int clusters_x = gridDim.x / 4;
@@ -98,6 +131,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
     const int rms_scalar_addr = smem + 132;
     float* rms_partials = reinterpret_cast<float*>(smem_raw + 136);
     const int rms_partials_addr = smem + 136;
+
+    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
+    // Mbarriers at smem_raw[168..184)
+
+    if (warp == 0) {
+        uint32_t leader = elect_sync();
+        if (leader) {
+            // rms_exchange: 2 barriers, init_count=1
+            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 176, 1);
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
+    }
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -1855,7 +1901,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
     }
     publish_start = (int)(cluster_id + num_clusters);
     #pragma unroll 1
-    for (int token = publish_start; token < tokens; token += num_clusters) {
+    for (int token = publish_start; token < tokens; token += (int)num_clusters) {
         int elem_0 = token * 7168 + cluster_thread * 8;
         float acc_1[8];
         unsigned int packed_acc_2[4];
@@ -3590,9 +3636,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     int lane_access = cluster_thread;
     int access_2 = cluster_id * 896 + (unsigned int)lane_access;
-    int rms_phase = 0;
+    unsigned int rms_trip = 0;
+    unsigned int rms_exchange_rms_trip = 0;
+    unsigned int _phase_rms_exchange = 0;
     #pragma unroll 1
-    for (int token_1 = cluster_id; token_1 < tokens; token_1 += num_clusters) {
+    for (int token_1 = cluster_id; token_1 < tokens; token_1 += (int)num_clusters) {
         long long data_base = (long long)data_epoch * comm_stride_elems;
         int prefetch_elem = access_2 * 8;
         float _vec_load_76[8];
@@ -3644,34 +3692,88 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
                 }
             }
         }
+        int next_access = access_2 + access_stride;
+        bool next_token_live = token_1 + token_stride < tokens;
+        if (next_token_live) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(residual + (next_access * 8)))); }
         int dividend = rank;
         int dividend_0 = rank + 1;
-        uint32_t _sysv_poll_group_0[8];
-        uint32_t _sysv_pending_82 = 3u;
-        do {
-            if (_sysv_pending_82 & 1u) {
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(dividend % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+        unsigned int packets_0[4];
+        unsigned int packets_1[4];
+        uint32_t _sysv_ld_0[4];
+        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_0[0]), "=r"(_sysv_ld_0[1]), "=r"(_sysv_ld_0[2]), "=r"(_sysv_ld_0[3]) : "l"(workspace_local + (data_base + (long long)(dividend % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+        #pragma unroll
+        for (int word = 0; word < 4; word++) {
+            packets_0[word] = _sysv_ld_0[word];
+        }
+        uint32_t _sysv_ld_1[4];
+        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_1[0]), "=r"(_sysv_ld_1[1]), "=r"(_sysv_ld_1[2]), "=r"(_sysv_ld_1[3]) : "l"(workspace_local + (data_base + (long long)(dividend_0 % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+        #pragma unroll
+        for (int word_1 = 0; word_1 < 4; word_1++) {
+            packets_1[word_1] = _sysv_ld_1[word_1];
+        }
+        int pending = 0;
+        #pragma unroll
+        for (int word_2 = 0; word_2 < 4; word_2++) {
+            pending = (((packets_0[word_2] & 65535) == 32768) ? 1 : pending);
+            pending = ((packets_0[word_2] >> 16 == 32768) ? 1 : pending);
+        }
+        if (pending == 1) {
+            uint32_t _sysv_poll_group_0[4];
+            uint32_t _sysv_pending_82 = 1u;
+            do {
+                if (_sysv_pending_82 & 1u) {
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(dividend % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+                }
+                if (_sysv_pending_82 & 1u) {
+                    if (!((((_sysv_poll_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_82 &= ~1u;
+                }
+            } while (_sysv_pending_82 != 0u);
+            #pragma unroll
+            for (int word_3 = 0; word_3 < 4; word_3++) {
+                packets_0[word_3] = _sysv_poll_group_0[word_3];
             }
-            if (_sysv_pending_82 & 2u) {
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + (long long)(dividend_0 % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+        }
+        int pending_1 = 0;
+        #pragma unroll
+        for (int word_4 = 0; word_4 < 4; word_4++) {
+            pending_1 = (((packets_1[word_4] & 65535) == 32768) ? 1 : pending_1);
+            pending_1 = ((packets_1[word_4] >> 16 == 32768) ? 1 : pending_1);
+        }
+        if (pending_1 == 1) {
+            uint32_t _sysv_poll_group_1[4];
+            uint32_t _sysv_pending_83 = 1u;
+            do {
+                if (_sysv_pending_83 & 1u) {
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[0]), "=r"(_sysv_poll_group_1[1]), "=r"(_sysv_poll_group_1[2]), "=r"(_sysv_poll_group_1[3]) : "l"(workspace_local + (data_base + (long long)(dividend_0 % 2 * total_access * 8) + (long long)(access_2 * 8))) : "memory");
+                }
+                if (_sysv_pending_83 & 1u) {
+                    if (!((((_sysv_poll_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_83 &= ~1u;
+                }
+            } while (_sysv_pending_83 != 0u);
+            #pragma unroll
+            for (int word_5 = 0; word_5 < 4; word_5++) {
+                packets_1[word_5] = _sysv_poll_group_1[word_5];
             }
-            if (_sysv_pending_82 & 1u) {
-                if (!((((_sysv_poll_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_82 &= ~1u;
-            }
-            if (_sysv_pending_82 & 2u) {
-                if (!((((_sysv_poll_group_0[4] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[4] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[5] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[5] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[6] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[6] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[7] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[7] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_82 &= ~2u;
-            }
-        } while (_sysv_pending_82 != 0u);
+        }
+        unsigned int words[8];
+        #pragma unroll
+        for (int word_6 = 0; word_6 < 4; word_6++) {
+            words[word_6] = packets_0[word_6];
+        }
+        #pragma unroll
+        for (int word_7 = 0; word_7 < 4; word_7++) {
+            words[4 + word_7] = packets_1[word_7];
+        }
         float sum_value[8];
         unsigned int sum_words[4];
         #pragma unroll
         for (int pair_78 = 0; pair_78 < 4; pair_78++) {
-            sum_words[pair_78] = _sysv_poll_group_0[pair_78];
+            sum_words[pair_78] = words[pair_78];
         }
         #pragma unroll
         for (int pair_79 = 0; pair_79 < 4; pair_79++) {
             uint32_t _f16x2_add_76;
-            asm("add.f16x2 %0, %1, %2;" : "=r"(_f16x2_add_76) : "r"(sum_words[pair_79]), "r"(_sysv_poll_group_0[4 + pair_79]));
+            asm("add.f16x2 %0, %1, %2;" : "=r"(_f16x2_add_76) : "r"(sum_words[pair_79]), "r"(words[4 + pair_79]));
             sum_words[pair_79] = _f16x2_add_76;
         }
         #pragma unroll
@@ -3689,7 +3791,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
                 : "r"(sum_words[_pair]));
         }
         int access_in_token = lane_access;
-        int elem_1 = access_2 * 8;
+        int elem_2 = access_2 * 8;
         unsigned int _packed_0[4];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3711,7 +3813,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
             __half2 _h2 = __float22half2_rn(make_float2(sum_value[_lp*2 + 6], sum_value[_lp*2+1 + 6]));
             _packed_0[_lp + 3] = *(uint32_t*)&_h2;
         }
-        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(moe_allreduce_out + elem_1), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "r"(_packed_0[(0) + 2]), "r"(_packed_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(moe_allreduce_out + elem_2), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "r"(_packed_0[(0) + 2]), "r"(_packed_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         #pragma unroll
         for (int j_78 = 0; j_78 < 8; j_78++) {
             _vec_load_76[j_78] = _vec_load_76[j_78] + sum_value[j_78];
@@ -3757,46 +3859,59 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
             __half2 _h2 = __float22half2_rn(make_float2(_vec_load_76[_lp*2 + 6], _vec_load_76[_lp*2+1 + 6]));
             _packed_1[_lp + 3] = *(uint32_t*)&_h2;
         }
-        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(residual_out + elem_1), "r"(_packed_1[(0) + 0]), "r"(_packed_1[(0) + 1]), "r"(_packed_1[(0) + 2]), "r"(_packed_1[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(residual_out + elem_2), "r"(_packed_1[(0) + 0]), "r"(_packed_1[(0) + 1]), "r"(_packed_1[(0) + 2]), "r"(_packed_1[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         float square_sum = 0.0f;
         #pragma unroll
         for (int j_79 = 0; j_79 < 8; j_79++) {
             square_sum = __fmaf_rn(_vec_load_76[j_79], _vec_load_76[j_79], square_sum);
         }
-        float _warp_reduce_83 = square_sum;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_83 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_83, offset);
-        square_sum = _warp_reduce_83;
-        if (lane == 0) {
-            reduce_smem[warp] = square_sum;
-        }
-        __syncthreads();
-        float block_sum = ((tid < 7) ? reduce_smem[lane] : 0.0f);
-        float _warp_reduce_84 = block_sum;
+        float _warp_reduce_84 = square_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_84 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_84, offset);
-        block_sum = _warp_reduce_84;
-        int slot_base = rms_phase * 4;
+        square_sum = _warp_reduce_84;
+        int rms_parity = (int)(rms_trip & 1);
+        if (lane == 0) {
+            reduce_smem[rms_parity * 7 + warp] = square_sum;
+        }
+        __syncthreads();
+        float block_sum = 0.0f;
+        if (tid < 7) {
+            block_sum = reduce_smem[rms_parity * 7 + tid];
+        }
+        float _warp_reduce_85 = block_sum;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_85 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_85, offset);
+        block_sum = _warp_reduce_85;
+        int slot_base = rms_parity * 4;
         if (tid < 4) {
-            uint32_t _cluster_mapa_85;
+            uint32_t _cluster_mapa_86;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_85) : "r"(rms_partials_addr), "r"(tid));
+                : "=r"(_cluster_mapa_86) : "r"(rms_partials_addr), "r"(tid));
+            uint32_t _mbar_peer_87;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_87) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid));
             asm volatile(
-                "st.shared::cluster.f32 [%0], %1;"
-                :: "r"(_cluster_mapa_85 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum) : "memory");
+                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                :: "r"(_cluster_mapa_86 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum), "r"(_mbar_peer_87) : "memory");
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        if (tid == 0) {
+            mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 16);
+        }
+        asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(uint32_t(_phase_rms_exchange)), "r"(uint32_t(10000000)) : "memory");
+        asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
         float cluster_sum = 0.0f;
         cluster_sum = cluster_sum + rms_partials[slot_base];
         cluster_sum = cluster_sum + rms_partials[slot_base + 1];
         cluster_sum = cluster_sum + rms_partials[slot_base + 2];
         cluster_sum = cluster_sum + rms_partials[slot_base + 3];
         float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
-        rms_phase = 1 - rms_phase;
+        rms_trip += 1;
+        rms_exchange_rms_trip += 1;
+        if (rms_exchange_rms_trip == 2) { rms_exchange_rms_trip = 0; _phase_rms_exchange ^= 1; }
         float norm_value[8];
         #pragma unroll
         for (int j_80 = 0; j_80 < 8; j_80++) {
@@ -3808,13 +3923,14 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
             __half2 _h2 = __float22half2_rn(make_float2(norm_value[_lp*2 + 0], norm_value[_lp*2+1 + 0]));
             norm_value_f16[_lp] = *(uint32_t*)&_h2;
         }
-        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(norm_out + elem_1), "r"(norm_value_f16[(0) + 0]), "r"(norm_value_f16[(0) + 1]), "r"(norm_value_f16[(0) + 2]), "r"(norm_value_f16[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(norm_out + elem_2), "r"(norm_value_f16[(0) + 0]), "r"(norm_value_f16[(0) + 1]), "r"(norm_value_f16[(0) + 2]), "r"(norm_value_f16[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         access_2 += access_stride;
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     unsigned int clear_words[4];
     #pragma unroll
-    for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+    for (int word_8 = 0; word_8 < 4; word_8++) {
+        clear_words[word_8] = 2147516416;
     }
     long long clear_base = (long long)clear_epoch * comm_stride_elems;
     #pragma unroll 4
@@ -3824,8 +3940,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _sysv_wait_p_86 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_sysv_wait_p_86 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_88 = reinterpret_cast<volatile int*>(completion) + (0);
+                while (*_sysv_wait_p_88 != static_cast<int>(num_bids)) {}
             }
             flag_addr[0] = (flag + 1) % 3;
             clear_addr[0] = tokens * 7168 * 2;
@@ -3833,6 +3949,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_f16_lat_late_b5(__half* __restrict__ 
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
 } // extern "C"

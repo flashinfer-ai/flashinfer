@@ -239,10 +239,14 @@ _R2_SMALL_M_WRITE_FAST_MATH_CELLS = _by_arch_sm(
 )
 # Round-5 write cells: the dense key of the program a snapshot-write cell's variant derives from,
 # consulted before the derivation (the derived write program holds the release and adds in bf16
-# without the early release); ``_persistent_plan_exact`` appends ``_write``.
+# without the early release); ``_persistent_plan_exact`` appends ``_write``.  A cell names one key
+# or one key per PDL mode (off, on).
 _WRITE_PERSISTENT_KEY_CELLS = _by_arch_sm(
     ROUTES["WRITE_PERSISTENT_KEY_CELLS"],
-    lambda t: {c: str(v) for c, v in _cells(t).items()},
+    lambda t: {
+        cell: (tuple(v) if isinstance(v, (list, tuple)) else str(v))
+        for cell, v in _cells(t).items()
+    },
 )
 
 
@@ -461,15 +465,19 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
-# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_write][_cta2]``: ``_fm`` is the
-# fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built with
-# ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a registered
-# program of its own whose schedule label ends in ``_authored_fences`` --, ``_write`` the
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_write][_cta2]``: ``_fm``
+# is the fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built
+# with ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a
+# registered program of its own whose schedule label ends in ``_authored_fences`` --, ``_crheld``
+# (round 19) the held-release program -- the program of the same key with flag bit 0 set and
+# without the suffix, built without the early consumed release; the key spells bit 0 as 0 and
+# the schedule label adds ``_held_release`` after ``_authored_fences`` --, ``_write`` the
 # snapshot-write variant and ``_cta2`` the program built for two CTAs per SM, launched on
-# ``min(M, 2 x SMs)`` CTAs.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_write`` /
-# ``_cta2`` lines.
+# ``min(M, 2 x SMs)`` CTAs.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_crheld`` /
+# ``_write`` / ``_cta2`` lines.
 _PERSISTENT_KEY = re.compile(
-    r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_fm)?(_crfnone)?(_write)?(_cta2)?$"
+    r"^persistent:k(?P<K>\d+)_nc(?P<nc>\d+)_d(?P<depth>\d+)_f(?P<bits>[01]+)"
+    r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<write>_write)?(?P<cta2>_cta2)?$"
 )
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
@@ -478,7 +486,11 @@ _PAIR_KEY = re.compile(r"^pair:k(\d+)_nc(\d+)(_pbf16a)?(_fm)?(_write)?$")
 
 
 def _persistent_schedule_id(
-    nc: int, depth: int, bits: str, authored_fences: bool = False
+    nc: int,
+    depth: int,
+    bits: str,
+    authored_fences: bool = False,
+    held_release: bool = False,
 ) -> str:
     schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
     if bits[_PERSISTENT_FLAG_ECR] == "1":
@@ -493,6 +505,8 @@ def _persistent_schedule_id(
         schedule_id += "_register_carry_only"
     if authored_fences:
         schedule_id += "_authored_fences"
+    if held_release:
+        schedule_id += "_held_release"
     return schedule_id
 
 
@@ -556,7 +570,8 @@ def _cell_pinned_write_keys(arch: Optional[str]) -> frozenset[str]:
     return frozenset(
         f"{key}_write"
         for by_cell in (_WRITE_PERSISTENT_KEY_CELLS.get(arch) or {}).values()
-        for key in by_cell.values()
+        for value in by_cell.values()
+        for key in (value if isinstance(value, tuple) else (value,))
     )
 
 
@@ -569,36 +584,40 @@ def _persistent_fallback(
         _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
     )
     want_nc, want_depth, want_bits = (
-        (int(exact.group(2)), int(exact.group(3)), exact.group(4))
+        (int(exact["nc"]), int(exact["depth"]), exact["bits"])
         if exact
         else (None, None, None)
     )
-    want_write = bool(exact and exact.group(7)) or plan.kernel_key.endswith("_write")
-    want_fm = bool(exact and exact.group(5)) or "_fm" in plan.kernel_key
-    want_authored = bool(exact and exact.group(6)) or "_crfnone" in plan.kernel_key
-    want_two_ctas = bool(exact and exact.group(8)) or plan.kernel_key.endswith("_cta2")
+    want_write = bool(exact and exact["write"]) or plan.kernel_key.endswith("_write")
+    want_fm = bool(exact and exact["fm"]) or "_fm" in plan.kernel_key
+    want_authored = bool(exact and exact["crfnone"]) or "_crfnone" in plan.kernel_key
+    want_held = bool(exact and exact["crheld"]) or "_crheld" in plan.kernel_key
+    want_two_ctas = bool(exact and exact["cta2"]) or plan.kernel_key.endswith("_cta2")
     pinned = _cell_pinned_write_keys(plan.arch)
     candidates = []
     for key in table:
         match = _PERSISTENT_KEY.match(key)
-        if match is None or int(match.group(1)) != K:
+        if match is None or int(match["K"]) != K:
             continue
         if key in pinned:
             # a write-cell program serves its table cells only
             continue
-        if bool(match.group(7)) != want_write:
+        if bool(match["write"]) != want_write:
             # the snapshot store exists only in the write variants: never cross that line
             continue
-        if bool(match.group(5)) != want_fm:
+        if bool(match["fm"]) != want_fm:
             # fast-math programs round differently (one BF16 ulp class): never substitute across it
             continue
-        if bool(match.group(6)) != want_authored:
+        if bool(match["crfnone"]) != want_authored:
             # the fence-authored twin states its own tcgen05 fences: never substitute across it
             continue
-        if bool(match.group(8)) != want_two_ctas:
+        if bool(match["crheld"]) != want_held:
+            # a held-release program keeps the early-release levers: never substitute across it
+            continue
+        if bool(match["cta2"]) != want_two_ctas:
             # a two-CTA program launches on another grid: never substitute across it
             continue
-        nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
+        nc, depth, bits = int(match["nc"]), int(match["depth"]), match["bits"]
         score = (
             nc != want_nc,
             depth != want_depth,
@@ -618,7 +637,9 @@ def _persistent_fallback(
         grid_x, grid_policy = min(M, 2 * num_sms), "two_ctas_per_sm"
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
-    schedule_id = _persistent_schedule_id(nc, depth, bits, want_authored)
+    schedule_id = _persistent_schedule_id(
+        nc, depth, bits, want_authored, held_release=want_held
+    )
     if want_fm:
         schedule_id += "_fastmath"
     if want_two_ctas:
@@ -687,7 +708,7 @@ def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
         if match is None:
             return plan
         fallback = _persistent_fallback(
-            plan, table, num_sms, M, int(match.group(1)), exact_key
+            plan, table, num_sms, M, int(match["K"]), exact_key
         )
         return fallback if fallback is not None else plan
     return plan
@@ -893,21 +914,24 @@ def _persistent_plan_for_key(
     """The plan of a round-2 / round-3 persistent cell: the key as the table names it, the grid of
     its ``nc`` (``min(M, 2 x SMs)`` for a ``_cta2`` key) and the labels of its fields (what
     ``_persistent_plan_exact`` derives for a legacy cell; a ``_crfnone`` key labels its schedule
-    ``_authored_fences``, a ``_cta2`` key ``_two_ctas_per_sm``)."""
+    ``_authored_fences``, a ``_crheld`` key ``_held_release``, a ``_cta2`` key
+    ``_two_ctas_per_sm``)."""
     match = _PERSISTENT_KEY.match(key)
-    if match is None or int(match.group(1)) != K or match.group(7):
+    if match is None or int(match["K"]) != K or match["write"]:
         raise ValueError(
             f"round-2 cell ({M}, {K}) names {key!r}, not a dense persistent key of K={K}"
         )
-    nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
-    if match.group(8):
+    nc, depth, bits = int(match["nc"]), int(match["depth"]), match["bits"]
+    if match["cta2"]:
         grid_x, grid_policy = min(M, 2 * num_sms), "two_ctas_per_sm"
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
-    schedule_id = _persistent_schedule_id(nc, depth, bits, bool(match.group(6))) + (
-        "_fastmath" if match.group(5) else ""
+    schedule_id = _persistent_schedule_id(
+        nc, depth, bits, bool(match["crfnone"]), held_release=bool(match["crheld"])
     )
-    if match.group(8):
+    if match["fm"]:
+        schedule_id += "_fastmath"
+    if match["cta2"]:
         schedule_id += "_two_ctas_per_sm"
     wait_policy = "deferred_wait_st" if _wait_policy(arch) else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
@@ -929,7 +953,8 @@ def _persistent_plan_exact(
     """The persistent program of a cell (the dense tail of ``_plan_route_exact``), mirrored from the
     Cake dispatcher's persistent policies (``write``: the program the snapshot-write variant is
     derived from; it holds the release from ``_WRITE_HELD_CONSUMED_RELEASE_MIN_M``).  A dense
-    round-2 cell takes the key its table names (per PDL mode when the cell names two)."""
+    round-2 cell or a round-5 write cell takes the key its table names (per PDL mode when the
+    cell names two)."""
     if not write:
         cell = _r2(_R2_PERSISTENT_KEY_CELLS, arch, num_sms).get((M, K))
         if cell is not None:
@@ -939,7 +964,8 @@ def _persistent_plan_exact(
         # A round-5 write cell: the dense key its snapshot-write variant derives from.
         cell = _r2(_WRITE_PERSISTENT_KEY_CELLS, arch, num_sms).get((M, K))
         if cell is not None:
-            return _persistent_plan_for_key(arch, num_sms, M, K, use_pdl, cell)
+            key = cell[int(use_pdl)] if isinstance(cell, tuple) else cell
+            return _persistent_plan_for_key(arch, num_sms, M, K, use_pdl, key)
     defer = _wait_policy(arch)
     nc, depth = _schedule(arch, M, K, write)
     grid_x, grid_policy = _grid(M, num_sms, nc)

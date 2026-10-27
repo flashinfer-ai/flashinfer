@@ -1057,9 +1057,10 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     it, compute capability 9.0 takes the fused form on every host, eager or captured,
     and so does 12.0 below the tile stream (a call whose CTAs would each walk
     ``STREAM_TILES`` tiles takes the split form: the whole-tile program's);
-    10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
-    outside capture (the captured call keeps the split form); 10.7 and 8.x are split alone.
-    GPU-free: the device facts are faked per device index."""
+    10.0 / 10.3 take it only on a host of ``FUSED_HOSTS``, at ``rows <= FUSED_MAX_ROWS``
+    and outside capture -- and that list is empty, so they keep the split form on every
+    host, eager or captured, and never read the capture state; 10.7 and 8.x are split
+    alone.  GPU-free: the device facts are faked per device index."""
     facts = {
         800: ("sm_80", 108),
         900: ("sm_90a", 132),
@@ -1082,7 +1083,7 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     try:
         assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
         assert cake_backend.FUSED_SPLIT_ONLY_ARCHES == ("sm_107a",)
-        assert cake_backend.FUSED_HOSTS == ("aarch64",)
+        assert cake_backend.FUSED_HOSTS == ()
         assert cake_backend.FUSED_MAX_ROWS == 4
         capacity = [
             cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030, 1070, 1200)
@@ -1091,8 +1092,8 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
         for host in ("aarch64", "x86_64"):
             monkeypatch.setattr(cake_backend, "HOST_MACHINE", host)
             reads.cache_clear()
-            grace = host == "aarch64"
-            eager = "fused" if grace else "split"
+            # 10.0 / 10.3: the split form at every row on both hosts (no host is listed),
+            # eager or captured; no capture-state read.
             for index, splits_at in (
                 (1000, (33, 33, 18)),
                 (1030, (33, 33, 19)),
@@ -1100,9 +1101,9 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
                 sm_count = facts[index][1]
                 for rows, splits in zip((1, 2, 4), splits_at, strict=True):
                     assert rows * 2 * splits <= sm_count
-                    assert form(rows, 2, splits, index) == eager, (host, index, rows)
+                    assert form(rows, 2, splits, index) == "split", (host, index, rows)
                     assert form(rows, 2, splits, index, True) == "split"
-                    assert reads(rows, index) is grace
+                    assert reads(rows, index) is False
                 # Above FUSED_MAX_ROWS (rows 8 at 9 splits fit the capacity), with one
                 # split or above the capacity: split.
                 assert form(8, 2, 9, index) == "split"
@@ -1174,7 +1175,7 @@ def test_capabilities_route_to_the_six_libraries():
         assert cake_jit.arch_for_capability(capability) is None
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
     # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
-    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule bounds the form there).
+    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule keeps the split form there).
     assert cake_jit.DECODE_THREADS == {
         "sm_80": 128,
         "sm_90a": 128,

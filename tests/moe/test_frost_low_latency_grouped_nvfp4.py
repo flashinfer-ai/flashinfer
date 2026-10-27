@@ -34,6 +34,7 @@ TACTICS = [
 
 
 def _check(actual, expected):
+    assert actual.dtype == expected.dtype
     assert torch.isfinite(actual).all()
     delta = actual.double() - expected.double()
     fp16 = expected.dtype is torch.float16

@@ -67,8 +67,8 @@ LOGICAL_C = {
     "eps": "eps",
 }
 # The variants with exported programs: three of op B's four forms (the fourth runs through the post_weight
-# programs), both modes of op A in the plain and the PDL build, op C's BF16 form in the plain and the PDL build (the
-# PDL route on the Blackwell architectures alone: on sm_107a the facade keeps the CuTe DSL kernel with PDL).
+# programs), both modes of op A in the plain and the PDL build, op C's BF16 form in the plain and the PDL build (one
+# PDL table per architecture, sm_107a's over the R200 graph-replay tables).
 SHIPPED_VARIANTS = {
     OP: ("alpha_tensor_pw", "alpha_scalar_nopw", "alpha_scalar_pw"),
     OP_A: ("mode0", "mode0_pdl", "mode1", "mode1_pdl"),
@@ -126,106 +126,65 @@ OP_C_WINDOWS = {
         "order": "tokens",
     },
 }
-# Op C's windows of record on sm_107a: nine programs over ten windows (the plain 256-thread program owns the top
-# window of 128 and of 32 heads); the token counts of each head count are partitioned but for the declared gaps,
-# where the FlashInfer kernel measured ahead: 128 heads at 1 and 3-8 tokens, 32 heads at 10-64 and 257-1024.
+# Op C's windows of record on sm_107a: twelve programs over fourteen windows; the token counts of each head count are
+# partitioned but for the declared gaps, where the FlashInfer kernel measured ahead: 128 heads at 1 and 3-8 tokens,
+# 32 heads at 10-64 and 257-767.  The four R200 bandwidth-band programs (the packed four-row forms at 256 and 64
+# threads, the two-row 128-thread token cluster and the 64-thread 256-bit form) own the rows above the run-1 routes:
+# 128 heads 384-511 and from 2561 the 256-thread packed form, 512-2560 the 64-thread one; 32 heads 768-2047 the
+# two-row token cluster, from 2048 the 64-thread packed form; 16 heads from 2048 the 256-bit form.
+
+
+def _form(threads: int, lanes: int, **knobs) -> dict:
+    """The selecting build keywords of an op C program: its block, its lanes per row and the knobs off their
+    defaults (one CTA, no token cluster, the token-major order, one row per thread)."""
+    return {
+        "threads": threads,
+        "lanes": lanes,
+        "cluster": 1,
+        "tcluster": 1,
+        "order": "tokens",
+        "rows_per_thread": 1,
+        **knobs,
+    }
+
+
 OP_C_WINDOWS_SM107A = {
-    (128, 1, 2): {
-        "threads": 256,
-        "lanes": 32,
-        "cluster": 16,
-        "tcluster": 1,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (128, 8, 64): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 16,
-        "order": "heads",
-        "rows_per_thread": 1,
-    },
-    (128, 64, 256): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 1,
-        "order": "tokens",
-        "rows_per_thread": 2,
-    },
-    (128, 256, 1024): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 1,
-        "order": "heads",
-        "rows_per_thread": 1,
-    },
-    (128, 1024, None): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 1,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (32, 0, 9): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 16,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (32, 64, 256): {
-        "threads": 128,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 8,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (32, 1024, None): {
-        "threads": 256,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 1,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (16, 0, 1024): {
-        "threads": 128,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 16,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
-    (16, 1024, None): {
-        "threads": 128,
-        "lanes": 8,
-        "cluster": 1,
-        "tcluster": 1,
-        "order": "tokens",
-        "rows_per_thread": 1,
-    },
+    (128, 1, 2): _form(256, 32, cluster=16),
+    (128, 8, 64): _form(256, 8, tcluster=16, order="heads"),
+    (128, 64, 256): _form(256, 8, rows_per_thread=2),
+    (128, 256, 383): _form(256, 8, order="heads"),
+    (128, 383, 511): _form(256, 8, rows_per_thread=4, packed=True),
+    (128, 511, 2560): _form(64, 8, rows_per_thread=4, packed=True),
+    (128, 2560, None): _form(256, 8, rows_per_thread=4, packed=True),
+    (32, 0, 9): _form(256, 8, tcluster=16),
+    (32, 64, 256): _form(128, 8, tcluster=8),
+    (32, 767, 2047): _form(128, 8, tcluster=16, rows_per_thread=2),
+    (32, 2047, None): _form(64, 8, rows_per_thread=4, packed=True),
+    (16, 0, 1024): _form(128, 8, tcluster=16),
+    (16, 1024, 2047): _form(128, 8),
+    (16, 2047, None): _form(64, 4, width=256),
 }
 # The declared gaps of the sm_107a routes, (above, at_most) ranges of rows (tokens for op C) no program admits, keyed
 # (route, head count or None) like the partition test's window classes; every other route partitions its counts.
+# Op C's PDL route leaves gaps of its own there (one token at every head count, 128 heads at 9-64 and 32 heads at
+# 10-257: the CuTe DSL kernel under PDL ahead of both forms of the routed program), spelled under GAPS_PDL as well.
 GAPS_SM107A = {
     (f"{OP}_alpha_scalar_pw", None): ((0, 255),),
     (f"{OP_A}_mode0", None): ((128, 256),),
     (f"{OP_A}_mode0_pdl", None): ((128, 256),),
     (f"{OP_C}_bf16", 128): ((0, 1), (2, 8)),
-    (f"{OP_C}_bf16", 32): ((9, 64), (256, 1024)),
+    (f"{OP_C}_bf16", 32): ((9, 64), (256, 767)),
+    (f"{OP_C}_bf16_pdl", 128): ((0, 1), (8, 64)),
+    (f"{OP_C}_bf16_pdl", 32): ((0, 1), (9, 257)),
+    (f"{OP_C}_bf16_pdl", 16): ((0, 1),),
 }
-# The declared gaps of the Blackwell PDL routes, keyed (arch, route, head count or None): the row counts where the
+# The declared gaps of the PDL routes, keyed (arch, route, head count or None): the row counts where the
 # CuTe DSL kernel under PDL measured ahead of both the PDL build and the plain build of the routed program, so the
 # facade's auto keeps it there.  Op A's mode-0 routes declare one gap each; op C's bf16_pdl tables declare the token
 # counts the CuTe DSL kernel under PDL wins in the graph regime (one token at every head count, 128 heads around 64
-# tokens, 32 heads around 128 and 256 tokens); the windows and gaps partition the token count for every head count
-# and keep the plain route's boundaries.
+# tokens and 32 heads around 128 and 256 tokens on the Blackwell architectures; one token at every head count,
+# 128 heads at 9-64 and 32 heads at 10-257 on sm_107a); the windows and gaps partition the token count for every
+# head count and keep the plain route's boundaries a program touches (a gap may span one).
 GAPS_PDL = {
     ("sm_100a", f"{OP_A}_mode0_pdl", None): ((768, 4095),),
     ("sm_103a", f"{OP_A}_mode0_pdl", None): ((1024, 8191),),
@@ -235,6 +194,9 @@ GAPS_PDL = {
     ("sm_103a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (32, 64)),
     ("sm_103a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 128), (192, 256)),
     ("sm_103a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
+    ("sm_107a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (8, 64)),
+    ("sm_107a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (9, 257)),
+    ("sm_107a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
 }
 # Op A's Blackwell PDL routes, (at_most, program) windows per (arch, mode), the last unbounded: a program named by its
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
@@ -278,13 +240,15 @@ OP_A_PDL_WINDOWS = {
         (None, "pro"),
     ),
 }
-# Op C's Blackwell PDL route per architecture: (heads, above, at_most) -> (the selecting keywords of the program, as
-# OP_C_WINDOWS spells them, its form): "pdl" the PDL build, "pdl_late" the late-signal PDL build of the two
-# token-cluster programs, "plain" the plain route's build borrowed (16 heads above 1024 tokens on both
-# architectures; on sm_103a also 128 heads at 257-2048 tokens and 32 heads at 1025-8192 tokens, where the PDL build
-# is 1-6 % behind the plain build and no launch overlaps its predecessor).  Contiguous over the token count per head
-# count; every boundary of the plain route is one of these (the pdl table splits a plain window between the pdl and
-# the pdl_late build, or between the borrowed plain build and the pdl build).
+# Op C's PDL route per architecture: (heads, above, at_most) -> (the selecting keywords of the program, as
+# OP_C_WINDOWS or OP_C_WINDOWS_SM107A spells them, its form): "pdl" the PDL build, "pdl_late" the late-signal PDL
+# build of the two token-cluster programs, "plain" the plain route's build borrowed (16 heads above 1024 tokens on
+# the Blackwell architectures; on sm_103a also 128 heads at 257-2048 tokens and 32 heads at 1025-8192 tokens, where
+# the PDL build is 1-6 % behind the plain build and no launch overlaps its predecessor; on sm_107a the 64-thread
+# packed form at 128 heads 513-2560 and 32 heads above 2048, the 128-thread tail-free form at 16 heads 1025-2047 and
+# the 256-bit form at 16 heads from 2048).  Contiguous over the token count per head count but for the declared
+# gaps; every boundary of the plain route a program touches is one of these (the pdl table splits a plain window
+# between the pdl and the pdl_late build, or between the borrowed plain build and the pdl build; a gap may span one).
 _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
     OP_C_WINDOWS[key]
     for key in (
@@ -294,6 +258,18 @@ _C16, _CT16, _HM, _T256, _T128_CT16, _T128 = (
         (32, 1024, None),
         (16, 0, 1024),
         (16, 1024, None),
+    )
+)
+_CT16_HM, _R2, _CT8, _P1, _P2, _P3, _P4 = (
+    OP_C_WINDOWS_SM107A[key]
+    for key in (
+        (128, 8, 64),
+        (128, 64, 256),
+        (32, 64, 256),
+        (128, 383, 511),
+        (128, 511, 2560),
+        (32, 767, 2047),
+        (16, 2047, None),
     )
 )
 OP_C_PDL_WINDOWS = {
@@ -327,6 +303,24 @@ OP_C_PDL_WINDOWS = {
         (16, 8, 64): (_T128_CT16, "pdl_late"),
         (16, 64, 1024): (_T128_CT16, "pdl"),
         (16, 1024, None): (_T128, "plain"),
+    },
+    "sm_107a": {
+        (128, 1, 2): (_C16, "pdl"),
+        (128, 2, 8): (_C16, "pdl"),
+        (128, 64, 256): (_R2, "pdl"),
+        (128, 256, 383): (_HM, "pdl"),
+        (128, 383, 511): (_P1, "pdl"),
+        (128, 511, 512): (_P2, "pdl"),
+        (128, 512, 2560): (_P2, "plain"),
+        (128, 2560, None): (_P1, "pdl"),
+        (32, 1, 9): (_CT16, "pdl"),
+        (32, 257, 767): (_T256, "pdl"),
+        (32, 767, 2047): (_P3, "pdl"),
+        (32, 2047, 2048): (_P2, "pdl"),
+        (32, 2048, None): (_P2, "plain"),
+        (16, 1, 1024): (_T128_CT16, "pdl"),
+        (16, 1024, 2047): (_T128, "plain"),
+        (16, 2047, None): (_P4, "plain"),
     },
 }
 # Op A's windows of record on sm_107a, one tuple of windows per record: the two composites alternate below 65 rows
@@ -383,12 +377,12 @@ def _owners(arch: str, route: str) -> set:
 
 
 def _routes_of(arch: str) -> set:
-    """Every shipped variant's route, but op C's PDL route on sm_107a."""
+    """Every shipped variant's route (the same set on every architecture)."""
+    del arch
     return {
         loader.route_key(op, variant)
         for op in loader.OPS
         for variant in SHIPPED_VARIANTS[op]
-        if not (arch == "sm_107a" and op == OP_C and variant == "bf16_pdl")
     }
 
 
@@ -841,15 +835,16 @@ def test_rmsnorm_sigmoid_gate_routes_window_the_token_count_per_head_count():
 
 
 def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
-    """Op C's PDL route has windows of its own per Blackwell architecture: each names the PDL build of a routed
-    program, its late-signal PDL build or the plain build the route borrows (16 heads above 1024 tokens on both
-    architectures, the whole-row programs up to 2048 / 8192 tokens on sm_103a: the plain record's plan, launched
-    without the attribute); the declared gaps (``GAPS_PDL``: one token at every head count, 128 heads around 64
-    tokens, 32 heads around 128 and 256 tokens) belong to no record.  The records appear in the route in window
-    order, each once."""
+    """Op C's PDL route has windows of its own per architecture: each names the PDL build of a routed program, its
+    late-signal PDL build or the plain build the route borrows (16 heads above 1024 tokens everywhere, the whole-row
+    programs up to 2048 / 8192 tokens on sm_103a, the 64-thread packed form at 128 heads 513-2560 and 32 heads above
+    2048 and the 256-bit form at 16 heads from 2048 on sm_107a: the plain record's plan, launched without the
+    attribute); the declared gaps (``GAPS_PDL``: one token at every head count; 128 heads around 64 tokens and 32
+    heads around 128 and 256 tokens on the Blackwell architectures, 32 heads at 10-17 and 129-256 on sm_107a) belong
+    to no record.  The records appear in the route in window order, each once."""
     plain_route = loader.route_key(OP_C, "bf16")
     route = loader.route_key(OP_C, "bf16_pdl")
-    for arch in BLACKWELL:
+    for arch in EVERY:
         plain_names = loader.route_modules(arch, plain_route)
         plain_by_key = {
             tuple(window): name
@@ -872,7 +867,11 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
             record = loader.MODULES[name]
             build = record["build"]
             assert {k: build[k] for k in selecting} == selecting, (arch, key)
-            assert build["tail"] == "none"
+            # the two-rows-per-thread form clamps its tail; every other routed build is tail-free
+            assert build["tail"] == ("clamp" if selecting is _R2 else "none"), (
+                arch,
+                key,
+            )
             assert build["pdl"] is (form != "plain") and record["launch"][
                 "use_pdl"
             ] is (form != "plain"), (arch, key)
@@ -908,13 +907,14 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                 assert (
                     record["route"] == route and "routes" not in record["select_rule"]
                 )
-                assert record["arches"] == list(BLACKWELL) or record["arches"] == [arch]
+                assert arch in record["arches"] and set(record["arches"]) <= set(EVERY)
                 assert name not in plain_names
         assert list(names) == order, arch
         # the pdl builds of five programs (four on sm_100a: the 16-CTA token-cluster program's pdl build keeps no
-        # window there), two pdl_late builds and the borrowed plain builds: the 16-head tail-free program on both
-        # architectures, plus the two whole-row programs on sm_103a
-        assert len(names) == (10 if arch == "sm_103a" else 7), arch
+        # window there), two pdl_late builds and the borrowed plain builds: the 16-head tail-free program on the
+        # Blackwell architectures, plus the two whole-row programs on sm_103a; on sm_107a the pdl builds of nine
+        # programs and three borrowed plain builds (the two token clusters' pdl builds left the route)
+        assert len(names) == {"sm_100a": 7, "sm_103a": 10, "sm_107a": 12}[arch], arch
         for heads, gaps in (
             (128, GAPS_PDL.get((arch, route, 128), ())),
             (32, GAPS_PDL.get((arch, route, 32), ())),
@@ -927,22 +927,25 @@ def test_rmsnorm_sigmoid_gate_pdl_route_names_a_build_form_per_window():
                         match=f"admits {tokens} rows of {heads} heads",
                     ):
                         loader.selected_module(arch, route, tokens, heads)
-    assert route not in loader.ROUTES["sm_107a"]
-    assert not loader.route_available("sm_107a", route)
-    assert loader.route_modules("sm_107a", route) == ()
-    with pytest.raises(NotImplementedError, match="no exported program"):
-        loader.selected_module("sm_107a", route, 64, 128)
+    # the plain build a PDL window borrows launches from the plain record on every architecture
+    for arch in EVERY:
+        assert route in loader.ROUTES[arch] and loader.route_available(arch, route)
+    borrowed = loader.selected_module("sm_107a", route, 1024, 128)
+    assert borrowed == loader.selected_module("sm_107a", plain_route, 1024, 128)
+    assert loader.MODULES[borrowed]["launch"]["use_pdl"] is False
 
 
 def test_rmsnorm_sigmoid_gate_routes_on_sm_107a():
-    """On sm_107a op C's route holds nine programs over ten windows: 128 heads at 2 tokens, 9-64 (the head-major
-    16-CTA token cluster), 65-256 (two rows per thread), 257-1024 (head-major) and 1025- (plain); 32 heads at 1-9
-    (the 16-CTA token cluster), 65-256 (the 128-thread 8-CTA token cluster) and 1025- (plain); 16 heads as on the
-    Blackwell architectures.  128 heads at 1 and 3-8 tokens and 32 heads at 10-64 and 257-1024 are declared gaps:
-    no program admits them."""
+    """On sm_107a op C's route holds twelve programs over fourteen windows: 128 heads at 2 tokens, 9-64 (the
+    head-major 16-CTA token cluster), 65-256 (two rows per thread), 257-383 (head-major), 384-511 and from 2561 (the
+    256-thread packed four-row form) and 512-2560 (its 64-thread form); 32 heads at 1-9 (the 16-CTA token cluster),
+    65-256 (the 128-thread 8-CTA token cluster), 768-2047 (the two-row 128-thread token cluster) and from 2048 (the
+    64-thread packed form); 16 heads as on the Blackwell architectures up to 2047 and the 64-thread 256-bit form
+    from 2048.  128 heads at 1 and 3-8 tokens and 32 heads at 10-64 and 257-767 are declared gaps: no program
+    admits them."""
     route = loader.route_key(OP_C, "bf16")
     names = loader.route_modules("sm_107a", route)
-    assert len(names) == 9
+    assert len(names) == 12
     windows = {}
     for name in names:
         for heads, above, at_most in loader.MODULES[name]["select_rule"]["windows"][
@@ -957,26 +960,37 @@ def test_rmsnorm_sigmoid_gate_routes_on_sm_107a():
         assert build["pdl"] is False
         assert tuple(record["launch"]["cluster"]) == _cluster_dims(build), key
         assert key[0] % record["grid_rule"]["rows_per_cta"] == 0, key
-    assert windows[(128, 1024, None)] == windows[(32, 1024, None)]
-    assert windows[(128, 8, 64)] != windows[(128, 256, 1024)]
+    # the 64-thread packed form serves 128 heads at 512-2560 and 32 heads from 2048; the 256-thread one two windows
+    assert windows[(128, 511, 2560)] == windows[(32, 2047, None)]
+    assert windows[(128, 383, 511)] == windows[(128, 2560, None)]
+    assert windows[(128, 8, 64)] != windows[(128, 256, 383)]
     for heads, tokens, key in (
         (128, 2, (128, 1, 2)),
         (128, 9, (128, 8, 64)),
         (128, 64, (128, 8, 64)),
         (128, 65, (128, 64, 256)),
         (128, 256, (128, 64, 256)),
-        (128, 257, (128, 256, 1024)),
-        (128, 1024, (128, 256, 1024)),
-        (128, 1025, (128, 1024, None)),
-        (128, 16384, (128, 1024, None)),
+        (128, 257, (128, 256, 383)),
+        (128, 383, (128, 256, 383)),
+        (128, 384, (128, 383, 511)),
+        (128, 511, (128, 383, 511)),
+        (128, 512, (128, 511, 2560)),
+        (128, 2560, (128, 511, 2560)),
+        (128, 2561, (128, 2560, None)),
+        (128, 16384, (128, 2560, None)),
         (32, 1, (32, 0, 9)),
         (32, 9, (32, 0, 9)),
         (32, 65, (32, 64, 256)),
         (32, 256, (32, 64, 256)),
-        (32, 1025, (32, 1024, None)),
+        (32, 768, (32, 767, 2047)),
+        (32, 2047, (32, 767, 2047)),
+        (32, 2048, (32, 2047, None)),
+        (32, 16384, (32, 2047, None)),
         (16, 1, (16, 0, 1024)),
         (16, 1024, (16, 0, 1024)),
-        (16, 1025, (16, 1024, None)),
+        (16, 1025, (16, 1024, 2047)),
+        (16, 2047, (16, 1024, 2047)),
+        (16, 2048, (16, 2047, None)),
     ):
         assert (
             loader.selected_module("sm_107a", route, tokens, heads) == windows[key]
@@ -988,7 +1002,7 @@ def test_rmsnorm_sigmoid_gate_routes_on_sm_107a():
         (32, 10),
         (32, 64),
         (32, 257),
-        (32, 1024),
+        (32, 767),
     ):
         with pytest.raises(
             NotImplementedError, match=f"admits {tokens} rows of {heads} heads"
@@ -1004,7 +1018,22 @@ def test_rmsnorm_sigmoid_gate_routes_on_sm_107a():
         2,
         1,
     )
-    for key in ((128, 8, 64), (128, 64, 256), (32, 64, 256)):
+    packed = loader.MODULES[windows[(128, 511, 2560)]]
+    assert packed["grid_rule"]["rows_per_cta"] == 32 and packed["build"]["packed"]
+    assert loader.launch_grid(packed, 512, device_index=0, values={"heads": 128}) == (
+        512,
+        4,
+        1,
+    )
+    for key in (
+        (128, 8, 64),
+        (128, 64, 256),
+        (128, 383, 511),
+        (128, 511, 2560),
+        (32, 64, 256),
+        (32, 767, 2047),
+        (16, 2047, None),
+    ):
         assert loader.MODULES[windows[key]]["arches"] == ["sm_107a"], key
 
 
@@ -1332,8 +1361,8 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
     counts 128, 32 and 16 and partition the positive token counts of each on the Blackwell architectures, so the
     predicate holds for those head counts at every token count and fails for every other head count (a 2-D
     ``(rows, 64)`` call is one head); the PDL route's windows leave the declared gaps to the CuTe DSL kernel under
-    PDL; on sm_107a the declared gaps of 128 and 32 heads are unsupported token counts and the PDL route does not
-    exist."""
+    PDL; on sm_107a the plain route's declared gaps of 128 and 32 heads are unsupported token counts and the PDL
+    route leaves gaps of its own."""
     assert pkg.RMSNORM_SIGMOID_GATE == OP_C
     assert pkg.HEAD_DIM == 64 and pkg.ROW_ALIGNMENT_BYTES == 16
     assert pkg.rmsnorm_sigmoid_gate_variant() == "bf16"
@@ -1404,18 +1433,15 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
             )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
     assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device)
-    assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, enable_pdl=True)
+    assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, enable_pdl=True)
     for heads in routed_heads:
-        assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(device, heads=heads)
-        assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
-            device, heads=heads, tokens=0
-        )
-        assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
-            device, heads=heads, enable_pdl=True
-        )
-        assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
-            device, heads=heads, tokens=1024, enable_pdl=True
-        )
+        for enable_pdl in (False, True):
+            assert pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                device, heads=heads, enable_pdl=enable_pdl
+            )
+            assert not pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                device, heads=heads, tokens=0, enable_pdl=enable_pdl
+            )
     for heads, tokens, supported in (
         (128, 1, False),
         (128, 2, True),
@@ -1433,7 +1459,8 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
         (32, 65, True),
         (32, 256, True),
         (32, 257, False),
-        (32, 1024, False),
+        (32, 767, False),
+        (32, 768, True),
         (32, 1025, True),
         (16, 1, True),
         (16, 1024, True),
@@ -1444,6 +1471,46 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
             bool(
                 pkg.is_cake_rmsnorm_sigmoid_gate_supported(
                     device, heads=heads, tokens=tokens
+                )
+            )
+            is supported
+        ), (heads, tokens)
+    # the PDL route on sm_107a: gaps of its own (one token at every head count, 128 heads at 9-64, 32 heads at 10-257),
+    # the borrowed plain builds admitted like any window
+    for heads, tokens, supported in (
+        (128, 1, False),
+        (128, 2, True),
+        (128, 3, True),
+        (128, 8, True),
+        (128, 64, False),
+        (128, 511, True),
+        (128, 512, True),
+        (128, 2560, True),
+        (128, 2561, True),
+        (128, 16384, True),
+        (32, 1, False),
+        (32, 2, True),
+        (32, 9, True),
+        (32, 10, False),
+        (32, 17, False),
+        (32, 18, False),
+        (32, 128, False),
+        (32, 129, False),
+        (32, 256, False),
+        (32, 257, False),
+        (32, 767, True),
+        (32, 2048, True),
+        (32, 2049, True),
+        (16, 1, False),
+        (16, 2, True),
+        (16, 2047, True),
+        (16, 2048, True),
+        (64, 64, False),
+    ):
+        assert (
+            bool(
+                pkg.is_cake_rmsnorm_sigmoid_gate_supported(
+                    device, heads=heads, tokens=tokens, enable_pdl=True
                 )
             )
             is supported
@@ -1517,8 +1584,8 @@ def test_rmsnorm_sigmoid_gate_support_follows_the_head_and_token_counts_through_
 def test_the_launch_attribute_follows_the_record():
     """A record's ``launch.use_pdl`` is its binding's programmatic-stream-serialization attribute: in the binding of
     every PDL build, absent from every plain build's -- the plain builds the PDL routes borrow included, so a call of
-    a PDL route in such a window launches without the attribute; op C's route alone borrows one on sm_100a and
-    sm_103a (the op A routes borrow nothing since the window re-measurement), on sm_107a none."""
+    a PDL route in such a window launches without the attribute; op C's route alone borrows one on every
+    architecture (the op A routes borrow nothing since the window re-measurement)."""
     attribute = "cudaLaunchAttributeProgrammaticStreamSerialization"
     borrowed = {}
     for name, record in loader.MODULES.items():
@@ -1529,19 +1596,12 @@ def test_the_launch_attribute_follows_the_record():
             assert record["launch"]["use_pdl"] is False and attribute not in binding
             for arch in per_arch:
                 borrowed.setdefault(arch, set()).add(route)
-    assert borrowed == {
-        "sm_100a": {loader.route_key(OP_C, "bf16_pdl")},
-        "sm_103a": {loader.route_key(OP_C, "bf16_pdl")},
-    }
+    assert borrowed == {arch: {loader.route_key(OP_C, "bf16_pdl")} for arch in EVERY}
     for arch, routes in borrowed.items():
         for route in routes:
             names = loader.route_modules(arch, route)
             forms = [loader.MODULES[n]["launch"]["use_pdl"] for n in names]
-            plain = (
-                3
-                if (arch, route) == ("sm_103a", loader.route_key(OP_C, "bf16_pdl"))
-                else 1
-            )
+            plain = 1 if arch == "sm_100a" else 3
             assert (
                 forms.count(False) == plain and forms.count(True) == len(names) - plain
             ), (arch, route)

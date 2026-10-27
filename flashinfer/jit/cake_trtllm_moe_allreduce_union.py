@@ -112,16 +112,18 @@ KERNELS: dict[str, Kernel] = {
     "ws2_f16_lat_b4": Kernel("float16", 2, 224, 4),
     "ws2_bf16_lat_late_b5": Kernel("bfloat16", 2, 224, 4),
     "ws2_f16_lat_late_b5": Kernel("float16", 2, 224, 4),
-    "ws4_bf16_lat_b4": Kernel("bfloat16", 4, 224, 4),
     "ws4_bf16_two_shot_b4": Kernel("bfloat16", 4, 224, 4),
     "ws4_f16_two_shot_b4": Kernel("float16", 4, 224, 4),
     "ws4_bf16_two_shot_b5": Kernel("bfloat16", 4, 224, 4),
     "ws4_f16_two_shot_b5": Kernel("float16", 4, 224, 4),
-    "ws8_bf16_lat_b4": Kernel("bfloat16", 8, 224, 4),
     "ws8_bf16_two_shot_b4": Kernel("bfloat16", 8, 224, 4),
-    "ws8_f16_two_shot_b4": Kernel("float16", 8, 224, 4),
     "ws8_bf16_two_shot_b5": Kernel("bfloat16", 8, 224, 4),
     "ws8_f16_two_shot_b5": Kernel("float16", 8, 224, 4),
+    "ws2_bf16_lat_t1": Kernel("bfloat16", 2, 224, 4),
+    "ws4_bf16_lat_t1": Kernel("bfloat16", 4, 224, 4),
+    "ws8_bf16_lat_t1": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_two_shot_il_b4": Kernel("bfloat16", 8, 224, 4),
+    "ws8_f16_two_shot_il_b4": Kernel("float16", 8, 224, 4),
 }
 
 ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
@@ -131,6 +133,7 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 2, "bfloat16", False, "lat_late_b5"): Route(
         "ws2_bf16_lat_late_b5", 5, 175, False
     ),
+    ("sm_100a", 2, "bfloat16", False, "lat_t1"): Route("ws2_bf16_lat_t1", 2, 71, False),
     ("sm_100a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
     ),
@@ -158,9 +161,7 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 4, "bfloat16", False, "generic"): Route(
         "ws4_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 4, "bfloat16", False, "lat_b4"): Route(
-        "ws4_bf16_lat_b4", 4, 142, False
-    ),
+    ("sm_100a", 4, "bfloat16", False, "lat_t1"): Route("ws4_bf16_lat_t1", 2, 71, False),
     ("sm_100a", 4, "bfloat16", False, "two_shot_b4"): Route(
         "ws4_bf16_two_shot_b4", 4, 142, False
     ),
@@ -194,11 +195,12 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "bfloat16", False, "lat_b4"): Route(
-        "ws8_bf16_lat_b4", 4, 142, False
-    ),
+    ("sm_100a", 8, "bfloat16", False, "lat_t1"): Route("ws8_bf16_lat_t1", 2, 71, False),
     ("sm_100a", 8, "bfloat16", False, "two_shot_b4"): Route(
         "ws8_bf16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_100a", 8, "bfloat16", False, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_100a", 8, "bfloat16", True, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
@@ -209,23 +211,26 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_100a", 8, "bfloat16", True, "two_shot_b5"): Route(
         "ws8_bf16_two_shot_b5", 5, 175, False
     ),
+    ("sm_100a", 8, "bfloat16", True, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
+    ),
     ("sm_100a", 8, "float16", False, "generic"): Route(
         "ws8_f16_generic", 4, None, False
-    ),
-    ("sm_100a", 8, "float16", False, "two_shot_b4"): Route(
-        "ws8_f16_two_shot_b4", 4, 142, False
     ),
     ("sm_100a", 8, "float16", False, "two_shot_b5"): Route(
         "ws8_f16_two_shot_b5", 5, 175, False
     ),
+    ("sm_100a", 8, "float16", False, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
+    ),
     ("sm_100a", 8, "float16", True, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "float16", True, "two_shot_b4"): Route(
-        "ws8_f16_two_shot_b4", 4, 142, False
-    ),
     ("sm_100a", 8, "float16", True, "two_shot_b5"): Route(
         "ws8_f16_two_shot_b5", 5, 175, False
+    ),
+    ("sm_100a", 8, "float16", True, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_103a", 2, "bfloat16", False, "lat_b4"): Route(
         "ws2_bf16_lat_b4", 4, 142, False
@@ -233,6 +238,7 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 2, "bfloat16", False, "lat_late_b5"): Route(
         "ws2_bf16_lat_late_b5", 5, 175, False
     ),
+    ("sm_103a", 2, "bfloat16", False, "lat_t1"): Route("ws2_bf16_lat_t1", 2, 71, False),
     ("sm_103a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
     ),
@@ -257,9 +263,7 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 2, "float16", True, "lat_late_b5"): Route(
         "ws2_f16_lat_late_b5", 5, 175, False
     ),
-    ("sm_103a", 4, "bfloat16", False, "lat_b4"): Route(
-        "ws4_bf16_lat_b4", 4, 142, False
-    ),
+    ("sm_103a", 4, "bfloat16", False, "lat_t1"): Route("ws4_bf16_lat_t1", 2, 71, False),
     ("sm_103a", 4, "bfloat16", False, "two_shot_b4"): Route(
         "ws4_bf16_two_shot_b4", 4, 142, False
     ),
@@ -296,11 +300,12 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "bfloat16", False, "lat_b4"): Route(
-        "ws8_bf16_lat_b4", 4, 142, False
-    ),
+    ("sm_103a", 8, "bfloat16", False, "lat_t1"): Route("ws8_bf16_lat_t1", 2, 71, False),
     ("sm_103a", 8, "bfloat16", False, "two_shot_b4"): Route(
         "ws8_bf16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_103a", 8, "bfloat16", False, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_103a", 8, "bfloat16", True, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
@@ -311,23 +316,26 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 8, "bfloat16", True, "two_shot_b5"): Route(
         "ws8_bf16_two_shot_b5", 5, 175, False
     ),
+    ("sm_103a", 8, "bfloat16", True, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
+    ),
     ("sm_103a", 8, "float16", False, "generic"): Route(
         "ws8_f16_generic", 4, None, False
-    ),
-    ("sm_103a", 8, "float16", False, "two_shot_b4"): Route(
-        "ws8_f16_two_shot_b4", 4, 142, False
     ),
     ("sm_103a", 8, "float16", False, "two_shot_b5"): Route(
         "ws8_f16_two_shot_b5", 5, 175, False
     ),
+    ("sm_103a", 8, "float16", False, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
+    ),
     ("sm_103a", 8, "float16", True, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "float16", True, "two_shot_b4"): Route(
-        "ws8_f16_two_shot_b4", 4, 142, False
-    ),
     ("sm_103a", 8, "float16", True, "two_shot_b5"): Route(
         "ws8_f16_two_shot_b5", 5, 175, False
+    ),
+    ("sm_103a", 8, "float16", True, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
     ),
 }
 
@@ -341,7 +349,7 @@ _SPECIALIZATION_RULES: dict[
     tuple[str, int, str, bool, int], tuple[tuple[int, int, str], ...]
 ] = {
     ("sm_100a", 2, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "lat_late_b5"),
     ),
     ("sm_100a", 2, "bfloat16", False, 16): ((96, 192, "lat_b4"),),
@@ -357,7 +365,7 @@ _SPECIALIZATION_RULES: dict[
         (1536, 2048, "lat_late_b5"),
     ),
     ("sm_100a", 4, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "two_shot_b4"),
     ),
     ("sm_100a", 4, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
@@ -373,23 +381,23 @@ _SPECIALIZATION_RULES: dict[
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_100a", 8, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "two_shot_b4"),
     ),
-    ("sm_100a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
-    ("sm_100a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_b4"),),
+    ("sm_100a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_il_b4"),),
+    ("sm_100a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_il_b4"),),
     ("sm_100a", 8, "bfloat16", True, 12): (
         (192, 384, "two_shot_b4"),
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_100a", 8, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
-    ("sm_100a", 8, "float16", False, 12): ((32, 96, "two_shot_b4"),),
+    ("sm_100a", 8, "float16", False, 12): ((32, 96, "two_shot_il_b4"),),
     ("sm_100a", 8, "float16", True, 16): (
-        (96, 192, "two_shot_b4"),
+        (96, 192, "two_shot_il_b4"),
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_103a", 2, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "lat_late_b5"),
     ),
     ("sm_103a", 2, "bfloat16", False, 16): ((96, 192, "lat_b4"),),
@@ -405,7 +413,7 @@ _SPECIALIZATION_RULES: dict[
         (1536, 2048, "lat_late_b5"),
     ),
     ("sm_103a", 4, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "two_shot_b4"),
     ),
     ("sm_103a", 4, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
@@ -421,19 +429,19 @@ _SPECIALIZATION_RULES: dict[
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_103a", 8, "bfloat16", False, 8): (
-        (1, 32, "lat_b4"),
+        (1, 32, "lat_t1"),
         (192, 384, "two_shot_b4"),
     ),
-    ("sm_103a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
-    ("sm_103a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_b4"),),
+    ("sm_103a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_il_b4"),),
+    ("sm_103a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_il_b4"),),
     ("sm_103a", 8, "bfloat16", True, 12): (
         (192, 384, "two_shot_b4"),
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_103a", 8, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
-    ("sm_103a", 8, "float16", False, 12): ((32, 96, "two_shot_b4"),),
+    ("sm_103a", 8, "float16", False, 12): ((32, 96, "two_shot_il_b4"),),
     ("sm_103a", 8, "float16", True, 16): (
-        (96, 192, "two_shot_b4"),
+        (96, 192, "two_shot_il_b4"),
         (1536, 2048, "two_shot_b5"),
     ),
 }

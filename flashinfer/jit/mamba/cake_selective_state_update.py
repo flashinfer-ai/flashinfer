@@ -6,7 +6,8 @@ The architecture-neutral CUDA programs under ``csrc/cake_selective_state_update`
 serve the Cake backend of :func:`flashinfer.mamba.selective_state_update`.
 ``MODULES`` records each generated program (sources, compile flags, FFI entry,
 argument plan, the names of its compile-time defines and every delivered
-instantiation keyed by the define-set digest that names its JIT module);
+instantiation keyed by the define-set digest that names its JIT module, and
+``arches`` for a program delivered for one architecture only);
 ``PROGRAMS`` maps the logical program names to those records.  Routes are
 chosen from host-known tensor metadata only: no device read-back, no device
 allocation and no stream synchronization happen on the call path, so every
@@ -66,6 +67,45 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_08dbd0bf11afe95f69e4": {
+        "sources": [
+            "cake_selective_state_update_08dbd0bf11afe95f69e4_kernel.cu",
+            "cake_selective_state_update_08dbd0bf11afe95f69e4_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
     "cake_selective_state_update_12a3743e215faee9d2d3": {
         "sources": [
             "cake_selective_state_update_12a3743e215faee9d2d3_kernel.cu",
@@ -109,15 +149,15 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_13fd5cba55ff23413b8f": {
+    "cake_selective_state_update_141341c762041c2f0989": {
         "sources": [
-            "cake_selective_state_update_13fd5cba55ff23413b8f_kernel.cu",
-            "cake_selective_state_update_13fd5cba55ff23413b8f_binding.cu",
+            "cake_selective_state_update_141341c762041c2f0989_kernel.cu",
+            "cake_selective_state_update_141341c762041c2f0989_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": [
-            ["buffer", "state"],
+            ["tma_buffer", "state_tma"],
             ["buffer", "x"],
             ["buffer", "dt"],
             ["buffer", "A"],
@@ -133,7 +173,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "dstate"],
             ["parameter", "ngroups"],
             ["parameter", "token_steps"],
-            ["parameter", "state_stride_slot"],
+            ["parameter", "head_tiles"],
             ["parameter", "dt_softplus"],
             ["parameter", "pad_slot_id"],
             ["grid", "grid_x"],
@@ -175,6 +215,84 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "a_head_stride"],
             ["parameter", "d_head_stride"],
             ["parameter", "dt_bias_head_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_1e25e7e97989ccf7d0ee": {
+        "sources": [
+            "cake_selective_state_update_1e25e7e97989ccf7d0ee_kernel.cu",
+            "cake_selective_state_update_1e25e7e97989ccf7d0ee_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_1f67b61ba56f424eee60": {
+        "sources": [
+            "cake_selective_state_update_1f67b61ba56f424eee60_kernel.cu",
+            "cake_selective_state_update_1f67b61ba56f424eee60_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
             ["parameter", "dt_softplus"],
             ["parameter", "has_z"],
             ["parameter", "disable_state_update"],
@@ -229,6 +347,45 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_2178baceb12c5afdb247": {
+        "sources": [
+            "cake_selective_state_update_2178baceb12c5afdb247_kernel.cu",
+            "cake_selective_state_update_2178baceb12c5afdb247_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
     "cake_selective_state_update_21e42f0390e2e795696b": {
         "sources": [
             "cake_selective_state_update_21e42f0390e2e795696b_kernel.cu",
@@ -272,10 +429,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_240c4d01808cea098731": {
+    "cake_selective_state_update_258ed8353a97efa06189": {
         "sources": [
-            "cake_selective_state_update_240c4d01808cea098731_kernel.cu",
-            "cake_selective_state_update_240c4d01808cea098731_binding.cu",
+            "cake_selective_state_update_258ed8353a97efa06189_kernel.cu",
+            "cake_selective_state_update_258ed8353a97efa06189_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -311,10 +468,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_2beef7af74a4b9f466e6": {
+    "cake_selective_state_update_2cc9268de87c59f1f73c": {
         "sources": [
-            "cake_selective_state_update_2beef7af74a4b9f466e6_kernel.cu",
-            "cake_selective_state_update_2beef7af74a4b9f466e6_binding.cu",
+            "cake_selective_state_update_2cc9268de87c59f1f73c_kernel.cu",
+            "cake_selective_state_update_2cc9268de87c59f1f73c_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -383,6 +540,240 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_32947e1a5daabf2f026b": {
+        "sources": [
+            "cake_selective_state_update_32947e1a5daabf2f026b_kernel.cu",
+            "cake_selective_state_update_32947e1a5daabf2f026b_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_37ca90dc0ecf1fd2354a": {
+        "sources": [
+            "cake_selective_state_update_37ca90dc0ecf1fd2354a_kernel.cu",
+            "cake_selective_state_update_37ca90dc0ecf1fd2354a_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_383bfdb61763de452c10": {
+        "sources": [
+            "cake_selective_state_update_383bfdb61763de452c10_kernel.cu",
+            "cake_selective_state_update_383bfdb61763de452c10_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_3c8e3282b6aff8c07fc4": {
+        "sources": [
+            "cake_selective_state_update_3c8e3282b6aff8c07fc4_kernel.cu",
+            "cake_selective_state_update_3c8e3282b6aff8c07fc4_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_400105cc25bf16992e7c": {
+        "sources": [
+            "cake_selective_state_update_400105cc25bf16992e7c_kernel.cu",
+            "cake_selective_state_update_400105cc25bf16992e7c_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_4331fbf0f1ba070a17ea": {
+        "sources": [
+            "cake_selective_state_update_4331fbf0f1ba070a17ea_kernel.cu",
+            "cake_selective_state_update_4331fbf0f1ba070a17ea_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
     "cake_selective_state_update_458e362c4e725222ee80": {
         "sources": [
             "cake_selective_state_update_458e362c4e725222ee80_kernel.cu",
@@ -415,6 +806,45 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "a_head_stride"],
             ["parameter", "d_head_stride"],
             ["parameter", "dt_bias_head_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_47799709ad4b6615e62f": {
+        "sources": [
+            "cake_selective_state_update_47799709ad4b6615e62f_kernel.cu",
+            "cake_selective_state_update_47799709ad4b6615e62f_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
             ["parameter", "dt_softplus"],
             ["parameter", "has_z"],
             ["parameter", "disable_state_update"],
@@ -555,10 +985,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_56f59f4867a850ae02ad": {
+    "cake_selective_state_update_55592a088e24771988a2": {
         "sources": [
-            "cake_selective_state_update_56f59f4867a850ae02ad_kernel.cu",
-            "cake_selective_state_update_56f59f4867a850ae02ad_binding.cu",
+            "cake_selective_state_update_55592a088e24771988a2_kernel.cu",
+            "cake_selective_state_update_55592a088e24771988a2_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -594,10 +1024,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_5a6018cb69a2c36aee16": {
+    "cake_selective_state_update_577db7d12e065d81f634": {
         "sources": [
-            "cake_selective_state_update_5a6018cb69a2c36aee16_kernel.cu",
-            "cake_selective_state_update_5a6018cb69a2c36aee16_binding.cu",
+            "cake_selective_state_update_577db7d12e065d81f634_kernel.cu",
+            "cake_selective_state_update_577db7d12e065d81f634_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -633,10 +1063,122 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_603e4207fbd87dcf8788": {
+    "cake_selective_state_update_62aa814f62781f9ab3d4": {
         "sources": [
-            "cake_selective_state_update_603e4207fbd87dcf8788_kernel.cu",
-            "cake_selective_state_update_603e4207fbd87dcf8788_binding.cu",
+            "cake_selective_state_update_62aa814f62781f9ab3d4_kernel.cu",
+            "cake_selective_state_update_62aa814f62781f9ab3d4_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_64e47b8b987cfa7322c8": {
+        "sources": [
+            "cake_selective_state_update_64e47b8b987cfa7322c8_kernel.cu",
+            "cake_selective_state_update_64e47b8b987cfa7322c8_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "state"],
+            ["buffer", "x"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["parameter", "batch_size"],
+            ["parameter", "nheads"],
+            ["parameter", "dim"],
+            ["parameter", "dstate"],
+            ["parameter", "ngroups"],
+            ["parameter", "token_steps"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_665f845c6e3c3550a34c": {
+        "sources": [
+            "cake_selective_state_update_665f845c6e3c3550a34c_kernel.cu",
+            "cake_selective_state_update_665f845c6e3c3550a34c_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "units"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_666ea56e7841b5e2396b": {
+        "sources": [
+            "cake_selective_state_update_666ea56e7841b5e2396b_kernel.cu",
+            "cake_selective_state_update_666ea56e7841b5e2396b_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -702,88 +1244,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_6a3d4261a49f481df37b": {
+    "cake_selective_state_update_6b20a536e14fc15a5a1b": {
         "sources": [
-            "cake_selective_state_update_6a3d4261a49f481df37b_kernel.cu",
-            "cake_selective_state_update_6a3d4261a49f481df37b_binding.cu",
-        ],
-        "compile_flags": ["--fmad=false"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "state_tma"],
-            ["buffer", "x"],
-            ["parameter", "dt_addr"],
-            ["parameter", "a_addr"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["parameter", "d_addr"],
-            ["buffer", "z"],
-            ["parameter", "dt_bias_addr"],
-            ["buffer", "output"],
-            ["parameter", "state_batch_indices_addr"],
-            ["parameter", "dst_state_batch_indices_addr"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "head_tiles"],
-            ["parameter", "x_batch_stride"],
-            ["parameter", "b_batch_stride"],
-            ["parameter", "c_batch_stride"],
-            ["parameter", "out_batch_stride"],
-            ["parameter", "dt_batch_stride"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "has_z"],
-            ["parameter", "disable_state_update"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_6af0e301baad62bb3cbc": {
-        "sources": [
-            "cake_selective_state_update_6af0e301baad62bb3cbc_kernel.cu",
-            "cake_selective_state_update_6af0e301baad62bb3cbc_binding.cu",
-        ],
-        "compile_flags": ["--fmad=false"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "state_tma"],
-            ["buffer", "x"],
-            ["parameter", "dt_addr"],
-            ["parameter", "a_addr"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["parameter", "d_addr"],
-            ["buffer", "z"],
-            ["parameter", "dt_bias_addr"],
-            ["buffer", "output"],
-            ["parameter", "state_batch_indices_addr"],
-            ["parameter", "dst_state_batch_indices_addr"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "head_tiles"],
-            ["parameter", "x_batch_stride"],
-            ["parameter", "b_batch_stride"],
-            ["parameter", "c_batch_stride"],
-            ["parameter", "out_batch_stride"],
-            ["parameter", "dt_batch_stride"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "has_z"],
-            ["parameter", "disable_state_update"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_707a4a29559f63634521": {
-        "sources": [
-            "cake_selective_state_update_707a4a29559f63634521_kernel.cu",
-            "cake_selective_state_update_707a4a29559f63634521_binding.cu",
+            "cake_selective_state_update_6b20a536e14fc15a5a1b_kernel.cu",
+            "cake_selective_state_update_6b20a536e14fc15a5a1b_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -894,79 +1358,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_79eadd3e6c90e3ed25ba": {
-        "sources": [
-            "cake_selective_state_update_79eadd3e6c90e3ed25ba_kernel.cu",
-            "cake_selective_state_update_79eadd3e6c90e3ed25ba_binding.cu",
-        ],
-        "compile_flags": ["--fmad=false"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "state_tma"],
-            ["buffer", "x"],
-            ["parameter", "dt_addr"],
-            ["parameter", "a_addr"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["parameter", "d_addr"],
-            ["buffer", "z"],
-            ["parameter", "dt_bias_addr"],
-            ["buffer", "output"],
-            ["parameter", "state_batch_indices_addr"],
-            ["parameter", "dst_state_batch_indices_addr"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "head_tiles"],
-            ["parameter", "x_batch_stride"],
-            ["parameter", "b_batch_stride"],
-            ["parameter", "c_batch_stride"],
-            ["parameter", "out_batch_stride"],
-            ["parameter", "dt_batch_stride"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "has_z"],
-            ["parameter", "disable_state_update"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_7cb3d356b3e893599b74": {
-        "sources": [
-            "cake_selective_state_update_7cb3d356b3e893599b74_kernel.cu",
-            "cake_selective_state_update_7cb3d356b3e893599b74_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "state"],
-            ["buffer", "x"],
-            ["buffer", "dt"],
-            ["buffer", "A"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["buffer", "D"],
-            ["buffer", "dt_bias"],
-            ["buffer", "output"],
-            ["buffer", "state_batch_indices"],
-            ["parameter", "batch_size"],
-            ["parameter", "nheads"],
-            ["parameter", "dim"],
-            ["parameter", "dstate"],
-            ["parameter", "ngroups"],
-            ["parameter", "token_steps"],
-            ["parameter", "state_stride_slot"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "defines": [],
-        "instantiations": {},
-    },
     "cake_selective_state_update_7ec2a66c2fcab8857b0e": {
         "sources": [
             "cake_selective_state_update_7ec2a66c2fcab8857b0e_kernel.cu",
@@ -1010,10 +1401,43 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_7fc2021df1941f0bc40b": {
+    "cake_selective_state_update_8135210c44963374bccd": {
         "sources": [
-            "cake_selective_state_update_7fc2021df1941f0bc40b_kernel.cu",
-            "cake_selective_state_update_7fc2021df1941f0bc40b_binding.cu",
+            "cake_selective_state_update_8135210c44963374bccd_kernel.cu",
+            "cake_selective_state_update_8135210c44963374bccd_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["tma_buffer", "x_tma"],
+            ["tma_buffer", "b_tma"],
+            ["tma_buffer", "c_tma"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["buffer", "intermediate_state"],
+            ["buffer", "intermediate_state_indices"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "total_tiles"],
+            ["parameter", "intermediate_stride_slot"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "cache_intermediate"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_825e3bef483e1d2841dc": {
+        "sources": [
+            "cake_selective_state_update_825e3bef483e1d2841dc_kernel.cu",
+            "cake_selective_state_update_825e3bef483e1d2841dc_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -1042,39 +1466,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "has_z"],
             ["parameter", "disable_state_update"],
             ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_8135210c44963374bccd": {
-        "sources": [
-            "cake_selective_state_update_8135210c44963374bccd_kernel.cu",
-            "cake_selective_state_update_8135210c44963374bccd_binding.cu",
-        ],
-        "compile_flags": ["--fmad=false"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "state_tma"],
-            ["tma_buffer", "x_tma"],
-            ["tma_buffer", "b_tma"],
-            ["tma_buffer", "c_tma"],
-            ["buffer", "dt"],
-            ["buffer", "A"],
-            ["buffer", "D"],
-            ["buffer", "dt_bias"],
-            ["buffer", "output"],
-            ["buffer", "state_batch_indices"],
-            ["buffer", "intermediate_state"],
-            ["buffer", "intermediate_state_indices"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "total_tiles"],
-            ["parameter", "intermediate_stride_slot"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "cache_intermediate"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -1157,6 +1548,84 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_8f98165e7ffdfa124514": {
+        "sources": [
+            "cake_selective_state_update_8f98165e7ffdfa124514_kernel.cu",
+            "cake_selective_state_update_8f98165e7ffdfa124514_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_96e16ae81b8c8834a42e": {
+        "sources": [
+            "cake_selective_state_update_96e16ae81b8c8834a42e_kernel.cu",
+            "cake_selective_state_update_96e16ae81b8c8834a42e_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
     "cake_selective_state_update_9859d0fa7a74fe87abc4": {
         "sources": [
             "cake_selective_state_update_9859d0fa7a74fe87abc4_kernel.cu",
@@ -1200,10 +1669,122 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_ab03343024ef0e7ceab1": {
+    "cake_selective_state_update_992d788b6c0cc88a38df": {
         "sources": [
-            "cake_selective_state_update_ab03343024ef0e7ceab1_kernel.cu",
-            "cake_selective_state_update_ab03343024ef0e7ceab1_binding.cu",
+            "cake_selective_state_update_992d788b6c0cc88a38df_kernel.cu",
+            "cake_selective_state_update_992d788b6c0cc88a38df_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["parameter", "batch_size"],
+            ["parameter", "nheads"],
+            ["parameter", "dim"],
+            ["parameter", "dstate"],
+            ["parameter", "ngroups"],
+            ["parameter", "token_steps"],
+            ["parameter", "head_tiles"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_9e4513f3aaed638dabdf": {
+        "sources": [
+            "cake_selective_state_update_9e4513f3aaed638dabdf_kernel.cu",
+            "cake_selective_state_update_9e4513f3aaed638dabdf_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_a596be8cfb44eb5c7fbb": {
+        "sources": [
+            "cake_selective_state_update_a596be8cfb44eb5c7fbb_kernel.cu",
+            "cake_selective_state_update_a596be8cfb44eb5c7fbb_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_acad3a85e999c48a1d14": {
+        "sources": [
+            "cake_selective_state_update_acad3a85e999c48a1d14_kernel.cu",
+            "cake_selective_state_update_acad3a85e999c48a1d14_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -1368,10 +1949,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_d1dfae27f5bec5ee6007": {
+    "cake_selective_state_update_c5d1c3af3e6803d2f114": {
         "sources": [
-            "cake_selective_state_update_d1dfae27f5bec5ee6007_kernel.cu",
-            "cake_selective_state_update_d1dfae27f5bec5ee6007_binding.cu",
+            "cake_selective_state_update_c5d1c3af3e6803d2f114_kernel.cu",
+            "cake_selective_state_update_c5d1c3af3e6803d2f114_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -1406,6 +1987,48 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "defines": [],
         "instantiations": {},
+    },
+    "cake_selective_state_update_d59335168efef54d6087": {
+        "sources": [
+            "cake_selective_state_update_d59335168efef54d6087_kernel.cu",
+            "cake_selective_state_update_d59335168efef54d6087_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+        "arches": [
+            "sm_100a",
+        ],
     },
     "cake_selective_state_update_da654c98ebe8c52ad280": {
         "sources": [
@@ -1559,6 +2182,45 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_ebc626eb782ee728cdbb": {
+        "sources": [
+            "cake_selective_state_update_ebc626eb782ee728cdbb_kernel.cu",
+            "cake_selective_state_update_ebc626eb782ee728cdbb_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
     "cake_selective_state_update_edea77f45a37d66ae65e": {
         "sources": [
             "cake_selective_state_update_edea77f45a37d66ae65e_kernel.cu",
@@ -1581,6 +2243,40 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "batch_size"],
             ["parameter", "token_steps"],
             ["parameter", "state_stride_slot"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_ef3807c7af19110c1126": {
+        "sources": [
+            "cake_selective_state_update_ef3807c7af19110c1126_kernel.cu",
+            "cake_selective_state_update_ef3807c7af19110c1126_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "state"],
+            ["buffer", "x"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["parameter", "batch_size"],
+            ["parameter", "nheads"],
+            ["parameter", "dim"],
+            ["parameter", "dstate"],
+            ["parameter", "ngroups"],
+            ["parameter", "token_steps"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "dt_softplus"],
             ["parameter", "pad_slot_id"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
@@ -1632,10 +2328,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_f4ac69e0aa1014876850": {
+    "cake_selective_state_update_f48259e1598cb15adb2c": {
         "sources": [
-            "cake_selective_state_update_f4ac69e0aa1014876850_kernel.cu",
-            "cake_selective_state_update_f4ac69e0aa1014876850_binding.cu",
+            "cake_selective_state_update_f48259e1598cb15adb2c_kernel.cu",
+            "cake_selective_state_update_f48259e1598cb15adb2c_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -1733,6 +2429,45 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "cake_selective_state_update_fc1cb2ecf8e93e3365ce": {
+        "sources": [
+            "cake_selective_state_update_fc1cb2ecf8e93e3365ce_kernel.cu",
+            "cake_selective_state_update_fc1cb2ecf8e93e3365ce_binding.cu",
+        ],
+        "compile_flags": ["--fmad=false"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["parameter", "state_batch_indices_addr"],
+            ["parameter", "dst_state_batch_indices_addr"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "head_tiles"],
+            ["parameter", "x_batch_stride"],
+            ["parameter", "b_batch_stride"],
+            ["parameter", "c_batch_stride"],
+            ["parameter", "out_batch_stride"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+    },
 }
 PROGRAMS: dict[str, str] = {
     "dynamic_lanes16": "cake_selective_state_update_edea77f45a37d66ae65e",
@@ -1745,22 +2480,41 @@ PROGRAMS: dict[str, str] = {
     "mtp_cache_groups8_heads64": "cake_selective_state_update_03e316d2e39f9165ae23",
     "mtp_horizontal_direct": "cake_selective_state_update_8135210c44963374bccd",
     "mtp_horizontal_early": "cake_selective_state_update_2daf8a1c27be3854989c",
-    "mtp_short_prefetch": "cake_selective_state_update_7cb3d356b3e893599b74",
-    "mtp_short_prefetch_heads64_groups8": "cake_selective_state_update_13fd5cba55ff23413b8f",
+    "mtp_short_prefetch": "cake_selective_state_update_ef3807c7af19110c1126",
+    "mtp_short_prefetch_heads64_groups8": "cake_selective_state_update_64e47b8b987cfa7322c8",
+    "mtp_short_ring_heads64_groups8_t1": "cake_selective_state_update_141341c762041c2f0989",
+    "mtp_short_ring_heads64_groups8_t2": "cake_selective_state_update_992d788b6c0cc88a38df",
     "stp_dim128_fp32": "cake_selective_state_update_4d2ff3309e21d5caaded",
-    "stp_dim128_hpc1_mb4": "cake_selective_state_update_ab03343024ef0e7ceab1",
-    "stp_dim128_hpc2": "cake_selective_state_update_f4ac69e0aa1014876850",
-    "stp_dim128_z_gated": "cake_selective_state_update_6af0e301baad62bb3cbc",
-    "stp_hd64_paired_hpc1": "cake_selective_state_update_7fc2021df1941f0bc40b",
-    "stp_hd64_paired_hpc1_bf16_i32": "cake_selective_state_update_56f59f4867a850ae02ad",
-    "stp_hd64_paired_hpc1_ratio8": "cake_selective_state_update_79eadd3e6c90e3ed25ba",
-    "stp_hd64_paired_hpc1_ratio8_bf16_i32": "cake_selective_state_update_5a6018cb69a2c36aee16",
-    "stp_hd64_paired_hpc2": "cake_selective_state_update_603e4207fbd87dcf8788",
-    "stp_hd64_paired_hpc2_bf16_i32": "cake_selective_state_update_2beef7af74a4b9f466e6",
-    "stp_hd64_paired_hpc2_mb2": "cake_selective_state_update_6a3d4261a49f481df37b",
-    "stp_hd64_paired_hpc2_mb2_bf16_i32": "cake_selective_state_update_240c4d01808cea098731",
-    "stp_hd64_paired_hpc4": "cake_selective_state_update_d1dfae27f5bec5ee6007",
-    "stp_hd64_paired_hpc4_bf16_i32": "cake_selective_state_update_707a4a29559f63634521",
+    "stp_dim128_hpc1_mb4": "cake_selective_state_update_55592a088e24771988a2",
+    "stp_dim128_hpc1_s2w4": "cake_selective_state_update_6b20a536e14fc15a5a1b",
+    "stp_dim128_hpc2": "cake_selective_state_update_f48259e1598cb15adb2c",
+    "stp_dim128_hpc2_s2w4_mb5": "cake_selective_state_update_d59335168efef54d6087",
+    "stp_dim128_z_balanced": "cake_selective_state_update_665f845c6e3c3550a34c",
+    "stp_dim128_z_gated": "cake_selective_state_update_2cc9268de87c59f1f73c",
+    "stp_hd64_paired_hpc1": "cake_selective_state_update_666ea56e7841b5e2396b",
+    "stp_hd64_paired_hpc1_bf16_i32": "cake_selective_state_update_62aa814f62781f9ab3d4",
+    "stp_hd64_paired_hpc1_ratio8": "cake_selective_state_update_ebc626eb782ee728cdbb",
+    "stp_hd64_paired_hpc1_ratio8_bf16_i32": "cake_selective_state_update_825e3bef483e1d2841dc",
+    "stp_hd64_paired_hpc1_ratio8_s4w2": "cake_selective_state_update_32947e1a5daabf2f026b",
+    "stp_hd64_paired_hpc1_ratio8_s4w2_bf16_i32": "cake_selective_state_update_577db7d12e065d81f634",
+    "stp_hd64_paired_hpc1_s4w2": "cake_selective_state_update_2178baceb12c5afdb247",
+    "stp_hd64_paired_hpc1_s4w2_bf16_i32": "cake_selective_state_update_258ed8353a97efa06189",
+    "stp_hd64_paired_hpc2": "cake_selective_state_update_acad3a85e999c48a1d14",
+    "stp_hd64_paired_hpc2_bf16_i32": "cake_selective_state_update_08dbd0bf11afe95f69e4",
+    "stp_hd64_paired_hpc2_mb2": "cake_selective_state_update_c5d1c3af3e6803d2f114",
+    "stp_hd64_paired_hpc2_mb2_bf16_i32": "cake_selective_state_update_1f67b61ba56f424eee60",
+    "stp_hd64_paired_hpc2_ratio8_s2w4": "cake_selective_state_update_96e16ae81b8c8834a42e",
+    "stp_hd64_paired_hpc2_ratio8_s2w4_bf16_i32": "cake_selective_state_update_4331fbf0f1ba070a17ea",
+    "stp_hd64_paired_hpc2_s2w4": "cake_selective_state_update_383bfdb61763de452c10",
+    "stp_hd64_paired_hpc2_s2w4_bf16_i32": "cake_selective_state_update_1e25e7e97989ccf7d0ee",
+    "stp_hd64_paired_hpc2_s2w4_mb5": "cake_selective_state_update_fc1cb2ecf8e93e3365ce",
+    "stp_hd64_paired_hpc2_s2w4_mb5_bf16_i32": "cake_selective_state_update_47799709ad4b6615e62f",
+    "stp_hd64_paired_hpc4": "cake_selective_state_update_8f98165e7ffdfa124514",
+    "stp_hd64_paired_hpc4_bf16_i32": "cake_selective_state_update_37ca90dc0ecf1fd2354a",
+    "stp_hd64_paired_hpc4_s2w4": "cake_selective_state_update_a596be8cfb44eb5c7fbb",
+    "stp_hd64_paired_hpc4_s2w4_bf16_i32": "cake_selective_state_update_9e4513f3aaed638dabdf",
+    "stp_hd64_paired_hpc4_s4w2": "cake_selective_state_update_3c8e3282b6aff8c07fc4",
+    "stp_hd64_paired_hpc4_s4w2_bf16_i32": "cake_selective_state_update_400105cc25bf16992e7c",
     "stp_hd64_rows_bf16_dt4_od": "cake_selective_state_update_f39cff0c3a588168210e",
     "stp_hd64_rows_bf16_dt4_od_bf16_i32": "cake_selective_state_update_7353941f6a49ddb8e867",
     "stp_hd64_rows_bf16_dt4_xa_bf16_i32": "cake_selective_state_update_458e362c4e725222ee80",
@@ -1789,6 +2543,17 @@ _DYNAMIC_MAX_TOKEN_STEPS = 8
 # The six-token cache producer's (batch, step) strides of x, dt, B and C in the raw SGLang ABI: the fused
 # projection's padded views the raw build folds.
 _MTP_CACHE_RAW_STRIDES = (26112, 4352, 51072, 8512, 26112, 4352, 26112, 4352)
+# The TMA-ring builds of the short program (64 heads of 8 groups, one or two folded tokens): eight heads of one
+# group per CTA, two CTAs per SM.  Per (architecture, token count): the smallest batch, the largest batch (None: no
+# bound) and the smallest fill of the ring's last wave of CTAs in quarters of a wave (whole waves always qualify).
+_MTP_SHORT_RING_HEADS_PER_CTA = 8
+_MTP_SHORT_RING_CTAS_PER_SM = 2
+_MTP_SHORT_RING_DOMAIN: dict[tuple[str, int], tuple[int, Optional[int], int]] = {
+    ("sm_100a", 1): (32, 96, 2),
+    ("sm_100a", 2): (32, None, 1),
+    ("sm_103a", 1): (64, 96, 2),
+    ("sm_103a", 2): (32, None, 0),
+}
 
 
 def _source_dir() -> Path:
@@ -1815,8 +2580,11 @@ def define_digest(defines: Sequence[tuple[str, int]]) -> str:
 def jit_spec(
     module: str, arch: str, defines: tuple[tuple[str, int], ...] = ()
 ) -> JitSpec:
-    """Build specification of one delivered program for ``arch`` and its compile-time defines."""
+    """Build specification of one delivered program for ``arch`` and its compile-time defines; a record
+    listing ``arches`` is delivered for those architectures only."""
     record = MODULES[module]
+    if arch not in record.get("arches", _ARCH_FLAGS):
+        raise ValueError(f"{module} is not delivered for {arch}")
     source_dir = _source_dir()
     # The define set names the instantiation through its digest (spelling twelve defines out exceeds
     # the 255-byte file-name limit of the JIT cache); ``MODULES[module]["instantiations"]`` maps every
@@ -1837,9 +2605,11 @@ def jit_spec(
 
 
 def gen_cake_selective_state_update_modules(arch: str) -> list[JitSpec]:
-    """Build specifications of every delivered program and of every instantiation of ``arch`` (the AOT table)."""
+    """Build specifications of every program delivered for ``arch`` and of every instantiation (the AOT table)."""
     specs: list[JitSpec] = []
     for module, record in MODULES.items():
+        if arch not in record.get("arches", _ARCH_FLAGS):
+            continue
         instantiations = record["instantiations"] or {"": {}}
         for values in instantiations.values():
             defines = tuple((name, int(values[name])) for name in record["defines"])
@@ -2024,6 +2794,37 @@ def mtp_cache_program(
                     return f"mtp_cache_groups{groups}_heads64", ()
                 return f"mtp_cache_groups{groups}", ()
     return "mtp_cache_c4_t6", defines
+
+
+def mtp_short_program(
+    batch_size: int,
+    nheads: int,
+    ngroups: int,
+    token_steps: int,
+    sm_count: int,
+    arch: str,
+) -> tuple[str, int]:
+    """``(program, head_tiles)`` of one short (one- or two-token, 128 x 128) launch; ``head_tiles`` is 0 for the
+    one-CTA-per-head builds.
+
+    On 64 heads of 8 groups the TMA-ring build of the launch's token count runs inside its domain
+    (``_MTP_SHORT_RING_DOMAIN``): a batch in the range of the architecture and token count, and a last wave of
+    eight-head CTAs (two per SM) filled at least to the bound, or a whole number of waves.  Smaller batches, and
+    batches that leave the ring's last wave nearly empty, run the build folding those counts with one CTA per
+    batch row and head.  Every other head and group count runs the prefetch build.
+    """
+    if (nheads, ngroups) != (64, 8):
+        return "mtp_short_prefetch", 0
+    bounds = _MTP_SHORT_RING_DOMAIN.get((arch, token_steps))
+    if bounds is not None:
+        low, high, quarters = bounds
+        if batch_size >= low and (high is None or batch_size <= high):
+            head_tiles = -(-(nheads // ngroups) // _MTP_SHORT_RING_HEADS_PER_CTA)
+            wave = _MTP_SHORT_RING_CTAS_PER_SM * sm_count
+            tail = batch_size * ngroups * head_tiles % wave
+            if tail == 0 or 4 * tail >= quarters * wave:
+                return f"mtp_short_ring_heads64_groups8_t{token_steps}", head_tiles
+    return "mtp_short_prefetch_heads64_groups8", 0
 
 
 def _plan_mtp_cache(
@@ -2226,13 +3027,135 @@ def hd64_paired_program(
 
 def dim128_program(heads_per_group: int, gated: bool) -> tuple[str, int]:
     """``(program, heads_per_cta)`` of the headdim-128 / dstate-128 single-token route: the z-gated build at four
-    CTAs per SM for a call with ``z``, otherwise the early-input build at one head per CTA (four CTAs per SM) for
-    one head per group and at two heads per CTA for more."""
+    CTAs per SM for a call with ``z`` (outside the persistent build's domain, :func:`dim128_balanced_units`),
+    otherwise the early-input build at one head per CTA (four CTAs per SM) for one head per group and at two heads
+    per CTA for more."""
     if gated:
         return "stp_dim128_z_gated", 2
     if heads_per_group == 1:
         return "stp_dim128_hpc1_mb4", 1
     return "stp_dim128_hpc2", 2
+
+
+# The persistent build of the z-gated 128x128 single-token program: per (architecture, SM count) the inclusive
+# intervals of ``batch x nheads`` in which a call with ``z`` runs it, and its CTAs per SM.
+_DIM128_BALANCED_UNITS: dict[tuple[str, int], tuple[tuple[int, int], ...]] = {
+    ("sm_100a", 148): ((64, 384), (1280, 1664), (2560, 2816), (3328, 4096)),
+    ("sm_103a", 152): ((64, 448), (1280, 1792), (2560, 3328), (3840, 4352)),
+}
+_DIM128_BALANCED_CTAS_PER_SM = 3
+
+
+def dim128_balanced_units(
+    batch_size: int, nheads: int, sm_count: int, arch: str
+) -> int:
+    """The heads (``batch_size x nheads``) a z-gated headdim-128 / dstate-128 single-token launch hands the
+    persistent build, or 0 when the launch keeps the z-gated build: the build runs inside the measured intervals
+    of the architecture at its SM count (``_DIM128_BALANCED_UNITS``), one launch of at most three CTAs per SM, each
+    CTA streaming whole heads."""
+    units = batch_size * nheads
+    intervals = _DIM128_BALANCED_UNITS.get((arch, sm_count), ())
+    return units if any(low <= units <= high for low, high in intervals) else 0
+
+
+# CTAs per SM of the two-head build from which a launch runs that build split two ways at five CTAs per SM, per
+# architecture: headdim 64, and headdim 128 (sm_100a only).
+_HD64_SPLIT_MB5_MIN_CTAS_PER_SM = {"sm_100a": 24, "sm_103a": 48}
+# The lower band of that split at headdim 64, per architecture: tenths of a CTA per SM of the two-head build from
+# which (inclusive) and below which a launch runs it.
+_HD64_SPLIT_MB5_BAND_TENTHS = {"sm_100a": (60, 75), "sm_103a": (66, 75)}
+_DIM128_SPLIT_MB5_MIN_CTAS_PER_SM = {"sm_100a": 48}
+
+
+def hd64_split_program(
+    row_groups: int,
+    program_heads_per_group: int,
+    sm_count: int,
+    arch: str,
+    raw_abi: bool,
+) -> Optional[tuple[str, int, int]]:
+    """``(program, heads_per_cta, p_split)`` of the P-split paired headdim-64 build for one launch, or ``None``
+    when the launch keeps the build :func:`hd64_paired_program` gives it (below two program heads per SM, the
+    row-owner tile).
+
+    A P-split build runs ``p_split`` CTAs on every work tile, each owning ``128 / p_split`` state rows of the
+    tile's program heads with its own consumer warps, at a fixed number of CTAs per SM; output and state are
+    bitwise those of the unsplit build.  The split follows the build :func:`hd64_paired_program` gives the
+    launch and that build's CTAs (``tiles``):
+
+    - one head per CTA: from one to two program heads per SM split four ways; above two, two heads per CTA
+      split two ways when the groups hold an even number of program heads (both with the folded ratio at eight
+      program heads per group);
+    - four heads per CTA: split two ways up to two ``tiles`` per SM;
+    - two heads per CTA at two CTAs per SM: no split;
+    - two heads per CTA at three CTAs per SM, below six ``tiles`` per SM and groups of a multiple of four
+      program heads: four heads per CTA split two ways up to three ``tiles`` per SM, above that split four ways
+      at nine CTAs per SM while the launch holds at most nine program heads per SM;
+    - two heads per CTA at three CTAs per SM from six ``tiles`` per SM: split two ways at five CTAs per SM from
+      6 (sm_100a) or 6.6 (sm_103a) to 7.5 ``tiles`` per SM and from 24 (sm_100a) or 48 (sm_103a) ``tiles`` per
+      SM.
+
+    ``raw_abi`` selects the build for BF16 ``dt`` / ``D`` / ``dt_bias`` and int32 slot tables.
+    """
+    suffix = "_bf16_i32" if raw_abi else ""
+    program_heads = row_groups * program_heads_per_group
+    if program_heads < 3 * sm_count:
+        ratio8 = "_ratio8" if program_heads_per_group == 8 else ""
+        if program_heads < sm_count:
+            return None
+        if program_heads <= 2 * sm_count:
+            return f"stp_hd64_paired_hpc1{ratio8}_s4w2{suffix}", 1, 4
+        if program_heads_per_group % 2:
+            return None
+        return f"stp_hd64_paired_hpc2{ratio8}_s2w4{suffix}", 2, 2
+    _, heads_per_cta = hd64_paired_program(
+        row_groups, program_heads_per_group, sm_count, raw_abi
+    )
+    tiles = _work_tiles(row_groups, program_heads_per_group, heads_per_cta)
+    if heads_per_cta == 4:
+        if tiles > 2 * sm_count:
+            return None
+        return f"stp_hd64_paired_hpc4_s2w4{suffix}", 4, 2
+    if program_heads < 6 * sm_count and tiles <= 2 * sm_count:
+        return None
+    if tiles < 6 * sm_count:
+        if program_heads_per_group % 4:
+            return None
+        if tiles <= 3 * sm_count:
+            return f"stp_hd64_paired_hpc4_s2w4{suffix}", 4, 2
+        if program_heads > 9 * sm_count:
+            return None
+        return f"stp_hd64_paired_hpc4_s4w2{suffix}", 4, 4
+    low, high = _HD64_SPLIT_MB5_BAND_TENTHS[arch]
+    if (
+        low * sm_count <= 10 * tiles < high * sm_count
+        or tiles >= _HD64_SPLIT_MB5_MIN_CTAS_PER_SM[arch] * sm_count
+    ):
+        return f"stp_hd64_paired_hpc2_s2w4_mb5{suffix}", 2, 2
+    return None
+
+
+def dim128_split_program(
+    row_groups: int, heads_per_group: int, sm_count: int, arch: str, gated: bool
+) -> Optional[tuple[str, int, int]]:
+    """``(program, heads_per_cta, p_split)`` of the P-split headdim-128 / dstate-128 build for one launch, or
+    ``None`` when the launch keeps the build :func:`dim128_program` gives it.  At one head per group the one-head
+    build splits two ways up to 3.5 CTAs per SM; from 48 CTAs per SM of the two-head build (16 waves of three
+    CTAs per SM), on sm_100a only, that build splits two ways at five CTAs per SM.  A call with ``z`` never
+    splits."""
+    if gated:
+        return None
+    if heads_per_group == 1:
+        if 2 * row_groups > 7 * sm_count:
+            return None
+        return "stp_dim128_hpc1_s2w4", 1, 2
+    min_ctas_per_sm = _DIM128_SPLIT_MB5_MIN_CTAS_PER_SM.get(arch)
+    if (
+        min_ctas_per_sm is None
+        or _work_tiles(row_groups, heads_per_group, 2) < min_ctas_per_sm * sm_count
+    ):
+        return None
+    return "stp_dim128_hpc2_s2w4_mb5", 2, 2
 
 
 def _plan_stp_rows(
@@ -2264,8 +3187,11 @@ def _plan_stp_rows(
     Every program head is one 128x128 BF16 state tile: with ``dim`` 64 two adjacent 64-row heads fold into one
     program head and the state is viewed as ``(slots, nheads / 2, 128, 128)``; with ``dim`` 128 one head is one
     program head and the tensor map covers the state as passed.  ``dt``, ``A``, ``D`` and ``dt_bias`` carry one
-    value per head at a unit head stride; slot tables are contiguous and cover the batch.  One ``shape`` /
-    ``stride()`` read per tensor.
+    value per head at a unit head stride; slot tables are contiguous and cover the batch.  A launch the P-split
+    rule takes (:func:`hd64_split_program`, :func:`dim128_split_program`) runs the split build under the same
+    bindings, ``p_split`` CTAs per work tile.  A call with ``z`` inside the persistent build's domain
+    (:func:`dim128_balanced_units`) runs that build: the same bindings with ``units`` (the batch's heads) for the
+    head tiles, at most three CTAs per SM.  One ``shape`` / ``stride()`` read per tensor.
     """
     x_shape = x.shape
     batch_size = x_shape[0]
@@ -2323,17 +3249,33 @@ def _plan_stp_rows(
     if paired:
         program_heads = nheads >> 1
         heads_per_group = program_heads // ngroups
-        program, heads_per_cta = hd64_paired_program(
-            batch_size * ngroups, heads_per_group, sms, raw_abi
+        split = hd64_split_program(
+            batch_size * ngroups, heads_per_group, sms, arch, raw_abi
         )
+        if split is None:
+            program, heads_per_cta = hd64_paired_program(
+                batch_size * ngroups, heads_per_group, sms, raw_abi
+            )
         state_tma = state.view(state.shape[0], program_heads, 128, 128)
     else:
         if raw_abi:
             return None
         program_heads = nheads
         heads_per_group = nheads // ngroups
-        program, heads_per_cta = dim128_program(heads_per_group, z is not None)
+        split = dim128_split_program(
+            batch_size * ngroups, heads_per_group, sms, arch, z is not None
+        )
+        if split is None:
+            program, heads_per_cta = dim128_program(heads_per_group, z is not None)
         state_tma = state
+    p_split = 1
+    if split is not None:
+        program, heads_per_cta, p_split = split
+    units = (
+        dim128_balanced_units(batch_size, nheads, sms, arch)
+        if not paired and z is not None
+        else 0
+    )
     head_tiles = (heads_per_group + heads_per_cta - 1) // heads_per_cta
     bindings = dict(
         state_tma=state_tma,
@@ -2361,11 +3303,23 @@ def _plan_stp_rows(
         disable_state_update=int(disable_state_update),
         pad_slot_id=pad_slot_id,
     )
-    # One CTA per work tile of ``heads_per_cta`` program heads of one (batch, group).
+    if units:
+        # The persistent build: CTA ``c`` of the grid streams heads ``c``, ``c + grid``, ... of the batch.
+        del bindings["head_tiles"]
+        bindings["units"] = units
+        return RoutePlan(
+            "stp_dim128_z_balanced",
+            (),
+            (min(units, _DIM128_BALANCED_CTAS_PER_SM * sms), 1, 1),
+            bindings,
+            arch,
+            device_index,
+        )
+    # ``p_split`` CTAs per work tile of ``heads_per_cta`` program heads of one (batch, group).
     return RoutePlan(
         program,
         (),
-        (batch_size * ngroups * head_tiles, 1, 1),
+        (batch_size * ngroups * head_tiles * p_split, 1, 1),
         bindings,
         arch,
         device_index,
@@ -2491,41 +3445,48 @@ def _plan_stp_hd64(
 ) -> Optional[RoutePlan]:
     """Headdim-64 / dstate-128 single-token decode (Nemotron-H, granite-4.0-h) on both ABIs and state dtypes.
 
-    BF16 state at saturating work pairs two heads into one 128x128 program head of the paired row-major
-    programs (even head count and even heads per group, at least two program blocks per SM); every other case
-    runs the direct row-owner tile.  Dense x/B/C/out rows may carry padded batch strides (the SGLang
-    fused-projection views).
+    BF16 state with an even head count and even heads per group pairs two heads into one 128x128 program head
+    of the paired row-major programs at saturating work (at least two program heads per SM) and wherever the
+    P-split rule takes the launch below that (one to two program heads per SM, :func:`hd64_split_program`);
+    every other case, and a split launch whose layout the paired programs cannot read, runs the direct
+    row-owner tile.  Dense x/B/C/out rows may carry padded batch strides (the SGLang fused-projection views).
     """
     sms = _sm_count(device_index)
     if (
         state.dtype == torch.bfloat16
         and nheads % 2 == 0
         and (nheads // ngroups) % 2 == 0
-        and x.shape[0] * (nheads >> 1) >= 2 * sms
     ):
-        return _plan_stp_rows(
-            state=state,
-            x=x,
-            dt=dt,
-            A=A,
-            B=B,
-            C=C,
-            D=D,
-            z=z,
-            dt_bias=dt_bias,
-            output=output,
-            source=source,
-            destination=destination,
-            nheads=nheads,
-            ngroups=ngroups,
-            dim=64,
-            dt_softplus=dt_softplus,
-            disable_state_update=disable_state_update,
-            pad_slot_id=pad_slot_id,
-            arch=arch,
-            device_index=device_index,
-            sms=sms,
+        saturating = x.shape[0] * (nheads >> 1) >= 2 * sms
+        split = hd64_split_program(
+            x.shape[0] * ngroups, (nheads >> 1) // ngroups, sms, arch, False
         )
+        if saturating or split is not None:
+            plan = _plan_stp_rows(
+                state=state,
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                output=output,
+                source=source,
+                destination=destination,
+                nheads=nheads,
+                ngroups=ngroups,
+                dim=64,
+                dt_softplus=dt_softplus,
+                disable_state_update=disable_state_update,
+                pad_slot_id=pad_slot_id,
+                arch=arch,
+                device_index=device_index,
+                sms=sms,
+            )
+            if plan is not None or saturating:
+                return plan
     x_shape, x_stride = x.shape, x.stride()
     batch_size = x_shape[0]
     rows_plan = hd64_rows_plan(batch_size, nheads, state.dtype, sms)
@@ -2905,8 +3866,15 @@ def plan_route(
         if compact is None:
             return None
         dt_compact, A_compact, D_compact, bias_compact = compact
+        program, head_tiles = mtp_short_program(
+            batch_size,
+            nheads,
+            ngroups,
+            token_steps,
+            _sm_count(device_index),
+            arch,
+        )
         bindings = dict(
-            state=state,
             x=x,
             dt=dt_compact,
             A=A_compact,
@@ -2922,21 +3890,18 @@ def plan_route(
             dstate=dstate,
             ngroups=ngroups,
             token_steps=token_steps,
-            state_stride_slot=state.stride(0),
             dt_softplus=int(dt_softplus),
             pad_slot_id=pad_slot_id,
         )
-        # 64 heads of 8 groups run the build that folds those counts into each CTA's (batch, head, group).
-        return RoutePlan(
-            "mtp_short_prefetch_heads64_groups8"
-            if (nheads, ngroups) == (64, 8)
-            else "mtp_short_prefetch",
-            (),
-            (batch_size * nheads, 1, 1),
-            bindings,
-            arch,
-            device_index,
-        )
+        if head_tiles:
+            # The TMA ring: a CTA per (batch row, group, tile of heads), the state a tensor map of the slot table.
+            bindings.update(state_tma=state, head_tiles=head_tiles)
+            grid = (batch_size * ngroups * head_tiles, 1, 1)
+        else:
+            # A CTA per (batch row, head); 64 heads of 8 groups fold those counts into each CTA's (batch, head, group).
+            bindings.update(state=state, state_stride_slot=state.stride(0))
+            grid = (batch_size * nheads, 1, 1)
+        return RoutePlan(program, (), grid, bindings, arch, device_index)
 
     if (
         state.dtype == torch.bfloat16
@@ -3110,9 +4075,12 @@ __all__ = [
     "RoutePlan",
     "define_digest",
     "dim128_program",
+    "dim128_split_program",
     "hd64_paired_program",
     "hd64_rows_plan",
+    "hd64_split_program",
     "jit_spec",
+    "mtp_short_program",
     "plan_route",
     "rows_defines",
     "try_cake_selective_state_update",

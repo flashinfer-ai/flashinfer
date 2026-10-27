@@ -2,7 +2,7 @@
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
 SM100/SM103/SM107, with FMA coverage on SM80, SM90 and SM120 and bounded
-grouped Tensor Core candidates on SM80/SM90/SM120.
+grouped Tensor Core candidates on SM80/SM90/SM103/SM120.
 SM80 admits BF16/FP16 inputs and weights; its other quantized formats remain unsupported.
 SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
 NVFP4/MXFP4/MXINT4 weights with BF16/FP16 activations. MXFP8 inputs and NVFP4 activations remain
@@ -369,7 +369,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM80: BF16/FP16 FMA and bounded grouped BF16/FP16 warp MMA, top-k <= 32; SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA, top-k <= 32, plus grouped BF16/FP16 WGMMA for the qualified workload above; SM100/103/107: FMA and MX Tensor Core; SM120: FMA, top-k <= 32, plus grouped BF16/FP16 warp MMA for the qualified workload above |
+| Architecture | SM80: BF16/FP16 FMA and bounded grouped BF16/FP16 warp MMA; SM90: FMA, grouped BF16/FP16/per-tensor FP8/DeepSeek block FP8 WGMMA, and bounded W8A16 warp MMA; SM100/107: FMA and MX Tensor Core; SM103: FMA, MX Tensor Core, and bounded W8A16/packed-NVFP4 warp MMA; SM120: FMA and bounded dense/per-tensor FP8/DeepSeek block FP8/W8A16/packed-NVFP4 warp MMA. Supported dtype, activation, shape and compiler combinations are restricted to the qualified candidate sections below; SM80/90/120 routing supports top-k <= 32. |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3/NVFP4/MXFP4/MXINT4 weight-only checkpoints with BF16/FP16 input and output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |

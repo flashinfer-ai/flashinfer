@@ -75,8 +75,10 @@ DAV_PLAN = [
 ]  # fmt: skip
 PLANS = {
     "kcp_fwdh_offset": FWDH_PLAN,
+    "kcp_fwdh_offset_vh64": FWDH_PLAN,
     "kcp_fwdh_tape": FWDH_PLAN,
     "kcp_dhu_offset": DHU_PLAN,
+    "kcp_dhu_offset_vh64": DHU_PLAN,
     "kcp_dhu_tape": DHU_PLAN,
     "kcp_transfer_walk": TRANSFER_PLAN,
     "kcp_affine_merge_c8": MERGE_PLAN,
@@ -87,6 +89,8 @@ PLANS = {
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
     "kcp_transfer_walk_tf32_hilo": TRANSFER_PLAN,
+    "kcp_fwdh_tape_full": FWDH_PLAN,
+    "kcp_dhu_tape_full": DHU_PLAN,
 }
 # The identity rule: ``cake_kda_train_<20 hex of sha256("<tart module>\\n<sorted JSON of the build keywords>")>``.
 _W = "sm100_sm103_sm107"
@@ -95,17 +99,25 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
         {"program": "offset"},
     ),
+    "kcp_fwdh_offset_vh64": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
+        {"program": "offset", "vh": 64, "prefetch": True, "tmem_batch": True},
+    ),
     "kcp_fwdh_tape": (
         f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
-        {"program": "tape"},
+        {"program": "tape", "vh": 64, "tape_store": "tma"},
     ),
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
         {"program": "offset"},
     ),
+    "kcp_dhu_offset_vh64": (
+        f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
+        {"program": "offset", "vh": 64},
+    ),
     "kcp_dhu_tape": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape"},
+        {"program": "tape", "vh": 64, "tape_store": "tma"},
     ),
     "kcp_transfer_walk": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_bf16x3_v1",
@@ -137,6 +149,14 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
         {"precision_mode": 0},
     ),
+    "kcp_fwdh_tape_full": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_kcp_fwdh_v1",
+        {"program": "tape"},
+    ),
+    "kcp_dhu_tape_full": (
+        f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
+        {"program": "tape"},
+    ),
 }
 
 
@@ -151,6 +171,8 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_transfer_walk_plain_tf32",
         "kcp_transfer_walk_bf16x3",
         "kcp_transfer_walk_tf32_hilo",
+        "kcp_fwdh_tape_full",
+        "kcp_dhu_tape_full",
     }
     assert kcp_jit.ARCHES == ARCHES == tuple(cake_jit.ARCHES)
     assert kcp_jit.PROGRAMS == (
@@ -220,8 +242,21 @@ def test_selection_and_grids() -> None:
     )
     with pytest.raises(ValueError):
         kcp_jit.select_record("kcp_affine_merge", ncols=64)
-    assert kcp_jit.select_record("kcp_fwdh_offset") == "kcp_fwdh_offset"
+    assert kcp_jit.select_record("kcp_fwdh_offset", form="full") == "kcp_fwdh_offset"
+    assert (
+        kcp_jit.select_record("kcp_fwdh_offset", form="split") == "kcp_fwdh_offset_vh64"
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_fwdh_offset")  # two records: the form must be given
+    assert kcp_jit.select_record("kcp_fwdh_tape", form="split") == "kcp_fwdh_tape"
     assert kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=3, num_heads=4) == (12, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwdh_offset_vh64", n_walk=3, num_heads=4) == (
+        24,
+        1,
+        1,
+    )
+    assert kcp_jit.launch_grid("kcp_dhu_tape", n_walk=3, num_heads=4) == (24, 1, 1)
+    assert kcp_jit.launch_grid("kcp_dhu_tape_full", n_walk=3, num_heads=4) == (12, 1, 1)
     assert kcp_jit.launch_grid("kcp_transfer_walk_bf16x3", n_walk=3, num_heads=4) == (
         12,
         1,
@@ -273,6 +308,63 @@ def test_test_record_selection_by_knobs() -> None:
         kcp_jit.test_record(3)
     with pytest.raises(ValueError):
         kcp_jit.test_record(0, "fp32")
+
+
+def test_walk_form_rules_and_records() -> None:
+    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the
+    # full-width record test-only under walk_form "full"
+    assert kcp_jit.WALK_FORM_RULES == {
+        "kcp_fwdh_offset": "fit",
+        "kcp_fwdh_tape": "split",
+        "kcp_dhu_offset": "fit",
+        "kcp_dhu_tape": "split",
+    }
+    sms = 152
+    assert kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms) == "split"
+    assert kcp_jit.walk_form("kcp_fwdh_offset", [111, 59, 52], 64, sms) == "split"
+    assert kcp_jit.walk_form("kcp_fwdh_offset", [104, 104, 19, 18], 64, sms) == "split"
+    assert kcp_jit.walk_form("kcp_dhu_offset", [124, 124, 124], 64, sms) == "full"
+    assert (
+        kcp_jit.walk_form("kcp_dhu_offset", [39] * 7 + [25] * 2 + [24] * 5, 64, sms)
+        == "full"
+    )
+    assert kcp_jit.walk_form("kcp_dhu_offset", [60, 59, 50, 48], 64, sms) == "full"
+    assert kcp_jit.walk_form("kcp_fwdh_offset", [64] * 7, 1, sms) == "split"
+    assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
+    assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
+    assert kcp_jit.walk_form("kcp_dhu_tape", [39] * 14, 64, sms) == "split"
+    assert (
+        kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, knob="full") == "full"
+    )
+    assert (
+        kcp_jit.walk_form("kcp_fwdh_tape", [222, 222], 64, sms, knob="full") == "full"
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.walk_form("kcp_fwdh_tape", [222, 222], 64, sms, knob="half")
+    assert kcp_jit.test_walk_record("kcp_fwdh_tape", "full")[0] == "kcp_fwdh_tape_full"
+    assert kcp_jit.test_walk_record("kcp_dhu_tape", "full")[0] == "kcp_dhu_tape_full"
+    with pytest.raises(ValueError):
+        kcp_jit.test_walk_record("kcp_fwdh_offset", "full")
+    for name in ("kcp_fwdh_tape_full", "kcp_dhu_tape_full"):
+        record = kcp_jit.TEST_MODULES[name]
+        assert record["test_knobs"] == {"walk_form": "full"}
+        assert record["select_rule"] == {"kind": "always"}
+        assert record["grid_rule"] == {"kind": "kcp_segments_heads"}
+    for name in (
+        "kcp_fwdh_offset_vh64",
+        "kcp_dhu_offset_vh64",
+        "kcp_fwdh_tape",
+        "kcp_dhu_tape",
+    ):
+        assert kcp_jit.MODULES[name]["grid_rule"] == {
+            "ctas_per_head": 2,
+            "kind": "kcp_segments_heads",
+        }
+    assert kcp_jit.MODULES["kcp_fwdh_offset_vh64"]["select_rule"] == {
+        "form": "split",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_tape"]["select_rule"] == {"kind": "always"}
 
 
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:

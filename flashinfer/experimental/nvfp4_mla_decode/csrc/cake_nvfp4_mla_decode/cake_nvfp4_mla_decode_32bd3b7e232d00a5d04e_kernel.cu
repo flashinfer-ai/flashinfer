@@ -70,7 +70,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o, float* __restrict__ lse, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ row_splits, int total_q, int num_heads, int max_splits)
+kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o, float* __restrict__ lse, __nv_bfloat16* partial_o, float* partial_lse, int* __restrict__ row_splits, int total_q, int num_heads, int max_splits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -446,28 +446,103 @@ kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o,
                 acc[j_6] = 0.0f;
             }
             #pragma unroll 1
-            for (int i_2 = 0; i_2 < used; i_2++) {
+            for (int i_2 = 0; i_2 < used - 1; i_2 += 2) {
                 float w_i = approx_exp2(partial_lse[lse_base_r + i_2] - global_lse2);
+                float w_n = approx_exp2(partial_lse[lse_base_r + i_2 + 1] - global_lse2);
+                float _vec_load_8[8];
+                {
+                    const uint4* _vptr_24 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_2 * split_stride) + 0);
+                    uint4 _vld_24[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_24[_blk] = _vptr_24[_blk];
+                        uint32_t* _vpairs_24 = reinterpret_cast<uint32_t*>(&_vld_24[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_24[_pair]) << 16);
+                            (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_24[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_9[8];
+                {
+                    const uint4* _vptr_25 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_2 * split_stride + 8) + 0);
+                    uint4 _vld_25[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_25[_blk] = _vptr_25[_blk];
+                        uint32_t* _vpairs_25 = reinterpret_cast<uint32_t*>(&_vld_25[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_25[_pair]) << 16);
+                            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_25[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_10[8];
+                {
+                    const uint4* _vptr_26 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + (i_2 + 1) * split_stride) + 0);
+                    uint4 _vld_26[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_26[_blk] = _vptr_26[_blk];
+                        uint32_t* _vpairs_26 = reinterpret_cast<uint32_t*>(&_vld_26[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_26[_pair]) << 16);
+                            (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_26[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_11[8];
+                {
+                    const uint4* _vptr_27 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + (i_2 + 1) * split_stride + 8) + 0);
+                    uint4 _vld_27[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_27[_blk] = _vptr_27[_blk];
+                        uint32_t* _vpairs_27 = reinterpret_cast<uint32_t*>(&_vld_27[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_27[_pair]) << 16);
+                            (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_27[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int j_7 = 0; j_7 < 8; j_7++) {
+                    acc[j_7] = __fmaf_rn(_vec_load_8[j_7], w_i, acc[j_7]);
+                    acc[8 + j_7] = __fmaf_rn(_vec_load_9[j_7], w_i, acc[8 + j_7]);
+                }
+                #pragma unroll
+                for (int j_8 = 0; j_8 < 8; j_8++) {
+                    acc[j_8] = __fmaf_rn(_vec_load_10[j_8], w_n, acc[j_8]);
+                    acc[8 + j_8] = __fmaf_rn(_vec_load_11[j_8], w_n, acc[8 + j_8]);
+                }
+            }
+            if ((used & 1) != 0) {
+                int i_last = used - 1;
+                float w_l = approx_exp2(partial_lse[lse_base_r + i_last] - global_lse2);
                 #pragma unroll
                 for (int j8 = 0; j8 < 16; j8 += 8) {
-                    float _vec_load_8[8];
+                    float _vec_load_12[8];
                     {
-                        const uint4* _vptr_24 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_2 * split_stride + j8) + 0);
-                        uint4 _vld_24[1];
+                        const uint4* _vptr_28 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_last * split_stride + j8) + 0);
+                        uint4 _vld_28[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_24[_blk] = _vptr_24[_blk];
-                            uint32_t* _vpairs_24 = reinterpret_cast<uint32_t*>(&_vld_24[_blk]);
+                            _vld_28[_blk] = _vptr_28[_blk];
+                            uint32_t* _vpairs_28 = reinterpret_cast<uint32_t*>(&_vld_28[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_24[_pair]) << 16);
-                                (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_24[_pair]) & 0xffff0000u);
+                                (&_vec_load_12[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_28[_pair]) << 16);
+                                (&_vec_load_12[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_28[_pair]) & 0xffff0000u);
                             }
                         }
                     }
                     #pragma unroll
-                    for (int j_7 = 0; j_7 < 8; j_7++) {
-                        acc[j8 + j_7] = __fmaf_rn(_vec_load_8[j_7], w_i, acc[j8 + j_7]);
+                    for (int j_9 = 0; j_9 < 8; j_9++) {
+                        acc[j8 + j_9] = __fmaf_rn(_vec_load_12[j_9], w_l, acc[j8 + j_9]);
                     }
                 }
             }
@@ -526,56 +601,131 @@ kernel_cake_nvfp4_mla_decode_32bd3b7e232d00a5d04e(__nv_bfloat16* __restrict__ o,
                 local_lse[i_3] = lv_1;
                 lse_max = fmaxf(lse_max, lv_1);
             }
-            float _warp_reduce_25 = lse_max;
+            float _warp_reduce_29 = lse_max;
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_25 = max_noftz(_warp_reduce_25, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_25, offset));
-            lse_max = _warp_reduce_25;
+                _warp_reduce_29 = max_noftz(_warp_reduce_29, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_29, offset));
+            lse_max = _warp_reduce_29;
             lse_max = ((lse_max != NEG_INF) ? lse_max : 0.0f);
             sum_w = 0.0f;
             #pragma unroll
             for (int i_4 = 0; i_4 < 2; i_4++) {
-                float _exp2_26 = approx_exp2(local_lse[i_4] - lse_max);
-                sum_w = sum_w + _exp2_26;
+                float _exp2_30 = approx_exp2(local_lse[i_4] - lse_max);
+                sum_w = sum_w + _exp2_30;
             }
-            float _warp_reduce_27 = sum_w;
+            float _warp_reduce_31 = sum_w;
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_27 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_27, offset);
-            sum_w = _warp_reduce_27;
-            float _log2_28;
-            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_28) : "f"(sum_w));
-            global_lse2 = lse_max + _log2_28;
+                _warp_reduce_31 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_31, offset);
+            sum_w = _warp_reduce_31;
+            float _log2_32;
+            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_32) : "f"(sum_w));
+            global_lse2 = lse_max + _log2_32;
             if (lane_0 == 0) {
                 *(reinterpret_cast<float*>(lse + row[1]) + (0)) = global_lse2 * 0.6931472f;
             }
             #pragma unroll
-            for (int j_8 = 0; j_8 < 16; j_8++) {
-                acc[j_8] = 0.0f;
+            for (int j_10 = 0; j_10 < 16; j_10++) {
+                acc[j_10] = 0.0f;
             }
             #pragma unroll 1
-            for (int i_5 = 0; i_5 < used; i_5++) {
+            for (int i_5 = 0; i_5 < used - 1; i_5 += 2) {
                 float w_i_1 = approx_exp2(partial_lse[lse_base_r + i_5] - global_lse2);
+                float w_n_1 = approx_exp2(partial_lse[lse_base_r + i_5 + 1] - global_lse2);
+                float _vec_load_13[8];
+                {
+                    const uint4* _vptr_33 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_5 * split_stride) + 0);
+                    uint4 _vld_33[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_33[_blk] = _vptr_33[_blk];
+                        uint32_t* _vpairs_33 = reinterpret_cast<uint32_t*>(&_vld_33[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_13[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_33[_pair]) << 16);
+                            (&_vec_load_13[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_33[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_14[8];
+                {
+                    const uint4* _vptr_34 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_5 * split_stride + 8) + 0);
+                    uint4 _vld_34[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_34[_blk] = _vptr_34[_blk];
+                        uint32_t* _vpairs_34 = reinterpret_cast<uint32_t*>(&_vld_34[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_14[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_34[_pair]) << 16);
+                            (&_vec_load_14[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_34[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_15[8];
+                {
+                    const uint4* _vptr_35 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + (i_5 + 1) * split_stride) + 0);
+                    uint4 _vld_35[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_35[_blk] = _vptr_35[_blk];
+                        uint32_t* _vpairs_35 = reinterpret_cast<uint32_t*>(&_vld_35[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_15[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_35[_pair]) << 16);
+                            (&_vec_load_15[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_35[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                float _vec_load_16[8];
+                {
+                    const uint4* _vptr_36 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + (i_5 + 1) * split_stride + 8) + 0);
+                    uint4 _vld_36[1];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 1; _blk++) {
+                        _vld_36[_blk] = _vptr_36[_blk];
+                        uint32_t* _vpairs_36 = reinterpret_cast<uint32_t*>(&_vld_36[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&_vec_load_16[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_36[_pair]) << 16);
+                            (&_vec_load_16[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_36[_pair]) & 0xffff0000u);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int j_11 = 0; j_11 < 8; j_11++) {
+                    acc[j_11] = __fmaf_rn(_vec_load_13[j_11], w_i_1, acc[j_11]);
+                    acc[8 + j_11] = __fmaf_rn(_vec_load_14[j_11], w_i_1, acc[8 + j_11]);
+                }
+                #pragma unroll
+                for (int j_12 = 0; j_12 < 8; j_12++) {
+                    acc[j_12] = __fmaf_rn(_vec_load_15[j_12], w_n_1, acc[j_12]);
+                    acc[8 + j_12] = __fmaf_rn(_vec_load_16[j_12], w_n_1, acc[8 + j_12]);
+                }
+            }
+            if ((used & 1) != 0) {
+                int i_last_1 = used - 1;
+                float w_l_1 = approx_exp2(partial_lse[lse_base_r + i_last_1] - global_lse2);
                 #pragma unroll
                 for (int j8_1 = 0; j8_1 < 16; j8_1 += 8) {
-                    float _vec_load_9[8];
+                    float _vec_load_17[8];
                     {
-                        const uint4* _vptr_29 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_5 * split_stride + j8_1) + 0);
-                        uint4 _vld_29[1];
+                        const uint4* _vptr_37 = reinterpret_cast<const uint4*>(partial_o + (o_base_r + i_last_1 * split_stride + j8_1) + 0);
+                        uint4 _vld_37[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_29[_blk] = _vptr_29[_blk];
-                            uint32_t* _vpairs_29 = reinterpret_cast<uint32_t*>(&_vld_29[_blk]);
+                            _vld_37[_blk] = _vptr_37[_blk];
+                            uint32_t* _vpairs_37 = reinterpret_cast<uint32_t*>(&_vld_37[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_29[_pair]) << 16);
-                                (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_29[_pair]) & 0xffff0000u);
+                                (&_vec_load_17[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_37[_pair]) << 16);
+                                (&_vec_load_17[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_37[_pair]) & 0xffff0000u);
                             }
                         }
                     }
                     #pragma unroll
-                    for (int j_9 = 0; j_9 < 8; j_9++) {
-                        acc[j8_1 + j_9] = __fmaf_rn(_vec_load_9[j_9], w_i_1, acc[j8_1 + j_9]);
+                    for (int j_13 = 0; j_13 < 8; j_13++) {
+                        acc[j8_1 + j_13] = __fmaf_rn(_vec_load_17[j_13], w_l_1, acc[j8_1 + j_13]);
                     }
                 }
             }
