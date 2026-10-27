@@ -72,7 +72,7 @@ LARGER_CAPACITY = 4096  # the odd-row cases run under this capacity
 # and bv0_rows() adds the grid-derived tier that selects the bv-0 two-shot
 # schedule (no fixed row count does so on every shipped grid). The fused norm
 # adds the 4096-row tier, which runs its residual-prefetch programs (18 to 28
-# rows per CTA on 148 to 212 SMs).
+# rows per CTA on 148 or 160 SMs).
 ROWS = {
     ("allreduce", 2): (3, 6, 1024, 16384),
     ("allreduce", 4): (4, 8, 44, 1024, 16384),

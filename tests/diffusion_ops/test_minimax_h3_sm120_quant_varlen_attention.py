@@ -27,6 +27,7 @@ import torch
 
 from flashinfer.diffusion_ops import minimax_h3_sm120_varlen_attention_fp8
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
+    _STREAM_WORKSPACES,
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
     MiniMaxH3VarlenPlan,
@@ -188,6 +189,49 @@ def test_minimax_h3_sm120_varlen_attention_fp8_custom_scale_and_empty_stream() -
     )
 
 
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_fp8_workspace_reuse_is_bitwise() -> None:
+    # The launch arguments of a plan are sliced from its stream's workspace once; a larger plan grows
+    # the workspace and drops them.  On a stream with a fresh workspace, the small plan called again
+    # after the growth, and on a second stream (its own workspace and arrival counters), is bitwise
+    # its first call; so is a call between the two plans' interleaved calls (the counters return to
+    # zero after every call).
+    device = torch.device("cuda:0")
+    heads = 8
+    small, large = (0, 133, 300, 900), (0, 257, 4567, 4824)
+    q, k, v = synthetic_inputs(small[-1], heads, seed=5, device=device)
+    ql, kl, vl = synthetic_inputs(large[-1], heads, seed=6, device=device)
+    cu = torch.tensor(small, dtype=torch.int32, device=device)
+    cul = torch.tensor(large, dtype=torch.int32, device=device)
+
+    def on_fresh_stream(calls):
+        stream = torch.cuda.Stream(device)
+        key = (device.index, stream.cuda_stream)
+        _STREAM_WORKSPACES.pop(key, None)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        outs, sizes = [], []
+        with torch.cuda.stream(stream):
+            for args, bounds in calls:
+                outs.append(
+                    minimax_h3_sm120_varlen_attention_fp8(*args, cu_seqlens_host=bounds)
+                )
+                sizes.append(_STREAM_WORKSPACES[key].buffers["q8"].numel())
+        torch.cuda.current_stream(device).wait_stream(stream)
+        return outs, sizes
+
+    small_call, large_call = ((q, k, v, cu), small), ((ql, kl, vl, cul), large)
+    (first, large_first, again, large_again), sizes = on_fresh_stream(
+        (small_call, large_call, small_call, large_call)
+    )
+    (on_side,), _ = on_fresh_stream((small_call,))
+    torch.cuda.synchronize()
+    # the large plan grew the workspace
+    assert sizes[0] < sizes[1] == sizes[2] == sizes[3]
+    assert torch.equal(first, again) and torch.equal(first, on_side)
+    assert torch.equal(large_first, large_again)
+    _check(first, fp32_oracle(q, k, v, small))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_fp8_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
@@ -235,3 +279,32 @@ def test_minimax_h3_sm120_varlen_plan_covers_every_unit_once() -> None:
     assert workspace_bytes(4824, heads, 5) > 0
     assert assign_unit_slots([], 8) == []
     assert sorted(assign_unit_slots([3, 1, 2, 5, 4], 2)) == [0, 1, 2, 3, 4]
+
+
+def test_minimax_h3_sm120_varlen_plan_rejects_32_bit_offset_overflow() -> None:
+    # The largest token count whose padded [tokens, heads, 128] extent fits a signed 32-bit offset.
+    heads = MINIMAX_H3_NUM_HEADS
+    row = heads * MINIMAX_H3_HEAD_DIM
+    fits = ((1 << 31) - 1) // row // 128 * 128
+    plan = MiniMaxH3VarlenPlan((0, fits), heads, torch.device("cpu"), num_ctas=170)
+    assert plan.padded_tokens * row <= (1 << 31) - 1
+    with pytest.raises(ValueError, match="32-bit offsets"):
+        MiniMaxH3VarlenPlan((0, fits + 1), heads, torch.device("cpu"), num_ctas=170)
+
+
+def test_minimax_h3_sm120_varlen_plan_rejects_32_bit_statistics_overflow() -> None:
+    heads = MINIMAX_H3_NUM_HEADS
+    limit = (1 << 31) - 1
+    # Empty segments: no tokens, one [heads, 128] row of K means and V scales each.
+    segments = limit // (heads * MINIMAX_H3_HEAD_DIM) + 1
+    with pytest.raises(ValueError, match="statistics kernels' 32-bit offsets"):
+        MiniMaxH3VarlenPlan(
+            (0,) * (segments + 1), heads, torch.device("cpu"), num_ctas=170
+        )
+    # One-token segments: the tokens fit, but each segment is a query tile with
+    # 2 * 128 partial floats per head.
+    tiles = limit // (heads * 2 * MINIMAX_H3_HEAD_DIM) + 1
+    with pytest.raises(ValueError, match="statistics kernels' 32-bit offsets"):
+        MiniMaxH3VarlenPlan(
+            tuple(range(tiles + 1)), heads, torch.device("cpu"), num_ctas=170
+        )

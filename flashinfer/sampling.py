@@ -124,6 +124,7 @@ def get_blackwell_softmax_op():
 _BLACKWELL_SOFTMAX_ROUTE_FALLBACK = 0
 _BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER = 5
 _BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT = 6
+_BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES = 7
 
 
 def _blackwell_softmax_route_for_testing(
@@ -149,6 +150,40 @@ def _blackwell_softmax_route_for_testing(
     return int(
         get_blackwell_softmax_module().softmax_route(
             logits_fp32,
+            temperature_fp32,
+            temperature_val,
+            enable_pdl,
+            temperature_is_none,
+        )
+    )
+
+
+def _blackwell_softmax_cached_kernel_for_testing(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    enable_pdl: bool = False,
+) -> Tuple[int, ...]:
+    """Return the cached-cluster kernel the C++ dispatcher would launch, without
+    launching it: (cluster CTAs, max tiles, 1 if it is a PDL twin, its resident
+    clusters on this device, the resident clusters of the 4-tile kernel twice its
+    size or 0 past 16 CTAs), or () for the other routes."""
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    device_index = logits.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if not _supports_blackwell_softmax(device_index):
+        return ()
+    maybe_temperature_arr, temperature_val, temperature_is_none = (
+        _validate_softmax_temperature(logits, temperature)
+    )
+    temperature_fp32 = (
+        maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+    )
+    return tuple(
+        int(x)
+        for x in get_blackwell_softmax_module().softmax_cached_kernel(
+            logits.float(),
             temperature_fp32,
             temperature_val,
             enable_pdl,

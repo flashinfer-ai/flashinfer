@@ -118,9 +118,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_RAW_SC_STAGE_BYTES 4096
 #define SMEM_SMEM_RAW_SC_STRIDE 20480
 #define SMEM_SMEM_EPI_OFF 299008
-#define SMEM_SMEM_EPI_STAGE_BYTES 16384
-#define SMEM_SMEM_EPI_STRIDE 16384
-#define SMEM_CLC_RESP_OFF 322848
+#define SMEM_SMEM_EPI_STAGE_BYTES 32768
+#define SMEM_SMEM_EPI_STRIDE 32768
+#define SMEM_CLC_RESP_OFF 331776
 #define SMEM_CLC_RESP_STAGE_BYTES 16
 #define SMEM_CLC_RESP_STRIDE 16
 #define SMEM_SMEM_V22_OFF 2048
@@ -183,7 +183,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_PCLC_RESP_OFF 322816
 #define SMEM_PCLC_RESP_STAGE_BYTES 16
 #define SMEM_PCLC_RESP_STRIDE 16
-#define SMEM_TOTAL 323584
+#define SMEM_TOTAL 332800
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -621,8 +621,8 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
   const int smem_raw_sc_addr = smem + 253952;
   uint8_t* smem_epi = reinterpret_cast<uint8_t*>(smem_raw + 299008);
   const int smem_epi_addr = smem + 299008;
-  unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 322848);
-  const int clc_resp_addr = smem + 322848;
+  unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 331776);
+  const int clc_resp_addr = smem + 331776;
   uint8_t* smem_v22 = reinterpret_cast<uint8_t*>(smem_raw + 2048);
   const int smem_v22_addr = smem + 2048;
   uint8_t* smem_v23 = reinterpret_cast<uint8_t*>(smem_raw + 18432);
@@ -14916,6 +14916,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
       }
       if (held != 0) {
         valid = 1;
+        asm volatile("cp.async.bulk.wait_group.read 0;");
         asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -20770,11 +20771,12 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_8) : "f"(row_sum));
                   lse2 = (float)(a_cur - 16384) + _log2_8 - 8.0f;
                 }
-                unsigned int stg = smem_epi_addr + (unsigned int)(quadrant_1 * 4096);
+                unsigned int stg = smem_epi_addr + (unsigned int)(quadrant_1 * 8192);
+                unsigned int stg1 = stg + 4096;
                 int row_in0 = row_in_req_2 - lane_0;
                 int rows_in_req = q_len_2 * num_heads;
                 int grow0 = q_start_2 * num_heads + row_in0;
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -20931,7 +20933,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 0, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
@@ -20940,10 +20941,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 0, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -20973,7 +20974,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_11);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_4[0], _tmem_load_4[1])))),
                     "r"(__as_u32(
@@ -20985,7 +20986,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_4[8], _tmem_load_4[9])))),
                     "r"(__as_u32(
@@ -20997,7 +20998,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_4[16], _tmem_load_4[17])))),
                     "r"(__as_u32(
@@ -21009,7 +21010,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_4[24], _tmem_load_4[25])))),
                     "r"(__as_u32(
@@ -21045,7 +21046,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_12);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_5[0], _tmem_load_5[1])))),
                     "r"(__as_u32(
@@ -21057,7 +21058,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_5[8], _tmem_load_5[9])))),
                     "r"(__as_u32(
@@ -21069,7 +21070,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_5[16], _tmem_load_5[17])))),
                     "r"(__as_u32(
@@ -21081,7 +21082,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_5[24], _tmem_load_5[25])))),
                     "r"(__as_u32(
@@ -21097,23 +21098,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req >= row_in0 + 32) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T), 64, grow0, stg);
+                      tma_store_2d((&O_T), 64, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T), 64, z_3, grow0, stg);
+                      tma_store_3d((&PO_T), 64, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T16), 64, grow0, stg);
+                      tma_store_2d((&O_T16), 64, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T16), 64, z_3, grow0, stg);
+                      tma_store_3d((&PO_T16), 64, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21271,7 +21271,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 256, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
@@ -21280,10 +21279,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 256, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21313,7 +21312,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_15);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_8[0], _tmem_load_8[1])))),
                     "r"(__as_u32(
@@ -21325,7 +21324,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_8[8], _tmem_load_8[9])))),
                     "r"(__as_u32(
@@ -21337,7 +21336,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_8[16], _tmem_load_8[17])))),
                     "r"(__as_u32(
@@ -21349,7 +21348,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_8[24], _tmem_load_8[25])))),
                     "r"(__as_u32(
@@ -21385,7 +21384,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_16);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_9[0], _tmem_load_9[1])))),
                     "r"(__as_u32(
@@ -21397,7 +21396,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_9[8], _tmem_load_9[9])))),
                     "r"(__as_u32(
@@ -21409,7 +21408,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_9[16], _tmem_load_9[17])))),
                     "r"(__as_u32(
@@ -21421,7 +21420,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_9[24], _tmem_load_9[25])))),
                     "r"(__as_u32(
@@ -21437,23 +21436,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req >= row_in0 + 32) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T), 320, grow0, stg);
+                      tma_store_2d((&O_T), 320, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T), 320, z_3, grow0, stg);
+                      tma_store_3d((&PO_T), 320, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T16), 320, grow0, stg);
+                      tma_store_2d((&O_T16), 320, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T16), 320, z_3, grow0, stg);
+                      tma_store_3d((&PO_T16), 320, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21611,7 +21609,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 128, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
@@ -21620,10 +21617,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 128, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21653,7 +21650,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_19);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_12[0], _tmem_load_12[1])))),
                     "r"(__as_u32(
@@ -21665,7 +21662,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_12[8], _tmem_load_12[9])))),
                     "r"(__as_u32(
@@ -21677,7 +21674,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_12[16], _tmem_load_12[17])))),
                     "r"(__as_u32(
@@ -21689,7 +21686,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_12[24], _tmem_load_12[25])))),
                     "r"(__as_u32(
@@ -21725,7 +21722,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_20);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_13[0], _tmem_load_13[1])))),
                     "r"(__as_u32(
@@ -21737,7 +21734,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_13[8], _tmem_load_13[9])))),
                     "r"(__as_u32(
@@ -21749,7 +21746,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_13[16], _tmem_load_13[17])))),
                     "r"(__as_u32(
@@ -21761,7 +21758,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_13[24], _tmem_load_13[25])))),
                     "r"(__as_u32(
@@ -21777,23 +21774,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req >= row_in0 + 32) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T), 192, grow0, stg);
+                      tma_store_2d((&O_T), 192, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T), 192, z_3, grow0, stg);
+                      tma_store_3d((&PO_T), 192, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T16), 192, grow0, stg);
+                      tma_store_2d((&O_T16), 192, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T16), 192, z_3, grow0, stg);
+                      tma_store_3d((&PO_T16), 192, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21951,7 +21947,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 384, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
@@ -21960,10 +21955,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 384, z_3, grow0, stg);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -21993,7 +21988,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_23);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_16[0], _tmem_load_16[1])))),
                     "r"(__as_u32(
@@ -22005,7 +22000,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_16[8], _tmem_load_16[9])))),
                     "r"(__as_u32(
@@ -22017,7 +22012,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_16[16], _tmem_load_16[17])))),
                     "r"(__as_u32(
@@ -22029,7 +22024,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_16[24], _tmem_load_16[25])))),
                     "r"(__as_u32(
@@ -22065,7 +22060,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_24);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_17[0], _tmem_load_17[1])))),
                     "r"(__as_u32(
@@ -22077,7 +22072,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_17[8], _tmem_load_17[9])))),
                     "r"(__as_u32(
@@ -22089,7 +22084,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_17[16], _tmem_load_17[17])))),
                     "r"(__as_u32(
@@ -22101,7 +22096,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_17[24], _tmem_load_17[25])))),
                     "r"(__as_u32(
@@ -22117,22 +22112,21 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req >= row_in0 + 32) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T), 448, grow0, stg);
+                      tma_store_2d((&O_T), 448, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T), 448, z_3, grow0, stg);
+                      tma_store_3d((&PO_T), 448, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0 < rows_in_req) {
                   if (elect_sync()) {
                     if (direct != 0) {
-                      tma_store_2d((&O_T16), 448, grow0, stg);
+                      tma_store_2d((&O_T16), 448, grow0, stg1);
                     } else {
-                      tma_store_3d((&PO_T16), 448, z_3, grow0, stg);
+                      tma_store_3d((&PO_T16), 448, z_3, grow0, stg1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
+                asm volatile("cp.async.bulk.commit_group;");
                 if (row_valid_2 != 0) {
                   if (direct != 0) {
                     *(reinterpret_cast<float*>(LSE + grow) + (0)) = lse2 * 0.6931472f;
@@ -22838,11 +22832,12 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_33) : "f"(row_sum_1));
                   lse2_1 = (float)(a_cur_1 - 16384) + _log2_33 - 8.0f;
                 }
-                unsigned int stg_1 = smem_epi_addr + (unsigned int)(quadrant_1 * 4096);
+                unsigned int stg_1 = smem_epi_addr + (unsigned int)(quadrant_1 * 8192);
+                unsigned int stg1_1 = stg_1 + 4096;
                 int row_in0_1 = row_in_req_3 - lane_0;
                 int rows_in_req_1 = q_len_3 * num_heads;
                 int grow0_1 = q_start_3 * num_heads + row_in0_1;
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23000,7 +22995,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 0, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
@@ -23009,10 +23003,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 0, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23042,7 +23036,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_36);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_22[0], _tmem_load_22[1])))),
                     "r"(__as_u32(
@@ -23054,7 +23048,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_22[8], _tmem_load_22[9])))),
                     "r"(__as_u32(
@@ -23066,7 +23060,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_22[16], _tmem_load_22[17])))),
                     "r"(__as_u32(
@@ -23078,7 +23072,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_22[24], _tmem_load_22[25])))),
                     "r"(__as_u32(
@@ -23114,7 +23108,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_37);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_23[0], _tmem_load_23[1])))),
                     "r"(__as_u32(
@@ -23126,7 +23120,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_23[8], _tmem_load_23[9])))),
                     "r"(__as_u32(
@@ -23138,7 +23132,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_23[16], _tmem_load_23[17])))),
                     "r"(__as_u32(
@@ -23150,7 +23144,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_23[24], _tmem_load_23[25])))),
                     "r"(__as_u32(
@@ -23166,23 +23160,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req_1 >= row_in0_1 + 32) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T), 64, grow0_1, stg_1);
+                      tma_store_2d((&O_T), 64, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T), 64, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T), 64, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T16), 64, grow0_1, stg_1);
+                      tma_store_2d((&O_T16), 64, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T16), 64, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T16), 64, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23340,7 +23333,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 256, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
@@ -23349,10 +23341,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 256, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23382,7 +23374,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_40);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_26[0], _tmem_load_26[1])))),
                     "r"(__as_u32(
@@ -23394,7 +23386,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_26[8], _tmem_load_26[9])))),
                     "r"(__as_u32(
@@ -23406,7 +23398,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_26[16], _tmem_load_26[17])))),
                     "r"(__as_u32(
@@ -23418,7 +23410,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_26[24], _tmem_load_26[25])))),
                     "r"(__as_u32(
@@ -23454,7 +23446,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_41);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_27[0], _tmem_load_27[1])))),
                     "r"(__as_u32(
@@ -23466,7 +23458,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_27[8], _tmem_load_27[9])))),
                     "r"(__as_u32(
@@ -23478,7 +23470,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_27[16], _tmem_load_27[17])))),
                     "r"(__as_u32(
@@ -23490,7 +23482,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_27[24], _tmem_load_27[25])))),
                     "r"(__as_u32(
@@ -23506,23 +23498,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req_1 >= row_in0_1 + 32) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T), 320, grow0_1, stg_1);
+                      tma_store_2d((&O_T), 320, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T), 320, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T), 320, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T16), 320, grow0_1, stg_1);
+                      tma_store_2d((&O_T16), 320, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T16), 320, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T16), 320, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23680,7 +23671,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 128, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
@@ -23689,10 +23679,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 128, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -23722,7 +23712,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_44);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_30[0], _tmem_load_30[1])))),
                     "r"(__as_u32(
@@ -23734,7 +23724,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_30[8], _tmem_load_30[9])))),
                     "r"(__as_u32(
@@ -23746,7 +23736,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_30[16], _tmem_load_30[17])))),
                     "r"(__as_u32(
@@ -23758,7 +23748,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_30[24], _tmem_load_30[25])))),
                     "r"(__as_u32(
@@ -23794,7 +23784,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_45);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_31[0], _tmem_load_31[1])))),
                     "r"(__as_u32(
@@ -23806,7 +23796,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_31[8], _tmem_load_31[9])))),
                     "r"(__as_u32(
@@ -23818,7 +23808,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_31[16], _tmem_load_31[17])))),
                     "r"(__as_u32(
@@ -23830,7 +23820,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_31[24], _tmem_load_31[25])))),
                     "r"(__as_u32(
@@ -23846,23 +23836,22 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req_1 >= row_in0_1 + 32) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T), 192, grow0_1, stg_1);
+                      tma_store_2d((&O_T), 192, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T), 192, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T), 192, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T16), 192, grow0_1, stg_1);
+                      tma_store_2d((&O_T16), 192, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T16), 192, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T16), 192, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -24020,7 +24009,6 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T), 384, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
@@ -24029,10 +24017,10 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     } else {
                       tma_store_3d((&PO_T16), 384, z_4, grow0_1, stg_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
-                asm volatile("cp.async.bulk.wait_group.read 0;");
+                asm volatile("cp.async.bulk.commit_group;");
+                asm volatile("cp.async.bulk.wait_group.read 1;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -24062,7 +24050,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_48);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((0 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_34[0], _tmem_load_34[1])))),
                     "r"(__as_u32(
@@ -24074,7 +24062,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((1 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_34[8], _tmem_load_34[9])))),
                     "r"(__as_u32(
@@ -24086,7 +24074,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((2 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_34[16], _tmem_load_34[17])))),
                     "r"(__as_u32(
@@ -24098,7 +24086,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((3 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_34[24], _tmem_load_34[25])))),
                     "r"(__as_u32(
@@ -24134,7 +24122,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                                           _scale2_49);
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((4 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_35[0], _tmem_load_35[1])))),
                     "r"(__as_u32(
@@ -24146,7 +24134,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((5 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_35[8], _tmem_load_35[9])))),
                     "r"(__as_u32(
@@ -24158,7 +24146,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((6 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_35[16], _tmem_load_35[17])))),
                     "r"(__as_u32(
@@ -24170,7 +24158,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                     : "memory");
                 asm volatile(
                     "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(
-                        stg_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
+                        stg1_1 + (unsigned int)(lane_0 * 128 + ((7 ^ chunk_rd) << 4))),
                     "r"(__as_u32(
                         __float22bfloat162_rn(make_float2(_tmem_load_35[24], _tmem_load_35[25])))),
                     "r"(__as_u32(
@@ -24186,22 +24174,21 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
                 if (rows_in_req_1 >= row_in0_1 + 32) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T), 448, grow0_1, stg_1);
+                      tma_store_2d((&O_T), 448, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T), 448, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T), 448, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 } else if (row_in0_1 < rows_in_req_1) {
                   if (elect_sync()) {
                     if (direct_1 != 0) {
-                      tma_store_2d((&O_T16), 448, grow0_1, stg_1);
+                      tma_store_2d((&O_T16), 448, grow0_1, stg1_1);
                     } else {
-                      tma_store_3d((&PO_T16), 448, z_4, grow0_1, stg_1);
+                      tma_store_3d((&PO_T16), 448, z_4, grow0_1, stg1_1);
                     }
-                    asm volatile("cp.async.bulk.commit_group;");
                   }
                 }
+                asm volatile("cp.async.bulk.commit_group;");
                 if (row_valid_3 != 0) {
                   if (direct_1 != 0) {
                     *(reinterpret_cast<float*>(LSE + grow_1) + (0)) = lse2_1 * 0.6931472f;
@@ -24322,6 +24309,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
       }
       if (held_1 != 0) {
         valid_1 = 1;
+        asm volatile("cp.async.bulk.wait_group.read 0;");
         asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -26968,6 +26956,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
       }
       if (held_2 != 0) {
         valid_2 = 1;
+        asm volatile("cp.async.bulk.wait_group.read 0;");
         asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -27973,6 +27962,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
       }
       if (held_3 != 0) {
         valid_3 = 1;
+        asm volatile("cp.async.bulk.wait_group.read 0;");
         asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -28488,6 +28478,7 @@ __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS)
       }
       if (held_4 != 0) {
         valid_4 = 1;
+        asm volatile("cp.async.bulk.wait_group.read 0;");
         asm volatile("tcgen05.fence::before_thread_sync;");
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");

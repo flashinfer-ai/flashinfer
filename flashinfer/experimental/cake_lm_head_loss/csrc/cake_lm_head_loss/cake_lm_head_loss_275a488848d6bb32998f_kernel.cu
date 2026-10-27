@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,9 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_lm_head_loss_275a488848d6bb32998f(float* __restrict__ acc, float* __restrict__ g, int* __restrict__ scan, int* __restrict__ idx_lo, __nv_bfloat16* __restrict__ out, int row_vecs, int num_rows)
 {
     const int tid = threadIdx.x;
@@ -67,7 +68,7 @@ kernel_cake_lm_head_loss_275a488848d6bb32998f(float* __restrict__ acc, float* __
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     float scale = g[0];
     float zero = 0.0f;
     int gstride = gridDim.x;
@@ -107,14 +108,28 @@ kernel_cake_lm_head_loss_275a488848d6bb32998f(float* __restrict__ acc, float* __
                 o[j] = ((owner == r) ? scale * _vec_load_1[j] : zero);
                 o[j + 4] = ((owner == r) ? scale * _vec_load_2[j] : zero);
             }
-            {
-                __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(o[0 + 0], o[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(o[0 + 2], o[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(o[0 + 4], o[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(o[0 + 6], o[0 + 7]);
-                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_out + off)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            unsigned int _packed_0[4];
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o[_lp*2 + 0], o[_lp*2+1 + 0]));
+                _packed_0[_lp] = *(uint32_t*)&_bf2;
             }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o[_lp*2 + 2], o[_lp*2+1 + 2]));
+                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o[_lp*2 + 4], o[_lp*2+1 + 4]));
+                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+            }
+            #pragma unroll
+            for (int _lp = 0; _lp < 1; _lp++) {
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o[_lp*2 + 6], o[_lp*2+1 + 6]));
+                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+            }
+            reinterpret_cast<int4*>(out + (row_out + off))[0] = reinterpret_cast<int4*>(_packed_0)[0];
         }
     }
 }

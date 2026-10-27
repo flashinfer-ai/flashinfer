@@ -2381,25 +2381,28 @@ def create_mma_task_split_kv(
             FmhaStage.Head,
         )
 
+        # TMEM P aliases S, so an instance's next QK must follow the PV that
+        # reads P. A Q128 tile with SMEM P leaves S once Softmax has the scores
+        # in registers: the next QK goes first and overlaps the exponentials
+        # of this tile (``stages_q128_p_in_smem``).
+        qk_before_pv = cfg.stages_q128_p_in_smem
         with domain_loop(0, domain, 1, unroll=1):
-            pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
-            qk_mma(
-                smem_k0,
-                tmem_s0,
-                tmem_stats_done0,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
-            pv_mma(smem_v1, smem_p1, "vp_mma_loop", KV_INST1, FmhaStage.Loop)
-            qk_mma(
-                smem_k1,
-                tmem_s1,
-                tmem_stats_done1,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
+            for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in (
+                (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
+                (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
+            ):
+                if not qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
+                qk_mma(
+                    smem_k,
+                    tmem_s,
+                    tmem_stats_done,
+                    q_desc,
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                )
+                if qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
 
         # The last BMM1 has been issued once the loop ends, and BMM2 never reads
         # Q. Releasing it here lets a persistent CTA load the next work tile's
@@ -3258,7 +3261,7 @@ def _softmax_schedule_body(
             **softmax_loop_kwargs
         )
         if cutlass.const_expr(releases_sage_stage_after_max):
-            # Dequantized scores went back to TMEM; the P pass reads no words.
+            # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
         if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
             # ConsRelease: free S once the scores are in registers unless
@@ -3303,6 +3306,12 @@ def _softmax_schedule_body(
                     s_arr=s_arr,
                     keeps_route_flags=sparse_route_flags,
                     swaps_route_flags=sparse_token_word2,
+                )
+            elif cutlass.const_expr(use_sage):
+                smem_p.compute_sage_p(
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                    sage_q_scale=sage_q_scale,
                 )
             else:
                 smem_p.compute_p(

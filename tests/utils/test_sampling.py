@@ -50,6 +50,82 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
+@pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16384, 16387])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sampling_last_valid_fallback(vocab_size, indices_dtype, deterministic):
+    # Force the rounding fallback: the total mass is below any Philox uniform.
+    # The last nonzero can be in an earlier tile, or in the final partial vector.
+    last = torch.tensor([0, 31, 1023, 2047, 4094, vocab_size - 1], device="cuda")
+    probs = torch.zeros(8, vocab_size, device="cuda")
+    probs[:6, 0] = 1e-20
+    probs[torch.arange(6, device="cuda"), last] = 1e-20
+    probs[7] = float("nan")
+    indices = torch.tensor(
+        [5, 0, 6, 4, 2, 7, 3, 1, 5], device="cuda", dtype=indices_dtype
+    )
+    expected = torch.cat([last, torch.zeros(2, device="cuda", dtype=last.dtype)])
+    expected_valid = torch.arange(8, device="cuda") < 6
+
+    samples, valid = flashinfer.sampling.sampling_from_probs(
+        probs,
+        indices=indices,
+        deterministic=deterministic,
+        seed=42,
+        offset=0,
+        return_valid=True,
+    )
+    torch.testing.assert_close(
+        samples, expected[indices].to(indices_dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(valid, expected_valid[indices])
+
+
+@pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16387])
+@pytest.mark.parametrize(
+    "sampling_type,mass",
+    [(name, 1.0) for name in ["plain", "top_k", "top_p", "min_p", "joint"]]
+    + [(name, 1e-20) for name in ["plain", "top_k", "top_p", "joint"]],
+)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sampling_masked_tiles_graph(vocab_size, sampling_type, mass, deterministic):
+    # Tiny mass forces fallback; min-p scales its uniform by the eligible mass,
+    # so its one-hot input only covers normal selection.
+    # k=2 prevents a bad zero-probability fallback from being hidden by a retry.
+    probs = torch.zeros(4, vocab_size, device="cuda")
+    positions = torch.tensor([0, 1023, 2047, vocab_size - 1], device="cuda")
+    rows = torch.arange(4, device="cuda")
+    probs[rows, positions] = mass
+    ops = {
+        "plain": (flashinfer.sampling.sampling_from_probs, {}),
+        "top_k": (flashinfer.sampling.top_k_sampling_from_probs, {"top_k": 2}),
+        "top_p": (flashinfer.sampling.top_p_sampling_from_probs, {"top_p": 0.9}),
+        "min_p": (flashinfer.sampling.min_p_sampling_from_probs, {"min_p": 0.1}),
+        "joint": (
+            flashinfer.sampling.top_k_top_p_sampling_from_probs,
+            {"top_k": 2, "top_p": 0.9, "filter_apply_order": "joint"},
+        ),
+    }
+    op, kwargs = ops[sampling_type]
+
+    def sample():
+        return op(probs, deterministic=deterministic, seed=42, offset=0, **kwargs)
+
+    torch.testing.assert_close(sample(), positions.to(torch.int32), atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        samples = sample()
+    graph.replay()
+    torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
+
+    # A later replay must not retain the previous call's local fallback candidate.
+    probs.zero_()
+    positions = vocab_size - 1 - positions
+    probs[rows, positions] = mass
+    graph.replay()
+    torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("shape", [(1, 4096), (5, 129280), (230, 129280)])
 @pytest.mark.parametrize("per_row_temperature", [False, True])
 def test_softmax_low_temperature_normalization(shape, per_row_temperature):
@@ -196,8 +272,10 @@ def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
         (256, 64000, None, False, 5),
         (1, 32000, None, False, 5),
         (1, 256000, None, False, 5),
-        (256, 256000, None, False, 6),
-        (512, 128000, 0.5, True, 6),
+        (48, 256000, None, False, 6),
+        (100, 128000, 0.5, True, 6),
+        (512, 256000, None, False, 7),
+        (1024, 128000, 0.5, True, 7),
     ],
 )
 def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
@@ -237,21 +315,28 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
 
 
 @pytest.mark.parametrize(
-    "rows,vocab_size,temperature_kind,enable_pdl,persistent",
+    "rows,vocab_size,temperature_kind,enable_pdl,expected_route",
     [
-        (1, 32000, "none", False, False),
-        (1, 262144, "none", False, False),  # widest cached row: 16 CTAs x 8 tiles
-        (8, 4096, "scalar", False, False),
-        (64, 32000, "scalar", True, False),
-        (16, 256000, "none", False, False),  # 8-tile rows under the threshold
-        (1024, 128000, "none", False, True),  # persistent 8-CTA clusters
-        (1024, 256000, "per_row", True, True),  # persistent 16-CTA clusters
-        (989, 128256, "per_row", True, True),  # rows not a multiple of the clusters
-        (600, 100008, "scalar", False, True),  # a partial last tile in every row
+        (1, 32000, "none", False, "row"),
+        (1, 262144, "none", False, "row"),  # widest cached row: 16 CTAs x 8 tiles
+        (8, 4096, "scalar", False, "row"),
+        (64, 32000, "scalar", True, "row"),
+        (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
+        (16, 256000, "none", False, "shared_tiles"),  # under 4/5 of persistent trips
+        (40, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
+        (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
+        (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (64, 128000, "none", False, "persistent"),  # 4/5 of the persistent trips
+        (200, 256000, "per_row", True, "persistent"),  # < 8 rows per shared cluster
+        (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
+        (1024, 128000, "none", False, "shared_tiles"),  # 7+ rows per C8 shared cluster
+        (1024, 256000, "per_row", True, "shared_tiles"),
+        (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
+        (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
     ],
 )
 def test_blackwell_cached_cluster_route_is_selected_and_correct(
-    rows, vocab_size, temperature_kind, enable_pdl, persistent
+    rows, vocab_size, temperature_kind, enable_pdl, expected_route
 ):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
@@ -275,13 +360,94 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
 
-    assert route == (
-        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
-        if persistent
-        else flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    assert route == routes[expected_route]
+    # Only sm_103a launches with PDL: the row-caching and shared-tile kernels
+    # through their _pdl twins, the persistent kernels through a flag.
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
     )
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    pdl_twin = enable_pdl and on_sm103 and expected_route != "persistent"
+    assert kernel[2] == int(pdl_twin)
     assert probs.data_ptr() != logits.data_ptr()
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (31, 32000),  # B200: as many rows as resident 16-CTA clusters
+        (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
+        (33, 32000),  # GB300: as many rows as resident 16-CTA clusters
+        (34, 32000),  # B200 and GB300
+        (36, 64000),
+        (71, 24576),  # B200: as many rows as resident 8-CTA clusters
+        (72, 24576),  # B200: fewer resident 8-CTA clusters than rows
+        (73, 24576),
+        (74, 24576),  # GB300: as many rows as resident 8-CTA clusters
+        (75, 24576),  # GB300: fewer resident 8-CTA clusters than rows
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_spread_keeps_rows_resident(
+    rows, vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
+
+    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters = kernel
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    # Spreading a row over more CTAs stops before a cluster size whose
+    # resident clusters are fewer than the rows, so all rows run in one wave,
+    # and not earlier: twice the CTAs would leave rows for a second wave.
+    assert max_tiles == 4
+    assert rows <= resident_clusters
+    assert rows > next_resident_clusters
+    assert pdl_twin == int(enable_pdl and on_sm103)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas",
+    [
+        (36, 80000, 16),  # 5-tile 8-CTA chunks
+        (36, 128000, 16),  # 8-tile 8-CTA chunks
+        (73, 32000, 8),  # 4-tile 4-CTA chunks; B200: past the resident 8-CTA clusters
+    ],
+)
+def test_blackwell_cached_cluster_spread_of_wide_chunks_ignores_residency(
+    rows, vocab_size, cluster_ctas
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+
+    # Rows whose chunks are wider than the capped spreads allow keep spreading
+    # even when some clusters then run in a second wave, as measured faster.
+    assert kernel[:2] == (cluster_ctas, 4)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize(
@@ -305,6 +471,7 @@ def test_blackwell_cached_cluster_route_declines_unaligned_rows(rows, vocab_size
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK,
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
         flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
     )
     torch.testing.assert_close(
         probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
@@ -380,8 +547,9 @@ def test_softmax(
         (256, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (512, 64000, "none"),  # cached cluster route, 8-CTA clusters
         (1024, 64000, "none"),  # cached cluster route, 8-CTA clusters
-        (1024, 256000, "none"),  # persistent 16-CTA non-portable clusters
-        (989, 128256, "per_row"),  # persistent 8-CTA clusters, per-row temperature
+        (48, 256000, "none"),  # persistent 16-CTA non-portable clusters
+        (1024, 256000, "none"),  # shared-tile 16-CTA non-portable clusters
+        (989, 128256, "per_row"),  # shared-tile 8-CTA clusters, per-row temperature
         (1, 32004, "none"),  # cooperative bootstrap route (vocab not a multiple of 8)
         (256, 32004, "none"),  # rowwise route (vocab not a multiple of 8)
         (1, 111, "scalar"),  # scalar-temperature warp-packed route

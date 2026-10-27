@@ -586,7 +586,7 @@ void Run(TensorView a_QN, TensorView a_QS, TensorView a_QR, TensorView a_CKV, Te
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y),
                         static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);
-  config.dynamicSmemBytes = 323584;
+  config.dynamicSmemBytes = 332800;
   config.stream = stream;
   cudaLaunchAttribute attrs[5] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;

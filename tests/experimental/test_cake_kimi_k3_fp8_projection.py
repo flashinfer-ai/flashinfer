@@ -93,7 +93,9 @@ GPU_ROWS = [
     # 16-byte row stride (6288) with a column edge (6284) that is not: register epilogue, padding untouched
     ("tp8", "in_proj_qkvgfab", 1000, 4),
     # round 11 (CAKE-985): rows whose table cells carry the round-10 / round-11 GEMM program tokens, so the composed
-    # program key below is exercised on a GPU: ``_pdlb`` on the aligned (TMA-store) view of the sm_103a 50,28,1024 cell,
+    # program key below is exercised on a GPU: ``_pdlb`` on the staged-register view of the sm_103a 50,28,1024 cell
+    # (N 6284 is not a multiple of 8, so the TMA store is refused on every view and ``gemm_rstaged_n192_k128_pdlb`` runs
+    # at stride 0 and 4),
     # ``_st`` (sm_100a 12,1,2048) / ``_gs`` (sm_103a 12,1,2048 and 96,1,2048), ``_cs<S>`` (sm_103a 5,28,2048) and ``_g64``
     # (sm_103a 144,6,16384); on the other architecture each row resolves to that table's own form.
     ("tp8", "in_proj_qkvgfab", 1000, 0),

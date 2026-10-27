@@ -670,6 +670,12 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        if indptr is not None:
+            indptr = indptr.contiguous()
+        if indices is not None:
+            indices = indices.contiguous()
+
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
             or use_clc is not None
@@ -2285,9 +2291,9 @@ class VariableBlockSparseAttentionWrapper:
 
 def _qsa_auto_backend(device: torch.device) -> str:
     """The route ``backend="auto"`` takes: ``"cake"`` on a compute capability the Cake package
-    exports a library for (``cake_jit.ARCH_BY_CAPABILITY``: 8.x, 9.0, 10.0 and 10.3, capability-exact);
-    ``"default"`` anywhere else, so the reference implementation reports the device the way it
-    always has (a 10.7 or 12.x device included, until the package ships for it)."""
+    exports a library for (``cake_jit.ARCH_BY_CAPABILITY``: 8.x, 9.0, 10.0, 10.3, 10.7 and 12.0,
+    capability-exact); ``"default"`` anywhere else, so the reference implementation reports the
+    device the way it always has (a 12.1 device included, until the package ships for it)."""
     if device.type != "cuda":
         return "default"
     from .experimental.cake_qsa_nvfp4.cake_jit import arch_for_capability
@@ -2314,7 +2320,7 @@ def qsa_sparse_paged_attention(
     v_sf: torch.Tensor,
     backend: str = "auto",
 ) -> torch.Tensor:
-    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM103.
+    r"""Gated sparse paged GQA attention over an NVFP4 KV cache, for SM80 through SM120.
 
     This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract for an NVFP4 main KV
     cache: the same arguments in the same order, plus the block scales ``k_sf`` / ``v_sf``.
@@ -2347,9 +2353,9 @@ def qsa_sparse_paged_attention(
     backend : str
         ``"auto"`` (the default) runs the Cake kernels of
         :mod:`flashinfer.experimental.cake_qsa_nvfp4` on every compute capability the
-        package exports a library for (8.x, 9.0 on the ``mma.sync`` programs; 10.0 and
-        10.3 on the tcgen05 programs; the table is capability-exact, so 10.7 and 12.x
-        are not included), and the reference implementation anywhere else, which then
+        package exports a library for (8.x, 9.0 and 12.0 on the ``mma.sync`` programs; 10.0,
+        10.3 and 10.7 on the tcgen05 programs; the table is capability-exact, so 12.1 is
+        not included), and the reference implementation anywhere else, which then
         reports the unsupported device. ``"cake"`` selects
         the Cake kernels (the same contract, their own split and merge plan) and
         ``"default"`` the reference implementation explicitly. The Cake kernels'

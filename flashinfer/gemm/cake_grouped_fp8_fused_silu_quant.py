@@ -78,7 +78,10 @@ current stream and may be captured into a CUDA graph (the small-M route's
 CuTe-DSL GEMM is specialized by one eager call at preparation).  The GEMM +
 act routes'
 BF16 ``(M, 2H)`` intermediate may be supplied by the caller (``workspace``) and
-is otherwise allocated once at preparation.
+is otherwise allocated once at preparation.  Preparation binds the problem
+shape, the route and the expert weights; the per-token operands (``a``,
+``a_scale``, ``m_indices``, ``out_q``, ``out_s``) may be rebound at every
+``launch`` so callers need no staging copies.
 """
 
 from __future__ import annotations
@@ -198,6 +201,40 @@ def bind_arguments(
                 f"generated program {module_name} binds {kind} {name!r}, which this host plan does not declare"
             )
     return tuple(arguments)
+
+
+def _argument_slots(arg_plan: Sequence[Sequence[str]]) -> dict[str, tuple[int, ...]]:
+    """Positions of every named binding in a generated program's argument plan."""
+    slots: dict[str, list[int]] = {}
+    for index, (kind, name) in enumerate(arg_plan):
+        if kind != "grid":
+            slots.setdefault(name, []).append(index)
+    return {name: tuple(positions) for name, positions in slots.items()}
+
+
+def _rebind_arguments(
+    arguments: tuple[Any, ...],
+    slots: dict[str, tuple[int, ...]],
+    bindings: dict[str, Any],
+) -> tuple[Any, ...]:
+    """``arguments`` with every slot of each named binding replaced; names a stage does not bind are ignored."""
+    rebound = list(arguments)
+    for name, value in bindings.items():
+        for position in slots.get(name, ()):
+            rebound[position] = value
+    return tuple(rebound)
+
+
+def _forward_fill_padding(
+    m_indices: torch.Tensor, filled: torch.Tensor, positions: torch.Tensor
+) -> None:
+    """``filled[r] = max(0, max(m_indices[:r + 1]))``: padding rows follow the preceding expert.
+
+    Two small allocation-free kernels (``cummax`` into prepared scratch, then
+    ``clamp``); both are graph-capturable.  Leading padding maps onto expert 0.
+    """
+    torch.cummax(m_indices, 0, out=(filled, positions))
+    filled.clamp_(min=0)
 
 
 # A partial final block hands the small-M GEMM to the Cake kernel from this K on (see small_m_gemm_backend).
@@ -546,37 +583,52 @@ def _require_tensor(
     return tensor
 
 
-def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
+def _validate_indices(
+    m_indices: torch.Tensor, groups: int, *, allow_padding: bool = False
+) -> tuple[int, ...]:
     """Check the routing contract (in range, sorted, 128-aligned internal boundaries) with one transfer.
 
     Every statistic is reduced on the device and copied to the host in a single
     transfer.  Returns the 128-row block count of every expert (the routing
     statistics of :func:`select_route`); every block is homogeneous under the
-    contract, so the expert of a block is the index of its first row.
+    contract, so the expert of a block is the index of its first row.  With
+    ``allow_padding`` the value ``-1`` marks padding rows: the contract applies
+    to the forward-filled indices the kernels read, and the remaining entries
+    must be nondecreasing.
     """
     indices = m_indices.to(torch.int64)
     m = indices.numel()
     device = indices.device
     zero = torch.zeros((), dtype=torch.int64, device=device)
+    lowest = indices.min()
+    if allow_padding:
+        filled = torch.cummax(indices, 0).values.clamp_(min=0)
+        # a routed row below the running maximum breaks the order
+        padding_unsorted = ((indices >= 0) & (indices != filled)).sum()
+        indices = filled
+    else:
+        padding_unsorted = zero
     if m > 1:
         step = indices[1:] - indices[:-1]
-        unsorted = (step < 0).sum()
+        unsorted = (step < 0).sum() + padding_unsorted
         misaligned = (
             (step > 0) & (torch.arange(1, m, device=device) % ROW_BLOCK != 0)
         ).sum()
     else:
-        unsorted = misaligned = zero
+        unsorted, misaligned = padding_unsorted, zero
     block_experts = indices[::ROW_BLOCK]
     counts = torch.zeros((groups,), dtype=torch.int64, device=device).scatter_add_(
         0, block_experts.clamp(0, groups - 1), torch.ones_like(block_experts)
     )
     stats = torch.cat(
-        (torch.stack((indices.min(), indices.max(), unsorted, misaligned)), counts)
+        (torch.stack((lowest, indices.max(), unsorted, misaligned)), counts)
     ).tolist()
     lowest, highest, unsorted, misaligned = stats[:4]
-    if lowest < 0 or highest >= groups:
+    if lowest < (-1 if allow_padding else 0) or highest >= groups:
+        if allow_padding:
+            raise ValueError("m_indices must satisfy -1 <= index < num_groups")
         raise ValueError(
-            "m_indices must satisfy 0 <= index < num_groups; -1 padding is unsupported"
+            "m_indices must satisfy 0 <= index < num_groups; -1 padding needs fill_padding=True"
         )
     if unsorted:
         raise ValueError("m_indices must be sorted in nondecreasing order")
@@ -617,14 +669,21 @@ def _group_blocks_from_counts(
 class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     """One prepared gate_up GEMM + SwiGLU + FP8 quantization launch.
 
-    Tensor storage, shapes and dtypes are bound at preparation; tensor
-    *contents* may change between launches.  ``launch()`` submits exactly
-    ``num_kernels`` kernels (two for the pair + tail route: the pair kernel,
-    then the tail kernel with the programmatic-dependent-launch attribute; one
-    for the mixed-schedule route; two for the GEMM + act routes: the grouped
-    GEMM into the private BF16 workspace, then the generated activation
-    kernel) on PyTorch's current stream for the bound
-    device and returns ``(out_q, out_s)``.
+    Shapes, dtypes, the route and the expert weights (``b``, ``b_scale``) are
+    bound at preparation; tensor *contents* may change between launches, and
+    the per-token operands ``a``, ``a_scale``, ``m_indices``, ``out_q`` and
+    ``out_s`` may be replaced by same-shape tensors at every ``launch``
+    (``launch(a=..., ...)``), so a caller can run one prepared object per layer
+    on whatever buffers the dispatcher produced.  The route is planned from the
+    prepared routing, so replacement indices must keep the routing contract
+    (and, when the routing-aware rule chose the route, the routing statistics
+    it was planned for).  ``launch()`` submits exactly ``num_kernels`` kernels
+    (two for the pair + tail route: the pair kernel, then the tail kernel with
+    the programmatic-dependent-launch attribute; one for the mixed-schedule
+    route; two for the GEMM + act routes: the grouped GEMM into the private
+    BF16 workspace, then the generated activation kernel; plus two tiny index
+    kernels when ``fill_padding`` is on) on PyTorch's current stream for the
+    bound device and returns ``(out_q, out_s)``.
     Every launch, including the first, may be captured into a CUDA graph; the
     prepared object retains no descriptor storage, and the small-M route's
     CuTe-DSL GEMM is run once at preparation so that it is specialized before
@@ -641,18 +700,100 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     gemm_backend: Optional[str]
     stage_module_names: dict[str, str]
     stage_grids: dict[str, tuple[int, int, int]]
-    _entries: tuple[tuple[Callable[..., Any], tuple[Any, ...]], ...]
-    _gemm: Optional[Callable[[], Any]]
+    m: int
+    n2: int
+    k: int
+    fill_padding: bool
+    _entries: tuple[
+        tuple[Callable[..., Any], tuple[Any, ...], dict[str, tuple[int, ...]]], ...
+    ]
+    _gemm: Optional[Callable[..., Any]]
     _gemm_out: Optional[torch.Tensor]
+    _padding_source: Optional[torch.Tensor]
+    _padding_scratch: Optional[tuple[torch.Tensor, torch.Tensor]]
 
-    def launch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.cuda.device(self.out_q.device):
+    def launch(
+        self,
+        a: Optional[torch.Tensor] = None,
+        a_scale: Optional[torch.Tensor] = None,
+        m_indices: Optional[torch.Tensor] = None,
+        out_q: Optional[torch.Tensor] = None,
+        out_s: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the route; any operand given here replaces the prepared one for this call.
+
+        Replacement tensors must match the prepared shape, dtype, device and
+        alignment.  Rebinding allocates nothing on the device.
+        """
+        device = self.out_q.device
+        rebound: dict[str, Any] = {}
+        gemm_indices = None
+        if (
+            a is not None
+            or a_scale is not None
+            or m_indices is not None
+            or out_q is not None
+            or out_s is not None
+        ):
+            h = self.n2 // 2
+            if a is not None:
+                a = _require_tensor(
+                    a,
+                    "a",
+                    shape=(self.m, self.k),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                rebound["A"] = rebound["A64"] = a.view(torch.uint8)
+            if a_scale is not None:
+                a_scale = rebound["a_scale"] = _require_tensor(
+                    a_scale,
+                    "a_scale",
+                    shape=(self.m, self.k // K_BLOCK),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            if m_indices is not None:
+                m_indices = _require_tensor(
+                    m_indices,
+                    "m_indices",
+                    shape=(self.m,),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if not self.fill_padding:
+                    gemm_indices = rebound["m_indices"] = m_indices
+            if out_q is not None:
+                rebound["out_q"] = _require_tensor(
+                    out_q,
+                    "out_q",
+                    shape=(self.m, h),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+            if out_s is not None:
+                rebound["out_s"] = _require_tensor(
+                    out_s,
+                    "out_s",
+                    shape=(self.m, h // GROUP_SIZE),
+                    dtype=torch.float32,
+                    device=device,
+                    alignment=4,
+                )
+        with torch.cuda.device(device):
+            if self.fill_padding:
+                assert self._padding_scratch is not None
+                source = m_indices if m_indices is not None else self._padding_source
+                assert source is not None
+                _forward_fill_padding(source, *self._padding_scratch)
             if self._gemm is not None:
-                self._gemm()
+                self._gemm(a=a, a_scale=a_scale, m_indices=gemm_indices)
             with tvm_ffi.use_torch_stream():
-                for entry, arguments in self._entries:
+                for entry, arguments, slots in self._entries:
+                    if rebound:
+                        arguments = _rebind_arguments(arguments, slots, rebound)
                     entry(*arguments)
-        return self.out_q, self.out_s
+        return rebound.get("out_q", self.out_q), rebound.get("out_s", self.out_s)
 
     __call__ = launch
 
@@ -690,6 +831,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     *,
     validate_indices: bool = False,
     group_counts: Optional[Sequence[int]] = None,
+    fill_padding: bool = False,
 ) -> PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     r"""Prepare a contiguous grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization launch on SM100a / SM103a.
 
@@ -710,7 +852,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         Contiguous int32 expert indices of shape ``(M,)``, sorted in
         nondecreasing order with ``0 <= index < G``; every internal expert
         boundary is a multiple of 128 rows (the final expert may be partial);
-        empty experts are allowed.
+        empty experts are allowed.  With ``fill_padding`` the value ``-1``
+        marks padding rows (the compact MoE layout): such a row is computed
+        with the preceding expert's weights (expert 0 for leading padding),
+        its output row is unspecified, and the contract applies to the
+        forward-filled indices.
     out_q : Optional[torch.Tensor]
         Contiguous FP8 E4M3 output ``(M, H)`` = ``silu(gate) * up`` quantized
         per token in groups of 128 columns.  Allocated if omitted.
@@ -729,11 +875,19 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         Rows per expert as host integers (``len == G``, summing to ``M``).
         Enables the routing-aware rule without any device work; checked for
         consistency against ``m_indices`` when ``validate_indices=True``.
+        With ``fill_padding`` an expert's count includes the padding rows that
+        follow it.
+    fill_padding : bool
+        Accept ``-1`` padding rows in ``m_indices``.  The prepared object owns
+        an ``(M,)`` int32 plus ``(M,)`` int64 scratch and every launch runs two
+        small forward-fill kernels before the route (graph-capturable).
 
     Returns
     -------
     PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant
-        Call ``.launch()`` to run the route's kernel(s) on the current stream.
+        Call ``.launch()`` to run the route's kernel(s) on the current stream;
+        ``.launch(a=..., a_scale=..., m_indices=..., out_q=..., out_s=...)``
+        swaps the per-token operands for that call.
 
     Notes
     -----
@@ -814,12 +968,21 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     if group_counts is not None:
         group_blocks = _group_blocks_from_counts(group_counts, m, groups)
     if validate_indices:
-        validated = _validate_indices(m_indices, groups)
+        validated = _validate_indices(m_indices, groups, allow_padding=fill_padding)
         if group_blocks is not None and validated != group_blocks:
             raise ValueError(
                 f"group_counts {list(group_counts)} disagree with m_indices (blocks {list(validated)})"
             )
         group_blocks = validated
+
+    padding_scratch = None
+    kernel_indices = m_indices
+    if fill_padding:
+        kernel_indices = torch.empty((m,), dtype=torch.int32, device=device)
+        padding_scratch = (
+            kernel_indices,
+            torch.empty((m,), dtype=torch.int64, device=device),
+        )
 
     sm_count = device_sm_count(device_index)
     route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks, k=k)
@@ -842,7 +1005,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             "out_s": out_s,
             "a_scale": a_scale,
             "b_scale": b_scale,
-            "m_indices": m_indices,
+            "m_indices": kernel_indices,
             "M": m,
             "N": n2,
             "K": k,
@@ -859,20 +1022,55 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             workspace, "workspace", shape=(m, n2), dtype=torch.bfloat16, device=device
         )
         if gemm_backend == GEMM_BACKEND_CAKE:
-            gemm = prepare_group_gemm_fp8_nt_groupwise_contiguous(
-                a, b, a_scale, b_scale, m_indices, out=gemm_out
-            ).launch
+            prepared_gemm = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+                a, b, a_scale, b_scale, kernel_indices, out=gemm_out
+            )
+
+            def gemm(
+                a: Optional[torch.Tensor] = None,
+                a_scale: Optional[torch.Tensor] = None,
+                m_indices: Optional[torch.Tensor] = None,
+                bound: tuple[torch.Tensor, ...] = (a, a_scale, kernel_indices),
+                y: torch.Tensor = gemm_out,
+            ) -> None:
+                if a is None and a_scale is None and m_indices is None:
+                    prepared_gemm.launch()
+                    return
+                # Rebound operands: prepare the GEMM on them (host work only, so the
+                # call stays graph-capturable).
+                prepare_group_gemm_fp8_nt_groupwise_contiguous(
+                    bound[0] if a is None else a,
+                    b,
+                    bound[1] if a_scale is None else a_scale,
+                    b_scale,
+                    bound[2] if m_indices is None else m_indices,
+                    out=y,
+                ).launch()
+
         else:
             from .gemm_base import group_gemm_fp8_nt_groupwise_contiguous
 
-            def gemm(y: torch.Tensor = gemm_out) -> None:
+            def gemm(
+                a: Optional[torch.Tensor] = None,
+                a_scale: Optional[torch.Tensor] = None,
+                m_indices: Optional[torch.Tensor] = None,
+                bound: tuple[torch.Tensor, ...] = (a, a_scale, kernel_indices),
+                y: torch.Tensor = gemm_out,
+            ) -> None:
                 group_gemm_fp8_nt_groupwise_contiguous(
-                    a, b, a_scale, b_scale, m_indices, out=y
+                    bound[0] if a is None else a,
+                    b,
+                    bound[1] if a_scale is None else a_scale,
+                    b_scale,
+                    bound[2] if m_indices is None else m_indices,
+                    out=y,
                 )
 
             # The CuTe-DSL kernel is specialized (compiled on a cold cache) by its
             # first call: run it once here, into the intermediate it owns anyway,
             # so that every launch() only submits work and may be captured.
+            if padding_scratch is not None:
+                _forward_fill_padding(m_indices, *padding_scratch)
             gemm()
 
         bindings = {"y": gemm_out, "out_q": out_q, "out_s": out_s, "M": m, "H": h}
@@ -883,13 +1081,14 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         program = PROGRAMS[MODULES[stage_module_name]["program"]]
         module = load_cake_grouped_fp8_fused_silu_quant_module(stage_module_name)
         entry = getattr(module, program["ffi_entry"])
+        arg_plan = ARG_PLANS[program["arg_plan"]]
         arguments = bind_arguments(
-            ARG_PLANS[program["arg_plan"]],
+            arg_plan,
             bindings,
             stage_grids[stage],
             module_name=stage_module_name,
         )
-        entries.append((entry, arguments))
+        entries.append((entry, arguments, _argument_slots(arg_plan)))
     return PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant(
         route=route,
         module_name=module_name,
@@ -899,9 +1098,15 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         gemm_backend=gemm_backend,
         stage_module_names=stage_module_names,
         stage_grids=stage_grids,
+        m=m,
+        n2=n2,
+        k=k,
+        fill_padding=fill_padding,
         _entries=tuple(entries),
         _gemm=gemm,
         _gemm_out=gemm_out,
+        _padding_source=m_indices if fill_padding else None,
+        _padding_scratch=padding_scratch,
     )
 
 

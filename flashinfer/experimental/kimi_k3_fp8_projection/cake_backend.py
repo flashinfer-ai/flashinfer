@@ -198,7 +198,7 @@ GEMM_TS_SLOT_FORMS = (
 )  # the staging-slot counts the Cake GEMM instance supports (4 needs the TMA-store epilogue)
 _GEMM_INSTANCE_TOKEN = re.compile(
     r"(?:_s(?P<s>[0-9]+)|_ts(?P<ts>[0-9]+))(?=_|$)"
-)  # ``_s<n>`` / ``_ts<n>`` (never ``_sk`` / ``_skf<n>`` / ``_sks<n>`` / ``_tstore``)
+)  # ``_s<n>`` / ``_ts<n>`` (never ``_sk`` / ``_skf<n>`` / ``_tstore``)
 GEMM_SKF_SUFFIX = "_skf"  # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the TMA-store GEMM programs (table key ``gemm_skf``)
 GEMM_SKF_MIN_ITERS = 4  # lever SKF: a pair's range of fewer K iterations cannot pay for the partial hand-offs
 GEMM_SKF_MAX_SLOTS = 2  # lever SKF: contributor partial slots per tile the finisher adds (more contributors: plain schedule)
@@ -207,7 +207,6 @@ GEMM_SKF_SLOT_FORMS = (
     4,
     8,
 )  # round 7: slot bounds of the shipped fix-up forms (``_skf`` = 2, ``_skf4`` / ``_skf8``)
-GEMM_SKS_SUFFIX = "_sks"  # round 7 (lever SKS): the sliced fix-up stream-K instance (table key ``gemm_sks``; ``_sks<slots>``)
 # round 10 (CAKE-985, lever SKP): the prefetched stream-K instance of the TMA-store GEMM programs (table key
 # ``gemm_skp``: the slot bound 1 / 4 / 8 names ``_skp`` / ``_skp4`` / ``_skp8``; precedence ``_skp`` > ``_skf``
 # as the Cake launcher)
@@ -1881,13 +1880,10 @@ class StreamKFixupPlan(NamedTuple):
     inst_slots: int = (
         GEMM_SKF_MAX_SLOTS  # round 7: slot bound of the launched instance form
     )
-    sliced: bool = False  # round 7 (lever SKS): sliced range mapping (``pairs`` = tiles, ``total`` = slices)
 
     @property
     def program_suffix(self) -> str:
-        """Program key suffix of the launched form: ``_skf`` (round 6), ``_skf4`` / ``_skf8``, or ``_sks<slots>``."""
-        if self.sliced:
-            return f"{GEMM_SKS_SUFFIX}{self.inst_slots}"
+        """Program key suffix of the launched form: ``_skf`` (round 6) or ``_skf4`` / ``_skf8``."""
         return GEMM_SKF_SUFFIX + (
             "" if self.inst_slots == GEMM_SKF_MAX_SLOTS else str(self.inst_slots)
         )
@@ -1895,12 +1891,10 @@ class StreamKFixupPlan(NamedTuple):
 
 def gemm_stream_k_fixup(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> bool:
     """Round 6 continuation 17/18 (lever SKF): True when the shape's table row asks for a fix-up stream-K GEMM
-    instance (key ``gemm_skf``, or the sliced form's ``gemm_sks``; GEMM-routed rows only)."""
+    instance (key ``gemm_skf``; GEMM-routed rows only)."""
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     return bool(
-        entry is not None
-        and entry.get("route") == "gemm"
-        and (entry.get("gemm_skf", 0) or entry.get("gemm_sks", 0))
+        entry is not None and entry.get("route") == "gemm" and entry.get("gemm_skf", 0)
     )
 
 
@@ -1931,31 +1925,8 @@ def gemm_stream_k_fixup_plan(
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch) or {}
     skf_key = int(entry.get("gemm_skf", 0))
     slot_cap = skf_key if skf_key in GEMM_SKF_SLOT_FORMS else GEMM_SKF_MAX_SLOTS
-    sks_want = int(entry.get("gemm_sks", 0))
     pairs = int(sm_count) // CTA_GROUP
     tiles = (int(m_tiles) // CTA_GROUP) * int(gemm_n_tiles)
-    if sks_want:
-        # round 7 (lever SKS): S slices per tile on tiles x S resident pairs (Cake host mirror)
-        slices = min(
-            pairs // tiles,
-            int(num_k_iters) // GEMM_SKF_MIN_ITERS,
-            slot_cap + 1,
-            sks_want if sks_want > 1 else pairs,
-        )
-        if slices < 2:
-            return None
-        inst = next(f for f in GEMM_SKF_SLOT_FORMS if f >= slices - 1)
-        return StreamKFixupPlan(
-            tiles,
-            slices,
-            slices - 1,
-            0,
-            tiles,
-            tiles * slices * CTA_GROUP,
-            tiles * (slices - 1) * gemm_skf_tile_bytes(gemm_bn),
-            inst,
-            True,
-        )
     if not skf_key:
         return None
     full, rem = divmod(tiles, pairs)
@@ -1983,7 +1954,6 @@ def gemm_stream_k_fixup_plan(
         (first if first > 0 else pairs) * CTA_GROUP,
         sk_tiles * slots * gemm_skf_tile_bytes(gemm_bn),
         next(f for f in GEMM_SKF_SLOT_FORMS if f >= slots),
-        False,
     )
 
 

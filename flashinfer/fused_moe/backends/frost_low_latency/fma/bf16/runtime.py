@@ -123,7 +123,7 @@ def execute(inputs, config, tactic):
                         narrow,
                         finalize,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
+                        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
         compiled(*tensors)

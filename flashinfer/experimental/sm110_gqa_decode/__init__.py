@@ -14,47 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental exact-SM110 GQA decode implementation.
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import torch
-
-
-def decode(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-    q_scale: float = 1.0,
-) -> torch.Tensor:
-    from .backend import sm110_gqa_decode
-
-    return sm110_gqa_decode(
-        q,
-        kv,
-        sequence_lengths,
-        out=out,
-        q_scale=q_scale,
-    )
-
-
-def prepare_for_launch(
-    inputs: dict[str, Any], num_splits: int | None = None
-) -> dict[str, Any]:
-    from .backend import prepare_for_launch as prepare
-
-    return prepare(inputs, num_splits=num_splits)
-
-
-def launch_prepared(prepared: dict[str, Any]) -> torch.Tensor:
-    from .backend import launch_prepared as launch
-
-    return launch(prepared)
-
-
-__all__ = ["decode", "prepare_for_launch", "launch_prepared"]
+# Experimental exact-SM110 GQA decode implementation (a Cake package).  The host
+# side lives in ``.backend`` (``sm110_gqa_decode``, ``prepare_for_launch``,
+# ``launch_prepared``) and the registry in ``.cake_jit``; the public entry points
+# are ``flashinfer.sm110_gqa_decode``, ``flashinfer.prepare_sm110_gqa_decode`` and
+# ``flashinfer.launch_sm110_gqa_decode_prepared`` in ``flashinfer/decode.py``.

@@ -27,15 +27,23 @@ tiles into ``splits`` splits; one decode CTA serves one (row, KV head, split).
 Split rule (:func:`num_splits`): ``tiles = ceil(selection_width / 64)``;
 ``splits = max(1, min(tiles, CTAS_PER_SM[arch] * sm_count // (rows *
 num_kv_heads)))`` (the resident CTAs per SM of the architecture's plain decode,
-its launch bound: two for the ``mma.sync`` decode of SM80 / SM90, one for the
-tcgen05 decode of SM100 / SM103); then the measured table
+its launch bound: two for the ``mma.sync`` decode of SM80 / SM90 / SM120, one
+for the tcgen05 decode of SM100 / SM103 / SM107); then the measured table
 :data:`SPLIT_OVERRIDES` of the device's SM count replaces the formula where it
 names ``(sm_count, rows)``; then ``splits <= min(tiles, MAX_SPLITS)``.  The
 rule reads the architecture and the SM count alone, cached per device.  On a
 B200 (148 SMs) the formula gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1,
 2, 4, 8, 16, 32, 64, 128 of the owner's shape (2 KV heads, 33 tiles); the
 table has no entry for 148 SMs (nor for the GB300's 152): the formula wins or
-ties every measured alternative there.
+ties every measured alternative there.  On an RTX PRO 6000 (188 SMs, two CTAs
+per SM) the formula gives 33, 33, 33, 23, 11, 5, 2, 1 and the table replaces
+rows 4, 8, 16 and 32 with 16, 11, 5 and 3 (measured whole call in both forms,
+both layouts, both L2 flushes: +15 to +39 % at rows 4 and 8, +2 to +8 % at rows
+16 and 32; rows 1 and 2 keep 33, where 16 splits lose 7 % after a read flush).
+That is the *plain* split count (:func:`plain_splits`).  Where the persistent
+walk serves the call (:func:`select_walk`, below) ``num_splits`` is instead the
+walk's partial slots per (row, KV head), :func:`cake_jit.walk_splits` -- 2 for
+rows 128 on 152 SMs, 2 for rows 128 and 256 on 212 -- and the merge reads that many.
 
 Form rule (:func:`select_form`): with one split the plain decode writes the
 output itself.  Above one split the *fused* form -- the cooperative build of
@@ -43,25 +51,37 @@ the decode, whose CTAs merge the splits in the same launch through a counter
 per (row, KV head) -- needs its grid ``rows * num_kv_heads * splits`` within
 the co-residency the decode's launch bound guarantees on the device
 (:func:`fused_capacity`: ``FUSED_CTAS_PER_SM[arch]`` times the SM count, 264
-on an H100, 148 on a B200, 152 on a GB300; a cooperative launch above the
-device's co-residency is refused by the driver).  Within it, compute
-capability 9.0 always takes the fused form.  Compute capability 10.0 and 10.3
-take it under the eager host rule alone: on a host of ``FUSED_HOSTS``
-(``aarch64``: the Grace host of a GB200 / GB300, whose eager path leaves a
-gap of several microseconds between the decode launch and the merge launch
-that costs more than the fused form's in-kernel merge tail), at ``rows <=
-FUSED_MAX_ROWS`` (4) and when the current stream is not capturing: a captured
-call is replayed without that gap, so it keeps the *split* form, whose GPU
-time is the shorter one.  Everywhere else -- compute capability 8.x, an x86
-host, rows above 4, a capturing stream, a call on a device other than the
-current one (its capture state is unreadable) -- the *split* form: the plain
-decode, then the separate merge.  The package's graph tests compare an eager
+on an H100, 376 on an RTX PRO 6000, 148 on a B200, 152 on a GB300; a
+cooperative launch above the device's co-residency is refused by the driver).
+Within it, compute capability 9.0 always takes the fused form, and 12.0 does
+except on a *wide* call (the program rule below: the whole-tile program ships
+in the split form alone, so a wide call takes the split form there).
+Compute capability 10.0 and 10.3 take it under the eager host rule alone: on a host of ``FUSED_HOSTS``,
+at ``rows <= FUSED_MAX_ROWS`` (4) and when the current stream is not
+capturing -- and ``FUSED_HOSTS`` lists no host.  The rule once named
+``aarch64`` (the Grace host of a GB200 / GB300) from an event-timed
+measurement that had the fused form's whole call 1.1-1.6x shorter at rows
+1-4; that measurement hid the fused form's longer pre-launch host path.
+Timed host-inclusively on a GB300 -- calls back to back, calls behind an L2
+flush in the stream, and lone synchronous calls -- the split form's whole
+call is the shorter one at rows 1-4 (1.07-1.14x, 1.21-1.40x and 1.08-1.14x)
+and the two forms tie above, while a captured call replays the split form
+either way.  So 10.0 and 10.3 take the *split* form on every host; the
+cooperative build and the rule stay for a host that measures otherwise.
+Compute capability 10.7 keeps the split form on
+every host: on an R200 system the split route's eager whole call is the
+shorter one at every row (measured at rows 1 to 16), so the rule does not
+apply there.  Everywhere else -- compute capability 8.x, a capturing stream,
+a call on a device other than the current one (its capture state is
+unreadable) -- the *split* form: the plain decode, then
+the separate merge.  The package's graph tests compare an eager
 call with its captured replay bit for bit, so the two forms agree exactly.
 
 Program rule (:func:`select_wide`, then :func:`cake_jit.select_records`): the
 registry's records are filtered by the device's architecture first (the
-``mma.sync`` decode's on ``sm_80`` / ``sm_90a``, the tcgen05 decode's on
-``sm_100a`` / ``sm_103a``).  On ``sm_80`` the plain decode has two programs:
+``mma.sync`` decode's on ``sm_80`` / ``sm_90a`` / ``sm_120a``, the tcgen05
+decode's on ``sm_100a`` / ``sm_103a`` / ``sm_107a``).  On ``sm_80`` the plain
+decode has two programs:
 a split-form call is *wide* when both hold: its decode grid ``rows *
 num_kv_heads * splits`` exceeds one resident wave (``CTAS_PER_SM[arch]`` CTAs
 per SM times the SM count: 216 CTAs on an A100's 108 SMs) and each of its CTAs
@@ -69,18 +89,40 @@ walks a long tile stream, ``ceil(tiles / splits) >= LONG_STREAM_TILES`` (16
 tiles = 1024 selected tokens).  A wide call launches the whole-tile program
 (``decode_whole_tile``: whole-tile gather, no L2 cache hint, shift selector --
 the previous release's ``sm_80`` decode); every other call launches the
-K-first program (``decode``), and ``sm_90a`` always does; ``sm_100a`` and
-``sm_103a`` launch the tcgen05 program (``decode_tcgen05``) in the split form
-whatever the grid.  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
+K-first program (``decode``), and ``sm_90a`` always does.  On ``sm_120a`` a
+split-form call is *wide* when each of its CTAs walks at least
+``STREAM_TILES`` tiles (11 tiles = 704 selected tokens), whatever the grid (an
+RTX PRO 6000's 376 resident CTAs hold every owner grid within one wave), and
+launches the whole-tile program too (its ``sm_120a`` build carries the L2
+evict-first policy on its copies; the form rule takes the split form on a
+wide call); below that stream the K-first program.  ``sm_100a``,
+``sm_103a`` and ``sm_107a`` launch the tcgen05 program (``decode_tcgen05``) in
+the split form whatever the grid, except that ``sm_103a`` and ``sm_107a`` launch
+the *persistent walk* (``decode_tcgen05_persistent``, :func:`select_walk`) on a
+split-form grid whose plain cut runs more than one resident wave within the
+architecture's measured range (``1 < ceil(rows * num_kv_heads * plain_splits /
+sm_count) <= WALK_MAX_WAVES[arch]``: 2 on ``sm_103a``, 3 on ``sm_107a``) and whose
+longest walked CTA is shorter than the plain program's longest
+(:func:`cake_jit.walk_applies`): one CTA per SM (:func:`cake_jit.walk_ctas` CTAs)
+walking a balanced, contiguous share of the (row, KV head) x tile slots, with
+:func:`cake_jit.walk_splits` partial slots per pair.  On a GB300 (152 SMs) at
+the owner's shape that is rows 128 alone (256 plain CTAs of 33 tiles in two
+waves -> 152 CTAs of 56-57 tiles, 2 slots); rows 1-64 run one wave and rows
+256 and above more than two, and keep the plain cut.  On an R200 (212 SMs) it
+is rows 128 (256 plain CTAs in two waves, the second 44 wide -> 212 CTAs of
+39-40 tiles, 2 slots) and rows 256 (512 plain CTAs in three waves -> 212 CTAs
+of 79-80 tiles, 2 slots); rows 1-64 run one wave and rows 318 and above more
+than three, and keep the plain cut.  Every call on ``sm_100a`` keeps it too
+(measured on a B200 the same two-wave grids tie).  On 108 SMs at the owner's 24 x 2 heads and 2051 selections (33
 tiles): rows 1-32 run at most one wave -> K-first; rows 64 (4 splits, 512
 CTAs, 9 tiles per CTA) -> K-first; rows 128 (2 splits, 512 CTAs, 17 tiles per
 CTA) -> whole-tile; the 2048-row single-split call (33 tiles per CTA) ->
 whole-tile.  Measured paired on two A100s (80 GB and 40 GB PCIe) under the
 memset flush, the K-first program is 1-7 % faster at rows 64 and the
 whole-tile program 6-8 % faster at rows 128, on both units.  The fused form
-is never wide: its grid is within the co-residency by the form rule.  The
-rule reads the architecture, the SM count and the call's tile and split
-counts alone.
+is never wide, and never walked: its grid is within the co-residency by the
+form rule.  The rule reads the architecture, the SM count and the call's
+tile and split counts alone.
 
 Workspace rule: the partials (``partial_out`` FP32 ``[splits, rows,
 num_qo_heads, 256]``, ``partial_lse`` FP32 ``[splits, rows, num_qo_heads]``)
@@ -137,29 +179,56 @@ MAX_SPLITS = cake_jit.MAX_SPLITS
 # co-residency per SM of the cooperative decode, the fused form's capacity (sm_80 absent: the split form alone).
 CTAS_PER_SM = cake_jit.DECODE_CTAS_PER_SM
 FUSED_CTAS_PER_SM = cake_jit.DECODE_FUSED_CTAS_PER_SM
-# The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, those
+# The eager host rule of the tcgen05 architectures (module docstring, "Form rule"): within the fused capacity, these
 # architectures take the fused form only on these host machines (``platform.machine()``), at this many rows or fewer,
-# and only outside a stream capture; compute capability 9.0 takes it within its capacity on every host.
+# and only outside a stream capture; compute capability 9.0 and 12.0 take it within their capacity on every host, and
+# sm_107a (not listed) keeps the split form on every host, the measured shorter one there.  No host machine is
+# listed: on the Grace host of a GB300 the split form's eager whole call is the shorter one at every row once the
+# host's enqueue time is counted (the rule once named ``aarch64`` from an event-timed measurement that hid the fused
+# form's longer pre-launch host path), so compute capability 10.0 and 10.3 keep the split form on every host; the
+# cooperative build and the rule stay for a host that measures otherwise.
 FUSED_HOST_RULE_ARCHES = ("sm_100a", "sm_103a")
-FUSED_HOSTS = ("aarch64",)
+FUSED_HOSTS: tuple[str, ...] = ()
 FUSED_MAX_ROWS = 4
+# Architectures whose cooperative build ships but whose eager call keeps the split form on every host.
+FUSED_SPLIT_ONLY_ARCHES = ("sm_107a",)
+# Architectures the persistent walk ships for (module docstring, "Program rule"): sm_103a, where the two-wave grids of
+# the owner's shape gain with the walk, and sm_107a, where its two- and three-wave grids do; the same two-wave grids tie
+# on a B200, so sm_100a keeps the plain program everywhere.  Its wave bound per architecture is the kernel file's table,
+# spelled by the registry.
+WALK_ARCHES = ("sm_103a", "sm_107a")
+WALK_MAX_WAVES = cake_jit.WALK_MAX_WAVES
 HOST_MACHINE = platform.machine()
 # The program rule's long-stream bound: tiles per CTA from which an sm_80 multi-wave grid runs the whole-tile program.
 LONG_STREAM_TILES = cake_jit.DECODE_LONG_STREAM_TILES
+# The program rule's stream bound of the ``long_stream`` grid class: tiles per CTA from which an sm_120a split-form call
+# runs the whole-tile program whatever its grid.
+STREAM_TILES = cake_jit.DECODE_STREAM_TILES
+# Architecture -> the grid bound at which its split-form call is wide (the whole-tile record's rule); an architecture
+# the map does not name is judged at the ``multi_wave_long`` bound, which selects nothing there.
+WIDE_BOUNDS = cake_jit.MODULES["decode_whole_tile"]["select_rule"]["grid"]
 # Every workspace slot starts on a 256-byte boundary.
 ALIGN = 256
 _LOG2E = math.log2(math.e)
 # The measured split table: ``(sm_count, rows) -> splits`` where the fastest split count of the acceptance fixture
 # (2 KV heads, a selection of 2051 tokens = 33 tiles) differs from the formula.  Keyed by the SM count, never by a
 # product name.  H100 (132 SMs): rows 4 take 16 splits and rows 8 take 8; A100 (108 SMs): rows 64 take 4 and rows
-# 128 take 2 (both above the formula's capacity; a plain launch runs in more than one wave).  No entry for a Blackwell
-# SM count: on 148 SMs (B200) and 152 SMs (GB300) the tcgen05 decode's one-CTA-per-SM formula wins or ties every measured
-# alternative (half splits, two-wave grids: whole call, both layouts, both flushes), so its rows run the formula.
+# 128 take 2 (both above the formula's capacity; a plain launch runs in more than one wave).  No entry for a tcgen05
+# device's SM count: on 148 SMs (B200) and 152 SMs (GB300) the tcgen05 decode's one-CTA-per-SM formula wins or ties every
+# measured alternative (half splits, two-wave grids: whole call, both layouts, both flushes), so its rows run the formula.
+# RTX PRO 6000 (188 SMs, the mma.sync decode's two CTAs per SM): rows 4 take 16 splits, rows 8 take 11, rows 16 take 5
+# and rows 32 take 3 (about half the formula's 33 / 23 / 11 / 5: fewer CTAs of two to seven tiles beat the formula's
+# one-tile CTAs whole call in both forms, both layouts, both flushes); rows 1 and 2 keep 33 (16 splits win after a memset
+# flush yet lose 7 % after a read flush) and rows 64 and 128 keep the formula (4 and 2 splits lose 3 to 7 %).
 SPLIT_OVERRIDES: dict[tuple[int, int], int] = {
     (132, 4): 16,
     (132, 8): 8,
     (108, 64): 4,
     (108, 128): 2,
+    (188, 4): 16,
+    (188, 8): 11,
+    (188, 16): 5,
+    (188, 32): 3,
 }
 
 
@@ -168,11 +237,11 @@ def num_tiles(selection_width: int) -> int:
     return -(-int(selection_width) // TILE_TOKENS)
 
 
-def num_splits(
+def plain_splits(
     num_rows: int, num_kv_heads: int, selection_width: int, sm_count: int, arch: str
 ) -> int:
-    """The split count of a call on a device of ``sm_count`` SMs whose exported architecture is ``arch`` (module
-    docstring, "Split rule")."""
+    """The plain program's split count on a device of ``sm_count`` SMs whose exported architecture is ``arch``: the
+    formula, the measured table and the caps of the module docstring's "Split rule"."""
     if num_rows < 1 or num_kv_heads < 1 or sm_count < 1:
         raise ValueError(
             f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, sm_count={sm_count} must all be at least 1"
@@ -193,6 +262,69 @@ def num_splits(
     return max(1, min(tiles, MAX_SPLITS, chosen))
 
 
+def select_walk(
+    num_rows: int, num_kv_heads: int, num_tiles: int, sm_count: int, arch: str
+) -> int:
+    """The CTA count of the persistent walk when it serves a split-form call of ``num_tiles`` tiles on a device of
+    ``sm_count`` SMs and architecture ``arch``, else 0 (module docstring, "Program rule"): the architecture ships the
+    walk (:data:`WALK_ARCHES`) and the walk shortens the call's longest CTA at the plain split count
+    (:func:`cake_jit.walk_applies`: a multi-wave plain grid within the architecture's wave bound).  Pure in its
+    integers.  The fused form is never walked: its grid is within one wave by the form rule, so the walk's multi-wave
+    condition excludes it."""
+    if (
+        int(num_rows) < 1
+        or int(num_kv_heads) < 1
+        or int(num_tiles) < 1
+        or int(sm_count) < 1
+    ):
+        raise ValueError(
+            f"num_rows={num_rows}, num_kv_heads={num_kv_heads}, num_tiles={num_tiles}, sm_count={sm_count} must all "
+            "be at least 1"
+        )
+    if arch not in CTAS_PER_SM:
+        raise ValueError(
+            f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}"
+        )
+    if arch not in WALK_ARCHES:
+        return 0
+    plain = plain_splits(
+        num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch
+    )
+    if not cake_jit.walk_applies(
+        num_rows, num_kv_heads, num_tiles, plain, sm_count, arch
+    ):
+        return 0
+    return cake_jit.walk_ctas(sm_count, int(num_rows) * int(num_kv_heads), num_tiles)
+
+
+def _split_count(
+    num_rows: int,
+    num_kv_heads: int,
+    num_tiles: int,
+    sm_count: int,
+    arch: str,
+    walk: int,
+) -> int:
+    """The call's split count given its walk: the walk's partial slots per (row, KV head) where the walk serves it,
+    the plain program's split count otherwise."""
+    if walk:
+        return cake_jit.walk_splits(walk, int(num_rows) * int(num_kv_heads), num_tiles)
+    return plain_splits(
+        num_rows, num_kv_heads, int(num_tiles) * TILE_TOKENS, sm_count, arch
+    )
+
+
+def num_splits(
+    num_rows: int, num_kv_heads: int, selection_width: int, sm_count: int, arch: str
+) -> int:
+    """The split count of a call on a device of ``sm_count`` SMs whose exported architecture is ``arch`` (module
+    docstring, "Split rule"): :func:`plain_splits`, or the persistent walk's partial slots per (row, KV head) where
+    the walk serves the call (:func:`select_walk`).  The count :func:`qsa_workspace_bytes` sizes a workspace for."""
+    tiles = num_tiles(selection_width)
+    walk = select_walk(num_rows, num_kv_heads, tiles, sm_count, arch)
+    return _split_count(num_rows, num_kv_heads, tiles, sm_count, arch, walk)
+
+
 def is_supported(device: torch.device | int | None = None) -> bool:
     """Whether ``device`` (the current CUDA device by default) is an exported target."""
     if not torch.cuda.is_available():
@@ -210,20 +342,35 @@ def fused_capacity(device_index: int) -> int:
     return FUSED_CTAS_PER_SM.get(arch, 0) * sm_count
 
 
+def _long_stream(num_tiles: int, splits: int, bound: int) -> bool:
+    """Whether each CTA of a call of ``num_tiles`` tiles at ``splits`` splits walks at least ``bound`` tiles
+    (``ceil(num_tiles / splits) >= bound``)."""
+    return -(-int(num_tiles) // int(splits)) >= int(bound)
+
+
 def select_form(
     num_rows: int,
     num_kv_heads: int,
     splits: int,
+    num_tiles: int,
     device_index: int,
     capturing: bool = False,
 ) -> str:
-    """``"fused"`` or ``"split"`` (module docstring, "Form rule"); ``capturing`` is
+    """``"fused"`` or ``"split"`` (module docstring, "Form rule"); ``num_tiles`` is
+    the call's tile count (the ``long_stream`` architectures take the split form on a
+    wide call: the whole-tile program ships in that form alone); ``capturing`` is
     whether the call's stream is capturing (or its state is unreadable: a device
     other than the current one), read by the caller and part of the plan's key."""
     grid = int(num_rows) * int(num_kv_heads) * int(splits)
     if int(splits) <= 1 or grid > fused_capacity(device_index):
         return "split"
     arch, _sm_count = _device_facts(device_index)
+    if WIDE_BOUNDS.get(arch) == "long_stream" and _long_stream(
+        num_tiles, splits, STREAM_TILES
+    ):
+        return "split"
+    if arch in FUSED_SPLIT_ONLY_ARCHES:
+        return "split"
     if arch not in FUSED_HOST_RULE_ARCHES:
         return "fused"
     if (
@@ -258,10 +405,13 @@ def select_wide(
     arch: str,
 ) -> bool:
     """Whether a call of ``form`` is *wide* on a device of ``sm_count`` SMs and architecture ``arch`` (module
-    docstring, "Program rule"): the split form with a decode grid ``num_rows * num_kv_heads * splits`` above one
-    resident wave, ``CTAS_PER_SM[arch] * sm_count`` CTAs, whose CTAs each walk at least ``LONG_STREAM_TILES`` of the
-    call's ``num_tiles`` tiles (``ceil(num_tiles / splits)``).  The fused form is never wide.  Pure: the SM count
-    and the architecture are the caller's (only ``sm_80`` has a record that reads it)."""
+    docstring, "Program rule"), at the architecture's grid bound (``WIDE_BOUNDS``): at ``multi_wave_long`` (``sm_80``
+    and every architecture the map does not name) the split form with a decode grid ``num_rows * num_kv_heads *
+    splits`` above one resident wave, ``CTAS_PER_SM[arch] * sm_count`` CTAs, whose CTAs each walk at least
+    ``LONG_STREAM_TILES`` of the call's ``num_tiles`` tiles (``ceil(num_tiles / splits)``); at ``long_stream``
+    (``sm_120a``) the split form whose CTAs each walk at least ``STREAM_TILES`` tiles, whatever the grid.  The fused
+    form is never wide.  Pure: the SM count and the architecture are the caller's (only ``sm_80`` and ``sm_120a`` have
+    a record that reads it)."""
     if (
         int(num_rows) < 1
         or int(num_kv_heads) < 1
@@ -279,11 +429,16 @@ def select_wide(
         raise ValueError(
             f"unknown arch {arch!r}; the architectures are {cake_jit.ARCHES}"
         )
+    if WIDE_BOUNDS.get(arch) == "long_stream":
+        return form == "split" and _long_stream(num_tiles, splits, STREAM_TILES)
     multi_wave = int(num_rows) * int(num_kv_heads) * int(splits) > CTAS_PER_SM[
         arch
     ] * int(sm_count)
-    long_stream = -(-int(num_tiles) // int(splits)) >= LONG_STREAM_TILES
-    return form == "split" and multi_wave and long_stream
+    return (
+        form == "split"
+        and multi_wave
+        and _long_stream(num_tiles, splits, LONG_STREAM_TILES)
+    )
 
 
 def _round_up(n: int, m: int) -> int:
@@ -545,12 +700,16 @@ def _resolve(
     capturing: bool,
 ) -> tuple[int, bool, tuple[Any, ...]]:
     """The plan of one call shape on one device, resolved once per key: ``(splits, fused, launches)`` from
-    the split rule, the form rule (``capturing``: the stream's capture state, read by the caller when the
-    form depends on it, else ``False``), the program rule and :func:`cake_jit.resolved_launches` (the loaded
-    FFI entries, their argument getters and grids, in launch order).  Pure in its host scalars."""
+    the walk rule and the split rule (the walk's slots where the walk serves the call), the form rule
+    (``capturing``: the stream's capture state, read by the caller when the form depends on it, else
+    ``False``), the program rule and :func:`cake_jit.resolved_launches` (the loaded FFI entries, their argument
+    getters and grids, in launch order).  Pure in its host scalars."""
     arch, sm_count = _device_facts(device_index)
-    splits = num_splits(num_rows, num_kv_heads, tiles * TILE_TOKENS, sm_count, arch)
-    form = select_form(num_rows, num_kv_heads, splits, device_index, capturing)
+    walk = select_walk(num_rows, num_kv_heads, tiles, sm_count, arch)
+    splits = _split_count(num_rows, num_kv_heads, tiles, sm_count, arch, walk)
+    form = select_form(num_rows, num_kv_heads, splits, tiles, device_index, capturing)
+    if form != "split":
+        walk = 0  # unreachable by the rules (a walked grid exceeds the fused capacity); the fused form is never walked
     wide = select_wide(num_rows, num_kv_heads, splits, tiles, form, sm_count, arch)
     launches = cake_jit.resolved_launches(
         form=form,
@@ -560,6 +719,7 @@ def _resolve(
         rows=num_rows,
         kv_heads=num_kv_heads,
         qo_heads=num_qo_heads,
+        walk=walk,
     )
     return splits, form == "fused", launches
 
@@ -884,20 +1044,27 @@ __all__ = [
     "FUSED_HOSTS",
     "FUSED_HOST_RULE_ARCHES",
     "FUSED_MAX_ROWS",
+    "FUSED_SPLIT_ONLY_ARCHES",
     "HEAD_DIM",
     "HOST_MACHINE",
     "LONG_STREAM_TILES",
     "MAX_GROUP_SIZE",
     "MAX_SPLITS",
     "SPLIT_OVERRIDES",
+    "STREAM_TILES",
     "TILE_TOKENS",
+    "WALK_ARCHES",
+    "WALK_MAX_WAVES",
+    "WIDE_BOUNDS",
     "fused_capacity",
     "is_supported",
     "num_splits",
     "num_tiles",
+    "plain_splits",
     "qsa_sparse_paged_attention",
     "qsa_workspace_bytes",
     "reset_workspace",
     "select_form",
+    "select_walk",
     "select_wide",
 ]

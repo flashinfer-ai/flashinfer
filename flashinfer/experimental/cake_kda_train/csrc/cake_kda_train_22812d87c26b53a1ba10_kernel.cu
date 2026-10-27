@@ -224,6 +224,10 @@ extern "C" {
 __global__ __launch_bounds__(320, LAUNCH_MIN_BLOCKS) void
 kernel_cake_kda_train_22812d87c26b53a1ba10(const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap kg_tma, __nv_bfloat16* __restrict__ u, float* __restrict__ gk, const __grid_constant__ CUtensorMap h_out, const __grid_constant__ CUtensorMap v_new, int num_heads, int* __restrict__ seq_chunk_start, int num_seqs, int segments, float* h0, unsigned int* flags, float* __restrict__ ht_out, int use_h0, int write_tapes, int write_ht, const __grid_constant__ CUtensorMap qg_tma, const __grid_constant__ CUtensorMap aqk_tma, __nv_bfloat16* __restrict__ o_out, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float scale, int epoch)
 {
+    // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
+    asm volatile("" : "+l"(h0));
+    __builtin_assume(__isGlobal(h0));
+
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -305,8 +309,8 @@ kernel_cake_kda_train_22812d87c26b53a1ba10(const __grid_constant__ CUtensorMap w
             mbarrier_init(smem + 48, 128);
             // dec_done: 1 barriers, init_count=128
             mbarrier_init(smem + 56, 128);
-            // h_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
+            // h_ready: 1 barriers, init_count=2
+            mbarrier_init(smem + 64, 2);
             // h_tape_read: 1 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
             // bv_tape_read: 1 barriers, init_count=1
@@ -1790,6 +1794,8 @@ kernel_cake_kda_train_22812d87c26b53a1ba10(const __grid_constant__ CUtensorMap w
                     _phase_bv_ready_0_1 ^= 1;
                     mbarrier_wait(dec_done_addr, _phase_dec_done_0);
                     _phase_dec_done_0 ^= 1;
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(h_ready_addr);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;

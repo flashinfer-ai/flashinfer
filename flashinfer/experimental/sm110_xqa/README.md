@@ -19,8 +19,28 @@ The package is a self-contained Cake package (FlashInfer issue #6553):
 | `cake_build.py` | The loader shared by every Cake package: a prebuilt `aot/<library>.so` when a builder compiled it, else FlashInfer's JIT from the manifest's sources and flags (`use_fast_math=False`; the entry's own `--use_fast_math` is in `nvcc_flags`). |
 | `csrc/cake_ffi_checks.h` | The tvm-ffi checks the bindings use; no FlashInfer header is included. |
 | `csrc/cake_sm110_xqa_<digest>_{kernel,binding}.cu` | One device translation unit and one tvm-ffi binding (`run`, `build_cuda_version`) per program. |
+| `csrc/cake_sm110_xqa_tree_fp16_contig_tmem_even_kernel.cuh` | The device translation unit the `tree_fp16_contig_g<ratio>_tmem_even` records share (GQA ratios 2, 4 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_contig_tmem_even_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_contig_tmem_odd_kernel.cuh` | The device translation unit the `tree_fp16_contig_g<ratio>_tmem_odd` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_contig_tmem_odd_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_page128_tmem_even_kernel.cuh` | The device translation unit the `tree_fp16_page128_g<ratio>_tmem_even` records share (GQA ratios 2, 4 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_page128_tmem_even_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_page128_tmem_odd_kernel.cuh` | The device translation unit the `tree_fp16_page128_g<ratio>_tmem_odd` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp16_page128_tmem_odd_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_tmem_even_kernel.cuh` | The device translation unit the `tree_fp8_contig_g<ratio>_tmem_even` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_tmem_even_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_tmem_odd_kernel.cuh` | The device translation unit the `tree_fp8_contig_g<ratio>_tmem_odd` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_tmem_odd_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_tmem_even_kernel.cuh` | The device translation unit the `tree_fp8_page128_g<ratio>_tmem_even` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_tmem_even_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_tmem_odd_kernel.cuh` | The device translation unit the `tree_fp8_page128_g<ratio>_tmem_odd` records share (GQA ratios 2, 4, 8 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_tmem_odd_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_pair_kernel.cuh` | The device translation unit the `tree_fp8_contig_g<ratio>_pair` records share (GQA ratios 2, 4 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_contig_pair_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_pair_kernel.cuh` | The device translation unit the `tree_fp8_page128_g<ratio>_pair` records share (GQA ratios 2, 4 and 16); each record's kernel source defines the ratio and the kernel symbol and includes it. |
+| `csrc/cake_sm110_xqa_tree_fp8_page128_pair_binding.h` | The tvm-ffi binding those records share; each record's binding source defines the ratio, the Q box height, the kernel symbol and name and the binding namespace and includes it. |
 | `csrc/cake_sm110_xqa_device_abi.cuh` | The device ABI block every kernel translation unit includes first: fixed-width typedefs, the `CakeTensorMap64` / `CUtensorMap` size and alignment asserts, the CUDA headers, `make_warp_uniform` and `CAKE_INF`. |
-| `csrc/cake_sm110_xqa_device_helpers.cuh` | The device helper library the kernel translation units share; a unit selects the guarded helpers it uses with `CAKE_SM110_XQA_NEED_*` defines before the include. |
+| `csrc/cake_sm110_xqa_device_helpers.cuh` | The device helper library the kernel translation units share; every kernel translation unit includes the whole library, and the helpers a unit does not call emit no code. |
 | `csrc/cake_sm110_xqa_kv_cache_list_contig.h` | The `KVCacheList` record of the contiguous cache layout, included by each tree kernel of that layout and by its binding. |
 | `csrc/cake_sm110_xqa_kv_cache_list_page128.h` | The `KVCacheList` record of the `page128` cache layout, included by each tree kernel of that layout and by its binding. |
 | `csrc/cake_sm110_xqa_binding_helpers_tma_record.h` | The host helpers the tree bindings share (CUDA and driver error checks, tensor-view accessors, TMA extent and stride conversion, the cache record writer), included once per binding inside its namespace after `KERNEL_NAME`. |
@@ -32,8 +52,11 @@ a literal by `scripts/check_cake_build_manifests.py`, which checks the manifest
 against the registry and the sources. Edit the exporter, not the generated
 files.
 
-The six `csrc/cake_sm110_xqa_*` headers (`.cuh` and `.h`) are a hand fold of
-blocks the generated files shared, pending regeneration from the exporter.
+The `csrc/cake_sm110_xqa_*` headers (`.cuh` and `.h`) are a hand fold of text
+the generated files shared, pending regeneration from the exporter. Like the
+other shared headers under `csrc/`, the `cake_sm110_xqa_tree_*` body headers
+are rebuilt through the build system's header dependency tracking and are not
+covered by a `build.json` digest.
 
 Native compilation and correctness checks have run with CUDA 13.4 on physical
 SM110 hardware. The interface supports two attention families:

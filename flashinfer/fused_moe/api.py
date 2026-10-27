@@ -2570,7 +2570,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
+    """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -2596,8 +2596,8 @@ class CuteDslConfig:
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
-        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
-        Defaults to NVFP4×NVFP4.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
+        (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2617,6 +2617,24 @@ class CuteDslConfig:
             device=device,
             nvfp4_4over6=nvfp4_4over6,
         )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
+
+        Returns the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``: E4M3 ``[M, H]`` and
+        row-major E8M0 scales ``[M, H // 32]``.
+        """
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CuteDslConfig")
+        if quant.swizzled_scale_factors is True:
+            raise ValueError(
+                "CuteDslConfig consumes only the linear activation scale layout."
+            )
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"
@@ -2946,7 +2964,9 @@ class CudnnFrostMxfp8Mxfp4Config:
 
 @dataclass(frozen=True)
 class FrostLowLatencyConfig:
-    """Low-token routed MoE on SM90/SM100/SM103/SM107/SM120.
+    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+
+    SM80 supports BF16/FP16 inputs and weights.
 
     SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
     NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
@@ -2965,16 +2985,25 @@ class FrostLowLatencyConfig:
     outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
     separate FP32 multiplication and addition. Packed routing scores retain
     BF16 rounding regardless of the input/output dtype. This is distinct from
-    the MX intermediate quantization/combine contract. SM90 and SM120 also
-    offer grouped BF16 Tensor Core candidates for default SwiGLU,
-    H=2048/I=512/top-k=10, T=4 or 8, with finalized BF16 output. Those
-    projections share the typed intermediate and ordered combine contract;
+    the MX intermediate quantization/combine contract. SM80, SM90 and SM120 also
+    offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
+    T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
+    and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
+    on SM120. SM120 also admits GeGLUTanh and default SiTU/SwiGLUStep
+    at T4/T8 with matching BF16/FP16 types. SM80 additionally admits BF16 default SwiGLU at
+    H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
+    intermediate and ordered combine contract;
     FMA remains the untuned default and a tuning candidate.
 
     Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
     BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
     Activation and intermediate quantization remain fused into FC1; FC2
     produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    On SM90, finalized default SwiGLU/SiTU at H=2048/I=512/top-k=10, T=4 or 8,
+    and ReLU2 at T=8 also offer grouped E4M3 WGMMA with bounded-K64 FP32 partial
+    promotion. SM120 adds grouped E4M3 warp MMA for the same shape, with
+    default SwiGLU/SiTU/ReLU2 at T4/T8. Static scales stay live, and FMA
+    remains the untuned default and tuning candidate.
     The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
     contract differs even with identical quantized weights and scales.
 
@@ -3013,7 +3042,7 @@ class FrostLowLatencyConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (90, 100, 103, 107, 120)
+        return arch in (80, 90, 100, 103, 107, 120)
 
     @staticmethod
     def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):

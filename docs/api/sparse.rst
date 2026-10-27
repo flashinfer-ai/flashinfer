@@ -45,9 +45,9 @@ flashinfer.msa_ops
 ==================
 
 Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
-selection dispatch on compute capability 10.0/10.3/10.7 (SM100/SM103/SM107) and
-SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
-only. On compute capability 10.0/10.3/10.7, NVFP4 K/V is served by dedicated
+selection dispatch on SM100/SM103/SM107/SM120/SM121. ``msa_proxy_score`` also
+supports SM90; only ``msa_proxy_score_fp4`` is SM120/SM121-only. On
+SM100/SM103/SM107, packed NVFP4 K/V is served by dedicated
 paged-KV prefill and decode routes that take the four regions of a packed
 NVFP4 page -- K data, K scales, V data, V scales -- as strided views of one
 allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
