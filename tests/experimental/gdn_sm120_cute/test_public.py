@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import subprocess
 import sys
+import warnings
+from types import SimpleNamespace
+
 import pytest
 import torch
 from flashinfer import gdn_prefill as fi
@@ -16,8 +19,6 @@ def sm120(request):
         torch.device("cuda")
     ) != (12, 0):
         pytest.skip("requires SM120")
-    if torch.cuda.get_device_properties("cuda").multi_processor_count != 156:
-        pytest.skip("public fast-path qualification requires RTX6000D / 156 SMs")
 
 
 def inputs(lengths=(64, 96), dtype=torch.bfloat16, index_dtype=torch.int32):
@@ -76,11 +77,117 @@ def test_public_forward(lengths, use_cp, preallocated, scale, monkeypatch):
             output_state=torch.empty_like(kwargs["initial_state"]),
         )
     actual = fi.chunk_gated_delta_rule(*args, backend="sm120_cute", **kwargs)
-    assert calls == [all(n % 32 == 0 for n in lengths)]
+    # The public adapter is supported on every SM120 SKU; only the qualified
+    # 156-SM part should enter the experimental implementation.
+    expected_calls = (
+        [all(n % 32 == 0 for n in lengths)]
+        if torch.cuda.get_device_properties(args[0].device).multi_processor_count == 156
+        else []
+    )
+    assert calls == expected_calls
     for x, y in zip(actual, expected, strict=True):
         _assert_relative(x, y.double())
     if preallocated:
         assert actual[0] is kwargs["output"] and actual[1] is kwargs["output_state"]
+
+
+@pytest.mark.parametrize("sm_count", [170, 188])
+@torch.inference_mode()
+def test_public_unqualified_sm120_fallback(sm_count, monkeypatch):
+    from flashinfer.experimental.gdn_sm120_cute import _api, backend
+
+    args, kwargs = inputs()
+    kwargs["use_cp"] = False
+    expected = fi.chunk_gated_delta_rule(*args, backend="flashinfer", **kwargs)
+
+    # Override only the adapter's view of the SKU. Patching torch.cuda itself
+    # would also change the official implementation that must remain runnable.
+    adapter_cuda = SimpleNamespace(**vars(torch.cuda))
+    adapter_cuda.get_device_properties = lambda device: SimpleNamespace(
+        major=12, minor=0, multi_processor_count=sm_count
+    )
+    adapter_torch = SimpleNamespace(**vars(torch))
+    adapter_torch.cuda = adapter_cuda
+    monkeypatch.setattr(backend, "torch", adapter_torch)
+
+    def forbidden(*a, **kw):
+        raise AssertionError("unqualified SM120 SKU must use official implementation")
+
+    monkeypatch.setattr(_api, "chunk_gated_delta_rule", forbidden)
+    actual = fi.chunk_gated_delta_rule(*args, backend="sm120_cute", **kwargs)
+    for x, y in zip(actual, expected, strict=True):
+        torch.testing.assert_close(x, y)
+
+
+@torch.inference_mode()
+def test_public_plan_cache_overflow_preserves_capture(monkeypatch):
+    if torch.cuda.get_device_properties("cuda").multi_processor_count != 156:
+        pytest.skip("CuTe metadata-cache qualification requires 156 SMs")
+    from flashinfer.experimental.gdn_sm120_cute import _api, backend
+
+    plans = {}
+    monkeypatch.setattr(backend, "_plans", plans)
+    monkeypatch.setattr(backend, "_plan_cache_full_warned", False)
+    calls = []
+    original = _api.chunk_gated_delta_rule
+
+    def capture(*a, **kw):
+        calls.append(kw["plan"])
+        return original(*a, **kw)
+
+    monkeypatch.setattr(_api, "chunk_gated_delta_rule", capture)
+    first_args, first_kwargs = inputs((33,))
+    first_kwargs["use_cp"] = False
+    expected = fi.chunk_gated_delta_rule(
+        *first_args, backend="flashinfer", **first_kwargs
+    )
+    fi.chunk_gated_delta_rule(*first_args, backend="sm120_cute", **first_kwargs)
+    for length in range(34, 97):
+        args, kwargs = inputs((length,))
+        kwargs["use_cp"] = False
+        fi.chunk_gated_delta_rule(*args, backend="sm120_cute", **kwargs)
+    assert len(plans) == len(calls) == 64
+    warmed_plans = plans.copy()
+    first_plan = calls[0]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fi.chunk_gated_delta_rule(
+            *first_args, backend="sm120_cute", **first_kwargs
+        )
+    assert len(calls) == 65 and calls[-1] is first_plan
+
+    args, kwargs = inputs((97,))
+    kwargs["use_cp"] = False
+    fallback_expected = fi.chunk_gated_delta_rule(*args, backend="flashinfer", **kwargs)
+    with pytest.warns(RuntimeWarning, match="64"):
+        actual = fi.chunk_gated_delta_rule(*args, backend="sm120_cute", **kwargs)
+    for x, y in zip(actual, fallback_expected, strict=True):
+        torch.testing.assert_close(x, y)
+
+    args, kwargs = inputs((98,))
+    kwargs["use_cp"] = False
+    fallback_expected = fi.chunk_gated_delta_rule(*args, backend="flashinfer", **kwargs)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always", RuntimeWarning)
+        actual = fi.chunk_gated_delta_rule(*args, backend="sm120_cute", **kwargs)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in recorded)
+    for x, y in zip(actual, fallback_expected, strict=True):
+        torch.testing.assert_close(x, y)
+    assert len(calls) == 65
+    assert tuple(plans) == tuple(warmed_plans)
+    assert all(plans[key] is plan for key, plan in warmed_plans.items())
+
+    actual = fi.chunk_gated_delta_rule(
+        *first_args, backend="sm120_cute", **first_kwargs
+    )
+    assert len(calls) == 66 and calls[-1] is first_plan
+    for x, y in zip(actual, expected, strict=True):
+        _assert_relative(x, y.double())
+    # Overflow must not release metadata still referenced by an existing graph.
+    graph.replay()
+    torch.cuda.synchronize()
+    for x, y in zip(captured, expected, strict=True):
+        _assert_relative(x, y.double())
 
 
 @pytest.mark.parametrize(

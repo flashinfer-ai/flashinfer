@@ -6,10 +6,26 @@ metadata. Linear/raw gates, checkpoints and non-FP32 state use the official path
 """
 
 from typing import Any
+import warnings
 
 import torch
 
 _plans: dict[tuple, Any] = {}
+_plan_cache_full_warned = False
+
+
+def _warn_plan_cache_full():
+    global _plan_cache_full_warned
+    if not _plan_cache_full_warned:
+        _plan_cache_full_warned = True
+        warnings.warn(
+            "SM120 CuTe sequence-plan cache is full (64 layouts); new layouts "
+            "use the official FlashInfer backend. Cached layouts remain usable. "
+            "Serving integrations need a bounded set of warmed layouts; see "
+            "flashinfer/experimental/gdn_sm120_cute/README.md.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def run(q, k, v, **kwargs):
@@ -108,6 +124,7 @@ def run(q, k, v, **kwargs):
         raise ValueError("max_seqlen must bound the supplied sequence lengths")
     key = (lengths, v.shape[1], str(q.device), cu.dtype, str(use_cp))
     if key not in _plans and len(_plans) >= 64:
+        _warn_plan_cache_full()
         return fallback()
     from ._api import build_plan, chunk_gated_delta_rule
 

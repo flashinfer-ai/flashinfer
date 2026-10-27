@@ -22,10 +22,28 @@ variable and stable-path implementation are removed.
 RTX 6000D, exact SM120/156 SMs, D=128, contiguous BF16/FP16 QKV, Hq=Hk and
 Hv divisible by Hq; finite FP32 native log gates and FP32 beta/state. CPU offsets
 must match the GPU offsets and remain immutable for each captured graph.
-Layouts are cached by CPU values, dtype, device and CP choice, not GPU tensor
-identity. Up to 64 layouts are retained without eviction to preserve captured
-pointer lifetimes; new layouts beyond that use the official backend. Warm a
-layout before graph capture. Empty sequences use the official backend.
+Plans are keyed by the packed sequence-length tuple, value-head count, device,
+index dtype and CP choice, not GPU tensor identity. Up to 64 keys are retained
+without eviction to preserve captured pointer lifetimes. The first new key
+encountered after the cache fills emits a one-time `RuntimeWarning` and uses the
+official backend; subsequent new keys also fall back. Existing cached keys keep
+using CuTe. Warm each intended layout before graph capture. Empty sequences use
+the official backend.
+
+### Serving integration and plan lifetime
+
+The 64-key bound is process-wide, including all devices, value-head counts,
+index dtypes and CP choices. Compilation reuse across lengths does not remove
+this metadata-plan bound. Integrations should select this backend for a small,
+repeated set of actual packed sequence layouts, warm that set before capture,
+and keep CPU/GPU offsets immutable and consistent for each captured graph.
+There is no automatic padding or length bucketing; supplying incorrect offsets
+to fit a cached layout is unsupported. Arbitrarily changing ragged prefill
+layouts will eventually use the official route for new keys. Such serving
+workloads should use the official backend until a graph-safe plan-cache policy
+is qualified. Captured plans are not evicted or cleared: a captured graph can
+still reference their device tensors. A future eviction policy must retain plans
+for every graph that still uses them; see tracking issue #7118.
 
 Linear/raw gates, absent gates, logits, checkpoints, state pools, non-FP32 state,
 other GPU configurations and unsupported shapes fall back to the official
@@ -61,9 +79,13 @@ The benchmark compares the actual public `chunk_gated_delta_rule` default route
 (`backend="flashinfer", use_cp="auto"`) with this explicit backend. Both receive
 the same native log gates, CPU offsets and optional caller buffers. GPU gate
 materialization and output/state copies performed by either call are included.
-CUPTI, cold L2, three alternating rounds, 10 warmups and 100 samples per round;
-JIT and CPU overhead are excluded. TP means per-rank head dimensions, without
-communication. Results for a source-hashed commit are stored beside the benchmark;
+Timing uses eager calls with `bench_gpu_time(enable_cupti=True,
+cold_l2_cache=True)`, three alternating rounds, 10 warmups and 100 samples per
+round. Each CUPTI span runs from the first kernel's start to the last kernel's
+end, including host launch gaps between kernels; CPU overhead is not fully
+excluded. JIT and input generation are excluded. These figures depend on the
+host and are not CUDA-graph replay timings. Inputs use normalized BF16 Q/K and
+unnormalized BF16 V. TP means per-rank head dimensions, without communication. Results for a source-hashed commit are stored beside the benchmark;
 older internal-kernel measurements are not evidence for this public adapter.
 
 Correctness tests include an independent FP64 recurrence, full/tail and index
