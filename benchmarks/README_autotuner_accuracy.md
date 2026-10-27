@@ -98,6 +98,14 @@ The returned callable can expose a zero-argument `.reference` function for a
 numerical reference. Without one, the report explicitly says that only the
 untuned default was checked. Composite multi-operation fixtures are rejected.
 
+A fixture can also provide `.prepare_validation(output, inputs)` to refresh its
+owned output before each final correctness replay, after all timing samples.
+The built-in FP8 fixture fills its separately allocated output with NaNs, so a
+no-write tactic cannot pass using another graph's stale output. Custom callbacks
+must preserve read operands and workspace, including any aliases. Without a
+callback, the report records `validation.output_refresh = "unavailable"` and
+cannot rule out this stale-output case.
+
 For example, a framework can load its captured layer inputs once in `build`,
 return a call through its real quantizer/linear path, and supply a suitable
 reference. Timing still covers the captured tunable component, not all work in

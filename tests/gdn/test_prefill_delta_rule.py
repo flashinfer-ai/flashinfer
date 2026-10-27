@@ -80,6 +80,12 @@ def _skip_if_not_sm100():
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
+def _skip_if_not_sm12x():
+    device = torch.device("cuda")
+    if not is_sm12x_supported(device):
+        pytest.skip("Requires SM12x")
+
+
 def _test_prefill_kernel(
     qkv_factory,
     dtype: str,
@@ -185,6 +191,59 @@ def _test_prefill_kernel(
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
+    return our_o, our_state
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("beta", [False, True])
+@pytest.mark.parametrize("alpha", [False, True])
+@pytest.mark.parametrize("seq_lens", [[64], [93]])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_sm12x_triangular_tiles_match_dense(
+    qkv_factory,
+    monkeypatch,
+    dtype: str,
+    seq_lens: list[int],
+    alpha: bool,
+    beta: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _skip_if_not_sm12x()
+
+    import cutlass.cute as cute
+    from flashinfer.gdn_kernels.delta_rule_dsl import delta_rule_sm120 as sm12x
+
+    class DenseMmaDeltaRule(sm12x._FullyFusedDeltaRuleSm120):
+        @cute.jit
+        def _gemm_upper_triangular_b(self, tiled_mma, t_a, t_b, t_acc, b_shape):
+            cute.gemm(tiled_mma, t_acc, t_a, t_b, t_acc)
+
+    def run():
+        return _test_prefill_kernel(
+            qkv_factory,
+            dtype,
+            1,
+            1,
+            1,
+            128,
+            64,
+            seq_lens,
+            1.0,
+            alpha,
+            beta,
+            False,
+            seed,
+        )
+
+    our_o, our_state = run()
+    monkeypatch.setattr(sm12x, "_FullyFusedDeltaRuleSm120", DenseMmaDeltaRule)
+    monkeypatch.setattr(
+        sm12x, "_get_prefill_kernel", sm12x._get_prefill_kernel.__wrapped__
+    )
+    ref_o, ref_state = run()
+
+    torch.testing.assert_close(our_o, ref_o, atol=0, rtol=0)
+    torch.testing.assert_close(our_state, ref_state, atol=0, rtol=0)
 
 
 @torch.inference_mode()

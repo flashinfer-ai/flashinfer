@@ -488,7 +488,7 @@ kernel_cake_dsv4_71e0baa44c61b948d82c(const __grid_constant__ CUtensorMap tmap_q
                     meta[1] = row_max_val;
                     meta[2] = acc_scale;
                     meta[3] = no_correction;
-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
+                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
                     tmem_st_x4_f32(meta_addr, meta);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(stats_addr + (score_phase) * 8);
@@ -543,7 +543,7 @@ kernel_cake_dsv4_71e0baa44c61b948d82c(const __grid_constant__ CUtensorMap tmap_q
             const int output_row_base = warp % 4 * 32;
             const int n_half_1 = warp % 4 / 2;
             const int my_row_1 = head_row_base_1 + lane;
-            const int corr_row = head_row_base_1 << 16;
+            const int corr_row = output_row_base << 16;
             int tile_cursor_1 = 0;
             unsigned int _phase_o_full_0 = 0;
             #pragma unroll 1

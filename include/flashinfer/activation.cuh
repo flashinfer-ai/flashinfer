@@ -60,6 +60,68 @@ __global__ __launch_bounds__(256) void act_and_mul_kernel(T* __restrict__ out,
 #endif
 }
 
+// Same computation as act_and_mul_kernel for launches where one block per row
+// leaves the GPU underused. Each row is split across `split` consecutive blocks
+// (blockIdx.x = row * split + chunk), and each thread issues kUnroll independent
+// loads per half before computing, instead of one dependent round trip per loop
+// iteration. Same vec_size alignment requirement as above.
+template <typename T, float (*Activation)(const float&), uint32_t vec_size, uint32_t kUnroll>
+__global__ __launch_bounds__(256) void act_and_mul_split_kernel(T* __restrict__ out,
+                                                                const T* __restrict__ input,
+                                                                const int d, const uint32_t split) {
+  const uint32_t row = blockIdx.x / split;
+  const uint32_t num_vecs = d / vec_size;
+  const uint32_t stride = blockDim.x * split;
+  uint32_t idx = (blockIdx.x - row * split) * blockDim.x + threadIdx.x;
+  const T* x_ptr = input + int64_t(row) * 2 * d;
+  const T* y_ptr = x_ptr + d;
+  T* out_ptr = out + int64_t(row) * d;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+#pragma unroll 1
+  for (; idx + (kUnroll - 1) * stride < num_vecs; idx += kUnroll * stride) {
+    // Hold the loaded vectors in the input type until all loads are issued;
+    // converting to float first would double the registers they occupy.
+    vec_t<T, vec_size> x_raw[kUnroll], y_raw[kUnroll];
+#pragma unroll
+    for (uint32_t k = 0; k < kUnroll; ++k) {
+      x_raw[k].load(x_ptr + (idx + k * stride) * vec_size);
+      y_raw[k].load(y_ptr + (idx + k * stride) * vec_size);
+    }
+#pragma unroll
+    for (uint32_t k = 0; k < kUnroll; ++k) {
+      vec_t<float, vec_size> x_vec, y_vec, out_vec;
+      x_vec.cast_from(x_raw[k]);
+      y_vec.cast_from(y_raw[k]);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        out_vec[i] = Activation(x_vec[i]) * y_vec[i];
+      }
+      out_vec.cast_store(out_ptr + (idx + k * stride) * vec_size);
+    }
+  }
+  if constexpr (kUnroll > 1) {
+#pragma unroll 1
+    for (; idx < num_vecs; idx += stride) {
+      vec_t<float, vec_size> x_vec, y_vec, out_vec;
+      x_vec.cast_load(x_ptr + idx * vec_size);
+      y_vec.cast_load(y_ptr + idx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        out_vec[i] = Activation(x_vec[i]) * y_vec[i];
+      }
+      out_vec.cast_store(out_ptr + idx * vec_size);
+    }
+  }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 }  // namespace activation
 }  // namespace flashinfer
 

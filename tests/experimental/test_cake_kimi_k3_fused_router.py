@@ -19,16 +19,22 @@ import torch
 
 from flashinfer.experimental.kimi_k3_fused_router import cake_backend, cake_jit
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
+    ARM_GW_CLUSTER,
     ARM_GW_CTAS_PER_SM,
     ARM_L_FAMILY,
     ARM_L_MAX_TOKENS,
     ARM_L_MIN_GRID,
     ARM_LC_TOKENS,
+    ARM_LCG_CLUSTER,
+    ARM_LCG_MAX_TOKENS,
     ARM_M_MAX_TOKENS,
     ARM_Q4S_CLUSTER,
     ARM_Q4S_CTAS_PER_SM,
     ARM_Q4S_FAMILY,
     BLOCK_M_VALUES,
+    CAPACITY_PROGRAM_ARM,
+    CAPACITY_ROUTES,
+    CAPACITY_WIDE_OFFSET,
     MEASURED_NUM_TOKENS,
     NUM_EXPERTS,
     OWNER_CTAS,
@@ -37,10 +43,12 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     TOP_K,
     KimiK3RoutePlan,
     allocate_kimi_k3_route_plan,
+    capacity_arm,
     launch_grid,
     max_route_blocks,
     persistent_grid_cap,
     route_arm,
+    route_arm_candidates,
     route_cell,
     validate_kimi_k3_fused_router_inputs,
 )
@@ -58,7 +66,10 @@ WORKSPACE_POISON = -91
 # The 28 measured cells: num_tokens in {1, 2, ..., 8192} x block_m in {8, 16}.
 MEASURED_SHAPES = [(rows, bm) for bm in BLOCK_M_VALUES for rows in MEASURED_NUM_TOKENS]
 # Token counts between the measured cells, one or two per arm range (including
-# the first count above every cell boundary up to the 8192-token limit).
+# the first count above every cell boundary up to the 8192-token limit), and
+# both sides of the capacity rule's thresholds C and 2C on a 148-SM B200
+# (568 / 1136) and a 152-SM GB300 (592 / 1184), and of 2C + 64, the start of
+# the wide arm on the B200 (1200) and at block_m 16 on the GB300 (1248).
 ARBITRARY_NUM_TOKENS = (
     3,
     5,
@@ -70,8 +81,20 @@ ARBITRARY_NUM_TOKENS = (
     200,
     257,
     300,
+    568,
+    569,
+    592,
+    593,
     1000,
     1025,
+    1135,
+    1136,
+    1183,
+    1184,
+    1199,
+    1200,
+    1247,
+    1248,
     2047,
     2049,
     3000,
@@ -274,15 +297,20 @@ def test_route_tables_cover_the_measured_cells():
     for arch, table in SHAPE_ROUTES.items():
         assert sorted(table) == sorted(MEASURED_SHAPES), arch
         assert len(table) == 28
-        assert set(table.values()) == {"L", "LC", "LP", "M", "Q4S", "Q4SP", "GW"}
-    # The two tables differ in exactly two cells of the L / LP family.
+        arms = {"L", "LC", "LCG", "M", "Q4S", "Q4SP", "GW"}
+        # LPC serves sm_100a's 64-token cells, LP sm_103a's (64, 8) and (128, 8).
+        arms.add("LP" if arch == "sm_103a" else "LPC")
+        assert set(table.values()) == arms
+    # The two tables differ in exactly three cells of the L family.
     differing = {
         key
         for key in SHAPE_ROUTES["sm_100a"]
         if SHAPE_ROUTES["sm_100a"][key] != SHAPE_ROUTES["sm_103a"][key]
     }
-    assert differing == {(64, 16), (128, 8)}
-    assert route_arm("sm_100a", 64, 16) == "LP"
+    assert differing == {(64, 8), (64, 16), (128, 8)}
+    assert route_arm("sm_100a", 64, 8) == "LPC"
+    assert route_arm("sm_103a", 64, 8) == "LP"
+    assert route_arm("sm_100a", 64, 16) == "LPC"
     assert route_arm("sm_103a", 64, 16) == "L"
     assert route_arm("sm_100a", 128, 8) == "L"
     assert route_arm("sm_103a", 128, 8) == "LP"
@@ -296,10 +324,13 @@ def test_route_tables_cover_the_measured_cells():
                 assert route_arm(arch, rows, bm) == "LC"
         assert {
             rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm in ARM_L_FAMILY
-        } == {32, 64, 128}
-        assert route_arm(arch, 32, 8) == "LP"
-        assert route_arm(arch, 32, 16) == "LP"
-        assert route_arm(arch, 64, 8) == "LP"
+        } == {64, 128}
+        # Arm LCG (one 16-CTA cluster of two row groups) serves the 32-token cell.
+        assert {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm == "LCG"
+        } == {ARM_LCG_MAX_TOKENS}
+        assert route_arm(arch, 32, 8) == "LCG"
+        assert route_arm(arch, 32, 16) == "LCG"
         assert route_arm(arch, 128, 16) == "L"
         assert route_arm(arch, 256, 16) == "M"
         assert route_arm(arch, 512, 16) == "Q4S"
@@ -323,11 +354,11 @@ def test_route_cell_and_arbitrary_token_counts():
     # Measured counts are their own cell; LC counts stay exact.
     for rows in MEASURED_NUM_TOKENS:
         assert route_cell(rows) == rows
-    # Counts below 32 that are not an LC row take the 32-token cell (LP).
+    # Counts below 32 that are not an LC row take the 32-token cell (LCG).
     for rows in (3, 5, 6, 7, 9, 15, 17, 31):
         assert route_cell(rows) == 32
         for arch in SHAPE_ROUTES:
-            assert route_arm(arch, rows, 8) == "LP"
+            assert route_arm(arch, rows, 8) == "LCG"
     # Every other count takes the next measured cell up.
     assert route_cell(33) == 64
     assert route_cell(100) == 128
@@ -351,7 +382,9 @@ def test_route_cell_and_arbitrary_token_counts():
         assert route_arm(arch, 1000, 16) == "Q4S"
         assert route_arm(arch, 2047, 8) == "Q4SP"
         assert route_arm(arch, 3000, 16) == "GW"
-    assert route_arm("sm_100a", 33, 16) == "LP"
+    assert route_arm("sm_100a", 33, 8) == "LPC"
+    assert route_arm("sm_103a", 33, 8) == "LP"
+    assert route_arm("sm_100a", 33, 16) == "LPC"
     assert route_arm("sm_103a", 33, 16) == "L"
     assert route_arm("sm_100a", 100, 8) == "L"
     assert route_arm("sm_103a", 100, 8) == "LP"
@@ -390,6 +423,14 @@ def test_launch_grid_rules(compute_capability, sm_count):
     # 16-CTA cluster for sixteen).
     for rows in ARM_LC_TOKENS:
         assert launch_grid("LC", rows, **kw) == rows
+        assert launch_grid("LC", rows, max_active_clusters=1, **kw) == rows
+    # Arm LCG: one cluster of 16 CTAs for any count up to 32.
+    assert ARM_LCG_CLUSTER == 16 and ARM_LCG_MAX_TOKENS == 32
+    for rows in (1, 3, 17, 31, 32):
+        assert launch_grid("LCG", rows, **kw) == ARM_LCG_CLUSTER
+        assert launch_grid("LCG", rows, max_active_clusters=1, **kw) == ARM_LCG_CLUSTER
+    with pytest.raises(RuntimeError, match="at most 32"):
+        launch_grid("LCG", 33, **kw)
     # Arm L: at least the 128 plan owners, otherwise one CTA per token up to
     # the cap; admits at most 128 tokens.
     assert ARM_L_MAX_TOKENS == 128
@@ -400,12 +441,13 @@ def test_launch_grid_rules(compute_capability, sm_count):
     assert launch_grid("L", 128, **kw) == 128
     with pytest.raises(RuntimeError, match="at most"):
         launch_grid("L", 129, **kw)
-    # Arm LP: the L rule (same kernel family, same admission guard).
-    assert ARM_L_FAMILY == ("L", "LP")
-    for rows in (3, 32, 64, 100, 128):
-        assert launch_grid("LP", rows, **kw) == launch_grid("L", rows, **kw)
-    with pytest.raises(RuntimeError, match="at most"):
-        launch_grid("LP", 1024, **kw)
+    # Arms LP and LPC: the L rule (same kernel family, same admission guard).
+    assert ARM_L_FAMILY == ("L", "LP", "LPC")
+    for arm in ARM_L_FAMILY[1:]:
+        for rows in (3, 32, 64, 100, 128):
+            assert launch_grid(arm, rows, **kw) == launch_grid("L", rows, **kw)
+        with pytest.raises(RuntimeError, match="at most"):
+            launch_grid(arm, 1024, **kw)
     # Arm M: 128 <= num_tokens <= the architecture's owner scratch bound.
     assert launch_grid("M", 128, **kw) == 128
     assert launch_grid("M", 200, **kw) == 200
@@ -417,11 +459,24 @@ def test_launch_grid_rules(compute_capability, sm_count):
         launch_grid("M", m_max + 1, **kw)
     with pytest.raises(RuntimeError, match="admits"):
         launch_grid("M", 64, **kw)
-    # Arm GW: CTAs-per-SM launch bound of the architecture (four on both).
+    # Arm GW: whole CTA pairs under the CTAs-per-SM launch bound of the
+    # architecture (four on both) and the co-resident pair capacity.
+    assert ARM_GW_CLUSTER == 2
     gw_ctas = ARM_GW_CTAS_PER_SM[compute_capability] * sm_count
-    assert launch_grid("GW", 300, **kw) == 300
-    assert launch_grid("GW", 4096, **kw) == min(4096, gw_ctas)
-    assert launch_grid("GW", 8192, **kw) == gw_ctas
+    gw = dict(max_active_clusters=1000, **kw)
+    assert launch_grid("GW", 300, **gw) == 300
+    assert launch_grid("GW", 301, **gw) == 302
+    assert launch_grid("GW", 4096, **gw) == min(4096, gw_ctas)
+    assert launch_grid("GW", 8192, **gw) == gw_ctas
+    assert launch_grid("GW", 8192, max_active_clusters=100, **kw) == 200
+    assert launch_grid("GW", 8192, max_active_clusters=1, **kw) == ARM_GW_CLUSTER
+    for rows in (300, 301, 4096, 8192):
+        for clusters in (1, 37, 100, 1000):
+            grid = launch_grid("GW", rows, max_active_clusters=clusters, **kw)
+            assert grid % ARM_GW_CLUSTER == 0
+            assert grid <= min(gw_ctas, clusters * ARM_GW_CLUSTER)
+    with pytest.raises(RuntimeError, match="cluster capacity"):
+        launch_grid("GW", 4096, **kw)
     # Arm Q4S: four CTAs per SM regardless of the architecture cap, bounded by
     # whole co-resident clusters, then rounded down to clusters.
     q4s_ctas = ARM_Q4S_CTAS_PER_SM * sm_count
@@ -443,16 +498,19 @@ def test_launch_grid_rules(compute_capability, sm_count):
         )
     with pytest.raises(RuntimeError, match="cluster capacity"):
         launch_grid("Q4S", 1024, **kw)
-    # Arm Q4SP: the Q4S rule (four CTAs per SM, whole co-resident clusters).
-    assert ARM_Q4S_FAMILY == ("Q4S", "Q4SP")
-    assert launch_grid("Q4SP", 2048, max_active_clusters=1000, **kw) == launch_grid(
-        "Q4S", 2048, max_active_clusters=1000, **kw
-    )
-    assert (
-        launch_grid("Q4SP", 2048, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
-    )
-    with pytest.raises(RuntimeError, match="cluster capacity"):
-        launch_grid("Q4SP", 2048, **kw)
+    # Arms Q4SP and Q4SPW: the Q4S rule (four CTAs per SM, whole co-resident
+    # clusters).
+    assert ARM_Q4S_FAMILY == ("Q4S", "Q4SP", "Q4SPW")
+    for arm in ("Q4SP", "Q4SPW"):
+        for rows in (300, 1024, 2048):
+            assert launch_grid(
+                arm, rows, max_active_clusters=1000, **kw
+            ) == launch_grid("Q4S", rows, max_active_clusters=1000, **kw)
+        assert (
+            launch_grid(arm, 2048, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
+        )
+        with pytest.raises(RuntimeError, match="cluster capacity"):
+            launch_grid(arm, 2048, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("Q4SP", 2049, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError):
@@ -462,7 +520,9 @@ def test_launch_grid_rules(compute_capability, sm_count):
     with pytest.raises(RuntimeError, match="exactly num_tokens"):
         launch_grid("LC", 32, **kw)
     with pytest.raises(RuntimeError, match="launch bound"):
-        launch_grid("GW", 4096, compute_capability=(9, 0), sm_count=132)
+        launch_grid(
+            "GW", 4096, compute_capability=(9, 0), sm_count=132, max_active_clusters=1
+        )
     with pytest.raises(ValueError):
         launch_grid("A", 1, **kw)
 
@@ -487,12 +547,128 @@ def test_launch_grid_small_devices(compute_capability, sm_count, admits_m):
     else:
         with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
             launch_grid("M", 256, **kw)
-    # Arms L / LP and GW stride their owners over the experts, so any grid
+    # Arms L / LP / LPC and GW stride their owners over the experts, so any grid
     # publishes the whole plan.
     for arm in ARM_L_FAMILY:
         assert launch_grid(arm, 128, **kw) == min(ARM_L_MIN_GRID, cap)
     gw_ctas = ARM_GW_CTAS_PER_SM[compute_capability] * sm_count
-    assert launch_grid("GW", 4096, **kw) == min(4096, gw_ctas)
+    assert launch_grid("GW", 4096, max_active_clusters=1000, **kw) == min(4096, gw_ctas)
+    # A device holding one CTA pair per SM halves the GW grid.
+    assert (
+        launch_grid("GW", 4096, max_active_clusters=sm_count, **kw)
+        == ARM_GW_CLUSTER * sm_count
+    )
+
+
+@pytest.mark.parametrize("compute_capability", [(10, 0), (10, 3)])
+def test_launch_grid_refuses_missing_clusters(compute_capability):
+    """A device (or MIG slice) that admits too few clusters is refused, not hung."""
+    kw = dict(compute_capability=compute_capability, sm_count=148)
+    # The one-cluster arms need the driver to admit one cluster.
+    for arm, rows in (("LC", 16), ("LC", 8), ("LCG", 32), ("LCG", 3)):
+        with pytest.raises(RuntimeError, match="co-resident clusters"):
+            launch_grid(arm, rows, max_active_clusters=0, **kw)
+    # Arm GW needs at least one co-resident CTA pair.
+    with pytest.raises(RuntimeError, match="2-CTA clusters"):
+        launch_grid("GW", 4096, max_active_clusters=0, **kw)
+    assert launch_grid("GW", 4096, max_active_clusters=1, **kw) == ARM_GW_CLUSTER
+    # The Q4S family needs the 128 plan-owner CTAs co-resident.
+    for arm in ARM_Q4S_FAMILY:
+        with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
+            launch_grid(
+                arm, 2048, max_active_clusters=OWNER_CTAS // ARM_Q4S_CLUSTER - 1, **kw
+            )
+        assert (
+            launch_grid(
+                arm, 2048, max_active_clusters=OWNER_CTAS // ARM_Q4S_CLUSTER, **kw
+            )
+            == OWNER_CTAS
+        )
+
+
+def test_capacity_rule_routes_q4s_cells():
+    """Q4S-family cells follow the batch against C, the device's Q4S-family cap."""
+    assert CAPACITY_PROGRAM_ARM == "Q4SP"
+    assert CAPACITY_ROUTES == {
+        "sm_100a": ("Q4SP", "Q4SPW"),
+        "sm_103a": ("Q4SP", "Q4SPW"),
+    }
+    assert CAPACITY_WIDE_OFFSET == {
+        ("sm_100a", 8): 64,
+        ("sm_100a", 16): 64,
+        ("sm_103a", 16): 64,
+    }
+    rule = CAPACITY_ROUTES["sm_103a"]
+    # GB300 (152 SMs): C = 592, 2C = 1184; at block_m 16 the wide arm starts
+    # at 2C + 64 = 1248.
+    gb300 = {
+        256: "M",
+        257: "Q4S",
+        512: "Q4S",
+        592: "Q4S",
+        593: "Q4SP",
+        1024: "Q4SP",
+        1183: "Q4SP",
+        1184: "Q4SPW",
+        2048: "Q4SPW",
+        2049: "GW",
+        8192: "GW",
+    }
+    wide16 = {1184: "Q4SP", 1247: "Q4SP", 1248: "Q4SPW"}
+    for bm in BLOCK_M_VALUES:
+        expected = {**gb300, **(wide16 if bm == 16 else {})}
+        for rows, arm in expected.items():
+            got = route_arm("sm_103a", rows, bm, cluster_capacity=592)
+            assert got == arm, (bm, rows)
+        # Without a capacity the cell's arm (the arm of num_tokens <= C) remains.
+        assert route_arm("sm_103a", 1184, bm) == "Q4SP"
+        assert route_arm("sm_103a", 593, bm) == "Q4S"
+    # A 148-SM device at C = 568 under the same rule: 568 / 569 / 1135 / 1136.
+    assert capacity_arm("Q4S", 568, 568, rule) == "Q4S"
+    assert capacity_arm("Q4S", 569, 568, rule) == "Q4SP"
+    assert capacity_arm("Q4SP", 1135, 568, rule) == "Q4SP"
+    assert capacity_arm("Q4SP", 1136, 568, rule) == "Q4SPW"
+    assert capacity_arm("Q4SP", 1199, 568, rule, 64) == "Q4SP"
+    assert capacity_arm("Q4SP", 1200, 568, rule, 64) == "Q4SPW"
+    # B200 (148 SMs): C = 568, 2C = 1136; at both block_m values the wide arm
+    # starts at 2C + 64 = 1200.
+    b200 = {
+        256: "M",
+        257: "Q4S",
+        512: "Q4S",
+        568: "Q4S",
+        569: "Q4SP",
+        1024: "Q4SP",
+        1135: "Q4SP",
+        1136: "Q4SP",
+        1199: "Q4SP",
+        1200: "Q4SPW",
+        2048: "Q4SPW",
+        2049: "GW",
+        8192: "GW",
+    }
+    for bm in BLOCK_M_VALUES:
+        for rows, arm in b200.items():
+            got = route_arm("sm_100a", rows, bm, cluster_capacity=568)
+            assert got == arm, (bm, rows)
+        assert route_arm("sm_100a", 1200, bm) == "Q4SP"
+        assert route_arm("sm_100a", 569, bm) == "Q4S"
+    # A small slice moves to the wide arm early; other arms never change.
+    assert capacity_arm("Q4S", 300, 128, rule) == "Q4SPW"
+    assert capacity_arm("Q4S", 200, 128, rule) == "Q4SP"
+    assert capacity_arm("Q4S", 300, 128, rule, 64) == "Q4SP"
+    assert capacity_arm("Q4S", 320, 128, rule, 64) == "Q4SPW"
+    for arm in ("L", "LP", "LPC", "LC", "LCG", "M", "GW"):
+        assert capacity_arm(arm, 4096, 1, rule) == arm
+    with pytest.raises(RuntimeError, match="admits none"):
+        capacity_arm("Q4S", 300, 0, rule)
+    # Availability asks for every arm a shape may take on some device.
+    assert route_arm_candidates("sm_103a", 1024, 8) == ("Q4S", "Q4SP", "Q4SPW")
+    assert route_arm_candidates("sm_103a", 2048, 16) == ("Q4SP", "Q4SPW")
+    assert route_arm_candidates("sm_103a", 128, 8) == ("LP",)
+    assert route_arm_candidates("sm_100a", 64, 8) == ("LPC",)
+    assert route_arm_candidates("sm_100a", 1024, 8) == ("Q4S", "Q4SP", "Q4SPW")
+    assert route_arm_candidates("sm_100a", 2048, 16) == ("Q4SP", "Q4SPW")
 
 
 def test_registry_keys_are_dispatch_arms():
@@ -508,19 +684,32 @@ def test_registry_keys_are_dispatch_arms():
             assert record["arm"] == arm
             assert record["num_tokens"] == (int(rows) if rows else None)
             assert arch in record["arches"]
-            assert record["launch"]["cooperative"] == (arm != "LC")
+            assert record["launch"]["cooperative"] == (arm not in ("LC", "LCG"))
             cluster = record["launch"]["cluster"][0]
             if arm == "LC":
                 assert cluster == int(rows)
+            elif arm == "LCG":
+                assert cluster == ARM_LCG_CLUSTER
             elif arm in ARM_Q4S_FAMILY:
                 assert cluster == ARM_Q4S_CLUSTER
+            elif arm == "GW":
+                assert cluster == ARM_GW_CLUSTER
             else:
                 assert cluster == 1
             # The occupancy query ships exactly with the cluster-bounded programs.
             assert cake_jit.queries_occupancy(name) == (
-                arm in ARM_Q4S_FAMILY or key == "LC:16"
+                arm in (*ARM_Q4S_FAMILY, "LCG", "GW") or key == "LC:16"
             )
             assert ("kernel_declaration" in record) == cake_jit.queries_occupancy(name)
+    # Every arm a route table or a capacity rule names is registered, and only those:
+    # the package ships no program that no cell dispatches to.
+    for arch, table in SHAPE_ROUTES.items():
+        keys = {
+            cake_jit.kernel_key(arm, rows if arm == "LC" else None)
+            for (rows, _), arm in table.items()
+        }
+        keys.update(CAPACITY_ROUTES.get(arch, ()))
+        assert keys == set(cake_jit.ROUTES[arch]), arch
     with pytest.raises(ValueError, match="per num_tokens"):
         cake_jit.kernel_key("LC")
     assert cake_jit.kernel_key("LC", 4) == "LC:4"
@@ -665,7 +854,10 @@ def _run_and_check(num_tokens, block_m, seed):
     plan = allocate_kimi_k3_route_plan(num_tokens, block_m, device)
     poison_plan(plan)
     runner = prepare_kimi_k3_fused_router(logits, bias, block_m=block_m, plan=plan)
-    assert runner.arm == route_arm(_gpu_arch(), num_tokens, block_m)
+    capacity = cake_backend.route_capacity(device, block_m)
+    assert runner.arm == route_arm(
+        _gpu_arch(), num_tokens, block_m, cluster_capacity=capacity
+    )
     out = runner()
     torch.cuda.synchronize()
     assert out is plan
@@ -740,6 +932,18 @@ def test_launch_makes_no_allocation():
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
+
+
+def test_route_capacity_follows_the_device():
+    device = _require_program(1024, 8)
+    for bm in BLOCK_M_VALUES:
+        capacity = cake_backend.route_capacity(device, bm)
+        if _gpu_arch() in CAPACITY_ROUTES:
+            # C is whole 4-CTA clusters and at least the plan owners.
+            assert capacity is not None
+            assert capacity % ARM_Q4S_CLUSTER == 0 and capacity >= OWNER_CTAS
+        else:
+            assert capacity is None
 
 
 def test_prepare_caches_device_facts_and_occupancy():
