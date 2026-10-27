@@ -4184,14 +4184,17 @@ def test_w4a8_fused_moe_tactics_and_apis(
 @cute_dsl_available
 @sm10x_required
 class TestRubinMultiCtaTacticRejected:
-    """A Rubin tactic with ``cluster_shape_m > 1`` must be refused.
+    """A Rubin tactic whose cluster spans several routing tiles must be refused.
 
     ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
-    uninitialized. A multi-CTA cluster would require the tile count handed to
-    the kernel to be rounded up to a multiple of ``cluster_shape_m`` so every
-    cluster reaches its barrier uniformly, which widens the kernels' bounds
-    check past what routing wrote. Neither the rounding nor the matching
-    buffer initialization is implemented.
+    uninitialized. A cluster over several routing tiles (1-CTA MMA with
+    ``cluster_shape_m > 1``) would require the tile count handed to the kernel
+    to be rounded up to a multiple of ``cluster_shape_m`` so every cluster
+    reaches its barrier uniformly, which widens the kernels' bounds check past
+    what routing wrote. Neither the rounding nor the matching buffer
+    initialization is implemented. A 2-CTA MMA (``mma_inst_shape[0] == 256``)
+    with ``cluster_shape_m == 2`` covers exactly one routing tile and is
+    accepted (``test_two_cta_rubin_tactic_is_not_rejected``).
 
     ``get_valid_tactics`` filters these out during autotuning, but that path
     is bypassed by an explicitly supplied or cache-restored tactic, so
@@ -4202,22 +4205,33 @@ class TestRubinMultiCtaTacticRejected:
     pytestmark = _requires_dsl_arch
 
     @staticmethod
-    def _rubin_tactic_params(gemm1_cluster_m: int, gemm2_cluster_m: int):
-        """Synthetic Rubin tactic parameters, optionally multi-CTA."""
+    def _rubin_tactic_params(
+        gemm1_cluster_m: int, gemm2_cluster_m: int, gemm2_rubin: bool = True
+    ):
+        """Synthetic Rubin tactic parameters, optionally multi-CTA.
+
+        With ``gemm2_rubin=False`` GEMM2 gets no Rubin MMA shapes, so the
+        backstop has no CTA group size to check its cluster against.
+        """
         return dict(
             gemm1_mma_tiler=(128, 128, 256),
             gemm1_mma_inst_shape=(128, 128, 128),
             gemm1_cluster_shape_mn=(gemm1_cluster_m, 1),
-            gemm2_mma_tiler=(128, 128, 256),
-            gemm2_mma_inst_shape=(128, 128, 128),
+            gemm2_mma_tiler=(128, 128, 256) if gemm2_rubin else None,
+            gemm2_mma_inst_shape=(128, 128, 128) if gemm2_rubin else None,
             gemm2_cluster_shape_mn=(gemm2_cluster_m, 1),
         )
 
     @pytest.mark.parametrize(
-        "gemm1_cluster_m,gemm2_cluster_m", [(2, 1), (1, 2), (2, 2)]
+        "gemm1_cluster_m,gemm2_cluster_m,gemm2_rubin",
+        [(2, 1, True), (1, 2, True), (2, 2, True), (1, 2, False)],
     )
     def test_rejected_before_routing(
-        self, monkeypatch, gemm1_cluster_m: int, gemm2_cluster_m: int
+        self,
+        monkeypatch,
+        gemm1_cluster_m: int,
+        gemm2_cluster_m: int,
+        gemm2_rubin: bool,
     ):
         """Rejection must precede ``moe_sort`` and any GEMM launch."""
         import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
@@ -4260,7 +4274,9 @@ class TestRubinMultiCtaTacticRejected:
                 top_k=top_k,
                 num_local_experts=num_experts,
                 output_dtype=torch.bfloat16,
-                **self._rubin_tactic_params(gemm1_cluster_m, gemm2_cluster_m),
+                **self._rubin_tactic_params(
+                    gemm1_cluster_m, gemm2_cluster_m, gemm2_rubin
+                ),
             )
 
         assert not routing_calls, "routing ran despite an unsupported tactic"
@@ -4313,6 +4329,60 @@ class TestRubinMultiCtaTacticRejected:
                 **self._rubin_tactic_params(1, 1),
             )
 
+    def test_two_cta_rubin_tactic_is_not_rejected(self, monkeypatch):
+        """A 2-CTA tile-256 tactic (cluster (2, 1)) covers one routing tile.
+
+        Both CTAs of the cluster map to the same moe_sort tile, so no tile
+        count rounding or metadata initialization is needed and the runtime
+        backstop must let it through to routing.
+        """
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        class _Reached(Exception):
+            pass
+
+        def _tripwire(*args, **kwargs):
+            raise _Reached
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(_Reached):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                tile_size=256,
+                gemm1_mma_tiler=(256, 256, 256),
+                gemm1_mma_inst_shape=(256, 256, 128),
+                gemm1_cluster_shape_mn=(2, 1),
+                gemm2_mma_tiler=(256, 256, 256),
+                gemm2_mma_inst_shape=(128, 256, 128),
+                gemm2_cluster_shape_mn=(1, 1),
+            )
+
     def test_autotuner_filters_multi_cta_tactics(self):
         """``_tactic_ok`` must drop synthetic multi-CTA Rubin tactics.
 
@@ -4335,6 +4405,136 @@ class TestRubinMultiCtaTacticRejected:
         assert _is_rubin_tactic(synthetic), "synthetic tactic is not Rubin-shaped"
         assert synthetic not in ALL_RUBIN_MOE_TACTICS, (
             "a multi-CTA tactic is present in the enumerated Rubin list"
+        )
+
+
+def _rubin_tactic_with(predicate):
+    """Return the first enumerated Rubin MoE tactic matching ``predicate``."""
+    from flashinfer.fused_moe.cute_dsl.tuner import ALL_RUBIN_MOE_TACTICS
+
+    return next(t for t in ALL_RUBIN_MOE_TACTICS if predicate(t))
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not is_sm107(), reason="Rubin (SM107) MoE tactics")
+class TestRubinTwoCtaAndClusterNTacticsAccuracy:
+    """2-CTA tile-256 and cluster_shape_n=2 Rubin plans match the reference.
+
+    Runs one plan of each new kind at the Qwen3-VL-235B MoE shape (128
+    experts, top-8, hidden 4096, intermediate 1536). Random routing leaves
+    partial routing tiles; balanced routing fills every tile.
+    """
+
+    pytestmark = _requires_dsl_arch
+
+    @pytest.mark.parametrize("routing", ["random", "balanced"])
+    @pytest.mark.parametrize(
+        "pick",
+        [
+            pytest.param(
+                lambda t: t[1][2] == (2, 1) and t[2][2] == (2, 1),
+                id="2cta-fc1-2cta-finalize",
+            ),
+            pytest.param(
+                lambda t: t[0] == 256 and t[2][2] == (1, 2),
+                id="tile256-finalize-cluster-n2",
+            ),
+            pytest.param(
+                lambda t: t[0] == 128 and t[2][2] == (1, 2),
+                id="tile128-finalize-cluster-n2",
+            ),
+        ],
+    )
+    def test_accuracy(self, pick, routing: str):
+        """Run the picked plan end to end and compare to the FP4 reference."""
+        from flashinfer import CuteDslMoEWrapper
+        from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+        if not is_rubin_cute_dsl_available():
+            pytest.skip("Rubin requires CuTe DSL 4.8")
+
+        num_tokens, hidden_size, intermediate_size = 1024, 4096, 1536
+        num_experts, top_k = 128, 8
+        tactic = _rubin_tactic_with(pick)
+
+        torch.manual_seed(0)
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        if routing == "balanced":
+            expert_ids = torch.arange(
+                num_tokens * top_k, device="cuda", dtype=torch.int32
+            )
+            tensors["token_selected_experts"] = (
+                (expert_ids % num_experts).view(num_tokens, top_k).contiguous()
+            )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+        inputs = [
+            tensors["x"],
+            tensors["x_sf"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
+        ]
+        assert tactic in moe._runner.get_valid_tactics(inputs, None), (
+            f"{tactic} is not offered for the Qwen3-VL MoE shape"
+        )
+
+        result = moe.run(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            tactic=tactic,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert torch.isfinite(result).all(), f"non-finite output for {tactic}"
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"{tactic}: only {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
         )
 
 
