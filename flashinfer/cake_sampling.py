@@ -449,7 +449,7 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant ships a whole-CTA-tail build (a manifest entry with ``fused_block_tail``): the
     kernel taken by launch_flags bit 3, built for the cluster-8 streams the host can fuse it into
     (``_fuse_block_tail``) and, as a speculative-sample build (bits 3 + 6), for the cluster-1 ept-32 stream
-    (``_c1_block_tail``).  The default build of every variant carries only the two-warp tail --
+    (``_c12_block_tail``).  The default build of every variant carries only the two-warp tail --
     compiling the whole-CTA tail into it slowed every k <= 64 launch on sm_103a / sm_107a by 13-33 %."""
     found = False
     for v in load_manifest()["stage1"]:
@@ -470,7 +470,7 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
 # identical; eager 0.93-0.98).  R200 keeps the cluster-8 chain (no graph-replay A/B recorded for it).  This policy covers
 # the cluster-8 streams (``_fuse_block_tail``), up to the vocabulary bound of ``_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY``;
-# the cluster-1 cells are listed per capability in ``_C1_BLOCK_TAIL_CELLS``.
+# the cluster-1 / cluster-2 cells are listed per capability in ``_C12_BLOCK_TAIL_CELLS``.
 _BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3)}
 )
@@ -515,40 +515,56 @@ def _stage1_has_block_tail_build(cluster: int, ept: int, spec_sample: bool) -> b
     )
 
 
-# Cluster-1 cells whose spec-sample stream takes the whole-CTA tail (launch_flags bits 3 + 6) per capability: one CTA
-# per row, so every row's tail runs beside the others in a one-wave grid and the stage-2/3 launch, its ramp and its
-# prologue leave the chain.  At V = 262144, batch 128, k = 1000 the one launch runs about 0.95-0.97 of the two-launch
-# chain of the same stage-1 text on B200 and GB300 and 0.98-0.99 on R200, eager and under graph replay, with the same
-# sampled tokens.
-_C1_BLOCK_TAIL_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
-    (10, 0): frozenset({(262144, 128)}),
-    (10, 3): frozenset({(262144, 128)}),
-    (10, 7): frozenset({(262144, 128)}),
+# Cluster-1 / cluster-2 cells whose stream takes the whole-CTA tail (launch_flags bit 3, with bit 6 for the
+# speculative-sample build) per capability: (vocab, batch) -> the (cluster, ept, spec_sample) of the whole-CTA-tail
+# build the cell launches above top-k 768, whatever the measured pick.  One CTA (cluster 1) or two (cluster 2) per row,
+# so on a one-wave grid every row's tail runs beside the others and the stage-2/3 launch, its ramp and its prologue
+# leave the chain.  At V = 262144, batch 128, k = 1000 the cluster-1 speculative-sample launch runs about 0.95-0.97 of
+# the two-launch chain of the same stage-1 text on B200 and GB300 and 0.98-0.99 on R200, eager and under graph replay,
+# with the same sampled tokens.  Round 17 (lever BT-X) adds two H100 cells on the default-sample builds of the (1, 16)
+# and (2, 32) streams: at k = 1000 (two boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up
+# round, the same sampled tokens) V = 32768 with 128 rows ran 0.90-0.91x and V = 262144 with 32 rows 0.94-0.96x of the
+# chains they replace (the (1, 16) speculative-sample chain and the (2, 16) chain).  Other cells lost or tied: on H100
+# V = 128256 / 151936 / 262144 with 128 rows and V = 151936 / 262144 with 64 rows ran 1.07-1.23x; B200 lost on every
+# screened cell but V = 32768 with 128 rows, which tied (up to 1.006x eager), so B200 keeps the chain.
+_C12_BLOCK_TAIL_CELLS: dict[
+    tuple[int, int], dict[tuple[int, int], tuple[int, int, bool]]
+] = {
+    (9, 0): {(32768, 128): (1, 16, False), (262144, 32): (2, 32, False)},
+    (10, 0): {(262144, 128): (1, 32, True)},
+    (10, 3): {(262144, 128): (1, 32, True)},
+    (10, 7): {(262144, 128): (1, 32, True)},
 }
 
 
-def _c1_block_tail(
+def _c12_block_tail(
     batch: int,
     vocab: int,
-    cluster: int,
-    ept: int,
-    stream: bool,
     top_k_max: Optional[int],
     capability: tuple[int, int],
-) -> bool:
-    """Whether a cluster-1 stream launch runs the spec-sample whole-CTA tail (``_C1_BLOCK_TAIL_CELLS``)."""
+    sm_count: int,
+    smem_limit: Optional[int] = None,
+) -> Optional[tuple[int, int, bool]]:
+    """The (cluster, ept, spec_sample) of the cluster-1 / cluster-2 whole-CTA-tail stream build this call launches
+    (``_C12_BLOCK_TAIL_CELLS``): 768 < top_k_max <= the slab, the build ships and fits ``smem_limit``, and its
+    stage-1 grid is a single wave; else None."""
     if top_k_max is None or not (
         _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
     ):
-        return False
-    if not (stream and int(cluster) == 1):
-        return False
-    cells = _C1_BLOCK_TAIL_CELLS.get(
-        (int(capability[0]), int(capability[1])), frozenset()
+        return None
+    build = _C12_BLOCK_TAIL_CELLS.get((int(capability[0]), int(capability[1])), {}).get(
+        (int(vocab), int(batch))
     )
-    if (int(vocab), int(batch)) not in cells:
-        return False
-    return _stage1_has_block_tail_build(cluster, ept, True)
+    if build is None:
+        return None
+    cluster, ept, spec = build
+    if (cluster, ept, True) not in _stage1_variants(smem_limit):
+        return None
+    if not _stage1_has_block_tail_build(cluster, ept, spec):
+        return None
+    if int(batch) * cluster > min(int(sm_count), _wave_ctas(int(sm_count))[cluster]):
+        return None
+    return build
 
 
 # Round 17 (lever LP-BT 3b): the leader-push form of the cluster-8 ept-16 stream's whole-CTA-tail build (`_lp_bt`, and
@@ -2161,8 +2177,15 @@ def _launch_plan(
     lp_block = _block_tail_enabled(device_index) and _leader_push_block_tail(
         batch, vocab, top_k_max, sm_count, capability
     )
+    c12_block = (
+        None
+        if lp_block
+        else _c12_block_tail(batch, vocab, top_k_max, capability, sm_count, smem_limit)
+    )
     if lp_block:
         cluster, ept, stream = _LEADER_PUSH_BLOCK_TAIL_STAGE1
+    elif c12_block is not None:
+        cluster, ept, stream = c12_block[0], c12_block[1], True
     else:
         cluster, ept, stream = _sm12x_resident(
             capability,
@@ -2188,11 +2211,9 @@ def _launch_plan(
     )
     # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
     # one-wave stage-1 grid.
-    c1_block = not fused and _c1_block_tail(
-        batch, vocab, cluster, ept, stream, top_k_max, capability
-    )
+    c12_fused = not fused and c12_block is not None
     fused_block = (
-        c1_block
+        c12_fused
         or lp_block
         or (
             not fused
@@ -2235,7 +2256,8 @@ def _launch_plan(
             cluster, ept, stream, launch_flags, top_k_max, capability, vocab
         )
     elif fused_block:
-        launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if c1_block else 0)
+        spec_block = c12_fused and c12_block is not None and c12_block[2]
+        launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if spec_block else 0)
         launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
         if lp_block:
             launch_flags |= _FLAG_LEADER_PUSH
