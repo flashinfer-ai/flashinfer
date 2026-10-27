@@ -386,6 +386,8 @@ def _resolve_plan_dtypes(
     v_dtype: torch.dtype | None,
     output_dtype: torch.dtype | None,
     sage: SageAttentionConfig | None,
+    *,
+    use_block_sparse: bool,
 ) -> tuple[torch.dtype, torch.dtype, torch.dtype, str]:
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
@@ -400,6 +402,13 @@ def _resolve_plan_dtypes(
     if sage is None:
         if output_dtype is None:
             output_dtype = q_dtype
+        if (
+            not use_block_sparse
+            and q_dtype == kv_dtype == v_dtype == torch.float8_e4m3fn
+            and output_dtype in _SUPPORTED_DTYPES
+        ):
+            # Dense per-tensor FP8: the run's bmm1/bmm2 scales carry Q/K/V scales.
+            return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
         return (
             kv_dtype,
             v_dtype,
@@ -498,7 +507,12 @@ def _validate_block_sparse_static_profile(
     if mask_type == "causal" and seq_len_q > seq_len_kv:
         raise ValueError("causal block-sparse requires seq_len_q <= seq_len_kv")
     kv_dtype, v_dtype, output_dtype, dtype_key = _resolve_plan_dtypes(
-        q_dtype, kv_dtype, v_dtype, output_dtype, sage
+        q_dtype,
+        kv_dtype,
+        v_dtype,
+        output_dtype,
+        sage,
+        use_block_sparse=use_block_sparse,
     )
     kv_route_size = _select_block_sparse_kv_route_size(
         q_tile_size=q_tile_size,

@@ -39,6 +39,8 @@ class _PairedCase:
     seq_len_q: int
     seq_len_kv: int
     dtype: torch.dtype = torch.bfloat16
+    # A per-tensor E4M3 plan's 16-bit output; None takes the Q dtype.
+    o_dtype: torch.dtype | None = None
     batch_size: int = 2
     num_kv_heads: int = 2
     persistent: bool = False
@@ -68,6 +70,14 @@ _CASES = (
         seq_len_kv=1072,
         mask_type="causal",
         persistent=True,
+    ),
+    _PairedCase(
+        "fp8_causal_fp16_out",
+        seq_len_q=64,
+        seq_len_kv=1072,
+        dtype=_FP8,
+        o_dtype=torch.float16,
+        mask_type="causal",
     ),
 )
 
@@ -99,6 +109,7 @@ def _plan(case: _PairedCase, *, query_paired: bool) -> BlockSparseTSWrapper:
                 use_block_sparse=False,
                 mask_type=case.mask_type,
                 q_data_type=case.dtype,
+                o_data_type=case.o_dtype,
                 query_paired=query_paired,
             )
     finally:
@@ -131,19 +142,39 @@ def _reference(q, k, v, sm_scale: float, mask_type: str) -> torch.Tensor:
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_dense_plan_matches_fp32(case: _PairedCase, query_paired: bool) -> None:
-    """Paired and unpaired dense Q128 plans match FP32 attention."""
+    """Paired and unpaired dense Q128 plans match FP32 attention.
+
+    E4M3 tensors carry per-tensor scales: Q and K through ``sm_scale``, V
+    through ``bmm2_scale``.
+    """
 
     torch.manual_seed(20261018)
     shape_q = (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM)
     shape_kv = (case.batch_size, case.seq_len_kv, case.num_kv_heads, _HEAD_DIM)
+    tensors = [
+        torch.randn(shape, device="cuda") for shape in (shape_q, shape_kv, shape_kv)
+    ]
+    scales = [
+        tensor.abs().amax().item() / 448.0 if case.dtype == _FP8 else 1.0
+        for tensor in tensors
+    ]
     q, k, v = (
-        torch.randn(shape, device="cuda").to(case.dtype)
-        for shape in (shape_q, shape_kv, shape_kv)
+        (tensor / scale).to(case.dtype)
+        for tensor, scale in zip(tensors, scales, strict=True)
     )
     sm_scale = _HEAD_DIM**-0.5
-    out = _plan(case, query_paired=query_paired).run(q, k, v, sm_scale=sm_scale)
-    assert out.dtype == case.dtype
-    expected = _reference(q, k, v, sm_scale, case.mask_type)
+    out = _plan(case, query_paired=query_paired).run(
+        q, k, v, sm_scale=sm_scale * scales[0] * scales[1], bmm2_scale=scales[2]
+    )
+    assert out.dtype == (case.o_dtype or case.dtype)
+    expected = _reference(
+        *(
+            tensor.float() * scale
+            for tensor, scale in zip((q, k, v), scales, strict=True)
+        ),
+        sm_scale,
+        case.mask_type,
+    )
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
 

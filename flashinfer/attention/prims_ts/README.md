@@ -331,7 +331,9 @@ the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
 Sage plan. A dense plan may omit `q_block_size` and `kv_block_size`; each then
 defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
-both.
+both. A dense Q128 plan also takes per-tensor `torch.float8_e4m3fn` Q/K/V with
+a 16-bit output: `run` takes the Q and K scales in `sm_scale` and the V scale
+in `bmm2_scale`, which scales the output.
 
 A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
 `query_paired=True`: each CTA then runs two consecutive Q128 tiles of one

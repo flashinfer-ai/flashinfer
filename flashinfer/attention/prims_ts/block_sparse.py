@@ -239,6 +239,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``k_data_type``. ``kv_data_type`` is a compatibility alias that sets
         both K and V; explicit K/V dtypes must agree with it.
 
+        A dense plan also takes per-tensor ``torch.float8_e4m3fn`` Q/K/V with
+        a ``torch.float16`` or ``torch.bfloat16`` output: :meth:`run` folds
+        the Q and K scales into ``sm_scale`` and the V scale into
+        ``bmm2_scale``.
+
         ``sage_config`` enables Sage attention on the Q64/KV256 and Q128/KV128
         Keeps profiles: Q and K share ``torch.float8_e4m3fn`` or
         ``torch.int8``, V is ``torch.float8_e4m3fn`` (so INT8 plans set
@@ -344,6 +349,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         out: torch.Tensor | None = None,
         validate: bool = True,
         sage: SageAttentionParams | None = None,
+        bmm2_scale: float = 1.0,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -426,6 +432,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         sage : SageAttentionParams, optional
             Scale tensors of this run. Required by a Sage plan and rejected
             otherwise.
+        bmm2_scale : float
+            Scale applied to the output of a dense plan, such as the V scale
+            of per-tensor E4M3 V, whose Q and K scales ``sm_scale`` carries.
+            Defaults to 1.0; a block-sparse plan accepts only 1.0.
 
         Returns
         -------
@@ -454,6 +464,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             sm_scale=sm_scale,
             out=out,
             sage=sage,
+            bmm2_scale=bmm2_scale,
         )
         run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
@@ -483,6 +494,7 @@ def block_sparse_attention(
     sage: SageAttentionParams | None = None,
     sage_config: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    bmm2_scale: float = 1.0,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -551,6 +563,9 @@ def block_sparse_attention(
     softmax_rescale_threshold_log2 : float, optional
         Binades a row maximum may rise before the output is rescaled, 0 to 8
         (default 8); see :meth:`BlockSparseTSWrapper.plan`.
+    bmm2_scale : float, optional
+        Output scale of a dense call, such as the V scale of per-tensor E4M3
+        V; see :meth:`BlockSparseTSWrapper.run`. Defaults to 1.0.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -677,6 +692,7 @@ def block_sparse_attention(
         sm_scale=sm_scale,
         out=out,
         sage=sage,
+        bmm2_scale=bmm2_scale,
     )
 
 

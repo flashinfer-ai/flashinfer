@@ -2919,6 +2919,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
         **values,
         kv_valid_bits_is_live=True,
         sm_scale=1.25,
+        bmm2_scale=0.5,
         paged_kv=None,
     )
 
@@ -2950,6 +2951,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             None,  # v_scale
             None,  # v_mean
             1.25,
+            0.5,  # bmm2_scale
         )
     ]
 
@@ -3043,6 +3045,12 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             {"num_qo_heads": 65_536, "num_kv_heads": 65_536},
             r"grid\.y.*num_kv_heads=65536",
             id="head-grid-limit",
+        ),
+        # Per-tensor E4M3 runs only dense plans.
+        pytest.param(
+            {"q_data_type": torch.float8_e4m3fn, "o_data_type": torch.bfloat16},
+            "matching Q, K/V, and output dtypes",
+            id="fp8-block-sparse",
         ),
     ),
 )

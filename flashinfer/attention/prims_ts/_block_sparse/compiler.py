@@ -136,6 +136,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         v_scale: cute.Tensor | None,
         v_mean: cute.Tensor | None,
         sm_scale: cutlass.Float32,
+        bmm2_scale: cutlass.Float32,
         stream: cuda_drv.CUstream,
         static_config: cutlass.Constexpr[FmhaDecodeConfig],
         static_batch_size: cutlass.Constexpr[int],
@@ -241,7 +242,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 null_i32,  # split_kv_counter
                 null_f32,  # attention_sinks
                 sm_scale,
-                Float32(1.0),  # output_scale
+                bmm2_scale,  # output_scale
                 Int32(
                     static_seq_len_kv * static_num_kv_heads * static_head_dim
                 ),  # kv_b_stride
@@ -452,6 +453,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             sage_scales_fake,
             Int32(0),
             *sage_fakes,
+            Float32(1.0),
             Float32(1.0),
         )
     else:

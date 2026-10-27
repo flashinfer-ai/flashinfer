@@ -97,6 +97,8 @@ class _BlockSparseRunArgs:
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
+    # Output scale of a dense contiguous run; block-sparse runs keep 1.0.
+    bmm2_scale: float = 1.0
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
@@ -326,6 +328,7 @@ def validate_block_sparse_run(
     sm_scale: float | None,
     out: torch.Tensor | None,
     sage: SageAttentionParams | None = None,
+    bmm2_scale: float = 1.0,
 ) -> _BlockSparseRunArgs:
     """Validate one run and allocate only an omitted output tensor.
 
@@ -335,6 +338,8 @@ def validate_block_sparse_run(
     explicit output is returned by identity and may not overlap any live launch
     input or plan-owned buffer. Storage overlap is a caller precondition and
     is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
+    ``bmm2_scale`` scales the output of a dense run; a block-sparse plan
+    accepts only 1.0.
     """
 
     use_proxy_routes = state.use_proxy_routes
@@ -476,6 +481,9 @@ def validate_block_sparse_run(
         if sm_scale is None
         else _validate_scale(sm_scale, "sm_scale")
     )
+    bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+    if state.use_block_sparse and bmm2_scale != 1.0:
+        raise ValueError("bmm2_scale must be 1.0 for a block-sparse plan")
     if out is None:
         out = torch.empty(q_shape, device=state.device, dtype=state.output_dtype)
     else:
@@ -499,6 +507,7 @@ def validate_block_sparse_run(
         kv_valid_bits=effective_kv_valid_bits,
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
+        bmm2_scale=bmm2_scale,
         paged_kv=paged_kv,
         sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
@@ -518,6 +527,7 @@ def prepare_block_sparse_run_unchecked(
     sm_scale: float | None,
     out: torch.Tensor | None,
     sage: SageAttentionParams | None = None,
+    bmm2_scale: float = 1.0,
 ) -> _BlockSparseRunArgs:
     """Canonicalize one trusted run without invoking explicit validators.
 
@@ -573,6 +583,7 @@ def prepare_block_sparse_run_unchecked(
         sm_scale=1.0 / math.sqrt(state.head_dim)
         if sm_scale is None
         else float(sm_scale),
+        bmm2_scale=float(bmm2_scale),
         paged_kv=paged_kv,
         sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
@@ -658,6 +669,7 @@ def launch_block_sparse(
             0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
             *run_args.sage_slots,
             run_args.sm_scale,
+            run_args.bmm2_scale,
         )
     return run_args.out
 

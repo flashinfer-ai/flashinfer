@@ -139,6 +139,10 @@ _SAGE_GROUPED_KEEPS_PROFILES = {
     for qk_dtype in (Float8E4M3FN, Int8)
     for out_dtype in (Float16, BFloat16)
 }
+# Dense per-tensor E4M3 Q128 recipes: the Sage Q128 resources without scales.
+_CONTIGUOUS_FP8_GROUPED_KEEPS_PROFILES = {
+    profile for profile in _SAGE_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
+}
 # (Q, K, output) dtype triples of the Sage recipes; V is E4M3 in every one.
 _SAGE_DTYPE_RECIPES = {
     (profile[0], profile[1], profile[3]) for profile in _SAGE_GROUPED_KEEPS_PROFILES
@@ -2453,12 +2457,14 @@ class FmhaDecodeConfig:
     @property
     def _uses_contiguous_grouped_keeps_recipe(self) -> bool:
         """Whether the dtype and staging key is a contiguous grouped-Keeps recipe."""
-        profiles = (
-            _SAGE_GROUPED_KEEPS_PROFILES
-            if self.use_sage_attention
-            else _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+        profile = self._grouped_keeps_profile_key
+        if self.use_sage_attention:
+            return profile in _SAGE_GROUPED_KEEPS_PROFILES
+        return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES or (
+            profile in _CONTIGUOUS_FP8_GROUPED_KEEPS_PROFILES
+            and self.tile_size_q == 128
+            and not self.use_block_sparse
         )
-        return self._grouped_keeps_profile_key in profiles
 
     @property
     def _in_grouped_q_selection_scope(self) -> bool:
@@ -5105,7 +5111,7 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
             and cfg._grouped_keeps_profile_key in _GROUPED_KEEPS_PAGED_FP8_PROFILES
         )
     ):
-        raise ValueError("query_paired supports FP16, BF16, Sage and paged FP8 recipes")
+        raise ValueError("query_paired supports FP16, BF16, FP8 and Sage recipes")
     if (
         cfg.use_block_sparse
         or cfg.use_split_kv
