@@ -837,6 +837,54 @@ class Sm100BlockScaledMoeEpilogue:
             )
 
     @cute.jit
+    def _scatter_metadata(
+        self,
+        alpha,
+        per_token_scale,
+        token_mapping,
+        token_final_scales,
+        route_start,
+        valid_tokens,
+        lane,
+    ):
+        """Keep route indices and rounded output scales in registers for every slab."""
+        groups = max(1, self.tile_n // 32)
+        output_rows = cute.make_rmem_tensor((groups,), cutlass.Int32)
+        output_scales = cute.make_rmem_tensor((groups,), cutlass.Float32)
+        for group in cutlass.range_constexpr(groups):
+            output_rows[group] = 0
+            output_scales[group] = alpha
+            row = route_start + group * 32 + lane
+            if group * 32 + lane < valid_tokens:
+                expanded = token_mapping[row]
+                output_row = expanded
+                route_scale = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.use_fused_finalize):
+                    output_row = expanded // self.top_k
+                    route_scale = cutlass.Float32(
+                        token_final_scales[output_row, expanded % self.top_k]
+                    )
+                if cutlass.const_expr(self.use_per_token_scale):
+                    route_scale = (
+                        route_scale
+                        * per_token_scale[
+                            row
+                            if self.per_token_scale_is_routed
+                            else token_mapping[row] // self.top_k
+                        ]
+                    )
+                scale = alpha * route_scale
+                if cutlass.const_expr(
+                    self.final_scale_dtype in (cutlass.BFloat16, cutlass.Float16)
+                ):
+                    # Match the former metadata buffer's rounding before
+                    # multiplying the FP32 accumulator.
+                    scale = cutlass.Float32(self.final_scale_dtype(scale))
+                output_rows[group] = output_row
+                output_scales[group] = scale
+        return output_rows, output_scales
+
+    @cute.jit
     def _run_bulk_direction(
         self,
         acc_tensor,
@@ -855,7 +903,6 @@ class Sm100BlockScaledMoeEpilogue:
     ):
         warp = (tidx // 32) % 4
         lane = tidx % 32
-        groups = max(1, self.tile_n // 32)
         tokens = self.bulk_tokens
         stages = self.bulk_stages
         if cutlass.const_expr(tokens not in (32, 64)):
@@ -865,30 +912,9 @@ class Sm100BlockScaledMoeEpilogue:
             self.final_scale_dtype in (cutlass.BFloat16, cutlass.Float16)
         ):
             uniform_scale = cutlass.Float32(self.final_scale_dtype(uniform_scale))
-        output_rows = cute.make_rmem_tensor((groups,), cutlass.Int32)
-        scales = cute.make_rmem_tensor((groups,), cutlass.Float32)
-        for group in cutlass.range_constexpr(groups):
-            output_rows[group] = 0
-            scales[group] = alpha
-            row = route_start + group * 32 + lane
-            if group * 32 + lane < valid_tokens:
-                output_rows[group] = token_mapping[row]
-                route_scale = cutlass.Float32(1.0)
-                if cutlass.const_expr(self.use_per_token_scale):
-                    route_scale = (
-                        route_scale
-                        * per_token_scale[
-                            row
-                            if self.per_token_scale_is_routed
-                            else token_mapping[row] // self.top_k
-                        ]
-                    )
-                scale = alpha * route_scale
-                if cutlass.const_expr(
-                    self.final_scale_dtype in (cutlass.BFloat16, cutlass.Float16)
-                ):
-                    scale = cutlass.Float32(self.final_scale_dtype(scale))
-                scales[group] = scale
+        output_rows, scales = self._scatter_metadata(
+            alpha, per_token_scale, token_mapping, None, route_start, valid_tokens, lane
+        )
         # Eight padding elements rotate row banks for the transposed matrix
         # store while keeping each 128-channel bulk-copy row 16-byte aligned.
         shared_all = cute.make_tensor(
@@ -1106,39 +1132,15 @@ class Sm100BlockScaledMoeEpilogue:
             # Fetch the whole tile's routing metadata before its stores. Keeping
             # the slab indices static preserves these values in registers.
             groups = max(1, self.tile_n // 32)
-            output_rows = cute.make_rmem_tensor((groups,), cutlass.Int32)
-            output_scales = cute.make_rmem_tensor((groups,), cutlass.Float32)
-            for group in cutlass.range_constexpr(groups):
-                output_rows[group] = 0
-                output_scales[group] = alpha
-                row = route_start + group * 32 + lane
-                if group * 32 + lane < valid_tokens:
-                    expanded = token_mapping[row]
-                    output_row = expanded
-                    route_scale = cutlass.Float32(1.0)
-                    if cutlass.const_expr(self.use_fused_finalize):
-                        output_row = expanded // self.top_k
-                        route_scale = cutlass.Float32(
-                            token_final_scales[output_row, expanded % self.top_k]
-                        )
-                    if cutlass.const_expr(self.use_per_token_scale):
-                        route_scale = (
-                            route_scale
-                            * per_token_scale[
-                                row
-                                if self.per_token_scale_is_routed
-                                else token_mapping[row] // self.top_k
-                            ]
-                        )
-                    scale = alpha * route_scale
-                    if cutlass.const_expr(
-                        self.final_scale_dtype in (cutlass.BFloat16, cutlass.Float16)
-                    ):
-                        # Match the former metadata buffer's rounding before
-                        # multiplying the FP32 accumulator.
-                        scale = cutlass.Float32(self.final_scale_dtype(scale))
-                    output_rows[group] = output_row
-                    output_scales[group] = scale
+            output_rows, output_scales = self._scatter_metadata(
+                alpha,
+                per_token_scale,
+                token_mapping,
+                token_final_scales,
+                route_start,
+                valid_tokens,
+                lane,
+            )
             for group in cutlass.range_constexpr(groups):
                 if group * 32 < valid_tokens:
                     self._run_token_group(

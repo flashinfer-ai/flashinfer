@@ -301,6 +301,17 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.gather_k = 256 if both_fp4 else 128
         if mma_tiler_mnk[2] != self.gather_k:
             raise ValueError("Unsupported public blockscaled K tile")
+        self.bulk_output_bytes = (
+            output_dtype.width // 8
+            if (
+                scatter_output
+                and not use_fused_finalize
+                and output_dtype in (cutlass.BFloat16, cutlass.Float16)
+                and not generate_sfc
+                and mma_tiler_mnk[1] >= 128
+            )
+            else 0
+        )
         if k_steps is None:
             k_steps = self._select_k_steps(
                 mma_tiler_mnk,
@@ -310,14 +321,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 num_stages,
                 overlap_epilogue,
                 overlap_activation_accumulators,
-                output_dtype.width // 8
-                if (
-                    scatter_output
-                    and not use_fused_finalize
-                    and output_dtype in (cutlass.BFloat16, cutlass.Float16)
-                    and not generate_sfc
-                )
-                else 0,
+                self.bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
             )
@@ -331,10 +335,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.unpack_weights = weight_dtype.width < activation_dtype.width
         self.a_storage_dtype = cutlass.Int8 if self.unpack_weights else weight_dtype
         self.mma_m = mma_tiler_mnk[0]
-        if self.mma_m not in (128, 256):
-            raise ValueError(
-                "Blockscaled split MoE requires M128 or M256 with a supported K tile"
-            )
         if mma_tiler_mnk[1] not in (16, 32, 64, 128, 256):
             raise ValueError("Unsupported routed-token tile")
         self.cta_group_size = self.mma_m // 128
@@ -413,13 +413,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         if self.overlap_activation_accumulators and not self.can_overlap_accumulators:
             raise ValueError("Unsupported overlapping activation accumulator geometry")
         self.tmem_cols = (
-            1
-            << (
-                self.acc_stages * self.acc_cols
-                + self.sf_cols * self.channel_tiles
-                + self.sfb_cols
-                - 1
-            ).bit_length()
+            1 << (self.acc_stages * self.acc_cols + scale_cols - 1).bit_length()
         )
         # Stream weights while preserving activation reuse across channel tiles.
         self.weight_cache_policy = 0x12F0000000000000  # EVICT_FIRST
@@ -485,6 +479,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         num_tile_info_stages,
         tma_sfb,
     ):
+        # The CLC response has its own 16-byte alignment inside the slab.
         scheduler_bytes = 32 * num_tile_info_stages + 48 if use_clc_scheduler else 0
         operand_barriers = 2 + int(not tma_sfb)
         return (
@@ -684,16 +679,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             + cute.cosize(sfb) * self.sf_dtype.width // 8
         )
 
-    def _metadata_bytes(self, num_stages):
-        # The CLC response has its own 16-byte alignment inside the slab.
-        return self._pipeline_metadata_bytes(
-            num_stages,
-            self.acc_stages,
-            self.use_clc_scheduler,
-            self.num_tile_info_stages,
-            self.tma_sfb,
-        )
-
     def _configure_pipeline_storage(self, tiled_mma, reduction_size):
         """Fit SM100 operand stages around the epilogue's working storage.
 
@@ -715,19 +700,11 @@ class Sm100BlockScaledGroupedGemmKernel:
             raise ValueError(
                 "SM100 operand layout no longer matches the storage planner"
             )
-        bulk_output = (
-            self.scatter_output
-            and not self.use_fused_finalize
-            and self.output_dtype in (cutlass.BFloat16, cutlass.Float16)
-            and not self.epilogue.generate_sfc
-            and self.route_tile >= 128
-        )
-        bulk_output_bytes = self.output_dtype.width // 8 if bulk_output else 0
         num_stages = self.requested_num_stages
         if num_stages is None:
             num_stages = self._operand_stage_capacity(
                 stage_bytes,
-                bulk_output_bytes,
+                self.bulk_output_bytes,
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
@@ -745,10 +722,16 @@ class Sm100BlockScaledGroupedGemmKernel:
         available = (
             capacity
             - self._operand_bytes(layouts)
-            - self._metadata_bytes(self.num_stages)
+            - self._pipeline_metadata_bytes(
+                self.num_stages,
+                self.acc_stages,
+                self.use_clc_scheduler,
+                self.num_tile_info_stages,
+                self.tma_sfb,
+            )
         )
         (self.epilogue.bulk_tokens, self.epilogue.bulk_stages, scratch_bytes) = (
-            self._epilogue_storage(available, bulk_output_bytes)
+            self._epilogue_storage(available, self.bulk_output_bytes)
         )
         self.epilogue_scratch_floats = scratch_bytes // 4
         if available < self.epilogue_scratch_floats * 4:
@@ -1002,7 +985,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             cute.make_layout((self.cta_group_size, 1, 1)), (tiled_mma.thr_id.shape,)
         )
         self._configure_pipeline_storage(tiled_mma, weights.shape[1])
-        self.acc_layout = tiled_mma.make_fragment_C(
+        acc_layout = tiled_mma.make_fragment_C(
             tiled_mma.partition_shape_C((self.mma_m, self.allocated_n))
         ).layout
 
@@ -1183,7 +1166,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             b_copy_layout,
             self.sfa_layout,
             self.sfb_layout,
-            self.acc_layout,
+            acc_layout,
             tma_atom_a,
             tma_weights,
             tma_atom_b,
@@ -1269,7 +1252,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         a_pipe.producer_acquire(producer)
         if cutlass.const_expr(self.enable_iket):
             _iket.range_pop()
-        if cutlass.const_expr(self.enable_iket):
             _iket.range_push("producer_weight_tma")
         for channel_tile in cutlass.range_constexpr(self.channel_tiles):
             cute.copy(
@@ -1744,7 +1726,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                     acc_pipe.consumer_wait(consumer)
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
-                    if cutlass.const_expr(self.enable_iket):
                         _iket.range_push("epi_body")
                     norm = cutlass.Float32(1.0)
                     if cutlass.const_expr(norm_const is not None):
@@ -1831,7 +1812,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_pipe.consumer_wait(consumer)
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_pop()
-                if cutlass.const_expr(self.enable_iket):
                     _iket.range_push("epi_body")
                 if cutlass.const_expr(self.overlap_activation_accumulators):
                     epi_accumulator = cute.make_tensor(
@@ -2004,7 +1984,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             a_pipe.consumer_wait(consumer)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
-                        if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("mma_sf_copy_issue")
                         sf_stage = (None, None, None, None, consumer.index)
                         sf_stage_a = (
@@ -2027,7 +2006,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
-                        if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("mma_umma0_issue")
                         _blockscaled_dynamic_mma(
                             mma_accumulator,

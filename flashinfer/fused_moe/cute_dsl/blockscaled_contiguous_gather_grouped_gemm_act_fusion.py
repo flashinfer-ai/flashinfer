@@ -980,16 +980,12 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion_impl(
             scatter_output=False,
             per_token_scale_is_routed=False,
             k_steps=k_steps,
-            num_stages=None,
-            overlap_epilogue=True,
             overlap_activation_accumulators=None,
             pdl_signal_at="startup",
-            prefetch_weights_before_wait=enable_pdl,
             publish_routing_before_signal=enable_pdl,
             weight_scale_cache_policy="evict_first",
             activation_cache_policy="evict_last",
             use_clc_scheduler=use_clc_scheduler,
-            num_tile_info_stages=1,
             sm_count=sm_count,
         )
         return out, out_scale if generate_sfc else None

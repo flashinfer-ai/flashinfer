@@ -162,7 +162,7 @@ class PrepareRouted:
                     target[0] = value
 
 
-def allocate(activation, activation_sf, capacity, sf_vec_size):
+def _sf_columns(activation, sf_vec_size):
     if activation.dtype == torch.uint8:
         reduction = activation.shape[1] * 2
     elif activation.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -171,13 +171,18 @@ def allocate(activation, activation_sf, capacity, sf_vec_size):
         raise TypeError(f"unsupported blockscaled activation dtype {activation.dtype}")
     if sf_vec_size not in (16, 32) or reduction % (sf_vec_size * 4):
         raise ValueError("unsupported SF geometry")
+    return reduction // sf_vec_size
+
+
+def allocate(activation, activation_sf, capacity, sf_vec_size):
+    sf_columns = _sf_columns(activation, sf_vec_size)
     payload = torch.empty(
         (capacity, activation.shape[1]),
         device=activation.device,
         dtype=activation.dtype,
     )
     sf = torch.empty(
-        ((capacity + 127) // 128 * 128 * (reduction // sf_vec_size),),
+        ((capacity + 127) // 128 * 128 * sf_columns,),
         device=activation.device,
         dtype=activation_sf.dtype,
     )
@@ -197,13 +202,7 @@ def prepare(
     sf_vec_size,
     enable_pdl=True,
 ):
-    if activation.dtype == torch.uint8:
-        reduction = activation.shape[1] * 2
-    elif activation.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        reduction = activation.shape[1]
-    else:
-        raise TypeError(f"unsupported activation dtype {activation.dtype}")
-    sf_columns = reduction // sf_vec_size
+    sf_columns = _sf_columns(activation, sf_vec_size)
     payload_bytes = activation.shape[1] * activation.element_size()
     capacity = mapping.numel()
     tensors = (activation, activation_sf, routed, routed_sf, mapping, limits, num_tiles)
@@ -239,8 +238,6 @@ def prepare(
         x.data_ptr() % 4 for x in (activation_sf, routed_sf)
     ):
         raise ValueError("unaligned preparation storage")
-    if sf_vec_size not in (16, 32) or reduction % (4 * sf_vec_size):
-        raise ValueError("unsupported SF geometry")
     # Bound the persistent grid by hardware thread capacity, as in the
     # W4A16 permutation launch. Workspace allocation remains per invocation.
     properties = torch.cuda.get_device_properties(activation.device)

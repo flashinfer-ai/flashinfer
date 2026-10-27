@@ -59,18 +59,6 @@ from cutlass.pipeline import (
 from cutlass.pipeline.helpers import MbarrierArray
 
 
-def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
-    """Initializes the mbarrier and synchronizes the threadblock or cluster.
-
-    This function places a fence on the mbarrier initialization to ensure
-    proper synchronization across the threadblock or cluster.
-
-    Args:
-        cta_layout_vmnk (Optional[cute.Layout]): The CTA layout for VMNK. Defaults to None.
-    """
-    cute.arch.mbarrier_init_fence()
-
-
 ##############################################################################
 # Pipeline classes
 ##############################################################################
@@ -226,7 +214,7 @@ class PipelineTmaUmma(PipelineAsync):
         consumer_mask = producer_mask
 
         if not defer_sync:
-            pipeline_init_wait(cta_layout_vmnk)
+            cute.arch.mbarrier_init_fence()
 
         return PipelineTmaUmma(
             sync_object_full,
@@ -377,7 +365,7 @@ class PipelineUmmaAsync(PipelineAsync):
         )
 
         if not defer_sync:
-            pipeline_init_wait(cta_layout_vmnk)
+            cute.arch.mbarrier_init_fence()
 
         return PipelineUmmaAsync(
             sync_object_full,
@@ -418,7 +406,7 @@ class PipelineCpAsyncUmma(PipelineAsync):
 
     Key differences from PipelineAsyncUmma:
     - Suitable for gather/permutation operations during load
-    - Used in this kernel for A and SFA matrices with token-based gather addressing
+    - Used for narrow activation scale-factor tiles inside a canonical 128-row SF atom
     """
 
     cta_group: cute.nvgpu.tcgen05.CtaGroup
@@ -432,20 +420,6 @@ class PipelineCpAsyncUmma(PipelineAsync):
             cute.arch.block_idx_in_cluster()
         )
         return cta_rank_in_cluster // cta_v_size * cta_v_size
-
-    @staticmethod
-    def _compute_is_leader_cta(cta_layout_vmnk: cute.Layout):
-        """
-        Computes leader threadblocks for 2CTA kernels. For 1CTA, all threadblocks are leaders.
-        """
-        bidx, bidy, _ = cute.arch.block_idx()
-        mma_coord_vmnk = (
-            bidx % cute.size(cta_layout_vmnk, mode=[0]),
-            bidx // cute.size(cta_layout_vmnk, mode=[0]),
-            bidy,
-            None,
-        )
-        return mma_coord_vmnk[0] == 0
 
     @staticmethod
     def _compute_peer_cta_mask(cta_layout_vmnk: cute.Layout):
