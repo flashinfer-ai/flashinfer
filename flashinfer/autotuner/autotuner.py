@@ -7,6 +7,7 @@ import importlib
 import inspect
 import itertools
 import json
+import logging
 import os
 import statistics
 import tempfile
@@ -2674,12 +2675,13 @@ class AutoTuner:
                 # Record the cache miss config.
                 # Expect no cache miss in inference. Thus, any cache miss should be recorded.
                 if not is_cache_hit:
-                    logger.debug(
-                        f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
-                    )
-                    logger.debug(
-                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                        )
+                        logger.debug(
+                            f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
+                        )
 
                     # If the user has loaded an autotune cache (via
                     # ``autotune(cache=...)``) or warmed up profiling

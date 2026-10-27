@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import random
 import tracemalloc
 import weakref
@@ -316,6 +317,44 @@ def test_search_cache_hit_and_miss():
     tuner.profiling_cache[key] = (1, None)
     hit = tuner.search_cache("dummy", [runner], shapes, config)
     assert hit == (True, 0, 1, None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_choose_one_cache_miss_debug_work(level, monkeypatch, caplog):
+    from flashinfer.autotuner.autotuner import logger
+
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    caplog.set_level(logging.DEBUG)
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    previous_level = logger.level
+    # The JIT logger is constructed directly, outside logging's logger registry.
+    with (
+        patch.object(logger, "_cache", {}),
+        patch.object(logger, "handlers", [caplog.handler]),
+        patch.object(
+            AutoTuner, "_get_cache_key", wraps=AutoTuner._get_cache_key
+        ) as key,
+    ):
+        logger.setLevel(level)
+        try:
+            selected, tactic = tuner.choose_one(
+                "dummy", [runner], TuningConfig(), [torch.zeros(8, 16)]
+            )
+        finally:
+            logger.setLevel(previous_level)
+
+    assert selected is runner
+    assert tactic == -1
+    assert tuner.profiling_cache == {}
+    assert tuner._file_configs == {}
+    if level == logging.DEBUG:
+        assert any("Using fallback tactic for dummy" in m for m in caplog.messages)
+        assert any("Generated key" in m and "DummyRunner" in m for m in caplog.messages)
+    else:
+        assert key.call_count == 1  # Only the real lookup constructs a key.
+        assert not caplog.records
 
 
 def test_search_cache_hit_resolves_runner_id_against_current_list():
