@@ -263,11 +263,14 @@ def test_m128_ring_overlay_rows():
 def test_chain_entry_prefetch_rows():
     # The quantize + GEMM chain runs the entry L2 prefetch program (``_ep4``) of the GEMM
     # plan exactly on the cells of CHAIN_EP_RULES (program family and token count per
-    # architecture); the default-tactic plan never does (the GEMM alone takes it only on
-    # the GEMM_ALONE_EP_RULES cells), and the prefetch keeps the plan's grid.
-    for arch, cells in cb.CHAIN_EP_RULES.items():
+    # architecture) and on the (K, N) shapes of CHAIN_EP_MEASURED_CELLS at the measured
+    # SM count; the default-tactic plan never does (the GEMM alone takes it only on the
+    # GEMM_ALONE_EP_RULES cells), and the prefetch keeps the plan's grid.
+    for arch in sorted(set(cb.CHAIN_EP_RULES) | set(cb.CHAIN_EP_MEASURED_CELLS)):
+        cells = cb.CHAIN_EP_RULES.get(arch, {})
+        measured_cells = cb.CHAIN_EP_MEASURED_CELLS.get(arch, {})
         sm_count = cb.MEASURED_SM_COUNT[arch]
-        served = set()
+        served, measured_served = set(), set()
         for k, n in VALIDATED_GEMM_FAMILIES:
             for m in _EDGE_M:
                 for out_f16 in (False, True):
@@ -282,8 +285,20 @@ def test_chain_entry_prefetch_rows():
                     )
                     cell = cells.get(family)
                     inside = cell is not None and cell[0] <= m <= cell[1]
+                    measured = measured_cells.get(family)
+                    in_measured = (
+                        measured is not None
+                        and (k, n) in measured[2]
+                        and measured[0] <= m <= measured[1]
+                    )
                     tactic = cb.chain_gemm_tactic(plan)
-                    assert (tactic is not None) == inside, (arch, m, n, k, out_f16)
+                    assert (tactic is not None) == (inside or in_measured), (
+                        arch,
+                        m,
+                        n,
+                        k,
+                        out_f16,
+                    )
                     if tactic is None:
                         continue
                     chain = _registered(
@@ -292,8 +307,12 @@ def test_chain_entry_prefetch_rows():
                     )
                     assert chain.kernel_key == plan.kernel_key + "_ep4"
                     assert (chain.grid, chain.num_tiles) == (plan.grid, plan.num_tiles)
-                    served.add(family)
+                    (served if inside else measured_served).add(family)
         assert served == set(cells), (arch, sorted(set(cells) - served))
+        assert measured_served == set(measured_cells), (
+            arch,
+            sorted(set(measured_cells) - measured_served),
+        )
     # The prefetch is a knob of the 1-CTA program and the swapped-orientation split-K
     # program.
     with pytest.raises(ValueError, match="ep_stages"):
@@ -306,6 +325,36 @@ def test_chain_entry_prefetch_rows():
             148,
             tactic={**cb.default_tactic(512, 8192, 8192, 148), "ep_stages": 4},
         )
+
+
+def test_chain_entry_prefetch_measured_cells_keep_other_sm_counts():
+    # A CHAIN_EP_MEASURED_CELLS cell takes the prefetch only at the SM count it was timed
+    # on, where the GEMM alone keeps its program; the same shapes on the other SM count of
+    # the architecture (sm_100a on 152 SMs, sm_103a on 148) prefetch only inside a
+    # CHAIN_EP_RULES cell.
+    def family_of(plan):
+        return "_".join(
+            p
+            for p in plan.kernel_key.removeprefix("gemm:").split("_")
+            if p not in ("bf16", "f16")
+        )
+
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, cells in cb.CHAIN_EP_MEASURED_CELLS.items():
+        for family, (lo, hi, shapes) in cells.items():
+            for k, n in shapes:
+                for m in sorted({lo, hi}):
+                    for out_f16 in (False, True):
+                        sm_count = cb.MEASURED_SM_COUNT[arch]
+                        plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                        assert family_of(plan) == family, plan.kernel_key
+                        assert cb.chain_gemm_tactic(plan) is not None, (arch, m, n, k)
+                        assert cb.gemm_alone_tactic(plan) is None, (arch, m, n, k)
+                        plan = cb.gemm_plan(m, n, k, out_f16, arch, other[arch])
+                        rule = cb.CHAIN_EP_RULES.get(arch, {}).get(family_of(plan))
+                        inside = rule is not None and rule[0] <= m <= rule[1]
+                        tactic = cb.chain_gemm_tactic(plan)
+                        assert (tactic is not None) == inside, (arch, m, n, k, out_f16)
 
 
 def test_gemm_alone_entry_prefetch_rows():
