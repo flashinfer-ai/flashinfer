@@ -4270,10 +4270,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
-        # Old cuDNN captures still own this table after auto selects FA2.
+        # Old cuDNN captures retain lengths even with a caller-owned table.
         # Refresh their metadata during plan; replay cannot rebind pointers.
         if self._backend == "cudnn" or (
-            self.is_cuda_graph_enabled and self._cudnn_block_tables is not None
+            self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"

@@ -295,6 +295,10 @@ Replay an old capture only with lengths inside its declared bounds and compatibl
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
 
+Also capture with a caller-supplied table from the first plan, then change Q
+partitions while auto falls back. Table ownership does not tell whether an old
+cuDNN capture still needs its wrapper-owned length buffers refreshed.
+
 Valid attention lengths and physical ragged offsets are separate operands:
 `seq_lens_q` can be shorter than its query slot. Infer lengths from adjacent
 offsets only when lengths were omitted. Test explicit/default length transitions
