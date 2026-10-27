@@ -2367,7 +2367,8 @@ def test_route_twins_are_registered_hint_instances(arch):
     # closing cluster barrier ``_csrt``, the quantization carveout instance ``_cv100``, (round 12 batch 4) the gs-branch
     # form ``_gsb`` of a GEMM grid-stride program or (round 12 D) the three-slot early-TMEM-free form ``_ts3_tde`` of a
     # 192-wide 128-K TMA-store GEMM program (cluster launch control or grid-stride) or the MMA-warp TMEM allocation
-    # form ``_prg`` of a TMA-store GEMM program -- on the architecture
+    # form ``_prg`` of a TMA-store GEMM program, or (round 12 E) the early-TMEM-free form ``_tde`` of the two-stage
+    # four-slot four-tile-prefetch TMA-store GEMM program -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2391,6 +2392,7 @@ def test_route_twins_are_registered_hint_instances(arch):
                     and key in ("gemm_tstore_n192_k128", "gemm_tstore_n192_k128_gs")
                 )
                 or (suffix == "_prg" and key.startswith("gemm_tstore_"))
+                or (suffix == "_tde" and key == "gemm_tstore_s2_ts4_pf4")
             ), (cell, key, twin)
             if sko:
                 assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)
