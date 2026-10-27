@@ -411,10 +411,10 @@ kernel_cake_kimi_k3_fp8_projection_d79a3907504caa5b086a(const __grid_constant__ 
                         if (iter_k == 0) {
                             if (num_k_iters > 0) {
                                 #pragma unroll
-                                for (int kb_pf = 0; kb_pf < 2; kb_pf++) {
-                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(b_row0 % 128)), "r"((int)(b_row0 / 128 * (2 * num_k_iters) + kb_pf)) : "memory");
-                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 32) % 128)), "r"((int)((b_row0 + 32) / 128 * (2 * num_k_iters) + kb_pf)) : "memory");
-                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 64) % 128)), "r"((int)((b_row0 + 64) / 128 * (2 * num_k_iters) + kb_pf)) : "memory");
+                                for (int kb_pf_0 = 0; kb_pf_0 < 2; kb_pf_0++) {
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(b_row0 % 128)), "r"((int)(b_row0 / 128 * (2 * num_k_iters) + kb_pf_0)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 32) % 128)), "r"((int)((b_row0 + 32) / 128 * (2 * num_k_iters) + kb_pf_0)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 64) % 128)), "r"((int)((b_row0 + 64) / 128 * (2 * num_k_iters) + kb_pf_0)) : "memory");
                                 }
                                 asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row)) : "memory");
                             }
@@ -431,10 +431,10 @@ kernel_cake_kimi_k3_fp8_projection_d79a3907504caa5b086a(const __grid_constant__ 
                         int k_pf = iter_k + 2;
                         if (k_pf < num_k_iters) {
                             #pragma unroll
-                            for (int kb_pf_2 = 0; kb_pf_2 < 2; kb_pf_2++) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(b_row0 % 128)), "r"((int)(b_row0 / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf_2)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 32) % 128)), "r"((int)((b_row0 + 32) / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf_2)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 64) % 128)), "r"((int)((b_row0 + 64) / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf_2)) : "memory");
+                            for (int kb_pf = 0; kb_pf < 2; kb_pf++) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(b_row0 % 128)), "r"((int)(b_row0 / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 32) % 128)), "r"((int)((b_row0 + 32) / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)((b_row0 + 64) % 128)), "r"((int)((b_row0 + 64) / 128 * (2 * num_k_iters) + k_pf * 2 + kb_pf)) : "memory");
                             }
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row + k_pf * 2)) : "memory");
                         }

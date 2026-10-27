@@ -604,7 +604,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "fast_math": False,
         "shim": "b4c5c90e28f1a7e4",
         "arg_plan": "quant",
-        "closure_sha256": "3dafb90f401be9f1836bcd9edc4eae5d3ec84fa82a30135ff93c921e3d9e9793",
+        "closure_sha256": "99948803a6c146c02c58e6fce114dbc5bd19b3472c0854cbea2bd859e708af88",
     },
     "16c2fa9ff5c30b20cd5d": {
         "binding": "021cc0171d570f358807",
@@ -1486,7 +1486,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e6fa2204b9f06349",
         "arg_plan": "gemm",
-        "closure_sha256": "2329647cb82b9c901f474f03a4ac78903ddd46fddee5af45d7818b5847ffe0f3",
+        "closure_sha256": "d9988b436333409fe162b00b217bb0e332d279fb404fc29eebe53b6bece627c4",
     },
     "55edd49d3fc4d8738f68": {
         "kernel": "3fa6af62a780530c1810",
@@ -2308,7 +2308,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "35360aab45772340",
         "arg_plan": "gemm",
-        "closure_sha256": "c71cf0797b0b5f8f244d0f4e7a3bd77cca4e527a131843c75a95773c09fbba5f",
+        "closure_sha256": "361fc0a0041b319b5de795519308999a813f1c552b80aaa96eeaff4aae04c8c1",
     },
     "817af6c9b77f3e9d87b2": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -3673,7 +3673,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "9d12a3937a457ab0",
         "arg_plan": "gemm",
-        "closure_sha256": "adb351c98947389fe599ec0812799926b9c25c219a99a2fac7c2e3b088231950",
+        "closure_sha256": "33ed0011c23d62375c83d6ccac02b8449e061be245e015538bbd37fada2469c5",
     },
     "cd64e0c4e8bab2f61340": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4035,7 +4035,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "dcd0cb27c7b398a5",
         "arg_plan": "gemm",
-        "closure_sha256": "a913e47f27f076a2dba0e12a70975089edb6ac6463569fab31105ee511e67bec",
+        "closure_sha256": "4cf569870cfdeffbc3615e4ba230933891bb680bb9c85f6ca8ab88ebd5306469",
     },
     "d890c0913879154687ad": {
         "binding": "0cdb8cc10eb1192d3635",

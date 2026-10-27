@@ -757,7 +757,7 @@ kernel_cake_kimi_k3_fp8_projection_cca5af0a34a622d58d9d(const __grid_constant__ 
                 unsigned int ts_row = ts_base + (unsigned int)(local_row * 64);
                 int swz = local_row >> 1 & 3;
                 #pragma unroll
-                for (int c = 0; c < 2; c++) {
+                for (int c_0 = 0; c_0 < 2; c_0++) {
                     if (warp == 2) {
                         asm volatile("cp.async.bulk.wait_group.read 0;");
                     }
@@ -765,16 +765,16 @@ kernel_cake_kimi_k3_fp8_projection_cca5af0a34a622d58d9d(const __grid_constant__ 
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     if (col_part == 0) {
                         #pragma unroll
-                        for (int q = 0; q < 4; q++) {
-                            int s0 = c * 16 + q * 4;
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(_tmem_load_0_bf16[s0]), "r"(_tmem_load_0_bf16[s0 + 1]), "r"(_tmem_load_0_bf16[s0 + 2]), "r"(_tmem_load_0_bf16[s0 + 3]));
+                        for (int q_0 = 0; q_0 < 4; q_0++) {
+                            int s0_0 = c_0 * 16 + q_0 * 4;
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q_0 ^ swz) * 16)), "r"(_tmem_load_0_bf16[s0_0]), "r"(_tmem_load_0_bf16[s0_0 + 1]), "r"(_tmem_load_0_bf16[s0_0 + 2]), "r"(_tmem_load_0_bf16[s0_0 + 3]));
                         }
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     if (warp == 2) {
                         if (elect_sync()) {
-                            tma_store_2d((&OUT), off_n_1 + c * 32, off_m_1, ts_base);
+                            tma_store_2d((&OUT), off_n_1 + c_0 * 32, off_m_1, ts_base);
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
@@ -785,7 +785,7 @@ kernel_cake_kimi_k3_fp8_projection_cca5af0a34a622d58d9d(const __grid_constant__ 
                     if (col_part == 1) {
                         #pragma unroll
                         for (int q_1 = 0; q_1 < 4; q_1++) {
-                            int s0_1 = c * 16 + q_1 * 4;
+                            int s0_1 = c_0 * 16 + q_1 * 4;
                             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q_1 ^ swz) * 16)), "r"(_tmem_load_0_bf16[s0_1]), "r"(_tmem_load_0_bf16[s0_1 + 1]), "r"(_tmem_load_0_bf16[s0_1 + 2]), "r"(_tmem_load_0_bf16[s0_1 + 3]));
                         }
                     }
@@ -793,7 +793,7 @@ kernel_cake_kimi_k3_fp8_projection_cca5af0a34a622d58d9d(const __grid_constant__ 
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     if (warp == 2) {
                         if (elect_sync()) {
-                            tma_store_2d((&OUT), off_n_1 + 64 + c * 32, off_m_1, ts_base);
+                            tma_store_2d((&OUT), off_n_1 + 64 + c_0 * 32, off_m_1, ts_base);
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }

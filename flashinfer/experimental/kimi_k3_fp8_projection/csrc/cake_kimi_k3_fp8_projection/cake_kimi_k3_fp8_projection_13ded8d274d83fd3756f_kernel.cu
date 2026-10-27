@@ -113,20 +113,20 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
     int row = unit / units_per_row;
     int warp_in_rows = __all_sync(0xFFFFFFFF, row < M);
     if (warp_in_rows != 0) {
-        int row_c_w = row;
-        int k_block0_w = (unit - row * units_per_row) * QUANT_UNITS;
-        unsigned long long row_base_w = (unsigned long long)row_c_w * (unsigned long long)K;
-        int m_tile_w = row_c_w / sf_rows;
-        int row_in_tile_w = row_c_w - m_tile_w * sf_rows;
-        unsigned long long sf_row_base_w = (unsigned long long)m_tile_w * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile_w & 31) * 16 + (unsigned long long)(row_in_tile_w >> 5) * 4;
+        int row_c = row;
+        int k_block0 = (unit - row * units_per_row) * QUANT_UNITS;
+        unsigned long long row_base = (unsigned long long)row_c * (unsigned long long)K;
+        int m_tile = row_c / sf_rows;
+        int row_in_tile = row_c - m_tile * sf_rows;
+        unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
         asm volatile("griddepcontrol.wait;" ::: "memory");
-        float staged_w[32];
+        float staged[32];
         #pragma unroll
         for (int u = 0; u < QUANT_UNITS; u++) {
-            int k_ld = (k_block0_w + u) * 128 + half_lane * 8;
+            int k_ld = (k_block0 + u) * 128 + half_lane * 8;
             float _vec_load_0[8];
             {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (row_base_w + (unsigned long long)k_ld) + 0);
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (row_base + (unsigned long long)k_ld) + 0);
                 uint4 _vld_0[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -141,19 +141,19 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
             }
             #pragma unroll
             for (int j = 0; j < 8; j++) {
-                staged_w[u * 8 + j] = _vec_load_0[j];
+                staged[u * 8 + j] = _vec_load_0[j];
             }
         }
         #pragma unroll
         for (int u_1 = 0; u_1 < QUANT_UNITS; u_1++) {
-            int k_block = k_block0_w + u_1;
+            int k_block = k_block0 + u_1;
             int k = k_block * 128 + half_lane * 8;
             float vals[8];
             float mags[8];
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
-                vals[j_1] = staged_w[u_1 * 8 + j_1];
-                mags[j_1] = staged_w[u_1 * 8 + j_1];
+                vals[j_1] = staged[u_1 * 8 + j_1];
+                mags[j_1] = staged[u_1 * 8 + j_1];
             }
             mags[0] = fabsf(mags[0]);
             mags[1] = fabsf(mags[1]);
@@ -218,9 +218,9 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
                                        "f"(vals[6]), "f"(vals[7]));
                 _packed_0[1] = _packed;
             }
-            reinterpret_cast<int2*>(a_q + (row_base_w + (unsigned long long)k))[0] = reinterpret_cast<int2*>(_packed_0)[0];
+            reinterpret_cast<int2*>(a_q + (row_base + (unsigned long long)k))[0] = reinterpret_cast<int2*>(_packed_0)[0];
             if (half_lane == 0) {
-                unsigned long long sf_addr = sf_row_base_w + (unsigned long long)k_block * (unsigned long long)SF_TILE_BYTES;
+                unsigned long long sf_addr = sf_row_base + (unsigned long long)k_block * (unsigned long long)SF_TILE_BYTES;
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     *(reinterpret_cast<unsigned char*>(a_sf + (sf_addr + (unsigned long long)c)) + (0)) = (unsigned char)(scale_byte);
@@ -228,20 +228,20 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
             }
         }
     } else {
-        int row_c_c = ((row) < (M - 1) ? (row) : (M - 1));
-        int k_block0_c = (unit - row * units_per_row) * QUANT_UNITS;
-        unsigned long long row_base_c = (unsigned long long)row_c_c * (unsigned long long)K;
-        int m_tile_c = row_c_c / sf_rows;
-        int row_in_tile_c = row_c_c - m_tile_c * sf_rows;
-        unsigned long long sf_row_base_c = (unsigned long long)m_tile_c * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile_c & 31) * 16 + (unsigned long long)(row_in_tile_c >> 5) * 4;
+        int row_c_1 = ((row) < (M - 1) ? (row) : (M - 1));
+        int k_block0_1 = (unit - row * units_per_row) * QUANT_UNITS;
+        unsigned long long row_base_1 = (unsigned long long)row_c_1 * (unsigned long long)K;
+        int m_tile_1 = row_c_1 / sf_rows;
+        int row_in_tile_1 = row_c_1 - m_tile_1 * sf_rows;
+        unsigned long long sf_row_base_1 = (unsigned long long)m_tile_1 * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile_1 & 31) * 16 + (unsigned long long)(row_in_tile_1 >> 5) * 4;
         asm volatile("griddepcontrol.wait;" ::: "memory");
-        float staged_c[32];
+        float staged_1[32];
         #pragma unroll
         for (int u_2 = 0; u_2 < QUANT_UNITS; u_2++) {
-            int k_ld_1 = (k_block0_c + u_2) * 128 + half_lane * 8;
+            int k_ld_1 = (k_block0_1 + u_2) * 128 + half_lane * 8;
             float _vec_load_0_1[8];
             {
-                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(x + (row_base_c + (unsigned long long)k_ld_1) + 0);
+                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(x + (row_base_1 + (unsigned long long)k_ld_1) + 0);
                 uint4 _vld_3[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -256,19 +256,19 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
             }
             #pragma unroll
             for (int j_2 = 0; j_2 < 8; j_2++) {
-                staged_c[u_2 * 8 + j_2] = _vec_load_0_1[j_2];
+                staged_1[u_2 * 8 + j_2] = _vec_load_0_1[j_2];
             }
         }
         #pragma unroll
         for (int u_3 = 0; u_3 < QUANT_UNITS; u_3++) {
-            int k_block_1 = k_block0_c + u_3;
+            int k_block_1 = k_block0_1 + u_3;
             int k_1 = k_block_1 * 128 + half_lane * 8;
             float vals_1[8];
             float mags_1[8];
             #pragma unroll
             for (int j_3 = 0; j_3 < 8; j_3++) {
-                vals_1[j_3] = staged_c[u_3 * 8 + j_3];
-                mags_1[j_3] = staged_c[u_3 * 8 + j_3];
+                vals_1[j_3] = staged_1[u_3 * 8 + j_3];
+                mags_1[j_3] = staged_1[u_3 * 8 + j_3];
             }
             mags_1[0] = fabsf(mags_1[0]);
             mags_1[1] = fabsf(mags_1[1]);
@@ -334,9 +334,9 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
                                            "f"(vals_1[6]), "f"(vals_1[7]));
                     _packed_0_1[1] = _packed;
                 }
-                reinterpret_cast<int2*>(a_q + (row_base_c + (unsigned long long)k_1))[0] = reinterpret_cast<int2*>(_packed_0_1)[0];
+                reinterpret_cast<int2*>(a_q + (row_base_1 + (unsigned long long)k_1))[0] = reinterpret_cast<int2*>(_packed_0_1)[0];
                 if (half_lane == 0) {
-                    unsigned long long sf_addr_1 = sf_row_base_c + (unsigned long long)k_block_1 * (unsigned long long)SF_TILE_BYTES;
+                    unsigned long long sf_addr_1 = sf_row_base_1 + (unsigned long long)k_block_1 * (unsigned long long)SF_TILE_BYTES;
                     #pragma unroll
                     for (int c_1 = 0; c_1 < 4; c_1++) {
                         *(reinterpret_cast<unsigned char*>(a_sf + (sf_addr_1 + (unsigned long long)c_1)) + (0)) = (unsigned char)(scale_byte_1);
