@@ -1366,6 +1366,8 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         (8, 8192, 8192, torch.float16),  # 8-token tile
         (17, 7168, 16384, torch.bfloat16),  # 32-token tile, split-K 2
         (32, 8192, 8192, torch.bfloat16),  # 32-token tile
+        (24, 28672, 8192, torch.bfloat16),  # 32-token tile, two CTAs per SM on 152 SMs
+        (32, 28672, 8192, torch.float16),  # 32-token tile, two CTAs per SM on 152 SMs
         (128, 18432, 7168, torch.float16),  # one 128-token tile, 128-wide weight tiles
         (130, 18432, 7168, torch.bfloat16),  # one 128-token tile + the remainder fold
         (136, 18432, 7168, torch.float16),  # one 128-token tile + the remainder fold

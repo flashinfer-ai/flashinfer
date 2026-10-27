@@ -264,8 +264,15 @@ CLUSTER_SPLIT_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
     "sm_100a": (2, 32),
     "sm_103a": (2, 16),
 }
+# The quantize + GEMM chain at K = 8192 (the quantizer alone keeps the split): per architecture,
+# the token counts that run one CTA per row at its measured SM count (:data:`MEASURED_SM_COUNT`).
+# The row CTAs are few, so the GEMM's CTAs reach their entry L2 prefetch while the quantizer
+# still runs.  Other SM counts keep :func:`quant_cluster_split`.
+CHAIN_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
+    "sm_103a": (18, 32),
+}
 # The quantizer alone (the public per-token quantize entries; the quantize + GEMM chain keeps
-# :func:`quant_cluster_split`): per architecture and row width, the token-count ranges
+# :func:`chain_cluster_split`): per architecture and row width, the token-count ranges
 # ``(low, high, C)`` whose bf16 rows run as clusters of ``C`` CTAs instead.  Paired timings on
 # B200 and GB300 at the SM counts of :data:`MEASURED_SM_COUNT`; other SM counts keep the chain's
 # split.
@@ -410,6 +417,23 @@ def quant_cluster_split(m: int, k: int, is_bf16: bool, fold: bool, arch: str) ->
     return QUANT_CLUSTER_SPLIT if int(m) <= limit else 1
 
 
+def chain_cluster_split(
+    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+) -> int:
+    """CTAs per token row of the quantize + GEMM chain: 1 on the token counts
+    :data:`CHAIN_ONE_CTA_M_K8192` gives ``arch`` at K = 8192 at its measured SM count, else
+    :func:`quant_cluster_split`."""
+    cell = CHAIN_ONE_CTA_M_K8192.get(arch)
+    if (
+        cell is not None
+        and int(k) == 8192
+        and MEASURED_SM_COUNT.get(arch) == int(sm_count)
+        and cell[0] <= int(m) <= cell[1]
+    ):
+        return 1
+    return quant_cluster_split(m, k, is_bf16, fold, arch)
+
+
 def quant_alone_cluster_split(
     m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
 ) -> int:
@@ -459,8 +483,8 @@ def quant_plan(
     the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
     contiguous) only decides between the static-K and the runtime-geometry instance;
     ``alone`` selects the cluster split of the quantizer alone
-    (:func:`quant_alone_cluster_split`) instead of the chain's.
-    A row the cluster split serves (:func:`quant_cluster_split`) runs as a cluster of
+    (:func:`quant_alone_cluster_split`) instead of the chain's (:func:`chain_cluster_split`).
+    A row the cluster split serves runs as a cluster of
     ``C`` CTAs, each with the CTA shape of a ``C``-th of the row; the grid is one cluster
     per row, then (``M`` not a multiple of 128) the padding clusters, each CTA zeroing
     :data:`CLUSTER_SPLIT_PAD_CHUNKS` 16-byte chunks of the last scale tile."""
@@ -483,7 +507,7 @@ def quant_plan(
     split = (
         quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
         if alone
-        else quant_cluster_split(m, k, is_bf16, fold, arch)
+        else chain_cluster_split(m, k, is_bf16, fold, arch, sm_count)
     )
     if split > 1:
         share = (k // SF_VEC + split - 1) // split * SF_VEC
@@ -801,11 +825,12 @@ CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
 }
 # Chain cells of the entry L2 prefetch on the SM count of :data:`MEASURED_SM_COUNT` only: per
 # architecture, the program family, the token-count range and the ``(K, N)`` shapes (paired
-# timings on B200); the GEMM alone keeps its program there.
+# timings on B200 and GB300); the GEMM alone keeps its program there.
 CHAIN_EP_MEASURED_CELLS: dict[
     str, dict[str, tuple[int, int, tuple[tuple[int, int], ...]]]
 ] = {
     "sm_100a": {"m128_bF_ro": (128, 128, ((8192, 28672),))},
+    "sm_103a": {"n32_aF_l2256b_o2": (18, 32, ((8192, 28672),))},
 }
 # The GEMM alone (``mm_fp4``, and :func:`prepare_mm_fp4_per_token` without a tactic) takes
 # the entry L2 prefetch program on these cells too: per architecture, the program families

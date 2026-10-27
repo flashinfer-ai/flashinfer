@@ -219,7 +219,8 @@ def test_quant_plan_grid_and_keys():
     assert cb.quant_plan(8, 12288, True, False, "sm_100a", 148).cluster_split == 1
     # K = 8192: one CTA per row for 2..32 tokens (sm_100a) and 2..16 tokens (sm_103a),
     # with or without the folded out_scale.  One token keeps the four-CTA split, and so
-    # does sm_103a from 17 tokens up to its limits (17 with the out_scale folded).
+    # does sm_103a from 17 tokens up to its limits (17 with the out_scale folded), except
+    # the chain's one-CTA rows (test_chain_one_cta_quantizer_rows).
     for arch, sm_count, high in (("sm_100a", 148, 32), ("sm_103a", 152, 16)):
         for fold in (False, True):
             splits = [
@@ -229,7 +230,12 @@ def test_quant_plan_grid_and_keys():
             assert splits == [4, 1, 1], (arch, fold, splits)
     assert cb.quant_plan(17, 8192, True, True, "sm_103a", 152).cluster_split == 4
     assert cb.quant_plan(18, 8192, True, True, "sm_103a", 152).cluster_split == 1
-    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 152).cluster_split == 4
+    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 148).cluster_split == 4
+    assert (
+        cb.quant_plan(32, 8192, True, False, "sm_103a", 152, alone=True).cluster_split
+        == 4
+    )
+    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 152).cluster_split == 1
     assert cb.quant_plan(32, 8192, True, True, "sm_100a", 148).cluster_split == 1
     # One program per CTA shape (threads, register blocks per thread, occupancy):
     # K = 2688 and 4096 resolve to one shape, 7168 and 8192 to another.  The widths of
@@ -286,8 +292,8 @@ def test_quantizer_alone_cluster_split_rows():
     """The quantizer alone (``quant_plan(..., alone=True)``, the public per-token quantize
     entries) splits bf16 rows over the clusters of QUANT_ALONE_CLUSTER_SPLIT at the measured
     SM count of each architecture, with a generated program; everywhere else (other token
-    counts and row lengths, the other SM count, fp16 activations) it takes the chain's
-    plan, :func:`quant_cluster_split`."""
+    counts and row lengths, the other SM count, fp16 activations) it takes
+    :func:`quant_cluster_split`, the chain's plan outside CHAIN_ONE_CTA_M_K8192."""
     other = {"sm_100a": 152, "sm_103a": 148}
     for arch, table in cb.QUANT_ALONE_CLUSTER_SPLIT.items():
         sm_count = cb.MEASURED_SM_COUNT[arch]
@@ -310,10 +316,15 @@ def test_quantizer_alone_cluster_split_rows():
                         (c for lo, hi, c in table.get(k, ()) if lo <= m <= hi), None
                     )
                     if want is None:
-                        if not cb.quant_alone_pad_chunked(
+                        split = cb.quant_cluster_split(m, k, True, fold, arch)
+                        if cb.quant_alone_pad_chunked(
                             m, k, True, chain.k_static, arch, sm_count
                         ):
+                            pass
+                        elif chain.cluster_split == split:
                             assert alone == chain, (arch, k, m, fold)
+                        else:
+                            assert alone.cluster_split == split, (arch, k, m, fold)
                         continue
                     served.add((k, m))
                     assert alone.cluster_split == want, (arch, k, m, fold)
@@ -334,6 +345,39 @@ def test_quantizer_alone_cluster_split_rows():
             if lo <= m <= hi
         }
         assert served == listed, (arch, sorted(listed - served))
+
+
+def test_chain_one_cta_quantizer_rows():
+    """The quantize + GEMM chain runs one CTA per bf16 row of K = 8192 on the token counts of
+    CHAIN_ONE_CTA_M_K8192 at the measured SM count of each architecture, with a generated
+    program, where the quantizer alone keeps its cluster split; the other SM count, the other
+    token counts and the other row lengths take :func:`quant_cluster_split`."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, (lo, hi) in cb.CHAIN_ONE_CTA_M_K8192.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        served = set()
+        for k in sorted(set(REACHABLE_K) | {8192}):
+            for m in sorted(set(REACHABLE_M) | {lo - 1, lo, hi, hi + 1}):
+                for fold in (False, True):
+                    split = cb.quant_cluster_split(m, k, True, fold, arch)
+                    chain = _registered(
+                        cb.quant_plan(m, k, True, fold, arch, sm_count), arch
+                    )
+                    if k == 8192 and lo <= m <= hi:
+                        served.add(m)
+                        assert chain.cluster_split == 1, (arch, m, fold)
+                        assert chain.grid == cb.padded_rows(m), (arch, m, fold)
+                        alone = cb.quant_plan(
+                            m, k, True, fold, arch, sm_count, alone=True
+                        )
+                        assert alone.cluster_split == split, (arch, m, fold)
+                    else:
+                        assert chain.cluster_split == split, (arch, k, m, fold)
+                    assert (
+                        cb.chain_cluster_split(m, k, True, fold, arch, other[arch])
+                        == split
+                    ), (arch, k, m, fold)
+        assert served == {m for m in set(REACHABLE_M) | {lo, hi} if lo <= m <= hi}, arch
 
 
 def test_f16_quantizer_shapes_match_the_validated_f16_rows():
@@ -912,6 +956,41 @@ def test_quantizer_alone_split_matches_the_chain_quantizer(k, m, fold):
         t.view(torch.uint8).fill_(0xFF)
     cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
     cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
+# The chain's one-CTA-per-row cells (CHAIN_ONE_CTA_M_K8192) of every architecture, with and
+# without the folded out_scale.
+_CHAIN_ONE_CTA_CASES = sorted(
+    {
+        (8192, m, fold)
+        for lo, hi in cb.CHAIN_ONE_CTA_M_K8192.values()
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _CHAIN_ONE_CTA_CASES)
+def test_chain_one_cta_quantizer_matches_the_quantizer_alone(k, m, fold):
+    """The quantize + GEMM chain's one-CTA-per-row quantizer writes the same codes, block
+    scales (padding included) and per-token scales as the public quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(5000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb._prepare_quantize(x, gs_inv, got, out_scale=out_scale, alone=False)()
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, want, out_scale=out_scale)()
     torch.cuda.synchronize()
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a.reshape(-1), b.reshape(-1))
