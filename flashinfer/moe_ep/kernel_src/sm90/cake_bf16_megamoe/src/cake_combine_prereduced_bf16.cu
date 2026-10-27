@@ -74,6 +74,37 @@ constexpr int kMaxEpSize = 32;
 constexpr int kMaxTopK = 8;  // matches the pipe's top_k validation; sizes the in-register row lists
 constexpr int kThreads = 256;
 
+// Programmatic dependent launch (PDL).  Every kernel of the round waits for the
+// preceding grid before it touches global memory and then, unless told
+// otherwise, lets the next PDL-launched grid be scheduled at once; without the
+// early trigger the next grid is scheduled when this grid's blocks exit.  Both
+// instructions are no-ops when the launch carries no PDL attribute.  use_pdl:
+// bit 0 = launch with the PDL attribute, bit 1 = no early trigger.
+__device__ __forceinline__ void pdl_wait_and_trigger(int trigger) {
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+// Launch on the caller's stream, optionally with the PDL attribute (the kernel
+// may then start while the preceding kernel finishes; see pdl_wait_and_trigger).
+template <typename... Params, typename... Args>
+void launch_kernel(void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
+                   cudaStream_t stream, bool use_pdl, Args... args) {
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  config.attrs = &attr;
+  config.numAttrs = use_pdl ? 1 : 0;
+  cudaError_t const status = cudaLaunchKernelEx(&config, kernel, args...);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm90_cake_bf16: kernel launch failed: " << cudaGetErrorString(status);
+}
+
 PushLayout build_layout(int64_t peer_bases, int64_t ep_size, int64_t rank,
                         int64_t num_local_experts, int64_t pool_rows, int64_t meta_rows,
                         int64_t bytes_per_row, int64_t hidden, int64_t top_k, int64_t t_cap,
@@ -146,7 +177,9 @@ __global__ void __launch_bounds__(kThreads) combine_publish_prereduced_bf16_kern
     int32_t* __restrict__ grp_cnt, const int32_t* __restrict__ grp_rows,
     const int32_t* __restrict__ grp_list, int32_t* __restrict__ n_groups,
     int32_t* __restrict__ groups_per_src, int32_t* __restrict__ cdone_local,
-    const int32_t* __restrict__ round_ctr, int32_t* __restrict__ blocks_done, int split_partials) {
+    const int32_t* __restrict__ round_ctr, int32_t* __restrict__ blocks_done, int split_partials,
+    int pdl_trigger) {
+  pdl_wait_and_trigger(pdl_trigger);
   int const H = L.hidden;
   int const nv = H >> 3;               // 16-byte vectors per row
   int const total_groups = *n_groups;  // read once: the last block zeroes it below
@@ -287,7 +320,7 @@ void sm90_cake_combine_prereduced_bf16(TensorView y, TensorView meta, LAYOUT_PAR
                                        TensorView grp_list, TensorView n_groups,
                                        TensorView groups_per_src, TensorView cdone_local,
                                        TensorView round_ctr, TensorView blocks_done,
-                                       int64_t split_partials) {
+                                       int64_t split_partials, int64_t use_pdl) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   CHECK_INPUT_AND_TYPE(y, dl_bfloat16);
@@ -327,11 +360,12 @@ void sm90_cake_combine_prereduced_bf16(TensorView y, TensorView meta, LAYOUT_PAR
   // no memsets: the scratch was zeroed at construction and self-resets every round
   if (Mcap == 0) return;  // zero-row destinations were published by wait_prefix
   int const blocks = publish_grid_blocks(y.device());
-  combine_publish_prereduced_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
-      L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
-      static_cast<const int32_t*>(meta.data_ptr()), cnt,
-      static_cast<const int32_t*>(grp_rows.data_ptr()), glist, ng, gps, cdl,
-      static_cast<const int32_t*>(round_ctr.data_ptr()), bd, split_partials != 0 ? 1 : 0);
+  launch_kernel(combine_publish_prereduced_bf16_kernel, dim3(blocks), dim3(kThreads), 0, stream,
+                (use_pdl & 1) != 0, L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
+                static_cast<const int32_t*>(meta.data_ptr()), cnt,
+                static_cast<const int32_t*>(grp_rows.data_ptr()), glist, ng, gps, cdl,
+                static_cast<const int32_t*>(round_ctr.data_ptr()), bd, split_partials != 0 ? 1 : 0,
+                static_cast<int>((use_pdl & 2) == 0));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_cake_combine_prereduced_bf16, sm90_cake_combine_prereduced_bf16);

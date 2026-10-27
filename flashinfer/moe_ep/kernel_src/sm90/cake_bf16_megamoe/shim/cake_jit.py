@@ -30,6 +30,7 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 
 __all__ = [
     "GROUPED_GEMM_STAGES",
+    "gen_sm90_cake_bf16_combine_per_route_module",
     "gen_sm90_cake_bf16_combine_prereduced_module",
     "gen_sm90_cake_bf16_combine_tail_module",
     "gen_sm90_cake_bf16_combine_tail_prereduced_module",
@@ -38,6 +39,7 @@ __all__ = [
     "gen_sm90_cake_bf16_grouped_gemm_module",
     "grouped_gemm_manifest",
     "grouped_gemm_record",
+    "sm90_cake_bf16_combine_per_route_uri",
     "sm90_cake_bf16_combine_prereduced_uri",
     "sm90_cake_bf16_combine_tail_prereduced_uri",
     "sm90_cake_bf16_combine_tail_uri",
@@ -73,6 +75,13 @@ _COMBINE_PREREDUCED_SOURCES: _Sources = (
     (
         "cake_combine_prereduced_bf16.cu",
         _SOURCE_DIR / "cake_combine_prereduced_bf16.cu",
+    ),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_PER_ROUTE_SOURCES: _Sources = (
+    (
+        "cake_combine_per_route_bf16.cu",
+        _SOURCE_DIR / "cake_combine_per_route_bf16.cu",
     ),
     ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
 )
@@ -209,6 +218,24 @@ def gen_sm90_cake_bf16_combine_prereduced_module() -> JitSpec:
         "sm90_cake_bf16_combine_prereduced",
         _COMBINE_PREREDUCED_SOURCES,
         "cake_combine_prereduced_bf16.cu",
+    )
+
+
+def sm90_cake_bf16_combine_per_route_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the per-route combine publish module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_per_route", _COMBINE_PER_ROUTE_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_combine_per_route_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_per_route_bf16`` (per-route publish, self-resetting counters, PDL-capable)."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_per_route",
+        _COMBINE_PER_ROUTE_SOURCES,
+        "cake_combine_per_route_bf16.cu",
     )
 
 

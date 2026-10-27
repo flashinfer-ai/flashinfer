@@ -50,40 +50,40 @@
   },
   "files": [
     {
-      "bytes": 11048,
+      "bytes": 12115,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_binding.cu",
-      "sha256": "65a255bcbdfe1763b74c005c9e827d910bc7732046dd343179df3bdff526e332"
+      "sha256": "710bf8b7df40825aee86723fff71ea779a158cf142c0c7c74965c7cb6cf8406d"
     },
     {
-      "bytes": 11078,
+      "bytes": 12145,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_binding.cu",
-      "sha256": "8442138d8b43d0a3624f815ad777549f0350a6eee5b37fbd7f9056e471367c18"
+      "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
     },
     {
-      "bytes": 102727,
+      "bytes": 102953,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
-      "sha256": "49fd3e5488d235388a6f0e7f5a52499e0b3c57b0cba4e35ede7d0ffeb1071d4c"
+      "sha256": "cf9a70f8b479b1a571fe02c351496f6f862cc3c73d86318c95d0fe56447e4ab9"
     },
     {
-      "bytes": 86831,
+      "bytes": 87057,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
-      "sha256": "547edf708cf529e8d6a9846ecfb353353c1d000babbef48e4d30362490bb298b"
+      "sha256": "de8fa0a37957e9e6a2d3e01ed3488bd50762b09b82f1d06db52d82545ed73746"
     },
     {
-      "bytes": 11018,
+      "bytes": 12085,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_binding.cu",
-      "sha256": "a946b3067413ce41fb131e4eb150bcabbd10a71fbf0963c6325012a397b35bac"
+      "sha256": "c012efcaed791ef0288eb5e453ffe1b98ca9633f6fe03ed0a3b6d2fdd193bd35"
     },
     {
-      "bytes": 93383,
+      "bytes": 93609,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
-      "sha256": "e7f751dabaccaee0c67270b5f8e0c1905a2cd4cf8f43cfaf6feddb287c83b4c7"
+      "sha256": "58e3d8f727d5f4945cc67f09c3ddd2ab37ff98fba829eeaf9f556eb335e6b5da"
     }
   ],
   "generation_inputs": {
@@ -148,17 +148,17 @@
       },
       "closure": [
         {
-          "bytes": 86831,
+          "bytes": 87057,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
-          "sha256": "547edf708cf529e8d6a9846ecfb353353c1d000babbef48e4d30362490bb298b"
+          "sha256": "de8fa0a37957e9e6a2d3e01ed3488bd50762b09b82f1d06db52d82545ed73746"
         },
         {
-          "bytes": 11048,
+          "bytes": 12115,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_binding.cu",
-          "sha256": "65a255bcbdfe1763b74c005c9e827d910bc7732046dd343179df3bdff526e332"
+          "sha256": "710bf8b7df40825aee86723fff71ea779a158cf142c0c7c74965c7cb6cf8406d"
         }
       ],
-      "closure_sha256": "deb4331635bc8e601d016cf69486b7d170dca8c504e07e391e251a4232c14e11",
+      "closure_sha256": "1929236253070e0aad02cd009d8cc13249f486723fb4d4c331d84a07e01afab0",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated",
@@ -178,7 +178,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc1_gated",
@@ -273,17 +273,17 @@
       },
       "closure": [
         {
-          "bytes": 102727,
+          "bytes": 102953,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
-          "sha256": "49fd3e5488d235388a6f0e7f5a52499e0b3c57b0cba4e35ede7d0ffeb1071d4c"
+          "sha256": "cf9a70f8b479b1a571fe02c351496f6f862cc3c73d86318c95d0fe56447e4ab9"
         },
         {
-          "bytes": 11078,
+          "bytes": 12145,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_binding.cu",
-          "sha256": "8442138d8b43d0a3624f815ad777549f0350a6eee5b37fbd7f9056e471367c18"
+          "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
         }
       ],
-      "closure_sha256": "7647557602daee41e9f639e7bfd23f762c84bd9cd9e12ea7c3d1ae32ae6050f5",
+      "closure_sha256": "44811d2ab4b1f257aee35b3a67ea5c8718af41a531b09f8f0ba56dde6e4d3f27",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp",
@@ -303,7 +303,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_clamp_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc1_gated_clamp",
@@ -398,17 +398,17 @@
       },
       "closure": [
         {
-          "bytes": 93383,
+          "bytes": 93609,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
-          "sha256": "e7f751dabaccaee0c67270b5f8e0c1905a2cd4cf8f43cfaf6feddb287c83b4c7"
+          "sha256": "58e3d8f727d5f4945cc67f09c3ddd2ab37ff98fba829eeaf9f556eb335e6b5da"
         },
         {
-          "bytes": 11018,
+          "bytes": 12085,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_binding.cu",
-          "sha256": "a946b3067413ce41fb131e4eb150bcabbd10a71fbf0963c6325012a397b35bac"
+          "sha256": "c012efcaed791ef0288eb5e453ffe1b98ca9633f6fe03ed0a3b6d2fdd193bd35"
         }
       ],
-      "closure_sha256": "220c891f5f2a67e29e2ed46e71777eb1f68bcac279c9e69279558e2f15ef1ffc",
+      "closure_sha256": "17746dbcfca36bc7262d46bcc517457a9cabc82fd266543dbb18319dfbaee876",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2",
@@ -428,7 +428,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc2_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc2",

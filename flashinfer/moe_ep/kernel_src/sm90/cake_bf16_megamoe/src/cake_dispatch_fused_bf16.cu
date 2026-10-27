@@ -33,6 +33,19 @@
 //      into the destinations' pools, then fences at system scope;  grid barrier;
 //   4. block 0 releases every count cell (including the zero counts) in parallel.
 //
+// Optional round fusion (decode rounds):
+//   * fuse_begin: the kernel also opens the round in place of the vendored
+//     `bump_tag` + `wait_acks` kernels: every block reads the round counter once
+//     at entry and works with tag = counter + 1; block 0's lane d waits for
+//     destination d's ack of the previous round (same cell and tag as
+//     `wait_acks_kernel`) right before it reserves on d, so the route analysis
+//     of step 1 overlaps the ack wait; block 0 stores the new tag after the
+//     first grid barrier, when every block has read the old value.
+//   * fuse_prefix: block 0 then runs the receiver-side `wait_prefix` body (wait
+//     for every source's count and base cells, expert-major prefix, segment
+//     tables, zero-row cdone releases) in place of the vendored kernel, with the
+//     same cells, checks, traps and outputs.
+//
 // Cells, tags, SlotMeta fields, pool-head packing and the overflow / invalid
 // expert traps are those of the vendored protocol, so a peer running the
 // vendored `wait_prefix` / compact kernels consumes this dispatch unchanged.
@@ -133,13 +146,27 @@ __device__ __forceinline__ int warp_sum(int v) {
 
 // grid = max(T, 1) blocks (cooperative), block = kThreads.  Dynamic smem:
 // route ids [kMaxRoutes], lc [nkeys], exclusive scan [nkeys + 1], pc [eps].
+// Receiver-side prefix outputs (the arguments of the vendored `wait_prefix`).
+struct PrefixArgs {
+  int32_t* rows_per_src;
+  int64_t* offsets;
+  int32_t* seg_src_base;
+  int32_t* seg_out_base;
+  int32_t* pad_base;
+  int32_t* m_dev;
+  int32_t* p_dev;
+  int32_t* next_row;
+  int m_cap;
+  int max_rows_per_key;
+};
+
 template <int TOP_K>
 __global__ void __launch_bounds__(kThreads)
     dispatch_fused_dedup_kernel(PushLayout L, const uint8_t* __restrict__ x_bytes,
                                 int bytes_per_token, const int32_t* __restrict__ topk_ids,
-                                const float* __restrict__ topk_w,
-                                const int32_t* __restrict__ round_ctr, int32_t* __restrict__ bases,
-                                int local_num_tokens) {
+                                const float* __restrict__ topk_w, int32_t* round_ctr,
+                                int32_t* __restrict__ bases, int local_num_tokens, int fuse_begin,
+                                int fuse_prefix, PrefixArgs pa) {
   extern __shared__ int32_t smem[];
   int const E = L.num_local_experts;
   int const eps = L.ep_size;
@@ -154,7 +181,10 @@ __global__ void __launch_bounds__(kThreads)
   __shared__ int s_red[kWarps][2 * TOP_K];
   __shared__ int s_wsum[kWarps];
   cg::grid_group grid = cg::this_grid();
-  uint32_t const tag = static_cast<uint32_t>(*round_ctr);
+  // read once at entry by every block; with fuse_begin this round's tag is the
+  // counter + 1 (block 0 stores it after the first grid barrier)
+  uint32_t const tag = static_cast<uint32_t>(*reinterpret_cast<volatile int32_t*>(round_ctr)) +
+                       (fuse_begin ? 1u : 0u);
   int const tid = threadIdx.x;
   int const lane = tid & 31;
   int const warp = tid >> 5;
@@ -279,6 +309,9 @@ __global__ void __launch_bounds__(kThreads)
   // 2. block 0: reserve the meta/payload ranges on every destination
   if (t == 0 && tid < eps) {
     int const d = tid;
+    if (fuse_begin) {  // wait_acks_kernel: destination d has drained the previous round
+      wait_tag_u64(L, L.ack_cell(L.rank, d), tag - 1u);
+    }
     int const total_meta = s_scan[(d + 1) * E] - s_scan[d * E];
     int const total_payload = s_pc[d];
     int meta_base = 0, payload_base = 0;
@@ -302,6 +335,9 @@ __global__ void __launch_bounds__(kThreads)
     bases[eps + d] = payload_base;
   }
   grid.sync();
+  if (fuse_begin && t == 0 && tid == 0) {  // every block has read the old counter
+    *reinterpret_cast<volatile int32_t*>(round_ctr) = static_cast<int32_t>(tag);
+  }
 
   // 3. this token's SlotMeta records and carrier payload rows
   if (has_token) {
@@ -364,12 +400,74 @@ __global__ void __launch_bounds__(kThreads)
       st_release_sys_u64(L.count_cell(key / E, key % E, L.rank), pack_count_tag(s_lc[key], tag));
     }
   }
+  if (!fuse_prefix || t != 0) return;
+
+  // 5. block 0 (fuse_prefix): the vendored wait_prefix body.  The route-id area
+  //    of the dynamic smem is free again (host checks nkeys + 2 * eps <= kMaxRoutes).
+  int32_t* cnt = s_ids;          // [nkeys], indexed e * eps + s
+  int32_t* sbase = cnt + nkeys;  // [eps]
+  int32_t* sacc = sbase + eps;   // [eps]
+  __syncthreads();
+  uint64_t* cells = reinterpret_cast<uint64_t*>(L.window(L.rank) + L.count_cells_offset);
+  for (int i = tid; i < nkeys; i += kThreads) {
+    int c = wait_tag_u64(L, cells + i, tag);
+    if (c < 0 || c > pa.max_rows_per_key) {  // protocol corruption, not overflow
+      printf("sm90_push: bad count %d for (expert %d, src %d), max %d\n", c, i / eps, i % eps,
+             pa.max_rows_per_key);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+    }
+    cnt[i] = c;
+  }
+  for (int s = tid; s < eps; s += kThreads) {
+    sbase[s] = wait_tag_u64(L, L.base_cell(L.rank, s), tag);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int64_t acc = 0;
+    for (int s = 0; s < eps; ++s) sacc[s] = 0;
+    for (int e = 0; e < E; ++e) {
+      pa.offsets[e] = acc;
+      // deep_gemm::compute_padded_offset(acc, e): 32-align with headroom
+      pa.pad_base[e] = static_cast<int32_t>((acc + static_cast<int64_t>(e) * 31) / 32 * 32);
+      for (int s = 0; s < eps; ++s) {
+        int idx = e * eps + s;
+        pa.seg_out_base[idx] = static_cast<int32_t>(acc);
+        pa.seg_src_base[idx] = sbase[s] + sacc[s];
+        sacc[s] += cnt[idx];
+        acc += cnt[idx];
+      }
+    }
+    if (acc > static_cast<int64_t>(pa.m_cap)) {
+      printf("sm90_push: accumulated row count %lld exceeds m_cap %d\n",
+             static_cast<long long>(acc), pa.m_cap);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+      return;
+    }
+    pa.offsets[E] = acc;
+    pa.seg_out_base[nkeys] = static_cast<int32_t>(acc);
+    *pa.m_dev = static_cast<int32_t>(acc);
+    int64_t p = (static_cast<int64_t>(pa.m_cap) + static_cast<int64_t>(E) * 31) / 32 * 32;
+    *pa.p_dev = static_cast<int32_t>(p < 1 ? 1 : p);
+    *pa.next_row = 0;  // reset the persistent-compact work queue
+  }
+  __syncthreads();
+  for (int s = tid; s < eps; s += kThreads) {
+    int rows = 0;
+    for (int e = 0; e < E; ++e) rows += cnt[e * eps + s];
+    pa.rows_per_src[s] = rows;
+    if (rows == 0) {  // no combine rows will flow back to s: publish now
+      st_release_sys_u64(L.cdone_cell(s, L.rank), pack_count_tag(0, tag));
+    }
+  }
 }
 
 template <int TOP_K>
 void launch_fused_dispatch(const PushLayout& L, const uint8_t* x_bytes, int bytes_per_token,
-                           const int32_t* ids, const float* w, const int32_t* rc, int32_t* bases,
-                           int lt, int device_id, cudaStream_t stream) {
+                           const int32_t* ids, const float* w, int32_t* rc, int32_t* bases, int lt,
+                           int device_id, cudaStream_t stream, int fuse_begin, int fuse_prefix,
+                           PrefixArgs pa) {
   auto kernel = dispatch_fused_dedup_kernel<TOP_K>;
   int const nkeys = L.num_local_experts * L.ep_size;
   size_t const smem = static_cast<size_t>(kMaxRoutes + 2 * nkeys + 1 + L.ep_size) * sizeof(int32_t);
@@ -390,9 +488,12 @@ void launch_fused_dispatch(const PushLayout& L, const uint8_t* x_bytes, int byte
                   &bytes_per_token,
                   const_cast<int32_t**>(&ids),
                   const_cast<float**>(&w),
-                  const_cast<int32_t**>(&rc),
+                  &rc,
                   &bases,
-                  &lt};
+                  &lt,
+                  &fuse_begin,
+                  &fuse_prefix,
+                  &pa};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid));
   config.blockDim = dim3(kThreads);
@@ -412,7 +513,11 @@ void launch_fused_dispatch(const PushLayout& L, const uint8_t* x_bytes, int byte
 }  // namespace
 
 void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView topk_w,
-                                   LAYOUT_PARAMS, TensorView round_ctr, TensorView bases) {
+                                   LAYOUT_PARAMS, TensorView round_ctr, TensorView bases,
+                                   int64_t fuse_begin, int64_t fuse_prefix, TensorView rows_per_src,
+                                   TensorView offsets, TensorView seg_src_base,
+                                   TensorView seg_out_base, TensorView pad_base, TensorView m_dev,
+                                   TensorView p_dev, TensorView next_row, int64_t m_cap) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   int64_t const T = x.size(0);
@@ -438,26 +543,60 @@ void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView
   auto* xb = static_cast<const uint8_t*>(x.data_ptr());
   auto* ids = static_cast<const int32_t*>(topk_ids.data_ptr());
   auto* w = static_cast<const float*>(topk_w.data_ptr());
-  auto* rc = static_cast<const int32_t*>(round_ctr.data_ptr());
+  auto* rc = static_cast<int32_t*>(round_ctr.data_ptr());
   auto* bp = static_cast<int32_t*>(bases.data_ptr());
+  int const nkeys = L.num_local_experts * L.ep_size;
+  PrefixArgs pa{};
+  if (fuse_prefix != 0) {
+    TVM_FFI_ICHECK(fuse_begin != 0) << "dispatch_fused: fuse_prefix requires fuse_begin";
+    TVM_FFI_ICHECK(nkeys + 2 * L.ep_size <= kMaxRoutes)
+        << "dispatch_fused: fused prefix needs E*ep + 2*ep <= " << kMaxRoutes
+        << ", got E*ep = " << nkeys;
+    CHECK_INPUT_AND_TYPE(rows_per_src, dl_int32);
+    CHECK_INPUT_AND_TYPE(offsets, dl_int64);
+    CHECK_INPUT_AND_TYPE(seg_src_base, dl_int32);
+    CHECK_INPUT_AND_TYPE(seg_out_base, dl_int32);
+    CHECK_INPUT_AND_TYPE(pad_base, dl_int32);
+    CHECK_INPUT_AND_TYPE(m_dev, dl_int32);
+    CHECK_INPUT_AND_TYPE(p_dev, dl_int32);
+    CHECK_INPUT_AND_TYPE(next_row, dl_int32);
+    TVM_FFI_ICHECK(rows_per_src.numel() >= L.ep_size) << "wait_prefix: rows_per_src too small";
+    TVM_FFI_ICHECK(offsets.numel() >= L.num_local_experts + 1) << "wait_prefix: offsets too small";
+    TVM_FFI_ICHECK(seg_src_base.numel() >= nkeys) << "wait_prefix: seg_src_base too small";
+    TVM_FFI_ICHECK(seg_out_base.numel() >= nkeys + 1) << "wait_prefix: seg_out_base too small";
+    TVM_FFI_ICHECK(pad_base.numel() >= L.num_local_experts) << "wait_prefix: pad_base too small";
+    TVM_FFI_ICHECK(m_cap >= 1) << "wait_prefix: bad m_cap";
+    pa.rows_per_src = static_cast<int32_t*>(rows_per_src.data_ptr());
+    pa.offsets = static_cast<int64_t*>(offsets.data_ptr());
+    pa.seg_src_base = static_cast<int32_t*>(seg_src_base.data_ptr());
+    pa.seg_out_base = static_cast<int32_t*>(seg_out_base.data_ptr());
+    pa.pad_base = static_cast<int32_t*>(pad_base.data_ptr());
+    pa.m_dev = static_cast<int32_t*>(m_dev.data_ptr());
+    pa.p_dev = static_cast<int32_t*>(p_dev.data_ptr());
+    pa.next_row = static_cast<int32_t*>(next_row.data_ptr());
+    pa.m_cap = static_cast<int>(m_cap);
+    pa.max_rows_per_key = L.t_cap * L.top_k;  // one source's routes for one expert
+  }
+  int const fb = fuse_begin != 0 ? 1 : 0;
+  int const fp = fuse_prefix != 0 ? 1 : 0;
   int const lt = static_cast<int>(T);
   int const bpt = static_cast<int>(H) * 2;
   int const dev = x.device().device_id;
   switch (K) {
     case 1:
-      launch_fused_dispatch<1>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream);
+      launch_fused_dispatch<1>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
       break;
     case 2:
-      launch_fused_dispatch<2>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream);
+      launch_fused_dispatch<2>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
       break;
     case 4:
-      launch_fused_dispatch<4>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream);
+      launch_fused_dispatch<4>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
       break;
     case 6:
-      launch_fused_dispatch<6>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream);
+      launch_fused_dispatch<6>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
       break;
     case 8:
-      launch_fused_dispatch<8>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream);
+      launch_fused_dispatch<8>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
       break;
     default:
       TVM_FFI_ICHECK(false) << "dispatch_fused: unsupported top_k " << K

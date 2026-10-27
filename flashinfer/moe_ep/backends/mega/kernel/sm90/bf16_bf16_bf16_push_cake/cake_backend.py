@@ -227,6 +227,21 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} combine_wire must be one of {COMBINE_WIRES} or None, got "
                 f"{kcfg.combine_wire!r}"
             )
+        if kcfg.pdl is not None and not (
+            isinstance(kcfg.pdl, bool)
+            or (isinstance(kcfg.pdl, int) and 0 <= kcfg.pdl <= 31)
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl must be a bool, an edge mask in [0, 31] or None, got {kcfg.pdl!r}"
+            )
+        if kcfg.pdl_late is not None and not isinstance(kcfg.pdl_late, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl_late must be a bool or None, got {kcfg.pdl_late!r}"
+            )
+        if kcfg.fused_begin is not None and kcfg.fused_begin not in (0, 1, 2):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_begin must be 0, 1, 2 or None, got {kcfg.fused_begin!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -335,6 +350,9 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 transformed_weights,
                 clamp=None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
                 combine_wire=kcfg.combine_wire,
+                pdl=kcfg.pdl,
+                pdl_late=kcfg.pdl_late,
+                fused_begin=kcfg.fused_begin,
             )
         except Exception:
             pipe.destroy()
@@ -361,6 +379,9 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
             kcfg.allow_unverified_p2p,
             kcfg.combine_wire,
+            kcfg.pdl,
+            kcfg.pdl_late,
+            kcfg.fused_begin,
             float(kcfg.init_timeout_s),
         )
 

@@ -199,13 +199,14 @@ class ExportedGroupedGemm:
         w: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        pdl: bool = False,
     ) -> None:
         if self._destroyed:
             raise RuntimeError("ExportedGroupedGemm has been destroyed")
         num_experts, shape_n, shape_k = _check_geometry(
             gated=gated, a=a, w=w, offsets=offsets, out=out
         )
-        module.run(
+        (module.run_pdl if pdl else module.run)(
             num_experts,
             shape_n,
             shape_k,
@@ -225,8 +226,12 @@ class ExportedGroupedGemm:
         w13: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
     ) -> None:
-        self._launch(self._fc1, gated=True, a=a, w=w13, offsets=offsets, out=out)
+        self._launch(
+            self._fc1, gated=True, a=a, w=w13, offsets=offsets, out=out, pdl=pdl
+        )
 
     def fc2(
         self,
@@ -234,8 +239,12 @@ class ExportedGroupedGemm:
         w2: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
     ) -> None:
-        self._launch(self._fc2, gated=False, a=h, w=w2, offsets=offsets, out=out)
+        self._launch(
+            self._fc2, gated=False, a=h, w=w2, offsets=offsets, out=out, pdl=pdl
+        )
 
     def destroy(self) -> None:
         self._destroyed = True

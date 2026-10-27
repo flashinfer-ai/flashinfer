@@ -36,6 +36,7 @@ from .cake_gemm import (
     validate_grouped_gemm_geometry,
 )
 from .cake_jit import (
+    gen_sm90_cake_bf16_combine_per_route_module,
     gen_sm90_cake_bf16_combine_prereduced_module,
     gen_sm90_cake_bf16_combine_tail_module,
     gen_sm90_cake_bf16_combine_tail_prereduced_module,
@@ -48,10 +49,19 @@ __all__ = [
     "COMBINE_WIRES",
     "COMBINE_WIRE_PER_SHAPE_MAX_TOKENS",
     "COMBINE_WIRE_ENV",
+    "FUSED_BEGIN_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
     "FUSED_DISPATCH_MAX_ROUTES",
     "FUSED_DISPATCH_MAX_TOKENS",
+    "PDL_EDGES_ALL",
+    "PDL_EDGE_COMPACT",
+    "PDL_EDGE_FC1",
+    "PDL_EDGE_FC2",
+    "PDL_EDGE_PUBLISH",
+    "PDL_EDGE_TAIL",
+    "PDL_ENV",
+    "PDL_LATE_ENV",
     "Sm90CakeBf16MoERunner",
 ]
 
@@ -95,6 +105,32 @@ _PREREDUCED_WIRES = (COMBINE_WIRE_PREREDUCED, COMBINE_WIRE_PREREDUCED_HILO)
 # capacities run the pre-reduced wire.  The capacity is a pipe-creation constant
 # identical on every rank, so the selection is rank-consistent by construction.
 COMBINE_WIRE_PER_SHAPE_MAX_TOKENS = 8
+# Programmatic dependent launch of this package's kernels (compact, FC1, FC2,
+# combine publish, combine tail): each one is scheduled while its predecessor
+# finishes and waits for it (griddepcontrol.wait) before touching memory.
+# The value is on/off or a mask of PDL_EDGE_* bits (the kernels launched with
+# the PDL attribute).  With the per-route wire a PDL-launched publish runs this
+# package's twin of the vendored kernel (same bytes on the wire, self-resetting
+# row counters).
+PDL_ENV = "FLASHINFER_SM90_CAKE_BF16_PDL"
+PDL_EDGE_COMPACT = 1
+PDL_EDGE_FC1 = 2
+PDL_EDGE_FC2 = 4
+PDL_EDGE_PUBLISH = 8
+PDL_EDGE_TAIL = 16
+PDL_EDGES_ALL = 31
+# 1 = this package's small kernels let their PDL dependents be scheduled only
+# when they exit instead of right after their own wait (the early form lets
+# the dependent's blocks occupy the SMs while the producer runs).
+PDL_LATE_ENV = "FLASHINFER_SM90_CAKE_BF16_PDL_LATE"
+# Round opening folded into the small-round fused dispatch (requires the fused
+# tail and the fused dispatch path): 1 = the tag bump and the ack wait run in
+# the dispatch launch, 2 = also the receiver-side prefix (wait_prefix).
+FUSED_BEGIN_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN"
+FUSED_BEGIN_LEVELS = (0, 1, 2)
+_FUSED_PREFIX_MAX_KEYS = (
+    1024  # E * ep + 2 * ep bound of the fused prefix (dispatch smem)
+)
 
 
 def _env_flag(name: str) -> bool:
@@ -108,6 +144,46 @@ def _fused_combine_tail_default() -> bool:
 
 def _fused_dispatch_default() -> bool:
     return _env_flag(FUSED_DISPATCH_ENV)
+
+
+def _pdl_mask(value: bool | int | str) -> int:
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in ("0", "false", "off", "no"):
+            return 0
+        if raw in ("1", "true", "on", "yes"):
+            return PDL_EDGES_ALL
+        value = int(raw)
+    if isinstance(value, bool):
+        return PDL_EDGES_ALL if value else 0
+    mask = int(value)
+    if not 0 <= mask <= PDL_EDGES_ALL:
+        raise ValueError(
+            f"pdl must be a bool or an edge mask in [0, {PDL_EDGES_ALL}], got {value!r}"
+        )
+    return mask
+
+
+def _pdl_default() -> int:
+    return _pdl_mask(os.environ.get(PDL_ENV, "0"))
+
+
+def _pdl_late_default() -> bool:
+    return os.environ.get(PDL_LATE_ENV, "0").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+def _fused_begin_default() -> int:
+    raw = os.environ.get(FUSED_BEGIN_ENV, "0").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return 0
+    if raw in ("1", "2"):
+        return int(raw)
+    raise ValueError(f"{FUSED_BEGIN_ENV} must be one of 0, 1, 2, got {raw!r}")
 
 
 def _combine_wire_default(token_capacity: int) -> str:
@@ -186,6 +262,9 @@ class Sm90CakeBf16MoERunner:
         fused_combine_tail: bool | None = None,
         fused_dispatch: bool | None = None,
         combine_wire: str | None = None,
+        pdl: bool | int | None = None,
+        pdl_late: bool | None = None,
+        fused_begin: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -223,6 +302,27 @@ class Sm90CakeBf16MoERunner:
                 f"(fused_combine_tail=True / {FUSED_COMBINE_TAIL_ENV}=1)"
             )
         self._combine_wire = wire
+        self._pdl = _pdl_default() if pdl is None else _pdl_mask(pdl)
+        self._pdl_late = _pdl_late_default() if pdl_late is None else bool(pdl_late)
+        level = _fused_begin_default() if fused_begin is None else int(fused_begin)
+        if level not in FUSED_BEGIN_LEVELS:
+            raise ValueError(
+                f"fused_begin must be one of {FUSED_BEGIN_LEVELS}, got {fused_begin!r}"
+            )
+        if not (
+            self._fused_tail and self._fused_dispatch and pipe.config.dedup_dispatch
+        ):
+            level = 0  # the round opening is fused into the fused dispatch launch only
+        if level == 2 and pipe.E * pipe.ep + 2 * pipe.ep > _FUSED_PREFIX_MAX_KEYS:
+            level = 1
+        self._fused_begin = level
+        # the per-route wire publishes through this package's twin under PDL
+        self._own_per_route = (
+            bool(self._pdl & PDL_EDGE_PUBLISH)
+            and self._fused_tail
+            and wire == COMBINE_WIRE_PER_ROUTE
+        )
+        self._staged_prefix_done = False
         self.weights: Sm90CakeBf16Weights | None = None
 
         def _local_init():
@@ -279,7 +379,11 @@ class Sm90CakeBf16MoERunner:
                     gen_sm90_cake_bf16_combine_tail_prereduced_module().build_and_load()
                 )
             else:
-                self.publish_module = None
+                self.publish_module = (
+                    gen_sm90_cake_bf16_combine_per_route_module().build_and_load()
+                    if self._own_per_route
+                    else None
+                )
                 self.tail_module = (
                     gen_sm90_cake_bf16_combine_tail_module().build_and_load()
                     if self._fused_tail
@@ -309,6 +413,25 @@ class Sm90CakeBf16MoERunner:
     def combine_wire(self) -> str:
         """``"prereduced"`` or ``"per_route"`` (see the class docstring)."""
         return self._combine_wire
+
+    @property
+    def pdl(self) -> int:
+        """Mask of PDL_EDGE_* bits: the kernels launched as programmatic dependent launches."""
+        return self._pdl
+
+    @property
+    def pdl_late(self) -> bool:
+        """True when the small kernels let their PDL dependents start only at exit."""
+        return self._pdl_late
+
+    def _pdl_flag(self, edge: int) -> int:
+        # bit 0: launch with the PDL attribute; bit 1: no early trigger
+        return (1 if self._pdl & edge else 0) | (2 if self._pdl_late else 0)
+
+    @property
+    def fused_begin(self) -> int:
+        """Round-opening fusion level of small rounds (0, 1 or 2; see ``FUSED_BEGIN_ENV``)."""
+        return self._fused_begin
 
     def _use_fused_dispatch(self, num_tokens: int) -> bool:
         pipe = self.pipe
@@ -361,6 +484,11 @@ class Sm90CakeBf16MoERunner:
             self._pub_blocks_done = torch.zeros(1, dtype=torch.int32, device=dv)
             pipe._cdone_local.zero_()  # the publish kernel keeps it zeroed from here on
         else:  # per-route wire: compact builds no worklist; placeholders for the binding
+            if self._own_per_route:
+                # grid-completion counter of the per-route twin publish, which keeps
+                # the per-source row counters zeroed from here on (no per-round memset)
+                self._pub_blocks_done = torch.zeros(1, dtype=torch.int32, device=dv)
+                pipe._cdone_local.zero_()
             self._grp_cnt = self._grp_rows = self._grp_list = torch.zeros(
                 1, dtype=torch.int32, device=dv
             )
@@ -475,7 +603,7 @@ class Sm90CakeBf16MoERunner:
         stream = torch.cuda.current_stream()
         return stream, torch.cuda.is_current_stream_capturing()
 
-    def _begin_round(self) -> None:
+    def _begin_round(self, *, fused: bool = False) -> None:
         """Open the round: round-tag bump and ack wait, in the pipe's order.
 
         With the fused tail this mirrors ``Sm90PushPipe.proto_begin_round``
@@ -500,6 +628,8 @@ class Sm90CakeBf16MoERunner:
                 "the pipe runs ONE round at a time"
             )
         pipe._round_open = True
+        if fused:  # the fused dispatch bumps the tag and waits for the acks itself
+            return
         pipe.module.sm90_push_bump_tag(pipe._round)
         pipe.module.sm90_push_wait_acks(*pipe._layout_args(), pipe._round)
 
@@ -529,18 +659,32 @@ class Sm90CakeBf16MoERunner:
             # a capture the caller must have joined the streams beforehand.
             stream.wait_event(self._round_event)
         nv = self.record_stages
+        use_fused = self._use_fused_dispatch(num_tokens)
+        level = self._fused_begin if use_fused else 0
         try:
             with _record_stage("begin_round", nv):
-                self._begin_round()
+                self._begin_round(fused=level > 0)
             with _record_stage("dispatch", nv):
-                if self._use_fused_dispatch(num_tokens):
+                if use_fused:
+                    pipe = self.pipe
                     self.dispatch_module.sm90_cake_dispatch_fused_bf16(
                         x,
                         topk_ids,
                         topk_weights,
-                        *self.pipe._layout_args(),
-                        self.pipe._round,
+                        *pipe._layout_args(),
+                        pipe._round,
                         self._dispatch_bases,
+                        1 if level >= 1 else 0,
+                        1 if level == 2 else 0,
+                        pipe._rows_per_src,
+                        pipe._offsets,
+                        pipe._seg_src_base,
+                        pipe._seg_out_base,
+                        pipe._pad_base,
+                        pipe._m_dev,
+                        pipe._p_dev,
+                        pipe._next_row,
+                        pipe.m_cap,
                     )
                 else:
                     self.pipe.proto_dispatch(x, topk_ids, topk_weights)
@@ -548,6 +692,7 @@ class Sm90CakeBf16MoERunner:
             self._poison()
             raise
         self._staged_tokens = num_tokens
+        self._staged_prefix_done = level == 2
         self._staged_topk_ids = topk_ids  # the fused tail skips masked (-1) slots
         self._staged_stream = stream
         self._staged_stream_capturing = capturing
@@ -591,8 +736,9 @@ class Sm90CakeBf16MoERunner:
         nv = self.record_stages
         try:
             with stream_context:
-                with _record_stage("wait_prefix", nv):
-                    pipe.proto_wait_prefix()
+                if not self._staged_prefix_done:  # else run by the fused dispatch
+                    with _record_stage("wait_prefix", nv):
+                        pipe.proto_wait_prefix()
                 with _record_stage("compact_bf16", nv):
                     self.compact_module.sm90_cake_compact_bf16(
                         self.a1,
@@ -610,11 +756,24 @@ class Sm90CakeBf16MoERunner:
                         self._groups_per_src,
                         pipe._round,
                         1 if self._combine_wire in _PREREDUCED_WIRES else 0,
+                        self._pdl_flag(PDL_EDGE_COMPACT),
                     )
                 with _record_stage("fc1", nv):
-                    self.gemm.fc1(self.a1, weights.w13, pipe._offsets, self.h2)
+                    self.gemm.fc1(
+                        self.a1,
+                        weights.w13,
+                        pipe._offsets,
+                        self.h2,
+                        pdl=bool(self._pdl & PDL_EDGE_FC1),
+                    )
                 with _record_stage("fc2", nv):
-                    self.gemm.fc2(self.h2, weights.w2, pipe._offsets, self.y)
+                    self.gemm.fc2(
+                        self.h2,
+                        weights.w2,
+                        pipe._offsets,
+                        self.y,
+                        pdl=bool(self._pdl & PDL_EDGE_FC2),
+                    )
                 if self._combine_wire in _PREREDUCED_WIRES:
                     split = (
                         1 if self._combine_wire == COMBINE_WIRE_PREREDUCED_HILO else 0
@@ -634,6 +793,7 @@ class Sm90CakeBf16MoERunner:
                             pipe._round,
                             self._pub_blocks_done,
                             split,
+                            self._pdl_flag(PDL_EDGE_PUBLISH),
                         )
                     with _record_stage("combine_tail", nv):
                         self.tail_module.sm90_cake_combine_tail_prereduced_bf16(
@@ -646,11 +806,25 @@ class Sm90CakeBf16MoERunner:
                             self._tail_blocks_done,
                             num_tokens,
                             split,
+                            self._pdl_flag(PDL_EDGE_TAIL),
                         )
                     pipe._round_open = False  # the fused tail performed the ack
                 elif self._fused_tail:
                     with _record_stage("combine", nv):
-                        pipe.proto_combine(self.y, self.meta)
+                        if self._own_per_route:
+                            self.publish_module.sm90_cake_combine_per_route_bf16(
+                                self.y,
+                                self.meta,
+                                *pipe._layout_args(),
+                                pipe._m_dev,
+                                pipe._rows_per_src,
+                                pipe._cdone_local,
+                                pipe._round,
+                                self._pub_blocks_done,
+                                self._pdl_flag(PDL_EDGE_PUBLISH),
+                            )
+                        else:
+                            pipe.proto_combine(self.y, self.meta)
                     with _record_stage("combine_tail", nv):
                         self.tail_module.sm90_cake_combine_tail_bf16(
                             output,
@@ -661,6 +835,7 @@ class Sm90CakeBf16MoERunner:
                             pipe._done,
                             self._tail_blocks_done,
                             num_tokens,
+                            self._pdl_flag(PDL_EDGE_TAIL),
                         )
                     pipe._round_open = False  # the fused tail performed the ack
                 else:
@@ -677,6 +852,7 @@ class Sm90CakeBf16MoERunner:
             raise
         self._state = _RunnerState.IDLE
         self._staged_tokens = None
+        self._staged_prefix_done = False
         self._staged_topk_ids = None
         self._staged_stream = None
         self._staged_stream_capturing = False

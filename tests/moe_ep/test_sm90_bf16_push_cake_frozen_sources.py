@@ -46,7 +46,7 @@ EXPECTED_LAUNCH = {
     "dynamic_smem_bytes": 196704,
     "cluster": [2, 1, 1],
     "cooperative": False,
-    "use_pdl": False,
+    "use_pdl": True,
 }
 EXPECTED_ARG_PLAN = [
     ["parameter", "num_experts"],
@@ -120,6 +120,21 @@ def test_stage_record(stage: str) -> None:
     # Both translation units resolve and re-hash cleanly.
     assert _jit._sealed_source(units["device"]).is_file()
     assert _jit._sealed_source(units["binding"]).is_file()
+
+
+def test_closure_digests_match_records() -> None:
+    """Each module's ``closure_sha256`` (whose prefix names its JIT module) is the
+    digest of its own record, so a record edited without a reseal fails here."""
+    for record in _jit.grouped_gemm_manifest()["modules"]:
+        ident = {
+            key: value
+            for key, value in record.items()
+            if key not in ("arg_plan_sha256", "closure_sha256")
+        }
+        text = json.dumps(ident, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        assert hashlib.sha256(text.encode()).hexdigest() == record["closure_sha256"], (
+            record["name"]
+        )
 
 
 def test_host_constants_match_generator() -> None:

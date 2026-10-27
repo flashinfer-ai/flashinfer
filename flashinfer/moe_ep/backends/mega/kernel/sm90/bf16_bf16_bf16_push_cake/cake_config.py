@@ -48,6 +48,19 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     a pipe-creation constant identical on every rank, so the per-shape choice
     is rank-consistent; it is still verified by the construction-time
     allgather.
+
+    ``pdl`` launches the backend's own kernels of a round (compact, both
+    GEMMs, the combine publish and the combine tail) as programmatic dependent
+    launches, so each one is scheduled while its predecessor finishes; a mask
+    of the runner's ``PDL_EDGE_*`` bits selects a subset.  The per-route wire
+    then publishes through the backend's own copy of the vendored publish
+    kernel.  ``pdl_late`` makes the small kernels release their dependents
+    only when they exit.  ``fused_begin`` folds the round opening into the
+    small-round fused dispatch: ``1`` replaces the tag bump and the ack-wait
+    kernels, ``2`` additionally runs the receiver-side prefix in the same
+    launch.  Neither switch changes a stored value.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_PDL`` / ``FLASHINFER_SM90_CAKE_BF16_PDL_LATE`` /
+    ``FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN`` (default: off / off / ``0``).
     """
 
     intermediate_size: int
@@ -59,3 +72,6 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     allow_unverified_p2p: bool = False
     init_timeout_s: float = 600.0
     combine_wire: str | None = None
+    pdl: bool | int | None = None
+    pdl_late: bool | None = None
+    fused_begin: int | None = None
