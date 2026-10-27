@@ -17,9 +17,13 @@ output, one GEMM schedule per target and one program per output format:
   no scale tile is written.
 
 The token count ``M`` and the destination geometry are launch parameters, so
-every destination partition count ``P`` of one format routes to the same two
-programs of its target.  Tensor maps are passed by value; no descriptor
-workspace exists.
+every destination partition count ``P`` of one format routes to the same GEMM
+program of its target.  The norm stage is one program for both targets, except
+that on ``sm_103a`` four destinations (``P == 4``), and eight destinations
+(``P == 8``) of ``out_format="nvfp4"`` from ``M = 6096`` tokens on, take a
+second norm program that stages each row's activation in shared memory; both
+write the same bytes.  Tensor maps are passed by value; no descriptor workspace
+exists.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention import (
     FUSED_PACK_EPI8,
     FUSED_PACK_K96,
     NORM,
+    NORM_V5,
 )
 
 _HIDDEN = 5376
@@ -76,6 +81,20 @@ _GEMM_PROGRAMS: dict[tuple[str, str], cake_program.CakeProgram] = {
     ("nvfp4", "sm_103a"): FUSED_PACK_K96,
     ("e4m3", "sm_100a"): FUSED_E4M3_EPI8,
     ("e4m3", "sm_103a"): FUSED_E4M3_K96,
+}
+
+
+# The norm program of an (exact target, P) pair that does not take ``NORM``.
+_NORM_PROGRAMS: dict[tuple[str, int], cake_program.CakeProgram] = {
+    ("sm_103a", 4): NORM_V5,
+}
+
+# The norm program of an (output format, exact target, P) triple that does not
+# take ``NORM`` from a token count ``M`` on: ``(minimum M, program)``.
+_NORM_PROGRAMS_FROM_M: dict[
+    tuple[str, str, int], tuple[int, cake_program.CakeProgram]
+] = {
+    ("nvfp4", "sm_103a", 8): (6096, NORM_V5),
 }
 
 
@@ -132,15 +151,26 @@ def minimax_h3_nvfp4_target(device: torch.device) -> str:
 
 
 def minimax_h3_nvfp4_programs(
-    device: torch.device, out_format: str = "nvfp4"
+    device: torch.device,
+    out_format: str = "nvfp4",
+    P: Optional[int] = None,
+    M: Optional[int] = None,
 ) -> tuple[cake_program.CakeProgram, cake_program.CakeProgram]:
-    """``(norm, gemm)``: the two generated programs of ``out_format`` on the device's exact target."""
+    """``(norm, gemm)``: the two generated programs of ``out_format``, ``P``
+    destinations and ``M`` tokens on the device's exact target (``P=None``: the
+    norm program of every ``P`` but the ones with a program of their own;
+    ``M=None``: the norm program of every ``M`` but the ones with a program of
+    their own)."""
     if out_format not in _SUPPORTED_FORMATS:
         raise ValueError(
             f"out_format must be one of {_SUPPORTED_FORMATS}, got {out_format!r}"
         )
     target = minimax_h3_nvfp4_target(device)
-    return NORM, _GEMM_PROGRAMS[(out_format, target)]
+    norm = _NORM_PROGRAMS.get((target, P), NORM) if P is not None else NORM
+    from_m = _NORM_PROGRAMS_FROM_M.get((out_format, target, P))
+    if from_m is not None and M is not None and from_m[0] <= M:
+        norm = from_m[1]
+    return norm, _GEMM_PROGRAMS[(out_format, target)]
 
 
 def _gemm_row_tiles(M: int) -> int:
@@ -481,7 +511,7 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     _stage_workspace(norm_descriptor_workspace, name="norm_descriptor_workspace")
     _stage_workspace(gemm_descriptor_workspace, name="gemm_descriptor_workspace")
     target = minimax_h3_nvfp4_target(device)
-    norm_program, gemm_program = minimax_h3_nvfp4_programs(device, out_format)
+    norm_program, gemm_program = minimax_h3_nvfp4_programs(device, out_format, P, M)
     norm_run = norm_program.entry(target)
     gemm_run = gemm_program.entry(target)
     # Operands derived once at preparation: the GEMM output scale

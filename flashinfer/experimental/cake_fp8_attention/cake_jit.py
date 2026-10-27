@@ -228,7 +228,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {},
+        "build": {"unroll": 8},
         "dtypes": {
             "mean_k": "f32",
             "partials": "f32",
@@ -238,8 +238,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "grid_rule": {
             "kind": "batch_heads",
         },
-        "kernel": "cake_fp8_attention_3d93e4fe65e62bf146ce",
-        "kernel_symbol": "kernel_cake_fp8_attention_3d93e4fe65e62bf146ce",
+        "kernel": "cake_fp8_attention_8f4172c0adf623a761c9",
+        "kernel_symbol": "kernel_cake_fp8_attention_8f4172c0adf623a761c9",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -247,7 +247,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": True,
         },
-        "library": "cake_fp8_attention_3d93e4fe65e62bf146ce",
+        "library": "cake_fp8_attention_8f4172c0adf623a761c9",
         "logical": {
             "mean_k": "mean_k",
             "num_tiles": "num_qblocks",

@@ -101,6 +101,8 @@ def convert_mxfp4_pair_preprocessed_signs(
 def make_offset_smem_layout(
     tile_m: int,
     num_stages: int,
+    *,
+    folded_rows: int = MXFP4_FOLDED_M,
 ) -> cute.Layout:
     """Return the raw folded-offset layout copied by the TMA-A warp.
 
@@ -110,12 +112,13 @@ def make_offset_smem_layout(
 
     if tile_m % MXFP4_FOLD_M != 0:
         raise ValueError(f"tile_m ({tile_m}) must be divisible by {MXFP4_FOLD_M}")
+    fold_block_bytes = folded_rows * MXFP4_PHYSICAL_COLS
     m_blocks = tile_m // MXFP4_FOLD_M
-    stage_bytes = m_blocks * MXFP4_FOLD_BLOCK_BYTES
+    stage_bytes = m_blocks * fold_block_bytes
     return cute.make_layout(
         (
             MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLDED_M,
+            folded_rows,
             m_blocks,
             1,
             num_stages,
@@ -123,7 +126,7 @@ def make_offset_smem_layout(
         stride=(
             1,
             MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLD_BLOCK_BYTES,
+            fold_block_bytes,
             stage_bytes,
             stage_bytes,
         ),
@@ -171,19 +174,22 @@ def make_expanded_offset_view(
 def make_offset_smem_layout_k256(
     tile_m: int,
     num_stages: int,
+    *,
+    folded_rows: int = MXFP4_FOLDED_M,
 ) -> cute.Layout:
     """Return a K256-only folded-offset layout without changing K128 ABI."""
 
     if tile_m % MXFP4_FOLD_M != 0:
         raise ValueError(f"tile_m ({tile_m}) must be divisible by {MXFP4_FOLD_M}")
+    fold_block_bytes = folded_rows * MXFP4_PHYSICAL_COLS
     m_blocks = tile_m // MXFP4_FOLD_M
     k128_blocks_per_tile = 2
-    bytes_per_m_block = k128_blocks_per_tile * MXFP4_FOLD_BLOCK_BYTES
+    bytes_per_m_block = k128_blocks_per_tile * fold_block_bytes
     stage_bytes = m_blocks * bytes_per_m_block
     return cute.make_layout(
         (
             MXFP4_PHYSICAL_COLS,
-            MXFP4_FOLDED_M,
+            folded_rows,
             m_blocks,
             k128_blocks_per_tile,
             num_stages,
@@ -192,7 +198,7 @@ def make_offset_smem_layout_k256(
             1,
             MXFP4_PHYSICAL_COLS,
             bytes_per_m_block,
-            MXFP4_FOLD_BLOCK_BYTES,
+            fold_block_bytes,
             stage_bytes,
         ),
     )
