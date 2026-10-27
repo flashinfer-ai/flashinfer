@@ -227,9 +227,13 @@ def test_cute_dsl_moe_sanitizer(
         "--output",
         str(tmp_path),
     ]
+    # Isolate --keep-ptx artifacts from concurrent sanitizer workers.
+    dump_dir = tmp_path / "cute-dumps"
+    dump_dir.mkdir()
     env = dict(
         os.environ,
         PYTHONUNBUFFERED="1",
+        CUTE_DSL_DUMP_DIR=str(dump_dir),
         FLASHINFER_CUTE_DSL_DISABLE_CACHE="1",
         FLASHINFER_JIT_DEBUG="0",
         FLASHINFER_JIT_LINEINFO="1",
