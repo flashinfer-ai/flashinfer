@@ -940,7 +940,9 @@ def test_shared_workspace_is_sized_over_every_planned_bucket_not_the_largest_bat
             w.plan_info.workspace_size == sized[b]
             and w.plan_info.workspace_size <= ws.numel()
         )
-        out = _run(w.plan_info, cases[b])
+        out = _run(
+            w.plan_info, cases[b], workspace_buffer=ws
+        )  # a wrapper plan owns no workspace: the shared buffer rides every run
         _check_step(
             cases[b], w.plan_info, out, f"shared workspace over the max, batch {b}"
         )
