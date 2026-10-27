@@ -422,6 +422,14 @@ BS_SWAP_RP32_TILE_BOUND = {"sm_100a": (BS_SUB_ROWS, 1), "sm_103a": (BS_BLOCK_M, 
 BS_SWAP_RP32_ARCHS = frozenset(BS_SWAP_RP32_TILE_BOUND)
 BS_SWAP_RP32_MAX_ALIGNMENT = 64
 BS_SWAP_RP32_MAX_ROWS = 1536
+# On these architectures the 32-row-block program also serves the single-run
+# layouts (an alignment that is a multiple of 128) of more than
+# BS_SWAP_RP32_DENSE_MIN_ROWS rows per group, ahead of the other routes, while
+# its launch is one pass of two-CTA clusters, ``2 * ceil(m / 32) * n / 256``
+# CTAs of at most ``sm_count``: each cluster then streams one 32 x 256 tile's
+# weights, where the 128-row programs would leave most SMs idle.
+BS_SWAP_RP32_DENSE_ARCHS = frozenset({"sm_100a"})
+BS_SWAP_RP32_DENSE_MIN_ROWS = 128
 # The small-block swap-AB programs (32-row M blocks on a compact A slot, so
 # more stages fit in shared memory) serve these architectures, ahead of the
 # other swap-AB routes, while their launch is one wave on the device:
@@ -527,6 +535,10 @@ def bs_swap_route_for_shape(
       tiles meet the architecture's ``BS_SWAP_RP32_TILE_BOUND``
       (``factor * ceil(m / rows) * n / 256 <= sm_count``); with ``sm_count``
       ``None`` it keeps ``BS_SWAP_RUN32_ROUTE``.
+    - On ``BS_SWAP_RP32_DENSE_ARCHS`` a single-run layout of more than
+      ``BS_SWAP_RP32_DENSE_MIN_ROWS`` rows takes ``BS_SWAP_RP32_ROUTE`` when
+      ``2 * ceil(m / 32) * n / 256 <= sm_count`` (one pass of two-CTA
+      clusters); with ``sm_count`` ``None`` the rules below apply.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
       rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
@@ -567,6 +579,13 @@ def bs_swap_route_for_shape(
         return None
     # rows = routed / num_groups; compared without division.
     routed = m - num_groups * (alignment - 1)
+    if (
+        arch in BS_SWAP_RP32_DENSE_ARCHS
+        and sm_count is not None
+        and routed > BS_SWAP_RP32_DENSE_MIN_ROWS * num_groups
+        and 2 * math.ceil(m / BS_SUB_ROWS) * (n // 256) <= sm_count
+    ):
+        return BS_SWAP_RP32_ROUTE
     if k <= 512:
         swap = 2 * num_groups <= routed <= 20 * num_groups or (
             k <= 256 and num_groups <= routed < 2 * num_groups
