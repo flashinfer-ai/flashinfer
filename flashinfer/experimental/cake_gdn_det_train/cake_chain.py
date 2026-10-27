@@ -53,7 +53,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from functools import cache, lru_cache
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -439,7 +439,7 @@ def build_chunk_meta(
             seq_seg_start=views[5 + 3 * i],
             num_segments=len(parts[4 + 3 * i]),
             segment_len=int(scan_plans[i].segment_len),
-            scan_config=tuple(scan_plans[i].config),
+            scan_config=cast("tuple[int, int]", tuple(scan_plans[i].config)),
         )
         for i in range(2)
     ]
@@ -1006,7 +1006,7 @@ def dhu_tc_pricing(chunks, num_v_heads, device_index, sset: StageSet | None = No
     plan, _pricing = choose_scan_plan("dhu", total, len(chunks), num_v_heads, device_index, None,
                                       sset or stage_set(arch), True, scan_config=scan_config,
                                       segment_chunks=segment_chunks)  # fmt: skip
-    cfg = tuple(plan.config)
+    cfg = cast("tuple[int, int]", tuple(plan.config))
     cost_units = SCAN_STEP_FACTOR[cfg] * _scan_makespan(
         chunks,
         (1,) * len(chunks),
@@ -1495,7 +1495,7 @@ def _chunk_meta(
     index = _device_index(device)
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
-        layout = ("equal", int(batch), int(seq_len))
+        layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
         seq_lens = (int(seq_len),) * int(batch)
     elif batch != 1:
         raise ValueError("cu_seqlens requires a leading batch dimension of 1")
