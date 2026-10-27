@@ -736,7 +736,7 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
         for m in _EDGE_M:
             for out_f16 in (False, True):
                 reference = cb.gemm_plan(m, n, k, out_f16, arch, measured)
-                if reference.kernel_key not in registered:
+                if reference.unregistered_key is not None:
                     continue  # outside the registered matrix on the measured part too
                 served += 1
                 plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
@@ -791,6 +791,68 @@ def test_other_sm_count_runs_the_measured_kernel():
     t = cb.default_tactic(32, 28672, 8192, 152)
     plan = cb.gemm_plan(32, 28672, 8192, False, "sm_100a", 152, tactic=t)
     assert plan.kernel_key == "gemm:n32_bf16_aF_l2256b_o2"
+
+
+@pytest.mark.parametrize("sm_count", (148, 152))
+@pytest.mark.parametrize("arch", cb.ARCHES)
+def test_every_default_plan_runs_a_registered_program(arch, sm_count):
+    # Token counts between the validated rows select tactics whose kernels are not
+    # registered on either part (for example the 16-wide raster group without the CLC
+    # scheduler, or a stream-K tail of another slice count).  Every default plan runs a
+    # registered program: its own when registered, else the measured part's kernel,
+    # else the nearest registered program (on the other part: the one the measured
+    # part runs, when its grid reaches it), which records the unregistered key.
+    registered = KERNELS[arch]
+    measured = cb.MEASURED_SM_COUNT[arch]
+    nearest = 0
+    for k, n in (*VALIDATED_GEMM_FAMILIES, VALIDATED_OFF_MATRIX_FAMILY):
+        for m in (*range(1, 16385, 29), *_EDGE_M):
+            for out_f16 in (False, True):
+                own = cb._gemm_plan(m, n, k, out_f16, arch, sm_count)
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                assert plan.kernel_key in registered, (m, n, k, out_f16, own.kernel_key)
+                assert plan.sm_count == sm_count
+                if own.kernel_key in registered:
+                    assert plan.unregistered_key is None
+                    assert (plan.kernel_key, plan.grid) == (own.kernel_key, own.grid)
+                    continue
+                reference = cb.gemm_plan(m, n, k, out_f16, arch, measured)
+                if plan.unregistered_key is None:
+                    # the measured part's kernel (see the test above)
+                    assert sm_count != measured
+                    assert plan.kernel_key == reference.kernel_key
+                    continue
+                nearest += 1
+                assert plan.unregistered_key == own.kernel_key, (m, n, k, out_f16)
+                if plan.kernel_key != reference.kernel_key:
+                    assert (plan.alpha_n, plan.two_cta) == (own.alpha_n, own.two_cta)
+    assert nearest
+
+
+def test_off_matrix_rows_run_the_nearest_registered_program():
+    # The tile width, orientation and CTA group of the default tactic are kept; the raster
+    # group, the stream-K slice count, the scheduler and the operand cache hints move to
+    # the closest registered program.  The other part runs the measured part's program.
+    rows = (
+        (2049, 8192, 8192, False, "gemm:m256_2cta_bf16_aL_bL_l2256b_g8"),
+        (9729, 1536, 7168, False, "gemm:m192_2cta_bf16_aL_bL_l2256b_g8"),
+        (600, 1536, 7168, True, "gemm:m128_2cta_f16_bF_l2256b"),
+        (12, 2112, 7168, True, "gemm:n16_sk3_f16_l2256b"),
+    )
+    for m, n, k, out_f16, key in rows:
+        own = cb._gemm_plan(m, n, k, out_f16, "sm_100a", 148)
+        assert own.kernel_key not in KERNELS["sm_100a"], own.kernel_key
+        plan = cb.gemm_plan(m, n, k, out_f16, "sm_100a", 148)
+        assert plan.kernel_key == key and plan.unregistered_key == own.kernel_key
+        other = cb.gemm_plan(m, n, k, out_f16, "sm_100a", 152)
+        assert other.kernel_key == key and other.sm_count == 152
+    plan = cb.gemm_plan(4865, 7168, 16384, False, "sm_103a", 152)
+    assert plan.unregistered_key == "gemm:m192_2cta_bf16_aL_bL_l2256b_clc"
+    assert plan.kernel_key == "gemm:m192_2cta_bf16_aL_bL_l2256b"
+    # An explicit tactic is planned as given, registered or not.
+    own = cb._gemm_plan(2049, 8192, 8192, False, "sm_100a", 148)
+    plan = cb.gemm_plan(2049, 8192, 8192, False, "sm_100a", 148, tactic=own.tactic)
+    assert plan.kernel_key == own.kernel_key and plan.unregistered_key is None
 
 
 # ---------------------------------------------------------------------------
@@ -1119,16 +1181,73 @@ def test_token_remainder_fold_matches_route(m, out_dtype):
 
 
 @pytest.mark.parametrize("m", [9, 12, 16])
-def test_mm_fp4_cake_fp16_output_small_m_names_the_missing_program(m):
-    # The fp16-output 16-token swapped-orientation programs are not generated yet:
-    # the backend raises at preparation and names the kernel key it would need.
+def test_mm_fp4_cake_fp16_output_small_m_runs_a_registered_program(m):
+    # The fp16-output 16-token swapped-orientation programs of the default tactic are
+    # not generated: mm_fp4 runs the nearest registered program (the 16-token fp16
+    # program with the cluster split-K of three) and matches the reference.
     device = _require_program()
     n, k = 2112, 7168
     _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
         m, n, k, torch.bfloat16, device, seed=300 + m
     )
-    with pytest.raises(NotImplementedError, match=r"gemm:n16_.*_f16"):
-        mm_fp4(a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.float16, backend="cake")
+    out = mm_fp4(a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.float16, backend="cake")
+    torch.cuda.synchronize()
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+
+
+@pytest.mark.parametrize("chain", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k,out_dtype",
+    [
+        (12, 2112, 7168, torch.float16),  # 16-token tile, fp16 output
+        (600, 1536, 7168, torch.float16),  # 2-CTA 128-wide tile, fp16 output
+        (2049, 8192, 8192, torch.bfloat16),  # 16-wide raster group, static schedule
+        (769, 28672, 8192, torch.float16),  # stream-K tail of 8 slices
+        (9729, 1536, 7168, torch.bfloat16),  # stream-K tail with the 8-wide raster
+    ],
+)
+def test_off_matrix_rows_run_a_registered_program(m, n, k, out_dtype, chain):
+    # Rows whose own tactic selects an unregistered kernel run the nearest registered
+    # program (alone and in the quantize + GEMM chain) and match the reference.
+    device = _require_program()
+    x, _, a_fp4, a_sf, alpha, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=300 + m
+    )
+    w_u8 = w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    if chain:
+        ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+        runner = cb.prepare_nvfp4_per_token_chain(
+            x, gs_inv, w_u8, w_sf, out, ws, out_scale=w_scale
+        )
+        a_fp4, a_sf, alpha = ws.fp4, ws.sf, ws.scale
+        key = runner.kernels[1]
+    else:
+        a_u8 = a_fp4.view(torch.uint8)
+        runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+        key = runner.plan.kernel_key
+    assert key in KERNELS[cb._device_arch(device)]
+    runner()
+    torch.cuda.synchronize()
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+    if not chain:
+        public = mm_fp4(
+            a_fp4,
+            w_fp4.T,
+            a_sf,
+            w_sf.T,
+            alpha,
+            out_dtype,
+            None,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cake",
+            use_nvfp4=True,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(public, out)
 
 
 def test_quantize_fold_off_matrix_k_runs():
