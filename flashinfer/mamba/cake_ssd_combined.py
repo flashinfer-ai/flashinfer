@@ -126,9 +126,11 @@ class _Program:
     ``variant`` is the schedule variant of the exact-scan families: ``""``
     (the ring program), ``"noring"``, ``"tail"`` (the two-kernel family's
     2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
-    grid :func:`_tail_grid_size`) or ``"claim"`` (the two-kernel family's
+    grid :func:`_tail_grid_size`), ``"claim"`` (the two-kernel family's
     sm_107a varlen ring program that draws its work items at run time,
-    :func:`claim_selected`).
+    :func:`claim_selected`) or ``"ibulk"`` (the two-kernel family's sm_107a
+    packed-varlen ring program loading a work item's initial state as one
+    bulk copy, :func:`ibulk_selected`).
     """
 
     family: str
@@ -297,8 +299,10 @@ _EXACTONE_MODULES = {
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
 # table in-kernel.  The two-kernel claim programs
-# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`) exist on sm_107a
-# only: their entries are their sole sources (no fold module, never built for
+# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`) and
+# initial-state bulk programs (``exactpre_<state>_varlen_ibulk``,
+# :func:`ibulk_selected`) exist on sm_107a only (``_SM107_ONLY_PROGRAMS``):
+# their entries are their sole sources (no fold module, never built for
 # another architecture).
 _SM107_MODULES = {
     "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2c8ae2e234",
@@ -343,6 +347,8 @@ _SM107_MODULES = {
     "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_b3946eba3a",
     "exactpre_bf16_varlen_claim": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_bf54776bdb",
     "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_72edaa28a6",
+    "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_ef9dd3bbea",
+    "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_094f7fd546",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -418,9 +424,14 @@ _EXACTPRE_SMEM_BYTES = 232320
 _EXACTPRE_TAIL_SMEM_BYTES = 232320
 # Main dynamic SMEM of the sm_107a claim programs (``exactpre_*_claim``: the
 # two-kernel varlen ring programs with the 8-byte item hand-off slots and the
-# two claim mbarrier pairs); refreshed by the Cake export with the
+# two claim mbarrier pairs); the Cake export reads it for the launch of the
 # ``exactpre_*_claim`` table entries.
 _EXACTPRE_CLAIM_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a initial-state bulk programs
+# (``exactpre_*_ibulk``: the varlen ring programs with one more mbarrier, the
+# initial-state bulk copy's); the Cake export reads it for the launch of the
+# ``exactpre_*_ibulk`` table entries.
+_EXACTPRE_IBULK_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -695,6 +706,7 @@ _VARIANT_SMEM_BYTES = {
     ("exactone", "noring"): _EXACTONE_NORING_SMEM_BYTES,
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
+    ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
 }
 # Cluster shape of the main kernels (the Cake export checks the generated
 # sources against it): the ``_tail`` pair programs launch as 2-CTA clusters
@@ -748,9 +760,10 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
-# The sm_107a-only programs (the claim programs): their ``_SM107_MODULES``
-# entry is their main module on every architecture; only capability (10, 7)
-# routes to them (:func:`claim_selected`).
+# The sm_107a-only programs (the claim and initial-state bulk programs): their
+# ``_SM107_MODULES`` entry is their main module on every architecture; only
+# capability (10, 7) routes to them (:func:`claim_selected`,
+# :func:`ibulk_selected`).
 _SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
 _PROGRAMS.update(
     (name, _program(name, _SM107_MODULES[name]))
@@ -764,7 +777,8 @@ def _program_name(
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
-    one, ``"tail"`` or ``"claim"`` for the two-kernel exact-scan family)."""
+    one, ``"tail"``, ``"claim"`` or ``"ibulk"`` for the two-kernel exact-scan
+    family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1607,6 +1621,25 @@ _NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM = {(10, 7): 4}
 _CLAIM_MIN_ITEMS = {(10, 7): 2048}
 _CLAIM_MIN_ITEMS_PER_CTA = 8
 _CLAIM_STATE_DTYPES = {(10, 7): frozenset({torch.bfloat16, torch.float32})}
+# sm_107a: packed-varlen two-kernel ring calls of many short items take the
+# ``_ibulk`` program (``exactpre_*_varlen_ibulk``, bf16 / f16 state), whose
+# pre_inter warps read each work item's initial state as one 16 KB bulk copy
+# into a state stage (the CTA's first item at role start, every later item
+# while the previous item's last chunk runs) instead of 64 scalar global
+# loads per thread; that per-item load sits on pre_inter, the binding role of
+# short items.  The final state keeps the scalar store.  Taken with at least
+# ``_IBULK_MIN_ITEMS_PER_SM`` items per SM (a CTA runs consecutive items) of
+# at most ``_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks; a call with z
+# only with one host-known chunk per item and at least
+# ``_IBULK_Z_MIN_ITEMS_PER_SM`` items per SM, since with fewer items or
+# longer items its epilogue binds and the bulk load gains nothing.  Same
+# outputs bit for bit as the ring program.  Batched calls keep the ring
+# program (no gain measured).
+_IBULK_CAPABILITIES = frozenset({(10, 7)})
+_IBULK_STATE_DTYPES = frozenset({torch.bfloat16, torch.float16})
+_IBULK_MIN_ITEMS_PER_SM = 2
+_IBULK_MAX_CHUNKS_PER_ITEM = 8
+_IBULK_Z_MIN_ITEMS_PER_SM = 8
 
 
 def fused_selected(
@@ -1804,6 +1837,38 @@ def claim_selected(
     grid = _persistent_grid_size(total_work=items, sm_count=int(sm_count))
     return (
         chunks == 1 and items > min_items and items >= _CLAIM_MIN_ITEMS_PER_CTA * grid
+    )
+
+
+def ibulk_selected(
+    *,
+    capability: tuple[int, int],
+    state_dtype: torch.dtype,
+    mode_varlen: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    has_z: bool,
+) -> bool:
+    """Whether a two-kernel ring call (``exactpre``, variant ``""``) takes the
+    ``_ibulk`` program: a packed-varlen call on a ``_IBULK_CAPABILITIES``
+    device with a ``_IBULK_STATE_DTYPES`` state and at least
+    ``_IBULK_MIN_ITEMS_PER_SM`` x ``sm_count`` (sequence, head) items of at
+    most ``_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks
+    (:func:`host_chunks_per_item`); a call with z only with one chunk per item
+    and at least ``_IBULK_Z_MIN_ITEMS_PER_SM`` x ``sm_count`` items."""
+
+    if (int(capability[0]), int(capability[1])) not in _IBULK_CAPABILITIES:
+        return False
+    if not mode_varlen or state_dtype not in _IBULK_STATE_DTYPES:
+        return False
+    if has_z and (
+        chunks_per_item > 1 or total_work < _IBULK_Z_MIN_ITEMS_PER_SM * sm_count
+    ):
+        return False
+    return (
+        total_work >= _IBULK_MIN_ITEMS_PER_SM * sm_count
+        and chunks_per_item <= _IBULK_MAX_CHUNKS_PER_ITEM
     )
 
 
@@ -2661,6 +2726,7 @@ class CakeSSDCombined:
         workspace: dict[str, Any],
         name: str,
         value: Optional[torch.Tensor],
+        align: int = 1,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Resolve graph-stable packed storage for a public strided input.
 
@@ -2671,10 +2737,11 @@ class CakeSSDCombined:
         dtype) lives in the workspace for its lifetime and is never replaced,
         so the address a captured graph copies into stays valid when a later
         eager call of the same shape brings, say, a bf16 ``dt`` instead of an
-        f32 one.
+        f32 one.  ``align`` is the byte alignment the program needs of the
+        bound address: a contiguous input at a lesser one is copied too.
         """
 
-        if value is None or value.is_contiguous():
+        if value is None or (value.is_contiguous() and value.data_ptr() % align == 0):
             return value, None
         buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor]
         buffers = workspace["contiguous"]
@@ -2936,6 +3003,27 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             ):
                 program_family, variant = "exactpre", "claim"
+            # The initial-state bulk program takes the ring calls the claim
+            # rule leaves: a call both rules admit keeps the claim program.
+            if (
+                program_family == "exactpre"
+                and not variant
+                and ibulk_selected(
+                    capability=capability,
+                    state_dtype=self.state_dtype,
+                    mode_varlen=self.has_varlen,
+                    total_work=num_sequences * self.nheads,
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=self.has_varlen,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen if self.has_varlen else seqlen,
+                    ),
+                    sm_count=sm_count,
+                    has_z=self.has_z,
+                )
+            ):
+                variant = "ibulk"
         workspace: dict[str, Any] = {
             "program": _program_name(
                 program_family,
@@ -3654,8 +3742,10 @@ class CakeSSDCombined:
         # graph-stable storage.  Resolve the storage now; copy later, together.
         pending_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-        def packed(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            buffer, source = self._contiguous_input(workspace, name, value)
+        def packed(
+            name: str, value: Optional[torch.Tensor], align: int = 1
+        ) -> Optional[torch.Tensor]:
+            buffer, source = self._contiguous_input(workspace, name, value, align)
             if source is not None:
                 assert buffer is not None
                 pending_copies.append((buffer, source))
@@ -3666,7 +3756,13 @@ class CakeSSDCombined:
         D = packed("D", D)
         z = packed("z", z)
         dt_bias = packed("dt_bias", dt_bias)
-        initial_states = packed("initial_states", initial_states)
+        # The ``_ibulk`` programs read an item's initial state with one bulk
+        # copy, which needs a 16-byte aligned address.
+        initial_states = packed(
+            "initial_states",
+            initial_states,
+            16 if program.variant == "ibulk" else 1,
+        )
         seq_idx = packed("seq_idx", seq_idx)
         chunk_indices = packed("chunk_indices", chunk_indices)
         chunk_offsets = packed("chunk_offsets", chunk_offsets)
