@@ -44,7 +44,8 @@ limitations under the License.
 # cluster barrier arriving relaxed after a tcgen05 fence; ``_gsb`` the gs-branch
 # form of a 128-K grid-stride GEMM program; ``_ts3_tde`` a 192-wide 128-K
 # TMA-store GEMM program with three staging slots per epilogue group and the
-# pair's tensor memory freed by the MMA warps; ``_prg`` a TMA-store GEMM
+# pair's tensor memory freed by the MMA warps, ``_tde`` alone a GEMM program
+# with the pair's tensor memory freed by the MMA warps; ``_prg`` a TMA-store GEMM
 # program whose MMA warp allocates the pair's tensor memory, the load warp left
 # out of the allocation rendezvous), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.
@@ -1800,6 +1801,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "96,1,512": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
+        },
+        "96,1,1024": {
+            "gemm_tstore_s2_ts4_pf4": "gemm_tstore_s2_ts4_pf4_tde",
         },
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
