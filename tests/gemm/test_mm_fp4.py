@@ -742,6 +742,7 @@ def test_mm_fp4_l2_policy_rule():
     "backend,m,n,k",
     [
         ("cute-dsl", 128, 512, 512),
+        ("cute-dsl", 8, 2048, 4096),
         ("cutedsl_low_latency", 8, 1280, 2944),
         ("b12x", 128, 512, 512),
     ],
