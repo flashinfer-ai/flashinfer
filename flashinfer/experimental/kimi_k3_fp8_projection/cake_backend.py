@@ -104,7 +104,7 @@ from .cake_jit import (
     quant_kernel_key,
     route_available,
 )
-from .decode_table import ARCHES, decode_table, route_twins
+from .decode_table import ARCHES, decode_table, decode_table_m_ranges, route_twins
 
 # ---------------------------------------------------------------------------
 # Fixed geometry of the generated programs
@@ -140,6 +140,8 @@ GEMM_GROUP_M_FORMS = (
 GEMM_PDLB_SUFFIX = "_pdlb"  # round 11 (CAKE-985 T1a, lever _pdlb): the PDL-wait-after-weights form of the TMA-store / staged-register programs (table key ``gemm_pdlb``; the last stem token -- after the stream-K / _skp slot, before _pf<D>; no 384-wide form)
 GEMM_ST_SUFFIX = "_st"  # round 11 (CAKE-985 T2-e, lever _st): the static one-tile form of the 192-wide 128-K TMA-store / staged-register programs (table key ``gemm_static``; the ``_cs<S>`` slot after _k128; no stream-K / stage / prefetch / _pdlb composition)
 GEMM_GS_SUFFIX = "_gs"  # round 11 (CAKE-985 T6, lever _gs): the static grid-stride form of the 128-K TMA-store programs at bn 192 / 256 (table key ``gemm_gs``; the ``_cs<S>`` / ``_st`` slot after _k128; no stream-K / stage / prefetch / _pdlb / _st composition)
+GEMM_ARS_SUFFIX = "_ars"  # round 12 (lever ARS): the A-resident operand-stationary form of the 256-wide static grid-stride 128-K TMA-store program (table key ``gemm_ars`` beside ``gemm_gs``; right after _gs; the same launch, the activation K range resident in shared memory)
+GEMM_ARS_MAX_K = 512  # round 12 (lever ARS): the resident segment holds four 128-K activation boxes, so the form serves K <= 512
 GEMM_N384_CELL_CONFLICTS = (
     "gemm_pf",
     "gemm_sk",
@@ -815,17 +817,62 @@ class DecodeConfig:
         )
 
 
+def _bucket_lower(bucket: int) -> int:
+    """The first row count of a table bucket (the previous bucket plus one; 1 for the first bucket)."""
+    index = DECODE_TABLE_BUCKETS.index(int(bucket))
+    return DECODE_TABLE_BUCKETS[index - 1] + 1 if index > 0 else 1
+
+
+@functools.cache
+def cell_m_ranges(arch: str) -> dict[str, tuple[tuple[int, int, dict[str, Any]], ...]]:
+    """Round 12 (batch 4): the validated in-bucket row ranges of ``arch`` (``decode_table_m_ranges``), each
+    cell's ranges sorted by ``lo``.  A range refines a tabulated cell where the fastest route changes inside one bucket:
+    rows ``lo..hi`` take the range's entry, the cell's other rows keep the cell's entry.  Refused: a cell the table of
+    ``arch`` does not hold, a range outside its cell's bucket, one spanning the whole bucket (that is the cell's entry),
+    overlapping ranges, and an entry that is not a table row (a dict with a ``route``)."""
+    table = decode_table(arch) if arch in ARCHES else {}
+    out: dict[str, tuple[tuple[int, int, dict[str, Any]], ...]] = {}
+    for cell, ranges in decode_table_m_ranges(arch).items():
+        if cell not in table:
+            raise ValueError(f"{arch}: M ranges of {cell} refine no tabulated cell")
+        bucket = int(cell.split(",")[2])
+        if bucket not in DECODE_TABLE_BUCKETS:
+            raise ValueError(f"{arch}: M ranges of {cell} name no table bucket")
+        lower = _bucket_lower(bucket)
+        checked: list[tuple[int, int, dict[str, Any]]] = []
+        for lo, hi, entry in sorted(ranges, key=lambda r: int(r[0])):
+            lo, hi = int(lo), int(hi)
+            if not lower <= lo <= hi <= bucket or (lo, hi) == (lower, bucket):
+                raise ValueError(
+                    f"{arch}: M range {lo}..{hi} of {cell} is not a proper part of its bucket {lower}..{bucket}"
+                )
+            if checked and lo <= checked[-1][1]:
+                raise ValueError(f"{arch}: M ranges of {cell} overlap at {lo}")
+            if not isinstance(entry, dict) or "route" not in entry:
+                raise ValueError(
+                    f"{arch}: M range {lo}..{hi} of {cell} carries no table row (got {entry!r})"
+                )
+            checked.append((lo, hi, entry))
+        out[cell] = tuple(checked)
+    return out
+
+
 def decode_table_entry(
     M: int, n_tiles128: int, num_k_iters: int, arch: str
 ) -> Optional[dict[str, Any]]:
-    """Measured table entry for the shape, or ``None`` when the architecture / family is not tabulated."""
+    """Measured table entry for the shape, or ``None`` when the architecture / family is not tabulated.  Round 12
+    (batch 4): a row inside an in-bucket M range of its cell (``cell_m_ranges``) takes the range's entry."""
     if arch not in ARCHES:
         return None
     per_arch = decode_table(arch)
     bucket = next((b for b in DECODE_TABLE_BUCKETS if b >= M), None)
     if bucket is None:
         return None
-    return per_arch.get(f"{int(n_tiles128)},{int(num_k_iters)},{bucket}")
+    cell = f"{int(n_tiles128)},{int(num_k_iters)},{bucket}"
+    for lo, hi, entry in cell_m_ranges(arch).get(cell, ()):
+        if lo <= int(M) <= hi:
+            return entry
+    return per_arch.get(cell)
 
 
 def decode_config(
@@ -1438,6 +1485,65 @@ def _entry_gemm_gs(entry: dict[str, Any]) -> bool:
     if on not in (0, 1):
         raise ValueError(f"decode table entry gemm_gs must be 0 or 1 (got {entry})")
     return bool(on)
+
+
+def _entry_flag(entry: dict[str, Any], key: str) -> bool:
+    """A 0 / 1 table key of a cell (absent = 0)."""
+    on = int(entry.get(key, 0))
+    if on not in (0, 1):
+        raise ValueError(f"decode table entry {key} must be 0 or 1 (got {entry})")
+    return bool(on)
+
+
+def _entry_gemm_ars(entry: dict[str, Any]) -> bool:
+    """The ``gemm_ars`` key of a table cell (0 / 1; round 12, lever ARS): whether the cell's static grid-stride
+    launches (``gemm_gs``) take the A-resident operand-stationary ``_gs_ars`` program."""
+    return _entry_flag(entry, "gemm_ars")
+
+
+def gemm_ars_cell_conflicts(
+    entry: Optional[dict[str, Any]], num_k_iters: int
+) -> list[str]:
+    """Round 12 (lever ARS): what keeps a ``gemm_ars`` 1 cell from naming a program -- the form is the 256-wide
+    ``_gs`` program with the activation K range resident (``gemm_gs`` 1, ``gemm_bn`` 256, K of at most ``GEMM_ARS_MAX_K``,
+    i.e. ``num_k_iters`` 256-K iterations of at most that)."""
+    entry = entry or {}
+    conflicts = []
+    if not _entry_gemm_gs(entry):
+        conflicts.append("gemm_gs")
+    if int(entry.get("gemm_bn", BLOCK_N)) != BLOCK_N:
+        conflicts.append("gemm_bn")
+    if int(num_k_iters) * BLOCK_K > GEMM_ARS_MAX_K:
+        conflicts.append("K")
+    return conflicts
+
+
+def _entry_gemm_rstaged_pf(entry: dict[str, Any]) -> bool:
+    """The ``gemm_rstaged_pf`` key of a table cell (0 / 1; round 12, lever RPF): whether the cell's
+    staged-register launches take the cell's ``gemm_pf`` weight prefetch too (the TMA-store launches always do); a cell
+    setting it without a ``gemm_pf`` or with a 256-K hand-off (the form is a ``_k128`` program) is refused."""
+    on = _entry_flag(entry, "gemm_rstaged_pf")
+    if on and (
+        int(entry.get("gemm_pf", 0)) <= 0 or int(entry.get("gemm_bk", BLOCK_K)) != 128
+    ):
+        raise ValueError(
+            f"decode table entry gemm_rstaged_pf needs a gemm_pf and gemm_bk 128 (got {entry})"
+        )
+    return on
+
+
+def _entry_gemm_rstaged_skf(entry: dict[str, Any]) -> bool:
+    """The ``gemm_rstaged_skf`` key of a table cell (0 / 1; round 12, lever RSKF): whether the cell's
+    staged-register launches take the cell's fix-up stream-K form too (the ``_k128_skf`` staged-register program; the
+    TMA-store launches always do); a cell setting it without ``gemm_skf`` 1 and ``gemm_bk`` 128 is refused."""
+    on = _entry_flag(entry, "gemm_rstaged_skf")
+    if on and (
+        int(entry.get("gemm_skf", 0)) != 1 or int(entry.get("gemm_bk", BLOCK_K)) != 128
+    ):
+        raise ValueError(
+            f"decode table entry gemm_rstaged_skf needs gemm_skf 1 and gemm_bk 128 (got {entry})"
+        )
+    return on
 
 
 def gemm_gs_cell_conflicts(entry: Optional[dict[str, Any]]) -> list[str]:
@@ -2426,7 +2532,14 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
         GEMM_TSTORE_KERNEL_KEY,
         GEMM_RSTAGED_KERNEL_KEY,
     ]
-    for key, entry in decode_table(arch).items():
+    # round 12 (batch 4): every row segment of a cell (``_cell_segments``: its in-bucket M ranges and the rest
+    # of the bucket), each with its own entry, checked at its own edge rows
+    segments = [
+        (key, seg_entry, rows)
+        for key, cell_entry in decode_table(arch).items()
+        for seg_entry, rows in _cell_segments(arch, key, cell_entry)
+    ]
+    for key, entry, rows in segments:
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         # round 10 (CAKE-985, S1): table key ``gemm_cs`` (decode- or GEMM-route cell) -- the
         # cluster split-K programs the bucket's contract rows launch, derived from the rows'
@@ -2439,7 +2552,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
         if cs_form:
             gbn = int(entry.get("gemm_bn", BLOCK_N))
             cs_plan = None
-            for M in _bucket_rows(bucket):
+            for M in rows:
                 cs_plan = gemm_cluster_split_plan(
                     cs_form,
                     M,
@@ -2492,7 +2605,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
             # TMA-store eligible / 8-byte-aligned view of the bucket (the ``_st`` keys replace them below)
             ssfx = GEMM_ST_SUFFIX if _entry_gemm_static(entry) else ""
             if ssfx:
-                for M in _bucket_rows(bucket):
+                for M in rows:
                     gemm_static_tile(
                         M,
                         n_tiles128,
@@ -2509,7 +2622,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
             # program, as for the stream-K forms), validated at both bucket edges as ``route_plan`` validates a launch
             gssfx = GEMM_GS_SUFFIX if _entry_gemm_gs(entry) else ""
             if gssfx:
-                for M in _bucket_rows(bucket):
+                for M in rows:
                     gemm_gs_launch_pairs(
                         M,
                         n_tiles128,
@@ -2521,6 +2634,16 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         int(entry.get("gemm_bk", BLOCK_K)) == 128
                         and not gemm_bn_wide(gbn),
                     )
+            # round 12 (lever ARS): a ``gemm_ars`` cell's grid-stride launches take the A-resident ``_gs_ars``
+            # program (the token right after ``_gs``); the plain ``_gs`` program is then launched by no row of the cell
+            if _entry_gemm_ars(entry):
+                conflicts = gemm_ars_cell_conflicts(entry, num_k_iters)
+                if conflicts:
+                    raise ValueError(
+                        f"decode table cell {key} carries gemm_ars together with {conflicts}, which names no GEMM "
+                        f"instance (the A-resident form is the 256-wide _gs program at K <= {GEMM_ARS_MAX_K}; got {entry})"
+                    )
+                gssfx += GEMM_ARS_SUFFIX
             if gemm_bn_wide(gbn):
                 # round 10 (S3): the 384-wide pair-tile programs of the epilogues the cell's rows launch -- always the
                 # ``_k128`` form, never with stage / stream-K / prefetch tokens (a cell naming one is refused, as in the
@@ -2601,9 +2724,29 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                             )
                         )
                     if k128_rstaged:
+                        # round 12 (lever RPF): a ``gemm_rstaged_pf`` cell's staged-register rows prefetch at
+                        # the cell's ``gemm_pf`` too (``_pf<D>``); its plain staged-register program is then launched by
+                        # no row of the cell
                         gkeys.append(
-                            GEMM_RSTAGED_KERNEL_KEY + rtsfx + ksfx + ssfx + psfx
+                            gemm_kernel_key(
+                                GEMM_RSTAGED_KERNEL_KEY + rtsfx + ksfx + ssfx + psfx,
+                                gpf if _entry_gemm_rstaged_pf(entry) else 0,
+                            )
                         )
+                        # round 12 (lever RSKF): a ``gemm_rstaged_skf`` cell's staged-register rows take the
+                        # fix-up stream-K form too where the launch has a fractional wave; other launches keep the
+                        # plain staged-register program above
+                        if gskf and _entry_gemm_rstaged_skf(entry):
+                            gkeys.append(
+                                gemm_kernel_key(
+                                    GEMM_RSTAGED_KERNEL_KEY
+                                    + rtsfx
+                                    + ksfx
+                                    + GEMM_SKF_SUFFIX
+                                    + psfx,
+                                    gpf if _entry_gemm_rstaged_pf(entry) else 0,
+                                )
+                            )
                 elif isfx:
                     # round 9 (K6 arm G1): the cell's TMA-store program in its tokened form (the perf row's launch when the
                     # family's column edge admits the TMA store and no stream-K lever names that program -- the keys below
@@ -2720,7 +2863,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
         cell_units = int(entry.get("quant_units", 0))
         if cell_units and quant_kernel_key(cell_units) not in keys:
             keys.append(quant_kernel_key(cell_units))
-        for M in _bucket_rows(bucket):
+        for M in rows:
             cfg = decode_config(M, n_tiles128, num_k_iters, arch, sm_count)
             if cfg is None:
                 continue
@@ -2763,12 +2906,29 @@ def route_twin_keys(
 def _bucket_rows(bucket: int) -> tuple[int, ...]:
     """Row counts of one table bucket that can change the physical instance (the resident eligibility depends on
     the item count per CTA, so both ends of the bucket are enumerated)."""
-    lower = (
-        DECODE_TABLE_BUCKETS[DECODE_TABLE_BUCKETS.index(bucket) - 1] + 1
-        if bucket > 1
-        else 1
-    )
-    return tuple(sorted({lower, bucket}))
+    return tuple(sorted({_bucket_lower(bucket), bucket}))
+
+
+def _cell_segments(
+    arch: str, cell: str, entry: dict[str, Any]
+) -> tuple[tuple[dict[str, Any], tuple[int, ...]], ...]:
+    """Round 12 (batch 4): ``(entry, edge rows)`` per row segment of a cell's bucket -- each in-bucket M range
+    (``cell_m_ranges``) with its two edges, then the cell's entry with the edges of every part of the bucket no range
+    covers -- so a rule checked at the bucket edges is checked on both sides of every range edge (a cell without ranges
+    is one segment, the bucket's two edges)."""
+    bucket = int(cell.split(",")[2])
+    ranges = cell_m_ranges(arch).get(cell, ())
+    segments: list[tuple[dict[str, Any], tuple[int, ...]]] = [
+        (r_entry, tuple(sorted({lo, hi}))) for lo, hi, r_entry in ranges
+    ]
+    start = _bucket_lower(bucket)
+    for lo, hi, _ in ranges:
+        if start < lo:
+            segments.append((entry, tuple(sorted({start, lo - 1}))))
+        start = hi + 1
+    if start <= bucket:
+        segments.append((entry, tuple(sorted({start, bucket}))))
+    return tuple(segments)
 
 
 # ---------------------------------------------------------------------------
@@ -3241,9 +3401,15 @@ def route_plan(
             if gemm_reg_staged
             else GEMM_KERNEL_KEY
         )
+        # round 12: the cell's entry for the row (its in-bucket M range when one holds ``M``)
+        gentry = (
+            decode_table_entry(M, prepared.n_tiles128, prepared.num_k_iters, arch) or {}
+        )
+        # round 12 (lever RPF): a ``gemm_rstaged_pf`` cell's staged-register launches prefetch at the cell's distance too
+        rstaged_pf = base == GEMM_RSTAGED_KERNEL_KEY and _entry_gemm_rstaged_pf(gentry)
         gpf = (
             gemm_prefetch_distance(M, prepared.n_tiles128, prepared.num_k_iters, arch)
-            if gemm_tma_store
+            if gemm_tma_store or rstaged_pf
             else 0
         )
         gbn = gemm_block_n(
@@ -3390,15 +3556,32 @@ def route_plan(
             if base == GEMM_TSTORE_KERNEL_KEY and not wide
             else 0
         )
+        # round 12 (lever ARS): a ``gemm_ars`` cell's grid-stride launch takes the A-resident ``_gs_ars`` program
+        # (the same launch; the 256-wide _gs program at K <= GEMM_ARS_MAX_K, a cell naming it elsewhere is refused)
+        ars = bool(gs_pairs) and _entry_gemm_ars(gentry)
+        if ars:
+            conflicts = gemm_ars_cell_conflicts(gentry, prepared.num_k_iters)
+            if conflicts:
+                raise ValueError(
+                    f"{arch}: decode table cell of M={M} n_tiles128={prepared.n_tiles128} num_k_iters="
+                    f"{prepared.num_k_iters} carries gemm_ars together with {conflicts}, which names no GEMM instance "
+                    f"(the A-resident form is the 256-wide _gs program at K <= {GEMM_ARS_MAX_K})"
+                )
         if gs_pairs:
             # the _gs form of the plain _k128 / _n192_k128 stems first (the token takes the _cs<S> / _st slot, after _k128), then
             # as today, so a missing program falls back at the same geometry onto a registered program (a gemm_gs cell carries
-            # no stage / stream-K / prefetch / _pdlb / _st key: the candidates below are the plain forms)
+            # no stage / stream-K / prefetch / _pdlb / _st key: the candidates below are the plain forms); round 12: the
+            # ``_gs_ars`` form of a ``gemm_ars`` cell before its ``_gs`` form
             stems = [
                 v
                 for s, pf, bn in stems
                 for v in (
-                    (((_gs_stem(s), pf, bn),) if _gs_eligible(s) else ())
+                    (
+                        ((_gs_stem(s) + GEMM_ARS_SUFFIX, pf, bn),)
+                        if ars and _gs_eligible(s) and bn == BLOCK_N
+                        else ()
+                    )
+                    + (((_gs_stem(s), pf, bn),) if _gs_eligible(s) else ())
                     + ((s, pf, bn),)
                 )
             ]
@@ -3459,7 +3642,17 @@ def route_plan(
                     gemm_n_tiles(prepared, bn),
                     bn,
                 )
-                if stem.startswith(GEMM_TSTORE_KERNEL_KEY) and skp is None
+                if (
+                    stem.startswith(GEMM_TSTORE_KERNEL_KEY)
+                    or (
+                        # round 12 (lever RSKF): the staged-register ``_k128`` stems of a
+                        # ``gemm_rstaged_skf`` cell take the fix-up form too
+                        stem.startswith(GEMM_RSTAGED_KERNEL_KEY)
+                        and stem.endswith(GEMM_K128_SUFFIX)
+                        and _entry_gemm_rstaged_skf(gentry)
+                    )
+                )
+                and skp is None
                 else None
             )
             if skf is not None:
@@ -3492,8 +3685,8 @@ def route_plan(
         )[
             0
         ].endswith(
-            GEMM_GS_SUFFIX
-        )  # the launched program's form (a fallback may have dropped the _gs token; round 11 T6)
+            (GEMM_GS_SUFFIX, GEMM_GS_SUFFIX + GEMM_ARS_SUFFIX)
+        )  # the launched program's form (a fallback may have dropped the _gs token; round 11 T6; round 12: _gs_ars)
         ggs_pairs = (
             _gs_pairs(sm_count, _m_tiles(M), gemm_n_tiles(prepared, gbn)) if ggs else 0
         )  # P' at the launched program's bn (grid 2 P' CTAs, the sk_pairs scalar)

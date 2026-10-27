@@ -71,7 +71,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``gemm`` / ``gemm_rstaged`` / ``gemm_tstore``   the persistent 2-CTA
 #   block-scaled tcgen05 GEMM (256 output columns per CTA pair, M > 256) with
 #   the register, staged-register or TMA-store epilogue; the instance tokens
-#   follow the stem in the order ``[_n<bn>][_g64][_k128][_cs<S>|_st|_gs][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
+#   follow the stem in the order ``[_n<bn>][_g64][_k128][_cs<S>|_st|_gs[_ars]][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
 #   (``_n<bn>``: the bn-wide pair-tile form, 192, 224, 352 or 384 output columns
 #   per CTA pair -- ``_n224`` / ``_n352`` TMA-store programs only, round 12;
 #   ``_n384``: the 128 x 384 pair-tile form of the TMA-store / staged-register
@@ -97,7 +97,10 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   form of the plain ``_k128`` / ``_n192_k128`` TMA-store programs on the
 #   tabulated ``gemm_gs`` rows, round 11 -- pair p of 2 min(T, resident pairs)
 #   CTAs owns tiles p, p + P', ..., no cluster-launch-control work ring; the same
-#   slot; same output bits);
+#   slot; same output bits; ``_ars``: the A-resident form of the 256-wide
+#   ``_k128_gs`` program on the tabulated ``gemm_ars`` rows (K <= 512), round 12
+#   -- a CTA pair keeps its activation K range resident in shared memory across
+#   its tiles; the same launch; same output bits);
 # * ``decode:t<tok>_p<stages>[_fused][_a<n>][_e<n>][_res][_r<xb>][_q<lanes>][_cs<C>]...[_tso][_dpf][_pi<n>][_xp]``
 #   the swap-AB split-K decode kernel for one token-tile width, TMA pipeline
 #   depth, in-CTA quantization (``_fused``), ``n`` TMEM accumulator sets
@@ -3386,13 +3389,14 @@ def decode_kernel_key(
 
 def gemm_kernel_key(base: str, pf: int = 0) -> str:
     """``gemm`` / ``gemm_tstore`` / ``gemm_rstaged`` (with the ``_n<bn>`` (``_n192`` / ``_n224`` / ``_n352`` / ``_n384``) / ``_g64`` / ``_k128`` /
-    ``_cs<S>[r]`` / ``_st`` / ``_gs`` / ``_s<n>`` / ``_ts<n>`` / ``_sk`` / ``_skf`` / ``_pdlb`` instance suffixes, in that stem order; ``_n384`` /
+    ``_cs<S>[r]`` / ``_st`` / ``_gs`` / ``_ars`` / ``_s<n>`` / ``_ts<n>`` / ``_sk`` / ``_skf`` / ``_pdlb`` instance suffixes, in that stem order; ``_n384`` /
     ``_g64`` are the round-10 384-wide pair tile (table key ``gemm_bn`` 384) and 64-row-tile raster group (table key
     ``gemm_gm``); ``_k128`` is the 128-K operand hand-off form, table key ``gemm_bk``; ``_cs<S>[r]`` the cluster
     split-K form of the ``_n192_k128`` TMA-store / staged-register programs, table key ``gemm_cs``, round 10; ``_st`` the
     static one-tile form of the same programs (one tile per CTA pair, no CLC work ring), table key ``gemm_static``, round 11; ``_gs``
     the static grid-stride form of the ``_k128`` / ``_n192_k128`` TMA-store programs (pair p owns tiles p + i P' over 2 P' CTAs, no
-    CLC work ring), table key ``gemm_gs``, round 11;
+    CLC work ring), table key ``gemm_gs``, round 11; ``_ars`` (right after ``_gs``) its A-resident form at bn 256 and K <= 512, table key
+    ``gemm_ars``, round 12;
     ``_s<n>`` / ``_ts<n>`` the operand-stage / staging-slot form of the TMA-store programs, table keys
     ``gemm_stages`` / ``gemm_ts_slots``, round 9; ``_pdlb`` the PDL-wait-after-weights form of the TMA-store /
     staged-register programs, table key ``gemm_pdlb``, round 11, closing the stem) plus ``_pf<D>`` when the shape's table row prefetches the weight

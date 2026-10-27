@@ -42,9 +42,12 @@ limitations under the License.
 # shared-memory carveout of 100 percent, which the decode launch starting beside
 # it under PDL uses; ``_csrt`` a 4-way cluster split-K decode program's closing
 # cluster barrier arriving relaxed after a tcgen05 fence), measured faster on that
-# architecture's rows of the cell; ``route_twins(arch)`` reads it.  Generated
-# from the Cake measurement sweeps recorded in the source repository; do not
-# edit by hand.
+# architecture's rows of the cell; ``route_twins(arch)`` reads it.
+# ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
+# ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
+# entry, where the fastest route changes inside one bucket; ``decode_table_m_ranges(arch)``
+# reads it.  Generated from the Cake measurement sweeps recorded in the source
+# repository; do not edit by hand.
 
 from __future__ import annotations
 
@@ -495,10 +498,7 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "persist": True,
     },
     "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
-    "192,2,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "192,2,2048": {"route": "gemm", "gemm_bk": 128},
-    "192,2,4096": {"route": "gemm", "gemm_bk": 128},
-    "192,2,16384": {"route": "gemm", "gemm_bk": 128},
     "384,28,8": {
         "route": "decode",
         "tok": 16,
@@ -767,10 +767,16 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "route": "gemm",
             "gemm_bn": 192,
             "gemm_bk": 128,
-            "gemm_static": 1,
+            "gemm_pf": 2,
+            "gemm_rstaged_pf": 1,
         },
         "50,28,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
-        "50,28,4096": {"route": "gemm", "gemm_bk": 128},
+        "50,28,4096": {
+            "route": "gemm",
+            "gemm_bk": 128,
+            "gemm_skf": 1,
+            "gemm_rstaged_skf": 1,
+        },
         "50,28,16384": {"route": "gemm"},
         "56,6,256": {
             "route": "decode",
@@ -896,6 +902,24 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": True,
         },
         "192,2,512": {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1},
+        "192,2,1024": {
+            "route": "gemm",
+            "gemm_bk": 128,
+            "gemm_gs": 1,
+            "gemm_ars": 1,
+        },
+        "192,2,4096": {
+            "route": "gemm",
+            "gemm_bk": 128,
+            "gemm_gs": 1,
+            "gemm_ars": 1,
+        },
+        "192,2,16384": {
+            "route": "gemm",
+            "gemm_bk": 128,
+            "gemm_gs": 1,
+            "gemm_ars": 1,
+        },
         "384,28,1": {
             "route": "decode",
             "tok": 16,
@@ -1248,6 +1272,9 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pw": 2,
         },
         "192,2,512": {"route": "gemm", "gemm_bk": 128},
+        "192,2,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
+        "192,2,4096": {"route": "gemm", "gemm_bk": 128},
+        "192,2,16384": {"route": "gemm", "gemm_bk": 128},
         "384,28,1": {
             "route": "decode",
             "tok": 16,
@@ -1267,6 +1294,33 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
     },
 }
 
+
+DECODE_TABLE_M_RANGES: dict[
+    str, dict[str, tuple[tuple[int, int, dict[str, Any]], ...]]
+] = {
+    "sm_100a": {
+        "50,28,2048": (
+            (
+                1281,
+                2048,
+                {
+                    "route": "gemm",
+                    "gemm_bk": 128,
+                    "gemm_skf": 1,
+                    "gemm_rstaged_skf": 1,
+                },
+            ),
+        ),
+        "50,28,4096": ((3329, 3584, {"route": "gemm", "gemm_bk": 128}),),
+        "192,2,2048": (
+            (
+                1281,
+                2048,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1},
+            ),
+        ),
+    },
+}
 
 ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
     "sm_100a": {
@@ -1806,6 +1860,14 @@ def decode_table(arch: str) -> dict[str, dict[str, Any]]:
             f"no measured dispatch table for {arch!r} (tabulated: {ARCHES})"
         )
     return {**DECODE_TABLE, **overrides}
+
+
+def decode_table_m_ranges(
+    arch: str,
+) -> dict[str, tuple[tuple[int, int, dict[str, Any]], ...]]:
+    """The in-bucket row ranges of ``arch``: ``{cell: ((lo, hi, entry), ...)}``, rows ``lo..hi`` of the cell's bucket
+    taking ``entry`` instead of the cell's entry (none for an untabulated architecture)."""
+    return DECODE_TABLE_M_RANGES.get(arch, {})
 
 
 def route_twins(arch: str) -> dict[str, dict[str, str]]:

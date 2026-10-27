@@ -49,8 +49,10 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
 )
 from flashinfer.experimental.kimi_k3_fp8_projection.decode_table import (
     DECODE_TABLE,
+    DECODE_TABLE_M_RANGES,
     DECODE_TABLE_OVERRIDES,
     decode_table,
+    decode_table_m_ranges,
     route_twins,
 )
 from flashinfer.gemm import (
@@ -130,6 +132,15 @@ GPU_ROWS = [
     # unaligned-stride decode row.
     ("tp8", "f_b", 512, 4),
     ("tp1", "q_proj", 64, 4),
+    # Round 12 batch 4: rows of the sm_100a batch-4 programs -- ``gemm_rstaged_n192_k128_pf2`` (50,28,512,
+    # lever RPF), ``gemm_rstaged_k128_skf`` (the 1281..2048 range of 50,28,2048, lever RSKF), ``gemm_tstore_k128_gs_ars``
+    # (192,2,1024 and the 1281..2048 range of 192,2,2048, lever ARS) -- and the record row inside the 3329..3584 range of
+    # 50,28,4096; on sm_103a each row resolves to that table's own form.
+    ("tp8", "in_proj_qkvgfab", 512, 0),
+    ("tp8", "in_proj_qkvgfab", 2048, 0),
+    ("tp8", "in_proj_qkvgfab", 3584, 0),
+    ("tp1", "kv_b", 1024, 0),
+    ("tp1", "kv_b", 1281, 0),
 ]
 
 
@@ -572,6 +583,374 @@ def test_gemm_block_n_is_a_launch_parameter(monkeypatch):
             )
             assert other.gemm_bn == 256 and other.gemm_n_tiles == prepared.n_tiles
             assert f"_n{bn}" not in other.kernels[-1], other.kernels
+
+
+def _family_weight(tp, module, seed=2106):
+    """A prepared weight of a contract family for the host-rule tests (no weight bytes; random B scales)."""
+    n_valid, K = PROJECTION_FAMILIES[tp][module]
+    n_pad, num_k_iters = n_padded(n_valid), -(-K // 256)
+    g = torch.Generator().manual_seed(seed)
+    sf = torch.randint(
+        100, 140, (n_pad // BLOCK, K // BLOCK), dtype=torch.uint8, generator=g
+    )
+    return cb.PreparedProjectionWeight(
+        n_valid=n_valid,
+        K=K,
+        n_pad=n_pad,
+        n_tiles=n_pad // 256,
+        n_tiles128=-(-n_valid // BLOCK),
+        num_k_iters=num_k_iters,
+        sf_k_sets=k_sets(K),
+        k_blocks_pad=2 * num_k_iters,
+        weight_tiles=torch.zeros(1, dtype=torch.uint8),
+        scale_tiles=cb.weight_scale_tiles(sf, K),
+        weight_scale_ue8m0=torch.zeros(1),
+        sf_bytes=sf,
+    )
+
+
+_RECORD_K128 = {"route": "gemm", "gemm_bk": 128}
+_RSKF = {"route": "gemm", "gemm_bk": 128, "gemm_skf": 1, "gemm_rstaged_skf": 1}
+_ARS = {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1}
+# Round 12 batch 4: ``(cell, M, sm_100a entry)`` on both sides of every in-bucket range edge (M 1280 / 1281,
+# 3328 / 3329, 3584 / 3585) and at the bucket edges of each segment; sm_103a keeps each cell's entry on every row.
+_M_RANGE_EDGES = (
+    ("50,28,2048", 1025, _RECORD_K128),
+    ("50,28,2048", 1280, _RECORD_K128),
+    ("50,28,2048", 1281, _RSKF),
+    ("50,28,2048", 2048, _RSKF),
+    ("50,28,4096", 2049, _RSKF),
+    ("50,28,4096", 3328, _RSKF),
+    ("50,28,4096", 3329, _RECORD_K128),
+    ("50,28,4096", 3584, _RECORD_K128),
+    ("50,28,4096", 3585, _RSKF),
+    ("50,28,4096", 4096, _RSKF),
+    ("192,2,2048", 1025, _RECORD_K128),
+    ("192,2,2048", 1280, _RECORD_K128),
+    ("192,2,2048", 1281, _ARS),
+    ("192,2,2048", 2048, _ARS),
+)
+# the GEMM programs batch 4 adds to the sm_100a plan (levers RPF, RSKF, ARS)
+_BATCH4_KEYS = {
+    "gemm_rstaged_n192_k128_pf2",
+    "gemm_rstaged_k128_skf",
+    "gemm_tstore_k128_gs_ars",
+}
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
+    """Round 12 batch 4: ``DECODE_TABLE_M_RANGES`` refines a tabulated cell inside its bucket -- rows
+    ``lo..hi`` take the range's entry, the cell's other rows keep the cell's entry.  sm_100a only: tp8:in_proj_qkvgfab takes
+    the staged-register fix-up stream-K program (lever RSKF) on M 1281..2048 and on the 4096 bucket outside 3329..3584, and
+    tp1:kv_b takes the A-resident grid-stride program (lever ARS) on M 1281..2048.  Each row on both sides of each edge
+    resolves to its entry and launches that entry's program; with the batch-4 programs unregistered the rows fall back to
+    the record's programs.  The registry is stubbed, so the host rules are checked whether or not this checkout registers
+    the programs."""
+    assert set(DECODE_TABLE_M_RANGES) == {"sm_100a"}
+    assert decode_table_m_ranges("sm_90a") == {}
+    assert {
+        cell: tuple((lo, hi) for lo, hi, _ in ranges)
+        for cell, ranges in cb.cell_m_ranges(arch).items()
+    } == {
+        "sm_100a": {
+            "50,28,2048": ((1281, 2048),),
+            "50,28,4096": ((3329, 3584),),
+            "192,2,2048": ((1281, 2048),),
+        },
+        "sm_103a": {},
+    }[arch]
+    for cell, ranges in cb.cell_m_ranges(arch).items():
+        for _, _, entry in ranges:
+            assert entry["route"] == decode_table(arch)[cell]["route"] == "gemm"
+            assert entry != decode_table(arch)[cell], cell
+    for cell, M, entry in _M_RANGE_EDGES:
+        n_tiles128, num_k_iters, _ = (int(v) for v in cell.split(","))
+        expected = entry if arch == "sm_100a" else decode_table(arch)[cell]
+        assert cb.decode_table_entry(M, n_tiles128, num_k_iters, arch) == expected, (
+            cell,
+            M,
+        )
+        assert decode_config(M, n_tiles128, num_k_iters, arch, SM_COUNT) is None
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    in_proj = _family_weight("tp8", "in_proj_qkvgfab")
+    kv_b = _family_weight("tp1", "kv_b")
+    assert (in_proj.n_tiles128, in_proj.num_k_iters) == (50, 28)
+    assert (kv_b.n_tiles128, kv_b.num_k_iters) == (192, 2)
+    # tp8:in_proj_qkvgfab: 6284 columns (6284 % 8 == 4), so every view of the family is staged-register
+    staged = dict(gemm_tma_store=False, gemm_reg_staged=True)
+
+    def check(registered):
+        for cell, M, entry in _M_RANGE_EDGES:
+            m_tiles = cb._m_tiles(M)
+            if cell.startswith("50,"):
+                plan = cb.route_plan(in_proj, M, arch, SM_COUNT, None, **staged)
+                skf = cb.gemm_stream_k_fixup_plan(
+                    M, 50, 28, arch, SM_COUNT, m_tiles, plan.gemm_n_tiles, plan.gemm_bn
+                )
+                if arch == "sm_103a":
+                    expected = {
+                        "50,28,2048": "gemm_rstaged_k128",
+                        "50,28,4096": "gemm_rstaged_n192_k128",
+                    }[cell]
+                    assert skf is None
+                elif entry is _RSKF:
+                    # every RSKF row of the family has a fractional wave (25 N tiles x m_tiles / 2 over 74 pairs)
+                    assert skf is not None and skf.program_suffix == "_skf", (M, skf)
+                    expected = (
+                        "gemm_rstaged_k128_skf" if registered else "gemm_rstaged_k128"
+                    )
+                else:
+                    assert skf is None, (M, skf)
+                    expected = "gemm_rstaged_k128"
+                assert plan.kernels[-1] == expected, (cell, M, plan.kernels)
+                assert plan.gemm_bk == 128 and not plan.gemm_gs
+                if expected.endswith("_skf"):
+                    assert plan.gemm_skf == skf and plan.grids[-1] == skf.grid
+                else:
+                    assert plan.gemm_skf is None
+                    assert plan.grids[-1] == cb._gemm_grid(m_tiles, plan.gemm_n_tiles)
+            else:
+                # tp1:kv_b: 24576 columns -- the TMA-store view takes the grid-stride forms, the staged view the record's
+                plan = cb.route_plan(kv_b, M, arch, SM_COUNT, None)
+                ars = arch == "sm_100a" and entry is _ARS
+                expected = (
+                    ("gemm_tstore_k128_gs_ars" if registered else "gemm_tstore_k128_gs")
+                    if ars
+                    else "gemm_tstore_k128"
+                )
+                assert plan.kernels[-1] == expected, (cell, M, plan.kernels)
+                assert plan.gemm_bn == 256 and plan.gemm_n_tiles == 96
+                assert plan.gemm_gs == ars and plan.gemm_skf is None
+                pairs = min(m_tiles // 2 * 96, SM_COUNT // 2)
+                assert plan.gemm_gs_pairs == (pairs if ars else 0)
+                assert plan.grids[-1] == (
+                    2 * pairs if ars else cb._gemm_grid(m_tiles, 96)
+                )
+                if ars:
+                    assert pairs == 74 and plan.grids[-1] == 148
+                rplan = cb.route_plan(kv_b, M, arch, SM_COUNT, None, **staged)
+                assert rplan.kernels[-1] == "gemm_rstaged_k128" and not rplan.gemm_gs
+
+    check(True)
+    # the batch-4 programs unregistered: the rows fall back at the same geometry onto the record's programs
+    monkeypatch.setattr(
+        cb, "route_available", lambda arch, keys: not set(keys) & _BATCH4_KEYS
+    )
+    check(False)
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_batch4_whole_bucket_cells(monkeypatch, arch):
+    """Round 12 batch 4: whole-bucket sm_100a cells.  Lever RPF: the 50,28,512 cell (tp8:in_proj_qkvgfab:512)
+    left the static one-tile form for ``gemm_pf`` 2 + ``gemm_rstaged_pf`` 1, so its staged-register rows prefetch two stages
+    ahead (``gemm_rstaged_n192_k128_pf2``; the TMA-store launches of a ``gemm_pf`` cell always do).  Lever ARS: the
+    192,2,1024 / 4096 / 16384 cells (tp1:kv_b) launch the A-resident form of the 256-wide grid-stride program
+    (``gemm_tstore_k128_gs_ars``; the 1024 cell left the 192-wide tile for it); their staged-register rows keep the record's
+    program.  sm_103a keeps its cells.  Checked at both edges of each bucket, with the registry stubbed."""
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    in_proj = _family_weight("tp8", "in_proj_qkvgfab")
+    kv_b = _family_weight("tp1", "kv_b")
+    staged = dict(gemm_tma_store=False, gemm_reg_staged=True)
+    sm100 = arch == "sm_100a"
+    for M in (257, 512):
+        plan = cb.route_plan(in_proj, M, arch, SM_COUNT, None, **staged)
+        assert plan.kernels[-1] == (
+            "gemm_rstaged_n192_k128_pf2" if sm100 else "gemm_rstaged_n192_k128"
+        ), (M, plan.kernels)
+        assert plan.gemm_bn == 192 and plan.gemm_bk == 128
+        assert not plan.gemm_static and not plan.gemm_gs and plan.gemm_skf is None
+        # the predicated register epilogue keeps the record's program (no prefetch form)
+        reg = cb.route_plan(
+            in_proj,
+            M,
+            arch,
+            SM_COUNT,
+            None,
+            gemm_tma_store=False,
+            gemm_reg_staged=False,
+        )
+        assert "_pf" not in reg.kernels[-1] and reg.gemm_bn == 256, reg.kernels
+    assert cb.gemm_prefetch_distance(512, 50, 28, arch) == (2 if sm100 else 0)
+    for cell, M in (
+        ("192,2,1024", 513),
+        ("192,2,1024", 1024),
+        ("192,2,4096", 2049),
+        ("192,2,4096", 4096),
+        ("192,2,16384", 4097),
+        ("192,2,16384", 16384),
+    ):
+        plan = cb.route_plan(kv_b, M, arch, SM_COUNT, None)
+        if sm100:
+            pairs = min(cb._m_tiles(M) // 2 * 96, SM_COUNT // 2)
+            assert plan.kernels[-1] == "gemm_tstore_k128_gs_ars", (M, plan.kernels)
+            assert plan.gemm_bn == 256 and plan.gemm_gs and plan.gemm_gs_pairs == pairs
+            assert plan.grids[-1] == 2 * pairs == 148
+        else:
+            assert plan.kernels[-1] == (
+                "gemm_tstore_n192_k128" if cell == "192,2,1024" else "gemm_tstore_k128"
+            ), (M, plan.kernels)
+            assert not plan.gemm_gs
+        rplan = cb.route_plan(kv_b, M, arch, SM_COUNT, None, **staged)
+        assert rplan.kernels[-1] == (
+            "gemm_rstaged_n192_k128"
+            if cell == "192,2,1024" and not sm100
+            else "gemm_rstaged_k128"
+        ), (M, rplan.kernels)
+        assert not rplan.gemm_gs
+
+
+def test_batch4_entry_rules_and_required_keys(monkeypatch):
+    """Round 12 batch 4: the table keys ``gemm_rstaged_pf`` / ``gemm_rstaged_skf`` / ``gemm_ars`` (0 / 1; the
+    first two need the TMA-store form they extend -- ``gemm_pf`` / ``gemm_skf`` 1 -- at ``gemm_bk`` 128, the last the 256-wide
+    ``_gs`` program at K <= 512, refused elsewhere on both the launch and the plan), the row segments of a cell
+    (``_cell_segments``: each in-bucket range with its edges, then the rest of the bucket) and the refused range tables
+    (``cell_m_ranges``).  ``required_kernel_keys`` holds the batch-4 programs on sm_100a only."""
+    # entry keys
+    assert cb._entry_gemm_rstaged_pf(
+        {"route": "gemm", "gemm_bk": 128, "gemm_pf": 2, "gemm_rstaged_pf": 1}
+    )
+    assert not cb._entry_gemm_rstaged_pf(
+        {"route": "gemm", "gemm_bk": 128, "gemm_pf": 2}
+    )
+    for bad in (
+        {"gemm_bk": 128, "gemm_rstaged_pf": 1},
+        {"gemm_pf": 2, "gemm_rstaged_pf": 1},
+        {"gemm_bk": 256, "gemm_pf": 2, "gemm_rstaged_pf": 1},
+    ):
+        with pytest.raises(ValueError, match="gemm_rstaged_pf needs"):
+            cb._entry_gemm_rstaged_pf(bad)
+    assert cb._entry_gemm_rstaged_skf(_RSKF)
+    assert not cb._entry_gemm_rstaged_skf(_RECORD_K128)
+    for bad in (
+        {"gemm_bk": 128, "gemm_rstaged_skf": 1},
+        {"gemm_bk": 128, "gemm_skf": 2, "gemm_rstaged_skf": 1},
+        {"gemm_skf": 1, "gemm_rstaged_skf": 1},
+    ):
+        with pytest.raises(ValueError, match="gemm_rstaged_skf needs"):
+            cb._entry_gemm_rstaged_skf(bad)
+    assert cb._entry_gemm_ars(_ARS) and not cb._entry_gemm_ars(_RECORD_K128)
+    assert not cb._entry_gemm_ars({"gemm_ars": 0})
+    for key, fn in (
+        ("gemm_rstaged_pf", cb._entry_gemm_rstaged_pf),
+        ("gemm_rstaged_skf", cb._entry_gemm_rstaged_skf),
+        ("gemm_ars", cb._entry_gemm_ars),
+    ):
+        with pytest.raises(ValueError, match=f"{key} must be 0 or 1"):
+            fn({key: 2})
+    assert cb.gemm_ars_cell_conflicts(_ARS, 2) == []
+    assert cb.gemm_ars_cell_conflicts(None, 2) == ["gemm_gs"]
+    assert cb.gemm_ars_cell_conflicts({**_ARS, "gemm_bn": 192}, 2) == ["gemm_bn"]
+    assert cb.gemm_ars_cell_conflicts(_ARS, 3) == ["K"]
+    assert cb.gemm_ars_cell_conflicts({"gemm_bn": 224}, 6) == [
+        "gemm_gs",
+        "gemm_bn",
+        "K",
+    ]
+    # row segments: each range with its two edges, then the cell's entry on the rest of the bucket
+    table = decode_table("sm_100a")
+    assert cb._cell_segments("sm_100a", "50,28,2048", table["50,28,2048"]) == (
+        (_RSKF, (1281, 2048)),
+        (_RECORD_K128, (1025, 1280)),
+    )
+    assert cb._cell_segments("sm_100a", "50,28,4096", table["50,28,4096"]) == (
+        (_RECORD_K128, (3329, 3584)),
+        (_RSKF, (2049, 3328)),
+        (_RSKF, (3585, 4096)),
+    )
+    assert cb._cell_segments("sm_100a", "192,2,2048", table["192,2,2048"]) == (
+        (_ARS, (1281, 2048)),
+        (_RECORD_K128, (1025, 1280)),
+    )
+    assert cb._cell_segments("sm_103a", "50,28,2048", table["50,28,2048"]) == (
+        (table["50,28,2048"], (1025, 2048)),
+    )
+    assert cb._cell_segments("sm_100a", "50,28,1", table["50,28,1"]) == (
+        (table["50,28,1"], (1,)),
+    )
+    assert cb.cell_m_ranges("sm_103a") == {} and cb.cell_m_ranges("sm_90a") == {}
+    required = {arch: set(required_kernel_keys(arch, SM_COUNT)) for arch in ARCHES}
+    assert required["sm_100a"] >= _BATCH4_KEYS
+    assert not _BATCH4_KEYS & required["sm_103a"]
+    # the plain grid-stride program stays in the sm_100a plan (the 192,2,512 cell and the 192,2,2048 rows M <= 1280 keep it)
+    assert "gemm_tstore_k128_gs" in required["sm_100a"]
+    # a gemm_ars cell that is not the 256-wide _gs program at K <= 512 is refused on the plan and on the launch
+    real_table = cb.decode_table
+    kv_b = _family_weight("tp1", "kv_b")
+    q_b = _family_weight("tp8", "q_b")
+    assert (q_b.n_tiles128, q_b.num_k_iters) == (18, 6)
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    for cell, prepared, entry, conflict in (
+        ("192,2,4096", kv_b, {**_ARS, "gemm_bn": 192}, r"\['gemm_bn'\]"),
+        ("18,6,4096", q_b, dict(_ARS), r"\['K'\]"),
+    ):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                cb,
+                "decode_table",
+                lambda arch, cell=cell, entry=entry: {**real_table(arch), cell: entry},
+            )
+            with pytest.raises(
+                ValueError, match=f"carries gemm_ars together with {conflict}"
+            ):
+                cb.route_plan(prepared, 4096, "sm_100a", SM_COUNT, None)
+            with pytest.raises(
+                ValueError, match=f"{cell} carries gemm_ars together with {conflict}"
+            ):
+                required_kernel_keys("sm_100a", SM_COUNT)
+    # refused range tables (the cache is cleared around each, so no test sees another's ranges)
+    rec = dict(_RECORD_K128)
+    for ranges, match in (
+        ({"9,9,2048": ((1281, 2048, rec),)}, "refine no tabulated cell"),
+        (
+            {"50,28,2048": ((1024, 2048, rec),)},
+            "not a proper part of its bucket 1025..2048",
+        ),
+        ({"50,28,2048": ((1281, 2049, rec),)}, "not a proper part"),
+        ({"50,28,2048": ((1025, 2048, rec),)}, "not a proper part"),
+        ({"50,28,2048": ((1300, 1200, rec),)}, "not a proper part"),
+        ({"50,28,2048": ((1100, 1300, rec), (1300, 1400, rec))}, "overlap at 1300"),
+        ({"50,28,2048": ((1281, 2048, "gemm"),)}, "carries no table row"),
+        ({"50,28,2048": ((1281, 2048, {"gemm_bk": 128}),)}, "carries no table row"),
+    ):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cb, "decode_table_m_ranges", lambda arch, ranges=ranges: ranges)
+            cb.cell_m_ranges.cache_clear()
+            try:
+                with pytest.raises(ValueError, match=match):
+                    cb.cell_m_ranges("sm_100a")
+            finally:
+                cb.cell_m_ranges.cache_clear()
+    # unsorted, non-adjacent ranges: sorted by ``lo``; the segments cover the gaps between them
+    cell_entry = table["50,28,2048"]
+    ranges = {"50,28,2048": ((1500, 2048, _RSKF), (1100, 1200, rec))}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cb, "decode_table_m_ranges", lambda arch: ranges)
+        cb.cell_m_ranges.cache_clear()
+        try:
+            assert cb.cell_m_ranges("sm_100a") == {
+                "50,28,2048": ((1100, 1200, rec), (1500, 2048, _RSKF))
+            }
+            assert cb._cell_segments("sm_100a", "50,28,2048", cell_entry) == (
+                (rec, (1100, 1200)),
+                (_RSKF, (1500, 2048)),
+                (cell_entry, (1025, 1099)),
+                (cell_entry, (1201, 1499)),
+            )
+            for M, expected in (
+                (1099, cell_entry),
+                (1100, rec),
+                (1200, rec),
+                (1201, cell_entry),
+                (1499, cell_entry),
+                (1500, _RSKF),
+            ):
+                assert cb.decode_table_entry(M, 50, 28, "sm_100a") == expected, M
+        finally:
+            cb.cell_m_ranges.cache_clear()
 
 
 def test_sk_bindings_carry_no_split_scalars(monkeypatch):
@@ -1165,7 +1544,6 @@ def test_decode_config_round6_continuation_rules(arch):
         "12,28,16384",
         "12,28,2048",
         "17,28,16384",
-        "192,2,1024",
         "192,2,256",
         "24,2,1024",
         "24,2,2048",
@@ -1200,13 +1578,16 @@ def test_decode_config_round6_continuation_rules(arch):
     # controls in band; rule-5 refined 5(a) packet PASS step acc7795e), program ``gemm_tstore_n192_k128_skf`` -- the program the
     # 5,28,16384 cell launches on both GPUs, so no new instance.  Round 12: the sm_103a 48,28,1024 cell (tp8:fused_qkvg:1024)
     # left the 384-wide tile for ``gemm_bn`` 192 + ``gemm_bk`` 128 + ``gemm_pf`` 1 (bit-exact; 1.0375 against the 384-wide record
-    # on GB300), the ``gemm_tstore_n192_k128_pf1`` program the sm_103a plan already holds, so no new instance.
+    # on GB300), the ``gemm_tstore_n192_k128_pf1`` program the sm_103a plan already holds, so no new instance.  Round 12
+    # batch 4 (lever ARS): the sm_100a 192,2,1024 cell (tp1:kv_b:1024) left the 192-wide tile for the 256-wide A-resident
+    # grid-stride program, so it is a 192-wide cell on sm_103a only.
     assert (
         n192
         == n192_common
         | {
             "sm_100a": {"48,28,1024", "56,48,1024"},
             "sm_103a": {
+                "192,2,1024",
                 "24,2,4096",
                 "48,28,1024",
                 "5,28,2048",
@@ -1421,6 +1802,9 @@ def test_decode_config_round6_continuation_rules(arch):
     # on tree 66fec20d: 1.01987 / 1.01762 / 1.01762, aa 1.0 x3, bit-exact, Tier A; gemm_tstore_pf2 -> gemm_tstore_k128_gs).
     # ``gemm_tstore_pf2`` stays in both plans: sm_100a 144,6,512 / 144,6,1024 (56,48,512 until round 12 moved it to the
     # 224-wide tile) and the sm_103a pf-2 256-wide cells.  Round 12: sm_100a 56,6,512 launches the 224-wide ``_gs`` form.
+    # Round 12 batch 4 (lever ARS): the sm_100a 192,2,1024 / 192,2,4096 / 192,2,16384 cells (tp1:kv_b) launch the A-resident
+    # form of the 256-wide ``_gs`` program (``gemm_ars`` 1 next to ``gemm_gs`` 1; the 192,2,2048 cell takes it for M > 1280 only,
+    # through ``DECODE_TABLE_M_RANGES``).
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
@@ -1435,6 +1819,9 @@ def test_decode_config_round6_continuation_rules(arch):
                 "24,2,4096",
                 "56,6,512",
                 "192,2,512",
+                "192,2,1024",
+                "192,2,4096",
+                "192,2,16384",
             },
             "sm_103a": {
                 "96,1,2048",
@@ -1736,10 +2123,14 @@ def test_decode_config_round6_continuation_rules(arch):
         + "_skf"
     )
     assert {"gemm_tstore_skf", n192_skf} <= required
-    assert not any(
-        k.startswith(("gemm_rstaged", "gemm_n192", "gemm_pf")) and k.endswith("_skf")
+    # Round 12 batch 4 (lever RSKF): the sm_100a ``gemm_rstaged_skf`` rows (tp8:in_proj_qkvgfab: the 50,28,4096
+    # cell outside its 3329..3584 range and the 1281..2048 range of 50,28,2048) launch the staged-register fix-up program;
+    # no other register-epilogue program has the form.
+    assert {
+        k
         for k in required
-    )
+        if k.startswith(("gemm_rstaged", "gemm_n192", "gemm_pf")) and k.endswith("_skf")
+    } == {"sm_100a": {"gemm_rstaged_k128_skf"}, "sm_103a": set()}[arch]
 
 
 def test_decode_module_stage_clamp():
@@ -2221,11 +2612,22 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         # slot / stream-K token, as ``gemm_n384_cell_conflicts`` enforces); the predicated register epilogue keeps 256.
         n384 = bn == cb.GEMM_BLOCK_N_WIDE and expected_kernel != "gemm"
         wide = "_n192" if bn == 192 else ("_n384" if n384 else "")
+        # Round 12 (batch 4): the row's entry (its in-bucket M range when one holds ``M``); lever RPF: a
+        # ``gemm_rstaged_pf`` cell's staged-register rows prefetch at the cell's distance too.
+        gentry = (
+            cb.decode_table_entry(
+                M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+            )
+            or {}
+        )
+        rstaged_pf = expected_kernel == "gemm_rstaged" and cb._entry_gemm_rstaged_pf(
+            gentry
+        )
         gpf = (
             cb.gemm_prefetch_distance(
                 M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
             )
-            if aligned and not n384
+            if (aligned or rstaged_pf) and not n384
             else 0
         )
         # Round 8 (lever L8): the tabulated ``gemm_bk`` rows launch the ``_k128`` form (128-K operand hand-off, same output
@@ -2313,6 +2715,17 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             if gs_pairs and cb._gs_eligible(stem)
             else ""
         )
+        # Round 12 (lever ARS): a ``gemm_ars`` cell's grid-stride rows launch the A-resident ``_gs_ars`` program
+        # of the 256-wide form when it is registered (the same launch).
+        if (
+            slot == "_gs"
+            and bn == 256
+            and cb._entry_gemm_ars(gentry)
+            and cb.route_available(
+                plan.arch, (cb.gemm_kernel_key(stem + "_gs_ars", gpf),)
+            )
+        ):
+            slot = "_gs_ars"
         stem = stem + slot + isfx
         # Round 10 (CAKE-985 S2, lever SKP): the tabulated ``gemm_skp`` rows launch the prefetched stream-K instance
         # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound) when the geometry admits a plan; TMA-store stems
@@ -2350,7 +2763,16 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 plan.gemm_n_tiles,
                 bn,
             )
-            if skp is None and expected_kernel == "gemm_tstore"
+            if skp is None
+            and (
+                expected_kernel == "gemm_tstore"
+                # round 12 (lever RSKF): the staged-register _k128 rows of a ``gemm_rstaged_skf`` cell too
+                or (
+                    expected_kernel == "gemm_rstaged"
+                    and k128
+                    and cb._entry_gemm_rstaged_skf(gentry)
+                )
+            )
             else None
         )
         skf_key = cb.gemm_kernel_key(stem + "_skf", gpf)
@@ -2362,6 +2784,9 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         )
         # the ``_pdlb`` form first, then the record-order program when it is not registered (route_plan's fallback)
         expected_key = cb.gemm_kernel_key(full_stem, gpf)
+        if rstaged_pf and gpf and not cb.route_available(plan.arch, (expected_key,)):
+            # round 12 (lever RPF): the staged-register prefetching program is not registered -- the plain one
+            expected_key = cb.gemm_kernel_key(full_stem, 0)
         if pdlb:
             pdlb_key = cb.gemm_kernel_key(cb._pdlb_stem(full_stem), gpf)
             if cb.route_available(plan.arch, (pdlb_key,)):
@@ -2370,7 +2795,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         launched = expected_key.split("_pf")[0]
         assert plan.gemm_pdlb == launched.endswith("_pdlb")
         assert plan.gemm_static == launched.endswith("_st")
-        assert plan.gemm_gs == launched.endswith("_gs")
+        assert plan.gemm_gs == launched.endswith(("_gs", "_gs_ars"))
         assert plan.gemm_gm == (64 if "_g64" in launched else cb.GEMM_GROUP_M)
         assert (plan.gemm_bn, plan.gemm_n_tiles, plan.gemm_bk) == (
             bn,
