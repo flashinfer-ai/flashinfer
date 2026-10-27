@@ -147,12 +147,17 @@ def _inputs(lengths, heads):
     )
 
 
-def _run(d, lengths, heads, launches):
-    """Launch one prepared call ``launches`` times from the same initial pool."""
+def _run(d, lengths, heads, launches, *, checkpoints=True):
+    """Launch one prepared call ``launches`` times from the same initial pool
+    (``checkpoints=False``: without checkpoint rows)."""
     state0 = d["state"].clone()
     out = torch.empty_like(d["q"])
-    rows = torch.empty(
-        (d["rows"], heads, HEAD_DIM, HEAD_DIM), device="cuda", dtype=torch.float32
+    rows = (
+        torch.empty(
+            (d["rows"], heads, HEAD_DIM, HEAD_DIM), device="cuda", dtype=torch.float32
+        )
+        if checkpoints
+        else None
     )
     pool = d["state"].clone()
     call = prepare_bf16_kda_prefill(
@@ -171,8 +176,8 @@ def _run(d, lengths, heads, launches):
         sequence_lengths=tuple(lengths),
         state_indices=d["indices"],
         state_checkpoints=rows,
-        checkpoint_cu_starts=d["starts"],
-        checkpoint_every_n_tokens=CHECKPOINT_EVERY,
+        checkpoint_cu_starts=d["starts"] if checkpoints else None,
+        checkpoint_every_n_tokens=CHECKPOINT_EVERY if checkpoints else 0,
         beta_is_logit=True,
         plan_cache=KDAPrefillPlanCache(4),
     )
@@ -181,7 +186,9 @@ def _run(d, lengths, heads, launches):
         pool.copy_(state0)
         call.launch()
         torch.cuda.synchronize()
-        results.append((out.clone(), pool.clone(), rows.clone()))
+        results.append(
+            (out.clone(), pool.clone(), rows.clone() if checkpoints else out[:0])
+        )
     return str(call.schedule), results
 
 
@@ -272,6 +279,29 @@ def test_owner_helper_pool_is_bitwise_the_per_task_split(
         pytest.skip(f"{split_schedule}: the call takes no owner/helper split here")
     assert "_pool" not in split_schedule, split_schedule
     pool_schedule, pooled = _run(d, lengths, heads, launches=3)
+    assert pool_schedule.endswith(suffix), (pool_schedule, suffix)
+    assert pool_schedule.startswith(split_schedule), (pool_schedule, split_schedule)
+    for launch in pooled:
+        for got, want in zip(launch, split[0], strict=True):
+            assert torch.equal(_bits(got), _bits(want))
+
+
+@requires_sm100
+def test_owner_helper_pool_without_checkpoint_rows_is_bitwise_the_per_task_split(
+    monkeypatch,
+):
+    """The pooled program on a call without checkpoint rows (the FP32-carrier
+    module serves both): the same out and final state pool as the per-task
+    split, launch after launch."""
+    lengths, heads = (4096,) * 4, 16
+    suffix = _expected_suffix(lengths, heads)
+    assert "_pool" in suffix, suffix
+    d = _inputs(lengths, heads)
+    with monkeypatch.context() as m:
+        m.setattr(runtime, "_owner_helper_pool_count", lambda **_: 0)
+        split_schedule, split = _run(d, lengths, heads, launches=1, checkpoints=False)
+    assert "_owner" in split_schedule and "_pool" not in split_schedule, split_schedule
+    pool_schedule, pooled = _run(d, lengths, heads, launches=3, checkpoints=False)
     assert pool_schedule.endswith(suffix), (pool_schedule, suffix)
     assert pool_schedule.startswith(split_schedule), (pool_schedule, split_schedule)
     for launch in pooled:

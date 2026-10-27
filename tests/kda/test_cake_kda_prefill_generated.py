@@ -34,6 +34,7 @@ after a plan-cache rebind to new tensors.
 """
 
 import re
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -737,19 +738,52 @@ def _checkpoint_dtype(lower_bound):
 
 
 class _Call:
-    """One prepared launch with its own output and checkpoint rows."""
+    """One prepared launch with its own output and checkpoint rows.
 
-    def __init__(self, d, lower_bound, *, cu_seqlens=None, plan_cache=None):
+    By default the serving call: the FP32 pool in place through the state
+    indices, checkpoint rows every 64 tokens.  ``rows=False`` drops the
+    checkpoint rows; ``indexed=False`` passes one dense FP32 state per
+    sequence (the indexed call's slots, in sequence order) in place, and
+    ``initial=False`` with it starts from the zero state into that tensor.
+    """
+
+    def __init__(
+        self,
+        d,
+        lower_bound,
+        *,
+        cu_seqlens=None,
+        plan_cache=None,
+        rows=True,
+        indexed=True,
+        initial=True,
+        checkpoint_dtype=None,
+    ):
         heads = d["heads"]
-        rows = _checkpoint_starts(d["lengths"])[-1]
+        count = _checkpoint_starts(d["lengths"])[-1]
         self.d = d
+        self.indexed = indexed
+        self.initial = initial
         self.out = torch.full_like(d["q"], float("nan"))
-        self.checkpoints = torch.full(
-            (rows, heads, HEAD_DIM, HEAD_DIM),
-            float("nan"),
-            device="cuda",
-            dtype=_checkpoint_dtype(lower_bound),
+        self.checkpoints = (
+            torch.full(
+                (count, heads, HEAD_DIM, HEAD_DIM),
+                float("nan"),
+                device="cuda",
+                dtype=checkpoint_dtype or _checkpoint_dtype(lower_bound),
+            )
+            if rows
+            else None
         )
+        if indexed:
+            assert initial, "the indexed call reads its initial states from the pool"
+            initial_state = final_state = d["state"]
+            state_indices = d["state_indices"]
+        else:
+            self.dense = d["initial_pool"][d["state_indices"].long()].clone()
+            initial_state = self.dense if initial else None
+            final_state = self.dense
+            state_indices = None
         self.prepared = prepare_bf16_kda_prefill(
             d["q"],
             d["k"],
@@ -759,24 +793,30 @@ class _Call:
             A_log=d["A_log"].reshape(heads),
             dt_bias=d["dt_bias"].reshape(heads, HEAD_DIM),
             out=self.out,
-            initial_state=d["state"],
-            final_state=d["state"],
+            initial_state=initial_state,
+            final_state=final_state,
             scale=None,
             lower_bound=lower_bound,
             cu_seqlens=d["cu_seqlens"] if cu_seqlens is None else cu_seqlens,
             sequence_lengths=d["lengths"],
-            state_indices=d["state_indices"],
+            state_indices=state_indices,
             state_checkpoints=self.checkpoints,
-            checkpoint_cu_starts=d["checkpoint_cu_starts"],
-            checkpoint_every_n_tokens=CHECKPOINT_EVERY,
+            checkpoint_cu_starts=d["checkpoint_cu_starts"] if rows else None,
+            checkpoint_every_n_tokens=CHECKPOINT_EVERY if rows else 0,
             beta_is_logit=True,
             plan_cache=plan_cache,
         )
 
     def poison(self):
-        self.d["state"].copy_(self.d["initial_pool"])
+        if self.indexed:
+            self.d["state"].copy_(self.d["initial_pool"])
+        elif self.initial:
+            self.dense.copy_(self.d["initial_pool"][self.d["state_indices"].long()])
+        else:
+            self.dense.fill_(float("nan"))
         self.out.fill_(float("nan"))
-        self.checkpoints.fill_(float("nan"))
+        if self.checkpoints is not None:
+            self.checkpoints.fill_(float("nan"))
 
     def run(self):
         self.poison()
@@ -788,8 +828,10 @@ class _Call:
         d = self.d
         return (
             self.out.clone(),
-            d["state"][d["state_indices"].long()].clone(),
-            self.checkpoints.clone(),
+            d["state"][d["state_indices"].long()].clone()
+            if self.indexed
+            else self.dense.clone(),
+            None if self.checkpoints is None else self.checkpoints.clone(),
         )
 
 
@@ -867,6 +909,9 @@ def _assert_bitwise(got, want, label):
     for name, a, b in zip(
         ("out", "final state", "checkpoint rows"), got, want, strict=True
     ):
+        if a is None or b is None:
+            assert a is None and b is None, f"{label}: {name} on one side only"
+            continue
         assert torch.equal(
             a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
         ), f"{label}: {name} differs"
@@ -1265,3 +1310,267 @@ def test_stored_tensor_maps_equal_a_fresh_encode_after_prepare_and_rebind(
     assert (cache.misses, cache.hits) == (1, 2)
     _assert_bitwise(again.run(), got, "output moved")
     _assert_stored_maps_are_current(again.prepared, "output moved")
+
+
+# ------------------------------------------------- host routes: PS, MM, fallbacks
+
+PAIR_SHARE_ROWS = [
+    pytest.param([8192, 17], 12, id="8192+17-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+    pytest.param([8192], 6, id="8192-h6"),
+]
+STATE_VARIANTS = [
+    pytest.param(dict(indexed=True), id="indexed-pool"),
+    pytest.param(dict(indexed=False), id="dense-state"),
+    pytest.param(dict(indexed=False, initial=False), id="zero-initial-state"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("state", STATE_VARIANTS)
+@pytest.mark.parametrize("lengths,heads", PAIR_SHARE_ROWS)
+def test_pair_share_is_bitwise_the_routed_m64_program(
+    lengths, heads, state, monkeypatch
+):
+    """A long M64 value-split launch that takes the pair-share build equals, bit
+    for bit, the routed M64 program (the loader without pair-share builds):
+    output, final states and checkpoint rows, with and without state indices
+    and initial states."""
+    arch = registry.device_arch()
+    pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
+    d = _inputs(lengths, heads)
+
+    shared = _Call(d, -5.0, **state)
+    schedule = str(shared.prepared.schedule)
+    assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
+    assert schedule.endswith("_pair_share"), schedule
+    assert _modules(shared.prepared) & pair_share
+    shared_result = shared.run()
+    _assert_bitwise(shared.run(), shared_result, "pair-share repeat")
+
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    routed = _Call(d, -5.0, **state)
+    assert str(routed.prepared.schedule) == schedule.removesuffix("_pair_share")
+    assert not _modules(routed.prepared) & pair_share
+    _assert_bitwise(shared_result, routed.run(), "pair-share vs routed M64")
+
+
+CHAIN_ROWS = [
+    pytest.param([8192], 12, id="8192-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "env,lower_bound,checkpoint_dtype",
+    [
+        pytest.param(
+            "CAKE_KDA_AFFINE_APPLY", None, torch.bfloat16, id="apply-off-bf16-rows"
+        ),
+        pytest.param("CAKE_KDA_AFFINE_APPLY", None, None, id="apply-off-default-rows"),
+        pytest.param(
+            "CAKE_KDA_AFFINE_ROWS_IN_PLACE",
+            None,
+            torch.float32,
+            id="fp32-rows-not-in-place",
+        ),
+    ],
+)
+@pytest.mark.parametrize("lengths,heads", CHAIN_ROWS)
+def test_chain_composites_without_a_map_fold_build_keep_the_map_pass(
+    lengths, heads, env, lower_bound, checkpoint_dtype, monkeypatch
+):
+    """Chain composites whose main module has no map-fold build launch the map
+    pass: no ``_mapfold`` schedule, no map-fold program.  The unbounded gate
+    takes the chain with the apply route off, or with FP32 rows that are not
+    written in place (the apply route needs them in place)."""
+    if checkpoint_dtype == torch.float32 and _checkpoint_dtype(None) != torch.float32:
+        pytest.skip("no FP32 checkpoint rows for the unbounded gate here")
+    monkeypatch.setenv(env, "0")
+    arch = registry.device_arch()
+    folding = set(registry._RENDERED_MAP_FOLD_ROUTES[arch].values())
+    d = _inputs(lengths, heads)
+    call = _Call(d, lower_bound, checkpoint_dtype=checkpoint_dtype)
+    schedule = str(call.prepared.schedule)
+    assert schedule.startswith("split_seq_affine_prefix"), schedule
+    assert "_apply" not in schedule, schedule
+    assert "_mapfold" not in schedule, schedule
+    assert not _modules(call.prepared) & folding
+    _assert_close(call.run(), _reference(d, lower_bound), env)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "variant",
+    [
+        pytest.param(
+            dict(env="FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE"), id="torch-epilogue"
+        ),
+        pytest.param(dict(rows=False), id="no-checkpoint-rows"),
+    ],
+)
+@pytest.mark.parametrize("lengths,heads", CHAIN_ROWS)
+def test_chain_map_fold_is_bitwise_the_map_pass_off_the_serving_path(
+    lengths, heads, variant, monkeypatch
+):
+    """The chain composite with the torch epilogue, and without checkpoint rows,
+    equals the composite that launches the map pass, bit for bit; where the
+    main module has a map-fold build the composite takes it (``_mapfold``)."""
+    if "env" in variant:
+        monkeypatch.setenv(variant["env"], "0")
+    rows = variant.get("rows", True)
+    arch = registry.device_arch()
+    folding = set(registry._RENDERED_MAP_FOLD_ROUTES[arch].values())
+    d = _inputs(lengths, heads)
+    untouched = torch.ones(d["state"].shape[0], dtype=torch.bool, device="cuda")
+    untouched[d["state_indices"].long()] = False
+
+    folded = _Call(d, -5.0, rows=rows)
+    schedule = str(folded.prepared.schedule)
+    assert schedule.startswith("split_seq_affine_prefix"), schedule
+    fold = bool(_modules(folded.prepared) & folding)
+    assert fold == ("_mapfold" in schedule), schedule
+    if rows and _chain_map_fold_enabled():
+        assert fold, "the chain composite launched the map pass"
+    folded_result = folded.run()
+    assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
+    _assert_bitwise(folded.run(), folded_result, "folded repeat")
+
+    monkeypatch.setattr(
+        registry, "_RENDERED_MAP_FOLD_ROUTES", {name: {} for name in registry.ARCHES}
+    )
+    mapped = _Call(d, -5.0, rows=rows)
+    assert "_mapfold" not in str(mapped.prepared.schedule)
+    assert not _modules(mapped.prepared) & folding
+    _assert_bitwise(folded_result, mapped.run(), "folded vs map pass")
+
+
+INTERCEPTORS = [
+    pytest.param(
+        runtime.FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch,
+        runtime._ChainMapFoldUnavailable,
+        "_RENDERED_MAP_FOLD_ROUTES",
+        "_chain_map_fold_factory",
+        -5.0,
+        "_mapfold",
+        id="map-fold",
+    ),
+    pytest.param(
+        runtime.FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch,
+        runtime._PairMapFoldUnavailable,
+        "_RENDERED_FOLD_ROUTES",
+        "_pair_map_fold_factory",
+        None,
+        "_pairfold",
+        id="pair-map-fold",
+    ),
+    pytest.param(
+        runtime.FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch,
+        runtime._CorrectionMergeUnavailable,
+        "_RENDERED_MERGE_ROUTES",
+        "_correction_merge_factory",
+        -5.0,
+        "_correction_merge",
+        id="correction-merge",
+    ),
+]
+
+
+def _unrecognised_factories():
+    """Factories the fold / merge interceptors must not rewrite."""
+    m128 = partial(runtime._factory, "compiled_bf16_fused_m128")
+    return [
+        partial(runtime._factory, "compiled_bf16_fused_m64"),
+        partial(runtime._m64_pair_share_factory, "compiled_bf16_fused_m128"),
+        partial(lambda factory, *a, **k: factory(*a, **k), m128),  # a wrapper
+        lambda *a, **k: None,
+    ]
+
+
+@pytest.mark.parametrize(
+    "launch_cls,unavailable,table,factory_name,lower_bound,suffix", INTERCEPTORS
+)
+def test_interceptor_refuses_an_unrecognised_factory(
+    launch_cls, unavailable, table, factory_name, lower_bound, suffix, monkeypatch
+):
+    """Fail closed: an interceptor raises its ``...Unavailable`` exception for
+    any factory but the plain fused M128 row, before anything is built."""
+    built = []
+    monkeypatch.setattr(
+        runtime, "_build_kda_module", lambda factory, *a, **k: built.append(factory)
+    )
+    for factory in _unrecognised_factories():
+        with pytest.raises(unavailable):
+            launch_cls._build_kda_module(factory, 32)
+    assert not built
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "launch_cls,unavailable,table,factory_name,lower_bound,suffix", INTERCEPTORS
+)
+def test_composite_falls_back_when_its_interceptor_does_not_apply(
+    launch_cls, unavailable, table, factory_name, lower_bound, suffix, monkeypatch
+):
+    """When the interceptor does not recognise the main / correction factory,
+    or the body it built is not the build the loader names, the composite
+    takes its fallback (map pass, pair-map producer, epilogue): same bits."""
+    arch = registry.device_arch()
+    programs = set(getattr(registry, table)[arch].values())
+    d = _inputs([8192], 12)
+    routed = _Call(d, lower_bound)
+    schedule = str(routed.prepared.schedule)
+    if suffix not in schedule:
+        pytest.skip(f"{schedule}: the composite takes no {suffix} build here")
+    assert _modules(routed.prepared) & programs
+    routed_result = routed.run()
+
+    # The interceptor does not recognise the factory: it raises, the
+    # composite falls back.
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_is_fused_m128_row", lambda factory: False)
+        refused = _Call(d, lower_bound)
+        assert suffix not in str(refused.prepared.schedule)
+        assert not _modules(refused.prepared) & programs
+        _assert_bitwise(refused.run(), routed_result, "interceptor refused")
+
+    # The interceptor applies but the body is not the loader's build: the
+    # post-build check falls back as well.
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, factory_name, runtime._factory)
+        wrong_body = _Call(d, lower_bound)
+        assert suffix not in str(wrong_body.prepared.schedule)
+        assert not _modules(wrong_body.prepared) & programs
+        _assert_bitwise(wrong_body.run(), routed_result, "body check")
+
+
+@requires_blackwell
+def test_pair_cluster_capacity_probe_caches_only_an_answer(monkeypatch):
+    """A failed capacity probe returns 0 (the routed M64 program), warns once
+    and is not cached; the next probe that answers is."""
+    from flashinfer.jit.core import logger
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    monkeypatch.setattr(runtime, "_M64_PAIR_CLUSTER_CAPACITY", {})
+    monkeypatch.setattr(runtime, "_M64_PAIR_PROBE_WARNED", False)
+    warnings = []
+
+    def no_device(*args, **kwargs):
+        raise RuntimeError("probe failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "device", no_device)
+        patch.setattr(logger, "warning", lambda *args, **kwargs: warnings.append(args))
+        assert runtime._m64_pair_cluster_capacity(device) == 0
+        assert runtime._m64_pair_cluster_capacity(device) == 0
+        assert len(warnings) == 1, warnings
+        assert "capacity probe failed" in warnings[0][0]
+        assert device not in runtime._M64_PAIR_CLUSTER_CAPACITY
+    capacity = runtime._m64_pair_cluster_capacity(device)
+    assert capacity > 0
+    assert runtime._M64_PAIR_CLUSTER_CAPACITY[device] == capacity
