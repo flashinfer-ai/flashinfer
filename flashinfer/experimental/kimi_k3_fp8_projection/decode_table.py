@@ -44,7 +44,9 @@ limitations under the License.
 # cluster barrier arriving relaxed after a tcgen05 fence; ``_gsb`` the gs-branch
 # form of a 128-K grid-stride GEMM program; ``_ts3_tde`` a 192-wide 128-K
 # TMA-store GEMM program with three staging slots per epilogue group and the
-# pair's tensor memory freed by the MMA warps), measured faster on that
+# pair's tensor memory freed by the MMA warps; ``_prg`` a TMA-store GEMM
+# program whose MMA warp allocates the pair's tensor memory, the load warp left
+# out of the allocation rendezvous), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
@@ -1373,6 +1375,10 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_prg",
+        },
+        "12,1,16384": {
+            "gemm_tstore_n192_s2_ts4": "gemm_tstore_n192_s2_ts4_prg",
         },
         "12,28,64": {
             "decode:t32_p4_cs4_pf1": "decode:t32_p4_cs4_pf1_csrt",
@@ -1522,6 +1528,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "96,1,512": {
             "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_ts3_tde",
+        },
+        "96,1,1024": {
+            "gemm_tstore_k128_s2_ts4_pf2": "gemm_tstore_k128_s2_ts4_pf2_prg",
         },
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_gsb",
