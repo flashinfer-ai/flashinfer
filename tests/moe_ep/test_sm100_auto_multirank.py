@@ -70,6 +70,86 @@ def blackwell_bootstrap(request):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.gpu_2
+def test_phase_interleave_fc1_readiness(blackwell_bootstrap, monkeypatch):
+    import cutlass.cute as cute
+    from cutlass import Boolean, Int32
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.schedulers import (
+        fc12_scheduler as scheduler,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.schedulers.fc12_mapping import (
+        create_phase_interleaved_fc12_mapping_state,
+    )
+
+    spin_wait = scheduler.spin_wait
+
+    @cute.jit
+    def split_ready(pointer, condition):
+        # Model a stale peek on one CTA after the watermark is reached.
+        spin_wait(pointer, condition)
+        return cute.arch.block_idx()[0] != 0
+
+    monkeypatch.setattr(scheduler, "spin_peek", split_ready)
+
+    @dataclasses.dataclass(frozen=True)
+    class Probe:
+        counter: cute.Pointer | None = None
+        minimum_global_fc1_claims = 8
+
+        @cute.jit
+        def get_atomic_counter_pointer(self, index):
+            return self.counter + index
+
+        @cute.kernel
+        def kernel(
+            self, counter: cute.Tensor, tokens: cute.Tensor, output: cute.Tensor
+        ):
+            worker = Probe(counter.iterator)
+            mapping = create_phase_interleaved_fc12_mapping_state(
+                expert_count=1,
+                intermediate_gateup_size=256,
+                hidden_size=256,
+                mapping_cta_tile_shape_mnk=(128, 256, 128),
+                mapping_cluster_shape_mn=(1, 1),
+                token_padding_block=128,
+                sf_padding_block=128,
+                is_swap_ab=True,
+                expert_token_sizes=tokens,
+                expert_token_prefix_sum=None,
+            )
+            exhausted = (
+                scheduler.PhaseInterleavedFc12Scheduler._wait_for_fc1_prologue_claims(
+                    worker,
+                    Boolean(False),
+                    worker,
+                    mapping,
+                )
+            )
+            if cute.arch.thread_idx()[0] == 0:
+                output[cute.arch.block_idx()[0]] = Int32(exhausted)
+
+        @cute.jit
+        def __call__(
+            self, counter: cute.Tensor, tokens: cute.Tensor, output: cute.Tensor
+        ):
+            self.kernel(counter, tokens, output).launch(
+                grid=(2, 1, 1), block=(32, 1, 1), cluster=(2, 1, 1)
+            )
+
+    # The runtime stream has one tile, below the static watermark. Neither
+    # readiness path may mark FC1 exhausted before a uniform work claim.
+    counter = torch.tensor([8], device="cuda", dtype=torch.int32)
+    tokens = torch.tensor([1], device="cuda", dtype=torch.int32)
+    output = torch.full((2,), -1, device="cuda", dtype=torch.int32)
+    args = [from_dlpack(t) for t in (counter, tokens, output)]
+    cute.compile(Probe(), *args)(*args)
+    torch.cuda.synchronize()
+    assert output.tolist() == [0, 0]
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.gpu_2
 @pytest.mark.parametrize(
     "kind,variant,policy_name",
     [
