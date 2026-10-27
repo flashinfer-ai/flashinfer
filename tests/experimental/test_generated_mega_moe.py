@@ -864,6 +864,6 @@ def test_tp_ep_routing_change_on_one_workspace(case, rank, num_tokens):
     for _ in range(2):
         graph.replay()
         torch.cuda.synchronize()
-        for output, entries in zip(outputs_b, entries_b):
+        for output, entries in zip(outputs_b, entries_b, strict=True):
             check_b(output, entries)
         check_a(plan.outputs, permuted)
