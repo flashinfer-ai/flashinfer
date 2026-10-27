@@ -67,6 +67,7 @@ def _fake_cudnn(
 # -------------------------------------------------------------- version gate
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -84,6 +85,7 @@ def test_cudnn_frontend_version_parsing(clean_env, raw, expected):
     assert cudnn_utils.cudnn_frontend_version() == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,expected",
     [
@@ -103,11 +105,13 @@ def test_cudnn_frontend_leads_short_caches(clean_env, version, expected):
     assert cudnn_utils.cudnn_frontend_leads_short_caches() is expected
 
 
+@pytest.mark.cpu_only
 def test_cudnn_frontend_version_without_package(clean_env):
     clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
     assert cudnn_utils.cudnn_frontend_version() is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,cc,expected",
     [
@@ -133,6 +137,7 @@ def test_cudnn_frontend_serves_frost_decode(clean_env, version, cc, expected):
 # -------------------------------------------------------------- FROST runtime
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "installed,dsl,expected",
     [
@@ -161,6 +166,7 @@ def test_cudnn_frontend_frost_runtime_available(clean_env, installed, dsl, expec
     assert cudnn_utils.cudnn_frontend_frost_runtime_available() is expected
 
 
+@pytest.mark.cpu_only
 def test_cudnn_frontend_frost_runtime_needs_the_helpers(clean_env):
     # 1.29 and older have no cudnn.frost.buffers (and no FROST decode rows).
     _fake_cudnn(clean_env, "1.29.1", frost_helpers=False)
@@ -198,6 +204,7 @@ def _base():
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "changes",
     [
@@ -290,6 +297,7 @@ def test_auto_prefers_cudnn_inside_the_envelope(changes):
     assert _auto_decode_prefers_cudnn(**{**_base(), **changes}) is True
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "changes",
     [
@@ -481,6 +489,7 @@ def test_auto_keeps_fa2_outside_the_envelope(changes):
     assert _auto_decode_prefers_cudnn(**{**_base(), **changes}) is False
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "changes",
     [
@@ -507,6 +516,7 @@ def test_auto_takes_cudnn_when_fa2_cannot_serve_the_rows(changes):
     assert _auto_decode_prefers_cudnn(**kwargs) is True
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "changes",
     [
@@ -525,6 +535,7 @@ def test_auto_still_declines_what_cudnn_cannot_run_without_fa2(changes):
     assert _auto_decode_prefers_cudnn(**kwargs) is False
 
 
+@pytest.mark.cpu_only
 def test_auto_reads_the_override_from_the_environment(clean_env):
     kwargs = {**_base(), "override": None}
     assert _auto_decode_prefers_cudnn(**kwargs) is True
@@ -560,6 +571,7 @@ def _graph_fixed(handle, name="g"):
     pass
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "pygraph,graph,expected",
     [
@@ -585,6 +597,7 @@ def test_cudnn_frontend_accepts_cuda_graph_replay_hint(
         cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_cudnn_frontend_accepts_cuda_graph_replay_hint_without_package(clean_env):
     clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
     cudnn_utils.cudnn_frontend_accepts_cuda_graph_replay_hint.cache_clear()

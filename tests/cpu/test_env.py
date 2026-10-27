@@ -4,15 +4,17 @@ handling of a mismatched flashinfer-cubin package — issue #5886.
 env.py imports CompilationContext (CUDA deps), so we load it in isolation
 with lightweight stubs to keep tests runnable without a GPU.
 
-    python -m pytest tests/test_env.py -v --noconftest
+    python -m pytest tests/cpu/test_env.py -v --noconftest
 """
+
+import pytest
 
 import importlib.util
 import pathlib
 import sys
 import types
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _load_env_module():
@@ -76,6 +78,7 @@ def _create_aot_module(root, module_name):
 # -- priority tests (regression for #2976) ----------------------------------
 
 
+@pytest.mark.cpu_only
 def test_env_var_overrides_package(monkeypatch, tmp_path):
     """FLASHINFER_CUBIN_DIR must take priority over the installed package."""
     env_dir = str(tmp_path / "env_cubins")
@@ -87,6 +90,7 @@ def test_env_var_overrides_package(monkeypatch, tmp_path):
     assert _env._get_cubin_dir() == pathlib.Path(env_dir)
 
 
+@pytest.mark.cpu_only
 def test_package_used_when_no_env_var(monkeypatch, tmp_path):
     """Without the env var, the package path should be returned."""
     pkg_dir = str(tmp_path / "pkg_cubins")
@@ -97,6 +101,7 @@ def test_package_used_when_no_env_var(monkeypatch, tmp_path):
     assert _env._get_cubin_dir() == pathlib.Path(pkg_dir)
 
 
+@pytest.mark.cpu_only
 def test_env_var_used_when_no_package(monkeypatch, tmp_path):
     """Env var should work even when the package is not installed."""
     env_dir = str(tmp_path / "env_cubins")
@@ -105,6 +110,7 @@ def test_env_var_used_when_no_package(monkeypatch, tmp_path):
     assert _env._get_cubin_dir() == pathlib.Path(env_dir)
 
 
+@pytest.mark.cpu_only
 def test_default_when_nothing_set(monkeypatch):
     """Fall back to the default cache directory."""
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
@@ -124,6 +130,7 @@ def _install_cubin_pkg(monkeypatch, path, version):
     monkeypatch.setitem(sys.modules, "flashinfer_cubin", pkg)
 
 
+@pytest.mark.cpu_only
 def test_matching_package_used(monkeypatch, caplog, tmp_path):
     pkg_dir = str(tmp_path / "pkg_cubins")
     monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
@@ -132,6 +139,7 @@ def test_matching_package_used(monkeypatch, caplog, tmp_path):
     assert not caplog.records
 
 
+@pytest.mark.cpu_only
 def test_mismatched_package_ignored(monkeypatch, caplog, tmp_path):
     """A stale package must not break the import that replaces it."""
     monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
@@ -141,6 +149,7 @@ def test_mismatched_package_ignored(monkeypatch, caplog, tmp_path):
     assert "flashinfer download-kernels" in caplog.text
 
 
+@pytest.mark.cpu_only
 def test_mismatched_package_used_when_check_disabled(monkeypatch, tmp_path):
     pkg_dir = str(tmp_path / "pkg_cubins")
     monkeypatch.setenv("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -148,6 +157,7 @@ def test_mismatched_package_used_when_check_disabled(monkeypatch, tmp_path):
     assert _env._get_cubin_dir() == pathlib.Path(pkg_dir)
 
 
+@pytest.mark.cpu_only
 def test_aot_artifacts_select_each_heterogeneous_target(monkeypatch, tmp_path):
     fallback_root = tmp_path / "package-aot"
     sm103_root = tmp_path / "sm103a"
@@ -188,6 +198,7 @@ def test_aot_artifacts_select_each_heterogeneous_target(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.cpu_only
 def test_cuda_architectures_for_call_collects_nested_tensor_devices(monkeypatch):
     torch_stub = types.ModuleType("torch")
     torch_stub.cuda = types.SimpleNamespace(current_device=lambda: 0)

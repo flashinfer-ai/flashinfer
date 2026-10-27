@@ -6,6 +6,7 @@ import flashinfer.jit.core as jit_core
 from flashinfer.compilation_context import CompilationContext
 
 
+@pytest.mark.cpu_only
 def test_check_cuda_arch_refreshes_stale_global_context(monkeypatch):
     stale_context = SimpleNamespace(TARGET_CUDA_ARCHS=set())
     fresh_context = SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
@@ -18,6 +19,7 @@ def test_check_cuda_arch_refreshes_stale_global_context(monkeypatch):
     assert {(12, "0f")} == jit_core.current_compilation_context.TARGET_CUDA_ARCHS
 
 
+@pytest.mark.cpu_only
 def test_check_cuda_arch_reuses_populated_context(monkeypatch):
     cached_context = SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
 
@@ -33,6 +35,7 @@ def test_check_cuda_arch_reuses_populated_context(monkeypatch):
     assert {(12, "0f")} == cached_context.TARGET_CUDA_ARCHS
 
 
+@pytest.mark.cpu_only
 def test_check_cuda_arch_error_reports_detected_archs(monkeypatch):
     stale_context = SimpleNamespace(TARGET_CUDA_ARCHS=set())
     empty_context = SimpleNamespace(TARGET_CUDA_ARCHS=set())
@@ -45,6 +48,7 @@ def test_check_cuda_arch_error_reports_detected_archs(monkeypatch):
         jit_core.check_cuda_arch()
 
 
+@pytest.mark.cpu_only
 def test_normalize_sm120_uses_cuda_12_8_compatible_suffix(monkeypatch):
     monkeypatch.setattr(
         "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
@@ -54,6 +58,7 @@ def test_normalize_sm120_uses_cuda_12_8_compatible_suffix(monkeypatch):
     assert CompilationContext._normalize_cuda_arch(12, 0) == (12, "0a")
 
 
+@pytest.mark.cpu_only
 def test_normalize_sm120_prefers_f_suffix_on_cuda_12_9(monkeypatch):
     monkeypatch.setattr(
         "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda _version: True
@@ -62,6 +67,7 @@ def test_normalize_sm120_prefers_f_suffix_on_cuda_12_9(monkeypatch):
     assert CompilationContext._normalize_cuda_arch(12, 0) == (12, "0f")
 
 
+@pytest.mark.cpu_only
 def test_normalize_sm121_requires_cuda_12_9(monkeypatch):
     monkeypatch.setattr(
         "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
