@@ -584,6 +584,7 @@ CHAIN_EP_STAGES = 4
 CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
     "sm_100a": {
         "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
         "m64_bF_l2256b_ro": (128, 128),
         "n16_sk3_l2256b": (17, 32),
         "n32_aF_l2256b": (17, 32),
@@ -599,6 +600,7 @@ CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
     },
     "sm_103a": {
         "m128_bF": (128, 128),
+        "m128_bF_fold": (129, 136),
         "m64_bF_l2256b_ro": (128, 128),
         "n16_sk3_l2256b": (17, 32),
         "n32_aF_l2256b": (17, 32),
@@ -973,6 +975,10 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("ro")
     if int(tactic.get("ep_stages", 0)):
         parts.append(f"ep{int(tactic['ep_stages'])}")
+    if tactic.get("fold"):
+        parts.append("fold")
+    if tactic.get("b2"):
+        parts.append("b2" + str(tactic["b2"]))
     return "gemm:" + "_".join(parts)
 
 
@@ -1072,10 +1078,12 @@ KNOWN_TACTIC_KEYS = frozenset(
     {
         "a_hint",
         "alpha_n",
+        "b2",
         "b_hint",
         "blocks_per_sm",
         "deep_k",
         "ep_stages",
+        "fold",
         "half_m",
         "l2_promo",
         "num_stages",
@@ -1089,6 +1097,34 @@ KNOWN_TACTIC_KEYS = frozenset(
         "two_cta",
         "w_rows",
     }
+)
+
+
+# The token-remainder fold (``fold`` tactics, ``_fold`` keys): the 1-CTA 128-wide m
+# tile whose remainder token rows (at most 8 past its 128-row tile) ride on its
+# weight-tile stages as a swapped-role 128 x 8 MMA instead of a second token tile.
+# Without an explicit tactic, :func:`gemm_plan` takes it for 128 < M <= 136 on these
+# (arch, K, N) cells at the architecture's :data:`MEASURED_SM_COUNT`.
+FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+FOLD_TACTIC = {
+    "tile_n": 128,
+    "deep_k": False,
+    "alpha_n": False,
+    "a_hint": None,
+    "b_hint": "evict_first",
+    "l2_promo": None,
+    "fold": True,
+}
+
+# The 2-CTA token-remainder fold (``b2="fold"`` tactics, ``_b2fold`` keys): the static
+# 2-CTA pair program with 256-wide weight tiles whose remainder token rows (at most 16
+# past its 256-row pair tile) ride on its weight-tile stages as a swapped-role
+# 256 x 16 pair MMA instead of a second token tile.  Without an explicit tactic,
+# :func:`gemm_plan` takes it for 256 < M <= 272 on these (arch, K, N) cells at the
+# architecture's :data:`MEASURED_SM_COUNT` when the default plan is that program.
+B2_FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+B2_FOLD_BASE_KEYS = frozenset(
+    {"gemm:m256_2cta_bf16_bF_l2256b", "gemm:m256_2cta_f16_bF_l2256b"}
 )
 
 
@@ -1107,8 +1143,29 @@ def gemm_plan(
     Without an explicit ``tactic``, on an SM count other than ``arch``'s
     :data:`MEASURED_SM_COUNT` a default tactic whose kernel ``arch`` does not
     register falls back to the tactic of the measured SM count, planned (grid and
-    stream-K tail) for ``sm_count``."""
+    stream-K tail) for ``sm_count``.  Without an explicit ``tactic``, 128 < M <= 136
+    on a :data:`FOLD_CELLS` cell at ``arch``'s measured SM count takes the
+    token-remainder fold (:data:`FOLD_TACTIC`), and 256 < M <= 272 on a
+    :data:`B2_FOLD_CELLS` cell at that SM count, whose default plan is a
+    :data:`B2_FOLD_BASE_KEYS` program, takes its 2-CTA fold (``b2="fold"``)."""
+    if (
+        tactic is None
+        and 128 < int(m) <= 136
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in FOLD_CELLS
+    ):
+        tactic = dict(FOLD_TACTIC)
     plan = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic)
+    if (
+        tactic is None
+        and 256 < int(m) <= 272
+        and int(sm_count) == MEASURED_SM_COUNT.get(arch)
+        and (arch, int(k), int(n)) in B2_FOLD_CELLS
+        and plan.kernel_key in B2_FOLD_BASE_KEYS
+    ):
+        plan = _gemm_plan(
+            m, n, k, out_f16, arch, sm_count, tactic={**plan.tactic, "b2": "fold"}
+        )
     measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
     if (
         tactic is not None
@@ -1218,6 +1275,46 @@ def _gemm_plan(
     )
     w_tile = w_rows if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
+    if tactic.get("fold"):
+        if (
+            alpha_n
+            or two_cta
+            or split_k > 1
+            or deep_k
+            or tile_n != 128
+            or blocks_per_sm != 1
+            or tactic.get("ring_overlay")
+            or int(tactic.get("ep_stages", 0)) not in (0, CHAIN_EP_STAGES)
+            or not 128 < m <= 136
+        ):
+            raise ValueError(
+                "fold is a knob of the 1-CTA 128-wide m tile for 128 < M <= 136"
+            )
+        # One token tile: its 128 rows and the remainder rows the fold carries.
+        tok_tiles = 1
+    if tactic.get("b2") is not None:
+        if (
+            tactic["b2"] != "fold"
+            or alpha_n
+            or not two_cta
+            or tile_n != 256
+            or deep_k
+            or half_m
+            or stream_k
+            or str(tactic.get("sched", "static")) != "static"
+            or tactic.get("raster_group")
+            or tactic.get("num_stages") is not None
+            or tactic.get("b_hint") != "evict_first"
+            or tactic.get("a_hint")
+            or tactic.get("l2_promo") != "l2_256b"
+            or not 256 < m <= 272
+        ):
+            raise ValueError(
+                'b2="fold" is a knob of the static 2-CTA pair program with 256-wide'
+                " weight tiles (b_hint evict_first, l2_promo l2_256b) for 256 < M <= 272"
+            )
+        # One pair token tile: its 256 rows and the remainder rows the fold carries.
+        tok_tiles = 1
     w_tiles = (n + w_tile - 1) // w_tile
     num_tiles = tok_tiles * w_tiles
     sched = str(tactic.get("sched", "static"))

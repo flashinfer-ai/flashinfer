@@ -260,6 +260,83 @@ def test_m128_ring_overlay_rows():
     assert "ring_overlay" not in t
 
 
+def test_token_remainder_fold_rows():
+    # On a FOLD_CELLS (arch, K, N) cell at the measured SM count, 128 < M <= 136
+    # runs one 128-token tile of the 1-CTA m128 program that carries the remainder
+    # rows (``_fold``), and the chain takes its entry L2 prefetch form
+    # (``_ep4_fold``); on a B2_FOLD_CELLS cell, 256 < M <= 272 runs one pair token
+    # tile of the static 2-CTA pair program that carries the remainder rows
+    # (``_b2fold``).  The token counts next to the ranges, the other SM count of the
+    # architecture and the other shapes keep their plans, and the fold knobs refuse
+    # other programs and token counts.
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, k, n in sorted(cb.FOLD_CELLS):
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for out_f16, out in ((False, "bf16"), (True, "f16")):
+            for m in range(129, 137):
+                plan = _registered(cb.gemm_plan(m, n, k, out_f16, arch, sm_count), arch)
+                assert plan.kernel_key == f"gemm:m128_{out}_bF_fold", (arch, m)
+                assert plan.tok_tiles == 1 and plan.num_tiles == plan.w_tiles
+                assert cb.gemm_alone_tactic(plan) is None
+                tactic = cb.chain_gemm_tactic(plan)
+                assert tactic is not None, (arch, m, out_f16)
+                chain = _registered(
+                    cb.gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic),
+                    arch,
+                )
+                assert chain.kernel_key == f"gemm:m128_{out}_bF_ep4_fold"
+                assert (chain.grid, chain.num_tiles) == (plan.grid, plan.num_tiles)
+            for m in (128, 137):
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                assert "fold" not in plan.kernel_key, (arch, m, plan.kernel_key)
+            for m in (129, 136):
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, other[arch])
+                assert "fold" not in plan.kernel_key, (arch, m, plan.kernel_key)
+    for arch, k, n in sorted(cb.B2_FOLD_CELLS):
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for out_f16, out in ((False, "bf16"), (True, "f16")):
+            for m in range(257, 273):
+                plan = _registered(cb.gemm_plan(m, n, k, out_f16, arch, sm_count), arch)
+                assert plan.kernel_key == f"gemm:m256_2cta_{out}_bF_l2256b_b2fold"
+                assert plan.tok_tiles == 1
+                assert cb.chain_gemm_tactic(plan) is None
+                assert cb.gemm_alone_tactic(plan) is None
+            for m in (256, 273):
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                assert "fold" not in plan.kernel_key, (arch, m, plan.kernel_key)
+            for m in (257, 272):
+                plan = cb.gemm_plan(m, n, k, out_f16, arch, other[arch])
+                assert "fold" not in plan.kernel_key, (arch, m, plan.kernel_key)
+    cells = cb.FOLD_CELLS | cb.B2_FOLD_CELLS
+    for arch, sm_count in cb.MEASURED_SM_COUNT.items():
+        for k, n in (*VALIDATED_GEMM_FAMILIES, VALIDATED_OFF_MATRIX_FAMILY):
+            if (arch, k, n) in cells:
+                continue
+            for m in (129, 130, 136, 257, 264, 272):
+                plan = cb.gemm_plan(m, n, k, False, arch, sm_count)
+                assert "fold" not in plan.kernel_key, (arch, m, n, k, plan.kernel_key)
+    for m in (128, 137):
+        with pytest.raises(ValueError, match="fold"):
+            cb.gemm_plan(
+                m, 18432, 7168, False, "sm_100a", 148, tactic=dict(cb.FOLD_TACTIC)
+            )
+    with pytest.raises(ValueError, match="fold"):
+        cb.gemm_plan(
+            130,
+            18432,
+            7168,
+            False,
+            "sm_100a",
+            148,
+            tactic={**cb.FOLD_TACTIC, "ring_overlay": True},
+        )
+    b2 = cb.gemm_plan(257, 18432, 7168, False, "sm_100a", 148).tactic
+    assert b2["b2"] == "fold"
+    for m in (256, 273):
+        with pytest.raises(ValueError, match="b2"):
+            cb.gemm_plan(m, 18432, 7168, False, "sm_100a", 148, tactic=b2)
+
+
 def test_chain_entry_prefetch_rows():
     # The quantize + GEMM chain runs the entry L2 prefetch program (``_ep4``) of the GEMM
     # plan exactly on the cells of CHAIN_EP_RULES (program family and token count per
@@ -305,7 +382,7 @@ def test_chain_entry_prefetch_rows():
                         cb.gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic),
                         arch,
                     )
-                    assert chain.kernel_key == plan.kernel_key + "_ep4"
+                    assert chain.kernel_key == _ep4_key(plan.kernel_key)
                     assert (chain.grid, chain.num_tiles) == (plan.grid, plan.num_tiles)
                     (served if inside else measured_served).add(family)
         assert served == set(cells), (arch, sorted(set(cells) - served))
@@ -434,6 +511,14 @@ def _registered(plan, arch):
     """The plan's kernel resolves to a generated program of ``arch``."""
     assert plan.kernel_key in KERNELS[arch], plan.kernel_key
     return plan
+
+
+def _ep4_key(key):
+    """The entry L2 prefetch key of the program ``key``: ``_ep4`` goes before a trailing
+    token-remainder ``_fold``."""
+    if key.endswith("_fold"):
+        return key.removesuffix("_fold") + "_ep4_fold"
+    return key + "_ep4"
 
 
 def test_gemm_plan_geometry():
@@ -900,6 +985,8 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         (17, 7168, 16384, torch.bfloat16),  # 32-token tile, split-K 2
         (32, 8192, 8192, torch.bfloat16),  # 32-token tile
         (128, 18432, 7168, torch.float16),  # one 128-token tile, 128-wide weight tiles
+        (130, 18432, 7168, torch.bfloat16),  # one 128-token tile + the remainder fold
+        (136, 18432, 7168, torch.float16),  # one 128-token tile + the remainder fold
     ],
 )
 def test_chain_entry_prefetch_matches_gemm_alone(m, n, k, out_dtype):
@@ -924,7 +1011,7 @@ def test_chain_entry_prefetch_matches_gemm_alone(m, n, k, out_dtype):
     )
     if cb.chain_gemm_tactic(plan) is None:
         pytest.skip(f"{plan.kernel_key} has no chain cell on this part")
-    assert runner.kernels[1] == plan.kernel_key + "_ep4"
+    assert runner.kernels[1] == _ep4_key(plan.kernel_key)
     runner()
     torch.cuda.synchronize()
     alone = torch.full_like(out, float("nan"))
@@ -965,6 +1052,52 @@ def test_gemm_alone_entry_prefetch_matches_plain_program(n, k, out_dtype):
     plain = torch.full_like(out, float("nan"))
     cb.prepare_mm_fp4_per_token(
         a_u8, a_sf, w_u8, w_sf, alpha, plain, tactic=plan.tactic
+    )()
+    public = mm_fp4(
+        a_fp4,
+        w_fp4.T,
+        a_sf,
+        w_sf.T,
+        alpha,
+        out_dtype,
+        None,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="cake",
+        use_nvfp4=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain) and torch.equal(public, plain)
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [129, 130, 136, 257, 264, 272])
+def test_token_remainder_fold_matches_route(m, out_dtype):
+    # On a token-remainder fold cell (K 7168, N 18432 at the measured SM count)
+    # mm_fp4 and the prepared GEMM run the fold program, bitwise equal to the program
+    # of the plan without the fold (the 2-CTA pair program over the plain token tiles).
+    device = _require_program()
+    n, k = 18432, 7168
+    out_f16 = out_dtype == torch.float16
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=500 + m
+    )
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+    if not plan.kernel_key.endswith("fold"):
+        pytest.skip(f"{plan.kernel_key}: no token-remainder fold cell on this part")
+    route = cb._gemm_plan(m, n, k, out_f16, arch, sm_count)
+    assert "fold" not in route.kernel_key and route.kernel_key in KERNELS[arch]
+    a_u8, w_u8 = a_fp4.view(torch.uint8), w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+    assert runner.plan.kernel_key == plan.kernel_key
+    runner()
+    plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(
+        a_u8, a_sf, w_u8, w_sf, alpha, plain, tactic=route.tactic
     )()
     public = mm_fp4(
         a_fp4,
