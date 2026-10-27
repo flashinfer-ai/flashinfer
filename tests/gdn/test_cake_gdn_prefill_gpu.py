@@ -1962,6 +1962,7 @@ def test_public_cake_gdn_prefill_repeated_calls_allocate_no_device_memory(
     # GC pass there frees unrelated device blocks (84 frees with 0 allocations in one nightly shard).  Collect
     # it first, and keep the automatic collector off while the call runs.
     gc.collect()
+    gc_was_enabled = gc.isenabled()
     gc.disable()
     try:
         before = torch.cuda.memory_stats()
@@ -1969,7 +1970,8 @@ def test_public_cake_gdn_prefill_repeated_calls_allocate_no_device_memory(
         torch.cuda.synchronize()
         after = torch.cuda.memory_stats()
     finally:
-        gc.enable()
+        if gc_was_enabled:
+            gc.enable()
     allocated = after["allocation.all.allocated"] - before["allocation.all.allocated"]
     freed = after["allocation.all.freed"] - before["allocation.all.freed"]
     assert (allocated, freed) == (0, 0)
