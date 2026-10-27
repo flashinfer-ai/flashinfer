@@ -389,6 +389,7 @@ kernel_cake_gdn_train_6e7a1ca02911aa5f1313(const __grid_constant__ CUtensorMap k
             unsigned int _phase_h_ready_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
+                if (nc > c + 1) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(u + ((rs_next + (long long)num_heads * 64) * 128 + (long long)(vbase + lane_half * 32))))); }
                 mbarrier_wait(hs_free_addr, _phase_hs_free_0);
                 _phase_hs_free_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
