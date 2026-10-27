@@ -365,6 +365,18 @@ def test_selection_and_grids() -> None:
     assert cake_jit.launch_grid(
         "bwd_prep", num_chunks=2, num_heads=48, sm_count=148
     ) == (96, 1, 1)
+    # #6's record carries a per-architecture CTA factor: two persistent CTAs per SM on
+    # sm_100a, sm_103a and sm_107a, one when the launch names no architecture.
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        assert cake_jit.launch_grid(
+            "bwd_prep", num_chunks=7, num_heads=48, sm_count=148, arch=arch
+        ) == (296, 1, 1)
+    assert cake_jit.launch_grid(
+        "bwd_prep", num_chunks=7, num_heads=48, sm_count=148, arch=None
+    ) == (148, 1, 1)
+    assert cake_jit.launch_grid(
+        "bwd_prep", num_chunks=2, num_heads=48, sm_count=148, arch="sm_103a"
+    ) == (96, 1, 1)
     assert cake_jit.launch_grid("bwd_dqkg", num_chunks=7, num_qk_heads=16) == (
         112,
         1,

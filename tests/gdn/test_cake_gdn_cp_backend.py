@@ -26,6 +26,7 @@ import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 from .reference_delta_rule import blockwise_delta_rule, delta_rule
 
@@ -2201,14 +2202,6 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
     assert (prepared.cu_seqlens is cu_seqlens) == (cu_dtype == torch.int64)
 
 
-def _cuda_kernel_names(profile: torch.profiler.profile) -> list[str]:
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -2248,12 +2241,13 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
             _capture_graph=False,
         )
         torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as profile:
-            output, final_state = prepared.replay()
-            torch.cuda.synchronize()
-        kernels = _cuda_kernel_names(profile)
+        replays = []
+        # every CUDA record of one replay (copies included: the assertion below wants none); the helper retries a
+        # profiler session that lost its device records, so the outputs are the last replay's
+        kernels = cuda_kernel_names(
+            lambda: replays.append(prepared.replay()), exclude=()
+        )
+        output, final_state = replays[-1]
         assert len(kernels) == 4, kernels
         assert not any("copy" in name.lower() for name in kernels), kernels
         expected_t = f"t_precompute{'_bf16' if dtype == torch.bfloat16 else ''}"
@@ -2314,12 +2308,7 @@ def test_checkpoint_row_launches_no_extra_cast_kernel_for_int32_prefix() -> None
             _capture_graph=False,
         )
         torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as profile:
-            prepared.replay()
-            torch.cuda.synchronize()
-        kernels = _cuda_kernel_names(profile)
+        kernels = cuda_kernel_names(prepared.replay, exclude=())
         assert not any("copy" in name.lower() for name in kernels), kernels
         counts[cu_dtype] = len(kernels)
         assert prepared.plan.checkpoint_count == 3

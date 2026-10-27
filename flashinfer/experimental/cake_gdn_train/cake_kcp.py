@@ -1101,14 +1101,22 @@ class KernelBackend(Backend):
 
     def run(self, name: str, args: dict[str, Any]) -> None:
         call: KcpCall = args["_call"]
-        record, values, grid, is_test = resolve_launch(
-            name, args, cols_per_cta=self.cols_per_cta
-        )
         be = self.launcher()
         device_index = (
             call.device.index
             if call.device.index is not None
             else torch.cuda.current_device()
+        )
+        grid_args = args.get("_grid_args")
+        if grid_args and "sm_count" in grid_args:
+            # Persistent grids (#5 / #6 / #8): the record's per-architecture CTA factor
+            # reads the architecture this launch loads the library for.
+            args = {
+                **args,
+                "_grid_args": {**grid_args, "arch": be.device_arch(device_index)},
+            }
+        record, values, grid, is_test = resolve_launch(
+            name, args, cols_per_cta=self.cols_per_cta
         )
         module = None
         if is_test:  # a build.test.json record: loaded through load_test, never selected by default
