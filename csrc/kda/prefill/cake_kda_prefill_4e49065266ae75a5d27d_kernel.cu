@@ -674,10 +674,6 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
             unsigned int compute_stage = 0;
             unsigned int _phase_qk_full = 0;
             unsigned int _phase_v_full_0 = 0;
-            unsigned int _phase_old_out_ready = 0;
-            unsigned int _phase_u2_acc_ready = 0;
-            unsigned int _phase_final_ready = 0;
-            unsigned int _phase_ckpt_read_done = 0;
             #pragma unroll 1
             for (int chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
                 float _tmem_load_0[32];
@@ -743,7 +739,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 mbarrier_arrive(state_diag_ready_addr + (compute_stage) * 8);
                 mbarrier_wait(v_full_addr, _phase_v_full_0);
                 _phase_v_full_0 ^= 1;
-                mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
+                mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_qk_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_2[16];
                 asm volatile(
@@ -796,7 +792,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 if (elect_sync()) {
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
-                mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
+                mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_qk_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float _tmem_load_3[16];
                 asm volatile(
@@ -819,17 +815,17 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
-                mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
+                mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_qk_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
                 int checkpoint_token = (chunk_idx + 1) * 32;
                 if (checkpoint_every_n_tokens != 0) {
-                    mbarrier_wait(ckpt_read_done_addr + (compute_stage) * 8, _phase_ckpt_read_done);
+                    mbarrier_wait(ckpt_read_done_addr + (compute_stage) * 8, _phase_qk_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                 }
                 compute_stage += 1;
-                if (compute_stage == 5) { compute_stage = 0; _phase_qk_full ^= 1; _phase_old_out_ready ^= 1; _phase_u2_acc_ready ^= 1; _phase_final_ready ^= 1; _phase_ckpt_read_done ^= 1; }
+                if (compute_stage == 5) { compute_stage = 0; _phase_qk_full ^= 1; }
             }
             if (store_final_state != 0) {
                 #pragma unroll
@@ -898,7 +894,6 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
             int ckpt_wide = (((state_checkpoints_addr & 31) == 0) ? 1 : 0);
             int ckpt_quad_hi = lane_quad_1 >> 1 & 1;
             unsigned int _phase_state_inp_ready = 0;
-            unsigned int _phase_final_ready_1 = 0;
             #pragma unroll 1
             for (int chunk_idx_1 = 0; chunk_idx_1 < num_chunks_1; chunk_idx_1++) {
                 if (checkpoint_every_n_tokens != 0) {
@@ -1230,7 +1225,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                         }
                     }
                 }
-                mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_final_ready_1);
+                mbarrier_wait(final_ready_addr + (epilogue_stage) * 8, _phase_state_inp_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int chunk_is_full = ((seq_len_1 >= (chunk_idx_1 + 1) * 32) ? 1 : 0);
                 if (chunk_is_full != 0) {
@@ -1319,7 +1314,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                     }
                 }
                 epilogue_stage += 1;
-                if (epilogue_stage == 5) { epilogue_stage = 0; _phase_state_inp_ready ^= 1; _phase_final_ready_1 ^= 1; }
+                if (epilogue_stage == 5) { epilogue_stage = 0; _phase_state_inp_ready ^= 1; }
             }
             if (epilogue_local_warp == 0) {
                 asm volatile("cp.async.bulk.wait_group 0;");
@@ -1347,15 +1342,11 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
             int num_chunks_2 = (seq_len_2 + 32 - 1) / 32;
             unsigned int mma_stage = 0;
             unsigned int _phase_qk_full_1 = 0;
-            unsigned int _phase_state_inp_ready_1 = 0;
             unsigned int _phase_out_empty_0 = 1;
-            unsigned int _phase_state_diag_ready = 0;
-            unsigned int _phase_u_inp_ready = 0;
-            unsigned int _phase_u2_inp_ready = 0;
             #pragma unroll 1
             for (int _chunk_idx = 0; _chunk_idx < num_chunks_2; _chunk_idx++) {
                 mbarrier_wait(qk_full_addr + (mma_stage) * 8, _phase_qk_full_1);
-                mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_state_inp_ready_1);
+                mbarrier_wait(state_inp_ready_addr + (mma_stage) * 8, _phase_qk_full_1);
                 mbarrier_wait(out_empty_addr, _phase_out_empty_0);
                 _phase_out_empty_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1452,7 +1443,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                     "}\n"
                     :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_1), "r"(tmem_tmem_state_inp), "r"(0) : "memory");
                 elect_commit2(old_out_ready_addr + (mma_stage) * 8, raw_inputs_free_addr + (mma_stage) * 8);
-                mbarrier_wait(state_diag_ready_addr + (mma_stage) * 8, _phase_state_diag_ready);
+                mbarrier_wait(state_diag_ready_addr + (mma_stage) * 8, _phase_qk_full_1);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_2 = make_warp_uniform(((((smem_state_diag0_addr) >> 4) & 0x3FFF) | 0x200000) + (0) * 32);
                 mma_ts_step(tmem_tmem_state, tmem_tmem_state_inp, _mma_b_lo_2, 0xC0004010, 67437712, 1);
@@ -1470,7 +1461,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 mma_ts_step((tmem_tmem_state + (96)), tmem_tmem_state_inp + 48, _mma_b_lo_8, 0xC0004010, 67437712, 1);
                 int _mma_b_lo_9 = make_warp_uniform(((((smem_state_diag7_addr) >> 4) & 0x3FFF) | 0x200000) + (0) * 32);
                 mma_ts_step((tmem_tmem_state + (112)), tmem_tmem_state_inp + 56, _mma_b_lo_9, 0xC0004010, 67437712, 1);
-                mbarrier_wait(u_inp_ready_addr + (mma_stage) * 8, _phase_u_inp_ready);
+                mbarrier_wait(u_inp_ready_addr + (mma_stage) * 8, _phase_qk_full_1);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_10 = make_warp_uniform((((smem_inv_addr) >> 4) & 0x3FFF) + (mma_stage) * 2624);
                 asm volatile(
@@ -1495,7 +1486,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                     "}\n"
                     :: "r"(tmem_tmem_u2_acc), "r"(_mma_b_lo_10), "r"(tmem_tmem_u2_inp), "r"(0) : "memory");
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
-                mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
+                mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_qk_full_1);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_11 = make_warp_uniform(((((smem_final_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2624);
                 asm volatile(
@@ -1521,7 +1512,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                     :: "r"(tmem_tmem_state_out), "r"(_mma_b_lo_11), "r"(tmem_tmem_u2_inp), "r"(1) : "memory");
                 elect_commit(final_ready_addr + (mma_stage) * 8);
                 mma_stage += 1;
-                if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_ready_1 ^= 1; _phase_state_diag_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; }
+                if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; }
             }
             unsigned int _phase_tmem_dealloc_ready_0 = 0;
             mbarrier_wait(tmem_dealloc_ready_addr, _phase_tmem_dealloc_ready_0);
@@ -1600,6 +1591,12 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
             int prep_tid = prep_local_warp * 32 + lane;
             int num_prep_iters = (num_chunks_4 + 4 - prep_instance) / 5;
             unsigned int prep_stage = (unsigned int)prep_instance;
+            unsigned int raw_inputs_free_at = (unsigned int)prep_instance;
+            unsigned int smem_free_at = (unsigned int)prep_instance;
+            unsigned int gate_raw_full_at = (unsigned int)prep_instance;
+            unsigned int qk_raw_full_at = (unsigned int)prep_instance;
+            unsigned int prep_diag_ready_at = (unsigned int)prep_instance;
+            unsigned int prep_inv16_ready_at = (unsigned int)prep_instance;
             int gate_rate_stage_f32 = prep_instance * 10496;
             float gate_bias_cached = 0.0f;
             if (prep_tid == 0) {
@@ -1625,7 +1622,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 float early_beta_value = 0.0f;
                 float early_gate0 = 0.0f;
                 float gate_half_log2 = specialized_lower_bound * 1.442695f * 0.5f;
-                mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
+                mbarrier_wait(raw_inputs_free_addr + (raw_inputs_free_at) * 8, _phase_raw_inputs_free);
                 if (chunk_is_full_2 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
@@ -1637,14 +1634,14 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                         }
                     }
                 }
-                mbarrier_wait(smem_free_addr + (prep_stage) * 8, _phase_smem_free);
+                mbarrier_wait(smem_free_addr + (smem_free_at) * 8, _phase_smem_free);
                 if (chunk_is_full_2 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
                             tma_4d_gmem2smem(smem_q_raw_prefetch_addr + prep_stage * 41984, (&q_tma), 0, (int)(bos_4 + (long long)(chunk_idx_3 * 32)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                         }
                     }
-                    mbarrier_wait(gate_raw_full_addr + (prep_stage) * 8, _phase_gate_raw_full);
+                    mbarrier_wait(gate_raw_full_addr + (gate_raw_full_at) * 8, _phase_gate_raw_full);
                     if (prep_local_warp == 2 && lane < 32) {
                         unsigned int beta_raw_pair[1];
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&beta_raw_pair[0])) : "r"(smem_beta_raw_addr + prep_stage * 41984 + (unsigned int)(lane * 16) + (unsigned int)(head_idx_3 % 8 / 2 * 4)));
@@ -1773,7 +1770,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 }
                 asm volatile("barrier.sync %0, 128;" :: "r"(11 + prep_instance) : "memory");
                 if (chunk_is_full_2 != 0) {
-                    mbarrier_wait(qk_raw_full_addr + (prep_stage) * 8, _phase_qk_raw_full);
+                    mbarrier_wait(qk_raw_full_addr + (qk_raw_full_at) * 8, _phase_qk_raw_full);
                 }
                 #pragma unroll 1
                 for (int work_pass = 0; work_pass < 4; work_pass++) {
@@ -2596,7 +2593,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                 }
                 if (prep_local_warp < 2) {
                     mbarrier_arrive(prep_diag_ready_addr + (prep_stage) * 8);
-                    mbarrier_wait(prep_diag_ready_addr + (prep_stage) * 8, _phase_prep_diag_ready);
+                    mbarrier_wait(prep_diag_ready_addr + (prep_diag_ready_at) * 8, _phase_prep_diag_ready);
                 }
                 if (prep_local_warp < 2) {
                     int lane_row = lane & 7;
@@ -2660,7 +2657,7 @@ kernel_cake_kda_prefill_4e49065266ae75a5d27d(__nv_bfloat16* __restrict__ q, cons
                         :: "r"(_stmatrix_addr_28), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))
                         : "memory");
                     mbarrier_arrive(prep_inv16_ready_addr + (prep_stage) * 8);
-                    mbarrier_wait(prep_inv16_ready_addr + (prep_stage) * 8, _phase_prep_inv16_ready);
+                    mbarrier_wait(prep_inv16_ready_addr + (prep_inv16_ready_at) * 8, _phase_prep_inv16_ready);
                 }
                 if (prep_local_warp == 0) {
                     int lane_row_1 = lane % 16;

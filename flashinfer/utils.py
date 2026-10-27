@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import os
 import logging
 import functools
 import math
+from ctypes import byref
 from enum import Enum
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -661,41 +663,49 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+@functools.cache
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
+@functools.cache
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+@functools.cache
 def is_sm120a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm120f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm12x_supported(device: torch.device) -> bool:
     """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
 
@@ -1661,19 +1671,44 @@ def is_confidential_compute() -> bool:
         return forced == "1"
     if not torch.cuda.is_available():
         return False
+
     try:
         import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            state = pynvml.nvmlSystemGetConfComputeState()
-            # ccFeature != 0 means CC is enabled (ON or devtools).
-            return int(getattr(state, "ccFeature", 0)) != 0
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+    except ImportError:
+        logger.warning(
+            "[Flashinfer]: pynvml not available; assuming Confidential Computing is off"
+        )
         return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        with contextlib.suppress(pynvml.NVMLError):
+            pynvml.nvmlShutdown()
+
+    return cc_enabled
 
 
 @lru_cache(maxsize=1)

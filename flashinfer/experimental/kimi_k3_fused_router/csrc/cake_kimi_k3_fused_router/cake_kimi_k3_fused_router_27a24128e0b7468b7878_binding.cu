@@ -101,8 +101,15 @@ void Run(TensorView a_logits, TensorView a_bias, TensorView a_topk_weights, Tens
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(224, 1, 1);
-  config.dynamicSmemBytes = 19840;
+  config.dynamicSmemBytes = 4352;
   config.stream = stream;
+  cudaLaunchAttribute attrs[1] = {};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 1;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878), kernel_args),
             "cudaLaunchKernelExC");
 }
