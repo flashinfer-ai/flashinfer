@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
@@ -11,6 +13,11 @@ def _data_dtype(kind: str) -> torch.dtype:
     if kind == "mxfp8_e5m2":
         return torch.float8_e5m2
     raise ValueError(f"unsupported MXFP8 activation kind {kind!r}")
+
+
+def _fused_quant_type(kind: str) -> str:
+    # MXFP4-weight kinds still take MXFP8 E4M3 activations.
+    return "mxfp8_e5m2" if kind == "mxfp8_e5m2" else "mxfp8_e4m3"
 
 
 def stage_mega_moe_inputs(
@@ -26,8 +33,11 @@ def stage_mega_moe_inputs(
 ) -> int:
     """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
 
-    Torch-composed staging (the ``next/`` drop has no fused staging kernel
-    yet). Returns the staged token count.
+    Uses the fused SM100 CuTe-DSL stager (one launch: quantize + routing
+    repack) when the layout allows, else the torch-composed path. Both round
+    the E8M0 scale up from ``amax / fp8_max`` and the data to nearest even, so
+    they stage identical data; only an all-zero block's (unused) scale byte
+    may differ. Returns the staged token count.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
@@ -43,6 +53,40 @@ def stage_mega_moe_inputs(
         return 0
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+
+    if (
+        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and hidden_states.data_ptr() % 16 == 0
+        and hidden % (4 * Mxfp8BlockSize) == 0
+        and x_fp8.dtype == _data_dtype(kind)
+        and x_sf.shape[1] == hidden // Mxfp8BlockSize
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.data_ptr() % 16 == 0
+        and topk_weights.data_ptr() % 16 == 0
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            fused_quant_stage,
+            note_staged_tokens,
+        )
+
+        # Other layers can stage prequantized inputs into this pooled workspace.
+        # Their live counts do not update the shared stager's tail memo.
+        note_staged_tokens(topk_idx_out, capacity)
+        fused_quant_stage(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_fp8,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            quant_type=_fused_quant_type(kind),
+        )
+        return num_tokens
 
     q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
 
