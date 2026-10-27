@@ -2010,7 +2010,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
             for (int scrub_i = 0; scrub_i < 128; scrub_i++) {
                 scrub_zero[scrub_i] = 0.0f;
             }
-            const int scrub_row = o_tmem_row_base_1 + lane;
+            const int scrub_row = o_tmem_row_base_1;
             #pragma unroll
             for (int scrub_col = 0; scrub_col < 512; scrub_col += 128) {
                 asm volatile(

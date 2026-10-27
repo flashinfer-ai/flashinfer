@@ -203,6 +203,7 @@ def _run(q, cache, selection, gate, out=None):
         output_gate=gate,
         k_sf=sf[0],
         v_sf=sf[1],
+        backend="default",
     )
 
 
@@ -298,4 +299,4 @@ def test_rejects_invalid_inputs():
         {"output_gate": gate.half()},
     ):
         with pytest.raises(ValueError):
-            qsa_sparse_paged_attention(**{**args, **change})
+            qsa_sparse_paged_attention(**{**args, **change}, backend="default")

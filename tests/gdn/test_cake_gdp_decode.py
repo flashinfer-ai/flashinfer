@@ -779,7 +779,8 @@ def _program_cases() -> list:
             and loader.max_num_tokens(arch, n, use_qk_l2norm) > T
         ):
             T = loader.max_num_tokens(arch, n, use_qk_l2norm)
-        # 27 x 24 = 648 lies in the one-wave-of-5 T = 1 band of SM100 / SM103 on 132-160 SMs.
+        # 27 x 24 = 648 lies in the T = 1 tail-wave rows (4 x sm, 5 x sm] of SM100 / SM103 on
+        # 132-160 SMs (l8r4 since the band rule change); 257 x 80 covers the many-wave rows.
         for B, H in itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80)):
             if build["t_steps"] is None:
                 # The runtime program is the fallback: a T no static program owns selects it.
@@ -976,6 +977,32 @@ _STATE_HEAD_PROBES = (
     760,
     761,
     4096,
+    # the two-head edge 32 x sm and the many-wave edge 64 x sm, -1 / 0 / +1, for
+    # 132 / 148 / 152 / 160 SMs (every probe is tried on every SM count)
+    4223,
+    4224,
+    4225,
+    4735,
+    4736,
+    4737,
+    4863,
+    4864,
+    4865,
+    5119,
+    5120,
+    5121,
+    8447,
+    8448,
+    8449,
+    9471,
+    9472,
+    9473,
+    9727,
+    9728,
+    9729,
+    10239,
+    10240,
+    10241,
     20480,
 )
 
@@ -1070,10 +1097,18 @@ def test_misaligned_bf16_output_is_copied_back() -> None:
 def test_alignment_constants_match_the_kernel_sources() -> None:
     """The host checks' alignment constants are the widest vector accesses the shipped
     kernel sources make on q, k and the output (``reinterpret_cast`` on those pointers);
-    v, a and b are read element by element."""
+    v, a and b are read element by element (at most one 2-byte element per access)."""
     import flashinfer.cake_gdp_backend as backend
 
-    widths = {"__nv_bfloat162": 4, "uint2": 8, "uint4": 16, "float4": 16}
+    widths = {
+        "uint16_t": 2,
+        "unsigned": 4,
+        "__nv_bfloat162": 4,
+        "int2": 8,
+        "uint2": 8,
+        "uint4": 16,
+        "float4": 16,
+    }
     access = re.compile(
         r"reinterpret_cast<(?:const )?(\w+)\s*\*>\("
         r"(?:&\(\(\w+\*\)\()?(q|k|v|a|b|out)\b"
@@ -1086,7 +1121,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
             widest[name] = max(widest.get(name, 0), widths[cast])
     assert widest["q"] == widest["k"] == backend._QK_ALIGNMENT_BYTES == 8
     assert widest["out"] == backend._OUTPUT_ALIGNMENT_BYTES == 8
-    assert not {"v", "a", "b"} & widest.keys(), widest
+    assert all(widest.get(name, 0) <= 2 for name in ("v", "a", "b")), widest
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
@@ -1145,20 +1180,27 @@ def _static_pick(
 @pytest.mark.parametrize("sm", (148, 152))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads and l8r4 above it; on SM100 / SM103 the one-wave-of-5 program l8r4w5
-    takes (4 x sm, 5 x sm] and l8r4 resumes above it, while SM90 ships no l8r4w5 program
-    and keeps l8r4 there.  The choice depends on (arch, T, B x HV, sm_count) only."""
+    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], l8r4
+    takes (4 x sm, 64 x sm] (the tail-wave rows (4 x sm, 5 x sm] included: the
+    one-wave-of-5 band is off) and l8r4w5 takes every count above 64 x sm, while SM90
+    ships neither of the two and keeps l8r4 above 160.  The choice depends on
+    (arch, T, B x HV, sm_count) only."""
     assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
-        tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
+        one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
+        many_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
         expected = {
             160: ("splitv", "splitv8_tile8"),
-            161: ("lanerow", "l8r4"),
-            4 * sm: ("lanerow", "l8r4"),
-            4 * sm + 1: ("lanerow", tail_wave),
-            5 * sm: ("lanerow", tail_wave),
+            161: ("lanerow", one_wave),
+            4 * sm: ("lanerow", one_wave),
+            4 * sm + 1: ("lanerow", "l8r4"),
+            5 * sm: ("lanerow", "l8r4"),
             5 * sm + 1: ("lanerow", "l8r4"),
-            20480: ("lanerow", "l8r4"),
+            32 * sm - 1: ("lanerow", "l8r4"),
+            32 * sm: ("lanerow", "l8r4"),
+            64 * sm: ("lanerow", "l8r4"),
+            64 * sm + 1: ("lanerow", many_wave),
+            20480: ("lanerow", many_wave),
         }
         for state_heads, want in expected.items():
             assert _static_pick(arch, 3, 1, state_heads, sm) == want, (
@@ -1178,7 +1220,7 @@ def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
 def test_t4_band_follows_the_architecture(sm: int) -> None:
     """T = 4, three Householder steps: SM90 runs the one-CTA-per-SM program l4r2 up to
     `sm` state heads and l8r4 above it; SM100 / SM103 run l8r4 on every state-head count
-    and ship no l4r2 program (and SM90 no l8r4w5 program)."""
+    and ship no l4r2 program (and SM90 no l8r4p / l8r4w5 program)."""
     for arch in loader.ROUTES:
         for state_heads in (1, 24, sm, sm + 1, 4 * sm, 20480):
             one_cta_wave = arch == "sm_90a" and state_heads <= sm
@@ -1197,6 +1239,11 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
         }
         assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
         assert ("l8r4w5" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert ("l8r4p" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert "l8r4x2" not in variants, (
+            arch,
+            sorted(variants),
+        )  # the two-heads-per-CTA program ships nowhere
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

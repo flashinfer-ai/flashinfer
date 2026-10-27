@@ -26,6 +26,7 @@ from .gemm_base import (
     CUDNN_AVAILABLE,
     CudnnCaptureUnsafeError,
     DEFAULT_WORKSPACE_SIZE,
+    _effective_cache_m,
     UIDs,
     _gemm_workspace_at_least,
     _check_cudnn_fp4_availability,
@@ -35,7 +36,7 @@ from .gemm_base import (
     _get_cudnn_workspace_size,
     _cudnn_graph_engine_knob_tactics,
     _finalize_cudnn_graph_for_tactic,
-    _tactic_for_graph_cache,
+    _get_cudnn_override_graph,
     _torch_data_type_to_cudnn_data_type,
     _is_cudnn_override_shape_available,
     _check_cudnn_override_shape_availability,
@@ -375,15 +376,17 @@ _BF16_FP4_TUNING_CONFIG = TuningConfig(
 
 
 def _cudnn_bf16_fp4_runner(tuning_config):
-    """Build a ``CudnnBf16Fp4Runner`` bound to the active tuning config."""
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        tuning_config, spec_idx=0
-    )
+    """Build a ``CudnnBf16Fp4Runner`` for ``tuning_config``.
+
+    The M-bucket mapper is resolved per call (see :func:`_effective_cache_m`),
+    not captured here, so an active ``autotune(tuning_buckets=...)`` override is
+    always the one that shapes the cuDNN graph.
+    """
 
     class CudnnBf16Fp4Runner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = tuning_config
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -395,8 +398,10 @@ def _cudnn_bf16_fp4_runner(tuning_config):
         ):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
-            cache_m = self._m_bucket_mapper(actual_m)
-            return build_cudnn_bf16_fp4_graph_override_shape(
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
+            return _get_cudnn_override_graph(
+                build_cudnn_bf16_fp4_graph_override_shape,
+                tactic,
                 batch=1,
                 n=n,
                 k=k,
@@ -407,7 +412,6 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                 alpha_is_not_none=alpha is not None,
                 use_nvfp4=use_nvfp4,
                 cache_m=cache_m,
-                tactic=_tactic_for_graph_cache(tactic),
             )
 
         def get_valid_tactics(

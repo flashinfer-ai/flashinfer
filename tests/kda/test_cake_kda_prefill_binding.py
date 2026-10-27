@@ -27,11 +27,14 @@ from flashinfer.jit import env as jit_env
 from flashinfer.jit.cake_kda_prefill_binding import BINDINGS, _DEFAULT_SMEM_LIMIT
 
 PREPARED_EXPORTS = ("run", "run_prepare_tma", "run_prepared")
+# The shipped modules (the hand-owned rows); generated programs ship their own
+# binding and are checked by test_cake_kda_prefill_generated.py.
+SHIPPED = {name: cake_kda_tf32.MODULES[name] for name in cake_kda_tf32._MODULE_ROWS}
 
 
 def test_every_module_has_one_binding_row_and_one_kernel_source():
-    assert sorted(BINDINGS) == sorted(cake_kda_tf32.MODULES)
-    for record in cake_kda_tf32.MODULES.values():
+    assert sorted(BINDINGS) == sorted(SHIPPED)
+    for record in SHIPPED.values():
         # The fold test pins which body a module compiles.
         (source,) = record["sources"]
         assert re.fullmatch(
@@ -43,10 +46,10 @@ def test_bindings_render_to_the_pinned_text():
     # The sidecar pins the sha256 of each rendered binding (keyed by module).
     sidecar = Path(__file__).with_name("cake_kda_prefill_binding_sha256.json")
     pinned = json.loads(sidecar.read_text(encoding="utf-8"))
-    assert sorted(pinned) == sorted(cake_kda_tf32.MODULES)
+    assert sorted(pinned) == sorted(SHIPPED)
     symbols = set()
     namespaces = set()
-    for name, record in cake_kda_tf32.MODULES.items():
+    for name, record in SHIPPED.items():
         text = cake_kda_tf32.render_binding(name)
         assert hashlib.sha256(text.encode("utf-8")).hexdigest() == pinned[name], name
         symbol = f"kernel_{record['cache_name']}"
@@ -63,15 +66,15 @@ def test_bindings_render_to_the_pinned_text():
         namespaces.add(namespace)
     # Every module keeps its own kernel symbol and host-shim namespace, so all
     # modules can load into one process.
-    assert len(symbols) == len(cake_kda_tf32.MODULES)
-    assert len(namespaces) == len(cake_kda_tf32.MODULES)
+    assert len(symbols) == len(SHIPPED)
+    assert len(namespaces) == len(SHIPPED)
 
 
 def test_prepared_launch_skips_descriptor_encoding():
     # Only the preparing actions encode and upload the TMA descriptors and opt
     # the kernel into its dynamic shared memory; the launch-only action reuses
     # both. Modules without descriptors export run only and keep the opt-in.
-    for name, record in cake_kda_tf32.MODULES.items():
+    for name, record in SHIPPED.items():
         _signature, smem_bytes, _block, _launch, encoders, _strides = BINDINGS[name]
         text = cake_kda_tf32.render_binding(name)
         assert "ScopedCudaDevice" not in text
@@ -99,12 +102,8 @@ def test_spec_lists_the_kernel_body_and_the_rendered_binding(
         jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, f"{minor}a")}
     )
     monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
-    name = next(
-        name
-        for name, record in cake_kda_tf32.MODULES.items()
-        if arch in record["arches"]
-    )
-    record = cake_kda_tf32.MODULES[name]
+    name = next(name for name, record in SHIPPED.items() if arch in record["arches"])
+    record = SHIPPED[name]
     cake_kda_tf32.spec.cache_clear()
     try:
         spec = cake_kda_tf32.spec(name, arch)

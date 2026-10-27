@@ -250,7 +250,7 @@ try:
             tuning_live_tokens=args.live_tokens,
         )
         cfg = dataclasses.replace(
-            backend._genphase_config(fleet), apply_topk_at_fc1=early
+            backend._genphase_config(fleet), apply_routing_weights_before_fc2=early
         )
         report["resolved_schedule_policy"] = cfg.schedule_policy
         report["resolved_tile"] = cfg.resolved_mma_tiler_mnk

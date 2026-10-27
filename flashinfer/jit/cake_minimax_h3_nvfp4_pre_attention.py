@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generated programs of the MiniMax-H3 NVFP4 pre-attention: the RMSNorm + AdaLN + NVFP4
-quantize stage (NORM, sm_100a and sm_103a) and the fused NVFP4 QKV GEMM with the Q/K
-RMSNorm, the RoPE and the destination-major output in its epilogue, one schedule per
-target and one program per output format (FUSED_PACK_K96 / FUSED_E4M3_K96 on sm_103a,
-FUSED_PACK_EPI8 / FUSED_E4M3_EPI8 on sm_100a). The host module
+quantize stage (NORM, sm_100a and sm_103a; NORM_V5, the same stage with the activation
+staged in shared memory, sm_103a) and the fused NVFP4 QKV GEMM with the Q/K RMSNorm, the
+RoPE and the destination-major output in its epilogue, one schedule per target and one
+program per output format (FUSED_PACK_K96 / FUSED_E4M3_K96 on sm_103a, FUSED_PACK_EPI8 /
+FUSED_E4M3_EPI8 on sm_100a). The host module
 ``flashinfer.diffusion_ops.cake_minimax_h3_nvfp4`` computes the grids and launches them.
 
 Generated file: every value below is derived from the exported sources and checked
@@ -28,12 +29,12 @@ from . import cake_program
 from .core import JitSpec
 
 NORM = cake_program.CakeProgram(
-    name="cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f",
+    name="cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
     operator_dir="cake_minimax_h3_nvfp4_pre_attention",
-    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
     sources=(
-        "cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f_kernel.cu",
-        "cake_minimax_h3_nvfp4_pre_attention_44c090bc6141c321687f_binding.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -53,6 +54,10 @@ NORM = cake_program.CakeProgram(
         "write_debug",
         "eps",
         "M",
+        "out_sf",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
         "grid_x",
         "grid_y",
         "grid_z",
@@ -67,10 +72,62 @@ NORM = cake_program.CakeProgram(
         "activation_q",
         "activation_sf",
         "debug_adaln_bf16",
+        "out_sf",
     ),
     block=(128, 1, 1),
     cluster=(1, 1, 1),
     dynamic_smem_bytes=128,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+NORM_V5 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "write_debug",
+        "eps",
+        "M",
+        "out_sf",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "out_sf",
+    ),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=21632,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -326,6 +383,7 @@ FUSED_E4M3_EPI8 = cake_program.CakeProgram(
 
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     NORM,
+    NORM_V5,
     FUSED_PACK_K96,
     FUSED_PACK_EPI8,
     FUSED_E4M3_K96,
@@ -340,6 +398,7 @@ def aot_specs(target: str) -> tuple[JitSpec, ...]:
 
 __all__ = [
     "NORM",
+    "NORM_V5",
     "FUSED_PACK_K96",
     "FUSED_PACK_EPI8",
     "FUSED_E4M3_K96",

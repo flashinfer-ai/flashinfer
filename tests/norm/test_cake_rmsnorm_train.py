@@ -385,9 +385,9 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 def test_backward_programs_switch_on_row_count(hidden: int) -> None:
-    """Exactly one backward program runs per call, every exported backward program
-    runs for some row count, and forward + backward match the FP64 reference on
-    both sides of each switch point."""
+    """Exactly one pair -- a main program and its dw reduce program -- runs per
+    call, every exported backward program runs for some row count, and forward
+    + backward match the FP64 reference on both sides of each switch point."""
 
     _skip_unless_hidden(hidden)
     arch = loader.arch_for_capability(_capability())
@@ -395,8 +395,10 @@ def test_backward_programs_switch_on_row_count(hidden: int) -> None:
     launched = set()
     for rows in _switch_rows(arch, hidden, "bwd", False):
         selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
-        assert len(selected) == 1, f"hidden={hidden} rows={rows}: {selected}"
-        launched.add(selected[0])
+        assert len(selected) == 2, f"hidden={hidden} rows={rows}: {selected}"
+        main, reduce = (loader.MODULES[name] for name in selected)
+        assert main.get("workspace_rule") is not None and reduce["role"] == "bwd_reduce"
+        launched.update(selected)
         _check_case(hidden, rows)
     assert launched == set(names), (
         f"hidden={hidden}: never launched {set(names) - launched}"
@@ -610,8 +612,10 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
             (rows, hidden), float("nan"), dtype=torch.bfloat16, device=_device()
         )
         dw = torch.full((hidden,), float("nan"), dtype=torch.float32, device=_device())
-        # Poison the partial region; the kernels must rewrite every chunk they read.
-        workspace[: 4 * hidden].view(torch.float32).fill_(float("nan"))
+        # Poison the first partial row (after the counters); the kernels must
+        # rewrite every chunk they read.
+        begin = loader.COUNTERS_BYTES
+        workspace[begin : begin + 4 * hidden].view(torch.float32).fill_(float("nan"))
         cake_rmsnorm_train_backward(g, x, w, rstd, workspace=workspace, dx=dx, dw=dw)
         torch.cuda.synchronize()
         results.append((dx.clone(), dw.clone()))
@@ -621,6 +625,91 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
         assert torch.equal(dw, results[0][1])
     assert torch.equal(fresh[1], results[0][1]), "a fresh workspace changed dw"
     assert torch.isfinite(results[0][1]).all()
+
+
+def _taper_rows(record: dict, sms: int, limit: int) -> list[int]:
+    """Row counts of the record's window where its taper cuts another chunk
+    table than the module constants would: the first, a middle and the last
+    within ``limit`` (none for a program at the default taper)."""
+
+    rule = record["grid_rule"]
+    taper = loader.chunk_taper(rule)
+    if taper == (loader.TAIL_DIV, loader.MAX_HALVING):
+        return []
+    select = record["select_rule"]
+    above = 0 if select is None else int(select["above"])
+    at_most = None if select is None else select["at_most"]
+    last = limit if at_most is None else min(limit, int(at_most))
+    slots, rpi = int(rule["ctas_per_sm"]) * sms, int(rule["rows_per_issue"])
+    differing = [
+        rows
+        for rows in range(above + 1, last + 1)
+        if loader.n_chunks(rows, slots, rpi, *taper)
+        != loader.n_chunks(rows, slots, rpi)
+    ]
+    if not differing:
+        return []
+    return sorted({differing[0], differing[len(differing) // 2], differing[-1]})
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("residual", (False, True))
+def test_backward_reuses_a_poisoned_workspace_across_row_counts(
+    hidden: int, residual: bool
+) -> None:
+    """One caller-owned workspace serves every token count of a training step.
+    Its partial rows are poisoned with NaN before each call, so a host that cuts
+    another chunk table than the kernel -- a chunk count the main kernel wrote
+    no partial rows for -- surfaces in ``dw`` instead of hiding behind a fresh
+    zeroed buffer.  The row counts are the route's window edges and, for every
+    program built with a taper of its own, counts where its table differs from
+    the module constants'; they run largest first, then back up from the
+    smallest."""
+
+    _skip_unless_hidden(hidden)
+    if residual and not loader.route_applies(
+        device_capability=_capability(), hidden=hidden, kind="bwd", residual=True
+    ):
+        pytest.skip(f"hidden={hidden} has no exported residual backward route")
+    arch = loader.arch_for_capability(_capability())
+    sms = loader.sm_count(0)
+    limit = 32768
+    rows_set = {
+        rows for rows in _switch_rows(arch, hidden, "bwd", residual) if rows <= limit
+    }
+    for name in loader.route_modules(arch, hidden, "bwd", residual):
+        record = loader.MODULES[name]
+        if record.get("workspace_rule") is not None:
+            rows_set.update(_taper_rows(record, sms, limit))
+    descending = sorted(rows_set, reverse=True)
+    order = descending + descending[-2::-1]
+    eps = EPS[hidden]
+    workspace = cake_rmsnorm_train_backward_workspace(
+        max(rows_set), hidden, _device(), residual=residual
+    )
+    for rows in order:
+        generator = _generator(hidden, rows, 29, residual)
+        x = _rows(rows, hidden, generator=generator)
+        w = _weight(hidden, generator)
+        g = _rows(rows, hidden, generator=generator)
+        if residual:
+            u = _rows(rows, hidden, generator=generator)
+            g_h = _rows(rows, hidden, generator=generator)
+            _y, rstd, normalized = cake_rmsnorm_train_forward(x, w, eps, residual=u)
+        else:
+            g_h = None
+            _y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+            normalized = x
+        workspace[loader.COUNTERS_BYTES :].view(torch.float32).fill_(float("nan"))
+        dx, dw = cake_rmsnorm_train_backward(
+            g, normalized, w, rstd, g_residual=g_h, workspace=workspace
+        )
+        dx_ref, dw_ref = _reference_backward(g, normalized, w, eps, g_h=g_h)
+        label = f"hidden={hidden} rows={rows} residual={residual} (reused workspace)"
+        _assert_bf16_close(dx, dx_ref, f"dx {label}")
+        assert torch.isfinite(dw).all(), f"dw {label} has non-finite values"
+        error = _rel_l2(dw, dw_ref)
+        assert error <= DW_REL_L2, f"dw {label}: rel-L2 {error:.3e} > {DW_REL_L2:.0e}"
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
@@ -737,9 +826,10 @@ def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
 def test_workspace_bytes_and_layout(hidden: int) -> None:
     _skip_unless_hidden(hidden)
     small = cake_rmsnorm_train_backward_workspace_bytes(1, hidden, _device())
+    middle = cake_rmsnorm_train_backward_workspace_bytes(129, hidden, _device())
     large = cake_rmsnorm_train_backward_workspace_bytes(65536, hidden, _device())
     assert small > 0 and small % 256 == 0 and large % 256 == 0
-    assert large >= small
+    assert small <= middle <= large
     workspace = cake_rmsnorm_train_backward_workspace(65536, hidden, _device())
     assert workspace.dtype == torch.uint8 and workspace.numel() == large
     assert torch.count_nonzero(workspace) == 0

@@ -802,7 +802,7 @@ def test_sparse_to_dense_graph(sparse_ep_runtime, dtype, early, capacity):
         pkg.nvfp4_mega_launch_thunk if dtype == "nvfp4" else pkg.mxfp8_mega_launch_thunk
     )
     torch.manual_seed(6447 + rank)
-    options = dict(apply_topk_in_fc1=early) if dtype == "nvfp4" else {}
+    options = dict(apply_routing_weights_before_fc2=early) if dtype == "nvfp4" else {}
     _, w1, w2, buffer = create(
         rank,
         world,

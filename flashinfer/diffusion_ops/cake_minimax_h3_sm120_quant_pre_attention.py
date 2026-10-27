@@ -15,13 +15,26 @@ limitations under the License.
 """
 
 import functools
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import Any, NamedTuple, Optional, Tuple, Union
 
 import torch
+import tvm_ffi
 
 from ..api_logging import flashinfer_api
+from ..jit import cake_program
 from ..jit.cake_minimax_h3_sm120_quant_pre_attention import (
-    gen_minimax_h3_sm120_quant_pre_attention_module,
+    FP8_BF16,
+    FP8_E4M3,
+    FP8_MX_BF16,
+    FP8_MX_E4M3,
+    FP8_MX_NVFP4,
+    FP8_NVFP4,
+    NORM_FP8,
+    NORM_NVFP4,
+    NVFP4_BF16,
+    NVFP4_E4M3,
+    NVFP4_E4M3_G1,
+    NVFP4_NVFP4,
 )
 from ..utils import register_custom_op, register_fake_op, supported_compute_capability
 
@@ -40,6 +53,38 @@ E2M1_MAX = 6.0
 _OUT_MODES = {"bf16": 0, "e4m3": 1, "nvfp4": 2}
 _HIDDEN_SF = MINIMAX_H3_HIDDEN // MINIMAX_H3_SF_BLOCK  # 336
 _HEAD_SF = MINIMAX_H3_HEAD_DIM // MINIMAX_H3_SF_BLOCK  # 8
+# The fused GEMM: persistent 256-row x 128-column tiles, one CTA per SM; each 128-column
+# tile is one (head, kind) of the checkpoint row order head / kind / dim.
+_GEMM_BLOCK_M = 256
+_GEMM_N_TILES = MINIMAX_H3_QKV_WIDTH // MINIMAX_H3_HEAD_DIM  # 168
+_NORM_CTAS_PER_SM = 8
+# The weight scales as the NVFP4 GEMM's scale descriptor reads them: rows of 256 bytes, 168
+# per 128-column tile (the 128x4 swizzled layout of fp4_quantize).
+_SFB_ROW_BYTES = 256
+_SFB_ROWS = MINIMAX_H3_QKV_WIDTH * _HIDDEN_SF // _SFB_ROW_BYTES  # 28224
+
+# The fused GEMM program per (FP8 MMA form, out mode) and per out mode for NVFP4.  The
+# unit-scaled block-scale FP8 MMA form gives bitwise the dense form's output; GeForce
+# boards issue the dense FP8 MMA with FP32 accumulation at half the rate of that form.
+_FP8_GEMM = {
+    (False, 0): FP8_BF16,
+    (False, 1): FP8_E4M3,
+    (False, 2): FP8_NVFP4,
+    (True, 0): FP8_MX_BF16,
+    (True, 1): FP8_MX_E4M3,
+    (True, 2): FP8_MX_NVFP4,
+}
+# The NVFP4 GEMM program per (GeForce board, out mode): on the GeForce board the
+# E4M3-output program walks its tiles one M tile at a time (all 168 column tiles of
+# an M tile in turn).
+_NVFP4_GEMM = {
+    (False, 0): NVFP4_BF16,
+    (False, 1): NVFP4_E4M3,
+    (False, 2): NVFP4_NVFP4,
+    (True, 0): NVFP4_BF16,
+    (True, 1): NVFP4_E4M3_G1,
+    (True, 2): NVFP4_NVFP4,
+}
 
 Scalar = Union[float, torch.Tensor]
 
@@ -57,8 +102,119 @@ class MiniMaxH3PreAttentionOutput(NamedTuple):
 
 
 @functools.cache
-def _get_module():
-    return gen_minimax_h3_sm120_quant_pre_attention_module().build_and_load()
+def _device_facts(index: int) -> Tuple[str, int, str]:
+    """``(target, SM count, device name)`` of CUDA device ``index``."""
+    properties = torch.cuda.get_device_properties(index)
+    target = cake_program.CAPABILITY_TARGET.get(
+        (int(properties.major), int(properties.minor))
+    )
+    if target is None or target not in NORM_FP8.targets:
+        raise RuntimeError(
+            "MiniMax-H3 SM120 quantized pre-attention requires compute capability 12.0, "
+            f"got {properties.major}.{properties.minor}"
+        )
+    return target, int(properties.multi_processor_count), str(properties.name)
+
+
+def _fp8_unit_scale_mma(index: int) -> bool:
+    """Whether the FP8 GEMM on device ``index`` runs the unit-scaled block-scale MMA form."""
+    return "GeForce" in _device_facts(index)[2]
+
+
+def _nvfp4_one_m_tile_order(index: int) -> bool:
+    """Whether the NVFP4 GEMM's E4M3-output program on device ``index`` walks its tiles
+    one M tile at a time."""
+    return "GeForce" in _device_facts(index)[2]
+
+
+@functools.cache
+def _entry(program: cake_program.CakeProgram, target: str) -> Any:
+    return program.entry(target)
+
+
+@functools.cache
+def _placeholders(index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Operands a launch binds and never reads: the FP8 GEMM's two scale descriptors'
+    sources and the scale outputs of the BF16 / E4M3 out modes."""
+    device = torch.device("cuda", index)
+    return (
+        torch.zeros((_GEMM_BLOCK_M, 16), dtype=torch.uint8, device=device),
+        torch.zeros((8, _SFB_ROW_BYTES), dtype=torch.uint8, device=device),
+        torch.zeros((64,), dtype=torch.uint8, device=device),
+    )
+
+
+def _launch_plan(rows: int, num_sms: int) -> Tuple[int, int, int, int]:
+    """``(stage grid, GEMM grid, M tiles, GEMM tiles)``: eight stage CTAs per SM over
+    the rows, one persistent GEMM CTA per SM over the 256 x 128 tiles."""
+    num_m_tiles = (rows + _GEMM_BLOCK_M - 1) // _GEMM_BLOCK_M
+    total_tiles = num_m_tiles * _GEMM_N_TILES
+    stage_grid = max(1, min(rows, _NORM_CTAS_PER_SM * num_sms))
+    gemm_grid = max(1, min(total_tiles, num_sms))
+    return stage_grid, gemm_grid, num_m_tiles, total_tiles
+
+
+def _words(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(torch.uint8).view(torch.uint32)
+
+
+def _run_gemm(
+    gemm,
+    target: str,
+    index: int,
+    *,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    act_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    rope_cos_sin: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_sf: Optional[torch.Tensor],
+    k_sf: Optional[torch.Tensor],
+    v_sf: Optional[torch.Tensor],
+    rows: int,
+    eps: float,
+    alpha: float,
+    out_scales: Tuple[float, float, float],
+    sf_muls: Tuple[float, float, float],
+    gemm_grid: int,
+    num_m_tiles: int,
+    total_tiles: int,
+) -> None:
+    unused_sf = _placeholders(index)[2]
+    _entry(gemm, target)(
+        a,
+        b,
+        sfa,
+        sfb,
+        act_scale,
+        w_scale,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos_sin,
+        _words(q),
+        _words(k),
+        _words(v),
+        unused_sf if q_sf is None else q_sf,
+        unused_sf if k_sf is None else k_sf,
+        unused_sf if v_sf is None else v_sf,
+        rows,
+        num_m_tiles,
+        total_tiles,
+        eps,
+        alpha,
+        *out_scales,
+        *sf_muls,
+        gemm_grid,
+        1,
+        1,
+    )
 
 
 def _require(
@@ -106,7 +262,7 @@ def _check_rows(x: torch.Tensor) -> int:
     return rows
 
 
-def _check_common(
+def _check_inputs(
     x,
     x_norm_weight,
     adaln_scale,
@@ -122,21 +278,23 @@ def _check_common(
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device
     )
-    # The norm/AdaLN kernels index a fixed 9-row table (MINIMAX_H3_ADALN_ROWS).
-    _require(
-        "adaln_scale",
-        adaln_scale,
-        torch.bfloat16,
-        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
-        device,
-    )
-    _require(
-        "adaln_shift",
-        adaln_shift,
-        torch.bfloat16,
-        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
-        device,
-    )
+    for name, table in (("adaln_scale", adaln_scale), ("adaln_shift", adaln_shift)):
+        if (
+            isinstance(table, torch.Tensor)
+            and table.ndim == 2
+            and table.shape[0] != MINIMAX_H3_ADALN_ROWS
+        ):
+            raise ValueError(
+                f"{name} must have exactly {MINIMAX_H3_ADALN_ROWS} rows (the norm/AdaLN "
+                f"kernels index a {MINIMAX_H3_ADALN_ROWS}-row table), got {table.shape[0]}"
+            )
+        _require(
+            name,
+            table,
+            torch.bfloat16,
+            (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
+            device,
+        )
     _require("adaln_index", adaln_index, torch.int32, (rows,), device)
     _require(
         "q_norm_weight", q_norm_weight, torch.bfloat16, (MINIMAX_H3_HEAD_DIM,), device
@@ -151,6 +309,102 @@ def _check_common(
         (rows, MINIMAX_H3_ROPE_DIM),
         device,
     )
+    return rows, device
+
+
+def _check_common(
+    x,
+    x_norm_weight,
+    adaln_scale,
+    adaln_shift,
+    adaln_index,
+    q_norm_weight,
+    k_norm_weight,
+    rope_cos_sin,
+) -> Tuple[int, torch.device]:
+    """The public wrappers' check of the inputs both routes share."""
+    return _check_inputs(
+        x,
+        x_norm_weight,
+        adaln_scale,
+        adaln_shift,
+        adaln_index,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos_sin,
+    )
+
+
+def _output_layout(rows: int, out_mode: int) -> Tuple[torch.dtype, Tuple[int, ...]]:
+    """The dtype and shape of each of Q, K, V for ``out_mode`` (0, 1, 2)."""
+    heads = (rows, MINIMAX_H3_NUM_HEADS, MINIMAX_H3_HEAD_DIM)
+    if out_mode == _OUT_MODES["bf16"]:
+        return torch.bfloat16, heads
+    if out_mode == _OUT_MODES["e4m3"]:
+        return torch.float8_e4m3fn, heads
+    return torch.uint8, (rows, MINIMAX_H3_NUM_HEADS, MINIMAX_H3_HEAD_DIM // 2)
+
+
+def _check_weight_sf(qkv_weight_sf, device: torch.device) -> None:
+    if (
+        not isinstance(qkv_weight_sf, torch.Tensor)
+        or qkv_weight_sf.dtype != torch.uint8
+        or qkv_weight_sf.numel() != MINIMAX_H3_QKV_WIDTH * _HIDDEN_SF
+        or not qkv_weight_sf.is_cuda
+        or qkv_weight_sf.device != device
+        or not qkv_weight_sf.is_contiguous()
+    ):
+        raise ValueError(
+            f"qkv_weight_sf must be a contiguous uint8 CUDA tensor with {MINIMAX_H3_QKV_WIDTH * _HIDDEN_SF} "
+            "entries (FlashInfer 128x4 swizzled layout)"
+        )
+
+
+def _check_launch(
+    x,
+    x_norm_weight,
+    adaln_scale,
+    adaln_shift,
+    adaln_index,
+    q_norm_weight,
+    k_norm_weight,
+    rope_cos_sin,
+    q,
+    k,
+    v,
+    q_sf,
+    k_sf,
+    v_sf,
+    out_mode: int,
+) -> Tuple[int, torch.device]:
+    """The custom ops' own check of the shared tensors their two launches index: the
+    generated bindings check dtypes, devices and contiguity but not extents, and the ops
+    are reachable without the public wrappers."""
+    rows, device = _check_inputs(
+        x,
+        x_norm_weight,
+        adaln_scale,
+        adaln_shift,
+        adaln_index,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos_sin,
+    )
+    if out_mode not in _OUT_MODES.values():
+        raise ValueError(
+            f"out_mode must be 0 (bf16), 1 (e4m3) or 2 (nvfp4), got {out_mode}"
+        )
+    dtype, shape = _output_layout(rows, out_mode)
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require(name, tensor, dtype, shape, device)
+    if out_mode == _OUT_MODES["nvfp4"]:
+        sf_shape = (rows, MINIMAX_H3_NUM_HEADS, _HEAD_SF)
+        for name, tensor in (("q_sf", q_sf), ("k_sf", k_sf), ("v_sf", v_sf)):
+            if tensor is None:
+                raise ValueError(
+                    "q_sf, k_sf and v_sf are required for out_mode=2 (nvfp4)"
+                )
+            _require(name, tensor, torch.uint8, sf_shape, device)
     return rows, device
 
 
@@ -178,16 +432,7 @@ def _prepare_outputs(
         raise ValueError(
             f"out_mode must be one of {sorted(_OUT_MODES)}, got {out_mode!r}"
         )
-    heads = (rows, MINIMAX_H3_NUM_HEADS, MINIMAX_H3_HEAD_DIM)
-    if out_mode == "bf16":
-        dtype, shape = torch.bfloat16, heads
-    elif out_mode == "e4m3":
-        dtype, shape = torch.float8_e4m3fn, heads
-    else:
-        dtype, shape = (
-            torch.uint8,
-            (rows, MINIMAX_H3_NUM_HEADS, MINIMAX_H3_HEAD_DIM // 2),
-        )
+    dtype, shape = _output_layout(rows, _OUT_MODES[out_mode])
     outs = []
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor is None:
@@ -254,19 +499,19 @@ def _fp8_impl(
     sf_mul_k: float,
     sf_mul_v: float,
 ) -> None:
-    _get_module().minimax_h3_sm120_fp8_pre_attention(
+    # Two launches on the current stream: norm / AdaLN / per-token E4M3 quantization,
+    # then the persistent fused GEMM.  The bindings take the kernels' arguments in
+    # signature order, then the grid; each encodes its tensor maps from the tensors
+    # handed in its descriptor positions.
+    rows, device = _check_launch(
         x,
         x_norm_weight,
         adaln_scale,
         adaln_shift,
         adaln_index,
-        qkv_weight_q,
-        qkv_weight_scale,
         q_norm_weight,
         k_norm_weight,
         rope_cos_sin,
-        act_q,
-        act_scale,
         q,
         k,
         v,
@@ -274,14 +519,71 @@ def _fp8_impl(
         k_sf,
         v_sf,
         out_mode,
-        eps,
-        out_scale_q,
-        out_scale_k,
-        out_scale_v,
-        sf_mul_q,
-        sf_mul_k,
-        sf_mul_v,
     )
+    _require(
+        "qkv_weight_q",
+        qkv_weight_q,
+        torch.float8_e4m3fn,
+        (MINIMAX_H3_QKV_WIDTH, MINIMAX_H3_HIDDEN),
+        device,
+    )
+    _require(
+        "qkv_weight_scale",
+        qkv_weight_scale,
+        torch.float32,
+        (MINIMAX_H3_QKV_WIDTH,),
+        device,
+    )
+    _require("act_q", act_q, torch.float8_e4m3fn, (rows, MINIMAX_H3_HIDDEN), device)
+    _require("act_scale", act_scale, torch.float32, (rows,), device)
+    index = device.index
+    target, num_sms, _ = _device_facts(index)
+    stage_grid, gemm_grid, num_m_tiles, total_tiles = _launch_plan(rows, num_sms)
+    sfa, sfb, _ = _placeholders(index)
+    gemm = _FP8_GEMM[(_fp8_unit_scale_mma(index), out_mode)]
+    with torch.cuda.device(x.device), tvm_ffi.use_torch_stream():
+        _entry(NORM_FP8, target)(
+            x,
+            x_norm_weight,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
+            _words(act_q),
+            act_scale,
+            rows,
+            eps,
+            stage_grid,
+            1,
+            1,
+        )
+        _run_gemm(
+            gemm,
+            target,
+            index,
+            a=act_q.view(torch.uint8),
+            b=qkv_weight_q.view(torch.uint8),
+            sfa=sfa,
+            sfb=sfb,
+            act_scale=act_scale,
+            w_scale=qkv_weight_scale,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            rope_cos_sin=rope_cos_sin,
+            q=q,
+            k=k,
+            v=v,
+            q_sf=q_sf,
+            k_sf=k_sf,
+            v_sf=v_sf,
+            rows=rows,
+            eps=eps,
+            alpha=1.0,
+            out_scales=(out_scale_q, out_scale_k, out_scale_v),
+            sf_muls=(sf_mul_q, sf_mul_k, sf_mul_v),
+            gemm_grid=gemm_grid,
+            num_m_tiles=num_m_tiles,
+            total_tiles=total_tiles,
+        )
 
 
 @register_fake_op("flashinfer::minimax_h3_sm120_fp8_pre_attention")
@@ -350,20 +652,17 @@ def _nvfp4_impl(
     sf_mul_k: float,
     sf_mul_v: float,
 ) -> None:
-    _get_module().minimax_h3_sm120_nvfp4_pre_attention(
+    # Two launches on the current stream: norm / AdaLN / NVFP4 quantization, then the
+    # persistent fused block-scaled GEMM (see the FP8 route).
+    rows, device = _check_launch(
         x,
         x_norm_weight,
         adaln_scale,
         adaln_shift,
         adaln_index,
-        qkv_weight_q,
-        qkv_weight_sf,
-        act_global_scale,
         q_norm_weight,
         k_norm_weight,
         rope_cos_sin,
-        act_q,
-        act_sf,
         q,
         k,
         v,
@@ -371,15 +670,67 @@ def _nvfp4_impl(
         k_sf,
         v_sf,
         out_mode,
-        eps,
-        alpha,
-        out_scale_q,
-        out_scale_k,
-        out_scale_v,
-        sf_mul_q,
-        sf_mul_k,
-        sf_mul_v,
     )
+    _require(
+        "qkv_weight_q",
+        qkv_weight_q,
+        torch.uint8,
+        (MINIMAX_H3_QKV_WIDTH, MINIMAX_H3_HIDDEN // 2),
+        device,
+    )
+    _check_weight_sf(qkv_weight_sf, device)
+    _require("act_global_scale", act_global_scale, torch.float32, (1,), device)
+    _require("act_q", act_q, torch.uint8, (rows, MINIMAX_H3_HIDDEN // 2), device)
+    _require("act_sf", act_sf, torch.uint8, (rows, _HIDDEN_SF), device)
+    index = device.index
+    target, num_sms, _ = _device_facts(index)
+    stage_grid, gemm_grid, num_m_tiles, total_tiles = _launch_plan(rows, num_sms)
+    with torch.cuda.device(x.device), tvm_ffi.use_torch_stream():
+        _entry(NORM_NVFP4, target)(
+            x,
+            x_norm_weight,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
+            _words(act_q),
+            act_sf,
+            act_global_scale,
+            rows,
+            eps,
+            stage_grid,
+            1,
+            1,
+        )
+        # The per-token / per-channel dequant scales are FP8-only; the NVFP4 kernels bind
+        # a device scalar in their place and never read it.
+        _run_gemm(
+            _NVFP4_GEMM[(_nvfp4_one_m_tile_order(index), out_mode)],
+            target,
+            index,
+            a=act_q,
+            b=qkv_weight_q,
+            sfa=act_sf,
+            sfb=qkv_weight_sf.reshape(_SFB_ROWS, _SFB_ROW_BYTES),
+            act_scale=act_global_scale,
+            w_scale=act_global_scale,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            rope_cos_sin=rope_cos_sin,
+            q=q,
+            k=k,
+            v=v,
+            q_sf=q_sf,
+            k_sf=k_sf,
+            v_sf=v_sf,
+            rows=rows,
+            eps=eps,
+            alpha=alpha,
+            out_scales=(out_scale_q, out_scale_k, out_scale_v),
+            sf_muls=(sf_mul_q, sf_mul_k, sf_mul_v),
+            gemm_grid=gemm_grid,
+            num_m_tiles=num_m_tiles,
+            total_tiles=total_tiles,
+        )
 
 
 @register_fake_op("flashinfer::minimax_h3_sm120_nvfp4_pre_attention")
@@ -768,18 +1119,7 @@ def minimax_h3_nvfp4_pre_attention(
         (MINIMAX_H3_QKV_WIDTH, MINIMAX_H3_HIDDEN // 2),
         device,
     )
-    if (
-        not isinstance(qkv_weight_sf, torch.Tensor)
-        or qkv_weight_sf.dtype != torch.uint8
-        or qkv_weight_sf.numel() != MINIMAX_H3_QKV_WIDTH * _HIDDEN_SF
-        or not qkv_weight_sf.is_cuda
-        or qkv_weight_sf.device != device
-        or not qkv_weight_sf.is_contiguous()
-    ):
-        raise ValueError(
-            f"qkv_weight_sf must be a contiguous uint8 CUDA tensor with {MINIMAX_H3_QKV_WIDTH * _HIDDEN_SF} "
-            "entries (FlashInfer 128x4 swizzled layout)"
-        )
+    _check_weight_sf(qkv_weight_sf, device)
     if not isinstance(act_global_scale, torch.Tensor):
         raise ValueError("act_global_scale must be an FP32 [1] CUDA tensor")
     act_global_scale = act_global_scale.reshape(1)

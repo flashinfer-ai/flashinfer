@@ -16,10 +16,11 @@ limitations under the License.
 
 import functools
 import math
+from typing import Optional
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .jit.mhc import gen_mhc_module
 from .trace.templates.mhc import (
     mhc_post_trace,
@@ -566,3 +567,241 @@ def _mhc_pre_big_fuse_with_prenorm_impl_fake(
     block_size: int,
 ) -> None:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Experimental: fused mHC post -> pre (+ input RMSNorm)
+# ---------------------------------------------------------------------------
+#
+# Thin entry points. The implementation (support checks, JIT module, kernels and the
+# composable fallback) lives in flashinfer/experimental/mhc_fused_post_pre/ and is
+# imported on first call only.
+
+
+@flashinfer_experimental_api
+def mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-5,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-5,
+    out: Optional[tuple] = None,
+    fallback: bool = True,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    r"""Fused mHC post map followed by the next block's pre map and input RMSNorm (HC=4).
+
+    ``residual_cur[..., j, :] = bf16(x * post_layer_mix[..., j]
+    + sum_i residual[..., i, :] * comb_res_mix[..., i, j])``; the 24 mixes are the
+    projection of the flattened BF16 ``residual_cur`` onto ``fn`` scaled by
+    ``rsqrt(mean(residual_cur^2) + rms_eps)`` and by ``hc_scale``, plus ``hc_base``;
+    ``post_mix_cur = sigmoid(post logits) * hc_post_mult_value``; ``comb_mix_cur`` is
+    ``sinkhorn_repeat`` Sinkhorn iterations of ``softmax(comb logits) +
+    hc_sinkhorn_eps``; ``layer_input_cur`` is the RMSNorm (``norm_weight``,
+    ``norm_eps``, statistic from the pre-rounding FP32 sum) of the BF16 pre-mix
+    weighted sum of the ``residual_cur`` streams with
+    ``pre_mix = sigmoid(pre logits) + hc_pre_eps``.
+
+    On SM103 with hidden size 4096, the default constants
+    (``rms_eps=1e-5, hc_pre_eps=hc_sinkhorn_eps=1e-6, hc_post_mult_value=2,
+    sinkhorn_repeat=20, norm_eps=1e-5``) and 33 <= tokens <= 16384, one specialized
+    kernel launch computes all four outputs (TF32 projection with FP32 accumulation,
+    as the unfused TF32 pre-norm GEMM path). Every other call takes the fallback.
+
+    Calling this experimental API is the opt-in: no environment variable is involved,
+    and it takes part in no automatic backend selection. See
+    ``flashinfer/experimental/mhc_fused_post_pre/README.md``.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Layer output, shape ``[..., H]``, bfloat16.
+    residual : torch.Tensor
+        Multi-stream residual, shape ``[..., 4, H]``, bfloat16.
+    post_layer_mix : torch.Tensor
+        Shape ``[..., 4]`` or ``[..., 4, 1]``, float32.
+    comb_res_mix : torch.Tensor
+        Shape ``[..., 4, 4]``, float32 (``[old_hc, new_hc]``).
+    fn : torch.Tensor
+        Projection weight, shape ``[24, 4 * H]``, float32.
+    hc_scale : torch.Tensor
+        Shape ``[3]``, float32 (pre / post / comb logit scales).
+    hc_base : torch.Tensor
+        Shape ``[24]``, float32 (logit biases).
+    norm_weight : torch.Tensor
+        RMSNorm weight, shape ``[H]``, bfloat16.
+    rms_eps : float
+        Epsilon of the RMS scaling of the projected mixes.
+    hc_pre_eps : float
+        Added to the sigmoid pre-mix weights.
+    hc_sinkhorn_eps : float
+        Epsilon of the softmax and of every Sinkhorn normalization.
+    hc_post_mult_value : float
+        Scale of the sigmoid post-mix weights.
+    sinkhorn_repeat : int
+        Number of Sinkhorn iterations.
+    norm_eps : float
+        Epsilon of the input RMSNorm.
+    out : tuple, optional
+        Preallocated ``(residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur)``;
+        views of ``[M, 4, H]``, ``[M, 4]``, ``[M, 4, 4]`` and ``[M, H]`` are accepted.
+    fallback : bool
+        ``True`` (default): calls outside the specialized surface run the composable
+        PyTorch implementation. ``False``: such calls compute nothing and return
+        ``None``, so a framework can keep its own implementation for them.
+
+    Returns
+    -------
+    tuple or None
+        ``(residual_cur [..., 4, H] bf16, post_mix_cur [..., 4, 1] fp32,
+        comb_mix_cur [..., 4, 4] fp32, layer_input_cur [..., H] bf16)``; ``None`` only
+        when ``fallback=False`` and the specialized kernel did not serve the call.
+
+    Note
+    ----
+    The specialized kernel is built, loaded and prepared on the first call outside
+    CUDA graph capture, never under capture; call :func:`mhc_fused_post_pre_warmup`
+    before capturing graphs whose first call may be this one.
+    """
+    from .experimental.mhc_fused_post_pre import run
+
+    return run(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_eps=norm_eps,
+        out=out,
+        fallback=fallback,
+    )
+
+
+@flashinfer_experimental_api
+def mhc_fused_post_pre_supported(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: Optional[torch.Tensor],
+    rms_eps: float = 1e-5,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-5,
+    out: Optional[tuple] = None,
+) -> bool:
+    r"""Return ``True`` when :func:`mhc_fused_post_pre` would run the specialized kernel
+    for exactly these arguments (nothing is launched).
+
+    Capture-safe: under CUDA graph capture it never compiles or prepares a device, so an
+    unprepared device reports ``False`` (see :func:`mhc_fused_post_pre_warmup`). It never
+    allocates: without ``out`` only the inputs are checked (the outputs the op would
+    allocate always pass the output checks); with ``out`` those tensors are checked too.
+
+    Parameters
+    ----------
+    x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, norm_weight
+        As in :func:`mhc_fused_post_pre`.
+    rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_eps
+        As in :func:`mhc_fused_post_pre`.
+    out : tuple, optional
+        As in :func:`mhc_fused_post_pre`.
+
+    Returns
+    -------
+    bool
+        Whether the call would be served by the specialized kernel.
+    """
+    from .experimental.mhc_fused_post_pre import supported
+
+    return supported(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_eps=norm_eps,
+        out=out,
+    )
+
+
+@flashinfer_experimental_api
+def mhc_fused_post_pre_warmup(
+    device: Optional[torch.device] = None,
+    hidden_size: int = 4096,
+    hc_mult: int = 4,
+    rms_eps: float = 1e-5,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-5,
+) -> bool:
+    r"""Build, load and prepare the specialized :func:`mhc_fused_post_pre` kernels for
+    ``device`` (default: the current CUDA device) ahead of CUDA graph capture.
+
+    :func:`mhc_fused_post_pre` never compiles or prepares a device while the current
+    stream is capturing: an unprepared call made under capture is served by the
+    fallback (or declined with ``fallback=False``) and that path is what the graph
+    records. Callers that may issue their first call inside a capture (e.g. a decode
+    graph for a token count no eager warmup ran) call this once beforehand.
+
+    Parameters
+    ----------
+    device : torch.device, optional
+        The CUDA device to prepare; defaults to the current device.
+    hidden_size, hc_mult
+        Geometry of the calls to prepare for.
+    rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_eps
+        Constants of the calls to prepare for, as in :func:`mhc_fused_post_pre`.
+
+    Returns
+    -------
+    bool
+        ``True`` when calls with this geometry and these constants can dispatch the
+        specialized kernel on ``device`` -- also under capture. ``False`` without
+        building anything when the geometry / constants / architecture are outside the
+        specialized surface, or when called under capture.
+    """
+    from .experimental.mhc_fused_post_pre import warmup
+
+    return warmup(
+        device,
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_eps=norm_eps,
+    )

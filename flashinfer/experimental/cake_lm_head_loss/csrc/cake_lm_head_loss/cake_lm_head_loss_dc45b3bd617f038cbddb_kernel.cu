@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,9 +52,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_lm_head_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float* __restrict__ ws, int ws_slab, int num_vecs, int n_slabs)
 {
     const int tid = threadIdx.x;
@@ -67,7 +68,7 @@ kernel_cake_lm_head_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float* __r
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int stride = gridDim.x * 256;
     unsigned long long slab64 = (unsigned long long)ws_slab;
     #pragma unroll 2
