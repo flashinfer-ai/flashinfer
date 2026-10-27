@@ -483,12 +483,13 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
-        sf_requires_cluster_join,
+        tma_sfb,
     ):
         scheduler_bytes = 32 * num_tile_info_stages + 48 if use_clc_scheduler else 0
+        operand_barriers = 2 + int(not tma_sfb)
         return (
             (
-                (num_stages * (3 + int(sf_requires_cluster_join)) + acc_stages * 2) * 8
+                (num_stages * operand_barriers + acc_stages * 2) * 8
                 + 4
                 + scheduler_bytes
                 + 127
@@ -514,7 +515,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
-        sf_requires_cluster_join,
+        tma_sfb,
     ):
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
         available = (
@@ -525,7 +526,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
-                sf_requires_cluster_join,
+                tma_sfb,
             )
         )
         _, _, scratch_bytes = cls._epilogue_storage(available, bulk_output_bytes)
@@ -538,7 +539,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
-                sf_requires_cluster_join,
+                tma_sfb,
             )
             > capacity
         ):
@@ -571,7 +572,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages, can_overlap = cls._accumulator_storage(
             acc_cols, scale_cols, overlap_epilogue
         )
-        sf_requires_cluster_join = cta_group_size > 1 and route_tile < 128
         stage_bytes = cls._stage_storage_bytes(
             tile_k,
             allocated_n,
@@ -587,7 +587,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             acc_stages,
             use_clc_scheduler,
             num_tile_info_stages,
-            sf_requires_cluster_join,
+            route_tile >= 128,
         ), can_overlap
 
     @classmethod
@@ -691,7 +691,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             self.acc_stages,
             self.use_clc_scheduler,
             self.num_tile_info_stages,
-            self.sf_requires_cluster_join,
+            self.tma_sfb,
         )
 
     def _configure_pipeline_storage(self, tiled_mma, reduction_size):
@@ -731,7 +731,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
-                self.sf_requires_cluster_join,
+                self.tma_sfb,
             )
             if not self.overlap_epilogue:
                 # This producer executes its own epilogue before the next tile.
@@ -1103,10 +1103,8 @@ class Sm100BlockScaledGroupedGemmKernel:
         @cute.struct
         class SharedStorage:
             a_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            ab_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages]
-            sf_ready_barriers: cute.struct.MemRange[
-                cutlass.Int64,
-                self.num_stages if self.sf_requires_cluster_join else 0,
+            ab_barriers: cute.struct.MemRange[
+                cutlass.Int64, self.num_stages if not self.tma_sfb else 0
             ]
             acc_barriers: cute.struct.MemRange[cutlass.Int64, 2 * self.acc_stages]
             tmem_holding: cutlass.Int32
@@ -1114,9 +1112,12 @@ class Sm100BlockScaledGroupedGemmKernel:
                 cutlass.Int64,
                 2 * self.num_tile_info_stages if self.use_clc_scheduler else 0,
             ]
-            tile_info: cute.struct.MemRange[
-                cutlass.Int32,
-                4 * self.num_tile_info_stages if self.use_clc_scheduler else 0,
+            tile_info: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    4 * self.num_tile_info_stages if self.use_clc_scheduler else 0,
+                ],
+                16,
             ]
             clc_barriers: cute.struct.MemRange[
                 cutlass.Int64, 2 if self.use_clc_scheduler else 0
@@ -1360,7 +1361,12 @@ class Sm100BlockScaledGroupedGemmKernel:
             barrier_storage=storage.a_barriers.data_ptr(),
             defer_sync=True,
             num_stages=self.num_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            # TMA contributes one arrival; each local cp.async SF publication
+            # contributes one more when scales must be joined across CTAs.
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                1 + self.cta_group_size * int(self.sf_requires_cluster_join),
+            ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout,
             tx_count=self.cta_group_size
@@ -1426,13 +1432,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             if self.cta_group_size == 2
             else None,
         )
-        if cutlass.const_expr(self.sf_requires_cluster_join):
-            if tidx == 0 and cta_rank == 0:
-                for stage in cutlass.range_constexpr(self.num_stages):
-                    cute.arch.mbarrier_init(
-                        storage.sf_ready_barriers.data_ptr() + stage,
-                        self.cta_group_size,
-                    )
         # Publish all pipeline barriers once before any role can use them.
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.cta_group_size == 2):
@@ -1980,28 +1979,29 @@ class Sm100BlockScaledGroupedGemmKernel:
                             _iket.range_push("mma_sf_ready")
                         ab.consumer_wait(consumer)
                         # Publish each CTA's local cp.async scale bytes before
-                        # group-wide S2T reads. The operand empty ring prevents
-                        # reuse of this readiness slot until UMMA releases it.
+                        # group-wide S2T reads. Their arrivals join the TMA
+                        # completion; UMMA's empty release protects stage reuse.
                         cute.arch.fence_proxy("async.shared", space="cta")
                         if cutlass.const_expr(self.sf_requires_cluster_join):
-                            ready = (
-                                storage.sf_ready_barriers.data_ptr() + consumer.index
-                            )
                             with cute.arch.elect_one():
                                 cute.arch.mbarrier_arrive(
-                                    ready, 0, scope=nvvm.MemScopeKind.CLUSTER
+                                    a_pipe.sync_object_full.get_barrier(consumer.index),
+                                    0,
+                                    scope=nvvm.MemScopeKind.CLUSTER,
                                 )
-                            if cta_rank == 0:
-                                while not _blockscaled_cluster_try_wait(
-                                    ready, consumer.phase
-                                ):
-                                    pass
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                     if cta_rank == 0:
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("mma_tma_ready")
-                        a_pipe.consumer_wait(consumer)
+                        if cutlass.const_expr(self.sf_requires_cluster_join):
+                            while not _blockscaled_cluster_try_wait(
+                                a_pipe.sync_object_full.get_barrier(consumer.index),
+                                consumer.phase,
+                            ):
+                                pass
+                        else:
+                            a_pipe.consumer_wait(consumer)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                         if cutlass.const_expr(self.enable_iket):
@@ -2155,9 +2155,8 @@ class Sm100BlockScaledGroupedGemmKernel:
         pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
         ).arrive_and_wait()
-        if warp < 4:
+        if warp == 0:
             tmem.relinquish_alloc_permit()
-            pipeline.NamedBarrier(barrier_id=2, num_threads=128).arrive_and_wait()
             tmem.free(tmem_ptr, num_columns=self.tmem_cols)
 
 

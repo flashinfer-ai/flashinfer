@@ -1160,7 +1160,6 @@ class NVFP4QuantizePerTokenKernel:
                     per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
                 if tidx == Int32(0):
                     mPerTokenScale[row_idx] = per_token_scale
-                cute.arch.barrier()
 
                 sf_col_idx = tidx
                 while sf_col_idx < num_sf_blocks_per_row:

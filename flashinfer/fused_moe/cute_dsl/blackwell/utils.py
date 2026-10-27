@@ -898,9 +898,6 @@ class Sm100BlockScaledMoeEpilogue:
         for step in cutlass.range_constexpr(self.tile_n // tokens):
             group = self.tile_n // tokens - 1 - step if reverse else step
             if group * tokens < valid_tokens:
-                if cutlass.const_expr(step >= stages):
-                    cute.arch.cp_async_bulk_wait_group(stages - 1, read=True)
-                    self.transpose_barrier.arrive_and_wait()
                 shared = shared_all[None, None, step % stages]
                 ptr = (
                     acc_tensor.iterator
@@ -948,6 +945,10 @@ class Sm100BlockScaledMoeEpilogue:
                     )
                     converted.store(values.load().to(self.output_dtype))
                 words = cute.recast_tensor(packed, cutlass.Uint32)
+                # Wait only before overwriting the shared stage.
+                if cutlass.const_expr(step >= stages):
+                    cute.arch.cp_async_bulk_wait_group(stages - 1, read=True)
+                    self.transpose_barrier.arrive_and_wait()
                 for token8 in cutlass.range_constexpr(tokens // 8):
                     address = (
                         shared.iterator
