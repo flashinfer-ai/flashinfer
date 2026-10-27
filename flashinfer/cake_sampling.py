@@ -1061,6 +1061,50 @@ def _no_tail_flag(
     )
 
 
+# Fused-tail variants whose small-top-k launch takes the two-launch chain (stage 1 on the no-tail twin) on a multi-wave
+# stage-1 grid, per device (capability, SM count): (cluster, ept, stream) -> (smallest vocab, smallest batch) of the
+# launches that take it.  RTX PRO 6000 (12, 0) with 188 SMs, the (8, 32) resident, the chain against the fused tail
+# (two boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same sampled tokens):
+# faster on every measured cell with 32-128 rows at V = 92544-131072, top-k 10 / 50 / 64 (0.950-0.996x; at V = 128256
+# 0.983-0.992x with 32 rows, 0.976-0.988x with 64 and 0.950-0.960x with 128).  Outside that envelope the gain is not
+# consistent: 23 rows at V = 128256 are slower (1.005-1.031x), 24 rows faster eager but up to 1.008x slower under CUDA
+# graph at V = 128256 and up to 1.008x slower at V = 131072, and 32 rows at V = 65537 tie (0.996-1.004x).  Launches
+# with fewer rows or a shorter vocabulary keep the fused tail, including cells where the chain measured faster (24 rows
+# at V = 92544, 26 / 28 rows at V = 128256, 128 rows at V = 65537); top-k below 10 and more than 128 rows were not
+# measured.  The fused tail's own latency steps up by 4.7-5.2 us from 22 to 23 rows at V = 128256, so one cluster-8
+# wave holds 176 CTAs there (the cluster-8 width of the 212-SM table ``_wave_ctas`` uses for this device) and every
+# listed launch spans at least two waves.  An inference, not profiled: as for the whole-CTA tail (``_fuse_block_tail``),
+# rank 0 of every cluster runs the tail after its row, so each later wave presumably starts behind the tails of the
+# wave before it, while the chain's stage-2/3 kernel serves every row in one launch; a second wave of one or two
+# clusters presumably saves too little to pay for the second launch.  A device or variant absent here (another SM
+# count of the same capability too) keeps the fused tail on every grid.
+_MULTI_WAVE_CHAIN_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int]]
+] = {
+    # RTX PRO 6000 Blackwell Server (188 SMs)
+    (12, 0, 188): {(8, 32, False): (92544, 32)},
+}
+
+
+def _multi_wave_chain(
+    batch: int,
+    vocab: int,
+    cluster: int,
+    ept: int,
+    stream: bool,
+    capability: tuple[int, int],
+    sm_count: int,
+) -> bool:
+    """Whether a launch of ``batch`` rows of ``vocab`` entries whose top-k fits the two-warp tail takes the two-launch
+    chain instead: the variant is listed for the device (``capability``, ``sm_count``) in
+    ``_MULTI_WAVE_CHAIN_BY_DEVICE`` and ``vocab`` and ``batch`` reach the listed smallest vocab and batch.  The chain's
+    stage 1 then runs the variant's no-tail twin (``_no_tail_flag``)."""
+    least = _MULTI_WAVE_CHAIN_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    ).get((int(cluster), int(ept), bool(stream)))
+    return least is not None and int(vocab) >= least[0] and int(batch) >= least[1]
+
+
 @functools.cache
 def _stage1_has_leader_push(
     cluster: int, ept: int, stream: bool, coarse: bool, spec: bool
@@ -1952,9 +1996,14 @@ def _launch_plan(
         ),
     )
     threads, items = choose_stage23(top_k_max)
-    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
-    fused = top_k_max <= _fused_tail_kcap() and _stage1_has_fused_tail(
-        cluster, ept, stream
+    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch), except for the multi-wave
+    # launches of a variant ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists for the device, which take the chain.
+    fused = (
+        top_k_max <= _fused_tail_kcap()
+        and _stage1_has_fused_tail(cluster, ept, stream)
+        and not _multi_wave_chain(
+            batch, vocab, cluster, ept, stream, capability, sm_count
+        )
     )
     # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
     # one-wave stage-1 grid.

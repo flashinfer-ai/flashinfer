@@ -1752,6 +1752,179 @@ def test_stage23_forms_of_a_slab_sample_bitwise_alike():
             )
 
 
+# (device, vocab, batch, top-k) -> (plan without the multi-wave chain rule, plan with it) of every owner cell the rule
+# (``_MULTI_WAVE_CHAIN_BY_DEVICE``) changes: RTX PRO 6000's (8, 32) resident at V = 128256, top-k 10 / 50, with at
+# least 32 rows takes the chain on its no-tail twin (bit 12, with the early trigger, bit 1, where the stage-2/3 CTAs
+# fit beside the last stage-1 wave).
+_MULTI_WAVE_CHAIN_PLAN_CHANGES = {
+    ("RTX PRO 6000", 128256, 32, 10): ("8_32_0 f1 1L", "8_32_0 f4098 2L"),
+    ("RTX PRO 6000", 128256, 32, 50): ("8_32_0 f1 1L", "8_32_0 f4098 2L"),
+    ("RTX PRO 6000", 128256, 64, 10): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
+    ("RTX PRO 6000", 128256, 64, 50): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
+    ("RTX PRO 6000", 128256, 128, 10): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
+    ("RTX PRO 6000", 128256, 128, 50): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
+}
+
+
+def test_multi_wave_chain_changes_only_its_cells(monkeypatch):
+    """The multi-wave chain rule changes the launch plans of the owner cells on the emulated devices exactly on the cells
+    of ``_MULTI_WAVE_CHAIN_PLAN_CHANGES``, against the plans without it.  On RTX PRO 6000 (188 SMs), over batch 1-256
+    at vocabularies across the (8, 32) resident's range (65537-131072, both sides of 92544) and top-k 1 / 10 / 33 / 64,
+    a plan changes exactly where it is that variant's fused-tail launch with a vocab of at least 92544 and at least 32
+    rows, into the same variant's two-launch chain on its no-tail twin.  A (12, 0) device with 170 or 84 SMs keeps
+    every plan, its (8, 32) fused-tail launches of that vocab and batch range included.  The rule acts only up to the
+    two-warp tail's top-k cap, where no plan depends on whether CUDA is present, so no GPU is needed."""
+
+    def without_rule(cells=_PLAN_CELLS, emulated=None):
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_MULTI_WAVE_CHAIN_BY_DEVICE", {})
+            return _emulated_launch_plans(m, emulated, cells)
+
+    def in_class(cell, plan):
+        return (
+            plan is not None
+            and (plan.cluster, plan.ept, plan.stream) == (8, 32, False)
+            and plan.one_launch
+            and bool(plan.launch_flags & cs._FLAG_FUSE_TAIL)
+            and cell[1] >= 92544
+            and cell[2] >= 32
+        )
+
+    new = _emulated_launch_plans(monkeypatch)
+    old = without_rule()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan))
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert changed == _MULTI_WAVE_CHAIN_PLAN_CHANGES
+    rtx = {"RTX PRO 6000": _PLAN_DEVICES["RTX PRO 6000"]}
+    vocabs = (65537, 80000, 92543, 92544, 96192, 122881, 128256, 131072)
+    top_ks = (1, 10, 33, 64)
+    cells = tuple(itertools.product(vocabs, range(1, 257), top_ks))
+    new = _emulated_launch_plans(monkeypatch, rtx, cells)
+    old = without_rule(cells, rtx)
+    moved = 0
+    for cell, plan in new.items():
+        before = old[cell]
+        if in_class(cell, before):
+            assert not plan.one_launch, cell
+            assert plan.launch_flags & cs._FLAG_NO_TAIL, cell
+            assert not plan.launch_flags & cs._FLAG_FUSE_TAIL, cell
+            assert plan._replace(launch_flags=0, one_launch=True) == before._replace(
+                launch_flags=0
+            ), cell
+            moved += 1
+        else:
+            assert plan == before, cell
+    assert moved == sum(v >= 92544 for v in vocabs) * (256 - 31) * len(top_ks)
+    # the same capability with another SM count keeps every plan
+    smem = _PLAN_DEVICES["RTX PRO 6000"][2]
+    for sms in (170, 84):
+        other = {f"(12, 0) {sms} SMs": ((12, 0), sms, smem)}
+        new = _emulated_launch_plans(monkeypatch, other, cells + _PLAN_CELLS)
+        assert new == without_rule(cells + _PLAN_CELLS, other), sms
+        assert any(in_class(cell, plan) for cell, plan in new.items()), sms
+
+
+def test_multi_wave_chain_variants_take_their_no_tail_twins():
+    """Every variant ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists is a frozen fused-tail build whose smallest listed batch is a
+    stage-1 grid wider than one wave of the device's wave table: on that device a launch of at least the listed vocab
+    and batch takes the chain, one below either keeps the two-warp tail, and on that capability the chain's stage 1
+    runs the variant's no-tail twin at every such batch.  Every other device, another SM count of the same capability
+    included, keeps the fused tail on every grid."""
+    assert cs._MULTI_WAVE_CHAIN_BY_DEVICE == {
+        (12, 0, 188): {(8, 32, False): (92544, 32)}
+    }
+    for (major, minor, sms), table in cs._MULTI_WAVE_CHAIN_BY_DEVICE.items():
+        cap = (major, minor)
+        for (c, e, st), (vocab, rows) in table.items():
+            where = (cap, sms, c, e, st, vocab, rows)
+            assert cs._stage1_has_fused_tail(c, e, st), where
+            assert rows * c > cs._wave_ctas(sms)[c], where
+            for v, b in ((vocab - 1, rows), (vocab, rows - 1), (vocab - 1, 1024)):
+                assert not cs._multi_wave_chain(b, v, c, e, st, cap, sms), (where, v, b)
+            assert not cs._multi_wave_chain(rows - 1, 1 << 20, c, e, st, cap, sms)
+            for v, b in ((vocab, rows), (vocab, 1024), (1 << 20, rows)):
+                assert cs._multi_wave_chain(b, v, c, e, st, cap, sms), (where, v, b)
+            if not st:  # a resident's chain runs its default build
+                for batch in (rows, 2 * rows, 1024):
+                    assert cs._no_tail_flag(c, e, st, 0, batch, cap) == cs._FLAG_NO_TAIL
+            others = [(cap, n) for n in (84, 170, sms - 1, sms + 1)]
+            others += [(o, n) for o, n, _ in _PLAN_DEVICES.values()]
+            for other, n in others:
+                if (*other, n) not in cs._MULTI_WAVE_CHAIN_BY_DEVICE:
+                    assert not cs._multi_wave_chain(1024, 1 << 20, c, e, st, other, n)
+
+
+def test_multi_wave_chain_samples_like_the_fused_tail():
+    """On a launch ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists (at least the listed vocab and batch: a multi-wave stage-1
+    grid), the chain the rule takes (the variant's no-tail twin, then the stage-2/3 kernel) samples the same tokens and
+    writes the same sorted slab and renormalized probabilities as the variant's fused two-warp tail, bitwise, against
+    the reference too: scalar and per-row top-k / top-p, ties across the k boundary and +inf rows.  On the listed device
+    (capability and SM count), the public route plans that chain on the variant and returns the same tokens."""
+    _require_supported_device()
+    module = load_cake_sampling_module()
+    kcap = cs._fused_tail_kcap()
+    device = torch.cuda.current_device()
+    here = (*cs._device_capability(device), cs._sm_count(device))
+    for key, table in cs._MULTI_WAVE_CHAIN_BY_DEVICE.items():
+        for (c, e, st), (least_vocab, least_batch) in table.items():
+            if st and not _device_streams():
+                continue
+            vocab = 512 * c * e * 15 // 16 + 1  # covered by the variant, odd length
+            assert vocab >= least_vocab, (key, c, e, st, vocab)
+            batch = least_batch + 1
+            probs = _probs(batch, vocab, seed=97)
+            pn = probs.cpu().numpy()
+            pn[0, (np.arange(300) * 13) % vocab] = np.float32(2**-11)
+            pn[1, [7, vocab - 5]] = np.inf
+            probs.copy_(torch.tensor(pn, device="cuda"))
+            p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+            k_row = torch.tensor(
+                [1 + (kcap - 1) * i // (batch - 1) for i in range(batch)],
+                device="cuda",
+                dtype=torch.int32,
+            )
+            for k, p in ((10, 0.9), (kcap, p_row), (k_row, 0.75), (1, 1.0)):
+                fused = _fused_tail_launch(module, probs, k, p, (c, e, st), 0xC0DE, 5)
+                chain, _ = _run_and_check(
+                    probs,
+                    k,
+                    p,
+                    0xC0DE,
+                    5,
+                    variant=((c, e, st), choose_stage23(kcap)),
+                    flags=cs._FLAG_NO_TAIL,
+                )
+                where = (key, c, e, st, k if isinstance(k, int) else "per-row k")
+                assert np.array_equal(chain.samples, fused.samples), where
+                assert np.array_equal(chain.count, fused.count), where
+                for r in range(batch):
+                    n = int(fused.count[r])
+                    assert np.array_equal(chain.idx[r, :n], fused.idx[r, :n]), (
+                        *where,
+                        r,
+                    )
+                    for a, b in (
+                        (chain.vals, fused.vals),
+                        (chain.renorm, fused.renorm),
+                    ):
+                        assert np.array_equal(
+                            a[r, :n].view(np.uint32), b[r, :n].view(np.uint32)
+                        ), (*where, r)
+                if here != key:
+                    continue
+                kmax = k if isinstance(k, int) else int(k.max().item())
+                plan = cs._launch_plan(device, batch, vocab, kmax)
+                got = (plan.cluster, plan.ept, plan.stream)
+                assert got == (c, e, st), (*where, plan)
+                assert not plan.one_launch, (*where, plan)
+                assert plan.launch_flags & cs._FLAG_NO_TAIL, (*where, plan)
+                routed, _ = _run_and_check(probs, k, p, 0xC0DE, 5)
+                assert np.array_equal(routed.samples, fused.samples), where
+
+
 # --------------------------------------------------------------------------- adversarial
 
 
