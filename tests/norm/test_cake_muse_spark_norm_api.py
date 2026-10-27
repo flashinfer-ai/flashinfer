@@ -1393,7 +1393,8 @@ def test_rmsnorm_sigmoid_gate_helpers_and_support(monkeypatch):
     PDL; on sm_107a the plain route's declared gaps of 128 and 32 heads are unsupported token counts and the PDL
     route leaves gaps of its own."""
     assert pkg.RMSNORM_SIGMOID_GATE == OP_C
-    assert pkg.HEAD_DIM == 64 and pkg.ROW_ALIGNMENT_BYTES == 16
+    assert pkg.HEAD_DIM == 64 and pkg.ROW_ALIGNMENT_BYTES == 32
+    assert pkg.GATE_STRIDE_ELEMENTS == 16
     assert pkg.rmsnorm_sigmoid_gate_variant() == "bf16"
     assert pkg.rmsnorm_sigmoid_gate_variant(True) == "bf16_pdl"
     assert pkg.rmsnorm_sigmoid_gate_route() == f"{OP_C}_bf16"
@@ -1766,4 +1767,35 @@ def test_package_data_lists_the_package():
     assert (
         checker.check_package_data(_package(checker), cake_build.manifest(), table)
         == []
+    )
+
+
+def test_the_package_alignment_covers_the_widest_global_access_of_every_kernel():
+    """The package admits 32-byte aligned storage alone (``ALIGNMENT_BYTES``, ``ROW_ALIGNMENT_BYTES`` and the norm
+    facade's ``_CAKE_NORM_ALIGNMENT`` agree, and the sigmoid gate's token stride is a 32-byte multiple of BF16
+    elements): the widest global vector access of every shipped kernel text is 256 bits, so a view aligned to 16
+    bytes only never reaches a program (``"auto"`` runs the CuTe DSL kernel there)."""
+    from flashinfer import norm
+
+    assert (
+        pkg.ALIGNMENT_BYTES
+        == pkg.ROW_ALIGNMENT_BYTES
+        == norm._CAKE_NORM_ALIGNMENT
+        == 32
+    )
+    assert pkg.GATE_STRIDE_ELEMENTS * torch.bfloat16.itemsize == pkg.ROW_ALIGNMENT_BYTES
+    access = re.compile(r"\b(?:ld|st)\.global[\w.:]*?\.v(\d+)\.[bfsu](\d+)\b")
+    widest_by_kernel = {}
+    for path in sorted((PACKAGE_DIR / "csrc").glob("*_kernel.cu")):
+        widths = [
+            int(lanes) * int(bits) // 8
+            for lanes, bits in access.findall(path.read_text())
+        ]
+        widest_by_kernel[path.name] = max(widths, default=0)
+    assert widest_by_kernel, "no kernel text under csrc/"
+    assert all(width <= pkg.ALIGNMENT_BYTES for width in widest_by_kernel.values()), (
+        widest_by_kernel
+    )
+    assert pkg.ALIGNMENT_BYTES in widest_by_kernel.values(), (
+        "no kernel text carries a 256-bit vector access"
     )

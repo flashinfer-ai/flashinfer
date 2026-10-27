@@ -383,6 +383,13 @@ def test_refuses_inputs_outside_the_contract():
     ]
     with pytest.raises(ValueError, match="beta must be"):
         call(branch, residual, weight, alpha, misaligned, out, eps=EPS)
+    # aligned to 16 bytes but not to the package's 32: the programs read and write the FP32 planes in 256-bit vectors
+    half_aligned = torch.empty(HIDDEN_SIZE + 8, device="cuda", dtype=torch.float32)[
+        4 : 4 + HIDDEN_SIZE
+    ]
+    assert half_aligned.data_ptr() % 16 == 0 and half_aligned.data_ptr() % 32 != 0
+    with pytest.raises(ValueError, match=r"beta must be .*32-byte aligned storage"):
+        call(branch, residual, weight, alpha, half_aligned, out, eps=EPS)
     with pytest.raises(ValueError, match="out must be"):
         call(branch, residual, weight, alpha, beta, out.bfloat16(), eps=EPS)
     with pytest.raises(ValueError, match="supports compute capability"):
@@ -406,3 +413,57 @@ def test_refuses_inputs_outside_the_contract():
         beta.cpu(),
         backend="cake",
     )
+
+
+def test_storage_the_package_does_not_serve_falls_to_the_cute_kernel(monkeypatch):
+    """Rows aligned to 16 bytes but not 32 -- storage the facade's contract admits but the package does not (its
+    programs read and write the FP32 planes in 256-bit vectors) -- run the CuTe DSL kernel under ``auto`` and launch
+    no Cake program, whether the residual or the output sits there; an explicit ``"cake"`` raises."""
+    rows = next(
+        (
+            count
+            for count in (17, 16, 32, 64, 128)
+            if all(_admits(*form, count) for form in FORMS)
+        ),
+        None,
+    )
+    if rows is None:
+        pytest.skip("no probe row count lies in every route's windows on this device")
+    inputs = _inputs(rows, seed=rows)
+    if not supports_gated_residual_rmsnorm(*inputs, backend="cute"):
+        pytest.skip("the CuTe DSL kernel is not available on this device")
+    launched = []
+    monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))
+    branch, residual, weight, alpha, beta = inputs
+
+    def half_aligned_like(tensor: torch.Tensor) -> torch.Tensor:
+        storage = torch.empty(tensor.numel() + 8, dtype=tensor.dtype, device="cuda")
+        view = storage[4 : 4 + tensor.numel()].view_as(tensor)
+        assert view.data_ptr() % 16 == 0 and view.data_ptr() % 32 != 0
+        return view
+
+    shifted = half_aligned_like(residual)
+    shifted.copy_(residual)
+    shifted_inputs = [branch, shifted, weight, alpha, beta]
+    assert supports_gated_residual_rmsnorm(*shifted_inputs, backend="auto")
+    assert not supports_gated_residual_rmsnorm(*shifted_inputs, backend="cake")
+    for weight_before_norm, enable_pdl in FORMS:
+        out = _call(shifted_inputs, weight_before_norm, enable_pdl, backend="auto")
+        torch.cuda.synchronize()
+        _assert_close(out, _reference(shifted_inputs, weight_before_norm))
+        assert launched == []
+        with pytest.raises(ValueError, match="not available"):
+            _call(shifted_inputs, weight_before_norm, enable_pdl, backend="cake")
+    shifted_out = half_aligned_like(residual)
+    for weight_before_norm, enable_pdl in FORMS:
+        _call(inputs, weight_before_norm, enable_pdl, backend="auto", out=shifted_out)
+        torch.cuda.synchronize()
+        _assert_close(shifted_out, _reference(inputs, weight_before_norm))
+        assert launched == []
+        with pytest.raises(ValueError, match="not available"):
+            _call(
+                inputs, weight_before_norm, enable_pdl, backend="cake", out=shifted_out
+            )
+    # the same calls on storage the package serves launch its programs
+    _call(inputs, True, False, backend="auto")
+    assert len(launched) == 1
