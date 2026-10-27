@@ -372,31 +372,58 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
         use_clc,
     ) = _split_moe_tactic(tactic)
 
-    params = {
-        "tile_size": tile_size,
-        "gemm1_k_steps": k_steps[0],
-        "gemm2_k_steps": k_steps[1],
-        "gemm1_use_clc_scheduler": use_clc,
-        "gemm2_use_clc_scheduler": use_clc,
-        "is_rubin": is_rubin,
-    }
-    for phase, gemm_tactic in enumerate((gemm1_tactic, gemm2_tactic), 1):
-        if is_rubin:
-            mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m = gemm_tactic
-            mma_tiler_mn = (mma_tiler[0], mma_tiler[1])
-        else:
-            mma_tiler_mn, cluster_shape_mn, raster_along_m = gemm_tactic
-            mma_tiler = mma_inst_shape = None
-        params.update(
-            {
-                f"gemm{phase}_mma_tiler_mn": mma_tiler_mn,
-                f"gemm{phase}_cluster_shape_mn": cluster_shape_mn,
-                f"gemm{phase}_raster_along_m": raster_along_m,
-                f"gemm{phase}_mma_tiler": mma_tiler,
-                f"gemm{phase}_mma_inst_shape": mma_inst_shape,
-            }
-        )
-    return params
+    if is_rubin:
+        (
+            gemm1_mma_tiler,
+            gemm1_mma_inst_shape,
+            gemm1_cluster_shape_mn,
+            gemm1_raster_along_m,
+        ) = gemm1_tactic
+        (
+            gemm2_mma_tiler,
+            gemm2_mma_inst_shape,
+            gemm2_cluster_shape_mn,
+            gemm2_raster_along_m,
+        ) = gemm2_tactic
+        return {
+            "tile_size": tile_size,
+            "gemm1_k_steps": k_steps[0],
+            "gemm2_k_steps": k_steps[1],
+            "gemm1_use_clc_scheduler": use_clc,
+            "gemm2_use_clc_scheduler": use_clc,
+            "is_rubin": True,
+            "gemm1_mma_tiler_mn": (gemm1_mma_tiler[0], gemm1_mma_tiler[1]),
+            "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
+            "gemm1_raster_along_m": gemm1_raster_along_m,
+            "gemm1_mma_tiler": gemm1_mma_tiler,
+            "gemm1_mma_inst_shape": gemm1_mma_inst_shape,
+            "gemm2_mma_tiler_mn": (gemm2_mma_tiler[0], gemm2_mma_tiler[1]),
+            "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
+            "gemm2_raster_along_m": gemm2_raster_along_m,
+            "gemm2_mma_tiler": gemm2_mma_tiler,
+            "gemm2_mma_inst_shape": gemm2_mma_inst_shape,
+        }
+    else:
+        gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
+        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m = gemm2_tactic
+        return {
+            "tile_size": tile_size,
+            "gemm1_k_steps": k_steps[0],
+            "gemm2_k_steps": k_steps[1],
+            "gemm1_use_clc_scheduler": use_clc,
+            "gemm2_use_clc_scheduler": use_clc,
+            "is_rubin": False,
+            "gemm1_mma_tiler_mn": gemm1_mma_tiler_mn,
+            "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
+            "gemm1_raster_along_m": gemm1_raster_along_m,
+            "gemm1_mma_tiler": None,
+            "gemm1_mma_inst_shape": None,
+            "gemm2_mma_tiler_mn": gemm2_mma_tiler_mn,
+            "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
+            "gemm2_raster_along_m": gemm2_raster_along_m,
+            "gemm2_mma_tiler": None,
+            "gemm2_mma_inst_shape": None,
+        }
 
 
 def _get_arch_tactics() -> List[Tuple]:

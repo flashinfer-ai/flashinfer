@@ -1255,6 +1255,20 @@ def testCutlassFusedMoe(args):
     return res
 
 
+def _interleave_linear_and_gate(
+    x: torch.Tensor, group_size: int = 64, dim: int = -1
+) -> torch.Tensor:
+    """Interleave linear and gate weights for CuteDSL SwiGLU layout."""
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1 :]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size, *post_sizes)
+    x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
+
+
 def _create_nvfp4_moe_test_data(
     num_tokens: int,
     hidden_size: int,
@@ -1283,10 +1297,7 @@ def _create_nvfp4_moe_test_data(
     """
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-    from flashinfer.fused_moe.prepare import (
-        _cute_dsl_gated_weight_group_size,
-        _interleave_linear_and_gate,
-    )
+    from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
 
     if backend not in ("cute-dsl", "b12x"):
         raise ValueError(f"Unsupported backend: {backend!r}")
