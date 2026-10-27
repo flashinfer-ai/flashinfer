@@ -184,6 +184,8 @@ def _launch_early_exit_max_token_ctas(
     top_k: int,
     metadata_token_ctas: int,
 ) -> int:
+    # The legacy metadata_token_ctas name counts CGA routing records.
+    # The returned launch extent remains in CTA units.
     if not cfg.use_early_exit:
         return 0
 
@@ -192,7 +194,7 @@ def _launch_early_exit_max_token_ctas(
     )
 
     token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
-    cluster_dim_in_token = 1 if cfg.is_swap_ab else int(cfg.cluster_m)
+    cluster_dim_in_token = cfg.token_metadata_stride
     launch_token_ctas = compute_max_num_ctas_in_token_dim_for_moe(
         num_tokens=int(num_tokens),
         num_experts=int(num_routed_experts),
@@ -200,10 +202,13 @@ def _launch_early_exit_max_token_ctas(
         token_tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    if launch_token_ctas > int(metadata_token_ctas):
+    required_metadata = (
+        launch_token_ctas + cfg.token_metadata_stride - 1
+    ) // cfg.token_metadata_stride
+    if required_metadata > int(metadata_token_ctas):
         raise ValueError(
             "routing metadata capacity is smaller than the required token CTA "
-            f"launch bound: need {launch_token_ctas}, got {metadata_token_ctas}"
+            f"launch bound: need {required_metadata} records, got {metadata_token_ctas}"
         )
     return launch_token_ctas
 
@@ -413,7 +418,7 @@ def build_bf16_launch_io(
     if not total_num_padded_tokens.is_contiguous():
         raise ValueError("total_num_padded_tokens must be contiguous")
     if num_non_exiting_ctas.numel() < 1:
-        raise ValueError("num_non_exiting_ctas must contain the GPU active CTA count")
+        raise ValueError("num_non_exiting_ctas must contain the GPU active CGA count")
 
     launch_early_exit_max_token_ctas = _launch_early_exit_max_token_ctas(
         cfg=cfg,
@@ -459,9 +464,12 @@ def build_bf16_launch_io(
     logical_output_m = (
         m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
     )
-    if output_buf.numel() < logical_output_m * n_val:
+    logical_output_n = (
+        n_val // 2 if not cfg.is_swap_ab and cfg.has_gated_epilogue else n_val
+    )
+    if output_buf.numel() < logical_output_m * logical_output_n:
         raise ValueError(
-            f"{fc} output buffer too small: need {logical_output_m * n_val}, "
+            f"{fc} output buffer too small: need {logical_output_m * logical_output_n}, "
             f"got {output_buf.numel()}"
         )
 

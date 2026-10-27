@@ -18,7 +18,6 @@ from .core import (
 )
 
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
-CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 # Build tag carried by every Cake FMHA JIT module name.  It is the tag of the
@@ -32,6 +31,9 @@ _TARGET_FLAGS = {
 }
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+# The b256 sink member's shared host binding reads the architecture's dynamic
+# shared memory (``launch_override.by_arch[arch]``) from this define.
+_SINK_PEER_CLC_DYNAMIC_SMEM_MACRO = "CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES"
 _DECODE_BALANCED_JIT_BINDING = "jit/cake_fmha_decode_balanced_jit_binding.cu"
 CAKE_FMHA_BALANCED_DTYPES = ("bf16", "fp16")
 CAKE_FMHA_BALANCED_MTP_ROWS = (32, 64)
@@ -248,7 +250,16 @@ def _resolve_decode_native_bf16_selector(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> dict[str, int] | None:
+    """Pick the registry member serving this route.
+
+    An exact-shape member (selector with ``BATCH_SIZE``) wins when one exists,
+    unless the caller wants the LSE output: the exact-shape kernels never write
+    ``LSE_ptr``, so ``return_lse=True`` is served by the generic member of the
+    same semantic flags, or by nothing when that member is absent.
+    """
+
     semantic_selector = _validate_decode_native_specialization(
         target,
         batch_size,
@@ -268,7 +279,8 @@ def _resolve_decode_native_bf16_selector(
         "NUM_KV_HEADS": num_kv_heads,
     }
     if (
-        _get_component_member("decode_native_bf16", exact_selector, required=False)
+        not return_lse
+        and _get_component_member("decode_native_bf16", exact_selector, required=False)
         is not None
     ):
         return dict(sorted(exact_selector.items()))
@@ -291,6 +303,7 @@ def _is_cake_fmha_decode_native_bf16_available(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> bool:
     """Return whether the registry contains this BF16 route."""
 
@@ -305,6 +318,7 @@ def _is_cake_fmha_decode_native_bf16_available(
             has_window=has_window,
             use_scale_ptr=use_scale_ptr,
             retain_kv_l2=retain_kv_l2,
+            return_lse=return_lse,
         )
         is not None
     )
@@ -331,6 +345,28 @@ def _get_component_launch_sources(
         if not source.is_file():
             raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
     return body, launch_binding
+
+
+def _get_component_launch_defines(
+    component_name: str,
+    target: CakeFmhaTarget,
+    selector: Mapping[str, int],
+) -> list[str]:
+    """Defines a member's per-architecture launch override hands its binding.
+
+    A member whose ``launch_override.by_arch`` splits only the dynamic shared
+    memory by architecture compiles one host binding for both architectures;
+    the binding reads the architecture's ``dynamic_shared_memory_bytes`` from
+    ``CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES``.
+    """
+
+    member = _get_component_member(component_name, selector, required=True)
+    assert member is not None
+    by_arch = (member.get("launch_override") or {}).get("by_arch")
+    if by_arch is None:
+        return []
+    smem = by_arch[_TARGET_MANIFEST_ARCH[target]]["dynamic_shared_memory_bytes"]
+    return [f"-D{_SINK_PEER_CLC_DYNAMIC_SMEM_MACRO}={smem}"]
 
 
 def _get_component_sources(
@@ -360,7 +396,6 @@ def _validate_context_specialization(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> dict[str, int]:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
@@ -385,49 +420,7 @@ def _validate_context_specialization(
         "IS_CAUSAL": int(is_causal),
         "RETURN_LSE": int(return_lse),
     }
-    if exact_profile is None:
-        return selector
-    if exact_profile == "q511":
-        expected = (11, 10, 2, 5, 32, 1)
-        exact_selector = {
-            "HEADS_PER_GROUP": 5,
-            "L2_SWIZZLE": 1,
-            "NUM_M_BLOCKS": 11,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 32,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25,
-        }
-    else:
-        expected = (6, 10, 2, 5, 1024, 8)
-        exact_selector = {
-            "HEADS_PER_GROUP": 5,
-            "L2_SWIZZLE": 8,
-            "NUM_M_BLOCKS": 6,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 1024,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25,
-        }
-    actual = (
-        num_m_blocks,
-        num_q_heads,
-        num_kv_heads,
-        pack_g,
-        page_size,
-        l2_swizzle,
-    )
-    if actual != expected or selector != {
-        "ENABLE_SINK": 0,
-        "IS_CAUSAL": 1,
-        "RETURN_LSE": 0,
-    }:
-        raise ValueError(
-            f"context BF16 exact profile {exact_profile} does not match its fixed selector"
-        )
-    return {**selector, **exact_selector}
+    return selector
 
 
 def get_cake_fmha_context_bf16_uri(
@@ -442,7 +435,6 @@ def get_cake_fmha_context_bf16_uri(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> str:
     selector = _validate_context_specialization(
         target,
@@ -455,7 +447,6 @@ def get_cake_fmha_context_bf16_uri(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     )
     return (
         f"cake_fmha_context_bf16_{target}"
@@ -463,7 +454,6 @@ def get_cake_fmha_context_bf16_uri(
         f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
         f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
         f"_sink{selector['ENABLE_SINK']}"
-        f"_exact{exact_profile or 'generic'}"
         f"_{CAKE_FMHA_JIT_TAG}"
     )
 
@@ -481,7 +471,6 @@ def gen_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> JitSpec:
     """Build one authenticated context BF16 specialization."""
 
@@ -496,7 +485,6 @@ def gen_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     )
     sources = _get_component_sources(
         "context_bf16", target, selector, _CONTEXT_BF16_JIT_BINDING
@@ -515,7 +503,6 @@ def gen_cake_fmha_context_bf16_module(
             is_causal=is_causal,
             return_lse=return_lse,
             enable_sink=enable_sink,
-            exact_profile=exact_profile,
         ),
         sources=list(sources),
         extra_cuda_cflags=[
@@ -551,7 +538,6 @@ def load_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ):
     module = gen_cake_fmha_context_bf16_module(
         target,
@@ -564,7 +550,6 @@ def load_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context BF16 module: %s", module)
     return module
@@ -1049,6 +1034,7 @@ def get_cake_fmha_decode_native_bf16_uri(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> str:
     selector = _validate_decode_native_specialization(
         target,
@@ -1061,12 +1047,38 @@ def get_cake_fmha_decode_native_bf16_uri(
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
     )
+    # The module name only changes when ``return_lse`` bypasses an exact-shape
+    # member; elsewhere the generic member serves both cases from one build.
+    lse_tag = ""
+    if return_lse and _resolve_decode_native_bf16_selector(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    ) != _resolve_decode_native_bf16_selector(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+        return_lse=True,
+    ):
+        lse_tag = "_lse"
     return (
         f"cake_fmha_decode_native_bf16_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_sink{selector['HAS_SINK']}_window{selector['HAS_WINDOW']}"
         f"_scale{selector['USE_SCALE_PTR']}_retain{selector['RETAIN_KV_L2']}"
-        f"_{CAKE_FMHA_JIT_TAG}"
+        f"{lse_tag}_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1082,6 +1094,7 @@ def gen_cake_fmha_decode_native_bf16_module(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ) -> JitSpec:
     """Build one authenticated decode-native BF16 specialization."""
 
@@ -1095,6 +1108,7 @@ def gen_cake_fmha_decode_native_bf16_module(
         has_window=has_window,
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
+        return_lse=return_lse,
     )
     if selector is None:
         raise RuntimeError(
@@ -1117,6 +1131,7 @@ def gen_cake_fmha_decode_native_bf16_module(
             has_window=has_window,
             use_scale_ptr=use_scale_ptr,
             retain_kv_l2=retain_kv_l2,
+            return_lse=return_lse,
         ),
         sources=list(sources),
         extra_cuda_cflags=[
@@ -1130,6 +1145,7 @@ def gen_cake_fmha_decode_native_bf16_module(
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
             f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
+            *_get_component_launch_defines("decode_native_bf16", target, selector),
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -1149,6 +1165,7 @@ def load_cake_fmha_decode_native_bf16_module(
     has_window: bool,
     use_scale_ptr: bool,
     retain_kv_l2: bool,
+    return_lse: bool = False,
 ):
     module = gen_cake_fmha_decode_native_bf16_module(
         target,
@@ -1160,6 +1177,7 @@ def load_cake_fmha_decode_native_bf16_module(
         has_window=has_window,
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
+        return_lse=return_lse,
     ).build_and_load()
     logger.info("Loaded Cake FMHA decode-native BF16 module: %s", module)
     return module
@@ -1399,7 +1417,8 @@ def gen_cake_fmha_decode_balanced_hd64_module(
     One body (Q16Kv128 ForGen, page 16, ``q_len == 1``) in two structural
     instances: ``max_group`` 8 (eight softmax columns, 1..8 query heads per KV
     head -- the kernel of record) and 16 (sixteen columns, 9..16); batch, heads
-    and KV lengths are runtime kernel arguments.
+    and KV lengths are runtime kernel arguments.  One source serves both
+    instances (``CAKE_FMHA_BALANCED_MAX_GROUPS``).
     """
 
     component = cake_fmha_balanced_hd64_component_name(max_group)
@@ -1413,6 +1432,7 @@ def gen_cake_fmha_decode_balanced_hd64_module(
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             "-use_fast_math",
+            f"-DCAKE_FMHA_BALANCED_MAX_GROUPS={max_group}",
             f"-DCAKE_FMHA_BALANCED_LAUNCH={manifest_component['launch_binding']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
@@ -1591,6 +1611,7 @@ def gen_cake_fmha_decode_native_fp16_nhd_module(
             f"-DCAKE_FMHA_HAS_SINK={selector['HAS_SINK']}",
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+            f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -1815,6 +1836,7 @@ def gen_cake_fmha_decode_native_fp16_hd512_module(
             f"-DNUM_KV_HEADS={num_kv_heads}",
             f"-DCAKE_FMHA_HAS_WINDOW={selector['HAS_WINDOW']}",
             f"-DCAKE_FMHA_USE_SCALE_PTR={selector['USE_SCALE_PTR']}",
+            f"-DCAKE_FMHA_RETAIN_KV_L2={selector['RETAIN_KV_L2']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )

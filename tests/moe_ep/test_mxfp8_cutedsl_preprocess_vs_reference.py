@@ -369,8 +369,8 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
         topk_idx = symm_buffer.topk_idx[:num_tokens]
         topk_weights = symm_buffer.topk_weights[:num_tokens]
 
-        # The kernel folds the per-token topk weight into fc1 (apply_topk_in_fc1
-        # defaults to True) *before* the MXFP8 fc1-out round-trip; post-hoc
+        # The kernel folds the routing weight in before the MXFP8 FC1-output
+        # round-trip; post-hoc
         # weighting would NOT match, because the quant step changes the effective
         # magnitude. Apply it in the reference the same way and reduce with a
         # plain sum over topk (the weight is already folded in).
@@ -385,7 +385,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             fc2_weight_sf=fc2_plain_sf.unsqueeze(0),
             ab_dtype=data_dtype,
             gate_up_clamp=problem["gate_up_clamp"],
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"

@@ -46,9 +46,9 @@ that pins it ships the pair `..._tso_dpf` (16-byte-aligned output views) and
 launch argument.
 
 `decode_table.py` is the measured dispatch table
-(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for
-every family and `M <= 4096 / 16384` for the families measured faster on the
-decode kernel than on the GEMM)
+(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256 / 512 /
+1024 / 2048` for every family and `M <= 4096 / 16384` for 20 and 21 of the 22
+families)
 over the 22 representative families (TP8 and TP1 `q_proj`, `fused_qkvg`,
 `in_proj_qkvgfab`, `f_a`, `f_b`, `b_proj`, `kv_a`, `fused_qkv_a`, `q_b`,
 `kv_b`, `o_proj`): one table shared by SM100 and SM103 (`DECODE_TABLE`) plus
@@ -101,17 +101,35 @@ activation bit-exact vs the DeepGEMM recipe; see
 `tests/experimental/test_cake_kimi_k3_fp8_projection.py`.
 
 Benchmark: `python benchmarks/bench_cake_kimi_k3_fp8_projection.py [--cupti]`
-times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
-1024, 2048, 4096, 16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
+times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
+16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 
 Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
-and one launcher source per program for both architectures (the
-architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
-compiles each source with the flags of the device it runs on), the shared
-device-helper and host-helper headers, and nothing else. `cake_jit.py`
-registers them (`MODULES`: one record per program; `KERNELS`: logical kernel
-key -> program and compile-line defines, e.g. the three quantization widths
-are one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
-generated-program export; nothing there is hand-written.
+source per program or lever family and one launcher source per argument plan
+(5 launcher sources, one per argument plan, for the 107 programs) for both
+architectures (the architecture-specific lowering sits behind `__CUDA_ARCH__`
+guards; the JIT compiles each source with the flags of the device it runs
+on), the shared device-helper header, the host-helper header
+(`cake_kimi_k3_fp8_projection_host_common.cuh`: the dynamic-shared-memory and
+non-portable-cluster opt-ins and the receipt / chain text every launcher
+includes verbatim inside its namespace), and nothing else. A program that
+differs from a sibling only by a prefetch lever or by the raster group width
+shares the sibling's kernel source and selects its lever value
+(`-DCAKE_LEVER_*`, `-DACC_BUFS` or `-DGROUP_M`) on the compile line; the programs of one
+argument plan share one launcher source, and a program's TMA box dimensions,
+dynamic shared memory, block and cluster dimensions and its kernel symbol and
+launcher namespace are `-D` constants on its compile line (`-DCAKE_BOX_*`,
+`-DCAKE_DYN_SMEM`, `-DCAKE_BLOCK_X`, `-DCAKE_CLUSTER_*`,
+`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`); a source's defaults select
+the program it was exported for.
+`cake_jit.py` registers them (`MODULES`: one record per program, expanded
+from one row per program and the five named argument plans of `ARG_PLANS`;
+`KERNELS`: logical kernel key -> program and compile-line defines, e.g. the
+three quantization widths are one program with `-DQUANT_UNITS=1|2|4`). Both
+are written by the Cake generated-program export; the shared kernel and
+launcher sources, the hoisted host header, the `-D` entries of the records
+that use them, the row form of `MODULES`, the `shim` / `fast_math` row fields
+and the `_KERNEL_PROGRAMS` table are a hand fold of the exported files,
+pending regeneration by the export.

@@ -13,7 +13,6 @@ passed as caller-prequantized MXFP8 tuples, as in MoK's functional API.
 
 from dataclasses import dataclass, replace
 import math
-import os
 import sys
 
 import torch
@@ -80,6 +79,10 @@ def count_routed_load(routes, ep_size, local_experts):
     bins, so the integer bin arithmetic is exact: bin 0 collects the ``-1``
     padding, the last bin the ids at the limit, values outside the range are
     dropped, and the ``ep_size`` middle bins are the counts.
+
+    Reference form. The production path reads the owner bins the count kernel
+    writes into the tail of its ``counts`` buffer (``MoKScheduler.owner_loads``);
+    the two agree exactly (``tests/experimental/test_mok_bf16.py``).
     """
     flat = routes.reshape(-1)
     owner = torch.div(flat, local_experts, rounding_mode="floor")
@@ -138,6 +141,7 @@ class MoKFunctional:
         self._recompute_kernels = {}
         # id(native workspace) -> asynchronous per-rank routed-load observation.
         self._load_state = {}
+        self._sm_count = {}  # device index -> multi_processor_count
         self._kernels(1.0 if clamped_swiglu else None)
         self.epilogues = MoKEpilogues(topk)
 
@@ -282,14 +286,13 @@ class MoKFunctional:
                 "Workspace/expert geometry differs from the compiled scheduler"
             )
         self._check_device(workspace)
-        properties = torch.cuda.get_device_properties(workspace.device)
+        sms = self._sm_count.get(workspace.device.index)
+        if sms is None:
+            sms = self._sm_count[workspace.device.index] = (
+                torch.cuda.get_device_properties(workspace.device).multi_processor_count
+            )
         for count in (config.fwd_num_comm_sms, config.bwd_num_comm_sms):
-            if (
-                type(count) is not int
-                or count <= 0
-                or count % 2
-                or count >= properties.multi_processor_count
-            ):
+            if type(count) is not int or count <= 0 or count % 2 or count >= sms:
                 raise ValueError(
                     "Communication-SM counts must be positive, even and leave compute SMs"
                 )
@@ -299,10 +302,7 @@ class MoKFunctional:
                 type(hot) is not tuple
                 or len(hot) != 2
                 or any(
-                    type(count) is not int
-                    or count <= 0
-                    or count % 2
-                    or count >= properties.multi_processor_count
+                    type(count) is not int or count <= 0 or count % 2 or count >= sms
                     for count in hot
                 )
             ):
@@ -319,6 +319,8 @@ class MoKFunctional:
                 raise ValueError(
                     "imbalance_threshold must be a finite number above 1.0"
                 )
+        if type(config.comm_split_log) is not bool:
+            raise TypeError("comm_split_log must be a boolean")
         if (
             type(config.minibatch_size) is not int
             or config.minibatch_size <= 0
@@ -374,12 +376,15 @@ class MoKFunctional:
             workspace.ep_rank,
         )
         self._observe_load(workspace, config)
+        layout = self.scheduler.layout(counts, workspace.schedule_capacity, rank)
+        self.scheduler.release_counts()
         if owner is not None:
             return MoKSourceSchedule(
                 peer_rank=rank,
                 peer_token_idx=token,
                 num_tokens=count,
                 tokens_per_expert=counts,
+                layout=layout,
                 num_source_tokens=top_experts.shape[0],
                 workspace=owner,
             )
@@ -388,6 +393,7 @@ class MoKFunctional:
             peer_token_idx=token,
             num_tokens=count,
             tokens_per_expert=counts,
+            layout=layout,
         )
 
     def _load_entry(self, workspace, create):
@@ -395,7 +401,7 @@ class MoKFunctional:
         if entry is None and create:
             entry = {
                 "host": [
-                    torch.empty(workspace.ep_size, dtype=torch.int64, pin_memory=True)
+                    torch.empty(workspace.ep_size, dtype=torch.int32, pin_memory=True)
                     for _ in range(2)
                 ],
                 "events": [torch.cuda.Event() for _ in range(2)],
@@ -410,12 +416,14 @@ class MoKFunctional:
     def _observe_load(self, workspace, config):
         """Queue an asynchronous observation of the per-rank routed-row load.
 
-        Every rank counts the gathered expert IDs per owning rank
-        (``count_routed_load``: padding and invalid IDs excluded) on device and
-        copies the counts into pinned host memory behind a CUDA event: no host
-        synchronization. ``_comm_split`` reads the latest completed observation,
-        so a split change takes effect from the first later launch whose event
-        has completed. The gathered IDs, and so the counts, are identical on
+        Every rank counts the gathered expert IDs per owning rank on device
+        (the scheduler's count kernel bins them in the pass that counts this
+        rank's experts; padding and invalid IDs excluded, as
+        ``count_routed_load`` specifies) and copies the counts into pinned
+        host memory behind a CUDA event: no host synchronization.
+        ``_comm_split`` reads the latest completed observation, so a split
+        change takes effect from the first later launch whose event has
+        completed. The gathered IDs, and so the counts, are identical on
         every rank, but each rank decides from its own latest completed
         observation: with back-to-back steps a launch may run with different
         splits on different ranks for a step. The split is a per-rank launch
@@ -430,18 +438,17 @@ class MoKFunctional:
         ):
             return
         entry = self._load_entry(workspace, create=True)
-        loads = count_routed_load(
-            workspace.all_gather_top_experts_buffer,
-            workspace.ep_size,
-            self.local_experts,
-        )
+        loads = self.scheduler.owner_loads()
         slot = entry["slot"] ^ 1
         entry["host"][slot].copy_(loads, non_blocking=True)
         entry["events"][slot].record()
         entry["slot"] = entry["pending"] = slot
 
     def _comm_split(self, config, workspace):
-        """(forward, backward) communication-SM counts for the next launch."""
+        """(forward, backward) communication-SM counts for the next launch.
+
+        ``config.comm_split_log`` prints each change of the split to stderr.
+        """
         base = (config.fwd_num_comm_sms, config.bwd_num_comm_sms)
         if config.imbalance_comm_sms is None:
             return base
@@ -458,7 +465,7 @@ class MoKFunctional:
         )
         if split != entry["split"]:
             entry["split"] = split
-            if os.environ.get("CAKE_MOK_COMM_SPLIT_LOG", "0") not in ("", "0"):
+            if config.comm_split_log:
                 loads = entry["loads"]
                 total = sum(loads)
                 ratio = f"{max(loads) * len(loads) / total:.3f}" if total else "n/a"
@@ -598,6 +605,7 @@ class MoKFunctional:
             fwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            layout=schedule.layout,
         )
         self._barrier(workspace)
         output = self.epilogues.forward(
@@ -661,6 +669,7 @@ class MoKFunctional:
             fwd_comm_sms,
             config.macrobatch_size,
             config.minibatch_size,
+            layout=schedule.layout,
         )
         # Peers read this rank's x_buffer during dispatch.
         self._barrier(workspace)
@@ -769,21 +778,33 @@ class MoKFunctional:
             config.macrobatch_size,
             config.minibatch_size,
             weight_grad_accumulators=weight_grad_accumulators,
+            layout=schedule.layout,
         )
+        # Only dx_shared and the six weight gradients outlive the launch. The
+        # kernel's routed and shared scratch (values[1:9]) is dropped here,
+        # before the epilogue output and the score-gradient copy are allocated,
+        # instead of at return: the caching allocator hands its blocks only to
+        # later allocations on this stream, which are ordered after the kernel.
+        dx_shared, weight_grads = values[0], values[9:]
+        del values
         self._barrier(workspace)
         dx = self.epilogues.backward(
-            values[0], workspace.d_x_routed_buffer[: shared_rows * workspace.topk]
+            dx_shared, workspace.d_x_routed_buffer[: shared_rows * workspace.topk]
         )
+        del dx_shared
         dscores = workspace.d_router_weight_buffer[:source_count].clone()
+        dwg_shared, dwg_routed, dwu_shared, dwu_routed, dwd_shared, dwd_routed = (
+            weight_grads
+        )
         return (
             dx[:source_count],
             dscores,
-            values[10],
-            values[12],
-            values[14],
-            values[9],
-            values[11],
-            values[13],
+            dwg_routed,
+            dwu_routed,
+            dwd_routed,
+            dwg_shared,
+            dwu_shared,
+            dwd_shared,
         )
 
 

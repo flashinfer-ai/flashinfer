@@ -167,6 +167,7 @@ def _process_nvfp4_packed_scales(
     packed_scales: torch.Tensor,
     *,
     scale_factor: float,
+    a_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     packed_scales = packed_scales.to(torch.float16)
     packed_scales = packed_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
@@ -176,7 +177,11 @@ def _process_nvfp4_packed_scales(
     if scale_factor > 1.0:
         packed_scales = (packed_scales.float() * scale_factor).to(torch.float16)
     packed_scales = packed_scales * (2**7)
-    packed_scales[packed_scales < 2] = 0
+    # FP16's packed scale decoder represents these values exactly, including
+    # E4M3 subnormals. Flushing them discards valid checkpoint weights.
+    # Retain the existing BF16 encoding policy.
+    if a_dtype != torch.float16:
+        packed_scales[packed_scales < 2] = 0
     packed_scales = packed_scales.view(torch.int16) << 1
     packed_scales = packed_scales.view(torch.float8_e4m3fn)
     return packed_scales[:, 1::2].contiguous()
@@ -558,6 +563,7 @@ def _permute_nvfp4_scales(
         expert_packed = _process_nvfp4_packed_scales(
             expert_scales,
             scale_factor=combined_scale_factor,
+            a_dtype=a_dtype,
         )
         if packed_scales is None:
             packed_scales = torch.empty(

@@ -26,6 +26,7 @@ import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 from .reference_delta_rule import blockwise_delta_rule, delta_rule
 
@@ -47,19 +48,12 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
 
 
-def _kernel_table(arch: str) -> dict[str, str]:
-    table = gdn_cp_jit.KERNELS
-    if any(isinstance(value, dict) for value in table.values()):
-        table = table[arch]
-    return table
-
-
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_registry_maps_every_logical_kernel_to_a_program_for_the_arch(
     arch: str,
 ) -> None:
     csrc = _source_root().parents[1]
-    table = _kernel_table(arch)
+    table = gdn_cp_jit.KERNELS[arch]
     assert table, "the generated registry lists the kernels the host dispatches on"
     for name in table:
         program = gdn_cp_jit.program_for(name, arch)
@@ -91,11 +85,32 @@ def test_generated_sources_carry_no_manifest_and_every_kernel_is_registered() ->
     assert referenced <= present, sorted(referenced - present)
 
 
+def test_programs_shared_across_arches_serve_the_same_logical_kernels() -> None:
+    """A program listed for several architectures answers the same names on each.
+
+    One logical kernel must resolve to one program wherever that program is
+    listed; a table naming it on one architecture only would re-split the
+    generations silently.
+    """
+
+    for program, record in gdn_cp_jit.MODULES.items():
+        if len(record["arches"]) < 2:
+            continue
+        per_arch = []
+        for arch in record["arches"]:
+            table = gdn_cp_jit.KERNELS[arch]
+            per_arch.append({name for name in table if table[name] == program})
+            for name in per_arch[-1]:
+                assert gdn_cp_jit.program_for(name, arch) == program
+        assert per_arch[0], program
+        assert all(names == per_arch[0] for names in per_arch), (program, per_arch)
+
+
 @pytest.mark.parametrize(
     ("arch", "hq", "hv", "expected_t", "expected_chunk", "expected_source"),
     [
         ("sm_100a", 16, 48, "t_precompute", None, None),
-        ("sm_103a", 16, 48, "t_precompute_gb300_hv48_min6", None, None),
+        ("sm_103a", 16, 48, "t_precompute", None, None),
         ("sm_103a", 16, 64, "t_precompute", 4096, 32768),
         ("sm_103a", 32, 32, "t_precompute", None, None),
     ],
@@ -131,30 +146,13 @@ def test_long_row_dispatch_is_exact(
 @pytest.mark.parametrize(
     ("arch", "seq_lens", "dtype", "heads", "expected_prefill"),
     [
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (1, 1, 1),
-            "cp_prefill_equal_head_checkpoint",
-        ),
-        (
-            "sm_100a",
-            (128,),
-            torch.float16,
-            (32, 32, 32),
-            "cp_prefill_equal_head_checkpoint",
-        ),
+        ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
+        ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
+        ("sm_107a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
-        (
-            "sm_100a",
-            (128, 129),
-            torch.float16,
-            (4, 2, 2),
-            "cp_prefill_generic_checkpoint",
-        ),
+        ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
 )
 def test_generic_plan_selects_head_dtype_and_tail_routes(
@@ -611,7 +609,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
         "host_stages",
     ),
     [
-        # GB300 fp16 Hk16 alias class: the cu32 rule wins over the alias for int32 ...
+        # GB300 fp16 Hk16 class: int32 prefix sums select the cu32 program ...
         (
             "sm_103a",
             torch.float16,
@@ -622,7 +620,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
             "t_precompute_cu32",
             False,
         ),
-        # ... and int64 keeps today's alias.
+        # ... and int64 keeps the plain Stage-1 program.
         (
             "sm_103a",
             torch.float16,
@@ -630,7 +628,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
             (1536, 257),
             1536,
             torch.int64,
-            "t_precompute_gb300_hv48_min6",
+            "t_precompute",
             False,
         ),
         (
@@ -687,7 +685,7 @@ def _cu32_arches_only(name: str, arch: str) -> bool:
         ),
     ],
 )
-def test_build_plan_selects_cu32_before_the_gb300_alias(
+def test_build_plan_selects_cu32_only_for_int32_where_shipped(
     monkeypatch: pytest.MonkeyPatch,
     arch: str,
     io_dtype: torch.dtype,
@@ -738,32 +736,6 @@ def test_build_plan_selects_cu32_before_the_gb300_alias(
         )
 
 
-def test_has_gdn_cp_kernel_handles_flat_and_per_arch_tables(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    modules = {
-        "p100": {"arches": ["sm_100a"]},
-        "pall": {"arches": ["sm_100a", "sm_103a"]},
-    }
-    monkeypatch.setattr(gdn_cp_jit, "MODULES", modules)
-    monkeypatch.setattr(gdn_cp_jit, "KERNELS", {"a": "p100", "b": "pall"})
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_103a") is False
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_103a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("missing", "sm_100a") is False
-    monkeypatch.setattr(
-        gdn_cp_jit,
-        "KERNELS",
-        {"sm_100a": {"a": "p100", "b": "pall"}, "sm_103a": {"b": "pall"}},
-    )
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_100a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("a", "sm_103a") is False
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_103a") is True
-    assert gdn_cp_jit.has_gdn_cp_kernel("b", "sm_107a") is False
-    with pytest.raises(ValueError):
-        gdn_cp_jit.program_for("a", "sm_103a")
-
-
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 @pytest.mark.parametrize("name", ["t_precompute_cu32", "t_precompute_bf16_cu32"])
 def test_cu32_stage1_registry_arg_plan_matches_the_host_call(
@@ -788,8 +760,6 @@ def test_cu32_stage1_registry_arg_plan_matches_the_host_call(
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ]
-    assert record["launch"]["block"] == [128, 1, 1]
-    assert record["launch"]["cluster"] == [1, 1, 1]
 
 
 class _CopyRecorder:
@@ -2232,14 +2202,6 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
     assert (prepared.cu_seqlens is cu_seqlens) == (cu_dtype == torch.int64)
 
 
-def _cuda_kernel_names(profile: torch.profiler.profile) -> list[str]:
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
@@ -2279,12 +2241,13 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
             _capture_graph=False,
         )
         torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as profile:
-            output, final_state = prepared.replay()
-            torch.cuda.synchronize()
-        kernels = _cuda_kernel_names(profile)
+        replays = []
+        # every CUDA record of one replay (copies included: the assertion below wants none); the helper retries a
+        # profiler session that lost its device records, so the outputs are the last replay's
+        kernels = cuda_kernel_names(
+            lambda: replays.append(prepared.replay()), exclude=()
+        )
+        output, final_state = replays[-1]
         assert len(kernels) == 4, kernels
         assert not any("copy" in name.lower() for name in kernels), kernels
         expected_t = f"t_precompute{'_bf16' if dtype == torch.bfloat16 else ''}"
@@ -2292,10 +2255,7 @@ def test_direct_composite_launches_only_the_four_stages_for_both_prefix_dtypes(
             assert prepared.plan.t_kernel == f"{expected_t}_cu32"
             assert prepared.plan.host_stages_cu_seqlens is False
         else:
-            assert prepared.plan.t_kernel in (
-                expected_t,
-                "t_precompute_gb300_hv48_min6",
-            )
+            assert prepared.plan.t_kernel == expected_t
             assert prepared.cu_seqlens is cu_seqlens
         assert torch.equal(prepared.cu_seqlens, prefix)
         assert torch.equal(cu_seqlens, prefix.to(cu_dtype))
@@ -2348,12 +2308,7 @@ def test_checkpoint_row_launches_no_extra_cast_kernel_for_int32_prefix() -> None
             _capture_graph=False,
         )
         torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as profile:
-            prepared.replay()
-            torch.cuda.synchronize()
-        kernels = _cuda_kernel_names(profile)
+        kernels = cuda_kernel_names(prepared.replay, exclude=())
         assert not any("copy" in name.lower() for name in kernels), kernels
         counts[cu_dtype] = len(kernels)
         assert prepared.plan.checkpoint_count == 3

@@ -173,7 +173,7 @@ def run_mxfp4_k3_geometry(rank, world):
         activation="situ",
         situ_beta=4.0,
         situ_linear_beta=25.0,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
     )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, create_mega_kernel(cfg).runtime_requirements(bootstrap)

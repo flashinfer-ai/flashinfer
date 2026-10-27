@@ -1991,6 +1991,35 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
     )
 
 
+def _nvfp4_4over6_axis_value(kwargs: dict) -> int | None:
+    """Wire code of an explicit ``nvfp4_4over6=``; ``None`` when unset.
+
+    Unset is not resolved here: that would read the environment and make the
+    definition name depend on the process rather than on the call.
+    """
+    from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: PLC0415
+        _UNSET,
+        nvfp4_4over6_code,
+        resolve_nvfp4_4over6,
+    )
+
+    setting = kwargs.get("nvfp4_4over6", _UNSET)
+    if setting is _UNSET:
+        return None
+    return nvfp4_4over6_code(resolve_nvfp4_4over6(setting))
+
+
+def _nvfp4_4over6_axis() -> Const:
+    return Const(
+        description=(
+            "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); "
+            "absent when the call left nvfp4_4over6 unset."
+        ),
+        abbrev="r4o6",
+        extract=_nvfp4_4over6_axis_value,
+    )
+
+
 _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "seq_len": Var(description="Number of tokens."),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
@@ -2022,6 +2051,7 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "activation_type": Const(
         description="Fused activation type; 10 selects SiTU.", abbrev="act"
     ),
+    "nvfp4_4over6": _nvfp4_4over6_axis(),
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
@@ -3220,6 +3250,7 @@ cutlass_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Const(abbrev="i"),
         "top_k": Const(abbrev="topk"),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "input": Tensor(
@@ -3785,6 +3816,7 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         "activation_type": Const(
             description="Fused activation type; 10 selects SiTU.", abbrev="act"
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "gemm1_bias": _FP4_STANDARD_INPUTS["gemm1_bias"],
@@ -4125,6 +4157,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
                 "intermediate_size for non-gated ReLU^2."
             ),
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "x": Tensor(
@@ -4148,7 +4181,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="Packed FP4 FC1 weights.",
+            description="Packed FP4 FC1 weights (float8_e4m3fn for mxfp8).",
         ),
         "w1_weight_sf": Tensor(
             [
@@ -4174,12 +4207,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             dtype="float32",
             optional=True,
             description=(
-                "Global scale for W4A4 FC2 input quantization; omitted for W4A8/W4A16."
+                "Global scale for W4A4 FC2 input quantization; omitted for "
+                "W4A8/W4A16/MXFP8."
             ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="Packed FP4 FC2 weights.",
+            description="Packed FP4 FC2 weights (float8_e4m3fn for mxfp8).",
         ),
         "w2_weight_sf": Tensor(
             [
@@ -4209,7 +4243,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
+            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -4970,9 +5004,9 @@ def _cute_dsl_fused_moe_reference(
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
-    elif quant_mode == "w4a8":
+    elif quant_mode in ("w4a8", "mxfp8"):
         if x_sf is None:
-            raise ValueError("x_sf is required when quant_mode='w4a8'")
+            raise ValueError(f"x_sf is required when quant_mode={quant_mode!r}")
         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif quant_mode == "w4a16":
         if x_sf is not None:
@@ -4981,7 +5015,8 @@ def _cute_dsl_fused_moe_reference(
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
     is_mxfp4 = quant_mode == "w4a8"
-    if is_mxfp4:
+    is_mxfp8 = quant_mode == "mxfp8"
+    if is_mxfp4 or is_mxfp8:
 
         def mma_scales_to_logical(scales, rows, columns):
             groups = scales.shape[5]
@@ -4991,14 +5026,24 @@ def _cute_dsl_fused_moe_reference(
                 .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
             )
 
+        # FP4 weights pack two values per byte; FP8 weights are unpacked.
+        k_per_byte = 2 if is_mxfp4 else 1
         w1_weight_sf = mma_scales_to_logical(
-            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * 2
+            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * k_per_byte
         )
         w2_weight_sf = mma_scales_to_logical(
-            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
+            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * k_per_byte
         )
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+    if is_mxfp8:
+        W1 = _dequantize_fp4_hidden_states(
+            w1_weight, w1_weight_sf, is_weights_mxfp4=True
+        )
+        W2 = _dequantize_fp4_hidden_states(
+            w2_weight, w2_weight_sf, is_weights_mxfp4=True
+        )
+    else:
+        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
+        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)

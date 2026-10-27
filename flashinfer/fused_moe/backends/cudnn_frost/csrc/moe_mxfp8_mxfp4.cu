@@ -309,7 +309,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
             run(out, x, ids, scores, w1, w2, sf1, sf2, xsf, alpha1, alpha2, workspace, mode);
           });
     }
-    return Function(nullptr);
+    return std::nullopt;
   }
 
  private:

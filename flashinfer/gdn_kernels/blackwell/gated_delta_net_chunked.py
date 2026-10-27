@@ -192,6 +192,8 @@ class GatedDeltaNetChunkedKernel:
     # TMA descriptor size in bytes
     arch = "sm_100"
     bytes_per_tensormap = 128
+    # L1 policy for the initial-state load; arch subclasses may override.
+    state_load_l1c_evict_priority = cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE
     num_tensormaps = 4
 
     def __init__(
@@ -211,7 +213,15 @@ class GatedDeltaNetChunkedKernel:
         store_final_state: bool = True,
         enable_checkpoints: bool = False,
         is_persistent: bool = True,
+        state_stride_divisibility: int = 1,
     ):
+        if state_stride_divisibility < 1 or (
+            state_stride_divisibility & (state_stride_divisibility - 1)
+        ):
+            raise ValueError(
+                "state_stride_divisibility must be a positive power of two, got "
+                f"{state_stride_divisibility}"
+            )
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
         self.state_dtype = state_dtype
@@ -227,6 +237,8 @@ class GatedDeltaNetChunkedKernel:
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
         self.is_persistent = is_persistent
+        # Divisibility of the state slot/head/V strides; 1 = unknown.
+        self.state_stride_divisibility = state_stride_divisibility
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -508,32 +520,31 @@ class GatedDeltaNetChunkedKernel:
                 stride=(o.stride[2], o.stride[0], (o.stride[1], h_r * o.stride[1])),
             ),
         )
+
+        def _state_view(s):
+            """(V, K, (h_r, h_qv), N) view of an ``[N, H, V, K]`` state tensor."""
+            stride_n, stride_h, stride_v = s.stride[0], s.stride[1], s.stride[2]
+            if cutlass.const_expr(self.state_stride_divisibility > 1):
+                stride_n = cute.assume(stride_n, divby=self.state_stride_divisibility)
+                stride_h = cute.assume(stride_h, divby=self.state_stride_divisibility)
+                stride_v = cute.assume(stride_v, divby=self.state_stride_divisibility)
+            return cute.make_tensor(
+                s.iterator,
+                cute.make_layout(
+                    (s.shape[2], s.shape[3], (h_r, h_qv), s.shape[0]),
+                    stride=(
+                        stride_v,
+                        s.stride[3],
+                        (stride_h, h_r * stride_h),
+                        stride_n,
+                    ),
+                ),
+            )
+
         if cutlass.const_expr(s_in is not None):
-            s_in = cute.make_tensor(
-                s_in.iterator,
-                cute.make_layout(
-                    (s_in.shape[2], s_in.shape[3], (h_r, h_qv), s_in.shape[0]),
-                    stride=(
-                        s_in.stride[2],
-                        s_in.stride[3],
-                        (s_in.stride[1], h_r * s_in.stride[1]),
-                        s_in.stride[0],
-                    ),
-                ),
-            )
+            s_in = _state_view(s_in)
         if cutlass.const_expr(s_out is not None):
-            s_out = cute.make_tensor(
-                s_out.iterator,
-                cute.make_layout(
-                    (s_out.shape[2], s_out.shape[3], (h_r, h_qv), s_out.shape[0]),
-                    stride=(
-                        s_out.stride[2],
-                        s_out.stride[3],
-                        (s_out.stride[1], h_r * s_out.stride[1]),
-                        s_out.stride[0],
-                    ),
-                ),
-            )
+            s_out = _state_view(s_out)
         if cutlass.const_expr(self.enable_checkpoints):
             s_checkpoints = cute.make_tensor(
                 s_checkpoints.iterator,
@@ -3081,16 +3092,13 @@ class GatedDeltaNetChunkedKernel:
         cute.arch.fence_view_async_tmem_load()
         kk0_handle.release()
         for sub in cutlass.range(tKKrKK.shape[2]):
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_0.shape[0]),
-                vectorize=True,
-                unroll_full=True,
-            ):
-                tKKrKK[k, 0, sub] = (
-                    tKKrKK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * tGrBeta_0
-                )
-            tKKrKK_out_cal[None, 0, sub].store(
-                tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
+            self._scale_convert_shared_acc_fragment(
+                tKKrKK,
+                tGrCumsumlog_0,
+                tGrBeta_0,
+                tKKrKK_out_cal,
+                self.inverse_dtype,
+                sub,
             )
             cute.copy(
                 tiled_ainv_cal_r2s,
@@ -3109,16 +3117,13 @@ class GatedDeltaNetChunkedKernel:
         cute.arch.fence_view_async_tmem_load()
         kk1_handle.release()
         for sub in cutlass.range(tKKrKK.shape[2]):
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_1.shape[0]),
-                vectorize=True,
-                unroll_full=True,
-            ):
-                tKKrKK[k, 0, sub] = (
-                    tKKrKK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * tGrBeta_1
-                )
-            tKKrKK_out_cal[None, 0, sub].store(
-                tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
+            self._scale_convert_shared_acc_fragment(
+                tKKrKK,
+                tGrCumsumlog_1,
+                tGrBeta_1,
+                tKKrKK_out_cal,
+                self.inverse_dtype,
+                sub,
             )
             cute.copy(
                 tiled_ainv_cal_r2s,
@@ -3145,14 +3150,8 @@ class GatedDeltaNetChunkedKernel:
                 tTR_tStS[None, 0, sub, qk0_handle.index],
                 tQKrQK[None, 0, sub],
             )
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_0.shape[0]), vectorize=True, unroll_full=True
-            ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * scale
-                )
-            tQKrQK_out[None, 0, sub].store(
-                tQKrQK[None, 0, sub].load().to(self.io_dtype)
+            self._scale_convert_shared_acc_fragment(
+                tQKrQK, tGrCumsumlog_0, scale, tQKrQK_out, self.io_dtype, sub
             )
             cute.copy(
                 tiled_qk_r2s,
@@ -3176,14 +3175,8 @@ class GatedDeltaNetChunkedKernel:
                 tTR_tStS[None, 0, sub, qk1_handle.index],
                 tQKrQK[None, 0, sub],
             )
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_1.shape[0]), vectorize=True, unroll_full=True
-            ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * scale
-                )
-            tQKrQK_out[None, 0, sub].store(
-                tQKrQK[None, 0, sub].load().to(self.io_dtype)
+            self._scale_convert_shared_acc_fragment(
+                tQKrQK, tGrCumsumlog_1, scale, tQKrQK_out, self.io_dtype, sub
             )
             cute.copy(
                 tiled_qk_r2s,
@@ -3202,6 +3195,24 @@ class GatedDeltaNetChunkedKernel:
             a_inv_ready_producer,
             qk_ready_producer,
         )
+
+    @cute.jit
+    def _scale_convert_shared_acc_fragment(
+        self, frag, tGr, scalar, out_frag, out_dtype, sub
+    ):
+        """Scale a fragment by tGr and a scalar, then convert into out_frag."""
+        for k in cutlass.range(
+            cute.size(tGr.shape[0]), vectorize=True, unroll_full=True
+        ):
+            frag[k, 0, sub] = frag[k, 0, sub] * tGr[k, 0, sub] * scalar
+        out_frag[None, 0, sub].store(frag[None, 0, sub].load().to(out_dtype))
+
+    @cute.jit
+    def _apply_beta_upconvert_ainv(self, tCrAICal, tKKrBeta, tCrAIAcc):
+        """Up-convert the inverse fragment to f32 and apply per-column beta."""
+        tCrAIAcc.store(tCrAICal.load().to(self.acc_dtype))
+        for k in cutlass.range(cute.size(tCrAIAcc), vectorize=True, unroll_full=True):
+            tCrAIAcc[k] = tCrAIAcc[k] * tKKrBeta[k]
 
     @cute.jit
     def _partial_pair_inverse(
@@ -3320,9 +3331,7 @@ class GatedDeltaNetChunkedKernel:
             coord = tTR_tScS[k]
             tKKrBeta[k] = sBeta[coord[1], 0, beta0_handle.index]
         cute.copy(tiled_ainv_cal_s2r, tCsAI0Cal, tCrAI0Cal)
-        tCrAI0Acc.store(tCrAI0Cal.load().to(self.acc_dtype))
-        for k in cutlass.range(cute.size(tCrAI0), vectorize=True, unroll_full=True):
-            tCrAI0Acc[k] = tCrAI0Acc[k] * tKKrBeta[k]
+        self._apply_beta_upconvert_ainv(tCrAI0Cal, tKKrBeta, tCrAI0Acc)
         tCrAI0.store(tCrAI0Acc.load().to(self.io_dtype))
         cute.copy(tiled_ainv_s2r, tCrAI0, tCsAI0)
         cute.arch.fence_view_async_shared()
@@ -3342,9 +3351,7 @@ class GatedDeltaNetChunkedKernel:
             coord = tTR_tScS[k]
             tKKrBeta[k] = sBeta[coord[1], 0, beta1_handle.index]
         cute.copy(tiled_ainv_cal_s2r, tCsAI1Cal, tCrAI1Cal)
-        tCrAI1Acc.store(tCrAI1Cal.load().to(self.acc_dtype))
-        for k in cutlass.range(cute.size(tCrAI1), vectorize=True, unroll_full=True):
-            tCrAI1Acc[k] = tCrAI1Acc[k] * tKKrBeta[k]
+        self._apply_beta_upconvert_ainv(tCrAI1Cal, tKKrBeta, tCrAI1Acc)
         tCrAI1.store(tCrAI1Acc.load().to(self.io_dtype))
         cute.copy(tiled_ainv_s2r, tCrAI1, tCsAI1)
         cute.arch.fence_view_async_shared()
@@ -3992,7 +3999,7 @@ class GatedDeltaNetChunkedKernel:
             cute.autovec_copy(
                 tGR_tCgState[None, 0, sub],
                 tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                l1c_evict_priority=self.state_load_l1c_evict_priority,
             )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
                 tRT_tCrState[None, 0, sub].store(
@@ -4525,6 +4532,7 @@ class GatedDeltaNetChunkedKernel:
             )
             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
                 tTR_rKS[k] = tTR_rKS[k] * tGrCumprod[k]
+            cute.arch.fence_view_async_tmem_load()
             ks_handle.release()
             for k in cutlass.range(cute.size(tTR_rKS), vectorize=True):
                 tRT_rV[k] = tRT_rV[k] - tTR_rKS[k].to(self.io_dtype)
@@ -4566,6 +4574,7 @@ class GatedDeltaNetChunkedKernel:
             tTR_rNv_inp[None, sub, 0].store(
                 tTR_rNv[None, sub, 0].load().to(self.io_dtype)
             )
+        cute.arch.fence_view_async_tmem_load()
         nv_handle.release()
 
         tTR_rDv = tTR_rNv

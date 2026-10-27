@@ -165,6 +165,7 @@ MTP_BASELINE = {
 }
 
 PREFILL_BASELINE = {
+    "kernel_variant": "sm100",
     "target_key": (0, "sm100a"),
     "io_dtype_str": "torch.bfloat16",
     "state_dtype_str": "torch.float32",
@@ -180,6 +181,7 @@ PREFILL_BASELINE = {
     "cu_checkpoints_dtype_str": "none",
     "initial_state_inner_strides": None,
     "output_state_inner_strides": None,
+    "state_stride_divisibility": 1,
     "num_sm": 148,
 }
 
@@ -339,6 +341,8 @@ def test_nontranspose_name_varies_with_every_argument(param, alternate):
         ("stride1", 16384),
         ("stride2", 128),
         ("stride3", 1),
+        ("num_stages", 5),
+        ("blocks_per_state", 4),
     ],
 )
 def test_pretranspose_name_varies_with_every_argument(param, alternate):
@@ -400,8 +404,10 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("cu_checkpoints_dtype_str", "torch.int32"),
         ("initial_state_inner_strides", (16384, 128, 1)),
         ("output_state_inner_strides", (16384, 128, 1)),
+        ("state_stride_divisibility", 128),
         ("num_sm", 132),
         ("target_key", (0, "sm90a")),
+        ("kernel_variant", "sm107"),
     ],
 )
 def test_prefill_name_varies_with_every_argument(param, alternate):

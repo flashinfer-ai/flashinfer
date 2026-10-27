@@ -13,6 +13,7 @@ SM103 (B300/GB300):
 | API | Program family | QK MMA | PV MMA |
 | --- | --- | --- | --- |
 | `minimax_h3_varlen_attention(q, k, v, cu_seqlens, *, softmax_scale=None, out=None)` | `bf16` | `kind::f16` (BF16 x BF16, FP32 accumulate) | `kind::f16` (BF16 P x BF16 V) |
+| `minimax_h3_varlen_fp8_attention(q8, k8, v8, cu_seqlens, *, q_descale, k_descale, v_descale, softmax_scale=None, out=None)` | `fp8` | `kind::f8f6f4` (E4M3 x E4M3, FP32 accumulate; `q_descale * k_descale` folded into the exponent) | `kind::f8f6f4` (E4M3 P at unit scale x E4M3 V, FP32 accumulate; `v_descale` in the epilogue) |
 | `minimax_h3_varlen_nvfp4_attention(..., pv_mode="fp8")` | `nvfp4_fp8pv` | `kind::mxf4nvf4` E2M1 x E2M1, UE4M3 block-16 scales | `kind::f8f6f4` E4M3 P (TMEM) x dense E4M3 V, one per-tensor scale `448 / amax(V)` |
 | `minimax_h3_varlen_nvfp4_attention(..., pv_mode="fp4")` | `nvfp4_fp4pv` | `kind::mxf4nvf4` E2M1 x E2M1, UE4M3 block-16 scales | `kind::mxf4nvf4` E2M1 P (score-tile maximum as the shared anchor of the eight K16 scales) x E2M1 V^T with per-16-token UE4M3 scales |
 
@@ -201,6 +202,51 @@ their segment are written by one TMA store from a swizzled shared-memory slab;
 ragged tail tiles are stored row by row predicated on the row lying inside its
 segment.
 
+### FP8 (`fp8`)
+
+`minimax_h3_varlen_fp8_attention` takes E4M3 (`torch.float8_e4m3fn`) `query` /
+`key` / `value` (contiguous or the same strided `[T, H, 128]` views the BF16
+route reads: unit innermost stride, 16-byte-aligned head and token strides and
+base) with one FP32 descale per tensor (a float or a one-element CUDA tensor),
+and writes BF16 `out`. The kernel is the BF16 schedule over E4M3 operands: one
+persistent 2-CTA-cluster tcgen05 program, `kind::f8f6f4` K32 MMAs for QK and
+PV, FP32 softmax whose exponent carries `softmax_scale * q_descale * k_descale`,
+probabilities rounded to E4M3 at unit scale (`cvt.rn.satfinite.e4m3x2.f32`, the
+row sum taken over the unrounded FP32 probabilities) and `v_descale / row_sum`
+applied once in the epilogue.
+
+The host reuses the BF16 planner unchanged (`cached_bf16_segment_plan`: the
+same unit table, LPT slot assignment, K/V splits below four waves and tail-round
+Q split, the same plan cache) and binds one of two static programs
+(`ROUTES["fp8__<arch>"]["programs"]`, generated in-tree under
+`csrc/cake_minimax_h3_varlen_fp8_attention/` with the loader
+`flashinfer/jit/cake_minimax_h3_varlen_fp8_attention.py`): `ATTENTION`, the
+general program, or `ATTENTION_TINY` when every segment has at most
+`FP8_TINY_SEGMENT_TOKENS = 32` tokens (`fp8_attention_stage`). In a tiny plan
+every K/V block is a tail block with at most 32 valid keys, so the tiny build
+runs its softmax exp stream over 32 keys and stores zero E4M3 groups for the
+masked rest -- the output is bitwise the general program's, and the 9-token DiT
+rows gain 5-6 %; on plans with full blocks the same build is slower, so the
+general program keeps every other plan byte for byte. K/V-split units are
+merged by the BF16 route's `combine` program (same FP16 partial rows and
+`(m, l)` format). There is no dynamic-schedule or `sread` program on this
+route. The grid is `2 * num_clusters` as the BF16 route's.
+
+Numerics: against an FP32 reference over the dequantized E4M3 inputs the kernel
+holds `0.1 + 0.1 |expected|` elementwise (the E4M3-P convention: the
+probabilities of a row are rounded to E4M3 before the PV MMA, which on a
+9-key softmax does not average out -- the DiT tiny rows sit at 1.11x the
+SM120 FP8 operator's error and within 1.07x of the best public per-tensor FP8
+route). The error is the one every per-tensor-scaled FP8 attention pays.
+
+`minimax_h3_varlen_fp8_attention_bf16(q, k, v, cu_seqlens, *, softmax_scale=None, out=None)`
+is the BF16 convenience form: it quantizes BF16 `query` / `key` / `value` per
+tensor (`descale = amax(|x|) / 448`, torch ops, no host synchronization) and
+calls the FP8 entry with those descales; `prepare_minimax_h3_varlen_fp8_attention_bf16`
+returns a runner whose `quantize()` and `attention()` halves are separately
+launchable (the quantization is host composition outside the kernel and is
+timed apart from the attention launch).
+
 ### NVFP4 (`nvfp4_fp4pv`, `nvfp4_fp8pv`)
 
 Quantization is part of the pipeline: one fused quantizer launch (`quantize`;
@@ -288,9 +334,10 @@ is CUDA-Graph capturable.
   `tcgen05.ld.red` and runs every exp2 on MUFU; SM100 emulates the last
   quarter of the softmax exp2 pairs with a packed polynomial). SM120/SM121
   lack the tcgen05/TMEM path and are not supported; SM90 is not a target.
-* BF16 THD inputs and BF16 output only, head dimension 128, noncausal,
+* BF16 THD inputs (`bf16`, `nvfp4_*`) or E4M3 THD inputs with per-tensor
+  descales (`fp8`) and BF16 output only, head dimension 128, noncausal,
   self-attention (`H_q == H_kv`), no bias/mask/window/LSE/dropout.
-* The BF16 route reads strided `query` / `key` / `value` views in place: the
+* The BF16 and FP8 routes read strided `query` / `key` / `value` views in place: the
   host binding encodes the TMA descriptors from the views' strides and
   passes the Q view's token/head strides to the kernel's ragged-tail copy
   path. `out` is always contiguous. The NVFP4 routes (whose quantizers

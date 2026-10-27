@@ -20,11 +20,18 @@ import json
 import os
 import re
 import shutil
+import sys
+import sysconfig
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
-from .core import JitSpec, get_tmpdir, logger
+from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+from ._cute_dsl_source import (
+    _hash_source_files,
+    cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
+)
 
 _META_FILENAME = "meta.json"
 
@@ -38,31 +45,39 @@ def cute_dsl_cache_disabled() -> bool:
 def _get_cute_dsl_version() -> str:
     """Fingerprint of the CuTe-DSL compiler stack.
 
-    Covers every installed ``nvidia-cutlass-dsl*`` distribution, not just the
+    Covers TVM-FFI, Torch, Python's ABI, and every installed
+    ``nvidia-cutlass-dsl*`` distribution, not just the
     main package: the codegen backend lives in the libs packages, and the
     CUDA-family variant is encoded in the package *name* (e.g.
     ``nvidia-cutlass-dsl-libs-cu13``), so two environments with the same DSL
     version but different libs variants must not share artifacts. The system
-    CUDA toolkit/driver deliberately does not participate: ``cute.compile``
-    uses this bundled stack, not ``CUDA_HOME``.
+    CUDA toolkit does not participate: ``cute.compile`` uses the bundled stack,
+    not ``CUDA_HOME``. The active backend is not fingerprinted separately: with
+    multiple CUDA-family variants installed, a host driver change can switch
+    the selected backend without changing this fingerprint. Persistent caches
+    need a reset after such a switch.
     """
     import importlib.metadata
 
-    stack = sorted(
-        f"{dist.metadata['Name']}=={dist.version}"
-        for dist in importlib.metadata.distributions()
-        if (dist.metadata["Name"] or "").lower().startswith("nvidia-cutlass-dsl")
+    stack = []
+    for dist in importlib.metadata.distributions():
+        name = (dist.metadata["Name"] or "").lower().replace("_", "-")
+        if name in {"torch", "apache-tvm-ffi"} or name.startswith("nvidia-cutlass-dsl"):
+            # RECORD distinguishes rebuilt wheels with the same version;
+            # direct_url carries the commit of a VCS dependency override.
+            provenance = json.dumps(
+                [dist.read_text("RECORD"), dist.read_text("direct_url.json")]
+            ).encode()
+            stack.append(
+                f"{name}=={dist.version}:{hashlib.sha256(provenance).hexdigest()}"
+            )
+    return ";".join(
+        [
+            str(sys.implementation.cache_tag),
+            str(sysconfig.get_config_var("SOABI")),
+            *sorted(stack),
+        ]
     )
-    return ";".join(stack) if stack else "unknown"
-
-
-def _hash_source_files(paths: tuple) -> str:
-    sha = hashlib.sha256()
-    for path in sorted(str(p) for p in paths):
-        sha.update(path.encode())
-        with open(path, "rb") as f:
-            sha.update(f.read())
-    return sha.hexdigest()
 
 
 def _get_compile_arch() -> str:
@@ -95,6 +110,8 @@ class JitSpecCuteDsl(JitSpec):
     whole module); instances of the same op family share a module directory
     and its module-level ``meta.json``.
     """
+
+    toolchain = "cute_dsl"
 
     def __init__(
         self,
@@ -195,7 +212,9 @@ class JitSpecCuteDsl(JitSpec):
         """
         from filelock import FileLock
 
+        started = time.perf_counter()
         self._compiled_kernel = self.compile_fn()
+        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
         with FileLock(self.lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
@@ -318,7 +337,7 @@ def build_and_load_cute_dsl_kernel(
     # file from the hash: a weakened key could serve stale artifacts.
     try:
         source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError) as e:
+    except (OSError, TypeError, SyntaxError, ValueError) as e:
         logger.warning(
             f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
             f"({e}); bypassing the disk cache for this kernel."

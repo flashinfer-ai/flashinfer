@@ -1,6 +1,6 @@
 """Strict cold-L2 CUPTI benchmark for grouped MXFP8 quantization kernels.
 
-Both arms use preallocated outputs and prepared scheduling metadata.  The
+All arms use preallocated outputs and prepared scheduling metadata.  The
 timed boundary contains exactly one quantization-kernel launch; cuTile prefix
 construction and all Python/output-allocation work stay outside that boundary.
 CUDA-event and CUDA-graph timing fallbacks are deliberately rejected.
@@ -19,10 +19,11 @@ import torch
 
 import flashinfer.testing.utils as timing_utils
 from flashinfer.cutile import is_cuda_tile_available
-from flashinfer.jit.cake_grouped_mxfp8_quantize import (
-    get_cake_grouped_mxfp8_quantize_module,
+from flashinfer.quantization.fp8_quantization import (
+    cake_grouped_mxfp8_quantize_launch,
     is_cake_grouped_mxfp8_quantize_available,
 )
+from flashinfer.jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
     build_mxfp8_grouped_quant_prefix_schedule,
     mxfp8_grouped_quantize_cutile_with_prefix_schedule,
@@ -149,9 +150,8 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
     )
     cake_q = torch.empty_like(cutile_q)
     cake_sf = torch.empty_like(cutile_sf)
-
-    cake_module = get_cake_grouped_mxfp8_quantize_module(x.dtype, x.device)
-    stream = int(torch.cuda.current_stream(x.device).cuda_stream)
+    cuda_q = torch.empty_like(cutile_q)
+    cuda_sf = torch.empty_like(cutile_sf)
 
     def run_cutile_kernel():
         mxfp8_grouped_quantize_cutile_with_prefix_schedule(
@@ -165,20 +165,33 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         )
 
     def run_cake_kernel():
-        cake_module.run(input_tensor, mask, cake_q, cake_sf, stream)
+        # The Cake program pads K to 128-column tiles itself: it reads the
+        # unpadded input and writes the preallocated padded outputs in exactly
+        # one kernel launch on the current stream.
+        cake_grouped_mxfp8_quantize_launch(x, mask, cake_q, cake_sf)
+
+    cuda_module = gen_mxfp8_quantization_sm100_module().build_and_load()
+
+    def run_cuda_kernel():
+        # use_silu_and_mul=False, enable_pdl=False; reads the unpadded x.
+        cuda_module.silu_and_mul_mxfp8_experts_quantize(
+            x, mask, cuda_q, cuda_sf, False, False
+        )
 
     run_cutile_kernel()
     run_cake_kernel()
+    run_cuda_kernel()
     torch.cuda.synchronize()
 
     for group in range(batch):
         valid_rows = int(mask[group].item())
-        torch.testing.assert_close(
-            cake_q[group, :valid_rows].view(torch.uint8),
-            cutile_q[group, :valid_rows].view(torch.uint8),
-            rtol=0,
-            atol=0,
-        )
+        for arm_q in (cake_q, cuda_q):
+            torch.testing.assert_close(
+                arm_q[group, :valid_rows].view(torch.uint8),
+                cutile_q[group, :valid_rows].view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
 
     def valid_scales(physical):
         m_tiles = (rows + 127) // 128
@@ -187,9 +200,10 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         unswizzled = unswizzled.transpose(2, 4)
         return unswizzled.reshape(batch, m_tiles * 128, k_tiles * 4)[:, :rows]
 
-    torch.testing.assert_close(
-        valid_scales(cake_sf), valid_scales(cutile_sf), rtol=0, atol=0
-    )
+    for arm_sf in (cake_sf, cuda_sf):
+        torch.testing.assert_close(
+            valid_scales(arm_sf), valid_scales(cutile_sf), rtol=0, atol=0
+        )
 
     arms = {
         "cutile": _measure_strict_cupti(
@@ -197,6 +211,9 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         ),
         "cake": _measure_strict_cupti(
             run_cake_kernel, warmup_ms=warmup_ms, benchmark_ms=benchmark_ms
+        ),
+        "cuda": _measure_strict_cupti(
+            run_cuda_kernel, warmup_ms=warmup_ms, benchmark_ms=benchmark_ms
         ),
     }
     return {
@@ -211,6 +228,7 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         "expected_gpu_activity_count_per_call": 1,
         "arms": arms,
         "cake_speedup": arms["cutile"]["median_ms"] / arms["cake"]["median_ms"],
+        "cuda_speedup": arms["cutile"]["median_ms"] / arms["cuda"]["median_ms"],
     }
 
 

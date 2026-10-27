@@ -64,7 +64,7 @@ BF16_FC1_BASE = dict(
 
 
 class TestBf16Fc1GatherValidation:
-    def test_validate_gather_noswap_tile16(self):
+    def test_validate_gather_both_orientations(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -74,7 +74,7 @@ class TestBf16Fc1GatherValidation:
             num_tokens=256,
             top_k=1,
             tile_n=16,
-            tile_k=128,
+            tile_k=64,
             mma_n=16,
             epi_tile_n=16,
             **uniform_pipeline_stage_overrides(4),
@@ -90,10 +90,10 @@ class TestBf16Fc1GatherValidation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             **BF16_FC1_BASE,
         )
@@ -107,12 +107,13 @@ class TestBf16Fc1TmaRoute:
     def _run(
         self,
         *,
-        tile_n=16,
+        tile_n=128,
         num_experts=2,
         num_tokens=256,
         top_k=1,
         swap_ab=False,
         act_kind=0,
+        pipeline_stages=4,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -129,10 +130,10 @@ class TestBf16Fc1TmaRoute:
             num_tokens=num_tokens,
             top_k=top_k,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
-            **uniform_pipeline_stage_overrides(4),
+            **uniform_pipeline_stage_overrides(pipeline_stages),
             **cfg,
         )
         assert result
@@ -141,7 +142,7 @@ class TestBf16Fc1TmaRoute:
         self._run(swap_ab=False)
 
     def test_tma_route_swap(self):
-        self._run(swap_ab=True)
+        self._run(tile_n=16, swap_ab=True)
 
     def test_tma_route_swiglu_noswap(self):
         self._run(swap_ab=False, act_kind=1)
@@ -155,26 +156,37 @@ class TestBf16Fc1TmaRoute:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             return_output=True,
             **uniform_pipeline_stage_overrides(4),
             **{**self.TMA_CFG, "act_kind": 1},
         )
 
         assert ok
-        assert output.shape == (256, 8)
+        assert output.shape == (256, 64)
 
     def test_tma_route_swiglu_swap(self):
-        self._run(swap_ab=True, act_kind=1)
+        self._run(tile_n=16, swap_ab=True, act_kind=1)
 
     def test_tma_route_4experts(self):
         self._run(num_experts=4, num_tokens=512)
 
     def test_tma_route_nonrounded_topk(self):
         self._run(num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
+
+    @pytest.mark.parametrize("tile_n", [16, 32, 128])
+    def test_tma_route_swap_partial_tile(self, tile_n):
+        self._run(
+            num_experts=3,
+            num_tokens=130,
+            top_k=2,
+            swap_ab=True,
+            tile_n=tile_n,
+            pipeline_stages=3,
+        )
 
 
 class TestBf16Fc1ActivationValidation:
@@ -193,27 +205,27 @@ class TestBf16Fc1ActivationValidation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=16 if swap_ab else 128,
+            tile_k=64,
+            mma_n=16 if swap_ab else 128,
+            epi_tile_n=16 if swap_ab else 128,
             **uniform_pipeline_stage_overrides(4),
             **cfg,
         )
 
-    def test_validate_geglu_noswap_tile16(self):
+    def test_validate_geglu_noswap_tile128(self):
         self._validate(act_kind=2, swap_ab=False)
 
     def test_validate_geglu_swap_tile16(self):
         self._validate(act_kind=2, swap_ab=True)
 
-    def test_validate_relu_eltwise_noswap_tile16(self):
+    def test_validate_relu_eltwise_noswap_tile128(self):
         self._validate(act_kind=3, swap_ab=False)
 
     def test_validate_relu_eltwise_swap_tile16(self):
         self._validate(act_kind=3, swap_ab=True)
 
-    def test_validate_none_eltwise_noswap_tile16(self):
+    def test_validate_none_eltwise_noswap_tile128(self):
         self._validate(act_kind=0, swap_ab=False)
 
     def test_validate_none_eltwise_swap_tile16(self):
@@ -224,7 +236,7 @@ class TestBf16Fc1GatherGPU:
     def _run(
         self,
         *,
-        tile_n=16,
+        tile_n=128,
         pipeline_stages=4,
         num_experts=1,
         num_tokens=128,
@@ -253,7 +265,7 @@ class TestBf16Fc1GatherGPU:
             num_tokens=num_tokens,
             top_k=top_k,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             problem_k=problem_k,
@@ -264,14 +276,8 @@ class TestBf16Fc1GatherGPU:
             f"FC1 gather failed: tile_n={tile_n}, swap={swap_ab}, cluster={cluster_m}"
         )
 
-    def test_gather_noswap_tile8(self):
-        self._run(tile_n=8, swap_ab=False)
-
-    def test_gather_noswap_tile16(self):
-        self._run(tile_n=16, swap_ab=False)
-
-    def test_gather_noswap_tile32(self):
-        self._run(tile_n=32, swap_ab=False)
+    def test_gather_noswap_tile128(self):
+        self._run(tile_n=128, swap_ab=False)
 
     def test_gather_swap_tile8(self):
         self._run(tile_n=8, swap_ab=True)
@@ -280,20 +286,20 @@ class TestBf16Fc1GatherGPU:
         self._run(tile_n=16, swap_ab=True)
 
     def test_gather_noswap_4experts(self):
-        self._run(tile_n=16, num_experts=4, num_tokens=512, swap_ab=False)
+        self._run(tile_n=128, num_experts=4, num_tokens=512, swap_ab=False)
 
     def test_gather_swap_4experts(self):
         self._run(tile_n=16, num_experts=4, num_tokens=512, swap_ab=True)
 
     def test_gather_noswap_nonrounded_topk(self):
-        self._run(tile_n=16, num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
+        self._run(tile_n=128, num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
 
     def test_gather_swap_nonrounded_topk(self):
         self._run(tile_n=16, num_experts=3, num_tokens=130, top_k=2, swap_ab=True)
 
-    def test_gather_noswap_2cta_tile64(self):
+    def test_gather_noswap_2cta_tile128(self):
         self._run(
-            tile_n=64,
+            tile_n=128,
             swap_ab=False,
             cluster_m=2,
             num_experts=2,
@@ -315,7 +321,7 @@ class TestBf16Fc1GatherGPU:
     def test_gather_2cta_multistage_wrap(self, swap_ab):
         """Cover two full turns of the four-stage 2-CTA LDGSTS pipeline."""
         self._run(
-            tile_n=64,
+            tile_n=64 if swap_ab else 128,
             swap_ab=swap_ab,
             cluster_m=2,
             num_experts=1,
@@ -329,7 +335,7 @@ class TestBf16Fc1SwiGLU:
     def _run_swiglu(
         self,
         *,
-        tile_n=16,
+        tile_n=128,
         pipeline_stages=4,
         num_experts=1,
         num_tokens=128,
@@ -357,7 +363,7 @@ class TestBf16Fc1SwiGLU:
             num_tokens=num_tokens,
             top_k=1,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             gemm1_clamp_limit_value=gemm1_clamp_limit_value,
@@ -366,11 +372,8 @@ class TestBf16Fc1SwiGLU:
         )
         assert result
 
-    def test_swiglu_noswap_tile8(self):
-        self._run_swiglu(tile_n=8, swap_ab=False)
-
-    def test_swiglu_noswap_tile16(self):
-        self._run_swiglu(tile_n=16, swap_ab=False)
+    def test_swiglu_noswap_tile128(self):
+        self._run_swiglu(tile_n=128, swap_ab=False)
 
     def test_swiglu_swap_tile8(self):
         self._run_swiglu(tile_n=8, swap_ab=True)
@@ -380,7 +383,7 @@ class TestBf16Fc1SwiGLU:
 
     def test_swiglu_gather_noswap(self):
         self._run_swiglu(
-            tile_n=16, swap_ab=False, has_gather=True, num_experts=2, num_tokens=256
+            tile_n=128, swap_ab=False, has_gather=True, num_experts=2, num_tokens=256
         )
 
     def test_swiglu_gather_swap(self):
@@ -390,7 +393,7 @@ class TestBf16Fc1SwiGLU:
 
     def test_swiglu_clamp_bias_noswap(self):
         self._run_swiglu(
-            tile_n=16,
+            tile_n=128,
             swap_ab=False,
             gemm1_clamp_limit_value=0.01,
             bias_type=1,
@@ -398,7 +401,7 @@ class TestBf16Fc1SwiGLU:
 
 
 class TestBf16Fc1GeGLU:
-    def _run_geglu(self, *, tile_n=16, swap_ab=False, has_gather=False):
+    def _run_geglu(self, *, tile_n=128, swap_ab=False, has_gather=False):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -416,7 +419,7 @@ class TestBf16Fc1GeGLU:
             num_tokens=256,
             top_k=1,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             **uniform_pipeline_stage_overrides(4),
@@ -428,14 +431,14 @@ class TestBf16Fc1GeGLU:
         self._run_geglu(swap_ab=False)
 
     def test_geglu_swap(self):
-        self._run_geglu(swap_ab=True)
+        self._run_geglu(tile_n=16, swap_ab=True)
 
     def test_geglu_gather(self):
         self._run_geglu(swap_ab=False, has_gather=True)
 
 
 class TestBf16Fc1ReLU2:
-    def _run_relu2(self, *, tile_n=16, swap_ab=False, has_gather=False):
+    def _run_relu2(self, *, tile_n=128, swap_ab=False, has_gather=False):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -453,7 +456,7 @@ class TestBf16Fc1ReLU2:
             num_tokens=256,
             top_k=1,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             **uniform_pipeline_stage_overrides(4),
@@ -465,7 +468,7 @@ class TestBf16Fc1ReLU2:
         self._run_relu2(swap_ab=False)
 
     def test_relu2_swap(self):
-        self._run_relu2(swap_ab=True)
+        self._run_relu2(tile_n=16, swap_ab=True)
 
     def test_relu2_gather(self):
         self._run_relu2(swap_ab=False, has_gather=True)
@@ -544,7 +547,7 @@ class TestBf16Fc1HighThroughput:
             problem_n=4096,
             problem_k=1024,
             tile_n=64,
-            tile_k=128,
+            tile_k=64,
             mma_n=64,
             epi_tile_n=64,
             **uniform_pipeline_stage_overrides(5),
