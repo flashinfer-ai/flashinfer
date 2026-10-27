@@ -940,9 +940,18 @@ def test_shared_workspace_is_sized_over_every_planned_bucket_not_the_largest_bat
             w.plan_info.workspace_size == sized[b]
             and w.plan_info.workspace_size <= ws.numel()
         )
-        out = _run(
-            w.plan_info, cases[b], workspace_buffer=ws
-        )  # a wrapper plan owns no workspace: the shared buffer rides every run
-        _check_step(
-            cases[b], w.plan_info, out, f"shared workspace over the max, batch {b}"
+        # a wrapper plan owns no workspace: the shared buffer rides every run; the oracle helper reads a plan's OWN workspace, so the
+        # bucket is also run through a plan that owns one and the two must agree bitwise (the same body, the same bytes)
+        out = _run(w.plan_info, cases[b], workspace_buffer=ws).clone()
+        ids_w = cases[b].block_ids_out.clone()
+        lens_w = cases[b].block_lens_out.clone()
+        ref = _plan(cases[b], g)
+        out_ref = _run(ref, cases[b])
+        _check_step(cases[b], ref, out_ref, f"shared workspace over the max, batch {b}")
+        assert (
+            torch.equal(out, out_ref)
+            and torch.equal(ids_w, cases[b].block_ids_out)
+            and torch.equal(lens_w, cases[b].block_lens_out)
+        ), (
+            f"batch {b}: the wrapper plan over the shared buffer and the owning plan differ"
         )

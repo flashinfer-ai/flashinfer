@@ -528,7 +528,7 @@ def qwen_3_8_block_workspace_size(
     """The workspace bytes a decode plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
     workspace with at init (before its memory profiling, when the caches do not exist yet) -- as the MAXIMUM of this query over
     EVERY ``(batch_size, q_len_per_req)`` bucket it will plan, with the knobs it will plan them with.  The largest batch is not the
-    largest workspace: under ``sparse_tile_form="auto"`` the batch 1 and 2 buckets take the lean body, whose split-KV partial slab
+    largest workspace: under ``sparse_tile_form="auto"`` an admissible batch 1 or 2 bucket (``top_k >= 8``) takes the lean body, whose split-KV partial slab
     (split 65 at the default k) is wider than the tcgen05 core's at batch 4 (at the 24 / 2 geometry, q_len 1, page 16, 512 pages,
     ring_cap 4: about 3.3 MB at batch 2 against about 1.8 MB at batch 4), so a buffer sized from the largest batch alone is rejected
     by the smaller bucket's plan with the typed workspace error.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
