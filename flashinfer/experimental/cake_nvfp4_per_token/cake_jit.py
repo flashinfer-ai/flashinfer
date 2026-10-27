@@ -26,13 +26,15 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Registry of the generated programs of the per-token NVFP4 path (SM100 /
 # SM103).
 #
-# ``ARG_PLANS`` holds the four argument orders of the generated host
+# ``ARG_PLANS`` holds the five argument orders of the generated host
 # launchers as ``[kind, name]`` pairs (``tma_buffer`` / ``buffer`` tensors,
 # ``parameter`` scalars and the ``grid`` dims; ``cake_backend._entry`` orders
 # a call by name): ``quant`` (the quantizer), ``gemm`` (the 1-CTA GEMM
 # programs of both orientations), ``gemm_2cta`` (the 2-CTA cluster programs,
-# which also take the raw block-scale buffers) and ``gemm_2cta_skt`` (their
-# stream-K form, which adds the reduction workspace).  ``_PROGRAMS`` holds
+# which also take the raw block-scale buffers), ``gemm_2cta_skt`` (their
+# stream-K form, which adds the reduction workspace) and ``gemm_2cta_ptr``
+# (the 2-CTA programs that store the output from registers, which take it as
+# a plain buffer instead of a TMA descriptor).  ``_PROGRAMS`` holds
 # one row per generated program, keyed by the 20-hex digest of the module
 # name ``cake_nvfp4_per_token_<digest>``: the ``ARG_PLANS`` key, the
 # exporter's closure digest of each architecture the program is built for
@@ -160,6 +162,24 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["buffer", "red_gen"],
         ["parameter", "sk_tiles"],
         ["parameter", "sk_pairs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_2cta_ptr": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "SFA"],
+        ["tma_buffer", "SFB"],
+        ["buffer", "SFA_RAW"],
+        ["buffer", "SFB_RAW"],
+        ["buffer", "alpha"],
+        ["buffer", "out"],
+        ["parameter", "M"],
+        ["parameter", "N"],
+        ["parameter", "K_tiles"],
+        ["parameter", "tok_tiles"],
+        ["parameter", "num_tiles"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
