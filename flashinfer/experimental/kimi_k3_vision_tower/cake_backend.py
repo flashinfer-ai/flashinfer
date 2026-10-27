@@ -118,6 +118,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
 
@@ -2788,7 +2789,8 @@ class KimiK3VisionTowerRunner:
     raises between two launches (an interrupt or an error on the host), it
     first enqueues the zeroing of a counter-gated plan's ready counters on the
     same stream, after the launches already enqueued, so the next forward
-    starts from clear counters.
+    starts from clear counters; it then re-raises the original exception, also
+    when the zeroing raises (a note on Python 3.11+ records that failure).
     """
 
     plan: VisionTowerPlan
@@ -2806,11 +2808,18 @@ class KimiK3VisionTowerRunner:
             try:
                 for item in self.launches:
                     item.entry(*item.arguments)
-            except BaseException:
+            except BaseException as error:
                 # A forward cut short leaves the counts of the producer twins it enqueued, and the next forward's
                 # consumers would pass their waits before their producers store; the last FC1 never ran to clear them.
+                # The caller sees the original exception even when the clear fails too (as a note on it).
                 if self.plan.ready_counters:
-                    self.plan.workspace["ready_counters"].zero_()
+                    try:
+                        self.plan.workspace["ready_counters"].zero_()
+                    except BaseException as clear_error:
+                        if sys.version_info >= (3, 11):
+                            error.add_note(
+                                f"clearing the ready counters also failed: {clear_error!r}"
+                            )
                 raise
         return self.out
 

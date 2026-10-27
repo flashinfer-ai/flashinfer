@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import dataclasses
 import math
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -1848,6 +1851,56 @@ def test_ready_counters_clear_after_an_interrupted_forward():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, expected) and cleared()
+
+
+class _ClearFailed(RuntimeError):
+    """The zeroing of the ready counters failing in its turn (e.g. on a broken stream)."""
+
+
+@pytest.mark.parametrize("clear_fails", [False, True])
+def test_an_interrupted_launch_reraises_its_own_exception(monkeypatch, clear_fails):
+    """Host only: launch() of a counter-gated plan cut short between two launches enqueues one zeroing of the counters
+    and re-raises the original exception, also when the zeroing raises in its turn (on Python 3.11+ a note on the
+    original then names that failure); a plan without ready counters leaves its workspace alone."""
+    monkeypatch.setattr(
+        cb, "tvm_ffi", types.SimpleNamespace(use_torch_stream=contextlib.nullcontext)
+    )
+    events = []
+
+    class Words:
+        def zero_(self):
+            events.append("zero")
+            if clear_fails:
+                raise _ClearFailed("the stream is broken")
+
+    def ran(*arguments):
+        events.append("ran")
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def runner(ready_counters):
+        plan = types.SimpleNamespace(
+            ready_counters=ready_counters, workspace={"ready_counters": Words()}
+        )
+        launches = tuple(
+            cb._Launch("layer_out_proj", 0, "", {}, entry, ())
+            for entry in (ran, stop, ran)
+        )
+        return cb.KimiK3VisionTowerRunner(plan, None, None, None, None, launches)
+
+    with pytest.raises(_Interrupt) as raised:
+        runner(("E1", "E2", "E3")).launch()
+    assert events == ["ran", "zero"]
+    notes = getattr(raised.value, "__notes__", [])
+    if clear_fails and sys.version_info >= (3, 11):
+        assert len(notes) == 1 and "_ClearFailed" in notes[0]
+    else:
+        assert notes == []
+    events.clear()
+    with pytest.raises(_Interrupt):
+        runner(()).launch()
+    assert events == ["ran"]
 
 
 def test_one_shot_api():
