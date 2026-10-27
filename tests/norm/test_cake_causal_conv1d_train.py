@@ -2040,7 +2040,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == pkg.__name__
+    # The manifest names the package by its FlashInfer import path, also in a copy
+    # vendored under another name (``pkg.__name__`` is then the copy's).
+    assert manifest["package"] == "flashinfer.cake_causal_conv1d_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()
