@@ -307,6 +307,49 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
     ]
 
 
+# Register-resident builds the host takes on one device only, in place of the build the cost model or a measured pick
+# selects there, per device (capability, SM count): the build replaced -> the build taken.  A 12.x device opts in to
+# 101,376 B of dynamic shared memory, so no stream fits and a row of 131,072 < V <= 163,840 entries lands on the
+# cluster-8 resident.  The (8, 40) build holds the V = 151,936 row at 92.7 % of its registers (77.3 % at ept 48) and
+# compiles for sm_120a without stack or spills, where the (8, 48) build spills; it carries the fused two-warp tail (one
+# launch at k <= fused_tail_kcap) and ships a no-tail twin for the two-launch chain.  RTX PRO 6000 (12, 0) with 188
+# SMs, V = 151936, batch 1-128, top-k 10 / 50 / 1000, against the (8, 48) build (two boards, eager and CUDA graph, two
+# input placements, 8 rounds, the same sampled tokens): 0.867-0.962x, -1.0..-7.1 us.  The cost model never ranks these
+# builds (its tables were fitted without them), and a device absent here (another SM count of the same capability
+# too) keeps its plans.
+_SM12X_RESIDENTS_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, bool]]
+] = {
+    # RTX PRO 6000 Blackwell Server (188 SMs)
+    (12, 0, 188): {(8, 48, False): (8, 40, False)},
+}
+# Every build of ``_SM12X_RESIDENTS_BY_DEVICE``: none is a cost-model candidate on any device.
+_SM12X_RESIDENT_BUILDS: frozenset[tuple[int, int, bool]] = frozenset(
+    build for table in _SM12X_RESIDENTS_BY_DEVICE.values() for build in table.values()
+)
+
+
+def _sm12x_resident(
+    capability: tuple[int, int],
+    sm_count: int,
+    vocab: int,
+    smem_limit: Optional[int],
+    pick: tuple[int, int, bool],
+) -> tuple[int, int, bool]:
+    """The ``_SM12X_RESIDENTS_BY_DEVICE`` build that replaces ``pick`` on the device (``capability``,
+    ``sm_count``) when it ships, fits ``smem_limit`` and covers ``vocab`` as the cost model's resident candidates do;
+    else ``pick``."""
+    build = _SM12X_RESIDENTS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    ).get((int(pick[0]), int(pick[1]), bool(pick[2])))
+    if build is None or build not in _stage1_variants(smem_limit):
+        return pick
+    cluster, ept, _ = build
+    if _THREADS * ept * cluster < vocab or _THREADS * ept * (cluster // 2) >= vocab:
+        return pick
+    return build
+
+
 @functools.cache
 def _stage23_variants() -> tuple[tuple[int, int], ...]:
     """Distinct frozen ``(threads, items)`` slabs (each is exported once per static form, see
@@ -676,7 +719,9 @@ _NO_TAIL_SHARED_BITS = (
 # rounds, two input placements).  The twin frees the registers of the tail, but the passes of some builds schedule
 # worse without it: GB300's cluster-8 streams lose 1-4 % with it, H100's cluster-1 stream 6 % and cluster-8 resident
 # 2-5 %, R200's cluster-8 ept-16 stream 1.5-8 % at 16 rows while it wins 1-6 % at up to 8 rows.  A build absent here
-# keeps its fused-tail form.
+# keeps its fused-tail form.  The (12, 0) entry of the (8, 40) resident is its chain form
+# (``_SM12X_RESIDENTS_BY_DEVICE``): a top-k above fused_tail_kcap takes the no-tail build, as the (8, 48) build it
+# replaces there runs without a tail.
 _NO_TAIL_MAX_BATCH_BY_CAPABILITY: dict[
     tuple[int, int], dict[tuple[int, int, bool, int], int]
 ] = {
@@ -709,6 +754,7 @@ _NO_TAIL_MAX_BATCH_BY_CAPABILITY: dict[
     (12, 0): {
         (4, 16, False, 0): 1 << 30,
         (8, 32, False, 0): 1 << 30,
+        (8, 40, False, 0): 1 << 30,
     },
 }
 _COARSE_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(9, 0), (10, 3)})
@@ -1519,7 +1565,9 @@ def _choose_stage1_resolved(
             batch, ce[0], ce[1], stream, int(sm_count), top_k_max, regime_two_launch
         )
 
-    variants = _stage1_variants(smem_limit)
+    variants = [
+        v for v in _stage1_variants(smem_limit) if v not in _SM12X_RESIDENT_BUILDS
+    ]
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
     streaming = [(c, e) for c, e, st in variants if st]
@@ -1893,10 +1941,15 @@ def _launch_plan(
     capability = _device_capability(device_index)
     two_launch = _launch_is_two_kernels(top_k_max, device_index)
     smem_limit = _smem_optin(device_index)
-    cluster, ept, stream = _measured_stage1_pick(
-        capability, sm_count, batch, vocab, top_k_max, smem_limit
-    ) or _choose_stage1_resolved(
-        batch, vocab, sm_count, smem_limit, top_k_max, two_launch
+    cluster, ept, stream = _sm12x_resident(
+        capability,
+        sm_count,
+        vocab,
+        smem_limit,
+        _measured_stage1_pick(capability, sm_count, batch, vocab, top_k_max, smem_limit)
+        or _choose_stage1_resolved(
+            batch, vocab, sm_count, smem_limit, top_k_max, two_launch
+        ),
     )
     threads, items = choose_stage23(top_k_max)
     # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
