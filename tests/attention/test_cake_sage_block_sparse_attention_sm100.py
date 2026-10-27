@@ -25,9 +25,8 @@ flashinfer public routes are covered by
 
 import math
 import re
-from pathlib import Path
-
 import zlib
+from pathlib import Path
 
 import pytest
 import torch

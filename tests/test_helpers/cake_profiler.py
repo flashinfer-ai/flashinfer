@@ -22,9 +22,9 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
-SENTINEL_KERNEL = (
-    "spin_kernel"  # ATen's at::cuda::sleep kernel, launched by torch.cuda._sleep
-)
+# ATen's at::cuda::sleep kernel, launched by torch.cuda._sleep; its CUDA activity record is the
+# namespace-qualified symbol ``at::cuda::(anonymous namespace)::spin_kernel(long)``
+SENTINEL_KERNEL = "::spin_kernel("
 ATTEMPTS = 4
 LOST_RECORDS = "CUPTI-LOST-RECORDS"
 _COPY_PREFIXES = ("Memcpy", "Memset")
@@ -36,6 +36,7 @@ def launch_sentinel() -> None:
 
 
 def is_sentinel(name: str) -> bool:
+    """Whether a CUDA activity record is the sentinel kernel (its namespace-qualified ATen symbol)."""
     return SENTINEL_KERNEL in name
 
 
@@ -53,9 +54,11 @@ def cuda_event_names(profile: torch.profiler.profile) -> list[str]:
 def between_sentinels(names: list[str]) -> list[str] | None:
     """The device records of a window ``sentinel, sentinel, <call>, sentinel``.
 
-    ``None`` when the session lost a sentinel (no record, a leading record or the trailing record missing), so
-    the caller profiles again.  A session with device records but no sentinel among them is not a loss: the
-    sentinel kernel's name changed and the helper must be fixed, so that raises.
+    The two leading sentinels cover the observed loss mode (the first record of a window dropped): a session is
+    accepted when at least one leading sentinel opens it and the trailing sentinel closes it.  ``None`` when the
+    session lost both leading sentinels or the trailing one, or holds a record before its first sentinel, so the
+    caller profiles again.  A session with device records but no sentinel among them is not a loss: the sentinel
+    kernel's name changed and the helper must be fixed, so that raises.
     """
     if not names:
         return None
@@ -91,8 +94,9 @@ def cuda_kernel_names(
     Records whose names start with ``exclude`` (memcpy / memset activities by default) are dropped.  ``fn`` runs
     once per session: the profiler's warm-up step (CUDA activity collection starts asynchronously once the
     profiler is entered) holds only a sentinel, and the measured call sits behind two leading sentinels and
-    before a trailing one.  A session that misses the leading or the trailing sentinel is retried, and after
-    ``attempts`` such sessions the test is skipped (``LOST_RECORDS``).
+    before a trailing one.  A session that misses the leading or the trailing sentinel is retried, so ``fn`` may
+    run up to ``attempts`` times and must tolerate that (callers that need the call's result keep the last one);
+    after ``attempts`` such sessions the test is skipped (``LOST_RECORDS``).
     """
     exclude = tuple(exclude)
     for _ in range(attempts):
