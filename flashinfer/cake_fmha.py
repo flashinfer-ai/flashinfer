@@ -2895,7 +2895,7 @@ class CakeFmhaContextProgramModule:
         The kernel reads every request's KV length (``seq_lens``) and query
         offsets (``cum_seq_lens_q``) itself; ``total_bh`` is the work-unit
         count ``batch_size x num_q_heads / pack_g``.  A device-scale program
-        reads the log2-domain bmm1 scale and the bmm2 scale through device
+        reads the raw bmm1 scale and the bmm2 scale through device
         pointers; a host-scalar program takes them as scalars and never reads
         the pointers.  The LSE, sink and Q-length pointers are unread (the
         programs write no LSE, take no sink and derive the query lengths from
@@ -2969,15 +2969,16 @@ class CakeFmhaContextProgramModule:
         if counter.dtype != torch.uint32:
             counter = counter.view(torch.uint32)
         if device_scales:
-            # bmm1 arrives in log2 units (trtllm_batch_context_with_kv_cache
-            # multiplies a device bmm1 scale by log2e).
+            # bmm1 arrives as the caller's device scale (not in log2 form):
+            # with bmm1_is_log2 = 0 the program forms the FP32 product
+            # bmm1 * log2e itself, the value the host multiply gave.
             if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
                 bmm2_scale, torch.Tensor
             ):
                 raise RuntimeError(
                     "a device-scale Cake FMHA context program takes tensor scales"
                 )
-            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 1
+            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 0
             bmm1_ptr = bmm1_scale if bmm1_scale.dim() == 1 else bmm1_scale.reshape(1)
             bmm2_ptr = bmm2_scale if bmm2_scale.dim() == 1 else bmm2_scale.reshape(1)
         else:

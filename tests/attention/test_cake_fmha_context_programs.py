@@ -921,7 +921,7 @@ def test_cake_context_program_device_scales_reach_the_binding_as_given(
     assert scaled["bmm1_scale_ptr"].data_ptr() == bmm1.data_ptr() != unread
     assert scaled["bmm2_scale_ptr"].data_ptr() == bmm2.data_ptr() != unread
     assert scaled["bmm1_scale_ptr"].shape == scaled["bmm2_scale_ptr"].shape == (1,)
-    assert scaled["bmm1_is_log2"] == 1
+    assert scaled["bmm1_is_log2"] == 0
     assert scaled["Q"].dtype == scaled["O_ptr"].dtype == torch.uint8
     assert scaled["Q"].data_ptr() == query.data_ptr()
     assert scaled["O_ptr"].data_ptr() == out.data_ptr()
@@ -995,7 +995,7 @@ def test_cake_context_runtime_program_takes_the_sizes_of_each_launch(
         1,
     )
     assert second["num_m_blocks"] == 4 and second["page_shift"] == 6
-    assert (second["scale_source"], second["bmm1_is_log2"]) == (1, 1)
+    assert (second["scale_source"], second["bmm1_is_log2"]) == (1, 0)
     assert second["num_ctas"] == second["grid_x"] == 40
     assert second["bmm1_scale_ptr"].data_ptr() == bmm1.data_ptr()
     assert second["bmm2_scale_ptr"].data_ptr() == bmm2.data_ptr()
