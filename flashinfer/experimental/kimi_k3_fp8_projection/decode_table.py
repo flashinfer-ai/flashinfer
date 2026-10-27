@@ -1800,7 +1800,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
             "quant:u4": "quant:u4_xef_qel",
         },
         "96,1,512": {
-            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
         "96,1,1024": {
             "gemm_tstore_s2_ts4_pf4": "gemm_tstore_s2_ts4_pf4_tde",
