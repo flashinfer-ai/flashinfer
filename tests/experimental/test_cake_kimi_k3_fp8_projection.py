@@ -1804,7 +1804,7 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 12 batch 4 (lever ARS): the sm_100a 192,2,1024 / 192,2,4096 / 192,2,16384 cells (tp1:kv_b) launch the A-resident
     # form of the 256-wide ``_gs`` program (``gemm_ars`` 1 next to ``gemm_gs`` 1; the 192,2,2048 cell takes it for M > 1280 only,
     # through ``DECODE_TABLE_M_RANGES``).  Round 12 D: the sm_103a 96,1,512 cell (tp1:f_b:512) takes the 192-wide ``_gs`` form and
-    # its ``_ts3_tde`` twin.
+    # its ``_ts3_tde_prg`` twin.
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
@@ -2368,7 +2368,8 @@ def test_route_twins_are_registered_hint_instances(arch):
     # form ``_gsb`` of a GEMM grid-stride program or (round 12 D) the three-slot early-TMEM-free form ``_ts3_tde`` of a
     # 192-wide 128-K TMA-store GEMM program (cluster launch control or grid-stride) or the MMA-warp TMEM allocation
     # form ``_prg`` of a TMA-store GEMM program, or (round 12 E) the early-TMEM-free form ``_tde`` of the two-stage
-    # four-slot four-tile-prefetch TMA-store GEMM program -- on the architecture
+    # four-slot four-tile-prefetch TMA-store GEMM program or both, ``_ts3_tde_prg``, of the 192-wide 128-K
+    # grid-stride program -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2393,6 +2394,7 @@ def test_route_twins_are_registered_hint_instances(arch):
                 )
                 or (suffix == "_prg" and key.startswith("gemm_tstore_"))
                 or (suffix == "_tde" and key == "gemm_tstore_s2_ts4_pf4")
+                or (suffix == "_ts3_tde_prg" and key == "gemm_tstore_n192_k128_gs")
             ), (cell, key, twin)
             if sko:
                 assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)
