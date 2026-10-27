@@ -914,6 +914,11 @@ bool launchClusterKernel(Data const& data, void* stream) {
   if (useWidePermutationCluster) {
     return launchClusterKernelBlockDim512(data, stream);
   }
+  // A permutation-only launch has no warp-per-token score phase; its per-expert histogram,
+  // offsets and permutation spread over all threads, so the full-width cluster is the fastest.
+  if (data.mPtrScores == nullptr) {
+    return launchClusterKernelBlockDim1024(data, stream);
+  }
 
   // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
   // Use them only where the requested token count fits; otherwise keep the original 1024-thread
