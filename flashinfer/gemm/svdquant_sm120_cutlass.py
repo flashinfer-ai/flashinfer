@@ -187,17 +187,35 @@ def _prepared_l2t_layout(
     return entry[2].get(layout)
 
 
+# The rank-128 linear workspace ends in the quantize-to-GEMM handoff counter, so a
+# cached one may only be reused on the stream it was allocated for. One is kept
+# per device, tagged with that stream; a call on another stream allocates a new
+# one and drops the old. The caching allocator hands a dropped block out again
+# only to later work on its own stream, so kernels still queued there are
+# unaffected, and the cache holds one workspace per device however many streams
+# callers use (keying a process-wide cache by stream kept one per stream forever).
+_SM120_LINEAR_WORKSPACE: dict[torch.device, tuple[int, torch.Tensor]] = {}
+
+
 def _sm120_linear_workspace(size: int, device: torch.device, rank: int) -> torch.Tensor:
     """Keep the quantize handoff private to each stream or captured graph."""
     name = "nvfp4_svdquant_gemm_workspace"
-    if rank == 128:
-        size += 8  # Aligned completion counter beyond every GEMM tactic's scratch.
-        if device.type == "cuda":
-            if torch.cuda.is_current_stream_capturing():
-                # Graphs can share a capture stream and replay on different streams.
-                return torch.empty(size, dtype=torch.uint8, device=device)
-            name += f"_stream_{torch.cuda.current_stream(device).cuda_stream}"
-    return _get_cache_buf(name, size, device)
+    if rank != 128:
+        return _get_cache_buf(name, size, device)
+    size += 8  # Aligned completion counter beyond every GEMM tactic's scratch.
+    if device.type != "cuda":
+        return _get_cache_buf(name, size, device)
+    if torch.cuda.is_current_stream_capturing():
+        # Graphs can share a capture stream and replay on different streams.
+        return torch.empty(size, dtype=torch.uint8, device=device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.current_stream(device).cuda_stream
+    cached = _SM120_LINEAR_WORKSPACE.get(device)
+    if cached is None or cached[0] != stream or cached[1].numel() < size:
+        cached = (stream, torch.empty(size, dtype=torch.uint8, device=device))
+        _SM120_LINEAR_WORKSPACE[device] = cached
+    return cached[1]
 
 
 def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:

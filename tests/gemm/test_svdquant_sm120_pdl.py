@@ -35,6 +35,22 @@ def test_quantize_handoff_workspace_is_isolated(capture: bool) -> None:
         torch.testing.assert_close(workspace, torch.full_like(workspace, index + 1))
 
 
+def test_quantize_handoff_workspace_cache_does_not_grow_with_streams() -> None:
+    """Calls from many streams keep one cached rank-128 workspace per device."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    device = torch.device("cuda")
+    size = 1 << 22
+    backend._sm120_linear_workspace(size, device, 128)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    for _ in range(8):
+        with torch.cuda.stream(torch.cuda.Stream()):
+            backend._sm120_linear_workspace(size, device, 128).fill_(1)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() <= allocated
+
+
 @pytest.mark.parametrize("m,k", [(17, 3072), (200, 4096), (64, 11008)])
 @pytest.mark.parametrize("extra_workspace", [0, 8])
 def test_deferred_prefix_matches_serialized_replays(
