@@ -22,9 +22,11 @@ TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
 # through cudaLaunchKernelExC with three counted attribute slots, the cluster
 # shape, the cooperative grid and, last, programmatic stream serialization; the
 # kernel runs the programmatic dependent launch protocol, triggering its
-# dependents on entry and waiting for its predecessor's completion after the
-# setup block, at kernel scope before the role dispatch, so no role's first
-# global access precedes it.
+# dependents on entry and waiting for its predecessor's completion at the entry
+# of every role body, after the role's register budget and before the role's
+# first global access, so the setup block (shared memory windows, tensor-map
+# prefetches, barrier initialization, tensor-memory allocation and the cluster
+# rendezvous) overlaps the predecessor's tail and no global access precedes it.
 LAUNCH_ATTRIBUTES = "  cudaLaunchAttribute attrs[3]{};\n"
 COOPERATIVE_SLOT = (
     "  attrs[n].id = cudaLaunchAttributeCooperative;\n"
@@ -39,7 +41,9 @@ PDL_SLOT = (
 )
 GRID_DEP_LAUNCH = 'asm volatile("griddepcontrol.launch_dependents;" ::: "memory");'
 GRID_DEP_WAIT = 'asm volatile("griddepcontrol.wait;" ::: "memory");'
-ROLE_DISPATCH = "// ---- Role: dispatch ----"
+ROLE_MARKER = re.compile(r"// ---- Role: (\w+) ----")
+ROLES = ("dispatch", "load_a", "load_b", "mma", "schedule", "epilogue")
+SETMAXNREG = "setmaxnreg."
 
 
 def expected_block_m(num_tokens):
@@ -168,13 +172,14 @@ def test_tp_ep_programs_launch_as_programmatic_dependents():
     """Every TP/EP program launches with programmatic stream serialization
     beside the cluster shape and the cooperative attribute, one counted slot
     each in a three-slot array with the programmatic slot last; its kernel
-    runs the programmatic dependent launch protocol, each instruction once:
+    runs the programmatic dependent launch protocol: one
     ``griddepcontrol.launch_dependents`` on entry, before the tensor-map
-    prefetches, and ``griddepcontrol.wait`` after the setup block's
-    ``tcgen05.fence::after_thread_sync`` and before the role dispatch, so
-    every role's warps pass it before their first global read (the dispatch
-    role's ``topk_idx_i32[`` is the kernel's first). Up to the wait the kernel
-    names none of its pointer parameters: a dependent so launched touches
+    prefetches, and one ``griddepcontrol.wait`` at the entry of each of the six
+    role bodies, after the role's ``setmaxnreg`` and before the role's first
+    global access (the dispatch role's ``topk_idx_i32[`` is the kernel's
+    first), so the setup block overlaps the predecessor's tail while every
+    warp still passes a wait before its first global read or write. Up to its
+    wait no role names a pointer parameter: a dependent so launched touches
     nothing its predecessor writes, pool rows, counters, gates or the output,
     before the predecessor has exited and flushed."""
     for name, (kernel, binding) in tp_ep_program_sources().items():
@@ -194,29 +199,31 @@ def test_tp_ep_programs_launch_as_programmatic_dependents():
         text = kernel.read_text()
         body = text.index(f"kernel_{name}(")
         brace = text.index("{", body)
-        assert text.count("griddepcontrol") == 2, name
+        assert text.count("griddepcontrol") == 1 + len(ROLES), name
         assert text.count(GRID_DEP_LAUNCH) == 1, name
-        assert text.count(GRID_DEP_WAIT) == 1, name
-        assert text.count(ROLE_DISPATCH) == 1, name
-        positions = dict(
-            launch_dependents=text.index(GRID_DEP_LAUNCH),
-            prefetch=text.index("prefetch.tensormap", body),
-            fence=text.index("tcgen05.fence::after_thread_sync", body),
-            wait=text.index(GRID_DEP_WAIT),
-            dispatch=text.index(ROLE_DISPATCH, body),
-            first_read=text.index("topk_idx_i32[", body),
-        )
-        assert brace < positions["launch_dependents"], (name, positions)
-        assert list(positions.values()) == sorted(positions.values()), (name, positions)
+        assert text.count(GRID_DEP_WAIT) == len(ROLES), name
+        launch_dependents = text.index(GRID_DEP_LAUNCH)
+        assert brace < launch_dependents < text.index("prefetch.tensormap", body), name
         pointers = re.findall(r"\*\s*__restrict__\s+(\w+)", text[body:brace])
         assert pointers, name
-        before_wait = text[brace : positions["wait"]]
-        touched = [
-            pointer
-            for pointer in pointers
-            if re.search(rf"(?<![.\w]){pointer}\b", before_wait)
-        ]
-        assert not touched, (name, touched)
+        markers = list(ROLE_MARKER.finditer(text, body))
+        assert sorted(marker.group(1) for marker in markers) == sorted(ROLES), name
+        assert all(launch_dependents < marker.start() for marker in markers), name
+        for marker, following in zip(markers, [*markers[1:], None]):
+            role = text[marker.end() : following.start() if following else len(text)]
+            assert role.count(GRID_DEP_WAIT) == 1, (name, marker.group(1))
+            wait = role.index(GRID_DEP_WAIT)
+            assert 0 <= role.index(SETMAXNREG) < wait, (name, marker.group(1))
+            before_wait = role[:wait]
+            touched = [
+                pointer
+                for pointer in pointers
+                if re.search(rf"(?<![.\w]){pointer}\b", before_wait)
+            ]
+            assert not touched, (name, marker.group(1), touched)
+        assert text.index("topk_idx_i32[", body) > text.index(
+            GRID_DEP_WAIT, markers[0].start()
+        ), name
 
 
 def test_model_programs_keep_their_launch_form():
