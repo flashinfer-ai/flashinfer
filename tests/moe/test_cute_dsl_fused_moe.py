@@ -945,8 +945,6 @@ class TestTacticEnumeration:
         for scheduler in (None, 0, 1, "true", (), (True,)):
             with pytest.raises(ValueError, match="scheduler|bool|CLC"):
                 canonicalize_w4a8_tactic((*tactics[0][:4], scheduler))
-            with pytest.raises(ValueError, match="scheduler|bool|CLC"):
-                canonicalize_w4a8_tactic((*tactics[0][:5], scheduler))
         for pair in (None, (), (4,), (4, 8, 4), (0, 8), (4, 16), (True, 8), (4.0, 8)):
             with pytest.raises(ValueError, match="K-step|k_steps_pair"):
                 canonicalize_w4a8_tactic((*legacy, pair))
@@ -1018,27 +1016,20 @@ class TestTacticEnumeration:
             (8, 4),
             (8, 8),
         }
-        assert len(ALL_BLACKWELL_MOE_TACTICS) == 720
-        assert {tactic[4:] for tactic in ALL_BLACKWELL_MOE_TACTICS} == {
-            (False, False),
-            (False, True),
-            (True, False),
-            (True, True),
-        }
+        assert len(ALL_BLACKWELL_MOE_TACTICS) == 360
+        assert {tactic[4] for tactic in ALL_BLACKWELL_MOE_TACTICS} == {False, True}
         for tactic in ALL_BLACKWELL_MOE_TACTICS:
-            assert len(tactic) == 6
-            tile_size, gemm1_tactic, gemm2_tactic, k_steps, fc1_clc, fc2_clc = tactic
-            assert type(fc1_clc) is type(fc2_clc) is bool
+            assert len(tactic) == 5
+            tile_size, gemm1_tactic, gemm2_tactic, k_steps, use_clc = tactic
+            assert type(use_clc) is bool
             assert gemm1_tactic[0][1] == gemm2_tactic[0][1] == tile_size
             params = _extract_tactic_params(tactic)
             assert (params["gemm1_k_steps"], params["gemm2_k_steps"]) == k_steps
-            assert params["gemm1_use_clc_scheduler"] is fc1_clc
-            assert params["gemm2_use_clc_scheduler"] is fc2_clc
-            assert (*tactic[:4], not fc1_clc, fc2_clc) in ALL_BLACKWELL_MOE_TACTICS
-            assert (*tactic[:5], not fc2_clc) in ALL_BLACKWELL_MOE_TACTICS
+            assert params["gemm1_use_clc_scheduler"] is use_clc
+            assert params["gemm2_use_clc_scheduler"] is use_clc
+            assert (*tactic[:4], not use_clc) in ALL_BLACKWELL_MOE_TACTICS
             legacy = _extract_tactic_params(tactic[:3])
             previous = _extract_tactic_params(tactic[:4])
-            previous_scheduler = _extract_tactic_params(tactic[:5])
             assert legacy["gemm1_use_clc_scheduler"] is True
             assert previous["gemm1_use_clc_scheduler"] is True
             assert legacy == {
@@ -1046,16 +1037,12 @@ class TestTacticEnumeration:
                 "gemm1_k_steps": None,
                 "gemm2_k_steps": None,
                 "gemm1_use_clc_scheduler": True,
-                "gemm2_use_clc_scheduler": False,
+                "gemm2_use_clc_scheduler": True,
             }
             assert previous == {
                 **params,
                 "gemm1_use_clc_scheduler": True,
-                "gemm2_use_clc_scheduler": False,
-            }
-            assert previous_scheduler == {
-                **params,
-                "gemm2_use_clc_scheduler": False,
+                "gemm2_use_clc_scheduler": True,
             }
         rubin = _extract_tactic_params(DEFAULT_RUBIN_MOE_TACTIC)
         assert rubin["is_rubin"]
@@ -1066,8 +1053,8 @@ class TestTacticEnumeration:
             _extract_tactic_params((*DEFAULT_RUBIN_MOE_TACTIC, (4, 8)))
         with pytest.raises(ValueError, match="Blackwell-only"):
             _extract_tactic_params((*DEFAULT_RUBIN_MOE_TACTIC, (4, 8), True))
-        with pytest.raises(ValueError, match="Blackwell-only"):
-            _extract_tactic_params((*DEFAULT_RUBIN_MOE_TACTIC, (4, 8), True, True))
+        with pytest.raises(ValueError, match="tactic must be"):
+            _extract_tactic_params((*ALL_BLACKWELL_MOE_TACTICS[0], True))
         with pytest.raises(ValueError, match="same architecture format"):
             _extract_tactic_params(
                 (128, ALL_BLACKWELL_MOE_TACTICS[0][1], DEFAULT_RUBIN_MOE_TACTIC[2])
