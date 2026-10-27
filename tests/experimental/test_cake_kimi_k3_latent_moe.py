@@ -368,11 +368,11 @@ def test_front_split_plan_rules():
 
 
 def test_front_fold_plan_rules():
-    """The fold form serves the TP8 rows of 16 row tiles (T = 1793-2048) on every qualified part: nine lanes of
-    eight clusters in the carry mode (the trailing-wave plan runs those 192 pair tiles whole); and the TP8 rows of
-    8 row tiles (T = 897-1024) on sm_103a 152-SM parts: 19 lanes of four clusters keeping the trailing-wave plan's
-    20 split tiles.  Every other row keeps the trailing-wave plan, and so does a device whose co-resident cluster
-    count does not hold the fold grid."""
+    """The fold form serves the TP8 rows of 16 row tiles (T = 1793-2048) on the 152-SM parts, sm_100a and sm_103a:
+    nine lanes of eight clusters in the carry mode (the trailing-wave plan runs those 192 pair tiles whole); and the
+    TP8 rows of 8 row tiles (T = 897-1024) on sm_103a 152-SM parts: 19 lanes of four clusters keeping the
+    trailing-wave plan's 20 split tiles.  148-SM parts keep the trailing-wave plan on every row, every other row
+    keeps it too, and so does a device whose co-resident cluster count does not hold the fold grid."""
     il = i_local_for_tp(8)
     carry = dict(
         num_items=72,
@@ -384,17 +384,26 @@ def test_front_fold_plan_rules():
         fold=True,
         ws_slots=2 * 144,
     )
-    for sm_count in QUALIFIED_SM_COUNTS:
-        assert front_split_plan(192, sm_count)["sk_tiles"] == 0
-        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
-            assert cb.front_fold_plan(16, il, sm_count, arch) == carry
-            for tokens in (1793, 1800, 2000, 2047, 2048):
-                plan = prefill_front_plan(tokens, il, sm_count, arch)
-                assert plan["m_tiles"] == 16 and plan["grid"] == 144
-                assert plan["evict_first"] and {k: plan[k] for k in carry} == carry
-                assert route_kernel_keys("front", 8, tokens, sm_count, arch=arch) == (
-                    "front:i768e1fold",
-                )
+    assert front_split_plan(192, 152)["sk_tiles"] == 0
+    assert front_split_plan(192, 148)["sk_tiles"] == 0
+    for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+        assert cb.front_fold_plan(16, il, 152, arch) == carry
+        assert cb.front_fold_plan(16, il, 148, arch) is None
+        for tokens in (1793, 1800, 2000, 2047, 2048):
+            plan = prefill_front_plan(tokens, il, 152, arch)
+            assert plan["m_tiles"] == 16 and plan["grid"] == 144
+            assert plan["evict_first"] and {k: plan[k] for k in carry} == carry
+            assert route_kernel_keys("front", 8, tokens, 152, arch=arch) == (
+                "front:i768e1fold",
+            )
+            # 148-SM parts: the trailing-wave plan, 192 whole pair tiles with the default weight policy.
+            whole = prefill_front_plan(tokens, il, 148, arch)
+            assert not whole["fold"] and whole["ws_slots"] == 0
+            assert whole["num_items"] == 192 and whole["sk_tiles"] == 0
+            assert route_kernel_keys("front", 8, tokens, 148, arch=arch) == (
+                "front:i768",
+            )
+        for sm_count in QUALIFIED_SM_COUNTS:
             for tokens in (1792, 2049, 4096):
                 assert not prefill_front_plan(tokens, il, sm_count, arch)["fold"]
                 key = route_kernel_keys("front", 8, tokens, sm_count, arch=arch)[0]
@@ -429,11 +438,12 @@ def test_front_fold_plan_rules():
             "front:i768",
         )
     # Occupancy guard: fewer co-resident clusters than the fold grid keep the trailing-wave plan.
-    assert prefill_front_plan(2048, il, 148, "sm_100a", 72)["fold"]
-    fallback = prefill_front_plan(2048, il, 148, "sm_100a", 71)
+    assert prefill_front_plan(2048, il, 152, "sm_100a", 72)["fold"]
+    fallback = prefill_front_plan(2048, il, 152, "sm_100a", 71)
     assert not fallback["fold"] and fallback["ws_slots"] == 0
     assert fallback["num_items"] == 192 and fallback["sk_tiles"] == 0
-    assert cb.prefill_front_kernel_key(fallback) == "front:i768"
+    assert cb.prefill_front_kernel_key(fallback) == "front:i768e1"
+    assert not prefill_front_plan(2048, il, 148, "sm_100a", 74)["fold"]
     fallback = prefill_front_plan(1024, il, 152, "sm_103a", 75)
     assert not fallback["fold"] and fallback["sk_tiles"] == 20
     assert cb.prefill_front_kernel_key(fallback) == "front:i768e1"
@@ -694,9 +704,9 @@ def test_plans_follow_the_device_sm_count():
             ) == route_kernel_keys("front", tp, tokens, 152)
             # The TP1 front rows of 129..512 tokens take the 224-wide tile on 152 SMs, which also
             # stream the front weights evict_first further: TP8 up to 16384 tokens, TP1 up to 2048;
-            # the fold form serves the TP8 rows of 16 row tiles on both counts.
+            # the fold form serves the TP8 rows of 16 row tiles on 152 SMs only.
             differs = (tp == 1 and DECODE_MAX_T < tokens <= 2048) or (
-                tp == 8 and 768 < tokens <= 16384 and cb.m_tiles_for(tokens) != 16
+                tp == 8 and 768 < tokens <= 16384
             )
             assert same_front == (not differs)
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
@@ -1184,7 +1194,7 @@ def test_front_evict_first_rows_are_a_reroute(monkeypatch, tp, tokens):
 
 @pytest.mark.parametrize("tokens", (1000, 1024, 1800, 2000, 2048))
 def test_front_fold_matches_the_trailing_wave_plan(monkeypatch, tokens):
-    """The TP8 rows the fold form serves (16 row tiles on every qualified part, 8 on sm_103a 152-SM parts): the
+    """The TP8 rows the fold form serves (16 row tiles on 152-SM parts, 8 on sm_103a 152-SM parts): the
     device holds the fold grid, the outputs match the reference and are bitwise those of the trailing-wave plan
     the occupancy guard falls back to, and re-launches, CUDA-graph replays and the one-shot entry point reproduce
     them with every counter back at zero."""
@@ -1799,11 +1809,22 @@ def _prepare(device, stage, tp, tokens, num_partials=1, seed=0):
 
 
 def _force_tail_plan(monkeypatch, **overrides):
-    """Route the TP1 T=256 tail to another registered program of the same tile and stream-K plan."""
-    plan_of = cb.prefill_tail_plan
+    """Route the TP1 T=256 tail to another registered program of the 256-wide tile and its stream-K plan for the
+    device's SM count.  152-SM parts run that row on the 192-wide tile (``tail_gemm_config``); the forced plan is
+    the 256-wide tile's there too."""
+    plan_of = getattr(cb.prefill_tail_plan, "__wrapped__", cb.prefill_tail_plan)
+    config_of = cb.tail_gemm_config
+
+    def config_256(M, tp, sm_count=SM_COUNT):
+        num_stages, block_n, final_ts = config_of(M, tp, sm_count)
+        if block_n == cb.TAIL_N192_BLOCK_N:
+            return cb.TAIL_NUM_STAGES, cb.BLOCK_N, cb.TAIL_FINAL_TS
+        return num_stages, block_n, final_ts
 
     def plan(M, tp, sm_count=SM_COUNT, num_partials=1):
-        p = plan_of(M, tp, sm_count, num_partials)
+        with monkeypatch.context() as m:
+            m.setattr(cb, "tail_gemm_config", config_256)
+            p = dict(plan_of(M, tp, sm_count, num_partials))
         assert p["block_n"] == cb.BLOCK_N
         p.update(
             weights_evict_first=False,
@@ -1830,14 +1851,23 @@ def _force_tail_plan(monkeypatch, **overrides):
 #   claimed_112: the TP1 T=256 tail on the claimed program (tail_gemm:tp1e0f1t1ci, cooperative 112-CTA grid): a
 #     second grid starts while the first one's last CTAs retire (claim ticket and retirement words);
 #   decode_coop: the TP1 T=16 decode tail (cooperative fused norm, grid counter);
-#   front_fold: the TP8 T=2048 front on the fold program (front:i768e1fold, cooperative 144-CTA grid): its CTAs
-#     wait for the carries other CTAs release (per-runner counters, per-stream partials).
+#   front_fold: the TP8 T=2048 front on the fold program of the 152-SM parts (front:i768e1fold, cooperative 144-CTA
+#     grid): its CTAs wait for the carries other CTAs release (per-runner counters, per-stream partials).
 _X2_ROWS = ("unfused_split", "claimed_112", "decode_coop", "front_fold")
 
 
 def _x2_front_fold_runner(device, seed):
     tp, tokens = 8, 2048
     _require_program("front", tp, tokens)
+    arch = _gpu_arch()
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if (
+        cb.front_fold_plan(cb.m_tiles_for(tokens), i_local_for_tp(tp), sm_count, arch)
+        is None
+    ):
+        pytest.skip(
+            f"no fold route on {arch} with {sm_count} SMs (the trailing-wave plan there)"
+        )
     args = _front_args(device, tp, tokens, seed)
     runner = prepare_kimi_k3_latent_moe_front(*args)
     assert runner.kernel_keys == ("front:i768e1fold",)
