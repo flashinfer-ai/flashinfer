@@ -411,11 +411,10 @@ class BatchedGemmConfig:
     ``MajorK`` keeps the existing storage, logically ``[expert, Mn, K]``.
     ``BlockMajorK`` stores the weight matrix as
     ``[expert, K_bytes / block_bytes, Mn, block_bytes]`` and is exposed to TMA
-    as ``(blockK_elems, Mn, K / blockK_elems, expert)``. ``block_bytes`` follows
-    TRT-LLM Gen's BlockMajorK rule: start from the number of elements in a 128B
-    K block, then use the padded smaller block only when the padded K tile spans
-    more than two 128B SMEM slices. The layout always applies to the weight
-    operand: A when :attr:`is_swap_ab`, B otherwise.
+    as ``(blockK_elems, Mn, K / blockK_elems, expert)``. ``block_bytes`` is
+    128, or 64 for padded formats (MXFP4 staged as 8-bit), whose TMA boxes are
+    exactly 64B wide (:attr:`block_major_k_bytes`). The layout always applies
+    to the weight operand: A when :attr:`is_swap_ab`, B otherwise.
     """
 
     # --- Pipeline stages ---
@@ -1246,23 +1245,19 @@ class BatchedGemmConfig:
         return 128 * 8 // self.weight_dtype_tma_bits
 
     @property
-    def block_major_k_smem_slices_per_tile(self) -> int:
-        """Number of padded 128B SMEM slices covered by one K tile."""
-        return (
-            self.block_major_k_pad_multiplier * self.tile_k
-        ) // self.block_major_k_elems_in_128b
-
-    @property
     def block_major_k_elems(self) -> int:
-        """Logical K elements covered by one BlockMajorK K block."""
-        elems_in_128b = self.block_major_k_elems_in_128b
-        if self.block_major_k_smem_slices_per_tile > 2:
-            return elems_in_128b // self.block_major_k_pad_multiplier
-        return elems_in_128b
+        """Logical K elements covered by one BlockMajorK K block.
+
+        The elements of a 128B K block, divided by the padding multiplier of
+        padded formats (MXFP4 staged as 8-bit), whose TMA boxes are exactly
+        64B wide. One TMA box then loads the ``tile_k / blockK_elems`` K blocks
+        of a K tile for any ``tile_k``.
+        """
+        return self.block_major_k_elems_in_128b // self.block_major_k_pad_multiplier
 
     @property
     def block_major_k_bytes(self) -> int:
-        """TRT-LLM Gen BlockMajorK K-block bytes for the weight TensorMap."""
+        """BlockMajorK K-block bytes of the weight TensorMap."""
         return self.block_major_k_elems * self.weight_dtype_tma_bits // 8
 
     @property

@@ -770,6 +770,73 @@ class TestMxFp4Bf16Fc1:
         )
 
 
+class TestMxfp4BlockMajorK:
+    """MXFP4 weights stored BlockMajorK, in 64-byte K blocks."""
+
+    @pytest.mark.parametrize("tile_k", [128, 256, 512])
+    def test_block_bytes(self, tile_k):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            make_config,
+        )
+        from flashinfer.tllm_enums import WeightLayout
+
+        cfg = make_config(
+            **{
+                **_mx_fc1_base(dtype_a=DType.MXE2M1),
+                "tile_n": 16,
+                "mma_n": 16,
+                "epi_tile_n": 16,
+                "tile_k": tile_k,
+                "weight_layout": int(WeightLayout.BlockMajorK),
+            }
+        )
+        # The padded 4-bit TMA format takes exactly 64-byte box rows.
+        assert cfg.block_major_k_bytes == 64
+        assert cfg.block_major_k_tile_slices == tile_k // 128
+
+    @pytest.mark.parametrize(("tile_k", "stages"), [(256, 5), (512, 3)])
+    def test_fc1_swiglu(self, tile_k, stages):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+        from flashinfer.tllm_enums import WeightLayout
+
+        cfg = {
+            **_mx_fc1_base(dtype_a=DType.MXE2M1),
+            "tile_n": 16,
+            "mma_n": 16,
+            "epi_tile_n": 16,
+            "tile_k": tile_k,
+            **uniform_pipeline_stage_overrides(stages),
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "weight_layout": int(WeightLayout.BlockMajorK),
+        }
+        _run_mx_fc1(cfg, num_tokens=256, problem_k=1024)
+
+    @pytest.mark.parametrize("umma_cta_count", [1, 2])
+    def test_fc2(self, umma_cta_count):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            TileScheduler,
+        )
+        from flashinfer.tllm_enums import WeightLayout
+
+        cfg = {
+            **_mx_fc2_base(dtype_a=DType.MXE2M1, dtype_b=DType.MXE4M3),
+            "tile_n": 16,
+            "mma_n": 16,
+            "epi_tile_n": 16,
+            "tile_k": 256,
+            "mma_m": 128 * umma_cta_count,
+            "umma_cta_count": umma_cta_count,
+            **uniform_pipeline_stage_overrides(4),
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "num_stages_tmem_acc": 2,
+            "weight_layout": int(WeightLayout.BlockMajorK),
+        }
+        _run_mx_fc2(cfg, num_tokens=256)
+
+
 class TestMxFc2LowLatency:
     def test_mxfp4_mxfp8_tile8_k512_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
