@@ -1271,6 +1271,8 @@ def testCutlassFusedMoe(args):
         cur_res["tp_rank"] = tp_rank
         cur_res["ep_size"] = ep_size
         cur_res["ep_rank"] = ep_rank
+        cur_res["no_fused_finalize"] = args.no_fused_finalize
+        cur_res["enable_alltoall"] = args.enable_alltoall
         res.append(cur_res)
 
     return res
