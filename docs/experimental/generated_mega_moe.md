@@ -59,9 +59,10 @@ the number of experts this rank holds (the leading dimension of its
 weights); `local_expert_offset` (default 0) is the global id of its first
 expert and `num_global_experts` (default `num_experts`) the size of the
 global space. `topk_idx` carries global ids in `[0, num_global_experts)` or
--1. A slot whose id falls outside `[local_expert_offset, local_expert_offset
-+ num_experts)` routes to no expert on this rank, exactly like a -1 slot,
-so the output is the rank's partial sum over its local routes, with zero
+-1. A slot whose id falls outside
+`[local_expert_offset, local_expert_offset + num_experts)` routes to no
+expert on this rank, exactly like a -1 slot, so the output is the rank's
+partial sum over its local routes, with zero
 rows for tokens without one; the combine of the partials across ranks is
 the caller's. The filter runs on the device (the `local_expert_offset`
 kernel scalar of the routes that carry `local_expert_filter`), so the
