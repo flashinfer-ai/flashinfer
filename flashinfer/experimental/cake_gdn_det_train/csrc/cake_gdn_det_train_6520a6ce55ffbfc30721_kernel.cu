@@ -2355,8 +2355,8 @@ kernel_cake_gdn_det_train_6520a6ce55ffbfc30721(__nv_bfloat16* __restrict__ qn, _
     }
     unsigned int _phase_rx_full_0 = 0;
     asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rx_full_addr), "r"(uint32_t(_phase_rx_full_0)), "r"(uint32_t(10000000)) : "memory");
-    _phase_rx_full_0 ^= 1;
     asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
+    _phase_rx_full_0 ^= 1;
     unsigned int base_q0 = ((rank == 0) ? s_ownq_addr : s_rx_addr);
     unsigned int base_k0 = ((rank == 0) ? s_ownk_addr : s_rx_addr + 8192);
     unsigned int base_20 = ((rank == 0) ? s_own2_addr : s_rx_addr + 16384);
