@@ -1093,3 +1093,46 @@ def per_token_group_quant_8bit(
         )
 
     raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")
+
+
+def mxfp8_quantize_bshd(
+    x: torch.Tensor, backend: Literal["cuda", "cute-dsl"] = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a ``[B, S, H, D]`` attention operand to MXFP8 for the PrimTS
+    context kernel.
+
+    The data stays in ``[B, S, H, D]`` order, so the rows are quantized in
+    place of any transpose. The scales come back as the kernel's
+    ``[B, H, tiles, 128, 4]`` byte atoms, one per 128-token tile and head with
+    one E8M0 scale per 32 channels, in the 128x4 order of the block-scaled
+    tensor-core instruction. ``S`` is padded to whole tiles with zero scales.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Half-precision ``[B, S, H, D]`` tensor with ``D`` a multiple of 32.
+    backend : {"cuda", "cute-dsl"}
+        Quantizer backend, as for :func:`mxfp8_quantize`.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(data, scales)``, the ``float8_e4m3fn`` data in the input layout and
+        the ``[B, H, tiles, 128, 4]`` uint8 scale atoms.
+    """
+    batch_size, seq_len, num_heads, head_dim = x.shape
+    data, scales = mxfp8_quantize(
+        x.reshape(batch_size * seq_len * num_heads, head_dim),
+        is_sf_swizzled_layout=False,
+        backend=backend,
+    )
+    tiles = (seq_len + 127) // 128
+    scales = scales.view(batch_size, seq_len, num_heads, head_dim // 32)
+    scales = torch.nn.functional.pad(
+        scales.permute(0, 2, 1, 3), (0, 0, 0, tiles * 128 - seq_len)
+    )
+    # Row r of a tile sits at byte 16 * (r % 32) + 4 * (r // 32) + block.
+    scales = scales.reshape(batch_size, num_heads, tiles, 4, 32, head_dim // 32)
+    return data.view(x.shape), scales.permute(0, 1, 2, 4, 3, 5).reshape(
+        batch_size, num_heads, tiles, 128, 4
+    )
