@@ -7383,6 +7383,51 @@ def test_source_sm107_no_z_calls_take_the_fused_program(
         assert name == f"exact_bf16_{mode}"
 
 
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize("has_z", (False, True))
+def test_source_sm107_long_varlen_items_take_the_tail_pair_program(
+    monkeypatch, arch, has_z
+):
+    """On SM107 a packed-varlen call of 64 sequences x 4096 tokens x 8 heads
+    without z (512 items of 32 chunks on 212 SMs: 3 item waves vs 2.5 pair
+    rounds) runs the tail-pair program under the long-item varlen penalty;
+    with z, and on SM103, it keeps the persistent program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs, tokens = 64, 4096
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, 8, 64, 128), dtype=torch.bfloat16),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    if arch == "sm_107a" and not has_z:
+        assert name == "exactpre_bf16_varlen_tail"
+    else:
+        assert name == "exactpre_bf16_varlen"
+
+
 def test_source_fused_route_mirrors_the_seed_rule():
     """``fused_selected`` reads the seed module's ``fused_route`` constants on
     host-known quantities: batched calls with at most 1024 (sequence, head)

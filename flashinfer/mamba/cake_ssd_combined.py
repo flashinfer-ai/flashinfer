@@ -1771,20 +1771,41 @@ class _TailFullGridRule:
     varlen chunk floor is 8: 256-item varlen calls of 8 chunks win 1.03-1.08x
     (perf_varlen_32x8, nem_v1024x2) and no varlen call above one item per SM
     with 8 chunks lies inside the fused window; the batched floor stays 16
-    (an 8-chunk batched call up to 256 items is a fused-window call)."""
+    (an 8-chunk batched call up to 256 items is a fused-window call).
+
+    The varlen pair render's cost is per item, so varlen calls without ``z``
+    whose items span at least ``long_chunks_varlen`` chunks spread it over
+    more chunk steps and take the smaller ``render_penalty_varlen_long``:
+    with the current varlen pair render those calls run faster on the pair
+    program in every call form, head count and state dtype measured, outputs
+    bitwise identical.  8-chunk items keep the larger penalty, and so do
+    calls with ``z``, whose pair epilogue gains little or nothing there.  The
+    rule reads the mean chunks per item: random sequence lengths win as much
+    as equal ones, but lengths that alternate long and short by sequence load
+    whole pairs unevenly and run slower on the pair program."""
 
     min_chunks_batched: int
     min_chunks_varlen: int
     render_penalty_batched: float
     render_penalty_varlen: float
+    long_chunks_varlen: int
+    render_penalty_varlen_long: float
 
     def min_chunks(self, mode_varlen: bool) -> int:
         return self.min_chunks_varlen if mode_varlen else self.min_chunks_batched
 
-    def render_penalty(self, mode_varlen: bool) -> float:
-        return (
-            self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
-        )
+    def render_penalty(
+        self, mode_varlen: bool, chunks_per_item: int = 0, has_z: bool = False
+    ) -> float:
+        """The render penalty of the call form; a varlen call without ``z``
+        of at least ``long_chunks_varlen`` chunks per item takes the long-item
+        penalty."""
+
+        if not mode_varlen:
+            return self.render_penalty_batched
+        if not has_z and chunks_per_item >= self.long_chunks_varlen:
+            return self.render_penalty_varlen_long
+        return self.render_penalty_varlen
 
 
 # sm_107a (R200, 212 SMs) only; the Blackwell rule keeps the balanced-grid
@@ -1795,6 +1816,8 @@ _TAIL_FULL_GRID_RULES: dict[tuple[int, int], _TailFullGridRule] = {
         min_chunks_varlen=8,
         render_penalty_batched=1 / 12,
         render_penalty_varlen=1 / 5,
+        long_chunks_varlen=16,
+        render_penalty_varlen_long=1 / 8,
     ),
 }
 
@@ -1812,6 +1835,7 @@ def _full_grid_tail_selected(
     chunks_per_item: int,
     sm_count: int,
     mode_varlen: bool,
+    has_z: bool = False,
 ) -> bool:
     """:class:`_TailFullGridRule` on a call whose balanced grid is the full
     device: the pair makespan (half-item rounds) grown by the measured render
@@ -1826,7 +1850,8 @@ def _full_grid_tail_selected(
     pair_makespan = pair_rounds / 2
     hand_off = (pair_rounds % 2) / chunks_per_item
     return (
-        pair_makespan * (1.0 + rule.render_penalty(mode_varlen)) + hand_off
+        pair_makespan * (1.0 + rule.render_penalty(mode_varlen, chunks_per_item, has_z))
+        + hand_off
         < persistent_makespan
     )
 
@@ -1844,6 +1869,7 @@ def tail_selected(
     sm_count: int,
     mode_varlen: bool = False,
     full_grid_rule: Optional[_TailFullGridRule] = None,
+    has_z: bool = False,
 ) -> bool:
     """Whether a two-kernel exact-scan call of ``total_work`` (sequence, head)
     items with ``chunks_per_item`` host-known chunks per item
@@ -1853,7 +1879,8 @@ def tail_selected(
     2`` (half items count) is below the persistent program's ``ceil(items /
     grid)``.  A call whose balanced grid is the full device takes the pair
     program only under ``full_grid_rule`` (:class:`_TailFullGridRule`, the
-    sm_107a admission; ``None`` -- the Blackwell default -- never)."""
+    sm_107a admission, which also reads whether the call has ``z``; ``None``
+    -- the Blackwell default -- never)."""
 
     pairs = sm_count // 2
     if pairs < 1 or total_work <= sm_count:
@@ -1866,6 +1893,7 @@ def tail_selected(
             chunks_per_item=chunks_per_item,
             sm_count=sm_count,
             mode_varlen=mode_varlen,
+            has_z=has_z,
         )
     if chunks_per_item < _TAIL_MIN_CHUNKS:
         return False
@@ -2728,6 +2756,7 @@ class CakeSSDCombined:
                 sm_count=sm_count,
                 mode_varlen=self.has_varlen,
                 full_grid_rule=tail_full_grid_rule(capability),
+                has_z=self.has_z,
             )
         )
         variant = (
