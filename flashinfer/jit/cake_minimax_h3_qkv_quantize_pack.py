@@ -1,271 +1,357 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-"""JIT loader for the Cake MiniMax-H3 QKV quantize-and-pack programs.
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Generated programs of the MiniMax-H3 QKV quantize-and-pack kernel: one program per
+output format (NVFP4, MXFP8) and destination partition count P (1, 2, 4, 8), each
+shipped for sm_100a and sm_103a. The host module
+``flashinfer.diffusion_ops.cake_minimax_h3_qkv_pack`` computes the grid and launches
+them.
 
-One generated program per output format (``nvfp4`` / ``mxfp8``) serves every
-destination partition count ``P`` and both exact targets: the token count
-``M`` and the derived strides are runtime launch parameters, ``P`` and
-``HEADS_PER_DESTINATION = 56 // P`` are compile-line definitions of the route,
-and the source is compiled with the exact flag set of the device it runs on.
-``MODULES`` and ``ROUTES`` are written by the Cake export; the empty tables are
-the source-only placeholder and every route lookup fails until they are filled.
+Generated file: every value below is derived from the exported sources and checked
+against them; do not edit.
 """
 
 from __future__ import annotations
 
-import functools
-from pathlib import Path
-from typing import Any, Literal
+from . import cake_program
+from .core import JitSpec
 
-import torch
+NVFP4_P1 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_1263f0007700395c8a00",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_1263f0007700395c8a00",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_1263f0007700395c8a00_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_1263f0007700395c8a00_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_global_scale", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
+NVFP4_P2 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_e889fd83c9b72f5d677f",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_e889fd83c9b72f5d677f",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_e889fd83c9b72f5d677f_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_e889fd83c9b72f5d677f_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_global_scale", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-MiniMaxH3QkvPackFormat = Literal["nvfp4", "mxfp8"]
-MiniMaxH3QkvPackTarget = Literal["sm100a", "sm103a"]
+NVFP4_P4 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_a38424f3cf2fcfdf3c77",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_a38424f3cf2fcfdf3c77",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_a38424f3cf2fcfdf3c77_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_a38424f3cf2fcfdf3c77_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_global_scale", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-_TARGET_FLAGS: dict[str, list[str]] = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
-}
+NVFP4_P8 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_24c77d41c7fa9da4416f",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_24c77d41c7fa9da4416f",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_24c77d41c7fa9da4416f_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_24c77d41c7fa9da4416f_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_global_scale", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-# program name -> {"sources": [kernel, binding] (relative to the csrc family
-# directory), "template", "ffi_entry", "compile_flags", "arg_plan",
-# "launch_grid_rule", "launch_block", "cluster", "dynamic_smem_bytes",
-# "use_pdl", "closure": {target: sealed closure identity}}.
-MODULES: dict[str, dict[str, Any]] = {
-    "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390": {
-        "sources": [
-            "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390_kernel.cu",
-            "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390_binding.cu",
-        ],
-        "template": "minimax_h3_qkv_pack_mxfp8",
-        "ffi_entry": "run",
-        "compile_flags": ["--use_fast_math"],
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "v"],
-            ["buffer", "out_q"],
-            ["buffer", "out_sf"],
-            ["parameter", "M"],
-            ["parameter", "token_stride"],
-            ["parameter", "head_stride"],
-            ["parameter", "ROWS_PER_DESTINATION"],
-            ["parameter", "SCALE_STRIDE"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch_grid_rule": {
-            "kind": "pack_warps_2d_plus_padding",
-            "tokens_per_warp": 16,
-            "warps_per_cta": 8,
-        },
-        "launch_block": [256, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
-        "use_pdl": False,
-        "closure": {
-            "sm100a": "a1489ee1821c4d09ae1a4942455209ab8fd5211005e31672b0a6790d836a99b6",
-            "sm103a": "bae384f17cfba35e5a5368818498d3ea68d10809fdd09c907bc1f18bd1f9e822",
-        },
-    },
-    "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65": {
-        "sources": [
-            "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65_kernel.cu",
-            "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65_binding.cu",
-        ],
-        "template": "minimax_h3_qkv_pack_nvfp4",
-        "ffi_entry": "run",
-        "compile_flags": ["--use_fast_math"],
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "v"],
-            ["buffer", "out_global_scale"],
-            ["buffer", "out_q"],
-            ["buffer", "out_sf"],
-            ["parameter", "M"],
-            ["parameter", "token_stride"],
-            ["parameter", "head_stride"],
-            ["parameter", "ROWS_PER_DESTINATION"],
-            ["parameter", "SCALE_STRIDE"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch_grid_rule": {
-            "kind": "pack_warps_2d_plus_padding",
-            "tokens_per_warp": 16,
-            "warps_per_cta": 8,
-        },
-        "launch_block": [256, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
-        "use_pdl": False,
-        "closure": {
-            "sm100a": "b2a654a5569d8604b30eaa3269f520d6b1c0c185072b730aac39328e2ec8b54d",
-            "sm103a": "bf5af4f9d69d3b0a67283b88066d1baf23a1b2e0215905a223a643278461886e",
-        },
-    },
-}
-# "<format>:<P>" -> {"module": program name, "defines": {"P": P, "HEADS_PER_DESTINATION": 56 // P}}.
-ROUTES: dict[str, dict[str, Any]] = {
-    "mxfp8:1": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390",
-        "defines": {"P": 1, "HEADS_PER_DESTINATION": 56},
-    },
-    "mxfp8:2": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390",
-        "defines": {"P": 2, "HEADS_PER_DESTINATION": 28},
-    },
-    "mxfp8:4": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390",
-        "defines": {"P": 4, "HEADS_PER_DESTINATION": 14},
-    },
-    "mxfp8:8": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390",
-        "defines": {"P": 8, "HEADS_PER_DESTINATION": 7},
-    },
-    "nvfp4:1": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65",
-        "defines": {"P": 1, "HEADS_PER_DESTINATION": 56},
-    },
-    "nvfp4:2": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65",
-        "defines": {"P": 2, "HEADS_PER_DESTINATION": 28},
-    },
-    "nvfp4:4": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65",
-        "defines": {"P": 4, "HEADS_PER_DESTINATION": 14},
-    },
-    "nvfp4:8": {
-        "module": "cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65",
-        "defines": {"P": 8, "HEADS_PER_DESTINATION": 7},
-    },
-}
+MXFP8_P1 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_1701b69f5a55c002e899",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_1701b69f5a55c002e899",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_1701b69f5a55c002e899_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_1701b69f5a55c002e899_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
+MXFP8_P2 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_49e4c48b4f723c622503",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_49e4c48b4f723c622503",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_49e4c48b4f723c622503_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_49e4c48b4f723c622503_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-def minimax_h3_qkv_pack_target(device: torch.device) -> MiniMaxH3QkvPackTarget:
-    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
-    if capability == (10, 0):
-        return "sm100a"
-    if capability == (10, 3):
-        return "sm103a"
-    raise RuntimeError(
-        "MiniMax-H3 QKV quantize-and-pack requires exact compute capability "
-        f"10.0 or 10.3, got {capability[0]}.{capability[1]}"
-    )
+MXFP8_P4 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_984b36ddc10c63bf8bf0",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_984b36ddc10c63bf8bf0",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_984b36ddc10c63bf8bf0_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_984b36ddc10c63bf8bf0_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
+MXFP8_P8 = cake_program.CakeProgram(
+    name="cake_minimax_h3_qkv_quantize_pack_14c89d4596a3b1552b0b",
+    operator_dir="cake_minimax_h3_qkv_quantize_pack",
+    kernel="kernel_cake_minimax_h3_qkv_quantize_pack_14c89d4596a3b1552b0b",
+    sources=(
+        "cake_minimax_h3_qkv_quantize_pack_14c89d4596a3b1552b0b_kernel.cu",
+        "cake_minimax_h3_qkv_quantize_pack_14c89d4596a3b1552b0b_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "q",
+        "k",
+        "v",
+        "out_q",
+        "out_sf",
+        "M",
+        "token_stride",
+        "head_stride",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=("q", "k", "v", "out_q", "out_sf"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=0,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-def _get_csrc_dir() -> Path:
-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_minimax_h3_qkv_quantize_pack"
-    checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "cake_minimax_h3_qkv_quantize_pack"
-    )
-    for candidate in (installed, checkout):
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "MiniMax-H3 QKV quantize-and-pack CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
-    )
-
-
-def _get_include_dir() -> Path:
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError("FlashInfer headers were not found")
-
-
-def _route(P: int, fmt: MiniMaxH3QkvPackFormat) -> dict[str, Any]:
-    key = f"{fmt}:{P}"
-    try:
-        return ROUTES[key]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"no exact MiniMax-H3 QKV quantize-and-pack route for {key}"
-        ) from exc
-
-
-def minimax_h3_qkv_pack_route_record(
-    device: torch.device, P: int, fmt: MiniMaxH3QkvPackFormat
-) -> dict[str, Any]:
-    """``{"P", "format", "target", "module"}`` for one destination partition count and format.
-
-    ``module`` is the generated program record plus its ``name`` and the
-    compile-line ``defines`` of this route; the prepared operation binds the
-    launch from its ``arg_plan`` and ``launch_grid_rule`` once at preparation.
-    """
-    target = minimax_h3_qkv_pack_target(device)
-    route = _route(P, fmt)
-    name = str(route["module"])
-    return {
-        "P": P,
-        "format": fmt,
-        "target": target,
-        "module": {**MODULES[name], "name": name, "defines": dict(route["defines"])},
-    }
-
-
-@functools.cache
-def gen_minimax_h3_qkv_pack_module(
-    target: MiniMaxH3QkvPackTarget, P: int, fmt: MiniMaxH3QkvPackFormat
-) -> JitSpec:
-    """JIT spec of one (target, P, format) instantiation of the format's program."""
-    if target not in _TARGET_FLAGS:
-        raise ValueError(f"unsupported MiniMax-H3 QKV pack target: {target}")
-    route = _route(P, fmt)
-    name = str(route["module"])
-    record = MODULES[name]
-    csrc = _get_csrc_dir()
-    defines = [f"-D{key}={value}" for key, value in route["defines"].items()]
-    spec = gen_jit_spec(
-        name=f"cake_minimax_h3_qkv_quantize_pack_{target}_{fmt}_p{P}_{record['closure'][target][:20]}",
-        sources=[csrc / source for source in record["sources"]],
-        extra_cuda_cflags=[*_TARGET_FLAGS[target], *record["compile_flags"], *defines],
-        extra_include_paths=[csrc, csrc.parent, _get_include_dir()],
-        needs_device_linking=True,
-    )
-    logger.info(
-        "Generated MiniMax-H3 QKV quantize-and-pack %s %s P=%d JIT spec: %s",
-        target,
-        fmt,
-        P,
-        spec.name,
-    )
-    return spec
+PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
+    NVFP4_P1,
+    NVFP4_P2,
+    NVFP4_P4,
+    NVFP4_P8,
+    MXFP8_P1,
+    MXFP8_P2,
+    MXFP8_P4,
+    MXFP8_P8,
+)
 
 
-@functools.cache
-def load_minimax_h3_qkv_pack_build(
-    target: MiniMaxH3QkvPackTarget, P: int, fmt: MiniMaxH3QkvPackFormat
-):
-    return gen_minimax_h3_qkv_pack_module(target, P, fmt).build_and_load()
-
-
-def load_minimax_h3_qkv_pack_module(
-    device: torch.device, P: int, fmt: MiniMaxH3QkvPackFormat
-):
-    return load_minimax_h3_qkv_pack_build(minimax_h3_qkv_pack_target(device), P, fmt)
+def aot_specs(target: str) -> tuple[JitSpec, ...]:
+    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
+    return cake_program.aot_specs(PROGRAMS, target)
 
 
 __all__ = [
-    "MODULES",
-    "ROUTES",
-    "MiniMaxH3QkvPackFormat",
-    "MiniMaxH3QkvPackTarget",
-    "gen_minimax_h3_qkv_pack_module",
-    "load_minimax_h3_qkv_pack_build",
-    "load_minimax_h3_qkv_pack_module",
-    "minimax_h3_qkv_pack_route_record",
-    "minimax_h3_qkv_pack_target",
+    "NVFP4_P1",
+    "NVFP4_P2",
+    "NVFP4_P4",
+    "NVFP4_P8",
+    "MXFP8_P1",
+    "MXFP8_P2",
+    "MXFP8_P4",
+    "MXFP8_P8",
+    "PROGRAMS",
+    "aot_specs",
 ]

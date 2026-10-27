@@ -10,8 +10,8 @@ from .core import JitSpec, current_compilation_context, gen_jit_spec
 # Blackwell targets compile the same text. Filled by the Cake source exporter;
 # an empty list keeps the portable helix kernel everywhere.
 GENERATED_SOURCES: List[str] = [
-    "generated/dcp_alltoall/cake_dcp_alltoall_335c14a7e34177967411_kernel.cu",
-    "generated/dcp_alltoall/cake_dcp_alltoall_baedc53532c2be692cbd_kernel.cu",
+    "generated/dcp_alltoall/cake_dcp_alltoall_ff3dfded867e5738be23_kernel.cu",
+    "generated/dcp_alltoall/cake_dcp_alltoall_b8b8ebc8b91fd813f375_kernel.cu",
 ]
 
 # (major, minor, define) of every target the generated kernels are built for.

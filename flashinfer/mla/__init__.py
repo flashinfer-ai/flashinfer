@@ -14,6 +14,10 @@
 
 from ._core import *  # noqa: F401,F403
 
+_SWA_LAZY_EXPORTS = frozenset(
+    {"batch_decode_with_kv_cache_mla_swa", "get_mla_swa_workspace_size_bytes"}
+)
+
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "get_prims_ts_batch_mla_decode_workspace_size",
@@ -91,6 +95,13 @@ _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     }
 )
 
+_CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS = frozenset(
+    {
+        "CakeMlaNvfp4PagedDecode",
+        "CakeMlaNvfp4QueryQuantize",
+    }
+)
+
 _CAKE_KIMI_K3_MLA_LAZY_EXPORTS = frozenset(
     {
         "KimiK3MlaFp8PagedAttention",
@@ -102,6 +113,12 @@ _CAKE_KIMI_K3_MLA_LAZY_EXPORTS = frozenset(
 def __getattr__(name: str):
     """Resolve lazily-exported MLA APIs without loading their runtime at import."""
 
+    if name in _SWA_LAZY_EXPORTS:
+        from . import _swa
+
+        value = getattr(_swa, name)
+        globals()[name] = value
+        return value
     if name in _PRIMS_TS_LAZY_EXPORTS:
         from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
 
@@ -144,6 +161,12 @@ def __getattr__(name: str):
         value = getattr(cake_dsv4, name)
         globals()[name] = value
         return value
+    if name in _CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS:
+        from ..experimental.cake_mla_nvfp4_paged_decode import cake_backend
+
+        value = getattr(cake_backend, name)
+        globals()[name] = value
+        return value
     if name in _CAKE_KIMI_K3_MLA_LAZY_EXPORTS:
         from . import cake_kimi_k3_mla
 
@@ -157,6 +180,7 @@ def __dir__():
     """Include lazily-exported names alongside the module globals."""
     return sorted(
         set(globals())
+        | _SWA_LAZY_EXPORTS
         | _PRIMS_TS_LAZY_EXPORTS
         | _SPARSE_MLA_SM120_LAZY_EXPORTS
         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
@@ -165,4 +189,5 @@ def __dir__():
         | _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS
         | _CAKE_DSV4_LAZY_EXPORTS
         | _CAKE_KIMI_K3_MLA_LAZY_EXPORTS
+        | _CAKE_MLA_NVFP4_PAGED_DECODE_LAZY_EXPORTS
     )

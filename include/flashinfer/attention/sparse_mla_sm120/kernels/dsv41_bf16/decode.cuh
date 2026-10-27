@@ -10,7 +10,9 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
-template <int NUM_HEADS, bool EXTRA_FP4>
+// MT selects the cache placement (Dsv41Bf16Cache); for DSV4_1_INLINE the page
+// strides are row pitches and the page sizes are unused.
+template <int NUM_HEADS, bool EXTRA_FP4, ModelType MT = ModelType::DSV4_1>
 __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     sparse_mla_decode_dsv41_bf16_kernel(
         const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -23,6 +25,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
   using R = Dsv41Bf16Resources;
   using Geometry = R::Geometry;
+  using Cache = Dsv41Bf16Cache<MT>;
   const int t = blockIdx.x, hs = blockIdx.y * R::HEADS_PER_CTA, split = blockIdx.z;
   const int qh = NUM_HEADS ? NUM_HEADS : num_heads;
   const int mh = NUM_HEADS ? NUM_HEADS : int(gridDim.y) * R::HEADS_PER_CTA;
@@ -70,18 +73,14 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         uint64_t raw = 0;
         __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
         if (index >= 0) {
-          const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
-          const int slot = index - page * pbs;
-          const uint8_t* base = cache + (size_t)page * stride;
-          const auto data_offset =
-              Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
-          const uint8_t* src = base + data_offset + (fp4 ? d / 2 : d);
+          size_t slot;
+          const uint8_t* base = Cache::locate(cache, index, pbs, stride, power_of_two, slot);
+          const uint8_t* src = base + Cache::data_offset(fp4, slot) + (fp4 ? d / 2 : d);
           raw = fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
                     : *reinterpret_cast<const uint64_t*>(src);
-          const auto scale_offset =
-              Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
-          const uint8_t sc = base[scale_offset + d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP
-                                                          : Dsv41Fp8Layout::QUANT_TILE)];
+          const uint8_t sc =
+              base[Cache::scale_offset(fp4, pbs, slot) +
+                   d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP : Dsv41Fp8Layout::QUANT_TILE)];
           scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fp4);
         }
         __nv_bfloat162 pairs[4];
@@ -92,7 +91,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
       }
     };
-    if ((pbs & (pbs - 1)) == 0)
+    if (Cache::INLINE || (pbs & (pbs - 1)) == 0)
       gather(true);
     else
       gather(false);

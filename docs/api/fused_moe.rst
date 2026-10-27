@@ -68,15 +68,47 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Frost low-latency backend
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``FrostLowLatencyConfig`` is an explicit candidate for SM100/SM103/SM107.
+It admits at most two tokens by default; ``max_num_tokens`` may be raised to
+8. Prepare another backend view to allow fallback beyond that ceiling.
+Precomputed routing is required; routing from logits, shared experts and
+expert-parallel communication are outside this backend.
+
+Supported weight/input pairs are MXFP4/MXFP8, MXFP8/MXFP8, BF16/BF16 and
+NVFP4/NVFP4. All four pairs accept SwiGLU, SwiGLUStep, SiTU, GeGLU,
+GeGLUTanh, ReLU, ReLU2, SiLU, GELU and Identity. SwiGLU alpha/beta/limit
+and SwiGLUStep limit are configurable; other activations require defaults.
+Pass the same activation to weight preparation and ``MoEConfig``.
+
+MX uses one prepared weight view for Tensor Core and FMA tactics, with
+FP32 activation followed by MXFP8 requantization. BF16 and NVFP4 use FMA,
+round the activation and expert results to BF16, and combine with ordered
+separate FP32 multiplication and addition. FMA requires top-k at most 32.
+NVFP4 additionally requires H divisible by 512 and I by 128 and does not
+support the 4over6 recipe. Use ``prepare_nvfp4_weights`` with canonical BF16
+source weights; input quantization is shared with
+``TrtllmFp4Config.prepare_activations``.
+
+These are multi-kernel pipelines. The MX Tensor Core path uses PDL between
+its fused projection/activation/quantizer and down projection. Prepare and
+warm up before CUDA Graph capture. CuTe DSL 4.8 or newer is required.
+
+.. autosummary::
+    :toctree: ../generated
+
+    FrostLowLatencyConfig
+
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
-Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. It can be selected explicitly
-with ``BackendOptions`` or admitted during autotuning alongside eligible
-backends. It does not require ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
-Cold calls without autotuning use the configured backend pool; automatic Frost
-candidates are first created during autotuning and may be reused afterward.
+Frost is a stable ``MoELayer`` backend on SM107a and SM120a. Its four configs
+are included in the default backend list and can
+also be selected through ``BackendOptions``. Candidates with unavailable weight
+views or unsupported input shapes are skipped. It does not require
+``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
 
 .. list-table:: Supported configurations
    :header-rows: 1
@@ -129,13 +161,25 @@ when both exist, the Frost-named view takes precedence. The public API is:
 The backend requires precomputed routing with contiguous int32 expert IDs and
 FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
-parameters, and routing from logits are unsupported. BF16 uses the measured
-model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
-artifact and native-plan bounds are checked per call. Configure another backend
-alongside Frost if unsupported calls need a fallback.
+parameters, and routing from logits are unsupported. Hidden/intermediate sizes
+must be positive multiples of 128. All four dtypes use measured model shortlists
+where available and a bounded, factorized tactic search for other supported
+shapes. Local expert counts are limited to 1024 and token counts to the configured
+tuning ceiling, at most 2**20. Kernel identities describe implementation content,
+independently of model dimensions.
+
+Quantized FC1 weight scales accept expert-major or branch-major storage and may
+be updated in place. For CUDA Graph replay, keep tensor pointers, shapes and
+layouts fixed and update tensors before replay on the same stream.
+
+After changing compiler or artifact configuration, call
+``layer.refresh_backends()`` outside CUDA Graph capture, or reconstruct the
+layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+The SM120 kernels were validated with PyTorch 2.14.0, CuTe DSL 4.7.1, TVM-FFI
+0.1.13.post3, and CUDA 13.4 with the bundled assembler.
 Runtime checks additionally require the DSL
 primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
 Older dependencies remain usable by other FlashInfer backends; these requirements
@@ -146,21 +190,35 @@ PTXAS executable only supplies the assembler for Frost's DSL kernels.
 
 On SM107, set ``FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas`` when the DSL bundles an older
 assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
-assemblers are rejected before kernel execution, including when reusing a cached
-automatic runner. Automatic selection skips unavailable Frost candidates;
-explicit selection reports the missing requirement.
+assemblers are rejected when building or refreshing a runner. Automatic selection
+skips unavailable Frost candidates; explicit selection reports the missing requirement.
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
-Admission checks the release version without imposing a patch-level minimum.
+There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
-SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+SM120 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 
 Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
 ship in the wheel and are compiled for the requested geometry into the writable
 FlashInfer cache. The four fixed routing/finalize adapters are also registered
-for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
+
+Artifact catalogs use schema v4. Each architecture shares tile definitions;
+gated/non-gated activation groups and compatible store policies expand into
+kernel descriptors during preparation. Sources share exact activation fragments.
+Device occupancy, L2 budget, pipeline stages and workspace are derived once from
+the preparation device. Kernels support symbolic problem sizes with explicit
+alignment and bounds; measured shortlists accelerate selection for known shapes,
+and bounded heuristics supply candidates for other shapes.
+
+Kernel IDs identify logical configurations. Source and compiler fingerprints
+qualify compiled kernels and persisted tuning choices. Artifact tooling should use
+``cudnn_frost.manifest.read_manifest`` and ``write_manifest`` to read expanded
+records and preserve existing dimension catalogs. The reader also accepts schema
+v2/v3 exports; ``dimension_catalog.write_catalog`` factors complete exports into
+the dimension format.
 
 Finalized precomputed ``MoELayer`` calls support ``FLASHINFER_TRACE_DUMP=1`` and
 ``MoELayer.__call__.fi_trace(self=layer, act_pack=activations, weight_pack=weights)``.
@@ -211,12 +269,13 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
-:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
-SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
-32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
-3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
-"specialized"``; everything else the runtime-hidden generic bundles,
-``plan.variant == "generic"``); the output has one owner per token, so replays
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100, SM103
+and SM107 devices the generated Cake programs serve one LoRA slice with rank 8,
+16, 32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688
+and 3072 at rank 32 use the specialized measured bodies at 32 to 1024 tokens on
+SM100, SM103 and SM107, ``plan.variant == "specialized"``; everything else, SM90
+included, the runtime-hidden generic bundles, ``plan.variant == "generic"``);
+the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted
 dispatch) is served through a token->pair route index that the shrink kernels
 publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
@@ -290,6 +349,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+    trtllm_fused_moe_workspace_size
 
 AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
 --------------------------------------------
@@ -693,7 +753,7 @@ These symbols are defined in the backend modules and re-exported from
 Standalone TRT-LLM Gen Routing
 ------------------------------
 
-The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs is
 exposed on its own so expert selection and the permutation/padding bookkeeping
 can be used (and tested) independently of quantization and GEMM configuration.
 
@@ -708,6 +768,18 @@ CuteDSL Fused MoE
 
 The CuteDSL backends are conditionally available when the
 ``nvidia-cutlass-dsl`` package is installed.
+
+With NVFP4 expert weights on Blackwell, :func:`cute_dsl_fused_moe` and
+:class:`CuteDslMoEWrapper` support two activation-precision choices:
+
+* ``quant_mode="w4a4"`` uses packed NVFP4 activations and FP4 MMA.
+* ``quant_mode="w4a16"`` keeps activations in BF16 and dequantizes packed
+  NVFP4 weights online for BF16 MMA. The FC1-to-FC2 activation handoff also
+  remains BF16.
+
+For more on the W4A16 design and performance, see
+`Faster-than-light NVFP4 decode—with precision
+<https://humansand.ai/blog/faster-than-light-nvfp4-decode>`_ by Ziang Li at humans& ai.
 
 .. autosummary::
     :toctree: ../generated

@@ -18,6 +18,18 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_nvfp4_per_token_device_common.cuh"
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the knob values below (the guarded defaults are this file's own values) and
+// rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel); the defaults name this file's own program.
+//   CAKE_OUT_F16  output dtype of the epilogue: 0 = bf16, 1 = f16
+#ifndef CAKE_OUT_F16
+#define CAKE_OUT_F16 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 224
 #define TMEM_ACC_OFFSET 0
@@ -59,7 +71,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ alpha, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int tok_tiles, int num_tiles)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ alpha, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int tok_tiles, int num_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -67,12 +79,7 @@ kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d(const __grid_constant__ CUtenso
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
+    smem = shared_base_addr(smem_raw);
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -102,7 +109,11 @@ kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d(const __grid_constant__ CUtenso
     const int smem_v6_addr = smem + 34816;
     uint8_t* smem_v7 = reinterpret_cast<uint8_t*>(smem_raw + 41984);
     const int smem_v7_addr = smem + 41984;
+#if CAKE_OUT_F16
+    __half* smem_out = reinterpret_cast<__half*>(smem_raw + 130048);
+#else
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 130048);
+#endif
     const int smem_out_addr = smem + 130048;
     if (warp == 2) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 2) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory"); }
@@ -448,17 +459,35 @@ kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d(const __grid_constant__ CUtenso
                     _tmem_load_1[4 * i_1 + 2] = _tmem_load_1[4 * i_1 + 2] * frag_alpha[2 * i_1];
                     _tmem_load_1[4 * i_1 + 3] = _tmem_load_1[4 * i_1 + 3] * frag_alpha[2 * i_1 + 1];
                 }
+#if CAKE_OUT_F16
+                uint32_t _tmem_load_0_f16[2];
+#else
                 uint32_t _tmem_load_0_bf16[2];
+#endif
                 #pragma unroll
                 for (int _lp = 0; _lp < 2; _lp++) {
+#if CAKE_OUT_F16
+                    __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                    _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+#else
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                     _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
+#endif
                 }
+#if CAKE_OUT_F16
+                uint32_t _tmem_load_1_f16[2];
+#else
                 uint32_t _tmem_load_1_bf16[2];
+#endif
                 #pragma unroll
                 for (int _lp = 0; _lp < 2; _lp++) {
+#if CAKE_OUT_F16
+                    __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                    _tmem_load_1_f16[_lp] = *(uint32_t*)&_h2;
+#else
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
                     _tmem_load_1_bf16[_lp] = *(uint32_t*)&_bf2;
+#endif
                 }
                 unsigned int st_row = lane % 8;
                 unsigned int st_col = epi_warp % 2 * 4 + lane / 8;
@@ -467,7 +496,11 @@ kernel_cake_nvfp4_per_token_9ca737b8f50f70eb4b5d(const __grid_constant__ CUtenso
                 for (int i_2 = 0; i_2 < 1; i_2++) {
                     uint32_t _stmatrix_addr_0 = static_cast<uint32_t>(write_base + (unsigned int)(i_2 * 1024));
                     asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
+#if CAKE_OUT_F16
+                        :: "r"(_stmatrix_addr_0), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[2 * i_2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[2 * i_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[2 * i_2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[2 * i_2 + 1]))
+#else
                         :: "r"(_stmatrix_addr_0), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[2 * i_2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_bf16[2 * i_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[2 * i_2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[2 * i_2 + 1]))
+#endif
                         : "memory");
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

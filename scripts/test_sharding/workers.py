@@ -158,10 +158,12 @@ def _descendant_pids(root_pid: int) -> set[int]:
     changed = True
     while changed:
         changed = False
-        for status_path in Path("/proc").glob("[0-9]*/status"):
+        for process_dir in Path("/proc").iterdir():
+            if not process_dir.name.isdigit():
+                continue
             try:
-                content = status_path.read_text(encoding="utf-8")
-                pid = int(status_path.parent.name)
+                content = (process_dir / "status").read_text(encoding="utf-8")
+                pid = int(process_dir.name)
                 parent_line = next(
                     line for line in content.splitlines() if line.startswith("PPid:")
                 )

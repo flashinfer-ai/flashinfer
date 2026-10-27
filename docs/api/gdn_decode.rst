@@ -17,6 +17,32 @@ recurrent gated delta-rule update for the current decode step.
     gated_delta_rule_mtp
     gated_delta_rule_replayssm_commit
 
+Rubin T=1 bf16-state decode (SM107)
+-----------------------------------
+
+On Rubin (compute capability 10.7), ``gated_delta_rule_decode_pretranspose``
+routes T=1 calls with a bfloat16 state, K=V=128 and ``B * HV >= 512`` to a
+Rubin-tuned kernel under ``backend="auto"``. It requests each 64-row state tile
+at once into shared memory, prefetches a later tile into L2 and issues fewer
+instructions; outputs and the updated state are bitwise equal to the generic
+kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
+``backend="flashinfer"`` keeps the generic kernel.
+
+uGPU localization: Rubin is built from two dies, each with its own SMs and
+memory. Allocate the state pool with :func:`ugpu_state_pool` (layout
+``[pool_size, HV, 2, V // 2, K]``, half ``t`` of every state in die ``t``'s
+memory) and a T=1 call on Rubin runs half ``t`` on die ``t``'s SMs, so no
+state byte crosses the die-to-die link, whatever the batch order or slot
+indices. Results are bitwise equal to the one-launch kernel. This targets
+CUDA-graph captured decode (make one eager call before capture, which creates
+the per-die green contexts); eager calls with ``B * HV < 8192`` are host-bound
+and run the two halves back to back on the current stream.
+
+.. autosummary::
+    :toctree: ../generated
+
+    ugpu_state_pool
+
 ReplaySSM speculative verification (SM100/SM103)
 ---------------------------------------------
 

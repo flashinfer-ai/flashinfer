@@ -211,8 +211,17 @@ FP8 Quantization
 
     mxfp8_quantize
     mxfp8_grouped_quantize
+    silu_and_mul_mxfp8_experts_quantize
     mxfp8_dequantize_host
     per_token_group_quant_8bit
+
+.. note::
+
+    ``mxfp8_grouped_quantize`` and ``silu_and_mul_mxfp8_experts_quantize``
+    require SM100+. The default ``"cutile"`` backend of
+    ``mxfp8_grouped_quantize`` requires ``cuda.tile`` (a ``requirements.txt``
+    dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
+    ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
 Fused gated-activation MXFP8 quantization
 -----------------------------------------
@@ -224,12 +233,6 @@ Fused gated-activation MXFP8 quantization
 
     silu_and_mul_mxfp8_quantize
     silu_and_mul_mxfp8_quantize_backward
-
-.. note::
-
-    ``mxfp8_grouped_quantize`` uses a cuTile backend and requires SM100+ and
-    ``cuda.tile`` (a ``requirements.txt`` dependency). ``K`` must be divisible
-    by 32 and is padded internally to 128-column tiles.
 
 CuTe-DSL Quantization Kernels (experimental)
 --------------------------------------------

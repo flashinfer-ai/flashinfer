@@ -19,18 +19,20 @@ nothing pushes results back: FC1 gathers straight from the dense received plane,
 and the FC2 epilogue warps send results to their owning rank themselves through
 the bulk reduce-add. Twelve warps cover every role.
 
-The kernel owns the workspace tail reset. Because it outlives the communication
-kernel, it is the only participant that can safely zero the counters, which it
-does between two NVLink barriers so that no rank observes a half-cleared
-workspace or exits before the clearing is visible.
+The kernel owns the workspace tail reset. It first drains the preceding
+communication grid and joins all local warp roles, then performs the local
+grid join before clearing counters and publishing to peers.
+A final NVLink barrier makes the clearing visible before the next invocation.
 """
 
 import math
+import os
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 
 import cutlass
+from .....helpers.ptx_helpers import barrier_sync_unaligned
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -126,6 +128,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        self.cluster_shape_mn = tuple(impl_desc.get("cluster_shape_mn", (4, 1)))
 
         for field_name, fixed_value, supplied_value in (
             ("cluster_shape_mn", self.cluster_shape_mn, impl_desc.get("cluster_shape_mn")),
@@ -165,6 +168,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
+        self.active_gather_b_warp_count = 2 if self.mma_tiler_mnk[1] == 64 and self.cluster_shape_mn == (4, 1) else 4
+        self.scheduler_consumer_thread_count = (7 + self.active_gather_b_warp_count) * 32
         self.schedule_policy = impl_desc["schedule_policy"]
         if len(self.schedule_policy) != 2:
             raise ValueError("schedule_policy must contain a mode and hint.")
@@ -256,9 +261,17 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         if self.epilogue.token_back_enabled:
             raise ValueError("The generation-phase communication component provides no token-back path.")
         self._device_workspace = self._build_device_workspace()
+        # This selects ownership only; every original tail-reset byte is cleared.
+        # Keep the original grid-counter phase convention during NCU replay.
+        self.tail_reset_single_cta = (
+            self.world_size > 1
+            and sum(self._device_workspace.tail_reset_bytes(space) for space in ("local", "shared")) <= 16384
+            and os.environ.get("MEGA_USE_NCU", "0") != "1"
+        )
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count)
         )
 
     # ------------------------------------------------------------------
@@ -351,11 +364,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             )
         if (instruction_m, instruction_n) != (mma_m, mma_n):
             raise NotImplementedError("Rubin Genphase MegaMoE does not implement M/N instruction repetition.")
-        # Tile N 64 is excluded because it turns on the halved SFB tile index and
-        # the SFB TMEM shift, and 512 is excluded because the FC1 gather needs one
-        # B row per 128-byte swizzle atom (see the mainloop's gather geometry).
-        if mma_n not in (128, 256):
-            raise ValueError(f"mma_tiler N must be 128 or 256, got {mma_n}.")
+        # The additional decode geometry is deliberately bounded to the
+        # MXFP8 and mixed-FP4 paths with two-CTA MMA and two or four gather warps.
+        if self.cluster_shape_mn != (4, 1) or self.mma_tiler_mnk[1] == 64:
+            if not (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and self.mma_tiler_mnk == (256, 64, 128)
+                and self.use_2cta_instrs
+                and (self.quant_kind == QuantKind.mxfp8_e4m3
+                     or (self.quant_kind == QuantKind.mxfp4_mxfp8 and self.cluster_shape_mn == (4, 1)))
+            ):
+                raise ValueError("GenPhase N64 requires MXFP8 E4M3 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
+        if mma_n not in (64, 128, 256):
+            raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
         if mma_k % instruction_k != 0:
             raise ValueError("mma_tiler K must be divisible by instruction K.")
         if mma_k % (self.sf_vec_size * 4) != 0:
@@ -522,6 +543,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"work{self.work_id_mode}_"
             f"fc2store{'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
+            f"singlectareset{int(self.tail_reset_single_cta)}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
             f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
@@ -711,10 +733,16 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         # FC1's B is the dense (source rank, source token) plane the communication
         # kernel filled, indexed by `gather_index` rather than by a pool row, so it
         # carries no per-expert offset.
+        # Gather4 always issues a 2D TMA instruction. A static singleton row
+        # mode is otherwise dropped from the descriptor at EP1 capacity one.
+        # Keep that extent dynamic so the descriptor retains both dimensions.
+        gather_rows = dense_activation.shape[0]
+        if cutlass.const_expr(gather_rows == 1):
+            gather_rows = cutlass.Int32(gather_rows)
         fc1_b = cute.make_tensor(
             dense_activation.iterator,
             cute.make_layout(
-                (dense_activation.shape[0], cutlass.Int32(hidden), singleton),
+                (gather_rows, cutlass.Int32(hidden), singleton),
                 stride=(dense_activation.stride[0], dense_activation.stride[1], 0),
             ),
         )
@@ -868,7 +896,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream)
+            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream, topk_indices=topk_indices)
 
     # ------------------------------------------------------------------
     # Device entry
@@ -1120,7 +1148,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
-            tmem_allocator.wait_for_alloc()
+            barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
             self.epilogue.run(
                 self._smem_workspace,
@@ -1146,6 +1174,46 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
 
+            iket.range_pop()
+
+        if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
+            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
+            # Every sibling executes warpgroup register deallocation above;
+            # only the active gather warps consume work and issue Gather4.
+            if warp_idx < Int32(self.gather_b_warp_ids[0] + self.active_gather_b_warp_count):
+                iket.range_push("genphase.gather_b1")
+                iket.range_push("gather_b1.wait_input_ready")
+                # `gather_index` is local, published by this rank's sort workers; the
+                # payload flag is written by peers, hence the wider scope.
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.token_data_ready_region),
+                    lambda value: value == Int32(self.token_comm.payload_ready_target),
+                    scope="sys",
+                )
+                spin_wait(
+                    self._device_workspace.ptr(self.token_comm.metadata_ready_region),
+                    lambda value: value == Int32(self.token_comm.metadata_ready_target),
+                    scope="gpu",
+                )
+                iket.range_pop()
+                sched_consumer = scheduler.make_consumer()
+                self._mainloop.run_tma_gather_b1(
+                    fc1_tma_b_atom=fc1_tma_b_atom,
+                    gather_index=gather_index,
+                    ab_pipeline=token_pipeline,
+                    ab_pipeline_state=gather_b_pipeline_state,
+                    sched_consumer=sched_consumer,
+                    gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
+                )
+                iket.range_pop()
+
+
+        # Empty routes do not force epilogue work to depend on every consumer.
+        # Drain the preceding router (including final refinement claims), then
+        # join every local role before any CTA can reset its ready counters.
+        cute.arch.griddepcontrol_wait()
+        cute.arch.sync_threads()
+        if warp_idx < len(self.epilogue_warp_ids):
             epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
 
             iket.range_push("tail.grid_sync_before_reset")
@@ -1155,10 +1223,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             iket.range_pop()
 
             iket.range_push("tail.reset_workspace")
-            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
-            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
-            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            if cutlass.const_expr(self.tail_reset_single_cta):
+                # The role/router drains and grid join above establish quiescence.
+                # CTA0 owns every reset store, including multiple rounds if needed.
+                # NvlinkBarrier's existing CTA rendezvous then joins these stores
+                # before its unchanged system fence and peer notification sequence.
+                if linear_cta_idx == Int32(0):
+                    self._device_workspace.reset_tail_space("shared", thread_idx, epilogue_thread_count)
+                    self._device_workspace.reset_tail_space("local", thread_idx, epilogue_thread_count)
+            else:
+                total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
+                global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
+                self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+                self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
             iket.range_pop()
 
             iket.range_push("tail.nvlink_publish")
@@ -1167,37 +1244,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 Int32(self.promised_launchable_sm_count),
                 linear_cta_idx,
                 thread_idx,
-                prologue_grid_sync=True,
+                prologue_grid_sync=not self.tail_reset_single_cta,
                 epilogue_grid_sync=False,
-            )
-            iket.range_pop()
-            iket.range_pop()
-
-        if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            iket.range_push("genphase.gather_b1")
-            iket.range_push("gather_b1.wait_input_ready")
-            # `gather_index` is local, published by this rank's sort workers; the
-            # payload flag is written by peers, hence the wider scope.
-            spin_wait(
-                self._device_workspace.ptr(self.token_comm.token_data_ready_region),
-                lambda value: value == Int32(self.token_comm.payload_ready_target),
-                scope="sys",
-            )
-            spin_wait(
-                self._device_workspace.ptr(self.token_comm.metadata_ready_region),
-                lambda value: value == Int32(self.token_comm.metadata_ready_target),
-                scope="gpu",
-            )
-            iket.range_pop()
-            sched_consumer = scheduler.make_consumer()
-            self._mainloop.run_tma_gather_b1(
-                fc1_tma_b_atom=fc1_tma_b_atom,
-                gather_index=gather_index,
-                ab_pipeline=token_pipeline,
-                ab_pipeline_state=gather_b_pipeline_state,
-                sched_consumer=sched_consumer,
-                gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
             )
             iket.range_pop()
 

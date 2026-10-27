@@ -416,6 +416,22 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
     return out
 
 
+def is_compute_sanitizer_active() -> bool:
+    """Detect whether the process runs under compute-sanitizer.
+
+    The tool injects itself through environment variables that child processes
+    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
+    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
+    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
+    """
+    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+        return True
+    return any(
+        "sanitizer" in os.environ.get(name, "").lower()
+        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+    )
+
+
 def set_seed(random_seed):
     """
     Set random seed for reproducibility during testing.
@@ -472,7 +488,7 @@ def attention_flops(
         head_dim_qk (int): Head dimension of the query and key.
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
-        causal (bool): Whether to use causal masking. FLOPs is halved for causal masking.
+        causal (bool): Whether to use causal masking. FLOPs are halved for causal masking.
 
     Returns:
         total_flops (int): Total FLOPs for the layer.
@@ -669,7 +685,7 @@ def attention_tb_per_sec(
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
+    Calculate the TB-per-second performance achieved for a given attention layer. Assumes all sequence lengths are the same within the batch.
 
     Args:
         batch_size (int): Batch size.
@@ -713,7 +729,7 @@ def attention_tb_per_sec_with_actual_seq_lens(
     o_dtype=torch.bfloat16,
 ):
     """
-    Calculate TB per second perf achieved for a given attention layer with actual sequence lengths.
+    Calculate the TB-per-second performance achieved for a given attention layer with actual sequence lengths.
     Does not assume all sequence lengths are the same within the batch.
 
     Args:
@@ -842,7 +858,7 @@ def bench_gpu_time_with_cuda_event(
         launch overhead. For microbenchmarking where launch latency matters,
         consider using ``bench_gpu_time_with_cudagraph`` instead.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1013,7 +1029,7 @@ def bench_gpu_time_with_cupti(
         If CUPTI is not available, a warning is issued and the function
         automatically falls back to CUDA event or CUDA graph timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1408,7 +1424,7 @@ def bench_gpu_time_with_cudagraph(
     See Also:
         - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device`` parameters
         are deprecated. Use ``cold_l2_cache`` instead.
     """
@@ -1643,7 +1659,7 @@ def bench_gpu_time(
         - ``bench_gpu_time_with_cudagraph``: Direct CUDA graph timing.
         - ``bench_gpu_time_with_cupti``: Direct CUPTI timing.
 
-    .. deprecated::
+    .. deprecated:: 0.6.0
         The ``l2_flush``, ``l2_flush_size_mb``, and ``l2_flush_device``
         parameters are deprecated. Use ``cold_l2_cache`` instead.
     """

@@ -30,6 +30,7 @@ output_column_dict = {
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "softmax_rescale_threshold_log2",
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
@@ -83,13 +84,6 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
-    ],
-    "moe_comm": [
-        "num_tokens",
-        "num_experts",
-        "top_k",
-        "ep_size",
-        "max_num_tokens",
     ],
     "allreduce_comm": [
         "num_tokens",
@@ -217,7 +211,6 @@ full_output_columns = (
     + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
-    + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
     + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
@@ -269,9 +262,6 @@ benchmark_apis = {
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
     "unified_moe": [
         "unified_moe",
-    ],
-    "moe_comm": [
-        "moe_a2a_dispatch_combine",
     ],
     "allreduce_comm": [
         "allreduce_fusion",
@@ -586,9 +576,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
+        "10.0": ["cutlass", "auto"],
+        "10.3": ["cutlass", "auto"],
+        "10.7": ["cutlass", "cute-dsl", "auto"],
         "12.0": [],
         "12.1": [],
     },
@@ -810,16 +800,16 @@ routine_cc_to_supported_backends = {
         "12.1": ["cute-dsl"],
     },
     "layernorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "cute-dsl"],
+        "8.0": ["cuda", "cute-dsl"],
+        "8.6": ["cuda", "cute-dsl"],
+        "8.9": ["cuda", "cute-dsl"],
+        "9.0": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "10.7": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {
@@ -1197,10 +1187,10 @@ routine_cc_to_supported_backends = {
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": ["flashinfer", "triton"],
-        "10.0": ["flashinfer", "triton"],
-        "10.3": ["flashinfer", "triton"],
-        "10.7": ["flashinfer", "triton"],
+        "9.0": ["flashinfer", "cute", "triton"],
+        "10.0": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.3": ["flashinfer", "cute", "cake_gdn", "triton"],
+        "10.7": ["flashinfer", "cute", "cake_gdn", "triton", "rubin", "rubin_ugpu"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],

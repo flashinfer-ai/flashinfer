@@ -54,8 +54,10 @@ from ..autotuner import (
 )
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
+    NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
     nvfp4_4over6_cache_key,
+    nvfp4_4over6_code,
     resolve_nvfp4_4over6,
 )
 from ..tllm_enums import DEFAULT_SWIGLU_LIMIT
@@ -65,6 +67,7 @@ from .api import (
     _CUDNN_GROUPED_GEMM_FP4_ARCHS,
     _CUDNN_GROUPED_GEMM_FP8_ARCHS,
     _CUDNN_GROUPED_GEMM_MXFP8_ARCHS,
+    _CUTILE_SUPPORTED_ACTIVATIONS,
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
     _CUTLASS_FP8_BLOCK_ARCHS,
@@ -87,6 +90,7 @@ from .api import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -118,10 +122,22 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
     GeGLUTanh,
     ReLU2,
     SiTU,
+    PowLU,
     Identity,
     GELU,
     ReLU,
     SiLU,
+)
+
+# The CuTile backends borrowed the CUTLASS list while both supported the same
+# activations; PowLU (CUTLASS-adaptor-only) is where they diverge. Derive the
+# class tuple from the enum allowlist that cutile/activation.py and prepare.py
+# actually enforce, so a future CUTLASS-only activation cannot leak into the
+# CuTile runners' claimed support.
+_CUTILE_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = tuple(
+    activation
+    for activation in _CUTLASS_SEMANTIC_ACTIVATIONS
+    if activation.type in _CUTILE_SUPPORTED_ACTIVATIONS
 )
 
 _CUTILE_INT32_INDEX_LIMIT = 1 << 31
@@ -567,6 +583,19 @@ def _cutlass_activation_params(
         params["swiglu_limit"] = torch.full(
             (num_experts,), activation.limit, dtype=torch.float32, device=device
         )
+    elif isinstance(activation, PowLU):
+        # PowLUAdaptor reads ``m`` from the generic swiglu_alpha slot and the
+        # clamp from swiglu_limit (see cutlass_fused_moe_kernels.cuh). Its
+        # compile-time default matches PowLU()'s, so a default ``m`` needs no
+        # tensor; an absent limit leaves the branches unclamped.
+        if activation.m != PowLU().m:
+            params["swiglu_alpha"] = torch.full(
+                (num_experts,), activation.m, dtype=torch.float32, device=device
+            )
+        if activation.limit is not None:
+            params["swiglu_limit"] = torch.full(
+                (num_experts,), activation.limit, dtype=torch.float32, device=device
+            )
     return params
 
 
@@ -587,6 +616,7 @@ class MoERunner(TunableRunner):
     """
 
     backend_key: ClassVar[str] = ""
+    weight_view_aliases: ClassVar[tuple[str, ...]] = ()
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ()
     supported_output_formats: ClassVar[tuple[QuantFormat, ...]] = (QuantFormat.BF16,)
@@ -650,7 +680,15 @@ class MoERunner(TunableRunner):
         self._support_checked = True
 
     def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
-        """Return per-call eligibility; override for input-dependent constraints."""
+        """Select candidates with prepared weights and supported input geometry."""
+        if self.backend_key not in weights.native_views and not any(
+            key in weights.native_views for key in self.weight_view_aliases
+        ):
+            return False
+        return self._accepts_shape(act)
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        """Check cheap input-dependent limits before packing and kernel preparation."""
         return True
 
     def _check_support(self) -> None:
@@ -1866,7 +1904,15 @@ class _CutlassRunnerBase(MoERunner):
                     f"{type(self).__name__}: SwiGLUStep does not consume "
                     f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
                 )
-        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU)):
+        # PowLU reads m from gemm1_alpha and its clamp from gemm1_clamp_limit;
+        # gemm1_beta has no PowLU meaning.
+        if isinstance(activation, PowLU) and "gemm1_beta" in view:
+            raise ValueError(
+                f"{type(self).__name__}: PowLU does not consume the per-expert "
+                "override gemm1_beta; only gemm1_alpha (the exponent m) and "
+                "gemm1_clamp_limit are valid."
+            )
+        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU, PowLU)):
             raise ValueError(
                 f"{type(self).__name__}: per-expert activation overrides {present} "
                 f"are invalid for {type(activation).__name__}."
@@ -2317,6 +2363,9 @@ class _CutlassRunnerBase(MoERunner):
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
             **self._activation_params,
+            # Unset everywhere except on CutlassNvfp4Runner (QuantConfig
+            # rejects an explicit value for other activations).
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
         )
         return inputs[0]
 
@@ -2438,6 +2487,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
     """
 
     backend_key = "cutlass_nvfp4"
+    # Threaded as QuantParams::FP4 nvfp4_4over6_code; both of CUTLASS's NVFP4
+    # activation quantizations have 4over6 variants, so no per-token rule.
+    supports_nvfp4_4over6 = True
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
@@ -3261,7 +3313,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    supported_activation_classes = _CUTILE_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _num_top_tactics_per_stage: ClassVar[int] = 2
@@ -4916,9 +4968,18 @@ class CuteDslRunner(MoERunner):
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        # MXFP8 activations: _check_support() rejects SiTU.
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+    }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
     # takes the recipe as an argument; _check_support() below narrows this to
     # the per-token path, the only one that runs that quantizer.
@@ -4951,16 +5012,26 @@ class CuteDslRunner(MoERunner):
                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
                 "activation scales."
             )
-        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if mxfp4_mxfp8 and hasattr(self, "device"):
+        # W4A8 (MXFP4 weights) and MXFP8 (MXFP8 weights) share the MXFP8
+        # activation path and its limits.
+        mxfp8_act = self.config.quant.pair in (
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        )
+        mode = (
+            "MXFP8"
+            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
+            else "W4A8"
+        )
+        if mxfp8_act and isinstance(self.config.activation, SiTU):
+            raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
+        if mxfp8_act and not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
+        if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
-                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
         if (
             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
             and not self.config.quant.per_token_scale
@@ -5064,6 +5135,7 @@ class CuteDslRunner(MoERunner):
         if self.config.quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
         ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
@@ -5074,11 +5146,11 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-                    else "w4a4"
-                ),
+                quant_mode={
+                    (QuantFormat.NVFP4, QuantFormat.NVFP4): "w4a4",
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
+                    (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
+                }[self.config.quant.pair],
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5174,13 +5246,16 @@ class CuteDslRunner(MoERunner):
             in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                (QuantFormat.MXFP8, QuantFormat.MXFP8),
             )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
+            # MXFP8 activations (W4A8 and MXFP8): one E4M3 byte per element and
+            # row-major E8M0 scales, no GEMM2 input scale.
+            mxfp8_act = pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
+            hidden_size = act.hidden_states_q.shape[1] * (1 if mxfp8_act else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
@@ -5188,15 +5263,15 @@ class CuteDslRunner(MoERunner):
                 act.hidden_states_q,
                 (
                     act.hidden_states_scale
-                    if is_mxfp4
+                    if mxfp8_act
                     else act.hidden_states_scale.unsqueeze(-1)
-                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
+                ).view(torch.uint8 if mxfp8_act else act.hidden_states_scale.dtype),
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                None if is_mxfp4 else v["fc2_input_scale"],
+                None if mxfp8_act else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
@@ -5312,6 +5387,17 @@ class _TrtllmRunnerBase(MoERunner):
     _pair: tuple[QuantFormat, QuantFormat]
     _num_weight_rows: int
     _intermediate_size: int
+    device: torch.device
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        """Pack the activation and weight views into the positional launch list.
+
+        Every concrete TRT-LLM runner defines its own packing; this declaration
+        is the interface a mixin layered over them can rely on.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not define pack_inputs")
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -5519,12 +5605,15 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     backend_key = "trtllm_fp4_routed"
     supports_per_token_scale = True
-    supported_routing_modes = (
+    # Threaded as MoERunnerArgs.nvfp4_4over6_code; _check_support() narrows
+    # it to the per-token path, the only one that requantizes the GEMM2 input.
+    supports_nvfp4_4over6 = True
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP4, QuantFormat.BF16),
@@ -5563,6 +5652,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support per-token scale for "
                     f"{pair[0].name}×{pair[1].name}."
+                )
+            if (
+                isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+                and not self.config.quant.per_token_scale
+            ):
+                # Only a pinned recipe is rejected: ``None`` is what GEMM1's
+                # NVFP4 epilogue (no 4over6 variant) already does.
+                raise NotImplementedError(
+                    f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                    "only with per_token_scale=True, the one path that requantizes "
+                    "the GEMM2 input."
                 )
 
             from ..utils import get_compute_capability
@@ -5663,6 +5763,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             use_per_token_scaling=self._per_token,
             num_experts=self.config.routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
+            # Unset reads the environment per call, like the flat API.
+            nvfp4_4over6_code=NVFP4_4OVER6_CODE_FROM_ENV
+            if self.config.quant.nvfp4_4over6 is _UNSET
+            else nvfp4_4over6_code(
+                resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+            ),
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -5905,6 +6011,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
 
 # ---------------------------------------------------------------------------
+# Cake StepFun FC1 inside the trtllm-gen fused-MoE pipeline (exact SM100/SM103)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
 # ---------------------------------------------------------------------------
 
@@ -5919,12 +6030,12 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "trtllm_fp8_block"
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
@@ -6281,14 +6392,20 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "trtllm_fp8_per_tensor"
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    )
     # GeGLU is representable by the enum but has no matching generated kernel.
-    supported_activation_classes = (SwiGLU, SwiGLUStep, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        SwiGLUStep,
+        ReLU2,
+    )
 
     def _check_activation_parameters(self) -> None:
         if (
@@ -6604,9 +6721,15 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.BF16, QuantFormat.BF16),
+    )
     # GeGLU and SiTU are represented by the launcher enum but have no matching kernels.
-    supported_activation_classes = (SwiGLU, SwiGLUStep, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        SwiGLUStep,
+        ReLU2,
+    )
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -6820,6 +6943,442 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             tuning_config=tuning_config,
             launch_state=_TrtllmLaunchState(static_kwargs),
         )
+
+
+# ---------------------------------------------------------------------------
+# Cake StepFun runners (exported Cake FC1 kernels inside the trtllm-gen pipeline)
+# ---------------------------------------------------------------------------
+class _CakeStepFunTuningModule:
+    """What the native family's ``_ensure_inner`` reads from ``self._module``.
+
+    The Cake backend loads no trtllm-gen module: ``MoERunner`` is the trtllm-gen
+    runner class used only as the tuning-config builder of the inherited
+    ``pack_inputs`` (its ``_make_tuning_config`` needs no kernel), and ``moe_op``
+    is ``None`` because every kernel of the forward is an exported Cake program.
+    """
+
+    moe_op = None
+
+    def __init__(self, runner_cls: type) -> None:
+        self.MoERunner = runner_cls
+
+
+class CakeStepFunRunner(_TrtllmRunnerBase):
+    """StepFun fused MoE on the exported Cake programs
+    (:mod:`flashinfer.experimental.cake_stepfun_moe`).
+
+    Instantiating this class returns the per-precision subclass for the
+    configured quantization: :class:`CakeStepFunNvfp4Runner` (NVFP4; with
+    ``per_token_scale`` the ``nvfp4_bf16tok`` family), :class:`CakeStepFunBf16Runner`,
+    :class:`CakeStepFunFp8PerTensorRunner` and :class:`CakeStepFunMxfp8Runner`.
+    Each inherits the input packing and validation of the matching
+    ``Trtllm*Runner`` (the physical weight and activation layouts are identical)
+    and runs every stage of the forward -- routing (Renormalize), FC1 with the
+    StepFun epilogue, the NVFP4 per-token requantization, FC2 and finalize --
+    through :func:`cake_backend.prepare_stepfun_moe`; no trtllm-gen kernel is
+    launched and nothing falls back to one. A tactic is the FC1 / FC2 tile:
+    :meth:`get_valid_tactics` enumerates ``cake_backend.plans_for`` (the tiles
+    exported for the family in both stages that pass the shape rules) and
+    ``tactic=-1`` runs ``cake_backend.default_plan`` (the planner's centre tile
+    on that ladder).
+
+    The Cake router reads routing logits (``RoutingInputMode.FromLogits``) or
+    unpacked pre-computed top-k ids + weights
+    (``RoutingInputMode.UnpackedPrecomputed``), each only when the generated
+    inventory exports that routing variant (and, for pre-computed weights, a
+    finalize variant of their dtype); routing biases, fused shared experts and
+    LoRA deltas are not supported. The weight view must come from
+    :meth:`CakeStepFunConfig.prepare_weights`: the kernels read the per-expert
+    ``gemm1_clamp_limit`` and have no implicit default limit. The knobs
+    (``FLASHINFER_CAKE_STEPFUN_FULL_PATH``,
+    ``FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS``, the NVFP4 4over6 recipe) are
+    resolved once in :meth:`check_support` through
+    :func:`flashinfer.fused_moe.api._resolve_cake_stepfun_knobs`; the package
+    itself reads no environment variable.
+    """
+
+    backend_key = "cake_stepfun"
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supports_fused_shared_experts = False
+    # Assigned by the ``Trtllm*Runner`` ``__init__`` of the per-precision subclass.
+    _num_local_experts: int
+    # The Cake family a subclass serves; NVFP4 resolves its per-token variant
+    # from the configuration (``family()``).
+    cake_family: ClassVar[str] = ""
+
+    def __new__(
+        cls,
+        config: MoEConfig | None = None,
+        device: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        if cls is CakeStepFunRunner:
+            # The dispatcher is abstract (input packing comes from the family's
+            # trtllm-gen parent). Without a config, as the registry lifecycle
+            # tests build bare instances, use the first family: before build()
+            # only the lifecycle guard is reachable, so the choice is immaterial.
+            cls = (
+                cls.runner_class_for(config.quant)
+                if config is not None
+                else _CAKE_STEPFUN_RUNNERS[0]
+            )
+        return super().__new__(cls)
+
+    @classmethod
+    def runner_class_for(cls, quant: QuantConfig) -> type["CakeStepFunRunner"]:
+        for runner_cls in _CAKE_STEPFUN_RUNNERS:
+            if runner_cls.supports_quant(quant):
+                return runner_cls
+        raise NotImplementedError(
+            f"CakeStepFunRunner has no family for {quant!r}; supported pairs: "
+            + ", ".join(f"{w.name}x{a.name}" for w, a in cls.supported_quant_variants)
+        )
+
+    @classmethod
+    def supports_quant(cls, quant: QuantConfig) -> bool:
+        if cls is CakeStepFunRunner:
+            return any(r.supports_quant(quant) for r in _CAKE_STEPFUN_RUNNERS)
+        return super().supports_quant(quant)
+
+    def family(self) -> str:
+        """Cake family of this configuration: ``nvfp4``, ``nvfp4_bf16tok``, ``bf16``,
+        ``fp8`` or ``mxfp8``."""
+        if self.cake_family == "nvfp4" and self.config.quant.per_token_scale:
+            return "nvfp4_bf16tok"
+        return self.cake_family
+
+    def _check_support(self) -> None:
+        # Fused shared experts are rejected before the base checks so the
+        # rejection reads like every other non-supporting backend's whatever
+        # activation the configuration names: the Cake family serves SwiGLUStep
+        # only, and the base order would report the activation first.
+        self._assert_shared_experts_supported()
+        super()._check_support()
+        from ..tllm_enums import RoutingMethodType
+        from .api import _resolve_cake_stepfun_knobs
+
+        compute_capability = get_compute_capability(self.device)
+        if compute_capability not in ((10, 0), (10, 3)):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports exact SM100 and SM103 only, "
+                f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+        # The Cake routing stage serves Renormalize (top-k then softmax) with
+        # routed experts only; nothing falls back to the native router.
+        routing = self.config.routing
+        if routing.method != RoutingMethodType.Renormalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} routes with RoutingMethodType.Renormalize "
+                f"only, got {routing.method!r}."
+            )
+        # FLASHINFER_CAKE_STEPFUN_FULL_PATH (``0`` names the removed FC1-only
+        # hybrid and raises), the reserved overlap SMs of the cooperative router
+        # and the NVFP4 4over6 recipe, resolved once per runner.
+        self._cake_knobs = _resolve_cake_stepfun_knobs(self.config)
+
+    def _build(self) -> None:
+        from ..api_logging import warn_experimental_backend_once
+        from ..experimental.cake_stepfun_moe import cake_backend
+        from .backends.trtllm.sm100_runner import MoERunner as _TuningRunner
+
+        self._cake = cake_backend
+        self._cake_arch = cake_backend.arch_for(self.device)
+        self._module = _CakeStepFunTuningModule(_TuningRunner)
+        warn_experimental_backend_once("fused_moe", "cake_stepfun")
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
+        view = weights.get_view(self.backend_key)
+        if view.get("gemm1_clamp_limit") is None:
+            raise ValueError(
+                f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
+                "produced by CakeStepFunConfig.prepare_weights in the 'cake_stepfun' view."
+            )
+        self._check_routing_protocol(act)
+        return super().pack_inputs(act, weights)
+
+    def _check_routing_protocol(self, act: MoEActivationPack) -> None:
+        """Reject routing protocols the exported Cake routing / finalize kernels do not serve."""
+        name = type(self).__name__
+        mode = act.routing_input_mode
+        if mode is RoutingInputMode.FromLogits:
+            kind = "scores"
+        elif mode is RoutingInputMode.UnpackedPrecomputed:
+            kind = "topk_ids"
+        else:
+            raise NotImplementedError(
+                f"{name} routes from logits (RoutingInputMode.FromLogits) or from "
+                "unpacked pre-computed top-k ids and weights "
+                "(RoutingInputMode.UnpackedPrecomputed); the Cake router has no "
+                f"variant for routing_input_mode={mode!r}."
+            )
+        if act.routing_bias is not None:
+            raise NotImplementedError(
+                f"{name}: the Cake router takes no routing bias (Renormalize)."
+            )
+        inputs = self._cake.routing_inputs()
+        if kind not in inputs:
+            raise NotImplementedError(
+                f"{name}: the generated inventory has no routing kernel reading "
+                f"{kind} (exported routing inputs: {', '.join(inputs) or 'none'}), "
+                f"so routing_input_mode={mode!r} is unavailable."
+            )
+        if (
+            mode is RoutingInputMode.UnpackedPrecomputed
+            and act.topk_weights is not None
+        ):
+            weights_dtype = {
+                torch.float32: "float32",
+                torch.bfloat16: "bfloat16",
+            }.get(act.topk_weights.dtype, str(act.topk_weights.dtype))
+            dtypes = self._cake.finalize_weight_dtypes()
+            if weights_dtype not in dtypes:
+                raise NotImplementedError(
+                    f"{name}: the generated inventory has no finalize kernel reading "
+                    f"{weights_dtype} expert weights (exported: "
+                    f"{', '.join(dtypes) or 'none'}); pass topk_weights in an "
+                    "exported dtype."
+                )
+
+    def _problem_size(self, inputs: List[torch.Tensor]) -> tuple[int, int]:
+        """``(num_tokens, hidden_size)`` of a packed (or autotuner-bucketed) input list."""
+        from .core import MoeRunnerInputs
+
+        moe_inputs = MoeRunnerInputs.from_list(list(inputs))
+        per_byte = self._cake.act_per_byte(self.family())
+        return (
+            int(moe_inputs.hidden_states.shape[0]),
+            int(moe_inputs.hidden_states.shape[1]) * per_byte,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        """The tiles exported for the family in both GEMM stages that pass the shape
+        rules (``cake_backend.plans_for``); empty when no tile is servable."""
+        self._require_built()
+        num_tokens, hidden_size = self._problem_size(inputs)
+        try:
+            plans = self._cake.plans_for(
+                self.family(), num_tokens, hidden_size, self._intermediate_size
+            )
+        except ValueError:
+            return []
+        return [plan.tile_n for plan in plans]
+
+    def default_tactic(self, inputs: List[torch.Tensor]) -> Any:
+        """Tactic ``forward`` runs for ``tactic=-1``: ``cake_backend.default_plan``, the
+        planner's centre tile applied to the exported ladder."""
+        self._require_built()
+        num_tokens, hidden_size = self._problem_size(inputs)
+        try:
+            plan = self._cake.default_plan(
+                self.family(), num_tokens, hidden_size, self._intermediate_size
+            )
+        except ValueError as error:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no exported Cake kernel for this problem: "
+                f"{error}"
+            ) from None
+        return plan.tile_n
+
+    def _resolve_tactic(self, inputs: List[torch.Tensor], tactic: Any) -> int:
+        if tactic == -1:
+            return int(self.default_tactic(inputs))
+        return int(tactic)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        self._require_built()
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
+
+    def _forward_inner(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        do_preparation: bool,
+        launch_state: _TrtllmLaunchState | None = None,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        from .core import MoeRunnerInputs
+
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState):
+            raise RuntimeError(
+                "Cake StepFun forward requires the launch state returned by pack_inputs."
+            )
+        # The Cake path has no separate preparation step: every call prepares
+        # (validation, buffer set, binding) and launches.
+        del do_preparation
+        static = launch_state.static_kwargs
+        moe_inputs = MoeRunnerInputs.from_list(list(inputs))
+        mode = static["routing_input_mode"]
+        if static.get("routing_bias") is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__}: the Cake router takes no routing bias."
+            )
+        if moe_inputs.gemm1_lora_delta is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support gemm1_lora_delta."
+            )
+        if mode is RoutingInputMode.FromLogits:
+            routing_logits = moe_inputs.routing_logits
+            topk_ids = topk_weights = None
+        elif mode is RoutingInputMode.UnpackedPrecomputed:
+            routing_logits = None
+            topk_ids = moe_inputs.topk_ids
+            topk_weights = moe_inputs.expert_weights
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support routing_input_mode={mode!r}."
+            )
+        do_finalize = bool(static["do_finalize"])
+
+        def scalar(name: str, fp8_name: str) -> torch.Tensor | None:
+            # The per-tensor FP8 view spells the activation scalars ``output*_scales_*``.
+            value = static.get(name)
+            return value if value is not None else static.get(fp8_name)
+
+        launch = self._cake.prepare_stepfun_moe(
+            family=self.family(),
+            hidden_states=moe_inputs.hidden_states,
+            hidden_states_scale=moe_inputs.hidden_states_scale,
+            gemm1_weights=static["gemm1_weights"],
+            gemm1_weights_scale=static.get("gemm1_weights_scale"),
+            output1_scale_scalar=scalar(
+                "output1_scale_scalar", "output1_scales_scalar"
+            ),
+            output1_scale_gate_scalar=scalar(
+                "output1_scale_gate_scalar", "output1_scales_gate_scalar"
+            ),
+            gemm1_clamp_limit=static["gemm1_clamp_limit"],
+            per_token_scale=moe_inputs.per_token_scale,
+            gemm2_weights=static["gemm2_weights"],
+            gemm2_weights_scale=static.get("gemm2_weights_scale"),
+            output2_scale_scalar=scalar(
+                "output2_scale_scalar", "output2_scales_scalar"
+            ),
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=int(static["num_experts"]),
+            top_k=int(self.config.routing.top_k),
+            local_expert_offset=int(static["local_expert_offset"]),
+            local_num_experts=int(self._num_local_experts),
+            plan=self._resolve_tactic(inputs, tactic),
+            output=moe_inputs.output if do_finalize else None,
+            do_finalize=do_finalize,
+            enable_pdl=bool(static["enable_pdl"]),
+            reserved_sms=int(self._cake_knobs["reserved_sms"]),
+            global_scale_inv=float(self._cake_knobs["global_scale_inv"]),
+        )
+        launch.launch()
+        if do_finalize:
+            return moe_inputs.output
+        return launch.outputs()
+
+    def _cache_key_extras(self) -> tuple:
+        # The runner name and the Cake family keep the tactic spaces apart.
+        return (type(self).__name__, self.family()) + super()._cache_key_extras()
+
+
+class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
+    """NVFP4 StepFun on the Cake programs (E2m1 output; bf16 output with fp32
+    per-token scales as the ``nvfp4_bf16tok`` family)."""
+
+    cake_family: ClassVar[str] = "nvfp4"
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+    )
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
+    }
+    supports_fused_shared_experts = False
+    supports_per_token_scale = True
+
+
+class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
+    """BF16 StepFun on the Cake programs (BlockMajorK weights)."""
+
+    cake_family: ClassVar[str] = "bf16"
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.BF16, QuantFormat.BF16),
+    )
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
+    supports_fused_shared_experts = False
+    supports_per_token_scale = False
+
+
+class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
+    """Per-tensor FP8 StepFun on the Cake programs (raw-unit clamp limits)."""
+
+    cake_family: ClassVar[str] = "fp8"
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    )
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
+    supports_fused_shared_experts = False
+    supports_per_token_scale = False
+
+
+class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
+    """MXFP8 StepFun on the Cake programs (UE8M0 block scales)."""
+
+    cake_family: ClassVar[str] = "mxfp8"
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    )
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
+    }
+    supports_fused_shared_experts = False
+    supports_per_token_scale = False
+
+
+_CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (
+    CakeStepFunNvfp4Runner,
+    CakeStepFunBf16Runner,
+    CakeStepFunFp8PerTensorRunner,
+    CakeStepFunMxfp8Runner,
+)
+CakeStepFunRunner.supported_quant_variants = tuple(
+    variant
+    for runner in _CAKE_STEPFUN_RUNNERS
+    for variant in runner.supported_quant_variants
+)
+CakeStepFunRunner.supports_per_token_scale = any(
+    runner.supports_per_token_scale for runner in _CAKE_STEPFUN_RUNNERS
+)
+CakeStepFunRunner.supported_activation_classes_by_quant = {
+    pair: (SwiGLUStep,)
+    for runner in _CAKE_STEPFUN_RUNNERS
+    for pair in runner.supported_quant_variants
+}
 
 
 # ---------------------------------------------------------------------------
@@ -8143,7 +8702,8 @@ class SM12xNvfp4Bf16Runner(MoERunner):
 
     backend_key = "sm12x_nvfp4_bf16"
     # A view prepared for the cuTile NVFP4 runners is the same tensors.
-    weight_view_keys = (backend_key, "cutile_nvfp4")
+    weight_view_aliases = ("cutile_nvfp4",)
+    weight_view_keys = (backend_key, *weight_view_aliases)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -8345,6 +8905,159 @@ class SM12xNvfp4Bf16Runner(MoERunner):
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2 = inputs
         workspace = self._workspace(x.shape[0], x.shape[1])
         self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out, workspace)
+        return out[: getattr(inputs, "num_tokens", out.shape[0])]
+
+
+class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
+    """CuTe-DSL W4A4 over the canonical NVFP4 weights shared with W4A16.
+
+    BF16 hidden states are quantized to NVFP4 inside the op with the per-layer
+    activation global scales of the weight view (default 1). Kernels are
+    specialized per token count, so calls are padded to the layer's hybrid
+    token bucket with expert id -1 rows, which the router drops.
+    """
+
+    backend_key = "sm12x_nvfp4"
+    weight_view_keys = (backend_key, "cutile_nvfp4")
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__(config, device)
+        self._unit_scale: Optional[torch.Tensor] = None
+
+    def _check_activation_parameters(self) -> None:
+        activation = self.config.activation
+        if isinstance(activation, SwiGLU) and activation != SwiGLU():
+            raise NotImplementedError(
+                "SM12x NVFP4 supports only default SwiGLU alpha, beta and limit."
+            )
+
+    def _check_support(self) -> None:
+        MoERunner._check_support(self)
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x NVFP4 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x NVFP4 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x NVFP4 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x NVFP4 requires do_finalize=True.")
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x NVFP4 quantizes BF16 inputs and takes no per-token scales."
+            )
+        inter = self.config.experts.intermediate_size
+        if inter % 64:
+            raise NotImplementedError(
+                f"SM12x NVFP4 requires intermediate_size % 64 == 0, got {inter}."
+            )
+        if not self.config.activation.is_gated and inter < 128:
+            raise NotImplementedError(
+                f"SM12x NVFP4 ReLU2 requires intermediate_size >= 128, got {inter}."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+            allocate_workspace,
+            run_moe_w4a4,
+        )
+
+        self._run = run_moe_w4a4
+        self._allocate_workspace = allocate_workspace
+
+    def _activation_global_scale(
+        self, view: dict[str, torch.Tensor], key: str
+    ) -> torch.Tensor:
+        scale = view.get(key)
+        if scale is None:
+            if self._unit_scale is None:
+                self._unit_scale = torch.ones(
+                    1, dtype=torch.float32, device=self.device
+                )
+            return self._unit_scale
+        if scale.numel() != 1 or scale.dtype is not torch.float32:
+            raise ValueError(
+                f"{self.backend_key}: {key} must be a one-element FP32 tensor, got "
+                f"{scale.dtype} {tuple(scale.shape)}."
+            )
+        if scale.device != self.device:
+            raise ValueError(f"{self.backend_key}: {key} must be on {self.device}.")
+        return scale.reshape(1)
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
+        x = act.hidden_states_q
+        if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
+            raise TypeError(
+                f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
+            )
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} quantizes BF16 inputs itself and requires "
+                "activation scales None."
+            )
+        num_tokens, hidden_size = x.shape
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs at least one token."
+            )
+        if hidden_size % 128:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires hidden_size % 128 == 0, "
+                f"got {hidden_size}."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        view = self._weight_view(weights)
+        w1, s1, g1, w2, s2, g2 = self._canonical_weights(view, hidden_size)
+        a1 = self._activation_global_scale(view, "w1_input_global_scale")
+        a2 = self._activation_global_scale(view, "w2_input_global_scale")
+        ids, topk_weights = act.topk_ids, act.topk_weights
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        if capacity != num_tokens:
+            pad_rows = capacity - num_tokens
+            x = torch.cat((x, x.new_zeros(pad_rows, hidden_size)))
+            ids = torch.cat((ids, ids.new_full((pad_rows, ids.shape[1]), -1)))
+            topk_weights = torch.cat(
+                (topk_weights, topk_weights.new_zeros(pad_rows, topk_weights.shape[1]))
+            )
+        packed = _SM12xNvfp4Bf16Inputs(
+            [x.new_empty(x.shape), x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2]
+        )
+        packed.num_tokens = num_tokens
+        return packed
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{type(self).__name__} supports only tactic -1.")
+        out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
+        workspace = self._workspace(x.shape[0], x.shape[1])
+        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace)
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 
@@ -9608,6 +10321,15 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
             dtype=self._block_scale_dtype,
             device=self.device,
         )
+        # Native cuDNN block-scale plans need the captured scale address to
+        # remain valid across repeated graph captures. Keep it in the bucket's
+        # workspace instead of replacing it with a new tensor on every call.
+        workspace.permuted_hidden_states_scale = torch.empty(
+            workspace.num_rows,
+            hidden_size // self._block_size,
+            dtype=self._block_scale_dtype,
+            device=self.device,
+        )
         return workspace
 
     def _stage_tactics(self, inputs: List[torch.Tensor], stage: int) -> List[Any]:
@@ -9702,10 +10424,10 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
         from ..quantization.fp4_quantization import block_scale_interleave
 
         scale_rows = workspace.permuted_hidden_states_scale_rows[: workspace.num_rows]
-        workspace.permuted_hidden_states_scale = (
-            block_scale_interleave(scale_rows.view(torch.uint8))
-            .view(scale_rows.shape)
-            .view(self._block_scale_dtype)
+        assert workspace.permuted_hidden_states_scale is not None
+        block_scale_interleave(
+            scale_rows.view(torch.uint8),
+            out=workspace.permuted_hidden_states_scale.view(torch.uint8).view(-1),
         )
         return layout, workspace
 

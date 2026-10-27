@@ -332,8 +332,13 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.flags.tensor.zero_()
+        # CUDA backend: row and route mailboxes with one slot per source rank. Every
+        # rank stores its routes into its slot on every rank and each BF16 row into
+        # its slot on the ranks that own the row's experts, so dispatch reads both
+        # from local memory.
+        route_slots = () if host_peer_table else (_WORLD_SIZE,)
         self.published_hidden = _allocate_symmetric(
-            (tokens, _HIDDEN),
+            (*route_slots, tokens, _HIDDEN),
             torch.bfloat16,
             device=device,
             group_name=group_name,
@@ -341,7 +346,7 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.published_topk_ids = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.int32,
             device=device,
             group_name=group_name,
@@ -349,7 +354,7 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.published_topk_weights = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.float32,
             device=device,
             group_name=group_name,
