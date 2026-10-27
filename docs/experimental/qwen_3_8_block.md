@@ -50,8 +50,10 @@ per shape bucket, each owning a zeroed workspace; the Qwen 3.5 rules of retentio
 (`fuse_prepare=None` -> True: one launch for the norm / RoPE / write-through / ring / compress, bitwise the four-launch twin;
 `fuse_prepare=False` is the twin), programmatic dependent launch OFF on the sparse chain (`use_pdl=None` -> False; `True` is a typed
 decline until the vendored tree serves it there), the sparse core's BODY by the tree's placement rule (`sparse_tile_form="auto"`: the
-LEAN decode tile -- `mma.sync` + `cp.async`, 128 threads per m16 tile, no TMEM / TMA / cluster -- on cc 10.7 at `batch x H_kv x q_len <= 4`
-units, i.e. `batch <= 2` at `q_len_per_req 1` on the 24 / 2 geometry, the tcgen05 core everywhere else; `"lean"` / `"tcgen05"` pin a body;
+LEAN decode tile -- `mma.sync` + `cp.async`, one CTA of `128 x N_MT` threads per (sequence, KV head, chunk), no TMEM / TMA / cluster -- on
+cc 10.7 at `batch x H_kv <= 4` CTAs per chunk (the bound's unit: the step's rows ride inside the CTA, so `q_len` is not in it) at every
+served step width the body admits -- under the in-block indexer the list is per row, which the lean body serves at one row only, i.e.
+`batch <= 2` at `q_len_per_req 1` on the 24 / 2 geometry --, the tcgen05 core everywhere else; `"lean"` / `"tcgen05"` pin a body;
 the same function under either body within the tree's budget, never bitwise ACROSS the bodies), the split-KV of the sparse tile by its
 rule (the lean split, 65 at `top_k 512`, on the lean body; the fill rule on the core). Every one reads back in `plan.declaration`
 (`fuse_prepare`, `fuse_prepare_requested`, `use_pdl`, `use_pdl_requested`, `use_pdl_effective`, `pdl_stages`, `sparse_tile_form_requested`,
@@ -140,9 +142,10 @@ out = w.run(hidden_states, None, None, weights, w_o,
   tile -- which ALWAYS splits), an int the explicit split (the combine as a second launch under a split, the gate riding it; on the lean
   body one of the lean splits, elsewhere a typed decline naming them); a performance knob -- the same function under every value.
 - **`sparse_tile_form`**: `"auto"` (default) / `"lean"` / `"tcgen05"` -- WHICH BODY of the index-list sparse core serves the step (the
-  paragraph above): `"auto"` follows the vendored placement rule (the lean tile on cc 10.7 inside `batch x H_kv x q_len <= 4` units where the
-  body admits the step -- under the in-block indexer at `q_len_per_req 1`, the per-row list past one row being the core's --, the tcgen05
-  core everywhere else), an explicit body is honoured where it admits the step and a typed `NotImplementedError` naming the arm where it
+  paragraph above): `"auto"` follows the vendored placement rule (the lean tile on cc 10.7 at `batch x H_kv <= 4` CTAs per chunk -- the
+  step width is not in the bound -- where the body admits the step: under the in-block indexer at `q_len_per_req 1`, the per-row list past
+  one row being the core's --, the tcgen05 core everywhere else), an explicit body is honoured where it admits the step and a typed
+  `NotImplementedError` naming the arm where it
   does not; any other spelling is a `ValueError` before any vendored code. A performance knob (the same function under either body within
   the tree's fixed-order-sum budget; bitwise within a body, never asserted bitwise across them) and a plan-cache key; the compiled body reads
   back in `plan.sparse_tile`. The lean tile's `sparse_sub_tiles_per_cta` pin is not exposed here (the vendored default k = 1 is the measured
@@ -202,7 +205,9 @@ plants a drift per constant. The probe's appended fields (`index_sources`, `inde
 everywhere, the lean decode tile too on cc 10.7 --, `sparse_tile_lean_default` -- whether `"auto"` consults the lean placement rule on this
 part --, ...) are READ off that envelope, never re-spelled; the per-cell reading (which body a `[batch, q_len]` step takes under a knob
 value) is `flashinfer.experimental.qwen_3_8_block.support.sparse_tile(...)`, the envelope's own rule, and the mirrored vocabulary
-(`SPARSE_TILE_FORMS`, the two `kernel_template` names, the AUTO bound `SPARSE_TILE_LEAN_MAX_UNITS = 4`) is re-checked by the same tripwire.
+(`SPARSE_TILE_FORMS`, the two `kernel_template` names, the AUTO bound `SPARSE_TILE_LEAN_MAX_UNITS = 4` and its unit -- the placement
+rule's reading over `(batch, q_len)` cells, `SPARSE_TILE_LEAN_RULE_CELLS`: CTAs per chunk, the step width outside the bound) is re-checked
+by the same tripwire.
 
 ## Requirements and limits
 
@@ -235,8 +240,8 @@ environment", for the full table.
 
 ## Where the kernels come from
 
-The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 117 files at the pinned commit
-`7301fad21` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode step, the block-sparse d256
+The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 118 files at the pinned commit
+`977757763` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode step, the block-sparse d256
 core with its two bodies (the tcgen05 core and the lean decode tile, plus the visible-set helper they share) and its paged indexer kernels
 (the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts (the `QSA` selection package), beside
 the dense forms' launches --, every file with its NVIDIA SPDX header, MIT or Apache-2.0; the import roots rewritten and the declared patches
@@ -245,8 +250,10 @@ indexer's decode step (`QsaSpec(index_source="indexer")` over the pools: the pag
 raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` default), the block-sparse decode schedule's split rule, the
 chain's programmatic-dependent-launch sites (served on the caller-list form; under the in-block indexer `use_pdl=True` stays a typed
 decline), the e4m3 compressed-key cache arms (served by the tree; this entry declines `index_cache_dtype=torch.float8_e4m3fn` by name until
-its own e4m3 cache surface lands) and, since this pin, the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its
-measured AUTO default on cc 10.7 (the lean tile up to 4 units: the batch 1 and 2 decode steps of this entry). `qwen_3_8_block_support(...).source`
+its own e4m3 cache surface lands) and the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its measured AUTO
+default on cc 10.7 -- since this pin the bound counts the lean grid's own unit, `batch x H_kv <= 4` CTAs per chunk at every served step
+width (its DSL-free rules module `sdpa/fwd/sparse_tile_rules.py` is the one file this pin adds to the closure); for this entry the batch 1
+and 2 decode steps at `q_len_per_req 1`, the in-block indexer's per-row list being served by the lean body at one row only. `qwen_3_8_block_support(...).source`
 reports the pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the
 cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/` (its README is the recipe; the tracer's `decode_qsa` forms declare this route,
 the batch-1 cells among them: the lean kernel module is loaded by path on that route only, so the closure needs their trace).

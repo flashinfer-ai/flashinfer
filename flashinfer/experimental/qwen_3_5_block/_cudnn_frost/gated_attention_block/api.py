@@ -963,8 +963,8 @@ def sparse_decode_split_choice(
     A PERFORMANCE choice only (the fp32 partials ride the workspace, the combine is one more launch): the same function under every
     value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]`` (the cap binds the DEFAULT only)."""
     if tile_form == "lean":
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import lean_sparse_split
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import sparse_lean_sub_tiles_per_cta
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import lean_sparse_split
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import sparse_lean_sub_tiles_per_cta
 
         k = (
             int(sub_tiles_per_cta)
@@ -1103,8 +1103,8 @@ class DecodeEnvelope:
     # (``heuristics.SPARSE_TILE_TCGEN05`` everywhere the form is served; ``SPARSE_TILE_LEAN`` too on cc 10.7, the lean tile's one part), and
     # the AUTO pin's reading on this part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7 since the gate measured the lean route, so
     # ``sparse_tile_form="auto"`` follows the placement rule there and resolves the tcgen05 core on every other part; the explicit ``"lean"``
-    # is served where the body admits the declaration).  The per-CELL reading is :meth:`sparse_tile` (the route reads B x S_q, which a
-    # static envelope cannot carry in one field).
+    # is served where the body admits the declaration).  The per-CELL reading is :meth:`sparse_tile` (the route reads the batch -- the CTAs
+    # per chunk, B x H_kv -- and the step width through the admissibility, which a static envelope cannot carry in one field).
     sparse_tiles: Tuple[str, ...] = ()
     sparse_tile_lean_default: bool = False
     device_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)  # the part :meth:`sparse_tile` reads the AUTO pin and the rule on
@@ -1124,7 +1124,7 @@ class DecodeEnvelope:
             return None
         if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16, torch.float16):
             return None  # e4m3 pools: the gathered cast + the dense decode tile run, no body of the sparse core
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as _H
 
         g = self._geometry
         q = g.qsa
@@ -5497,7 +5497,7 @@ class _SparseSdpa(_Stage):
     on the host (the setup launch normalizes them on device).  ``block_ids`` keeps its ``[T, top_k]`` form with every id
     RELATIVE TO ITS SEQUENCE (block ``j`` of sequence ``b`` = its tokens ``[4j, 4j + 4)``); the LSE is the head-major packed
     ``[1, H_q, T]`` the block already carries at ``B = 1``.  The ONE scratch the arm needs -- the adapter's int32 THD
-    metadata (``THD_WORK_META_WORDS(B)``, 16-byte rounded) -- enters the block's engine arm through
+    metadata (``THD_META_WORDS(B)`` = 4 B + 4 words, 16-byte rounded: the layout the sm107 sparse adapter sizes it with) -- enters the block's engine arm through
     :meth:`scratch_workspace_bytes` and is handed back at ``execute(workspace=)``.  A one-sequence packing computes the
     dense ``B = 1`` function bitwise; an empty sequence owns no rows.
 
@@ -5767,7 +5767,7 @@ class _SparseSdpa(_Stage):
         )
         self._impl.check_support()
         # the route PINNED by the kernel that will compile (a route is pinned, never transcribed): the adapter's resolved body must be the one the block declared
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_AUTO
 
         if self.tile_form != SPARSE_TILE_FORM_AUTO and self._impl.tile_form != self.tile_form:
             raise RuntimeError(
@@ -5787,7 +5787,7 @@ class _SparseSdpa(_Stage):
 
     def scratch_workspace_bytes(self) -> int:
         """The adapter's ``scratch_workspace_bytes``: 0 on a dense declaration (the kernel has no GMEM scratch), the int32
-        THD metadata (``THD_WORK_META_WORDS(B)`` words, 16-byte rounded) under ``thd=True``; folded into the block's workspace
+        THD metadata (``THD_META_WORDS(B)`` = 4 B + 4 words, 16-byte rounded: the sm107 sparse adapter's own sizing) under ``thd=True``; folded into the block's workspace
         like the dense stage's so the size stays honest either way."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
@@ -8408,9 +8408,10 @@ class GatedAttentionBlockFwd(APIBase):
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
         # APPENDED (the lean block-sparse decode tile; performance-only, the block-sparse stage's knob): WHICH BODY of the index-list sparse
-        # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 4 units, the
-        # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS (cc 10.7 since the end-to-end gate measured the lean
-        # route; the bound LEAN_SPARSE_MAX_UNITS = 4 units refit from its table), the tcgen05 core everywhere else; "lean": the lean decode
+        # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv <= 4 CTAs per chunk --
+        # the lean grid's own unit: the step's S_q rows ride inside the CTA, so S_q is not in the bound --, the lean body admissible) on the
+        # parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS (cc 10.7 since the end-to-end gate measured the lean route; the bound
+        # LEAN_SPARSE_MAX_UNITS = 4 refit from its table, its S_q 4 rows fixing the unit), the tcgen05 core everywhere else; "lean": the lean decode
         # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q <= 4 under the
         # shared list -- one list per sequence, every row of the step in one CTA -- or the per-row list at one row per sequence, bf16 /
         # f16, G <= 16, top_k >= 8; it ALWAYS splits: decode_split_kv None =
@@ -9726,7 +9727,7 @@ class GatedAttentionBlockFwd(APIBase):
         (``"auto"`` / ``"lean"`` / ``"tcgen05"``), ``sparse_sub_tiles_per_cta`` None or an int >= 1 and ONLY with the explicit ``"lean"`` (a
         lean-only pin is never silently ignored); off a QsaSpec geometry only ``"auto"`` and no pin (the knobs are the block-sparse stage's).
         Records the declaration; the resolution follows once the form is known."""
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORMS
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORMS
 
         if not isinstance(sparse_tile_form, str) or sparse_tile_form not in SPARSE_TILE_FORMS:
             raise ValueError(
@@ -9763,7 +9764,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``sparse_tile_form`` None, so the paged form never comes here); a dense geometry has no body."""
         if self.qsa is None or self.sparse_tile_form is not None or self.kv_source == KV_SOURCE_PAGED:
             return
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as _H
 
         if self.sparse_tile_form_requested == _H.SPARSE_TILE_FORM_LEAN:
             reason = _H.sparse_lean_tile_decline(
@@ -10448,7 +10449,7 @@ class GatedAttentionBlockFwd(APIBase):
             # THE BODY of the sparse core (the constructor's note on `sparse_tile_form`): resolved HERE, before the split, because the split
             # is the body's -- the lean tile's splits SELECT its k.  The admissibility and the placement rule are the heuristics' (one copy;
             # the adapter runs the same functions at check_support and `_SparseSdpa` pins its readback against this resolution).
-            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as _H
 
             top_k = self.qsa.top_k
             reason = _H.sparse_lean_tile_decline(
@@ -10491,7 +10492,7 @@ class GatedAttentionBlockFwd(APIBase):
             if form == _H.SPARSE_TILE_FORM_LEAN:
                 if reason is not None:
                     raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
-                from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+                from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import lean_sparse_n_sub, lean_sparse_split
 
                 n_sub, splits, k_max = lean_sparse_n_sub(top_k), _H.sparse_lean_splits(top_k), _H.sparse_lean_max_sub_tiles_per_cta(top_k)
                 if decode_split_kv is None:
@@ -10707,7 +10708,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``kernel_template`` (the tcgen05 core everywhere; the lean tile on cc 10.7, its one part -- ``heuristics._SPARSE_LEAN_TILE_RULE_CC``),
         the AUTO pin's reading on this part (``SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7, the measured part) and the part itself for the per-cell
         :meth:`DecodeEnvelope.sparse_tile`; empty off the sparse form."""
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as _H
 
         if not sparse_served:
             return dict(sparse_tiles=(), sparse_tile_lean_default=False, device_cc=cc)

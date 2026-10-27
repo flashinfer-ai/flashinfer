@@ -206,6 +206,10 @@ class SdpaDenseBinder:
     # The native D576x512 dense form of the extension's binder (the 7301fad21 pin) is not validated through this binder (the block's forms
     # are d256): False here and in the shim (``PYTHON_BINDER_FLAGS``), so the vendored ``prepared.py`` declines such a plan by name.
     supports_native_d576 = False
+    # The quantized (fp8) split attention-sink combine of the extension's binder (the 977757763 pin): this binder declines a split plan
+    # with a sink altogether (``supports_combine_q_lens`` above; the block declares no sink), so False here and in the shim, and the
+    # vendored ``prepared.py`` / ``api_dsl.py`` decline such a plan by name.
+    supports_quantized_split_sink = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaDenseBinder")
@@ -286,6 +290,11 @@ class SdpaThdBinder:
     supports_paged_physical_origins = False
     supports_paged_split_physical_origins = False
     supports_paged_fp8_physical_origins = False
+    # The native D576x512 PACKED forms of the extension's THD binder (the 977757763 pin: the unsplit form, the packed split): not validated
+    # through this binder (the block's packed forms are d256), so False here and in the shim (``PYTHON_BINDER_FLAGS``) and the vendored
+    # ``engines.py`` / ``api_dsl.py`` decline such a plan by name, as the dense binder's ``supports_native_d576`` does.
+    supports_native_d576 = False
+    supports_native_d576_packed_split = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaThdBinder")

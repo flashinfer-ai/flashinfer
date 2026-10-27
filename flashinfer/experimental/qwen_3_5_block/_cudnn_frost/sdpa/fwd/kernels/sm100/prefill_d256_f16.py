@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync  # noqa: F401
 from cutlass.experimental.cuda import tensor_map as tmap
-from cutlass._mlir.dialects import arith
+from cutlass._mlir.dialects import arith, llvm
 
 import cutlass
 from cutlass.experimental import primitives as prims
@@ -400,6 +400,17 @@ def _kernel(
     )
 
     bars = make_d256_bars(CFG, N_O_CHUNKS=N_O_CHUNKS, epilogue_gate=EPILOGUE_GATE)
+    # Half fused schedule, per CTA: stat_full has 128 softmax arrivals for
+    # shared alpha/max, stat_empty has 128 correction arrivals after S-hi is
+    # loaded. P0 aliases S[64:96] and waits on stat_empty; P1 aliases S[96:128]
+    # and follows stat_full, whose producer completes all S reads. Both edges
+    # have tcgen05 completion plus before/after-thread-sync fences (Rule S3).
+    # Across the CTA pair, ready[chunk0] still has 256 softmax + 256 correction
+    # arrivals; ready[chunk1] now has 256 correction arrivals instead of softmax.
+    # Counts, scheduler credits and phase cadence are unchanged.
+    softmax_exchange = None
+    if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+        softmax_exchange = cutlass.Array(cutlass.Float32, 4 * CFG.TILE_M, alignment=16, space=cutlass.AddressSpace.smem)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -464,6 +475,7 @@ def _kernel(
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
+            softmax_exchange=softmax_exchange,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             scale_log2=scale_softmax_log2,
@@ -483,8 +495,13 @@ def _kernel(
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
-        nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.INCREASE)
+        else:
+            nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _correction_warp_group(
+            softmax_exchange=softmax_exchange,
+            scale_log2=scale_softmax_log2,
             thd_origins=thd_origins,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
@@ -1243,6 +1260,8 @@ def _mma_warp_group(
                     if k % k_per_chunk == 0:
                         chunk_id = k // k_per_chunk
                         bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].wait(bmm2_ready_phase_cur)
+                        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                            _fused_after_sync()
                     mma_ts_step(bmm2_desc, (tmem_raw.subview(tmem_P_cur_addr)), desc_V, (tmem_raw.subview(cutlass.Int32(LAYOUT.O_OFF))), k, accum_b2)
                     accum_b2 = cutlass.Boolean(True)
                 elect_p = nvvm.elect_sync()
@@ -1272,6 +1291,8 @@ def _mma_warp_group(
                 if k % k_per_chunk == 0:
                     chunk_id = k // k_per_chunk
                     bars.mb_bmm2_ready[parity_last_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(chunk_id)].wait(bmm2_ready_phase_last)
+                    if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                        _fused_after_sync()
                 mma_ts_step(bmm2_desc, (tmem_raw.subview(tmem_P_last_addr)), desc_V, (tmem_raw.subview(cutlass.Int32(LAYOUT.O_OFF))), k, accum_b2)
                 accum_b2 = cutlass.Boolean(True)
             elect_p = nvvm.elect_sync()
@@ -1320,6 +1341,16 @@ def _mma_warp_group(
 
 
 @cute.jit
+def _fused_before_sync():
+    llvm.inline_asm(None, [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@cute.jit
+def _fused_after_sync():
+    llvm.inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@cute.jit
 def _softmax_warp_group(
     seqlen_q,
     seqlen_kv,
@@ -1337,6 +1368,7 @@ def _softmax_warp_group(
     leader_cta_id,
     cta_in_pair,
     qh_per_kh,
+    softmax_exchange=None,
 ):
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
 
@@ -1405,6 +1437,8 @@ def _softmax_warp_group(
                 )
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_after_sync()
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
 
                 tmem_base = tmem_ptr_i32.load()
@@ -1433,9 +1467,16 @@ def _softmax_warp_group(
                 new_total_max_safe = row_max_for_exp2(total_max)
                 alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
                 total_max_safe = new_total_max_safe
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
+                    softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
+                    softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(total_max_safe)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    _fused_before_sync()
+                else:
+                    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
 
                 reg_S = reg_S * scale_log2 - total_max_safe
@@ -1444,12 +1485,20 @@ def _softmax_warp_group(
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0)
                 chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    # P0 aliases S[64:96]. Correction releases after its S-hi
+                    # load completes; pair its producer fence with this acquire.
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    _fused_after_sync()
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_before_sync()
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 deferred_P_1 = None
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
                     deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
                     chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -1458,13 +1507,14 @@ def _softmax_warp_group(
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 new_p_sum_pair = hoisted_sum
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
 
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.HALF_FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
@@ -1477,6 +1527,8 @@ def _softmax_warp_group(
                 )
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_after_sync()
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
                 tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
@@ -1522,9 +1574,16 @@ def _softmax_warp_group(
                 new_total_max_safe = row_max_for_exp2(total_max)
                 alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
                 total_max_safe = new_total_max_safe
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
+                    softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
+                    softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(total_max_safe)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    _fused_before_sync()
+                else:
+                    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
                 reg_S = reg_S * scale_log2 - total_max_safe
 
@@ -1532,12 +1591,20 @@ def _softmax_warp_group(
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0)
                 chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    # P0 aliases S[64:96]. Correction releases after its S-hi
+                    # load completes; pair its producer fence with this acquire.
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    _fused_after_sync()
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_before_sync()
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 deferred_P_1 = None
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
                     deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
                     chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -1546,12 +1613,13 @@ def _softmax_warp_group(
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 new_p_sum_pair = hoisted_sum
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.HALF_FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
                 parity_is_even = parity_rt == cutlass.Int32(0)
@@ -1563,6 +1631,8 @@ def _softmax_warp_group(
                 )
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_after_sync()
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
                 tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
@@ -1589,9 +1659,16 @@ def _softmax_warp_group(
                 new_total_max_safe = row_max_for_exp2(total_max)
                 alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
                 total_max_safe = new_total_max_safe
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
+                    softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
+                    softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(total_max_safe)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    _fused_before_sync()
+                else:
+                    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
                 reg_S = reg_S * scale_log2 - total_max_safe
 
@@ -1599,12 +1676,20 @@ def _softmax_warp_group(
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0)
                 chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    # P0 aliases S[64:96]. Correction releases after its S-hi
+                    # load completes; pair its producer fence with this acquire.
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    _fused_after_sync()
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_before_sync()
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 deferred_P_1 = None
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
                     deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
                     chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -1613,12 +1698,13 @@ def _softmax_warp_group(
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 new_p_sum_pair = hoisted_sum
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.HALF_FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 parity_rt = kv_loop & cutlass.Int32(1)
                 parity_is_even = parity_rt == cutlass.Int32(0)
@@ -1630,6 +1716,8 @@ def _softmax_warp_group(
                 )
                 bmm1_phase = (bmm1_done_phase_pair >> parity_rt) & cutlass.Int32(1)
                 bars.mb_bmm1_done[parity_rt].wait(bmm1_phase)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_after_sync()
                 bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_rt)
                 tmem_base = tmem_ptr_i32.load()
                 s_addr_base = tmem_base + s_off_rt
@@ -1675,9 +1763,16 @@ def _softmax_warp_group(
                 new_total_max_safe = row_max_for_exp2(total_max)
                 alpha = cute.math.exp2(cute.math.min(total_max_safe - new_total_max_safe, cutlass.Float32(0.0)), fastmath=True)
                 total_max_safe = new_total_max_safe
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    exchange_base = parity_rt * cutlass.Int32(2 * CFG.TILE_M)
+                    softmax_exchange.subview(exchange_base + tid_in_wg).store(alpha)
+                    softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).store(total_max_safe)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    _fused_before_sync()
+                else:
+                    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
                 reg_S = reg_S * scale_log2 - total_max_safe
 
@@ -1685,12 +1780,20 @@ def _softmax_warp_group(
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
                 hoisted_sum = row_reduction_pair(chunk_P_0)
                 chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    # P0 aliases S[64:96]. Correction releases after its S-hi
+                    # load completes; pair its producer fence with this acquire.
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    _fused_after_sync()
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+                    _fused_before_sync()
                 bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 deferred_P_1 = None
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
                     deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
                     chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
@@ -1699,18 +1802,21 @@ def _softmax_warp_group(
                     bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
                 new_p_sum_pair = hoisted_sum
-                if cutlass.const_expr(N_CHUNKS == 2):
+                if cutlass.const_expr(N_CHUNKS == 2 and not CFG.HALF_FUSED_CORR_SPLIT_P):
                     new_p_sum_pair = new_p_sum_pair + row_reduction_pair(deferred_P_1)
                 alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
                 total_sum = total_sum * alpha_pair + new_p_sum_pair
-                bars.mb_stat_empty.wait(stat_empty_phase)
-                stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
+                if cutlass.const_expr(not CFG.HALF_FUSED_CORR_SPLIT_P):
+                    bars.mb_stat_empty.wait(stat_empty_phase)
+                    stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
 
         total_sum_scalar = total_sum[0] + total_sum[1]
         stats_addr_epi = tmem_ptr_i32.load() + cutlass.Int32(LAYOUT.STATS_EPI_OFF)
         stats_vec_epi = cutlass.Vector.from_elements((total_max_safe, total_sum_scalar), cutlass.Float32)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            _fused_before_sync()
         bars.mb_stat_full.arrive()
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
@@ -1760,12 +1866,15 @@ def _correction_warp_group(
     # Fused epilogue gate staging tile (appended; the call is by keyword); the gate barriers ride `bars`.  None = gate off.
     sGate=None,
     thd_origins=None,
+    softmax_exchange=None,
+    scale_log2=None,
 ):
     nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * (CFG.CORRECTION_WARPS + 1))
 
     tid_raw = cute.arch.thread_idx()[0]
     tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
 
+    bmm1_done_phase_pair = cutlass.Int32(0)
     bmm2_done_phase_pair = cutlass.Int32(0)
     stat_mbar_state = cutlass.Int32(0)
     epilogue_state = cutlass.Int32(1)
@@ -1800,63 +1909,137 @@ def _correction_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        if bounds.right > bounds.left:
-            lo_parity_rt = bounds.left & cutlass.Int32(1)
-            bars.mb_bmm2_ready[lo_parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            high_sum = cutlass.Vector.from_elements((cutlass.Float32(0.0), cutlass.Float32(0.0)), cutlass.Float32)
+            q_abs = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + tid_in_wg // cutlass.Int32(HEADS_PER_TILE)
+            if bounds.right <= bounds.left:
+                bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-            bars.mb_stat_full.wait(stat_mbar_state)
-            bars.mb_stat_empty.arrive()
-            stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
-        else:
-            bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-        for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
-            parity_prev_rt = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(1)
-            parity_cur_rt = kv_loop & cutlass.Int32(1)
-            tmem_base_iter = tmem_ptr_i32.load()
-
-            bars.mb_stat_full.wait(stat_mbar_state)
-
-            stats_off_cur = cutlass.Int32(
-                arith.select(
-                    (parity_cur_rt == cutlass.Int32(0)).ir_value(),
-                    cutlass.Int32(LAYOUT.STATS_EVEN_OFF).ir_value(),
-                    cutlass.Int32(LAYOUT.STATS_ODD_OFF).ir_value(),
+            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                parity_cur_rt = kv_loop & cutlass.Int32(1)
+                parity_prev_rt = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(1)
+                even = parity_cur_rt == cutlass.Int32(0)
+                s_off = cutlass.Int32(
+                    arith.select(even.ir_value(), cutlass.Int32(LAYOUT.S_ACC_EVEN_OFF).ir_value(), cutlass.Int32(LAYOUT.S_ACC_ODD_OFF).ir_value())
                 )
-            )
-            stats_addr = tmem_base_iter + stats_off_cur
-            stats_vec = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
-                num=2,
-            )
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            alpha = stats_vec[0]
-
-            alpha_is_one = alpha == cutlass.Float32(1.0)
-            all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
-
-            bars.mb_stat_empty.arrive()
-
-            bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
-            bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
-            bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
-
-            if ~all_alpha_one:
-                for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
-                    o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
-                    o_chunk = nvvm.tcgen05_ld(
-                        "32x32b",
-                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                        num=O_CHUNK,
+                p_off = cutlass.Int32(arith.select(even.ir_value(), cutlass.Int32(LAYOUT.P_EVEN_OFF).ir_value(), cutlass.Int32(LAYOUT.P_ODD_OFF).ir_value()))
+                phase = (bmm1_done_phase_pair >> parity_cur_rt) & cutlass.Int32(1)
+                bars.mb_bmm1_done[parity_cur_rt].wait(phase)
+                _fused_after_sync()
+                bmm1_done_phase_pair = bmm1_done_phase_pair ^ (cutlass.Int32(1) << parity_cur_rt)
+                tmem_base_iter = tmem_ptr_i32.load()
+                raw_hi = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base_iter + s_off + cutlass.Int32(64), cutlass.Float32), num=64)
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                if (kv_loop < bounds.unmasked_lo) | (kv_loop >= bounds.unmasked_hi):
+                    raw_hi = apply_mask_chunk(
+                        raw_hi,
+                        q_abs,
+                        kv_loop * cutlass.Int32(CFG.TILE_N) + cutlass.Int32(64),
+                        eff_seqlen_kv,
+                        CFG.WINDOW_LEFT,
+                        CFG.MASK_FLAGS,
+                        N=64,
+                        bottom_right=CFG.BOTTOM_RIGHT,
+                        causal_diag=None,
+                        window_right=CFG.WINDOW_RIGHT,
+                        mask_value=float("-inf"),
                     )
-                    o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
-                    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                bars.mb_stat_full.wait(stat_mbar_state)
+                _fused_after_sync()
+                exchange_base = parity_cur_rt * cutlass.Int32(2 * CFG.TILE_M)
+                alpha = softmax_exchange.subview(exchange_base + tid_in_wg).load()
+                max_safe = softmax_exchange.subview(exchange_base + cutlass.Int32(CFG.TILE_M) + tid_in_wg).load()
+                # Release the aliased S tail only after tcgen05.wait::ld and reads.
+                _fused_before_sync()
+                bars.mb_stat_empty.arrive()
+                stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
-            bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                if kv_loop != bounds.left:
+                    all_alpha_one = vote_sync(0xFFFFFFFF, alpha == cutlass.Float32(1.0), VoteSync.ALL)
+                    previous_phase = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
+                    bars.mb_bmm2_done[parity_prev_rt].wait(previous_phase)
+                    _fused_after_sync()
+                    bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
+                    if ~all_alpha_one:
+                        for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                            o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
+                            o_chunk = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), num=O_CHUNK)
+                            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                            o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
+                            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                _fused_before_sync()
+                bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-            stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
+                scaled = RegTile(raw_hi, size=64) * scale_log2 - max_safe
+                high_p = cute.math.exp2(scaled.vec, fastmath=True)
+                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(tmem_base_iter + p_off + cutlass.Int32(32), cutlass.Float32), high_p.to(STORAGE_DTYPE))
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+                _fused_before_sync()
+                bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(
+                    leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA
+                )
+                alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
+                high_sum = high_sum * alpha_pair + row_reduction_pair(high_p)
+
+        else:
+            if bounds.right > bounds.left:
+                lo_parity_rt = bounds.left & cutlass.Int32(1)
+                bars.mb_bmm2_ready[lo_parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+                bars.mb_stat_full.wait(stat_mbar_state)
+                bars.mb_stat_empty.arrive()
+                stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
+            else:
+                bars.mb_empty_mainloop.arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+            for kv_loop in cutlass.range(bounds.left + cutlass.Int32(1), bounds.right, 1, unroll=1):
+                parity_prev_rt = (kv_loop - cutlass.Int32(1)) & cutlass.Int32(1)
+                parity_cur_rt = kv_loop & cutlass.Int32(1)
+                tmem_base_iter = tmem_ptr_i32.load()
+
+                bars.mb_stat_full.wait(stat_mbar_state)
+
+                stats_off_cur = cutlass.Int32(
+                    arith.select(
+                        (parity_cur_rt == cutlass.Int32(0)).ir_value(),
+                        cutlass.Int32(LAYOUT.STATS_EVEN_OFF).ir_value(),
+                        cutlass.Int32(LAYOUT.STATS_ODD_OFF).ir_value(),
+                    )
+                )
+                stats_addr = tmem_base_iter + stats_off_cur
+                stats_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                    num=2,
+                )
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                alpha = stats_vec[0]
+
+                alpha_is_one = alpha == cutlass.Float32(1.0)
+                all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
+
+                bars.mb_stat_empty.arrive()
+
+                bmm2_done_phase_prev = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
+                bars.mb_bmm2_done[parity_prev_rt].wait(bmm2_done_phase_prev)
+                bmm2_done_phase_pair = bmm2_done_phase_pair ^ (cutlass.Int32(1) << parity_prev_rt)
+
+                if ~all_alpha_one:
+                    for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
+                        o_addr = tmem_base_iter + cutlass.Int32(LAYOUT.O_OFF + chunk_idx * O_CHUNK)
+                        o_chunk = nvvm.tcgen05_ld(
+                            "32x32b",
+                            nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                            num=O_CHUNK,
+                        )
+                        o_scaled = vec_scale_pair(o_chunk, alpha, O_CHUNK)
+                        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(o_addr, cutlass.Float32), o_scaled)
+                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+
+                bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+                stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
         tmem_base_epi = tmem_ptr_i32.load()
 
@@ -1871,6 +2054,8 @@ def _correction_warp_group(
         # stats are the reset values (max=-inf, sum=0) and the dead-row override
         # below emits O=0 / LSE=-inf.
         bars.mb_stat_full.wait(stat_mbar_state)
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            _fused_after_sync()
         stats_addr_epi = tmem_base_epi + cutlass.Int32(LAYOUT.STATS_EPI_OFF)
         stats_vec_epi = nvvm.tcgen05_ld(
             "32x32b",
@@ -1880,6 +2065,10 @@ def _correction_warp_group(
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         total_max_scaled = stats_vec_epi[0]
         total_sum = stats_vec_epi[1]
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            total_sum = total_sum + high_sum[0] + high_sum[1]
+        if cutlass.const_expr(CFG.HALF_FUSED_CORR_SPLIT_P):
+            _fused_before_sync()
         bars.mb_stat_empty.arrive()
         stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
@@ -2372,6 +2561,7 @@ def _host(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         cluster=(CFG.CTA_MMA, 1, 1),
+        min_blocks_per_mp=1 if CFG.HALF_FUSED_CORR_SPLIT_P else 0,
         stream=stream,
     )
 

@@ -91,18 +91,37 @@ DECLINE_KEYS: Tuple[str, ...] = (
     "fuse_prepare_rope_tables_unfused",
 )
 INDEX_LIST_FORMS: Tuple[Optional[str], ...] = (None, "per_row", "shared")
-# The sparse core's BODY knob, mirrored from the vendored tree (``sdpa.fwd.heuristics``: the ``tile_form`` vocabulary, the two bodies'
-# ``kernel_template`` names, the AUTO placement bound) and re-read against it by :func:`check_vendored_rules`.  The block-sparse decode
-# step on cc 10.7 has two bodies: the tcgen05 core (``sparse_d256_f16``) and, since the 7301fad21 pin, the LEAN decode tile
-# (``sparse_lean_d256_f16``: ``mma.sync`` + ``cp.async``, 128 threads per m16 tile, no TMEM / TMA / cluster).  ``"auto"`` (this entry's
-# default) takes the lean tile on cc 10.7 inside ``batch x H_kv x q_len <= SPARSE_TILE_LEAN_MAX_UNITS`` units where the body admits the
-# step (under the in-block indexer the per-row list is served at ``q_len_per_req == 1`` only) and the tcgen05 core everywhere else; a
-# performance-only knob: the same function under either body within the tree's fixed-order-sum budget, never bitwise across the bodies.
+# The sparse core's BODY knob, mirrored from the vendored tree (``sdpa.fwd.sparse_tile_rules``, the DSL-free home of the ``tile_form``
+# vocabulary, the two bodies' ``kernel_template`` names and the placement rule since the 977757763 pin -- ``sdpa.fwd.heuristics``
+# re-exports them) and re-read against it by :func:`check_vendored_rules`.  The block-sparse decode step on cc 10.7 has two bodies: the
+# tcgen05 core (``sparse_d256_f16``) and, since the 7301fad21 pin, the LEAN decode tile (``sparse_lean_d256_f16``: ``mma.sync`` +
+# ``cp.async``, one CTA of ``128 x N_MT`` threads per (sequence, KV head, chunk) -- 128 threads per m16 tile, the step's rows riding
+# inside the CTA --, no TMEM / TMA / cluster).  ``"auto"`` (this entry's default) takes the lean tile on cc 10.7 when ``batch x H_kv <=
+# SPARSE_TILE_LEAN_MAX_UNITS`` CTAs per chunk (the bound's unit since the 977757763 pin: the lean grid's own, so the step width is NOT in
+# the bound) at every served ``q_len`` 1..4 where the body admits the step -- under the in-block indexer the list is per row, which the
+# lean body serves at ``q_len_per_req == 1`` only, so for this entry that is ``batch <= 2`` at ``q_len_per_req 1`` on two KV heads -- and
+# the tcgen05 core everywhere else; a performance-only knob: the same function under either body within the tree's fixed-order-sum
+# budget, never bitwise across the bodies.
 SPARSE_TILE_FORM_AUTO = "auto"
 SPARSE_TILE_FORMS: Tuple[str, ...] = ("auto", "lean", "tcgen05")
 SPARSE_TILE_TCGEN05 = "sparse_d256_f16"  # the tcgen05 core's kernel_template (the readback of ``plan.sparse_tile`` on that body)
 SPARSE_TILE_LEAN = "sparse_lean_d256_f16"  # the lean decode tile's kernel_template
-SPARSE_TILE_LEAN_MAX_UNITS = 4  # the AUTO placement bound on cc 10.7: ``batch x H_kv x q_len`` units (B <= 2 at q_len 1 on two KV heads)
+SPARSE_TILE_LEAN_MAX_UNITS = 4  # the AUTO placement bound on cc 10.7, in CTAs per chunk (``batch x H_kv``: B <= 2 on two KV heads, at every served q_len)
+# The bound's UNIT as behaviour, mirrored from the vendored placement rule and re-read by :func:`check_vendored_rules`: what
+# ``sparse_decode_lean_tile_selected`` answers on cc 10.7 at ``top_k`` 512 over two KV heads per ``(batch, q_len)`` cell -- True iff
+# ``batch x 2 <= 4``, whatever the step width.  A tree that counted ``batch x H_kv x q_len`` (the 7301fad21 pin) reads the (1, 3), (1, 4)
+# and (2, 4) cells False, so the tripwire fires on the previous unit.  The rule's reading, not this entry's route: under the in-block
+# indexer's per-row list the lean body admits ``q_len_per_req == 1`` only (:func:`sparse_tile` reads the route cell by cell).
+SPARSE_TILE_LEAN_RULE_CELLS: Tuple[Tuple[int, int, bool], ...] = (
+    (1, 1, True),
+    (1, 3, True),
+    (1, 4, True),
+    (2, 1, True),
+    (2, 4, True),
+    (3, 1, False),
+    (4, 1, False),
+    (4, 4, False),
+)
 _FOLLOW_UP = (
     "the Qwen 3.8 block serves the DECODE form only: the prefill / extend forms of the in-block indexer (the prompt's compressed keys "
     "written into the paged cache, the ring primed from the prompt) are a later cuDNN Frontend PR's and will be vendored then"
@@ -654,8 +673,9 @@ def check_vendored_rules() -> Dict[str, Any]:
     ``index_state_rows_extra``, ``index_page_sizes``), the scorer's row rule as BEHAVIOUR (``validate_params`` over q_len 1 .. 20 at
     4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``), the projection route's verdicts
     (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it), the sparse core's body knob (the ``tile_form`` vocabulary,
-    the two bodies' ``kernel_template`` names, the AUTO placement bound and the envelope's cc 10.7 reading: both bodies served, the lean
-    rule consulted) and, behaviourally, every
+    the two bodies' ``kernel_template`` names, the AUTO placement bound, its UNIT as the placement rule's reading over ``(batch, q_len)``
+    cells -- CTAs per chunk, the step width outside the bound -- and the envelope's cc 10.7 reading: both bodies served, the lean rule
+    consulted) and, behaviourally, every
     decline key the README's Errors table names present in ``decode.declines``.  Once per process (the probe's vendored read,
     ``api.prepare``); returns the tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
@@ -667,7 +687,9 @@ def check_vendored_rules() -> Dict[str, Any]:
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block.kernels import (
         proj_gemm,
     )
-    from ..qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _heuristics
+    from ..qwen_3_5_block._cudnn_frost.sdpa.fwd import (  # the DSL-free home of the tile_form vocabulary and the placement rule (the heuristics re-export them)
+        sparse_tile_rules as _rules,
+    )
 
     _s35.check_vendored_rules()
     g = Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
@@ -684,13 +706,30 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_page_sizes": tuple(int(x) for x in env.index_page_sizes),
         "decode_capture_rows_max": int(proj_gemm.SMALL_M_MAX),
         # the sparse core's body knob (the lean decode tile): the vocabulary, the two bodies' kernel_template names, the AUTO placement
-        # bound, and the envelope's reading of the cc 10.7 part (both bodies served, the AUTO pin consulting the lean rule there)
-        "sparse_tile_forms": tuple(_heuristics.SPARSE_TILE_FORMS),
+        # bound, its unit as the rule's own reading over (batch, q_len) cells (cc 10.7, the Flash-Next top_k, two KV heads), and the
+        # envelope's reading of the cc 10.7 part (both bodies served, the AUTO pin consulting the lean rule there)
+        "sparse_tile_forms": tuple(_rules.SPARSE_TILE_FORMS),
         "sparse_tile_names": (
-            str(_heuristics.SPARSE_TILE_TCGEN05),
-            str(_heuristics.SPARSE_TILE_LEAN),
+            str(_rules.SPARSE_TILE_TCGEN05),
+            str(_rules.SPARSE_TILE_LEAN),
         ),
-        "sparse_tile_lean_max_units": int(_heuristics.LEAN_SPARSE_MAX_UNITS),
+        "sparse_tile_lean_max_units": int(_rules.LEAN_SPARSE_MAX_UNITS),
+        "sparse_tile_lean_rule_cells": tuple(
+            (
+                b,
+                q,
+                bool(
+                    _rules.sparse_decode_lean_tile_selected(
+                        batch=b,
+                        h_kv=g.num_kv_heads,
+                        s_q=q,
+                        top_k=g.top_k,
+                        device_cc=SUPPORTED_CC,
+                    )
+                ),
+            )
+            for b, q, _ in SPARSE_TILE_LEAN_RULE_CELLS
+        ),
         "sparse_tiles_cc107": tuple(str(x) for x in env.sparse_tiles),
         "sparse_tile_lean_default_cc107": bool(env.sparse_tile_lean_default),
     }
@@ -706,6 +745,7 @@ def check_vendored_rules() -> Dict[str, Any]:
         "sparse_tile_forms": SPARSE_TILE_FORMS,
         "sparse_tile_names": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
         "sparse_tile_lean_max_units": SPARSE_TILE_LEAN_MAX_UNITS,
+        "sparse_tile_lean_rule_cells": SPARSE_TILE_LEAN_RULE_CELLS,
         "sparse_tiles_cc107": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
         "sparse_tile_lean_default_cc107": True,
     }

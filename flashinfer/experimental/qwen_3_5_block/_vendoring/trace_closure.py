@@ -645,8 +645,10 @@ def form_decode_qsa(
     compressed-key cache ``[num_pages, P / 4, 1, 128]`` on the MAIN block table and the raw-key ring ``[num_ring_blocks, cap, 1, 128]``
     behind its own ``[B, 1]`` table -- at B 4 x S_q 4 (the MTP verify width; the tcgen05 core) by default, the four input-contract arms
     as the keyword arguments say.  ``batch`` / ``s_q`` (appended) shrink the step to the serving stacks' B 1 cells, where the sparse
-    core's body knob ``sparse_tile_form="auto"`` (the FlashInfer default) resolves the LEAN decode tile on cc 10.7 (``B x H_kv x S_q <= 4``
-    units): the lean kernel module is loaded by path only on that route, so the closure needs a trace of it."""
+    core's body knob ``sparse_tile_form="auto"`` (the FlashInfer default) resolves the LEAN decode tile on cc 10.7 (the placement bound
+    ``B x H_kv <= 4`` CTAs per chunk since cuDNN Frontend 977757763 -- ``B x H_kv x S_q <= 4`` units before it -- where the lean body admits
+    the step; under the in-block indexer the list is per row, which the lean body serves at one row only): the lean kernel module is
+    loaded by path only on that route, so the closure needs a trace of it."""
 
     def make():
         g0 = GatedAttentionBlockGeometry(
@@ -791,6 +793,19 @@ QSA_FORMS = {
     ),
     "decode_qsa_lean_b1_sq2_unfused_pertoken": form_decode_qsa(
         fused=False, tables_only=False, ring_slots=False, batch=1, s_q=2
+    ),
+    # the placement bound's cells (appended at the 977757763 re-vendor: the bound counts the CTAs per chunk, ``B x H_kv``, not
+    # ``B x H_kv x S_q``): B 2 x S_q 1 = 4 CTAs per chunk, the bound itself -> the lean body; B 4 x S_q 1 = 8 -> the tcgen05 core; B 1 x S_q 4
+    # = 2 CTAs per chunk, inside the bound, but under the in-block indexer the list is PER ROW and the lean body serves per-row lists at one
+    # row only (the list-form decline, independent of the bound) -> the tcgen05 core.  The three resolutions are recorded as declared facts.
+    "decode_qsa_bound_b2_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=2, s_q=1
+    ),
+    "decode_qsa_bound_b4_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=4, s_q=1
+    ),
+    "decode_qsa_bound_b1_sq4_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=1, s_q=4
     ),
 }
 if args.form == "all":

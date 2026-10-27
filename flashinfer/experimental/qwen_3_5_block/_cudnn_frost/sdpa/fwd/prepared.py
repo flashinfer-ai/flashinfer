@@ -462,6 +462,10 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    if getattr(spec, "origin_specs", None) is not None:
+        from .thd_origins import ROLES
+
+        roles += ROLES
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     gate_index = -1
     if gate is not None:
@@ -562,21 +566,22 @@ class PreparedThdLaunch:
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        indices = self._indices
-        if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
-        if self._native_indices is None:
-            roles = dict(zip(self._roles, indices))
-            native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
-            if self.spec.origin_specs is not None:
-                from .thd_origins import ROLES
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        roles = dict(zip(self._roles, self._indices))
+        native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+        if self.spec.origin_specs is not None:
+            from .thd_origins import ROLES
 
-                native_roles += ROLES
-            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+            native_roles += ROLES
+        self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        if self._native_indices is None:
+            self._prepare_indices(pack.index_of)
         self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
 
@@ -887,7 +892,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
 
-        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.has_sink and s.quant is not None and not getattr(_pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False):
+            raise NotImplementedError("cudnn.sdpa: FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension")
+        s.combine_q_lens = bool(s.has_sink) and s.seq_q_present and not s.ragged
         if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
             raise NotImplementedError(
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
@@ -913,8 +920,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
             **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
             decode_grid=decode_grid,
-            # Half flavors fold the attention sink in the combine (sink-free partials).
-            has_sink=bool(s.has_sink) and s.quant is None,
+            # Every admitted split sink is folded once over sink-free partials.
+            has_sink=bool(s.has_sink),
             has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)

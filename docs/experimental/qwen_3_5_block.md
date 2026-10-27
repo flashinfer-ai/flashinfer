@@ -189,7 +189,7 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(117 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+(118 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
 SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers, and --
@@ -203,7 +203,7 @@ does not carry -- the `gemm` package's lazy exports and the sm120 arch family; P
 one-device check ahead of its upstream landing, is retired now that the pinned commit carries it; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
 Pinned revision: cuDNN Frontend
-`7301fad21` on its `develop` branch (1.32.0: everything of the previous pins `f2aa360e5` / `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
+`977757763` on its `develop` branch (1.33.0: everything of the previous pins `7301fad21` / `f2aa360e5` / `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
 independent K / V paged-pool layouts, the split-prefix scheduling of paged packed attention, the decode step's measured defaults on cc 10.7
 (programmatic dependent launch on the decode tile's routes, the paged write-through folded into the norm + RoPE launch below 128 rows), the
 in-block QSA indexer's DECODE step over the pools that the Qwen 3.8 sibling binds: the indexer band on the small-M projection route, the
@@ -211,17 +211,24 @@ fused prepare with the paged side-cache arms, the paged scorer, the decode top-k
 core --, plus, on `develop`: the block-sparse decode schedule's split rule (the wave rule), the programmatic-dependent-launch sites of
 the block-sparse chain (served under the caller-list form, off by default), the e4m3 compressed-key cache arms of the compress and
 scorer kernels (served by the tree; the sibling entry declines that dtype by name until its own surface lands), the DSL-free front door
-`_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`); and, at
-this pin, the LEAN decode tile of the block-sparse core (`sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`, behind the sibling entry's
+`_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`); since the
+`7301fad21` pin, the LEAN decode tile of the block-sparse core (`sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`, behind the sibling entry's
 `sparse_tile_form` knob with its measured AUTO default on cc 10.7) with the visible-set helper it shares with the tcgen05 core, the
 packed forms' THD-origins module (`sdpa/fwd/kernels/thd_origins.py`: the per-role physical origins of a packed declaration, which this
 package's Python binder does not gather -- the shim's origin flags read False and such a plan is declined by name) and the SDPA stack's
-other `develop` changes between the pins (the d192 / d576 dense forms, the paged FP8 THD origins, the sm107 FP8 D64 arm: none of them on
-this package's routes).
+other `develop` changes between those pins (the d192 / d576 dense forms, the paged FP8 THD origins, the sm107 FP8 D64 arm: none of them on
+this package's routes); and, at this pin (`977757763`), the lean tile's placement bound counted in the lean grid's own unit (`B x H_kv <= 4`
+CTAs per chunk at every served step width; the rule lives in the DSL-free `sdpa/fwd/sparse_tile_rules.py`, the one file this pin adds to
+the closure, re-exported by the heuristics), the lean kernel's `cudnn_` name prefix, the SDPA stack's `develop` changes between `7301fad21`
+and `977757763` (the native SM107 FP8 D192 / D256 forms and split sinks, the native D576 THD forms, the paged D128 native pipeline, the
+prepared THD host's ordered binding and physical origins: none of them on this package's routes -- the extension's three new binder
+capability flags they bring, the quantized split sink and the native D576 packed forms, read False in the shim and are declined by name
+through this package's Python binder) and the FROST GEMM compiler's MoE-side change (qualified bulk reductions in the combine; the kernel
+templates of the closure byte-identical).
 The dense forms of this package are unchanged by the re-vendor (their files are byte-identical to the previous pin's except the block's
-`api.py`, the SDPA adapter's configuration / heuristics / engine tables, the prepared-plan host, the shared `tile_dsl` helpers, the sm100
-prefill tile and split combine and the GEMM registry's registration list, which carry the changes above; the GEMM compiler and its
-templates are byte-identical).
+`api.py`, the engine manifest, the SDPA adapter's configuration / heuristics / engine tables and its sparse adapter, the prepared-plan host
+and the THD split host, the THD-origins module, the sm100 prefill tile and split combine, and the GEMM compiler and its tile helpers, which
+carry the changes above; the GEMM kernel templates and the shared `tile_dsl` helpers are byte-identical).
 `qwen_3_5_block_support(...).source` reports the pin at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The

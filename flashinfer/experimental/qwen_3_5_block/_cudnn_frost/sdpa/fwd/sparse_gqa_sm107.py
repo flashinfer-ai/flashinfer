@@ -90,7 +90,8 @@ cannot be told apart -- and under ``tile_form="auto"`` on a listed part takes th
 split-major partial slab the tcgen05 core's split store writes, so the combine, its pinned form and the gate riding it are untouched.
 ``tile_form="auto"`` (the default) resolves through ``heuristics.sparse_tile_form_auto``: on the measured part
 (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS`` = cc 10.7 since the gate's table) the placement rule
-``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` = 4 units), the tcgen05 core on every
+``heuristics.sparse_decode_lean_tile_selected`` (``B x H_kv <= LEAN_SPARSE_MAX_UNITS`` = 4 CTAs per chunk -- the lean grid's own unit: the
+step's S_q rows ride inside the CTA, so B 1 and B 2 on two KV heads take the lean body at every served S_q 1..4), the tcgen05 core on every
 other part; an explicit ``"lean"`` is honoured where the body serves the declaration and a typed decline naming the arm where it does not (``heuristics.sparse_lean_tile_decline``:
 THD, a prefill / top-left form, no ``seq_kv_lens``, ``S_q`` past the served rows, per-row lists past one row, a group past 16, ``top_k`` below
 8, a non-default ``softmax_groups``), never a silent fallback; ``sub_tiles_per_cta`` is the lean body's pin and is refused by name where the
@@ -423,7 +424,7 @@ class SparseGqaFwdDslSm107:
         # vocabulary is the heuristics' (one spelling for the adapter and the gated attention block); resolved by check_support (the
         # placement rule on the measured parts, the explicit body honoured or declined by name) into `tile_form` / `kernel_template`.
         # `sub_tiles_per_cta` pins the lean body's k (1 .. min(8, n_sub - 1)); it is refused by name where the resolved body is tcgen05.
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORMS
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORMS
 
         if not isinstance(tile_form, str) or tile_form not in SPARSE_TILE_FORMS:
             raise ValueError(
@@ -581,7 +582,7 @@ class SparseGqaFwdDslSm107:
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
                 "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
             )
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import sparse_tcgen05_max_split  # one copy of the core's split bound (the envelope reads the same)
 
         max_tiles = sparse_tcgen05_max_split(self.top_k) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
 
@@ -793,8 +794,8 @@ class SparseGqaFwdDslSm107:
         (``ceil(n_sub / k)``; unset = the default k of :func:`heuristics.sparse_lean_sub_tiles_per_cta` or the pinned ``sub_tiles_per_cta``),
         k in ``1 .. min(8, n_sub - 1)``; ``self.split_kv`` becomes the lean split and ``self.sub_tiles_per_cta`` the k.  The TCGEN05 core:
         ``split_kv`` up to ``ceil((top_k + 1) / 32)`` as before; a ``sub_tiles_per_cta`` pin is refused by name (never silently ignored)."""
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as H
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import sparse_tile_rules as H
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import lean_sparse_n_sub, lean_sparse_split
 
         split_req = self.split_kv_requested
         reason = H.sparse_lean_tile_decline(
@@ -870,7 +871,7 @@ class SparseGqaFwdDslSm107:
     def kernel_template(self) -> Optional[str]:
         """The body ``compile`` loads, by its module stem (``heuristics.SPARSE_TILE_LEAN`` / ``SPARSE_TILE_TCGEN05``): the readback a caller
         pins its route against; None before ``check_support`` resolved the form."""
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_LEAN, SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN, SPARSE_TILE_LEAN, SPARSE_TILE_TCGEN05
 
         if self.tile_form is None:
             return None
@@ -879,7 +880,7 @@ class SparseGqaFwdDslSm107:
     @property
     def lean(self) -> bool:
         """Whether the resolved body is the lean tile (after ``check_support``)."""
-        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_LEAN
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import SPARSE_TILE_FORM_LEAN
 
         return self.tile_form == SPARSE_TILE_FORM_LEAN
 

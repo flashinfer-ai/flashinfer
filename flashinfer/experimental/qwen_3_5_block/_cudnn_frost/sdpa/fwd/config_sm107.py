@@ -192,6 +192,7 @@ __all__ = [
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_FP8_SPLIT_SHAPES",
+    "SM107_FP8_PACK_GQA_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
     "SM107_SCORE_STATS_SHAPES",
@@ -295,7 +296,15 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 # failed across the per-tensor FP8 THD suite.
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
-SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
+SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
+# Packing and splitting are separate domains; both graph and adapter read this one.
+SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})
+
+
+def supports_fp8_d256_padded_split(d_shape, *, device_cc, pertensor, thd, paged):
+    """Native dense D256 FP8 partials honor runtime Q/KV lengths and tails."""
+    return device_cc == (10, 7) and pertensor and d_shape == (256, 256) and not thd and not paged
+
 
 # f16/bf16 flavor names whose kernel body HAS been ported to the FROST
 # setup-kernel contract (the 14-arg build_thd_meta_o_descs_kernel + the 4B+4
@@ -303,18 +312,17 @@ SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128)})
 # `_validate_params` already receives, so adding a ported flavor is one entry.
 _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
 
-# Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line: wired through the K/V TMA-LDG sites of the MXFP8
-# d128 / d256 siblings only -- the SM100 PAGED_KV specialization ported (page id = TMA batch coordinate of the K/V and
-# SF descriptors, tile-in-page = SF tile coordinate).  engines' paged_d_shapes and the adapter's Rubin clause name the
-# same two shapes; half paged graphs never load an sm107 file (api_dsl._load_sm100_kernel_module routes them to the
-# SM100 bodies).  _validate_params declines every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at
-# module scope as well.  A page holds whole 128-row F8_128x4 SF atom sets, so page_size is a multiple of the KV tile.
+# Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line uses the native half D128 and MXFP8 D128/D256
+# K/V TMA-LDG sites. Half D256 prefill and the single-Q THD split retain their shared bodies. The page id is the TMA
+# batch coordinate; MXFP8 also indexes its SF descriptor by the page and tile-in-page. _validate_params declines
+# every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at module scope as well. MXFP8 pages hold
+# whole 128-row F8_128x4 SF atom sets. Half pages instead use boxes of at least eight rows within each KV tile.
 # Two cc 10.7 HALF kernels read pools natively and validate their OWN records (neither passes through _validate_params,
 # so this set does not name them): sm107/decode_d256_f16.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
 # route, the SM100 decode record re-validated for Rubin) and sm107/sparse_d256_f16.py (make_cfg_d256_sparse -- the
 # index-list core's gather warps read K / V from the pools through the (B, max_pages) table; page_size a multiple of
 # the 4-token block).
-_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128 mxfp8", "sm107 d256 mxfp8"})
+_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128", "sm107 d128 mxfp8", "sm107 d256 mxfp8"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
@@ -1623,7 +1631,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: half and per-tensor FP8 D128 and D192/V128. The engine
+    partial-output stores: half and per-tensor FP8 D128/D192, plus per-tensor FP8 D256. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -1677,20 +1685,27 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         if flavor not in _PAGED_KV_FLAVORS_SM107:
             raise ValueError(
                 f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
-                f"sm107/prefill_d128_mxfp8.py and sm107/prefill_d256_mxfp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
+                f"sm107/prefill_d128_f16.py, sm107/prefill_d128_mxfp8.py and sm107/prefill_d256_mxfp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
             )
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
-        if k.thd_varlen:
-            raise ValueError(
-                f"{flavor}: THD queries over MXFP8 pools are not wired on cc 10.7 (the quantized THD setup clamps K/V descriptors to a packed total)"
-            )
-        if k.pack_gqa or (k.split_kv or 1) > 1:
-            raise ValueError(f"{flavor}: paged_kv serves unsplit, unpacked plans only")
-        if k.page_size <= 0 or k.page_size % 128 != 0:
-            raise ValueError(
-                f"{flavor}: paged MXFP8 KV needs page_size to be a positive multiple of 128 (whole F8_128x4 SF atom sets per page); got {k.page_size}"
-            )
+        if flavor == "sm107 d128":
+            if k.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16) or k.d_flavor != 128:
+                raise ValueError(f"{flavor}: paged_kv is not wired for this dtype/tile; native paged half prefill requires the D128 half body")
+            p = k.page_size
+            if p < 8 or p % 8 or (p < 128 and 128 % p) or (p > 128 and p % 128):
+                raise ValueError(f"{flavor}: page_size must be a multiple of 8 dividing 128, or a multiple of 128; got {p}")
+        else:
+            if k.thd_varlen:
+                raise ValueError(
+                    f"{flavor}: THD queries over MXFP8 pools are not wired on cc 10.7 (the quantized THD setup clamps K/V descriptors to a packed total)"
+                )
+            if k.pack_gqa or (k.split_kv or 1) > 1:
+                raise ValueError(f"{flavor}: paged_kv serves unsplit, unpacked plans only")
+            if k.page_size <= 0 or k.page_size % 128 != 0:
+                raise ValueError(
+                    f"{flavor}: paged MXFP8 KV needs page_size to be a positive multiple of 128 (whole F8_128x4 SF atom sets per page); got {k.page_size}"
+                )
     elif k.page_size:
         raise ValueError(f"{flavor}: page_size requires paged_kv=True")
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
@@ -1853,7 +1868,7 @@ class _CfgSm107(D128FamilySmallTileFields):
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
     THD_VARLEN: int = 0
-    # Paged KV cache (TemplateParams.paged_kv / page_size); only the d128 / d256 MXFP8 factories set them.
+    # Paged KV cache (TemplateParams.paged_kv / page_size): D128 half and D128/D256 MXFP8 factories set them.
     PAGED_KV: int = 0
     PAGE_SIZE: int = 0
 
@@ -2436,7 +2451,15 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
     checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
-    _validate_params(flavor, params)
+    split_wired = not mxfp8 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    _validate_params(flavor, params, split_wired=split_wired)
+    if (params.split_kv or 1) > 1 and params.thd_varlen:
+        raise ValueError(f"{flavor}: per-tensor FP8 split-KV is dense-only")
+    if params.pack_gqa and not mxfp8:
+        if params.thd_varlen:
+            raise ValueError(f"{flavor}: per-tensor FP8 PackGQA is dense-only")
+        if 128 % params.qh_per_kh:
+            raise ValueError(f"{flavor}: PackGQA requires a whole head group dividing TILE_M=128; got {params.qh_per_kh}")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -3924,15 +3947,20 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
 # N_KEYS == 32 (one 32-bit mask word per ROW per sub-tile, 8 blocks per sub-tile), SMEM = 2 x STAGES x N_KEYS x 512 + N_MT x 8192 under the
 # standard carveout, 1 <= SUB_TILES_PER_CTA <= 8 (the body is range_constexpr-unrolled over it), 1 <= S_Q <= 4 (the shared list's bound).
 _LEAN_FLAVOR = "sm107 d256 sparse lean"
-LEAN_SPARSE_N_KEYS = 32  # keys per sub-tile = 8 four-token blocks = one 32-bit valid word
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules import (  # noqa: E402 -- the lean host arithmetic's DSL-free home
+    _LEAN_N_TAIL_MAX,
+    LEAN_SPARSE_MAX_SEQLEN_Q,
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_N_KEYS,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+)
+
 LEAN_SPARSE_BLOCKS_PER_SUB = LEAN_SPARSE_N_KEYS // _SPARSE_BLOCK_SIZE
 LEAN_SPARSE_THREADS_PER_MT = 128  # four warps per m16 tile: the d-slices of the split-D plan
 LEAN_SPARSE_ROWS_PER_MT = 16  # the m16n8k16 M extent: one m-tile = 16 query rows (token-major: row R = s x G + g)
-LEAN_SPARSE_MAX_SEQLEN_Q = 4  # the serving step's rows per sequence under ONE shared list (the sparse function's own S_q <= 4 bound)
-LEAN_SPARSE_MAX_SUB_TILES_PER_CTA = 8  # the sub-tile loop is unrolled at trace time (cutlass.range_constexpr); the fill rule never exceeds 7 (B 32)
-LEAN_SPARSE_TOPK_MIN = 8  # top_k < 8 is ONE sub-tile = split 1: the tcgen05 tile's cell (the adapter routes it there)
-LEAN_SPARSE_SERVED_MAX_S_Q = LEAN_SPARSE_MAX_SEQLEN_Q  # the step rows per sequence the ROUTE serves on the lean body = the kernel's own S_q bound (4: N_MT = ceil(S_q x G / 16) m16 tiles over ONE gathered sub-tile); the adapter and the heuristics read THIS constant, never a literal
-_LEAN_N_TAIL_MAX = 2  # the S_q <= 4 bound on the appended tail blocks (the same host bound at every S_q, so the S_q axis changes no grid)
 assert 1 <= LEAN_SPARSE_SERVED_MAX_S_Q <= LEAN_SPARSE_MAX_SEQLEN_Q  # the route never serves more rows than the kernel renders (the tripwire)
 _LEAN_S_EXCHANGE_BYTES = 4 * 4 * 32 * 16  # sS[4 warps][4 n-blocks][32 lanes][16 B] = 8 KiB per m-tile
 
@@ -3958,18 +3986,6 @@ def lean_sparse_n_mt(seqlen_q: int, qh_per_kh: int, rows_per_mt: int = LEAN_SPAR
     """The m16 tiles that hold the sequence's ``S_q x G`` query rows (token-major): 1 at S_q 1 / G 12, 2 at S_q 2, 3 at S_q 3..4 (G 12), 4 at
     S_q 4 / G 16, 1 at G 1 (four rows, one per token)."""
     return -(-(int(seqlen_q) * int(qh_per_kh)) // int(rows_per_mt))
-
-
-def lean_sparse_n_sub(top_k: int, block_size: int = _SPARSE_BLOCK_SIZE, n_keys: int = LEAN_SPARSE_N_KEYS) -> int:
-    """The HOST bound on a (sequence, KV head)'s 32-key sub-tiles: ``ceil((top_k + n_tail_max) x block_size / n_keys)`` = 65 at
-    top_k 512 (the device's real ``count + n_tail`` is smaller: the chunks past it are DEAD items that write the combine's identity)."""
-    return -(-(int(top_k) + _LEAN_N_TAIL_MAX) * int(block_size) // int(n_keys))
-
-
-def lean_sparse_split(top_k: int, sub_tiles_per_cta: int) -> int:
-    """The lean tile's split = the chunk count ``ceil(n_sub / k)``: the grid's x extent and the combine's partial count (65 / 33 / 22 / 17 at
-    top_k 512 for k = 1 / 2 / 3 / 4)."""
-    return -(-lean_sparse_n_sub(top_k) // int(sub_tiles_per_cta))
 
 
 def lean_sparse_smem_bytes(stages: int, n_mt: int = 1, n_keys: int = LEAN_SPARSE_N_KEYS, bpe_val: int = 2, d: int = 256) -> int:

@@ -13,8 +13,10 @@ over outlives its eviction and is released by ``clear_plan_cache`` only).  The v
 (``..qwen_3_5_block._cudnn_frost``) and so are the cache roots (``configure_vendored_tree``) and the operand helpers.
 
 The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
-the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv x q_len <= 4`` units (``batch <= 2`` at ``q_len 1`` on
-two KV heads; under the in-block indexer the lean tile serves ``q_len_per_req == 1``), the tcgen05 core everywhere else --, ``"lean"`` /
+the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
+977757763 pin: the step's rows ride inside the CTA, so ``q_len`` is not in it) at every served ``q_len`` 1..4 the body admits -- under the
+in-block indexer the list is per row, which the lean tile serves at ``q_len_per_req == 1`` only, so ``batch <= 2`` at ``q_len 1`` on two KV
+heads --, the tcgen05 core everywhere else --, ``"lean"`` /
 ``"tcgen05"`` pin a body (an explicit body the step does not admit is the tree's typed decline).  The body a plan compiled reads back
 in ``plan.sparse_tile`` (its ``kernel_template``) and ``plan.declaration``; it is a plan-cache key.
 """
@@ -774,7 +776,7 @@ def _light_decode_gates(
     ):
         raise ValueError(
             f"{_PKG}: sparse_tile_form must be one of {SPARSE_TILE_FORMS} ('auto' = the vendored placement rule: the lean decode tile on cc 10.7 "
-            f"at batch x H_kv x q_len <= 4 units, the tcgen05 core elsewhere; 'lean' / 'tcgen05' explicit), got {sparse_tile_form!r}"
+            f"at batch x H_kv <= 4 CTAs per chunk where the body admits the step, the tcgen05 core elsewhere; 'lean' / 'tcgen05' explicit), got {sparse_tile_form!r}"
         )
 
 

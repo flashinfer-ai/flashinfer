@@ -91,7 +91,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_d128_fa
 )
 
 # Native half THD flavors whose worklist and Stats stores use packed heads.
-SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
+SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128), (576, 512)})
 
 # Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
 SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
@@ -513,6 +513,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
+            or (device_cc in ((10, 0), (10, 3)) and d_shape == SM100_NATIVE_D576_SHAPE and max_q > 0)
         )
     )
 
@@ -524,13 +525,29 @@ def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
     )
 
 
+def supports_quantized_split_sink(*, device_cc, pertensor, thd):
+    """Per-tensor SM100/SM103/SM107 dense-Q partials fold the sink in combine.
+
+    Existing split, packing and paged head-dimension domains still apply.
+    MXFP8, packed queries and native SM120 need separate qualification.
+    """
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and pertensor and not thd
+
+
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
     """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
 
 
+def supports_thd_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Half partials fold the sink once in the final packed combine."""
+    return supports_paged_split_sink(d_shape, device_cc=device_cc, fp8=fp8, thd=thd, paged=paged, max_q=max_q) or (
+        device_cc in ((10, 0), (10, 3)) and d_shape == SM100_NATIVE_D576_SHAPE and not fp8 and thd and max_q > 0
+    )
+
+
 def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
-    """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
+    """The two-slab D128 prefill body, distinct from its split/decode tile."""
     # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
     return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
 
@@ -546,7 +563,7 @@ def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, c
 
 
 def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
-    """Rubin's shared two-CTA D128 paged half body packs a divisor of the GQA group."""
+    """Rubin's two-CTA D128 paged half body packs a divisor of the GQA group."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
@@ -657,6 +674,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
             or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
+            or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
                 flavor == "d128"
                 and k.cta_mma == 1
@@ -688,9 +706,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
                     )
                 )
                 or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
+            raise ValueError(
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, "
+                "paged half d256 cga2 unsplit, or native half d576 cga2"
+            )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -965,7 +987,7 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     CGA-width knob (D192). D128 CGA1 here models the 128-row decode/split
     tile; the paged prefill leg has two slabs and its caller accounts for them.
     """
-    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = _GEOMETRY_BY_D_QK[d_qk]
     if d_qk == 128 and cta_mma == 1:
         # Default D128 half CGA1 geometry is the decode/split tile
         # (sm100/decode_d128_f16.py, TILES_Q=1), not the two-slab paged prefill.
@@ -979,7 +1001,7 @@ def cga_ctas(d_qk: int, cta_mma: Optional[int] = None) -> int:
     Public CGA selects the MMA width. It is not a physical launch count for
     the role-split D512 flavor, whose CGA_M/CTA_MMA ratio is two.
     """
-    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = _GEOMETRY_BY_D_QK[d_qk]
     return cls.CGA_M // cls.CTA_MMA * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
@@ -1132,6 +1154,11 @@ class CfgD256:
     EPILOGUE_GATE: int = 0
     GATE_BPE: int = 2
 
+    # Half causal schedule: the dedicated correction WG also generates P1.
+    # Unlike MXFP8 FUSED_CORR_SPLIT_P, this retains one softmax WG and four
+    # correction warps. Append-only internal topology, not an autotune knob.
+    HALF_FUSED_CORR_SPLIT_P: int = 0
+
 
 def d256_gate_smem_bytes(cfg: CfgD256) -> int:
     """The SMEM the GATED d256 half rendering allocates, from the SAME constants its arrays are declared with:
@@ -1159,12 +1186,30 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
     checks = (
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d256: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
         (
-            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + cfg.SOFTMAX_WG1_REGS <= 512,
+            cfg.MMA_REGS + (0 if fused_corr_split_p else cfg.CORRECTION_REGS) + cfg.SOFTMAX_REGS + (cfg.SOFTMAX_WG1_REGS if split_p else 0) <= 512,
             "d256: register budget over 512",
         ),
         (
             cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0 and cfg.SOFTMAX_WG1_REGS % 8 == 0,
             "d256: per-role regs must be multiples of 8",
+        ),
+        (
+            not cfg.HALF_FUSED_CORR_SPLIT_P
+            or (
+                cfg.DTYPE_QKV == DTYPE_BF16
+                and cfg.MASK_FLAGS == MASK_CAUSAL
+                and not cfg.BOTTOM_RIGHT
+                and not cfg.WINDOW_LEFT
+                and not cfg.WINDOW_RIGHT
+                and not cfg.THD_VARLEN
+                and not cfg.PAGED_KV
+                and not cfg.EPILOGUE_GATE
+                and cfg.SPLIT_KV == 1
+                and not split_p
+                and not fused_corr_split_p
+                and cfg.CORRECTION_WARPS == 4
+            ),
+            "d256: half fused correction requires dense unsplit BF16 top-left causal",
         ),
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
@@ -1282,6 +1327,17 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     split_p = fp8 and (mask_flags == MASK_NONE or pt_plain_top_left_causal)
     pt_thd_split_p = pt_plain_top_left_causal and bool(mask_flags & MASK_PADDED)
     fused_corr_split_p = mxfp8 and strict_top_left_causal
+    half_fused_corr_split_p = (
+        not mxfp8
+        and params.dtype_qkv == DTYPE_BF16
+        and mask_flags == MASK_CAUSAL
+        and strict_top_left_causal
+        and not params.window_left
+        and not params.thd_varlen
+        and not params.paged_kv
+        and not params.epilogue_gate
+        and params.split_kv == 1
+    )
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
 
@@ -1290,7 +1346,11 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
     pt_e4_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E4M3 and mask_flags == MASK_CAUSAL and not params.bottom_right
     pt_e5_causal_regs = not mxfp8 and params.dtype_qkv == DTYPE_E5M2 and mask_flags == MASK_CAUSAL and not params.bottom_right
     softmax_regs, softmax_wg1_regs, correction_regs = 240, 136 if split_p else 40, 96
-    if fused_corr_split_p:
+    if half_fused_corr_split_p:
+        # 4 warps each: 240 softmax + 216 correction/P1 + 48 other = 504.
+        # WG1's legal tracing placeholder does not represent a live warpgroup.
+        correction_regs = 216
+    elif fused_corr_split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 248, 216, 64
     elif mxfp8 and split_p:
         softmax_regs, softmax_wg1_regs, correction_regs = 256, 144, 72
@@ -1340,6 +1400,14 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SOFTMAX_WARPGROUPS=2 if split_p or fused_corr_split_p else 1,
         CORRECTION_WARPS=0 if fused_corr_split_p else 4,
         FUSED_CORR_SPLIT_P=1 if fused_corr_split_p else 0,
+        HALF_FUSED_CORR_SPLIT_P=int(half_fused_corr_split_p),
+        # Forty registers spill the producer/scheduler's live metadata under
+        # the fused role split; 48 stays within the 64K register file.
+        MMA_REGS=48 if half_fused_corr_split_p else 40,
+        TMALDG_REGS=48 if half_fused_corr_split_p else 40,
+        TMASTG_REGS=48 if half_fused_corr_split_p else 40,
+        SCHEDULER_REGS=48 if half_fused_corr_split_p else 40,
+        OTHER_REGS=48 if half_fused_corr_split_p else 40,
         SOFTMAX_REGS=softmax_regs,
         SOFTMAX_WG1_REGS=softmax_wg1_regs,
         CORRECTION_REGS=correction_regs,
@@ -2218,8 +2286,6 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     if not getattr(params, "mma_2x2", False):
         raise ValueError("d512 2x2: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
     native_d576 = params.d_flavor == 576
-    if native_d576 and params.thd_varlen:
-        raise ValueError("d576: native 2x2 attention requires dense Q; THD origins are not wired")
     _validate_params("d512", params, d512_partial_pack_wired=native_d576)
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d512 2x2: BF16/FP16 inputs only")
@@ -3966,6 +4032,18 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     )
     _validate_cfg_d192(cfg)
     return cfg, _tma_iters(cfg)
+
+
+class _CfgD576Geometry:
+    """Native D576x512 launch geometry: the 2x2 datapath with one CTA pair (make_cfg_d512_2x2(cga_m=2))."""
+
+    TILES_Q = CfgD512X2.TILES_Q
+    TILE_M = CfgD512X2.TILE_M
+    CTA_MMA = CfgD512X2.CTA_MMA
+    CGA_M = 2
+
+
+_GEOMETRY_BY_D_QK = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512, 576: _CfgD576Geometry}
 
 
 MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}

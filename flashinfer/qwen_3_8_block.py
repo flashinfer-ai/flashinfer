@@ -340,8 +340,10 @@ def prepare_qwen_3_8_block_bf16(
         ``None`` = bf16 pools; ``torch.float8_e4m3fn`` is a typed decline until the sparse core's in-kernel dequant arm lands.
     sparse_tile_form : str
         WHICH BODY of the sparse core serves the step: ``"auto"`` (default) = the vendored placement rule -- on cc 10.7 the LEAN decode
-        tile (``mma.sync`` + ``cp.async``, no TMEM / TMA / cluster) at ``batch_size x H_kv x q_len_per_req <= 4`` units (``batch_size <= 2``
-        at ``q_len_per_req 1`` on two KV heads; under the in-block indexer the lean tile serves ``q_len_per_req == 1``), the tcgen05 core
+        tile (``mma.sync`` + ``cp.async``, one CTA of ``128 x N_MT`` threads, no TMEM / TMA / cluster) at ``batch_size x H_kv <= 4`` CTAs
+        per chunk -- the bound's unit: the step's rows ride inside the CTA, so ``q_len_per_req`` is not in it -- at every served step width
+        the body admits (under the in-block indexer the list is per row, which the lean tile serves at ``q_len_per_req == 1`` only:
+        ``batch_size <= 2`` at ``q_len_per_req 1`` on two KV heads), the tcgen05 core
         everywhere else --, ``"lean"`` / ``"tcgen05"`` pin a body (an explicit body the step does not admit is a typed decline naming the
         arm).  Performance-only: the same function under either body within the vendored tree's budget, never bitwise ACROSS the bodies
         (bitwise within each); the body that compiled reads back in ``plan.sparse_tile`` (``"sparse_lean_d256_f16"`` / ``"sparse_d256_f16"``).
