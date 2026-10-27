@@ -458,6 +458,32 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--old_context_len`      | Old context length for Llama 3.1 RoPE. Default: 8192                                                       |
 | `--backends`             | Backend to test: `cuda` (default)                                                                          |
 
+### Norm / Activation / Quantization / RoPE / Sampling additions (2026-10)
+New routines (all write `refcheck`-checked rows where a reference exists):
+
+| Routine | API | Backends (CSV `backend`) | Notes |
+|---|---|---|---|
+| `fused_add_rmsnorm_fp8_block_quant` | `flashinfer.norm.fused_add_rmsnorm_fp8_block_quant` | `cuda` | add + RMSNorm + 1x128 block-fp8 (DeepGEMM scale layout) |
+| `layernorm` | `flashinfer.layernorm` | `cute-dsl` (CUDA JIT fallback in `resolved_backend`) | bf16 in/out, fp32 gamma/beta |
+| `act_and_mul` | `silu_and_mul` / `gelu_and_mul` / `gelu_tanh_and_mul` | `cuda` | `--act_type silu\|gelu\|gelu_tanh`; `--hidden_size` = output width |
+| `mhc` | `flashinfer.mhc.mhc_post` / `mhc_pre_big_fuse[_with_prenorm]` | `cuda` | `--mhc_mode`, `--num_splits` |
+| `gated_residual_rmsnorm`, `gated_residual_next_rmsnorm`, `rmsnorm_sigmoid_gate` | `flashinfer.*` | `cute-dsl` (forces `backend="cute"`) | SM100/103/107; hidden 8192 / head dim 64; `--norm_variant` |
+| `scaled_fp4_grouped_quantize`, `mxfp8_grouped_quantize`, `silu_and_mul_scaled_nvfp4_experts_quantize`, `silu_and_mul_mxfp8_experts_quantize` | masked grouped `[B, M, K]` quantizers | `cuda` (+ `cutile` for mxfp8 grouped) | `--batch_size` = groups, `--masked_m` valid rows |
+| `per_token_group_quant_8bit` | `flashinfer.quantization.per_token_group_quant_8bit` | `cutile` | `--group_size --quant_dtype --column_major_scales --scale_tma_aligned --scale_ue8m0` |
+| `silu_and_mul_nvfp4_quantize` | fused SwiGLU + NVFP4 | `cute-dsl` | input `[m, 2k]` |
+| `nvfp4_kv_quantize`, `nvfp4_kv_dequantize`, `nvfp4_kv_dequantize_paged` | NVFP4 KV cache (de)quant | `cuda` | paged: `--num_kv_heads --page_size --kv_layout` |
+| `packbits`, `segment_packbits` | `flashinfer.packbits` | `cuda` | `--bitorder big\|little` |
+
+New modes on existing routines: `nvfp4_quantize --per_token_activation`, `--nvfp4_4over6 env|off|mae|mse`,
+fp8 input, `8x4`/`linear` layouts, cute-dsl vs cuda bitwise refcheck; RoPE `--inplace` (the `*_inplace` APIs),
+`--mla_kv`, `rope_quantize_fp8 --backends cutile`; sampling `--param_mode tensor` (per-request tensors),
+`--deterministic`, `--input_distribution`; top-k `--backends radix|clusters|cub` (forced through
+`FLASHINFER_TOPK_ALGO`; `cuda` = library auto-dispatch), `--sorted`, `--tie_break`, `--dsa_graph_safe`,
+top-k page-table `--page_size`. The Cake backend is not benchmarked by these routines.
+
+New mode flags are written as new CSV columns and stay empty on rows that do not use them
+(`blank_unused_mode_columns`), so pre-existing testlist lines keep the same CSV row.
+
 ### Mamba Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
