@@ -260,13 +260,16 @@ _PAGED_CASES = (
         "fp8_group8_persistent", heads_q_per_kv=8, seq_len_q=48, dtype=_FP8
     ),
     _PagedPairedCase(
-        "fp8_head_dim64_group128_bf16_output",
+        "fp8_head_dim64_group128_packed_causal_page64",
         heads_q_per_kv=128,
         seq_len_q=5,
         num_kv_heads=4,
+        page_size=64,
+        mask_type="causal",
         dtype=_FP8,
         output_dtype=torch.bfloat16,
         head_dim=64,
+        q_lens=(5, 2, 4),
     ),
 )
 

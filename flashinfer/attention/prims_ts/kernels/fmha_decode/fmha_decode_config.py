@@ -3282,7 +3282,8 @@ class FmhaDecodeConfig:
             # sliding window in direct launches only. The 16-bit Q128 recipe,
             # which reuses the contiguous 16-bit resources, runs fixed or
             # packed Q in direct nonpersistent launches; the FP8 recipes run
-            # fixed Q, direct or split.
+            # fixed Q, direct or split, and the FP8 Q128 tile also runs packed
+            # Q in direct launches.
             if self.use_attention_sinks or (
                 self.use_sliding_window_causal and not direct
             ):
@@ -3291,7 +3292,10 @@ class FmhaDecodeConfig:
                 return direct and not self.use_persistent_scheduler
             return (
                 (self.max_seq_len_q > 1 or self.grouped_q_fits_tile)
-                and not self.use_variable_seqlens_q
+                and (
+                    not self.use_variable_seqlens_q
+                    or (self.tile_size_q == 128 and direct)
+                )
                 and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
                 and (direct or self.has_valid_split_kv_fanout)
             )
