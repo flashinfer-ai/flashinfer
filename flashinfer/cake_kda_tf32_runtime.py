@@ -119,6 +119,22 @@ H12_DIRECT_N32_MAX_SEQ_LEN = 256
 H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN = 128
 BF16_N32_REGISTER_INVERSE_MIN_SEQ_LEN = 256
 INDEPENDENT_DVSPLIT_CTAS = 2
+# Shortest longest-sequence of an M64 value-split launch that takes the
+# loader's pair-share build of the module (see _m64_pair_share_factory), by
+# the launch's long-task load, heads x tokens / longest sequence (its task
+# count when the sequences are equal; a short sequence counts by its length):
+# the first (most tasks, shortest longest-sequence) row that holds the load
+# decides, and a launch beyond the last row keeps the routed program.
+# Off-bench sweeps measured the pair-share build faster only on long
+# sequences, and the more long tasks share the wave, the longer the sequence
+# it needs: on a 148-SM B200 it is slower beyond 48 equal tasks at every
+# length, while a 152-SM GB300 keeps it faster up to 72.
+M64_PAIR_SHARE_MIN_SEQ_LEN = ((32, 1024), (48, 2048))
+M64_PAIR_SHARE_MIN_SEQ_LEN_GB300 = ((32, 1024), (64, 2048), (72, 4096))
+# The M64 value split's CTA: 1024 threads and the dynamic shared memory that
+# keeps it at one CTA per SM (the cluster capacity probe launches this shape).
+M64_CTA_THREADS = 1024
+M64_CTA_SMEM_BYTES = 227328
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -913,6 +929,95 @@ def _correction_merge_factory(
     program = _kda_registry._RENDERED_MERGE_ROUTES.get(arch, {}).get(module)
     if program is None:
         raise _CorrectionMergeUnavailable
+    return _kda_registry.PreparedKernel(program, arch)
+
+
+# A minimal kernel the driver JIT-compiles for the cluster capacity probe: the
+# capacity depends on the launch shape (block, shared memory, cluster), not on
+# the body.
+_PAIR_PROBE_PTX = b"""
+.version 7.8
+.target sm_90
+.address_size 64
+.visible .entry cake_kda_pair_probe()
+{
+    ret;
+}
+\x00"""
+
+
+@cache
+def _m64_pair_cluster_capacity(device: torch.device) -> int:
+    """How many 2-CTA clusters of the M64 value split's CTA the device holds at once.
+
+    ``cuOccupancyMaxActiveClusters`` for a probe kernel launched with the M64
+    CTA's threads and dynamic shared memory (one CTA per SM) in clusters of
+    two.  The driver's answer follows the part's floorsweeping, which can leave
+    it below ``sm_count // 2``.  0 when the driver cannot answer: the runtime
+    then keeps the routed program.
+    """
+    import torch
+
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device):
+            torch.empty(0, device=device)  # the primary context is current
+            module = check(driver.cuModuleLoadData(_PAIR_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"cake_kda_pair_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        M64_CTA_SMEM_BYTES,
+                    )
+                )
+                config = driver.CUlaunchConfig()
+                config.gridDimX, config.gridDimY, config.gridDimZ = 2, 1, 1
+                config.blockDimX, config.blockDimY, config.blockDimZ = (
+                    M64_CTA_THREADS,
+                    1,
+                    1,
+                )
+                config.sharedMemBytes = M64_CTA_SMEM_BYTES
+                cluster = driver.CUlaunchAttribute()
+                cluster.id = (
+                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                )
+                cluster.value.clusterDim.x = 2
+                cluster.value.clusterDim.y = 1
+                cluster.value.clusterDim.z = 1
+                config.attrs = [cluster]
+                config.numAttrs = 1
+                return int(check(driver.cuOccupancyMaxActiveClusters(function, config)))
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception:
+        return 0
+
+
+# Long M64 value-split launches whose clusters fit one wave take the loader's
+# ``_RENDERED_PAIR_SHARE_ROUTES`` build of the module: the two value halves of
+# a task run as a 2-CTA cluster and each prepares every second 32-token chunk
+# for both (the same bits as the routed program).  Every other launch, and a
+# module without a pair-share build, keeps the routed program.
+def _m64_pair_share_factory(name, *args, **kwargs):
+    """The pair-share build of the factory row's M64 module, else ``_factory``."""
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    program = _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(arch, {}).get(module)
+    if program is None:
+        return _factory(name, *args, **kwargs)
     return _kda_registry.PreparedKernel(program, arch)
 
 
@@ -3057,8 +3162,29 @@ class FlashKDABlackwellBF16FusedLaunch:
             if self._pdl_wait_initial_state_f32 or self._pdl_publish_final_state:
                 self.schedule += "_pdl"
         elif use_independent_dvsplit:
+            pair_share_rows = (
+                M64_PAIR_SHARE_MIN_SEQ_LEN_GB300
+                if gpu_arch == "sm_103a" and sm_count == 152
+                else M64_PAIR_SHARE_MIN_SEQ_LEN
+            )
+            pair_share_min_seq_len = next(
+                (
+                    min_seq_len
+                    for most_tasks, min_seq_len in pair_share_rows
+                    if num_heads * total_tokens <= most_tasks * max_seq_len
+                ),
+                None,
+            )
+            pair_share = (
+                pair_share_min_seq_len is not None
+                and max_seq_len >= pair_share_min_seq_len
+                and total_tasks <= _m64_pair_cluster_capacity(q.device)
+            )
             self.module = self._build_body(
-                partial(_factory, "compiled_bf16_fused_m64"),
+                partial(
+                    _m64_pair_share_factory if pair_share else _factory,
+                    "compiled_bf16_fused_m64",
+                ),
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 active_beta_f32=self._active_beta_f32,
             )
@@ -3069,6 +3195,10 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._state_dtype_is_fp32
                 else "fused_m64_independent_dvsplit"
             )
+            if getattr(self.module, "name", None) in (
+                _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(gpu_arch, {}).values()
+            ):
+                self.schedule += "_pair_share"
         self.route = route
         self.gate_kind = gate_kind.value
         self.gpu_arch = gpu_arch

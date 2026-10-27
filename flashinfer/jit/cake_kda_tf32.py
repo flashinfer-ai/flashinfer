@@ -4217,6 +4217,16 @@ _RENDERED_FOLD_ROUTES = {
 # other launch of the module keeps the routed program.
 _RENDERED_MAP_FOLD_ROUTES = {"sm_100a": {}, "sm_103a": {}}
 
+# architecture -> shipped module -> the generated build of an M64 value-split
+# module that launches the two value halves of a task as a 2-CTA cluster and
+# prepares each 32-token chunk once per pair. The runtime takes it instead of
+# the ``_RENDERED_ROUTES`` program on long launches whose clusters the device
+# holds in one wave; every other launch of the module keeps the routed program.
+_RENDERED_PAIR_SHARE_ROUTES = {
+    "sm_100a": {},
+    "sm_103a": {},
+}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
