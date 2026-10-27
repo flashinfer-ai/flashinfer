@@ -91,6 +91,9 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
     )
     assert sup.index_query_rows_max == 0 and sup.fuse_prepare_default is False
     assert (
+        sup.sparse_tiles == () and sup.sparse_tile_lean_default is False
+    )  # the lean-tile rows: READ off the envelope, empty on a CPU probe
+    assert (
         "bfloat16"
         in qwen_3_8_block_support(torch.device("cpu"), g, dtype=torch.float16).reason
     )
@@ -146,6 +149,15 @@ def test_support_probe_on_the_local_device():
             128,
         )
         assert sup.fuse_prepare_default is True and sup.pdl_default is False
+        # the sparse core's two bodies on cc 10.7 and the AUTO pin consulting the lean rule there (the envelope's rows, mirrored by name)
+        from flashinfer.experimental.qwen_3_8_block import support
+
+        assert (
+            sup.sparse_tiles
+            == (support.SPARSE_TILE_TCGEN05, support.SPARSE_TILE_LEAN)
+            == ("sparse_d256_f16", "sparse_lean_d256_f16")
+        )
+        assert sup.sparse_tile_lean_default is True
         for key in (
             "indexer_e4m3_cache",
             "indexer_e4m3_pool",
@@ -164,6 +176,33 @@ def test_support_probe_on_the_local_device():
         )
 
 
+def test_mirrored_sparse_tile_vocabulary():
+    """The sparse core's body knob as this module mirrors it (``check_vendored_rules`` re-reads every value off the vendored heuristics):
+    the vocabulary, the two bodies' kernel_template names, the AUTO placement bound; the light gate refuses another spelling by name."""
+    from flashinfer.experimental.qwen_3_8_block import api, support
+
+    assert (
+        support.SPARSE_TILE_FORMS == ("auto", "lean", "tcgen05")
+        and support.SPARSE_TILE_FORM_AUTO == "auto"
+    )
+    assert (
+        support.SPARSE_TILE_LEAN == "sparse_lean_d256_f16"
+        and support.SPARSE_TILE_TCGEN05 == "sparse_d256_f16"
+    )
+    assert support.SPARSE_TILE_LEAN_MAX_UNITS == 4
+    g = _flash_next()
+    for form in support.SPARSE_TILE_FORMS:
+        api._light_decode_gates(g, 16, 1, None, None, form)
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        api._light_decode_gates(g, 16, 1, None, None, "fast")
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        api._light_decode_gates(g, 16, 1, None, None, None)
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        support.sparse_tile(
+            torch.device("cpu"), g, batch_size=1, sparse_tile_form="fast"
+        )
+
+
 def test_version_probe_is_the_qwen_3_5_tree():
     """ONE vendored tree for both packages: the 3.8 source record equals the 3.5 one field for field, and names the pinned commit."""
     from flashinfer.experimental.qwen_3_5_block import support as s35
@@ -172,6 +211,6 @@ def test_version_probe_is_the_qwen_3_5_tree():
 
     a, b = s38.source(), s35.source()
     assert Qwen38BlockSource is type(b) and a == b
-    assert a.commit.startswith("f2aa360e5") and a.version == "1.32.0" and a.files == 114
+    assert a.commit.startswith("7301fad21") and a.version == "1.32.0" and a.files == 117
     assert a.validated_cutedsl == "4.8.0" and a.validated_compute_capability == "10.7"
     assert qwen_3_8_block_support.is_experimental is True

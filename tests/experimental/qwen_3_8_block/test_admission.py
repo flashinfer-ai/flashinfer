@@ -55,9 +55,9 @@ def _geometry(**over):
     return Qwen38BlockGeometry(**kw)
 
 
-def _declare(geometry, q_len, page):
+def _declare(geometry, q_len, page, batch=2, **knobs):
     """The vendored declaration ``api.prepare`` builds for the decode form (host tensors; no device, nothing compiled): the two side
-    caches, the ring table, the position-table arm, the fused prepare."""
+    caches, the ring table, the position-table arm, the fused prepare; ``batch`` and ``knobs`` (``sparse_tile_form``, ...) appended."""
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block import (
         GatedAttentionBlockFwd as Fwd,
     )
@@ -71,7 +71,7 @@ def _declare(geometry, q_len, page):
         geometry.num_kv_heads,
     )
     mk = lambda *shape: torch.empty(*shape, dtype=dt)  # noqa: E731
-    b = 2
+    b = int(batch)
     cap = max(8, q_len + 3)
     rows = max(page // geometry.block_size, 1)
     return Fwd(
@@ -100,7 +100,84 @@ def _declare(geometry, q_len, page):
         ),
         sample_index_state_block_table=torch.zeros(b, 1, dtype=torch.int32),
         rope_position_tables_only=True,
+        **knobs,
     )
+
+
+def test_sparse_tile_form_facts_through_the_envelope_and_the_host_declaration():
+    """The sparse core's body knob, device-free: (1) the per-cell reading ``support.sparse_tile`` (the vendored envelope's own rule at the
+    cc 10.7 part) -- ``"auto"`` is the LEAN tile at batch 1 x q_len 1 (2 units) and batch 2 (4 units, the bound), the tcgen05 core at
+    batch 3 and 4 (6 / 8 units) and at q_len 2 (the in-block indexer's per-row list past one row is the core's); the explicit bodies read
+    back as named; over e4m3 pools no body runs (None); on a CPU part (no cc) the form is not served, so no body (None) -- and (2) the vendored declaration
+    ``api.prepare`` builds, with the explicit bodies: ``"lean"`` resolves the lean tile at its lean split (65 at top_k 512, k 1),
+    ``"tcgen05"`` the core, and the requested form reads back; the facts of (1) and (2) are the same spelling (``kernel_template``)."""
+    pytest.importorskip("cutlass")
+    from flashinfer.experimental.qwen_3_8_block import support
+
+    g = _geometry()
+    cell = lambda b, q, **kw: support.sparse_tile(
+        torch.device("cpu"),
+        g,
+        batch_size=b,
+        q_len_per_req=q,
+        device_cc_override=(10, 7),
+        **kw,
+    )  # noqa: E731
+    lean, core = support.SPARSE_TILE_LEAN, support.SPARSE_TILE_TCGEN05
+    assert cell(1, 1) == lean and cell(2, 1) == lean, (
+        "the AUTO pin on cc 10.7 inside the bound (B x H_kv x q_len <= 4 units)"
+    )
+    assert cell(3, 1) == core and cell(4, 1) == core and cell(32, 1) == core, (
+        "past the bound: the tcgen05 core"
+    )
+    assert cell(1, 2) == core and cell(1, 4) == core, (
+        "under the in-block indexer the per-row list past one row is the core's"
+    )
+    assert (
+        cell(1, 1, sparse_tile_form="tcgen05") == core
+        and cell(4, 1, sparse_tile_form="lean") == lean
+    ), "the explicit bodies"
+    assert cell(1, 2, sparse_tile_form="lean") is None, (
+        "an explicit lean body the step does not admit: no body (the plan is the typed decline)"
+    )
+    assert cell(1, 1, kv_cache_dtype=torch.float8_e4m3fn) is None, (
+        "over e4m3 pools no body of the sparse core runs"
+    )
+    assert (
+        cell(1, 1, decode_split_kv=16) == core
+        and cell(1, 1, decode_split_kv=65) == lean
+    ), "a pinned split keeps the body that honours it"
+    assert (
+        support.sparse_tile(torch.device("cpu"), g, batch_size=1, q_len_per_req=1)
+        is None
+    ), "no cc on a CPU host: the form is not served there, so no body"
+    # the host declaration with the explicit bodies (the vendored block's own readbacks: the form, the kernel_template, the split)
+    blk = _declare(g, 1, 16, batch=1, sparse_tile_form="lean")
+    assert (
+        blk.sparse_tile_form_requested,
+        blk.sparse_tile_form,
+        blk.sparse_tile,
+        blk.decode_split_kv,
+    ) == ("lean", "lean", lean, 65)
+    assert blk.sparse_sub_tiles_per_cta == 1
+    blk = _declare(g, 1, 16, batch=1, sparse_tile_form="tcgen05")
+    assert (blk.sparse_tile_form_requested, blk.sparse_tile_form, blk.sparse_tile) == (
+        "tcgen05",
+        "tcgen05",
+        core,
+    )
+    blk = _declare(
+        g, 1, 16, batch=1
+    )  # "auto" on a host declaration (no device cc): the core
+    assert (blk.sparse_tile_form_requested, blk.sparse_tile_form, blk.sparse_tile) == (
+        "auto",
+        "tcgen05",
+        core,
+    )
+    with pytest.raises(NotImplementedError, match="per-row lists at S_q = 2"):
+        _declare(g, 2, 16, batch=1, sparse_tile_form="lean")
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        _declare(g, 1, 16, batch=1, sparse_tile_form="fast")
 
 
 def _rubin_mocks():
@@ -148,6 +225,17 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
         facts["index_page_sizes"] == (16, 32, 64, 128)
         and facts["decode_capture_rows_max"] == 128
     )
+    # the lean decode tile's rows of the tree: the vocabulary, the two bodies, the AUTO bound, the cc 10.7 envelope (both bodies, the lean pin)
+    assert (
+        facts["sparse_tile_forms"] == ("auto", "lean", "tcgen05")
+        and facts["sparse_tile_lean_max_units"] == 4
+    )
+    assert (
+        facts["sparse_tile_names"]
+        == facts["sparse_tiles_cc107"]
+        == ("sparse_d256_f16", "sparse_lean_d256_f16")
+    )
+    assert facts["sparse_tile_lean_default_cc107"] is True
     plants = [
         ("INDEX_HEAD_DIM", 64, "index_head_dims"),
         ("INDEX_KV_HEADS", (2,), "index_kv_heads"),
@@ -162,6 +250,11 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
             support.DECLINE_KEYS + ("indexer_moved_row",),
             "indexer_moved_row",
         ),
+        # the sparse core's body knob (the lean decode tile): the vocabulary, the kernel_template names, the AUTO placement bound
+        ("SPARSE_TILE_FORMS", ("auto", "lean"), "sparse_tile_forms"),
+        ("SPARSE_TILE_LEAN", "sparse_lean_d256", "sparse_tile_names"),
+        ("SPARSE_TILE_TCGEN05", "sparse_d256", "sparse_tile_names"),
+        ("SPARSE_TILE_LEAN_MAX_UNITS", 8, "sparse_tile_lean_max_units"),
     ]
     for name, planted, token in plants:
         keep = getattr(support, name)

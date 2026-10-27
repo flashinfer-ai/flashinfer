@@ -6,8 +6,10 @@ the TP 2 / 4 shards) -- (1) the kernel's selection vs the fp64 top-k of its own 
 list; (2) ``out`` within the block suite's budget of the fp32 oracle fed THAT list; the written pool rows / ring rows / completed cache
 rows vs the reference; padded entries exactly 0, the null page / ring block untouched; page 16 / 32 / 64 / 128; the UNIFIED cache spelling
 vs the NHD one bitwise; the ring-slots arm vs the derived one bitwise; the fused prepare vs the unfused twin bitwise; the position-table
-arm vs the per-token arm bitwise; the declaration readbacks; the launch census by kernel count; three carried steps with a rejected
-draft re-stepped; the run-time typed declines; a cached step under ``set_sync_debug_mode("error")``; the compiled-plan cache's reload."""
+arm vs the per-token arm bitwise; the declaration readbacks; the launch census by kernel count and by kernel NAME (the lean decode
+tile at batch 1 under the AUTO body knob, the tcgen05 core at batch 4 and under the explicit pin); the two bodies of the sparse core
+within the budget of each other at batch 1; three carried steps with a rejected draft re-stepped; the run-time typed declines; a
+cached step under ``set_sync_debug_mode("error")``; the compiled-plan cache's reload."""
 
 import pytest
 import torch
@@ -151,6 +153,13 @@ def test_decode_matches_the_two_stage_oracle(name, q_len):
     assert d["indexer_launches"] == 2 and d["n_blocks_max"] == case.block_table.shape[
         1
     ] * (16 // 4)
+    # the sparse core's body under the AUTO knob at batch 4 (8 units at two KV heads, past the lean bound of 4): the tcgen05 core
+    assert (
+        d["sparse_tile_form_requested"] == "auto"
+        and plan.sparse_tile_form == d["sparse_tile_form"] == "tcgen05"
+        and plan.sparse_tile == d["sparse_tile"] == "sparse_d256_f16"
+        and d["sparse_sub_tiles_per_cta"] is None
+    ), d
     out = _run(plan, case)
     assert out.shape == (case.b * q_len, g.d_model) and out.dtype == torch.bfloat16
     stats, completed = _check_step(case, plan, out, f"decode {name} q{q_len}")
@@ -351,13 +360,46 @@ def test_fused_prepare_is_bitwise_the_unfused_twin_and_the_table_arm_the_per_tok
         _plan(case, g, fuse_prepare=False, rope_position_tables_only=True)
 
 
+def _kernel_names(plan, case, **outputs):
+    """The CUDA kernels one ``plan.run`` launches on the case's tensors (the profiler's names), the case's sentinel fills outside the window."""
+    case.reset_outputs()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        plan.run(
+            case.hidden_states,
+            None,
+            None,
+            case.weights38,
+            case.w_o,
+            **case.decode_args(),
+            **outputs,
+        )
+        torch.cuda.synchronize()
+    return [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
 def test_launch_census_matches_the_declaration():
     """The number of kernels one step launches (the profiler's count) equals the declaration's ``launches_per_execute``: 8 at a split
-    (the slab GEMM, the prepare, the scorer, the top-k, the sparse tile, the combine, the out projection, its reducer), no memset / memcpy."""
+    (the slab GEMM, the prepare, the scorer, the top-k, the sparse tile, the combine, the out projection, its reducer), no memset / memcpy.
+    At batch 1 (2 units) the AUTO body knob resolves the LEAN decode tile on cc 10.7: the census names ONE ``cudnn_sparse_lean_kernel``
+    and NO ``cudnn_kernel__kernel`` sparse core; the explicit ``"tcgen05"`` pin on the same bucket names the core and no lean kernel at
+    the same launch count (the lean tile replaces the core one for one; both routes run their split combine)."""
     g = _geometry("24_2")
     case = Qsa38PagedCase(g, (8192,), 1, page_size=16, seed=7)
     case.prime()
     plan = _plan(case, g)
+    assert (
+        plan.sparse_tile == "sparse_lean_d256_f16"
+        and plan.sparse_tile_form == "lean"
+        and plan.decode_split_kv == 65
+    ), (
+        plan.sparse_tile,
+        plan.decode_split_kv,
+    )
     _run(plan, case)  # warm (the launch stream, the first-execute paths)
 
     def census(**outputs):
@@ -406,6 +448,112 @@ def test_launch_census_matches_the_declaration():
         and any("qsa_score_paged" in n for n in names)
         and any("qsa_topk_decode" in n for n in names)
     ), names
+    if not names:  # CUPTI unavailable: the count assertions above would have failed first; the names are the pin below
+        pytest.skip(
+            "torch.profiler recorded no CUDA event (CUPTI unavailable on this node)"
+        )
+    has = lambda ns, tok: sum(tok in n for n in ns)  # noqa: E731
+    assert (
+        has(names, "cudnn_sparse_lean_kernel") == 1
+        and has(names, "cudnn_kernel__kernel") == 0
+    ), names
+    assert has(names, "cudnn_kernel__combine_decode_grid_kernel") == 1, names
+    # the explicit tcgen05 pin on the same bucket: the core by name, no lean kernel, the same launch count
+    core = _plan(case, g, sparse_tile_form="tcgen05")
+    assert (
+        core.sparse_tile == "sparse_d256_f16"
+        and core.sparse_tile_form == "tcgen05"
+        and 2 <= core.decode_split_kv <= 17
+    )
+    _run(core, case)
+    core_names = _kernel_names(core, case)
+    assert (
+        has(core_names, "cudnn_kernel__kernel") == 1
+        and has(core_names, "cudnn_sparse_lean_kernel") == 0
+    ), core_names
+    assert (
+        len(core_names) == len(names) == core.declaration["launches_per_execute"] == 8
+    ), (len(core_names), len(names))
+    assert has(core_names, "cudnn_kernel__combine_decode_grid_kernel") == 1, core_names
+
+
+def test_the_two_bodies_of_the_sparse_core_agree_within_the_budget_at_batch_1():
+    """The sparse core's two bodies on the same primed step at batch 1 x q_len 1 (the serving stacks' decode cell): ``"auto"`` (= the lean
+    tile on cc 10.7) and the explicit ``"lean"`` are the SAME body (``out``, the list, the pools / ring / cache bitwise); ``"tcgen05"`` is
+    the former function -- the list and every written row bitwise (the same prepare / scorer / top-k kernels run on both routes), ``out``
+    within the block suite's budget of the lean body's (cosine; never asserted bitwise across the bodies: a 4 x 64-d split-K sum in fixed
+    order vs one 256-d MMA chain), each body against the two-stage oracle; the readbacks and the workspace carve of each body
+    (``qwen_3_8_block_workspace_size`` with the same knob equals the plan's; the lean split's wider slab exceeds the core's)."""
+    from flashinfer.qwen_3_8_block import qwen_3_8_block_workspace_size
+    from tests.test_helpers.qwen_3_8_block_cases import OUT_COS
+
+    g = _geometry("24_2")
+    results = {}
+    for form in ("auto", "lean", "tcgen05"):
+        case = Qsa38PagedCase(g, (8192,), 1, page_size=16, seed=9)
+        case.prime()
+        plan = _plan(case, g, sparse_tile_form=form)
+        d = plan.declaration
+        body = "tcgen05" if form == "tcgen05" else "lean"
+        template = "sparse_d256_f16" if body == "tcgen05" else "sparse_lean_d256_f16"
+        assert (
+            d["sparse_tile_form_requested"] == form
+            and plan.sparse_tile_form == d["sparse_tile_form"] == body
+        ), d
+        assert plan.sparse_tile == d["sparse_tile"] == template, d
+        assert (
+            (plan.decode_split_kv == 65 and d["sparse_sub_tiles_per_cta"] == 1)
+            if body == "lean"
+            else (d["sparse_sub_tiles_per_cta"] is None)
+        ), d
+        sized = qwen_3_8_block_workspace_size(
+            "decode",
+            geometry=g,
+            device="cuda",
+            page_size=16,
+            batch_size=1,
+            q_len_per_req=1,
+            max_pages=int(case.block_table.shape[1]),
+            sparse_tile_form=form,
+        )
+        assert sized == plan.workspace_size, (form, sized, plan.workspace_size)
+        out = _run(plan, case)
+        _check_step(case, plan, out, f"decode body {form}")
+        results[form] = (
+            out.clone(),
+            case.block_ids_out.clone(),
+            case.block_lens_out.clone(),
+            (
+                bits(case.kv_cache).clone(),
+                bits(case.index_state_cache).clone(),
+                bits(case.index_kv_cache).clone(),
+            ),
+            plan.workspace_size,
+        )
+    auto, lean, core = results["auto"], results["lean"], results["tcgen05"]
+    assert torch.equal(auto[0], lean[0]) and torch.equal(auto[1], lean[1]), (
+        "auto resolves the lean body at batch 1: the same bytes"
+    )
+    for x, y in zip(auto[3], lean[3], strict=True):
+        assert torch.equal(x, y)
+    assert torch.equal(lean[1], core[1]) and torch.equal(lean[2], core[2]), (
+        "the list is the indexer's on both bodies: bitwise"
+    )
+    for x, y in zip(lean[3], core[3], strict=True):
+        assert torch.equal(x, y), (
+            "the pools / ring / cache rows are the prepare's on both bodies: bitwise"
+        )
+    a, b = lean[0].float().flatten(), core[0].float().flatten()
+    cos = float(torch.dot(a, b) / (a.norm() * b.norm()).clamp_min(1e-30))
+    md = float((a - b).abs().max())
+    bitwise = bool(torch.equal(bits(lean[0]), bits(core[0])))
+    print(
+        f"\nlean vs tcgen05 at batch 1 x q_len 1: cos(out) {cos:.6f} max|diff| {md:.3e} (bitwise across the bodies {bitwise}: not required)"
+    )
+    assert cos > OUT_COS, f"the two bodies disagree past the budget: cos {cos}"
+    assert lean[4] > core[4], (
+        "the lean split's partial slab (65 partials) is wider than the core's"
+    )
 
 
 def test_three_carried_steps_with_a_rejected_draft():
