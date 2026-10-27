@@ -995,13 +995,15 @@ class NVFP4QuantizePerTokenKernel:
         mPerTokenScale: cute.Tensor,
         M: Int32,
         padded_M: Int32,
-        num_blocks: Int32,
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
-        mValidRows: Optional[cute.Tensor],
-        mRowLimits: Optional[cute.Tensor],
         stream,
+        num_blocks: Optional[Int32] = None,
+        mValidRows: Optional[cute.Tensor] = None,
+        mRowLimits: Optional[cute.Tensor] = None,
     ):
+        if cutlass.const_expr(num_blocks is None):
+            num_blocks = padded_M
         self.kernel(
             mInput,
             mOutput,
@@ -1033,8 +1035,8 @@ class NVFP4QuantizePerTokenKernel:
         padded_M: Int32,
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
-        mValidRows: Optional[cute.Tensor],
-        mRowLimits: Optional[cute.Tensor],
+        mValidRows: Optional[cute.Tensor] = None,
+        mRowLimits: Optional[cute.Tensor] = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -2433,12 +2435,12 @@ def _get_compiled_kernel_nvfp4_per_token(
             per_token_scale_fake,
             Int32(1),
             Int32(1),
-            Int32(1),
             global_scale_inv_fake,
             out_scale_fake,
+            stream_fake,
+            Int32(1),
             valid_rows_fake,
             row_limits_fake,
-            stream_fake,
             options="--enable-tvm-ffi",
         ),
         extra_key_files=_kernel_source_files(),
@@ -3394,9 +3396,9 @@ def nvfp4_quantize_per_token_cute_dsl(
         per_token_scale,
         m,
         padded_m,
-        num_blocks,
         global_scale_inv_tensor,
         out_scale if fold_out_scale else global_scale_inv_tensor,
+        num_blocks,
         valid_rows,
         row_limits,
     )

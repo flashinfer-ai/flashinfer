@@ -272,7 +272,7 @@ class Sm100W4A16GroupedGemmKernel:
         raster_along_m: bool,
         transform_fragment_size: int,
         m_cluster_aligned: bool,
-        gated_weight_group_size: int,
+        gated_weight_group_size: int = 64,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count

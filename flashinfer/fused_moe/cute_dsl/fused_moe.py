@@ -231,6 +231,7 @@ def _validate_mxfp_weight_dtype(
     x: torch.Tensor,
     w1_weight: torch.Tensor,
     w2_weight: torch.Tensor,
+    swap_ab: bool,
 ) -> None:
     if quant_mode == "w4a8":
         weight_dtype = torch.uint8
@@ -240,6 +241,10 @@ def _validate_mxfp_weight_dtype(
         raise ValueError(f"Unexpected MXFP quant_mode {quant_mode!r}")
     if x.dtype is not torch.float8_e4m3fn:
         raise TypeError(f"quant_mode={quant_mode!r} requires float8_e4m3fn input")
+    if not swap_ab:
+        if quant_mode == "mxfp8" and w1_weight.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn weights")
+        return
     if w1_weight.dtype is not weight_dtype or w2_weight.dtype is not weight_dtype:
         raise TypeError(
             f"quant_mode={quant_mode!r} requires {weight_dtype} GEMM1 and GEMM2 weights"
@@ -1423,7 +1428,9 @@ class CuteDslMoEWrapper:
         num_tokens = token_selected_experts.size(0)
 
         if self.quant_mode in ("w4a8", "mxfp8"):
-            _validate_mxfp_weight_dtype(self.quant_mode, x, w1_weight, w2_weight)
+            _validate_mxfp_weight_dtype(
+                self.quant_mode, x, w1_weight, w2_weight, self.swap_ab
+            )
             if per_token_scale is not None:
                 raise ValueError(
                     "per_token_scale is not supported for MXFP8 activations"
@@ -1900,7 +1907,7 @@ def cute_dsl_fused_moe(
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     if quant_mode in ("w4a8", "mxfp8"):
-        _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight)
+        _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
         if torch.cuda.get_device_capability(x.device) == (10, 7):
             raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:

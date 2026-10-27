@@ -2498,16 +2498,12 @@ def _cute_dsl_gated_weight_group_size(
     """Resolve the gated row layout and reject unsupported swap-AB targets."""
     if not isinstance(swap_ab, bool):
         raise TypeError("swap_ab must be a bool")
-    arch = get_compute_capability(torch.device(device))
-    if swap_ab:
-        if arch not in ((10, 0), (10, 3)):
-            raise ValueError("CuTe DSL MoE swap_ab=True requires SM100 or SM103")
-        return 16
-    if arch in ((10, 0), (10, 3), (10, 7)):
+    if not swap_ab:
         return 64
-    raise ValueError(
-        f"Split CuTe DSL MoE weight preparation does not support SM{arch[0]}{arch[1]}"
-    )
+    arch = get_compute_capability(torch.device(device))
+    if arch in ((10, 0), (10, 3)):
+        return 16
+    raise ValueError("CuTe DSL MoE swap_ab=True requires SM100 or SM103")
 
 
 def _interleave_linear_and_gate(

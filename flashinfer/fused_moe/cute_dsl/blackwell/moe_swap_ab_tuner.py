@@ -54,12 +54,37 @@ DEFAULT_SWAP_AB_MOE_TACTIC = (
 )
 
 
-def canonicalize_swap_ab_tactic(tactic: Any) -> Tuple:
+def _split_swap_ab_tactic(tactic: Any) -> Tuple:
     """Accept automatic K depth or explicit FC1/FC2 depths and shared CLC."""
     if not isinstance(tactic, (tuple, list)) or len(tactic) not in (3, 4, 5):
         raise ValueError(
             "swap-AB tactic must be (tile_size, gemm1, gemm2[, k_steps_pair[, use_clc]])"
         )
+
+    tile_size, gemm1, gemm2 = tactic[:3]
+    if not isinstance(gemm1, (tuple, list)) or not isinstance(gemm2, (tuple, list)):
+        raise ValueError("GEMM sub-tactics must be tuples or lists")
+    if len(gemm1) != 3 or len(gemm2) != 3:
+        raise ValueError("swap-AB GEMM sub-tactics must use the Blackwell format")
+    if len(tactic) == 3:
+        k_steps = (None, None)
+    else:
+        k_steps = tactic[3]
+        if not isinstance(k_steps, (tuple, list)) or len(k_steps) != 2:
+            raise ValueError("k_steps_pair must contain FC1 and FC2 depths")
+        if any(type(depth) is not int or depth not in (4, 8) for depth in k_steps):
+            raise ValueError("Blackwell K-step depths must be 4 or 8")
+    if len(tactic) == 5:
+        use_clc = tactic[4]
+        if type(use_clc) is not bool:
+            raise ValueError("CLC scheduling choice must be a boolean")
+    else:
+        use_clc = True
+    return tile_size, gemm1, gemm2, k_steps, use_clc
+
+
+def canonicalize_swap_ab_tactic(tactic: Any) -> Tuple:
+    """Canonicalize an MX-activation tactic from Python or JSON."""
 
     def as_tuple(value):
         if isinstance(value, (tuple, list)):
@@ -67,14 +92,7 @@ def canonicalize_swap_ab_tactic(tactic: Any) -> Tuple:
         return value
 
     result = as_tuple(tactic)
-    if len(result) >= 4:
-        depths = result[3]
-        if not isinstance(depths, tuple) or len(depths) != 2:
-            raise ValueError("k_steps_pair must contain FC1 and FC2 depths")
-        if any(type(depth) is not int or depth not in (4, 8) for depth in depths):
-            raise ValueError("Blackwell K-step depths must be 4 or 8")
-    if len(result) == 5 and type(result[4]) is not bool:
-        raise ValueError("CLC scheduling choice must be a boolean")
+    _split_swap_ab_tactic(result)
     if not any(
         candidate[: len(result)] == result for candidate in ALL_SWAP_AB_MOE_TACTICS
     ):
@@ -83,10 +101,7 @@ def canonicalize_swap_ab_tactic(tactic: Any) -> Tuple:
 
 
 def extract_swap_ab_tactic_params(tactic: Any) -> dict:
-    tactic = canonicalize_swap_ab_tactic(tactic)
-    tile_size, gemm1, gemm2 = tactic[:3]
-    k_steps = (None, None) if len(tactic) == 3 else tactic[3]
-    use_clc = True if len(tactic) < 5 else tactic[4]
+    tile_size, gemm1, gemm2, k_steps, use_clc = _split_swap_ab_tactic(tactic)
     params = {"tile_size": tile_size, "is_rubin": False}
     for phase, gemm, depth in (
         ("gemm1", gemm1, k_steps[0]),

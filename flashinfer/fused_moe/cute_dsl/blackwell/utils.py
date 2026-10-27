@@ -48,7 +48,7 @@ Blackwell (SM100) specific kernel utilities.
 
 Re-exports shared utilities from common/kernel_utils.py (pointer helpers, the
 f32 activation functions, fmin) and adds Blackwell-specific functions:
-blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16, and PDL publication.
+blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
 """
 
 from cutlass._mlir.dialects import llvm

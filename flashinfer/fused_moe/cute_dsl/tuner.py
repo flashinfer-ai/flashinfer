@@ -713,10 +713,10 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.situ_linear_beta,
                 self.use_per_token_activation,
                 self.quant_mode,
-                self.swap_ab,
                 self.use_cuda_graph,
                 self._localization_signature(),
             )
+            + (("swap_ab",) if self.swap_ab else ())
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -1000,11 +1000,14 @@ class CuteDslFusedMoERunner(TunableRunner):
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import (
                 DEFAULT_SWAP_AB_MOE_TACTIC,
+                canonicalize_swap_ab_tactic,
                 extract_swap_ab_tactic_params,
             )
 
             if tactic is None or tactic == -1:
                 tactic = DEFAULT_SWAP_AB_MOE_TACTIC
+            elif self.quant_mode in ("w4a8", "mxfp8"):
+                tactic = canonicalize_swap_ab_tactic(tactic)
             params = extract_swap_ab_tactic_params(tactic)
             kwargs.update(
                 gemm1_k_steps=params["gemm1_k_steps"],
@@ -1257,8 +1260,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.swiglu_limit,
                 self.situ_beta,
                 self.situ_linear_beta,
-                self.swap_ab,
             )
+            + (("swap_ab",) if self.swap_ab else ())
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -1276,8 +1279,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
-            self.swap_ab,
-        )
+        ) + (("swap_ab",) if self.swap_ab else ())
 
     def get_valid_tactics(  # type: ignore[override]
         self,

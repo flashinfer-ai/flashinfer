@@ -969,6 +969,9 @@ while other runner-specific restrictions remain in `check_support()`.
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
 
+CuTe-DSL SiTU with MXFP4×MXFP8 or MXFP8×MXFP8 requires
+`CuteDslConfig(swap_ab=True)` on SM100/SM103.
+
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU
 `clamp_limit`, so that non-default field is rejected. CUTLASS SiTU uses the

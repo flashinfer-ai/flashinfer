@@ -4992,6 +4992,9 @@ class CuteDslRunner(MoERunner):
             for backend in self.config.backend
             if isinstance(backend, CuteDslConfig)
         ]
+        if not candidates:
+            # Direct legacy runner construction has no backend-specific options.
+            return False
         if len(candidates) != 1:
             raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
         return candidates[0].swap_ab
@@ -5203,11 +5206,13 @@ class CuteDslRunner(MoERunner):
         return self._inner.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (
+        extras = super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
-            self.swap_ab,
         )
+        if self.swap_ab:
+            extras += ("swap_ab",)
+        return extras
 
     def forward(
         self,

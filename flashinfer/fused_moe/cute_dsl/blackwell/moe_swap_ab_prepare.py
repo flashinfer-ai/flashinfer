@@ -218,29 +218,32 @@ def prepare(
     sf_vec_size,
     enable_pdl=True,
 ):
+    payload_bytes = activation.shape[1] * activation.element_size()
+    capacity = mapping.numel()
+    tensors = (activation, activation_sf, routed, routed_sf, mapping, limits, num_tiles)
     if activation_sf is None:
-        if activation.dtype != torch.bfloat16 or routed_sf is not None:
-            raise ValueError("unscaled preparation requires BF16 without SF storage")
+        if activation.dtype != torch.bfloat16 or routed.dtype != torch.bfloat16:
+            raise TypeError("W4A16 permutation requires BF16 input and output")
+        if routed_sf is not None:
+            raise ValueError("unscaled preparation requires no SF storage")
+        if any(x.data_ptr() % 16 for x in (activation, routed)) or payload_bytes % 16:
+            raise ValueError("W4A16 permutation requires 16-byte aligned rows and storage")
         sf_columns = 0
     else:
         if routed_sf is None:
             raise ValueError("scaled preparation requires routed SF storage")
         sf_columns = _sf_columns(activation, sf_vec_size)
-    payload_bytes = activation.shape[1] * activation.element_size()
-    capacity = mapping.numel()
-    tensors = (activation, activation_sf, routed, routed_sf, mapping, limits, num_tiles)
-    if any(
-        not x.is_cuda or x.device != activation.device or not x.is_contiguous()
-        for x in tensors
-        if x is not None
-    ):
-        raise ValueError("same-device contiguous CUDA tensors required")
-    if (
-        routed.shape != (capacity, activation.shape[1])
-        or routed.dtype != activation.dtype
-    ):
-        raise ValueError("routed payload shape/dtype mismatch")
-    if activation_sf is not None:
+        if any(
+            not x.is_cuda or x.device != activation.device or not x.is_contiguous()
+            for x in tensors
+            if x is not None
+        ):
+            raise ValueError("same-device contiguous CUDA tensors required")
+        if (
+            routed.shape != (capacity, activation.shape[1])
+            or routed.dtype != activation.dtype
+        ):
+            raise ValueError("routed payload shape/dtype mismatch")
         if (
             activation_sf.numel() != activation.shape[0] * sf_columns
             or activation_sf.element_size() != 1
@@ -251,17 +254,16 @@ def prepare(
             or routed_sf.dtype != activation_sf.dtype
         ):
             raise ValueError("canonical routed SF storage mismatch")
-    if any(x.dtype != torch.int32 for x in (mapping, limits, num_tiles)):
-        raise TypeError("routing metadata must be int32")
-    if (
-        capacity % route_tile
-        or limits.numel() < capacity // route_tile
-        or num_tiles.numel() != 1
-    ):
-        raise ValueError("metadata capacity mismatch")
-    if any(x.data_ptr() % 16 for x in (activation, routed)) or payload_bytes % 16:
-        raise ValueError("payload rows and storage require 16-byte alignment")
-    if activation_sf is not None:
+        if any(x.dtype != torch.int32 for x in (mapping, limits, num_tiles)):
+            raise TypeError("routing metadata must be int32")
+        if (
+            capacity % route_tile
+            or limits.numel() < capacity // route_tile
+            or num_tiles.numel() != 1
+        ):
+            raise ValueError("metadata capacity mismatch")
+        if any(x.data_ptr() % 16 for x in (activation, routed)) or payload_bytes % 16:
+            raise ValueError("payload rows and storage require 16-byte alignment")
         if any(x.data_ptr() % 32 for x in (activation, routed)) or any(
             x.data_ptr() % 4 for x in (activation_sf, routed_sf)
         ):
