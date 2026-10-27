@@ -409,13 +409,13 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
         """
 
         assert self.route_metadata is not None
-        num_insts = Int32(self.cfg.num_insts_kv)
+        tiles_per_loop = Int32(self.cfg.kv_tiles_per_loop)
         if cutlass.const_expr(target == "head"):
             route_idx = Int32(self.inst_id)
         elif cutlass.const_expr(target == "first_loop"):
-            route_idx = num_insts + Int32(self.inst_id)
+            route_idx = tiles_per_loop + Int32(self.inst_id)
         else:
-            route_idx = (stage_info.loop_offset + Int32(2)) * num_insts + Int32(
+            route_idx = (stage_info.loop_offset + Int32(2)) * tiles_per_loop + Int32(
                 self.inst_id
             )
         route_record_word_offset = self._route_record_word_offset(stage_info, route_idx)
@@ -465,14 +465,14 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
 
         assert self.route_metadata is not None
         # HEAD publishes one route per instruction. LOOP starts after those
-        # two publications, hence the one-based loop offset below. Keeping the
+        # publications, hence the one-based loop offset below. Keeping the
         # constexpr branch local lets the task scheduler specialize each work
         # clone together with its HEAD/LOOP section.
         if cutlass.const_expr(section == FmhaStage.Head):
             route_idx = Int32(self.inst_id)
         else:
             route_idx = (stage_info.loop_offset + Int32(1)) * Int32(
-                self.cfg.num_insts_kv
+                self.cfg.kv_tiles_per_loop
             ) + Int32(self.inst_id)
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         if cutlass.const_expr(self.route_layout.uses_one_warp_transport):

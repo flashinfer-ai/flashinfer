@@ -66,7 +66,6 @@ from .fmha_decode_constants import (
 from .fmha_decode_resources.helpers_common import (
     _assume_nonnegative_i32,
     _q_cta_first_token,
-    _q_group_token_base,
     _q_seq_bounds,
     _warp_broadcast_i32,
 )
@@ -631,7 +630,7 @@ def _prepared_sparse_row_address(
 ) -> cutlass.Int32:
     """Map a (q_group, head, batch) tile to its prepared row header index."""
 
-    q_token_base = _q_group_token_base(cfg, q_group_idx)
+    q_token_base = _q_cta_first_token(cfg, q_group_idx)
     q_block = q_token_base // cutlass.Int32(cfg.q_block_size)
     num_q_blocks = (cfg.max_seq_len_q + cfg.q_block_size - 1) // cfg.q_block_size
     if cutlass.const_expr(cfg.shares_sparse_pattern):

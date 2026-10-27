@@ -748,7 +748,8 @@ class FmhaDecodeConfig:
     # Query-paired topology: the two instances are two consecutive Q tiles of
     # one KV head that share every K/V tile (one K and one V load per tile,
     # QK0/QK1 and PV0/PV1 from the same stages, one output tile each) instead
-    # of two halves of one Q tile's KV range. Dense Keeps Q128/KV128 only.
+    # of two halves of one Q tile's KV range. Keeps Q128/KV128 only; the Q
+    # tiles of a block-sparse CTA share one Q block and its route list.
     query_paired: bool = False
 
     # ------------------------------------------------------------------
@@ -5117,15 +5118,8 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
             "query_paired requires the grouped Keeps Q128/KV128 profile with "
             "two instances and head dim 64 or 128"
         )
-    if (
-        cfg.use_block_sparse
-        or cfg.use_split_kv
-        or split_kv_mode != "disabled"
-        or cfg.use_transform_kv
-    ):
-        raise ValueError(
-            "query_paired supports no block-sparse routes, split-KV or transform-KV"
-        )
+    if cfg.use_split_kv or split_kv_mode != "disabled" or cfg.use_transform_kv:
+        raise ValueError("query_paired supports no split-KV or transform-KV")
 
 
 def _validate_profile_support(

@@ -157,8 +157,7 @@ class _BlockSparseStaticProfile:
     sage: SageAttentionConfig | None = None
     use_block_sparse: bool = True
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
-    # One CTA processes two consecutive Q128 tiles over one K/V stream
-    # (dense plans only).
+    # One CTA processes two consecutive Q128 tiles over one K/V stream.
     query_paired: bool = False
 
 
@@ -533,15 +532,18 @@ def _validate_block_sparse_static_profile(
             num_rows=1,
         )
     if query_paired:
-        if use_block_sparse:
-            raise NotImplementedError(
-                "query_paired requires a dense, contiguous K/V plan "
-                "(use_block_sparse=False)"
-            )
         if q_tile_size != 128:
             raise NotImplementedError(
                 "query_paired requires a Q128 tile: q_block_size * Hq/Hkv of at "
                 f"least 128; got Q{q_tile_size}"
+            )
+        # Both Q tiles of a paired CTA read one route list.
+        paired_rows = q_block_size * (num_qo_heads // num_kv_heads)
+        if use_block_sparse and paired_rows % 256:
+            raise NotImplementedError(
+                "query_paired with block-sparse routes requires q_block_size * "
+                "Hq/Hkv to be a multiple of 256, so both Q tiles of a CTA share "
+                f"one Q block; got {paired_rows}"
             )
     return _BlockSparseStaticProfile(
         batch_size=batch_size,

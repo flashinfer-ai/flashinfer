@@ -336,10 +336,12 @@ a 16-bit output, and `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V and a
 `torch.bfloat16` output (QK-BF16/PV-FP8): `run` takes the Q and K scales in
 `sm_scale` and the V scale in `bmm2_scale`, which scales the output.
 
-A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
+A Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
 `query_paired=True`: each CTA then runs two consecutive Q128 tiles of one
 sequence and KV head over a single K/V stream; see
-[Query pairing](kernels/fmha_decode/README.md#query-pairing).
+[Query pairing](kernels/fmha_decode/README.md#query-pairing). A block-sparse
+plan pairs when `q_block_size * Hq / Hkv` is a multiple of 256, so both Q
+tiles of a CTA read one route list.
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its

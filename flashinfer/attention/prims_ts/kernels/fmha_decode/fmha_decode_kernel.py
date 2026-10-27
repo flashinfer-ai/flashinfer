@@ -1036,15 +1036,18 @@ def _build_decode_gen_schedule(
             tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata0",
         )
-        sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
-            pipeline_config=None,
-            cfg=cfg,
-            inst_id=1,
-            route_metadata=sparse_route_metadata,
-            route_layout=prepared_route_layout,
-            tma_oob_origin=max_seq_len_kv,
-            name="smemBlockSparseKvMetadata1",
-        )
+        if not cfg.query_paired:
+            # A query-paired CTA loads each routed K/V tile once; the first
+            # instance's route also feeds the second Softmax.
+            sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
+                pipeline_config=None,
+                cfg=cfg,
+                inst_id=1,
+                route_metadata=sparse_route_metadata,
+                route_layout=prepared_route_layout,
+                tma_oob_origin=max_seq_len_kv,
+                name="smemBlockSparseKvMetadata1",
+            )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata0_cfg,
             cfg=cfg,
@@ -1489,9 +1492,9 @@ def _build_decode_gen_schedule(
         smem_resources.append(smem_page_offsets)
     if smem_page_offsets_v is not None:
         smem_resources.append(smem_page_offsets_v)
-    if sparse_kv_metadata0 is not None:
-        smem_resources.append(sparse_kv_metadata0)
-        smem_resources.append(sparse_kv_metadata1)
+    for resource in (sparse_kv_metadata0, sparse_kv_metadata1):
+        if resource is not None:
+            smem_resources.append(resource)
     if sparse_softmax_metadata0 is not None:
         smem_resources.append(sparse_softmax_metadata0)
         smem_resources.append(sparse_softmax_metadata1)
@@ -1989,18 +1992,19 @@ def _build_decode_gen_schedule(
         }
     elif use_per_inst_kv_resources:
         resource_dependency_graph = {
-            **(
-                {
-                    sparse_kv_metadata0: [],
-                    sparse_kv_metadata1: [],
-                }
-                if sparse_kv_metadata0 is not None
-                else {}
-            ),
+            **{
+                resource: []
+                for resource in (sparse_kv_metadata0, sparse_kv_metadata1)
+                if resource is not None
+            },
             **(
                 {
                     sparse_softmax_metadata0: [sparse_kv_metadata0],
-                    sparse_softmax_metadata1: [sparse_kv_metadata1],
+                    sparse_softmax_metadata1: [
+                        sparse_kv_metadata0
+                        if sparse_kv_metadata1 is None
+                        else sparse_kv_metadata1
+                    ],
                 }
                 if sparse_softmax_metadata0 is not None
                 else {}
@@ -3991,9 +3995,7 @@ def fmha_block_sparse_launch(
                     swizzle=tma_swizzle,
                 )
 
-    q_groups = Int32(
-        (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-    )
+    q_groups = Int32(cfg.num_q_ctas)
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (q_groups, h_k, b),

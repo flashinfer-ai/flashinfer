@@ -2,10 +2,12 @@
 
 A query-paired plan runs two consecutive Q128 tiles of one sequence and KV
 head on one CTA, each K/V instance owning a tile over the whole K/V stream.
-Dense block-sparse wrapper plans pair contiguous K/V; paged decode plans pair
-when ``query_paired=True`` and the launch qualifies, or when the automatic
+Block-sparse wrapper plans pair contiguous K/V, dense or along the routes of
+a Q block that covers both tiles; paged decode plans pair when
+``query_paired=True`` and the launch qualifies, or when the automatic
 selection pairs a ``None`` plan. Sage recipes are covered in
-``test_attention_ts_sage.py``.
+``test_attention_ts_sage.py`` and paired block-sparse routes in
+``test_attention_ts_block_sparse.py``.
 """
 
 from __future__ import annotations

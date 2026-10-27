@@ -199,9 +199,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Sage plan. A dense plan may omit ``q_block_size`` and
         ``kv_block_size``; each then defaults to 128, which selects the
         Q128/KV128 Keeps tile. A block-sparse plan requires both.
-        ``query_paired=True`` makes each CTA of a dense plan process two
-        consecutive Q128 tiles over one K/V stream; it requires
-        ``head_dim=128`` and a Q128 tile (``q_block_size * Hq / Hkv >= 128``).
+        ``query_paired=True`` makes each CTA process two consecutive Q128
+        tiles over one K/V stream; it requires ``head_dim=128`` and a Q128
+        tile (``q_block_size * Hq / Hkv >= 128``). Both tiles of a
+        block-sparse CTA read one route list, so a block-sparse plan also
+        requires ``q_block_size * Hq / Hkv`` to be a multiple of 256.
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and

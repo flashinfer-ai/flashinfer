@@ -99,7 +99,7 @@ class _SageCase:
     tiny_q_scales: bool = False
     # One routing pattern serves every KV head.
     share_pattern_across_kv_heads: bool = False
-    # Each CTA of a dense Q128 plan finalizes two consecutive Q tiles.
+    # Each CTA of a Q128 plan finalizes two consecutive Q tiles.
     query_paired: bool = False
 
     @property
@@ -132,6 +132,8 @@ _Q128 = dict(
     kv_block_size=64,
     kv_tile=128,
 )
+# 32-token Q blocks hold the two Q128 tiles of a paired CTA.
+_Q128_PAIRED_ROUTES = {**_Q128, "seq_len_q": 64, "q_block_size": 32}
 
 _DENSE_CASES = (
     _SageCase(
@@ -272,6 +274,27 @@ _SPARSE_CASES = (
         sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
         routes="proxy",
         share_pattern_across_kv_heads=True,
+    ),
+    _SageCase(
+        "q128_exact_int8_k4_q4_bitmask_causal_paired_persistent",
+        **{**_Q128_PAIRED_ROUTES, "seq_len_kv": 536},
+        qk_dtype=torch.int8,
+        out_dtype=torch.float16,
+        sage=SageAttentionConfig(q_block_size=4, k_block_size=4),
+        routes="exact",
+        sparse_format="bitmask",
+        mask_type="causal",
+        persistent=True,
+        query_paired=True,
+    ),
+    # Both instances of a paired CTA read one route's summary scales.
+    _SageCase(
+        "q128_proxy_fp8_k16_s4_shared_pattern_paired",
+        **_Q128_PAIRED_ROUTES,
+        sage=SageAttentionConfig(k_summary_block_size=4),
+        routes="proxy",
+        share_pattern_across_kv_heads=True,
+        query_paired=True,
     ),
 )
 _CASES_BY_NAME = {case.name: case for case in _DENSE_CASES + _SPARSE_CASES}
