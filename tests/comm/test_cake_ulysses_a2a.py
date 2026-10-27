@@ -185,6 +185,72 @@ def test_registered_outputs_take_the_direct_route(world_size):
     multi_process_parallel(world_size, _registered_worker, ())
 
 
+def _offset_input(dimensions, dtype, offset):
+    """A contiguous CUDA tensor that starts ``offset`` elements into its storage."""
+    numel = 1
+    for extent in dimensions:
+        numel *= extent
+    storage = torch.empty(numel + offset, dtype=dtype, device="cuda")
+    return storage[offset:].view(dimensions)
+
+
+def _unaligned_rank_worker(world_size, rank, port):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        for shape in shapes(world_size):
+            if shape["performance"]:
+                continue
+            dtype = getattr(torch, shape["dtype"])
+            batch, sequence, heads, head_dim = (
+                shape[key] for key in ("B", "S_local", "H", "D")
+            )
+            local_shape = (batch, sequence, heads, head_dim)
+            global_shape = (batch, sequence * world_size, heads // world_size, head_dim)
+            offset = 1 if rank == 1 else 0
+            inputs = tuple(
+                _offset_input(dimensions, dtype, offset)
+                for dimensions in (local_shape, local_shape, local_shape, global_shape)
+            )
+            if rank == 1:
+                assert all(source.data_ptr() % 16 for source in inputs)
+            case = prepare(
+                shape,
+                backend="nvlink",
+                nvlink_kernel="cake",
+                inputs=inputs,
+                registered=True,
+            )
+            try:
+                assert case.nvlink_kernel == "cake" and case.registered
+                for step in range(2):
+                    _refresh(case, step)
+                    case.check()
+            finally:
+                case.close()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 6, 8])
+def test_registered_outputs_with_one_unaligned_rank(world_size):
+    """Rank 1 passes every input one element into its storage, so its streams take the
+    element path while its peers' take the 16-byte vector path; every correctness row
+    of the world completes bit-exact on the direct route."""
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+    if torch.cuda.get_device_capability(0) not in pkg.SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("the Cake portfolio targets Blackwell SM100/SM103")
+    if not cake_direct_available(world_size):
+        pytest.skip("build.json delivers no direct-route library for this device yet")
+    multi_process_parallel(world_size, _unaligned_rank_worker, ())
+
+
 # ---- the package route (CPU) -------------------------------------------------------
 
 

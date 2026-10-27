@@ -44,7 +44,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_muse_spark_norm needs an SM100 / SM103 device with every route exported",
+    reason="cake_muse_spark_norm needs an SM100 / SM103 / SM107 device with every route exported",
 )
 
 
@@ -113,13 +113,31 @@ def _kwargs(inputs, has_post_weight: bool):
 
 
 def _edge_rows(route: str) -> list[int]:
-    """1, both sides of every window edge of the route on this device, and the two contract rows."""
+    """1, both sides of every window edge of the route on this device (the rows of a gap between windows
+    included), and the two contract rows."""
     rows = {1, 17, 2437}
     for name in loader.route_modules(_arch(), route):
-        for _above, at_most in loader.MODULES[name]["select_rule"]["windows"][_arch()]:
+        for above, at_most in loader.MODULES[name]["select_rule"]["windows"][_arch()]:
+            rows.add(int(above) + 1)
             if at_most is not None:
                 rows.update((int(at_most), int(at_most) + 1))
     return sorted(rows)
+
+
+def _admits(tensor_alpha: bool, has_post_weight: bool, rows: int) -> bool:
+    """Whether the Cake package serves ``rows`` rows of the form on this device (its routes may leave a window of
+    row counts to the CuTe DSL kernel, as the scalar-alpha forms do below 256 rows on sm_107a)."""
+    return pkg.is_cake_gated_residual_next_rmsnorm_supported(
+        _device(), tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
+    )
+
+
+def _admitted_rows(tensor_alpha: bool, has_post_weight: bool, *candidates: int) -> int:
+    """The first of ``candidates`` the Cake package serves for the form on this device."""
+    for rows in candidates:
+        if _admits(tensor_alpha, has_post_weight, rows):
+            return rows
+    raise AssertionError((tensor_alpha, has_post_weight, candidates))
 
 
 @pytest.mark.parametrize(
@@ -146,6 +164,23 @@ def test_every_window_matches_the_reference(form):
             assert supports_gated_residual_next_rmsnorm(
                 *inputs, post_weight=kwargs.get("post_weight"), backend="cake"
             )
+            if not _admits(tensor_alpha, has_post_weight, rows):
+                # a declared gap of the route on this device (the kernel lane left the row count to the CuTe DSL
+                # kernel): the package refuses the explicit call and ``auto`` runs that kernel
+                with pytest.raises(NotImplementedError, match=f"admits {rows} rows"):
+                    loader.selected_module(_arch(), route, rows)
+                with pytest.raises(ValueError, match=f"admits {rows} rows"):
+                    _call(inputs, **kwargs)
+                if supports_gated_residual_next_rmsnorm(
+                    *inputs, post_weight=kwargs.get("post_weight"), backend="cute"
+                ):
+                    before = len(launched)
+                    _assert_close(
+                        _call(inputs, backend="auto", **kwargs),
+                        _reference(inputs, **kwargs),
+                    )
+                    assert len(launched) == before
+                continue
             _assert_close(_call(inputs, **kwargs), _reference(inputs, **kwargs))
             assert launched[-1] == (loader.selected_module(_arch(), route, rows), rows)
     finally:
@@ -227,7 +262,8 @@ def test_cuda_graph_replay_uses_changed_inputs(form):
     tensor_alpha, has_post_weight = form
     pkg._zero_post_weights.clear()
     pkg.warm_up(_device(), tensor_alpha=tensor_alpha, has_post_weight=has_post_weight)
-    inputs = _inputs(17, tensor_alpha=tensor_alpha)
+    rows = _admitted_rows(tensor_alpha, has_post_weight, 17, 257, 513, 2437)
+    inputs = _inputs(rows, tensor_alpha=tensor_alpha)
     kwargs = _kwargs(inputs, has_post_weight)
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream()
@@ -260,20 +296,74 @@ def test_warm_up_loads_every_route():
 
 
 def test_launch_grid_follows_the_record_rule():
+    """Every record delivered for this device launches the grid its ``grid_rule`` spells: ``rows x row_ctas`` CTAs
+    for a ``rows`` rule (``row_ctas`` the rule's CTAs per row, the cluster when it names none), ``min(rows, co-resident
+    clusters) x cluster`` for the persistent row loop, and the kernel's own two-dimensional arithmetic for a
+    ``tokens_heads`` rule (``ceil(heads / rows_per_cta)`` head blocks beside the token count rounded up to the token
+    cluster, in the order the rule names).  The launch cluster is the rule's: ``cluster`` CTAs along the head-block
+    axis, or for a ``tokens_heads`` rule without one the token cluster ``tcluster`` along the token axis; every grid
+    is a whole number of clusters."""
     device = _device()
+    checked = 0
     for name, record in loader.MODULES.items():
         if _arch() not in record["arches"]:
             continue
-        cluster = record["grid_rule"]["cluster"]
-        assert record["launch"]["cluster"][0] == cluster
+        rule = record["grid_rule"]
+        cluster = int(rule["cluster"])
+        kind = rule["kind"]
+        tcluster = int(rule.get("tcluster", 1))
+        if kind != "tokens_heads" or cluster > 1:
+            launch_cluster = (cluster, 1, 1)
+        elif rule.get("order") == "heads":
+            launch_cluster = (1, tcluster, 1)
+        else:
+            launch_cluster = (tcluster, 1, 1)
+        assert tuple(record["launch"]["cluster"]) == launch_cluster, (
+            name,
+            rule,
+            record["launch"]["cluster"],
+        )
         for rows in (1, 7, 148, 4096):
-            grid = loader.launch_grid(record, rows, device_index=device.index)
-            if record["grid_rule"]["kind"] == "rows":
-                assert grid == (rows * cluster, 1, 1)
-            else:
+            if kind == "rows":
+                grid = loader.launch_grid(record, rows, device_index=device.index)
+                assert grid == (rows * int(rule.get("row_ctas", cluster)), 1, 1), (
+                    name,
+                    rows,
+                    grid,
+                )
+            elif kind == "persistent_rows":
+                grid = loader.launch_grid(record, rows, device_index=device.index)
                 capacity = loader.cluster_capacity(name, _arch(), device.index)
-                assert capacity >= 1
-                assert grid == (min(rows, capacity) * cluster, 1, 1)
+                assert capacity >= 1, name
+                assert grid == (min(rows, capacity) * cluster, 1, 1), (name, rows, grid)
+            else:
+                assert kind == "tokens_heads", (name, rule)
+                rows_per_cta = int(rule["rows_per_cta"])
+                interleave = int(rule.get("interleave", 1))
+                # the head counts the record's windows name on any device (the only ones its head blocks fill a
+                # whole cluster for), or its CTA's own when it names none
+                heads_named = {
+                    int(heads)
+                    for windows in record["select_rule"]["windows"].values()
+                    for heads, _above, _at_most in windows
+                } or {rows_per_cta}
+                for heads in sorted(heads_named):
+                    grid = loader.launch_grid(
+                        record, rows, device_index=device.index, values={"heads": heads}
+                    )
+                    blocks = -(-heads // rows_per_cta)
+                    if cluster > 1 or rule.get("order") == "heads":
+                        expected = (blocks, -(-rows // tcluster) * tcluster, 1)
+                    else:
+                        step = max(tcluster, interleave)
+                        expected = (-(-rows // step) * step, blocks, 1)
+                    assert grid == expected, (name, rows, heads, grid)
+                    assert all(
+                        extent % size == 0
+                        for extent, size in zip(grid, launch_cluster, strict=True)
+                    ), (name, rows, heads, grid, launch_cluster)
+            checked += 1
+    assert checked
 
 
 def test_refuses_inputs_outside_the_contract():
