@@ -1396,7 +1396,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             info_pipe = pipeline.PipelineAsync.create(
                 barrier_storage=storage.tile_info_barriers.data_ptr(),
                 num_stages=self.num_tile_info_stages,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread, self.threads_per_cta - 32
                 ),
@@ -2123,11 +2123,9 @@ class Sm100BlockScaledGroupedGemmKernel:
                             sInfo[0, info_producer.index] = next_tile
                             sInfo[1, info_producer.index] = next_expert
                             sInfo[2, info_producer.index] = next_valid
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        pipeline.NamedBarrier(
-                            barrier_id=5, num_threads=32
-                        ).arrive_and_wait()
-                        info_pipe.producer_commit(info_producer)
+                            # Generic shared stores publish through this owner's
+                            # release arrival to the consumers' acquire waits.
+                            info_pipe.producer_commit(info_producer)
                         info_producer.advance()
                     if work.is_valid_tile:
                         clc_pipe.consumer_wait(clc_consumer)
