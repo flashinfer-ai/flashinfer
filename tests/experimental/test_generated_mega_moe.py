@@ -826,6 +826,7 @@ def test_tp_ep_routing_change_on_one_workspace(case, rank, num_tokens):
     def check_b(output, entries):
         torch.testing.assert_close(output, ref_b, atol=0, rtol=0)
         assert (entries[unrouted_b] == -1).all().item()
+        assert (entries[local_a & ~unrouted_b] >= 0).all().item()
         check_v3_workspace(plan, scratch_cleared=cleared)
 
     def check_a(output, entries):
@@ -847,21 +848,22 @@ def test_tp_ep_routing_change_on_one_workspace(case, rank, num_tokens):
     # The alternation captured once: the route copies are memcpy nodes, which
     # the kernel nodes depend on fully, and the launch before every B launch
     # is an A launch, whose entries a read before the dispatch's store returns.
-    output_b = torch.empty_like(plan.outputs)
-    entries_b = torch.empty_like(permuted)
+    outputs_b = [torch.empty_like(plan.outputs) for _ in range(3)]
+    entries_b = [torch.empty_like(permuted) for _ in range(3)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        for _ in range(3):
+        for output, entries in zip(outputs_b, entries_b):
             bound_ids.copy_(ids_b)
             bound_weights.copy_(weights_b)
             plan.run()
-            output_b.copy_(plan.outputs)
-            entries_b.copy_(permuted)
+            output.copy_(plan.outputs)
+            entries.copy_(permuted)
             bound_ids.copy_(ids_a)
             bound_weights.copy_(weights_a)
             plan.run()
     for _ in range(2):
         graph.replay()
         torch.cuda.synchronize()
-        check_b(output_b, entries_b)
+        for output, entries in zip(outputs_b, entries_b):
+            check_b(output, entries)
         check_a(plan.outputs, permuted)
