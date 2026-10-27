@@ -109,7 +109,9 @@ jobs:
           APPROVED=$(gh pr view "$PR_NUMBER" \
             --repo "${{ github.repository }}" \
             --json reviews \
-            --jq '[.reviews[] | select(.state == "APPROVED")] | length')
+            --jq '[.reviews[]
+                   | select(.state == "APPROVED"
+                            and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
 
           if [[ "${APPROVED:-0}" -gt 0 ]]; then
             echo "PR has $APPROVED approval(s)"
