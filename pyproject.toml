@@ -155,6 +155,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
 "flashinfer.experimental.qwen_3_5_block" = ["README.md"]
 "flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
+"flashinfer.experimental.qwen_3_8_block" = ["README.md"]
 # CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention, and the generated sources and
 # build manifest (build.json) of its Cake backend, the public entry's default route on SM80-SM90.
 "flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]

@@ -34,7 +34,7 @@ What is pinned here:
    ``csrc/`` decodes; a silent change here miscompiles every 4over6 kernel.
 4. **The on-disk cache key.** ``nvfp4_4over6_cache_key`` string literals are
    part of every user's CuTe-DSL artifact directory, so they are pinned
-   character-for-character (see ``tests/jit/test_cute_dsl_cache.py`` for the
+   character-for-character (see ``tests/cpu/jit/test_cute_dsl_cache.py`` for the
    cross-check against the kernel-name function itself).
 5. **Canonicalization.** A subclass of ``NVFP44Over6Config`` must collapse to
    the base class before it can reach a ``@functools.cache`` key.
@@ -140,6 +140,7 @@ ALL_RECIPES = [
 class TestResolveTruthTable:
     """{env unset, env=1, env=1+MSE, env=1+256} x {omitted, None, config}."""
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     def test_omitted_argument_reads_the_environment(self, monkeypatch, env_id):
         env, expected = ENV_STATES[env_id]
@@ -148,6 +149,7 @@ class TestResolveTruthTable:
             warnings.simplefilter("ignore", FutureWarning)
             assert resolve_nvfp4_4over6() == expected
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     def test_environment_enabling_4over6_is_deprecated(self, monkeypatch, env_id):
         """The env vars are a compatibility shim: warn (visibly) only when they act."""
@@ -164,6 +166,7 @@ class TestResolveTruthTable:
             assert repr(expected) in str(deprecations[0].message)
             assert "nvfp4_4over6=" in str(deprecations[0].message)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     def test_none_ignores_the_environment(self, monkeypatch, env_id):
         """``FLASHINFER_NVFP4_4OVER6=1`` cannot turn an explicit ``None`` back on."""
@@ -173,6 +176,7 @@ class TestResolveTruthTable:
             warnings.simplefilter("error", FutureWarning)
             assert resolve_nvfp4_4over6(None) is None
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
     def test_explicit_config_does_not_merge_with_environment(
@@ -193,6 +197,7 @@ class TestResolveTruthTable:
         assert resolved.err_mode == recipe.err_mode
         assert resolved.err_use_fast_math == recipe.err_use_fast_math
 
+    @pytest.mark.cpu_only
     def test_default_config_is_not_topped_up_from_environment(self, monkeypatch):
         """``NVFP44Over6Config()`` under a fully non-default environment.
 
@@ -211,6 +216,7 @@ class TestResolveTruthTable:
         )
         assert resolve_nvfp4_4over6(NVFP44Over6Config()) == NVFP44Over6Config()
 
+    @pytest.mark.cpu_only
     def test_environment_is_read_on_every_call(self, monkeypatch):
         """An omitted argument must not latch: the docstring promises a per-call read."""
         _apply_env(monkeypatch, {})
@@ -222,12 +228,14 @@ class TestResolveTruthTable:
             monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
             assert resolve_nvfp4_4over6() is None
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("value", ["0", "true", "TRUE", "yes", ""])
     def test_only_the_literal_1_enables_4over6(self, monkeypatch, value):
         """Legacy contract: ``env_flag_enabled`` compares against ``"1"``."""
         _apply_env(monkeypatch, {"FLASHINFER_NVFP4_4OVER6": value})
         assert resolve_nvfp4_4over6() is None
 
+    @pytest.mark.cpu_only
     def test_unset_sentinel_is_the_default_and_private(self):
         """The default is a sentinel, not a public type: callers omit the
         argument rather than spelling it, and its repr names the env vars."""
@@ -235,6 +243,7 @@ class TestResolveTruthTable:
         assert "FLASHINFER_NVFP4_4OVER6" in repr(_UNSET)
         assert _UNSET is not None and not isinstance(_UNSET, NVFP44Over6Config)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("bogus", ["auto", 3, 0, 1.5, True, ["MAE"], object()])
     def test_bogus_setting_raises_type_error(self, bogus):
         with pytest.raises(TypeError, match="nvfp4_4over6"):
@@ -247,6 +256,7 @@ class TestResolveTruthTable:
 
 
 class TestConfigValidation:
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("e4m3_max", [0, 1, 127, 255, 257, 448.0, 512])
     def test_bad_e4m3_max_rejected(self, e4m3_max):
         if e4m3_max == 448.0:
@@ -256,11 +266,13 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="256 or 448"):
             NVFP44Over6Config(e4m3_max=e4m3_max)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("err_mode", ["mad", "", "MAE2", 2, -1])
     def test_bad_err_mode_rejected(self, err_mode):
         with pytest.raises(ValueError, match="MAE or MSE"):
             NVFP44Over6Config(err_mode=err_mode)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("text,expected", [("mae", "MAE"), ("mse", "MSE")])
     def test_err_mode_string_is_normalized(self, text, expected):
         cfg = NVFP44Over6Config(err_mode=text)
@@ -273,6 +285,7 @@ class TestConfigValidation:
             NVFP44Over6Config(err_mode=NVFP44Over6ErrMode[expected])
         )
 
+    @pytest.mark.cpu_only
     def test_frozen(self):
         cfg = NVFP44Over6Config()
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -295,11 +308,13 @@ def _eval_repr(obj):
 
 
 class TestReprRoundTrip:
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
     def test_config_round_trip(self, recipe):
         assert _eval_repr(recipe) == recipe
         assert hash(_eval_repr(recipe)) == hash(recipe)
 
+    @pytest.mark.cpu_only
     def test_config_repr_emits_non_default_fields_only(self):
         assert repr(NVFP44Over6Config()) == "NVFP44Over6Config()"
         assert repr(NVFP44Over6Config(e4m3_max=256)) == (
@@ -316,6 +331,7 @@ class TestReprRoundTrip:
             "err_mode=NVFP44Over6ErrMode.MSE, err_use_fast_math=True)"
         )
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("member", list(NVFP44Over6ErrMode), ids=lambda m: m.name)
     def test_err_mode_round_trip(self, member):
         assert repr(member) == f"NVFP44Over6ErrMode.{member.name}"
@@ -329,22 +345,27 @@ class TestPickleAndDeepcopy:
     sentinel would be an unknown setting and raise ``TypeError``.
     """
 
+    @pytest.mark.cpu_only
     def test_pickle_preserves_identity(self):
         assert pickle.loads(pickle.dumps(_UNSET)) is _UNSET
 
+    @pytest.mark.cpu_only
     def test_deepcopy_preserves_identity(self):
         assert copy.deepcopy(_UNSET) is _UNSET
         assert copy.copy(_UNSET) is _UNSET
 
+    @pytest.mark.cpu_only
     def test_round_tripped_sentinel_still_resolves(self, monkeypatch):
         _apply_env(monkeypatch, {})
         revived = pickle.loads(pickle.dumps(_UNSET))
         assert resolve_nvfp4_4over6(revived) is None
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("member", list(NVFP44Over6ErrMode), ids=lambda m: m.name)
     def test_err_mode_pickle_preserves_identity(self, member):
         assert pickle.loads(pickle.dumps(member)) is member
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
     def test_config_pickle_and_deepcopy(self, recipe):
         assert pickle.loads(pickle.dumps(recipe)) == recipe
@@ -366,10 +387,12 @@ class TestWireFormat:
     failing assertion instead of being silently mirrored.
     """
 
+    @pytest.mark.cpu_only
     def test_sentinel_values(self):
         assert NVFP4_4OVER6_CODE_FROM_ENV == -1
         assert NVFP4_4OVER6_CODE_STANDARD == 0
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "config,code",
         [
@@ -390,29 +413,35 @@ class TestWireFormat:
     def test_documented_packings(self, config, code):
         assert nvfp4_4over6_code(config) == code
 
+    @pytest.mark.cpu_only
     def test_standard_code_is_even_and_enabled_codes_are_odd(self):
         """bit0 is the enable bit; C++ dispatches on it."""
         assert nvfp4_4over6_code(None) % 2 == 0
         for recipe in ALL_RECIPES:
             assert nvfp4_4over6_code(recipe) % 2 == 1
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
     def test_round_trip(self, recipe):
         assert nvfp4_4over6_from_code(nvfp4_4over6_code(recipe)) == recipe
 
+    @pytest.mark.cpu_only
     def test_round_trip_off(self):
         assert nvfp4_4over6_from_code(nvfp4_4over6_code(None)) is None
 
+    @pytest.mark.cpu_only
     def test_from_env_code_decodes_to_unset(self):
         assert nvfp4_4over6_from_code(-1) is _UNSET
         assert nvfp4_4over6_from_code(NVFP4_4OVER6_CODE_FROM_ENV) is _UNSET
 
+    @pytest.mark.cpu_only
     def test_codes_are_unique_across_all_recipes(self):
         codes = {nvfp4_4over6_code(r) for r in ALL_RECIPES}
         assert len(codes) == len(ALL_RECIPES)
         assert NVFP4_4OVER6_CODE_STANDARD not in codes
         assert NVFP4_4OVER6_CODE_FROM_ENV not in codes
 
+    @pytest.mark.cpu_only
     def test_code_rejects_an_unresolved_setting(self):
         """``nvfp4_4over6_code`` is typed on the *resolved* two-state value.
 
@@ -432,12 +461,14 @@ class TestCacheKey:
     """``nvfp4_4over6_cache_key`` must keep the ``_4over6_<e4m3>_<mode>_<fast>``
     suffix ``_nvfp4_kernel_name`` has always used, or every on-disk CuTe-DSL
     artifact is invalidated on upgrade. The cross-check against the
-    kernel-name function is in ``tests/jit/test_cute_dsl_cache.py``.
+    kernel-name function is in ``tests/cpu/jit/test_cute_dsl_cache.py``.
     """
 
+    @pytest.mark.cpu_only
     def test_off(self):
         assert nvfp4_4over6_cache_key(None) == "off"
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "config,key",
         [
@@ -464,11 +495,13 @@ class TestCacheKey:
     def test_legacy_suffix_strings(self, config, key):
         assert nvfp4_4over6_cache_key(config) == key
 
+    @pytest.mark.cpu_only
     def test_keys_are_unique(self):
         keys = {nvfp4_4over6_cache_key(r) for r in ALL_RECIPES}
         assert len(keys) == len(ALL_RECIPES)
         assert nvfp4_4over6_cache_key(None) not in keys
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("recipe", ALL_RECIPES + [None], ids=repr)
     def test_keys_are_symbol_safe(self, recipe):
         """The key is embedded in a kernel symbol and a directory name."""
@@ -476,6 +509,7 @@ class TestCacheKey:
 
         assert re.fullmatch(r"[0-9A-Za-z_]+", nvfp4_4over6_cache_key(recipe))
 
+    @pytest.mark.cpu_only
     def test_string_and_enum_err_mode_share_a_key(self):
         assert nvfp4_4over6_cache_key(
             NVFP44Over6Config(err_mode="MSE")
@@ -487,6 +521,7 @@ class TestCacheKey:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
 def test_resolve_canonicalizes_subclass_to_base(recipe):
     """A subclass must not reach a ``@functools.cache`` key.
@@ -521,6 +556,7 @@ def test_resolve_canonicalizes_subclass_to_base(recipe):
     assert nvfp4_4over6_code(resolved) == nvfp4_4over6_code(recipe)
 
 
+@pytest.mark.cpu_only
 def test_resolve_returns_a_plain_config_unchanged():
     """No needless copying: an already-canonical config is returned as-is."""
     recipe = NVFP44Over6Config(err_mode="MSE")
@@ -541,18 +577,21 @@ class TestScaleHelpers:
     read would rescale every existing caller's tensor.
     """
 
+    @pytest.mark.cpu_only
     def test_default_is_full_e4m3_range(self, monkeypatch):
         _apply_env(monkeypatch, {"FLASHINFER_NVFP4_4OVER6": "1"})
         # Legacy default must NOT consult the environment.
         assert nvfp4_e4m3_max() == FLOAT8_E4M3_MAX == 448.0
         assert nvfp4_e4m3_max(None) == 448.0
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("e4m3_max", [448, 256])
     def test_resolved_config_selects_the_clamp(self, e4m3_max):
         cfg = NVFP44Over6Config(e4m3_max=e4m3_max)
         assert nvfp4_e4m3_max(cfg) == float(e4m3_max)
         assert nvfp4_e4m3_max(nvfp4_4over6_config=cfg) == float(e4m3_max)
 
+    @pytest.mark.cpu_only
     def test_no_three_state_spelling_on_scale_helpers(self):
         """One recipe type everywhere: the helpers take ``nvfp4_4over6_config``
         only, so there is no second keyword to disagree with it."""
@@ -563,6 +602,7 @@ class TestScaleHelpers:
         with pytest.raises(TypeError):
             make_nvfp4_global_scale(x, True, **unresolved_keyword)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("e4m3_max", [448, 256])
     def test_per_token_scale_inverts_e4m3_max_times_six(self, e4m3_max):
         """The invariant the kernel relies on: ``e4m3_max * 6 * scale == 1``.
@@ -582,6 +622,7 @@ class TestScaleHelpers:
         product = float(scale.item()) * nvfp4_e4m3_max(cfg) * FLOAT4_E2M1_MAX
         assert product == pytest.approx(1.0, rel=1e-6)
 
+    @pytest.mark.cpu_only
     def test_per_token_scale_default_matches_standard_nvfp4(self):
         """Legacy default (no recipe) is the 448 scale, unchanged."""
         x = torch.zeros(4, 16, dtype=torch.float32)
@@ -592,6 +633,7 @@ class TestScaleHelpers:
             1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX), rel=1e-6
         )
 
+    @pytest.mark.cpu_only
     def test_per_token_scale_differs_between_clamps(self):
         """Guards the whole point: the two clamps must not collapse."""
         x = torch.zeros(4, 16, dtype=torch.float32)
@@ -601,6 +643,7 @@ class TestScaleHelpers:
         )
         assert float(s448.item()) != float(s256.item())
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("e4m3_max", [448, 256])
     def test_per_tensor_amax_scale_uses_the_clamp(self, e4m3_max):
         cfg = NVFP44Over6Config(e4m3_max=e4m3_max)
@@ -609,6 +652,7 @@ class TestScaleHelpers:
         expected = e4m3_max * FLOAT4_E2M1_MAX / 2.0
         assert float(scale.item()) == pytest.approx(expected, rel=1e-6)
 
+    @pytest.mark.cpu_only
     def test_per_tensor_all_zero_input_saturates(self):
         """Pre-existing edge case; the new parameter must not disturb it."""
         x = torch.zeros(4, 16, dtype=torch.float32)
@@ -617,6 +661,7 @@ class TestScaleHelpers:
         )
         assert float(scale.item()) == torch.finfo(torch.float32).max
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize("e4m3_max", [448, 256])
     def test_explicit_global_scale_wins_over_amax(self, e4m3_max):
         """``global_scale=`` bypasses the amax path in per-tensor mode."""

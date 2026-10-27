@@ -12,6 +12,7 @@ from flashinfer.mla import cake_dsv4 as cake
 from flashinfer.mla.cake_dsv4 import allocate_cake_dsv4_output, cake_dsv4_out_phase
 
 
+@pytest.mark.cpu_only
 def test_out_phase_table_is_route_conditional():
     assert (
         cake_dsv4_out_phase("bf16_h128_prefill_v42", num_heads=128, sparse_topk=128)
@@ -54,6 +55,7 @@ def test_out_phase_table_is_route_conditional():
         assert cake_dsv4_out_phase(route, num_heads=64, sparse_topk=128) is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("shape", [(12, 64, 512), (3, 4, 128, 512), (7, 512)])
 def test_allocate_output_pins_the_base_phase(shape):
     for _ in range(4):
@@ -122,6 +124,7 @@ def _run_fp8_swa(monkeypatch, *, num_heads, out, out_shape=None):
     return result, seen
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_places_out_none_by_route(monkeypatch):
     result, seen = _run_fp8_swa(monkeypatch, num_heads=64, out=None)
     assert seen["route"] == "fp8_lowhead_prefill"
@@ -139,6 +142,7 @@ def test_run_cake_dsv4_places_out_none_by_route(monkeypatch):
     )
 
 
+@pytest.mark.cpu_only
 def test_run_cake_dsv4_keeps_a_caller_out_as_is(monkeypatch):
     raw = torch.zeros((12 * 64 * 512 + 2048,), dtype=torch.bfloat16)
     start = (

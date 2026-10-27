@@ -12,7 +12,13 @@ a recorded FACT, not a guess.  Then it declares the requested serving form(s) th
 do, and -- with ``--mode execute`` on a Rubin device -- runs check_support / compile / execute / synchronize, logging the stage
 and the wall time of each (a compile budget is NOT a kernel timeout: the stage line says which one ran out).
 
-    trace_closure.py --form {prefill,extend,decode,all} --mode {declare,execute} --device {cpu,cuda} --out <json> [--frost-flag unset|keep]
+    trace_closure.py --form {prefill,extend,decode,decode_qsa,all} --mode {declare,execute} --device {cpu,cuda} --out <json> [--frost-flag unset|keep]
+
+``decode_qsa`` (the Qwen 3.8 Flash-Next decode route): the in-block indexer's DECODE step over the pools -- ``QsaSpec(index_source=
+"indexer", index_band=True)`` with the two paged side caches (the compressed-key cache on the main block table, the raw-key ring) --
+declared FOUR ways so every lazily imported module of the route is traced: the fused prepare launch with the position-table RoPE arm
+and the ring rows from the stack's own slot mapping (the serving form), the same with the rows derived in-kernel, and the unfused
+twin (per-token cos / sin) with and without the slot mapping; ``--mode execute`` runs all four on the device.
 
 The JSON holds: the ordered module list with files + sizes, the import edges (importer -> imported) restricted to the
 ``cudnn`` package, every third-party top-level package touched, the data files opened under the package, the extension
@@ -146,7 +152,11 @@ pathlib.Path.open = _hook_path_open  # type: ignore[method-assign]
 
 # --------------------------------------------------------------------------- args
 ap = argparse.ArgumentParser()
-ap.add_argument("--form", default="all", choices=["prefill", "extend", "decode", "all"])
+ap.add_argument(
+    "--form",
+    default="all",
+    choices=["prefill", "extend", "decode", "decode_qsa", "all"],
+)
 ap.add_argument("--mode", default="declare", choices=["declare", "execute"])
 ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
 ap.add_argument("--out", required=True)
@@ -239,6 +249,7 @@ from cudnn.gated_attention_block import (  # noqa: E402
     KV_SOURCE_PAGED,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
+    QsaSpec,
     decode_route,
     qkvg_from_vllm,
 )
@@ -616,9 +627,156 @@ except Exception as exc:  # noqa: BLE001
     log(f"host api FAILED: {type(exc).__name__}: {exc}")
     traceback.print_exc()
 
+
+def form_decode_qsa(*, fused: bool, tables_only: bool, ring_slots: bool):
+    """The in-block indexer's DECODE step over the pools (the Qwen 3.8 Flash-Next decode route): a dense [B, S_q] declaration on a
+    ``QsaSpec(index_source="indexer", index_band=True)`` geometry with ``kv_source="paged"`` and the two paged side caches -- the
+    compressed-key cache ``[num_pages, P / 4, 1, 128]`` on the MAIN block table and the raw-key ring ``[num_ring_blocks, cap, 1, 128]``
+    behind its own ``[B, 1]`` table -- at S_q 4 (the MTP verify width), the four input-contract arms as the keyword arguments say."""
+
+    def make():
+        g0 = GatedAttentionBlockGeometry(
+            d_model=D_MODEL,
+            h_q=H_Q,
+            h_kv=H_KV,
+            d_head=D,
+            rope_dim=ROPE,
+            causal_bottom_right=True,
+            qsa=QsaSpec(top_k=512, index_source="indexer", index_band=True),
+        )
+        gen = torch.Generator(device=DEV).manual_seed(4)
+        B, S_Q, CAP, D_I = 4, 4, 8, 128
+        kv_lens_l = [40, 0, 17, 64]
+        L_MAX = 64
+        max_pages = (L_MAX + PAGE - 1) // PAGE
+        n_pages = sum((L + PAGE - 1) // PAGE for L in kv_lens_l) + 3
+        n_pos = max_pages * PAGE
+        w = weights(
+            g0, gen
+        )  # w_qkvg carries the fifth (indexer) band: g0.n_qkvg includes it
+        w_iq = torch.ones(D_I, dtype=DT, device=DEV)
+        w_ik = torch.ones(D_I, dtype=DT, device=DEV)
+        h = torch.randn(
+            B, S_Q, D_MODEL, generator=gen, device=DEV, dtype=torch.float32
+        ).to(DT)
+        pos_tab = torch.arange(n_pos, device=DEV)[None]
+        cos_pos, sin_pos = rope_tables(
+            pos_tab
+        )  # [1, n_pos, ROPE]: the position-indexed tables (the block starts; every rotation under the table arm)
+        pos = torch.tensor(
+            [
+                list(range(L - S_Q, L)) if L >= S_Q else list(range(S_Q))
+                for L in kv_lens_l
+            ],
+            device=DEV,
+        )
+        cos, sin = rope_tables(pos)
+        out = torch.empty(B, S_Q, D_MODEL, dtype=DT, device=DEV)
+        kc, vc = pools(n_pages)
+        table = torch.zeros(B, max_pages, dtype=torch.int32, device=DEV)
+        slots = torch.full((B * S_Q,), -1, dtype=torch.int64, device=DEV)
+        ring_slots_t = torch.full((B * S_Q,), -1, dtype=torch.int64, device=DEV)
+        icache = torch.zeros(n_pages, PAGE // 4, 1, D_I, dtype=DT, device=DEV)
+        ring = torch.zeros(B + 1, CAP, 1, D_I, dtype=DT, device=DEV)
+        ring_table = torch.zeros(B, 1, dtype=torch.int32, device=DEV)
+        nxt = 1
+        for b, L in enumerate(kv_lens_l):
+            if L == 0:
+                continue
+            n = (L + PAGE - 1) // PAGE
+            pages = list(range(nxt, nxt + n))
+            nxt += n
+            table[b, :n] = torch.tensor(pages, dtype=torch.int32, device=DEV)
+            ring_table[b, 0] = b + 1
+            for p in range(L - S_Q):
+                kc[pages[p // PAGE], :, p % PAGE] = torch.randn(
+                    H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+                vc[pages[p // PAGE], :, p % PAGE] = torch.randn(
+                    H_KV, D, generator=gen, device=DEV, dtype=torch.float32
+                ).to(DT)
+            for i in range(S_Q):
+                p = L - S_Q + i
+                if p >= 0:
+                    slots[b * S_Q + i] = pages[p // PAGE] * PAGE + p % PAGE
+                    ring_slots_t[b * S_Q + i] = (b + 1) * CAP + p % CAP
+        kv_lens = torch.tensor(kv_lens_l, dtype=torch.int32, device=DEV)
+        tables = (None, None) if tables_only else (cos, sin)
+        blk = GatedAttentionBlockFwd(
+            h,
+            w["w_qkvg"],
+            w["w_q_norm"],
+            w["w_k_norm"],
+            *tables,
+            w["w_o"],
+            out,
+            g0,
+            paged_kv_page_size=PAGE,
+            kv_source=KV_SOURCE_PAGED,
+            sample_k_cache=kc,
+            sample_v_cache=vc,
+            sample_block_table=table,
+            fuse_norm_rope=False,
+            fuse_gate=FUSE_GATE,
+            fuse_prepare=fused,
+            sample_index_kv_cache=icache,
+            sample_index_state_cache=ring,
+            sample_index_state_block_table=ring_table,
+            index_state_slot_mapping_present=ring_slots,
+            rope_position_tables_only=tables_only,
+        )
+        ids_out = torch.full((B, S_Q, 512), -7, dtype=torch.int32, device=DEV)
+        lens_out = torch.full((B, S_Q), -7, dtype=torch.int32, device=DEV)
+        return (
+            blk,
+            [h, w["w_qkvg"], w["w_q_norm"], w["w_k_norm"], *tables, w["w_o"], out],
+            dict(
+                k_cache=kc,
+                v_cache=vc,
+                block_table=table,
+                kv_lens=kv_lens,
+                slot_mapping=slots,
+                w_iq_norm=w_iq,
+                w_ik_norm=w_ik,
+                block_ids_out=ids_out,
+                block_lens_out=lens_out,
+                index_kv_cache=icache,
+                index_state_cache=ring,
+                index_state_block_table=ring_table,
+                index_state_slot_mapping=ring_slots_t if ring_slots else None,
+                cos_pos=cos_pos,
+                sin_pos=sin_pos,
+            ),
+            out,
+        )
+
+    return make
+
+
 forms = {"prefill": form_prefill, "extend": form_extend, "decode": form_decode}
-for nm in forms if args.form == "all" else [args.form]:
-    declare(nm, forms[nm])
+# the Qwen 3.8 decode route, four declarations (one per input-contract arm the serving stacks take; all four executed on a device)
+QSA_FORMS = {
+    "decode_qsa_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True
+    ),
+    "decode_qsa_fused_tables": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=False
+    ),
+    "decode_qsa_unfused_pertoken_slots": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=True
+    ),
+    "decode_qsa_unfused_pertoken": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=False
+    ),
+}
+if args.form == "all":
+    selected = {**forms, **QSA_FORMS}
+elif args.form == "decode_qsa":
+    selected = QSA_FORMS
+else:
+    selected = {args.form: forms[args.form]}
+for nm, fn in selected.items():
+    declare(nm, fn)
 
 # --------------------------------------------------------------------------- the report
 STAGE["name"] = "report"
