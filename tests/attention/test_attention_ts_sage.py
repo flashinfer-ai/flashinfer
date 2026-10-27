@@ -1012,17 +1012,12 @@ def _sage_decode_config(
             "direct-output grid",
             id="split-kv",
         ),
-        pytest.param(
-            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
-            "contiguous K/V",
-            id="paged-kv",
-        ),
     ),
 )
 def test_sage_decode_config_rejects_unsupported_launches(
     overrides: dict[str, object], match: str
 ) -> None:
-    """Only the direct output store of contiguous K/V applies the V scales."""
+    """Only the direct output store applies the V scales."""
 
     with pytest.raises(ValueError, match=match):
         _sage_decode_config(**overrides)

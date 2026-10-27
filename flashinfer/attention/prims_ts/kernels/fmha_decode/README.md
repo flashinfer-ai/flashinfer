@@ -211,10 +211,10 @@ bound the kernel and the paired grid needs fewer CTA waves.
 - `None` (default): the automatic tile selection of fixed multi-token
   launches on 4- to 128-token pages scores the paired tile with the
   unpaired ones and pairs the plan when that costs less.
-- `True`: pair whenever the launch supports it: an FP16, BF16, or FP8
-  recipe with head dim 128 (64 or 128 for FP8, which pairs fixed Q only),
-  at least two Q tiles in a request, and enough unpaired Q tiles to fill
-  one wave of CTAs. Other launches plan unpaired.
+- `True`: pair whenever the launch supports it: an FP16, BF16, FP8, or
+  Sage recipe with head dim 128 (64 or 128 for FP8, which pairs fixed Q
+  only), at least two Q tiles in a request, and enough unpaired Q tiles
+  to fill one wave of CTAs. Other launches plan unpaired.
 - `False`: never pair.
 
 The plan's policy records the outcome. Paired plans do not split K/V. In a
@@ -437,8 +437,8 @@ plan-owned length storage and requires graph recapture.
 - Q and K must share one dtype; the only mixed combination is
   `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
 - Sage attention (8-bit Q/K of one dtype with `torch.float8_e4m3fn` V and
-  dequantization scales) runs only through `BlockSparseTSWrapper` and
-  `block_sparse_attention`; see
+  dequantization scales) takes `sage_config=` at plan time and `sage=` on
+  every run, with head dim 128 and without split-KV; see
   [Sage attention](../../README.md#sage-attention).
 - Positive K/V lengths must be no greater than the static plan
   bound.

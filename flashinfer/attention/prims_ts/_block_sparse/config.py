@@ -24,7 +24,11 @@ from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from ..sage.config import SageAttentionConfig, validate_sage_recipe
+from ..sage.config import (
+    SageAttentionConfig,
+    sage_decode_config_fields,
+    validate_sage_recipe,
+)
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
@@ -374,12 +378,6 @@ def _validate_max_blocks_per_row(
     return max_blocks_per_row
 
 
-def _plan_dtype_key(dtype: torch.dtype) -> str:
-    """Return the compile-key name of a plan dtype; Int8 is a Sage Q/K dtype."""
-
-    return "int8" if dtype == torch.int8 else _dtype_key(dtype)
-
-
 def _resolve_plan_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype | None,
@@ -408,7 +406,7 @@ def _resolve_plan_dtypes(
             and output_dtype in _SUPPORTED_DTYPES
         ):
             # Dense per-tensor FP8: the run's bmm1/bmm2 scales carry Q/K/V scales.
-            return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
+            return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
         return (
             kv_dtype,
             v_dtype,
@@ -424,7 +422,7 @@ def _resolve_plan_dtypes(
         v_dtype=v_dtype,
         output_dtype=output_dtype,
     )
-    return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
+    return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
 
 
 def _validate_block_sparse_static_profile(
@@ -552,8 +550,8 @@ def _validate_block_sparse_static_profile(
         q_tile_size=q_tile_size,
         kv_route_size=kv_route_size,
         dtype_key=dtype_key,
-        out_dtype_key=_plan_dtype_key(output_dtype),
-        v_dtype_key=_plan_dtype_key(v_dtype),
+        out_dtype_key=_dtype_key(output_dtype),
+        v_dtype_key=_dtype_key(v_dtype),
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
         v_dtype=v_dtype,
@@ -613,16 +611,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         config_args["use_persistent_scheduler"] = True
     if key.sage is not None:
         config_args.update(
-            {
-                "sage_q_block_size": key.sage.q_block_size,
-                "sage_k_block_size": key.sage.k_block_size,
-                "sage_k_summary_block_size": (
-                    key.sage.k_summary_block_size
-                    if key.use_proxy_routes
-                    else key.sage.k_block_size
-                ),
-                "sage_v_mean": key.sage.v_mean,
-            }
+            sage_decode_config_fields(key.sage, use_proxy_routes=key.use_proxy_routes)
         )
     layout_args: dict[str, object]
     if key.page_size is None:

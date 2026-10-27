@@ -34,6 +34,16 @@ from flashinfer.trace.templates.attention import (
 
 from . import _q_token_kv_block_sparse_policy as _sparse_policy
 from ._block_sparse.common import _num_sparse_pattern_heads
+from .sage.config import (
+    SageAttentionConfig,
+    SageAttentionParams,
+    _validate_int8_qk_device,
+    resolve_sage_config,
+    sage_decode_config_fields,
+    sage_scale_shapes,
+    validate_sage_params,
+    validate_sage_recipe,
+)
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
@@ -80,6 +90,8 @@ class _DecodeWorkspaceLayout:
     split_kv_counter: _WorkspaceSection
     cu_seqlens_q: _WorkspaceSection
     attention_sinks: _WorkspaceSection
+    # A Sage plan's prepared scales; empty without Sage attention.
+    sage_scales: _WorkspaceSection
     uses_split_kv: bool
     total_bytes: int
 
@@ -93,6 +105,7 @@ class _DecodeWorkspaceViews:
     split_kv_counter: torch.Tensor
     cu_seqlens_q: torch.Tensor
     attention_sinks: torch.Tensor
+    sage_scales: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -103,6 +116,10 @@ class _DecodeLaunchSpec:
     max_active_clusters: int
     policy: tuple[tuple[str, object], ...]
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+    # A Sage plan's prepared-scale words in the workspace and the shape of
+    # each Sage scale tensor a run supplies, by field name; none without Sage.
+    sage_scale_words: int = 0
+    sage_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
 
 
 class _DirectQ1CompileSpec(NamedTuple):
@@ -197,6 +214,9 @@ class _DecodePlanState:
     planned_seq_lens_device: Optional[torch.Tensor]
     policy: tuple[tuple[str, object], ...]
     storage_page_size: Optional[int] = None
+    # Expected shape of every Sage scale tensor a run supplies, by field name;
+    # None without Sage attention.
+    sage_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
 
 
 def _decode_policy_from_config(
@@ -241,6 +261,7 @@ def _decode_policy_from_config(
         ("use_persistent_scheduler", bool(config.use_persistent_scheduler)),
         ("groups_tokens_heads_q", bool(config.groups_tokens_heads_q)),
         ("query_paired", bool(config.query_paired)),
+        ("use_sage_attention", bool(config.use_sage_attention)),
     )
 
 
@@ -370,6 +391,7 @@ def _make_decode_workspace_layout(
     *,
     use_separate_reduction_kernel: bool,
     use_split_kv: bool = False,
+    sage_scale_words: int = 0,
 ) -> _DecodeWorkspaceLayout:
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = output_dtype
@@ -393,14 +415,31 @@ def _make_decode_workspace_layout(
     )
     cu_seqlens_q, byte_end = _append_workspace_section(byte_end, (1,), torch.int32)
     attention_sinks, byte_end = _append_workspace_section(byte_end, (1,), torch.float32)
+    sage_scales, byte_end = _append_workspace_section(
+        byte_end, (sage_scale_words,), torch.float32
+    )
     return _DecodeWorkspaceLayout(
         partial_o=partial_o,
         partial_stats=partial_stats,
         split_kv_counter=split_kv_counter,
         cu_seqlens_q=cu_seqlens_q,
         attention_sinks=attention_sinks,
+        sage_scales=sage_scales,
         uses_split_kv=use_split_kv,
         total_bytes=_align_up(byte_end),
+    )
+
+
+def _sage_launch_inputs(
+    workspace: _DecodeWorkspaceViews, sage: SageAttentionParams
+) -> tuple[Optional[torch.Tensor], ...]:
+    """Return a Sage run's prepared-scale buffer and scale tensors in launch order."""
+    return (
+        workspace.sage_scales,
+        sage.q_scale,
+        sage.k_scale,
+        sage.v_scale,
+        sage.v_mean,
     )
 
 
@@ -453,6 +492,7 @@ def _bind_decode_workspace(
         attention_sinks=_workspace_section_view(
             workspace_buffer, layout.attention_sinks
         ),
+        sage_scales=_workspace_section_view(workspace_buffer, layout.sage_scales),
     )
 
 
@@ -671,14 +711,15 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
         torch.uint8: "float4_e2m1fn",
+        torch.int8: "int8",
     }
     try:
         return keys[dtype]
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts decode supports torch.float16, torch.bfloat16, "
-            "torch.float8_e4m3fn, and packed NVFP4 K/V in torch.uint8; "
-            f"got {dtype}"
+            "torch.float8_e4m3fn, packed NVFP4 K/V in torch.uint8, and "
+            f"torch.int8 Sage Q/K; got {dtype}"
         ) from error
 
 
@@ -701,7 +742,17 @@ def _validate_dtype_pair(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    sage: Optional[SageAttentionConfig] = None,
 ) -> None:
+    if sage is not None:
+        validate_sage_recipe(
+            sage,
+            q_dtype=q_dtype,
+            k_dtype=k_dtype,
+            v_dtype=v_dtype,
+            output_dtype=output_dtype,
+        )
+        return
     _dtype_key(q_dtype)
     _dtype_key(k_dtype)
     _dtype_key(v_dtype)
@@ -841,7 +892,8 @@ def _validate_q(
         leading_name = "total Q token count" if use_packed_q else "batch size"
         raise ValueError(f"q {leading_name} and head count must be positive")
     _validate_head_dim(int(q.shape[-1]))
-    if q.dtype not in _SUPPORTED_INPUT_DTYPES:
+    # Int8 Q is a Sage recipe, which plan dtype validation checks.
+    if q.dtype not in (*_SUPPORTED_INPUT_DTYPES, torch.int8):
         raise NotImplementedError(f"unsupported attention-ts q dtype {q.dtype}")
     if q.device.type != "cuda":
         raise ValueError("q must be a CUDA tensor")
@@ -1210,8 +1262,10 @@ def _decode_launch_spec_from_config(
     head_dim: int,
     seq_len_q: int,
     max_active_clusters: int,
+    sage: Optional[SageAttentionConfig] = None,
+    max_kv_len: Optional[int] = None,
 ) -> _DecodeLaunchSpec:
-    """Derive policy and scratch geometry from one finalized FMHA config."""
+    """Derive policy, scratch and Sage scale geometry from one finalized FMHA config."""
 
     scratch_shapes = _decode_scratch_shapes(
         cfg,
@@ -1221,23 +1275,42 @@ def _decode_launch_spec_from_config(
         head_dim=head_dim,
         seq_len_q=seq_len_q,
     )
+    sage_scale_words = 0
+    sage_shapes = None
+    if sage is not None:
+        assert max_kv_len is not None
+        sage_scale_words = cfg.sage_scale_layout(max_kv_len).total_words(
+            batch_size * num_kv_heads
+        )
+        sage_shapes = sage_scale_shapes(
+            sage,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            seq_len_kv=max_kv_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
 
     return _DecodeLaunchSpec(
         config=cfg,
         max_active_clusters=int(max_active_clusters),
         policy=_decode_policy_from_config(cfg),
         scratch_shapes=scratch_shapes,
+        sage_scale_words=sage_scale_words,
+        sage_scale_shapes=sage_shapes,
     )
 
 
-# Two consecutive grouped Keeps Q128 tiles of one request and KV head per CTA.
-_QUERY_PAIRED_DECODE_PROFILE = {
+# The grouped Keeps Q128/KV128 tile.
+_KEEPS_Q128_DECODE_PROFILE = {
     "use_keeps_mma_ab": True,
     "tile_size_q": 128,
     "tile_size_kv": 128,
     "groups_tokens_heads_q": True,
-    "query_paired": True,
 }
+# Two consecutive grouped Keeps Q128 tiles of one request and KV head per CTA.
+_QUERY_PAIRED_DECODE_PROFILE = {**_KEEPS_Q128_DECODE_PROFILE, "query_paired": True}
 
 
 @functools.cache
@@ -1264,6 +1337,7 @@ def _resolve_decode_launch_spec(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     query_paired: Optional[bool] = None,
+    sage: Optional[SageAttentionConfig] = None,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
@@ -1282,9 +1356,20 @@ def _resolve_decode_launch_spec(
         page_size,
         page_size if storage_page_size is None else storage_page_size,
     )
+    if sage is not None:
+        if use_q_token_kv_block_sparse_route or storage_page_size != page_size:
+            raise NotImplementedError(
+                "Sage attention does not support QToken-KvBlock-Sparse routes "
+                "or physical pages larger than page_size"
+            )
+        if q_dtype_key == "int8":
+            _validate_int8_qk_device(torch.int8, device_index)
+        # Only the direct output store applies the V scales.
+        split_kv = False
 
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
+        SOFTMAX_RESCALE_THRESHOLD_LOG2,
         arch_config_args,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
@@ -1387,7 +1472,28 @@ def _resolve_decode_launch_spec(
             if query_paired is False:
                 # The grouped-Q cost model may pair Q tiles unless told not to.
                 config_overrides["query_paired"] = False
-            cfg = make_config(config_overrides)
+            if sage is None:
+                cfg = make_config(config_overrides)
+            else:
+                # A paged request keeps the contiguous Sage plans' softmax
+                # anchor headroom, computing what a dense plan over its K/V does.
+                config_overrides.update(
+                    sage_decode_config_fields(sage),
+                    softmax_rescale_threshold_log2=SOFTMAX_RESCALE_THRESHOLD_LOG2,
+                )
+                # The grouped-Q selection chooses a Sage launch's tile; other
+                # launches take the grouped Keeps Q128/KV128 tile.
+                try:
+                    cfg = make_config(config_overrides)
+                except ValueError:
+                    cfg = None
+                if cfg is None or any(
+                    getattr(cfg, field) != value
+                    for field, value in _KEEPS_Q128_DECODE_PROFILE.items()
+                ):
+                    cfg = make_config(
+                        {**config_overrides, **_KEEPS_Q128_DECODE_PROFILE}
+                    )
 
             # A grouped fixed-Q launch can leave most of the first service wave
             # idle. In that regime, evaluate the narrowest supported Swaps head
@@ -1497,7 +1603,9 @@ def _resolve_decode_launch_spec(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         seq_len_q=seq_len_q,
+        max_kv_len=max_kv_len,
         max_active_clusters=int(max_active_clusters),
+        sage=sage,
     )
 
 
@@ -1606,6 +1714,15 @@ def _get_compiled_decode(
     Int64 = cutlass.Int64
     Float32 = cutlass.Float32
 
+    prepare_sage_scales = None
+    if cfg.use_sage_attention:
+        from .sage.prepare import _PrepareSageScales
+
+        # The kernel reads the layout of its static K/V length, max_kv_len.
+        prepare_sage_scales = _PrepareSageScales(
+            layout=cfg.sage_scale_layout(max_kv_len), num_kv_heads=num_kv_heads
+        )
+
     @cute.jit
     def main_tensor_adapter(
         q: cute.Tensor,
@@ -1632,6 +1749,7 @@ def _get_compiled_decode(
         bmm1_scale: cutlass.Float32,
         bmm2_scale: cutlass.Float32,
         direct_q1_inputs: tuple,
+        sage_inputs: tuple,
         stream: cuda_drv.CUstream,
         static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
         static_seq_len_q: cutlass.Constexpr[int],
@@ -1689,6 +1807,28 @@ def _get_compiled_decode(
                 lengths=False,
             )
 
+        sage_kwargs = {}
+        if cutlass.const_expr(static_cfg.use_sage_attention):
+            # ``sage_inputs`` is (prepared scales, q_scale, k_scale, v_scale,
+            # v_mean). The prepare writes the scales attention reads, clamped
+            # to each request's K/V and packed Q lengths, as an ordinary launch
+            # that attention follows in stream order.
+            sage_scales, q_scale, k_scale, v_scale, v_mean = sage_inputs
+            prepare_sage_scales(
+                q_scale,
+                k_scale,
+                None,
+                v_scale,
+                v_mean,
+                sage_scales,
+                stream,
+                seq_lens_kv=seq_lens,
+                cu_seqlens_q=(
+                    cu_seqlens_q if static_cfg.use_variable_seqlens_q else None
+                ),
+            )
+            sage_kwargs = {"sage_scales_iter": sage_scales.iterator}
+
         fmha_decode_launch(
             (
                 batch_size,
@@ -1733,6 +1873,7 @@ def _get_compiled_decode(
             v_token_stride,
             static_full_split_prefix,
             static_native_uniform_kv,
+            **sage_kwargs,
         )
 
     reduction_tensor_adapter = None
@@ -1915,6 +2056,16 @@ def _get_compiled_decode(
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    sage_fake: tuple = ()
+    if cfg.use_sage_attention:
+        v_rows_shape = (cute.sym_int(), num_kv_heads, head_dim)
+        sage_fake = (
+            fake_compact(Float32, (cute.sym_int(),), 16),
+            fake_compact(Float32, (num_qo_heads, cute.sym_int()), 16),
+            fake_compact(Float32, (num_kv_heads, cute.sym_int()), 16),
+            fake_compact(Float32, v_rows_shape, 16),
+            fake_compact(Float32, v_rows_shape, 16) if cfg.sage_v_mean else None,
+        )
     direct_q1_fake: tuple = ()
     if direct_q1_spec is not None:
         rows = cute.sym_int()
@@ -1978,6 +2129,7 @@ def _get_compiled_decode(
             Float32(1.0),
             Float32(1.0),
             direct_q1_fake,
+            sage_fake,
             stream_fake,
             cfg,
             seq_len_q,
@@ -2050,6 +2202,7 @@ def get_prims_ts_batch_decode_workspace_size(
     device: Optional[Union[int, str, torch.device]] = None,
     split_kv: bool = True,
     query_paired: Optional[bool] = None,
+    sage_config: Optional[SageAttentionConfig] = None,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
@@ -2077,7 +2230,8 @@ def get_prims_ts_batch_decode_workspace_size(
     ``split_kv`` permits automatic split fanout when True (default), or forces
     nonsplit execution when False. It is independent of Q layout and must
     match the value supplied to attention planning/launch, as must
-    ``query_paired``.
+    ``query_paired`` and ``sage_config``, whose prepared scales the workspace
+    holds.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -2108,7 +2262,7 @@ def get_prims_ts_batch_decode_workspace_size(
     k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
     if out_dtype is None:
         out_dtype = q_dtype
-    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
+    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype, sage_config)
     inferred_device = (
         qo_indptr.device
         if device is None and isinstance(qo_indptr, torch.Tensor)
@@ -2146,6 +2300,7 @@ def get_prims_ts_batch_decode_workspace_size(
         resolved_device,
         split_kv=split_kv,
         query_paired=query_paired,
+        sage=sage_config,
     ).total_bytes
 
 
@@ -2263,6 +2418,7 @@ def _launch_decode(
     workspace: _DecodeWorkspaceViews,
     compiled_main: Callable[..., object],
     compiled_reducer: Optional[Callable[..., object]],
+    sage_inputs: tuple[Optional[torch.Tensor], ...] = (),
 ) -> torch.Tensor:
     """Launch the compiled main kernel and its optional standalone reducer."""
 
@@ -2292,6 +2448,7 @@ def _launch_decode(
         runtime.bmm1_scale,
         runtime.bmm2_scale,
         (),
+        sage_inputs,
     )
     if compiled_reducer is not None:
         compiled_reducer(
@@ -2552,6 +2709,8 @@ class PrimsTSBatchDecodePlan:
     _compiled_reducer: Optional[Callable[..., object]]
     _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
+    # A Sage plan's prepared-scale workspace view and retained scale tensors.
+    _sage_inputs: tuple[Optional[torch.Tensor], ...] = ()
 
     def run(
         self,
@@ -2632,6 +2791,7 @@ class PrimsTSBatchDecodePlan:
             scale_qk,
             scale_v,
             direct_inputs,
+            self._sage_inputs,
         )
         if self._compiled_reducer is not None:
             self._compiled_reducer(
@@ -2671,6 +2831,7 @@ def _resolve_decode_workspace_layout(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     query_paired: Optional[bool] = None,
+    sage: Optional[SageAttentionConfig] = None,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
@@ -2699,12 +2860,14 @@ def _resolve_decode_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
         query_paired,
+        sage,
     )
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        sage_scale_words=spec.sage_scale_words,
     )
 
 
@@ -3432,6 +3595,8 @@ def _prepare_prims_ts_batch_decode_plan(
     share_pattern_across_kv_heads: bool = True,
     allow_head_aware_locators: bool = False,
     query_paired: Optional[bool] = None,
+    sage: Optional[SageAttentionParams] = None,
+    sage_config: Optional[SageAttentionConfig] = None,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3502,11 +3667,13 @@ def _prepare_prims_ts_batch_decode_plan(
         output_dtype = out.dtype if out is not None else query.dtype
     elif not isinstance(output_dtype, torch.dtype):
         raise TypeError("out_dtype must be a torch.dtype")
+    sage_config = resolve_sage_config(sage, sage_config)
     _validate_dtype_pair(
         query.dtype,
         k_cache.dtype,
         v_cache.dtype,
         output_dtype,
+        sage_config,
     )
     k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
@@ -3539,7 +3706,7 @@ def _prepare_prims_ts_batch_decode_plan(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    spec = _resolve_decode_launch_spec(*policy_args, query_paired)
+    spec = _resolve_decode_launch_spec(*policy_args, query_paired, sage_config)
     if query_major_memberships:
         if not spec.config.supports_query_major_memberships:
             raise ValueError(
@@ -3570,6 +3737,7 @@ def _prepare_prims_ts_batch_decode_plan(
         output_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        sage_scale_words=spec.sage_scale_words,
     )
     _validate_workspace_buffer(
         workspace_buffer,
@@ -3646,6 +3814,11 @@ def _prepare_prims_ts_batch_decode_plan(
     # keeps one replay contract for every split policy.
     if layout.uses_split_kv:
         workspace.split_kv_counter.zero_()
+    sage_inputs: tuple[Optional[torch.Tensor], ...] = ()
+    if sage is not None:
+        assert spec.sage_scale_shapes is not None
+        validate_sage_params(sage, spec.sage_scale_shapes, device=query.device)
+        sage_inputs = _sage_launch_inputs(workspace, sage)
     plan = PrimsTSBatchDecodePlan(
         _query_shape=tuple(query.shape),
         _query_stride=tuple(query.stride()),
@@ -3667,6 +3840,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _compiled_reducer=compiled_reducer,
         _direct_q1_inputs=direct_q1_inputs,
         _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
+        _sage_inputs=sage_inputs,
     )
     return plan, out
 
@@ -3692,6 +3866,8 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     page_size: Optional[int] = None,
     split_kv: bool = True,
     query_paired: Optional[bool] = None,
+    sage: Optional[SageAttentionParams] = None,
+    sage_config: Optional[SageAttentionConfig] = None,
 ) -> PrimsTSBatchDecodePlan:
     """Validate and prepare a reusable dense-block-table PrimTS launch.
 
@@ -3749,6 +3925,14 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         head per CTA over one K/V stream when the launch supports it (True),
         never (False), or when the automatic tile selection prefers it
         (``None``, default). Match workspace sizing's value.
+    sage : SageAttentionParams, optional
+        Scale tensors of a Sage plan, retained like the K/V cache; their
+        values may change between launches.
+    sage_config : SageAttentionConfig, optional
+        The Sage recipe of ``sage``, by default :class:`SageAttentionConfig`
+        with ``v_mean`` set when ``sage.v_mean`` is present; see
+        :meth:`BatchDecodePagedTSWrapper.plan` for the scale layout. Match
+        workspace sizing's value.
 
     Returns
     -------
@@ -3779,6 +3963,8 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         split_kv=split_kv,
         use_q_token_kv_block_sparse_route=False,
         query_paired=query_paired,
+        sage=sage,
+        sage_config=sage_config,
     )
     return plan
 
@@ -3847,6 +4033,7 @@ class BatchDecodePagedTSWrapper:
         storage_page_size: Optional[int] = None,
         split_kv: bool = True,
         query_paired: Optional[bool] = None,
+        sage_config: Optional[SageAttentionConfig] = None,
         validate: bool = True,
         initialize_workspace: bool = True,
     ) -> None:
@@ -3939,6 +4126,13 @@ class BatchDecodePagedTSWrapper:
             never (False), or when the automatic tile selection prefers it
             (``None``, default); the decode README's Query pairing section lists
             the launches that pair. The plan's policy records the outcome.
+        sage_config : SageAttentionConfig, optional
+            Sage attention recipe of the plan (see the PrimTS README); the plan
+            runs the grouped Keeps Q128 tile and never splits K/V. Every
+            :meth:`run` supplies :class:`SageAttentionParams` in the flat layout
+            of a dense plan whose K/V length is ``max_kv_len`` and whose Q
+            length is ``max_seq_len_q``; scales past a request's length are not
+            read.
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
@@ -3986,6 +4180,7 @@ class BatchDecodePagedTSWrapper:
                 k_data_type,
                 v_data_type,
                 o_data_type,
+                sage_config,
             )
 
             specialization_seq_lens = _normalize_plan_seq_lens(
@@ -4035,7 +4230,10 @@ class BatchDecodePagedTSWrapper:
             storage_page_size,
         )
         spec = _resolve_decode_launch_spec(
-            *policy_args, split_kv=split_kv, query_paired=query_paired
+            *policy_args,
+            split_kv=split_kv,
+            query_paired=query_paired,
+            sage=sage_config,
         )
         if specialization_seq_lens is None:
             kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
@@ -4097,6 +4295,7 @@ class BatchDecodePagedTSWrapper:
             o_data_type,
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
+            sage_scale_words=spec.sage_scale_words,
         )
         if workspace_buffer is None:
             initialize_workspace = True
@@ -4157,6 +4356,7 @@ class BatchDecodePagedTSWrapper:
             planned_seq_lens_device=planned_seq_lens_device,
             policy=policy,
             storage_page_size=storage_page_size,
+            sage_scale_shapes=spec.sage_scale_shapes,
         )
         # This is the only wrapper mutation. Any failure above leaves the
         # previous complete plan revision usable.
@@ -4174,6 +4374,7 @@ class BatchDecodePagedTSWrapper:
         qo_indptr: Optional[torch.Tensor] = None,
         bmm1_scale: Optional[float] = None,
         bmm2_scale: float = 1.0,
+        sage: Optional[SageAttentionParams] = None,
         out: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
@@ -4231,6 +4432,9 @@ class BatchDecodePagedTSWrapper:
             ``head_dim``.
         bmm2_scale : float
             Value/output scaling factor. Defaults to ``1.0``.
+        sage : SageAttentionParams, optional
+            Scale tensors of this run. Required by a Sage plan and rejected
+            otherwise; see :meth:`plan` for their layout.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
@@ -4263,6 +4467,16 @@ class BatchDecodePagedTSWrapper:
             effective_seq_lens = seq_lens
 
         runtime_qo_indptr = qo_indptr if state.use_packed_q else None
+        if (sage is None) != (state.sage_scale_shapes is None):
+            raise ValueError(
+                "sage=SageAttentionParams(...) is required by a Sage plan and "
+                "rejected by a plan without Sage attention"
+            )
+        sage_inputs: tuple[Optional[torch.Tensor], ...] = ()
+        if sage is not None:
+            if validate:
+                validate_sage_params(sage, state.sage_scale_shapes, device=state.device)
+            sage_inputs = _sage_launch_inputs(state.workspace, sage)
         if validate:
             (
                 metadata_device,
@@ -4348,6 +4562,7 @@ class BatchDecodePagedTSWrapper:
             workspace=state.workspace,
             compiled_main=state.compiled_main,
             compiled_reducer=state.compiled_reducer,
+            sage_inputs=sage_inputs,
         )
 
 
@@ -4372,6 +4587,8 @@ def batch_decode_with_paged_kv_cache(
     page_size: Optional[int] = None,
     split_kv: bool = True,
     query_paired: Optional[bool] = None,
+    sage: Optional[SageAttentionParams] = None,
+    sage_config: Optional[SageAttentionConfig] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     max_kv_len: Optional[int] = None,
     validate: bool = True,
@@ -4438,11 +4655,19 @@ def batch_decode_with_paged_kv_cache(
         Run two consecutive grouped Keeps Q128 tiles of one request and KV
         head per CTA when the launch supports it (True), never (False), or
         when the automatic tile selection prefers it (``None``, default).
+    sage : SageAttentionParams, optional
+        Scale tensors of a Sage attention launch, which requires
+        ``max_kv_len``; see :meth:`BatchDecodePagedTSWrapper.plan` for their
+        layout.
+    sage_config : SageAttentionConfig, optional
+        The Sage recipe of ``sage``. Defaults to :class:`SageAttentionConfig`
+        with ``v_mean`` set when ``sage.v_mean`` is present.
     workspace_buffer : torch.Tensor, optional
         Zero-initialized caller-owned byte scratch; re-zero when layout inputs
         (including batch size) change. Exclusive to one in-flight launch/graph.
     max_kv_len : int, optional
         Static K/V capacity; defaults to the metadata maximum with validation.
+        A Sage launch requires it: it lays out the scale tensors.
     validate : bool
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
@@ -4473,6 +4698,11 @@ def batch_decode_with_paged_kv_cache(
 
     if not isinstance(validate, bool):
         raise TypeError("validate must be a bool")
+    sage_config = resolve_sage_config(sage, sage_config)
+    if sage is not None and max_kv_len is None:
+        raise ValueError(
+            "Sage attention requires max_kv_len, which lays out its scales"
+        )
     if validate or workspace_buffer is None or out is None:
         if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -4599,6 +4829,7 @@ def batch_decode_with_paged_kv_cache(
             device=q.device,
             split_kv=split_kv,
             query_paired=query_paired,
+            sage_config=sage_config,
         )
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.int8, device=q.device
@@ -4617,6 +4848,7 @@ def batch_decode_with_paged_kv_cache(
         storage_page_size=storage_page_size,
         split_kv=split_kv,
         query_paired=query_paired,
+        sage_config=sage_config,
         packed_query=use_packed_q,
         q_data_type=q.dtype,
         k_data_type=k_cache.dtype,
@@ -4638,6 +4870,7 @@ def batch_decode_with_paged_kv_cache(
         qo_indptr=qo_indptr,
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
+        sage=sage,
         out=out,
         validate=validate,
     )

@@ -2255,21 +2255,19 @@ class FmhaDecodeConfig:
         if not self.groups_tokens_heads_q:
             # The prepared ``sfQ`` rows follow the grouped Q tile rows.
             raise ValueError("Sage attention requires groups_tokens_heads_q=True")
-        if self.use_paged_kv or self.headdim != 128:
-            raise ValueError("Sage attention requires contiguous K/V with headdim=128")
+        if self.headdim != 128:
+            raise ValueError("Sage attention requires headdim=128")
         # Only the direct output store applies the V channel scales and means;
         # split-KV partials and reductions do not.
         if (
-            self.use_variable_seqlens_q
-            or self.use_sliding_window_causal
-            or self.use_attention_sinks
+            self.use_attention_sinks
             or self.use_split_kv
             or self.use_cluster_smem_reduction
             or self.use_separate_reduction_kernel
         ):
             raise ValueError(
                 "Sage attention supports the direct-output grid only, without "
-                "split-KV, variable-Q, sliding-window, or attention-sink features"
+                "split-KV or attention sinks"
             )
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
@@ -2503,6 +2501,9 @@ class FmhaDecodeConfig:
         """
         if not self.supports_grouped_keeps:
             return False
+        if self.use_sage_attention:
+            # A Sage recipe runs grouped Keeps only.
+            return True
         profile = self._grouped_keeps_profile_key
         if (
             self.use_paged_kv
@@ -3237,7 +3238,13 @@ class FmhaDecodeConfig:
         ):
             return True
         if self.use_sage_attention:
-            return False
+            # Paged Sage reads the contiguous Sage resources, fixed or packed Q.
+            return (
+                self._uses_contiguous_grouped_keeps_recipe
+                and direct
+                and self.use_paged_kv
+                and not self.use_attention_sinks
+            )
 
         if profile in _D192_GROUPED_KEEPS_PROFILES:
             # Fixed-Q staged resources support dense/paged K/V, CLC and

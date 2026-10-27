@@ -2680,6 +2680,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "page_size",
         "split_kv",
         "query_paired",
+        "sage",
+        "sage_config",
         "workspace_buffer",
         "max_kv_len",
         "validate",
@@ -2711,6 +2713,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "storage_page_size",
         "split_kv",
         "query_paired",
+        "sage_config",
         "validate",
         "initialize_workspace",
     )
@@ -2725,6 +2728,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "qo_indptr",
         "bmm1_scale",
         "bmm2_scale",
+        "sage",
         "out",
         "validate",
     )
@@ -2813,6 +2817,11 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
                 assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
                 assert parameter.default is True
                 assert parameter.annotation in (bool, "bool")
+                continue
+            if parameter.name == "sage_config":
+                # The Sage recipe fixes the scale tensors' layout and the
+                # result, as the block-sparse APIs' parameter does; it does
+                # not tune the launch.
                 continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
@@ -4948,6 +4957,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "sage_scale_shapes": None,
             "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),
@@ -5013,6 +5023,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "sage_scale_shapes": None,
             "use_packed_q": True,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
@@ -5036,6 +5047,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         "_DecodeQModePlanState",
         (),
         {
+            "sage_scale_shapes": None,
             "use_packed_q": False,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
@@ -5244,6 +5256,7 @@ def test_attention_ts_decode_planned_full_dynamic_uses_owned_seq_lens(
         "_PlannedFullDynamicDecodePlanState",
         (),
         {
+            "sage_scale_shapes": None,
             "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),

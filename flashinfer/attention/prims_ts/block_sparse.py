@@ -82,7 +82,11 @@ from .decode import (
     _validate_runtime_device,
 )
 from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from .sage.config import SageAttentionConfig, SageAttentionParams
+from .sage.config import (
+    SageAttentionConfig,
+    SageAttentionParams,
+    resolve_sage_config,
+)
 
 
 class _BlockSparseWrapperBase:
@@ -577,10 +581,7 @@ def block_sparse_attention(
         The compact output tensor; identical to ``out`` when provided.
     """
 
-    if sage_config is not None and sage is None:
-        raise ValueError("sage_config requires the sage scale tensors of this call")
-    if sage is not None and sage_config is None:
-        sage_config = SageAttentionConfig(v_mean=sage.v_mean is not None)
+    sage_config = resolve_sage_config(sage, sage_config)
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")

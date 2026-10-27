@@ -21,7 +21,9 @@ summaries, the ``sfQ`` rows of the Q tiles, then the ``sfV`` row and, with a
 V mean, the ``v_mean`` row. This kernel reads the flat ``q_scale``,
 ``k_scale`` and ``k_summary_scale`` tensors and the ``[B, Hkv, D]``
 ``v_scale`` and ``v_mean`` tensors; one thread writes one float4 of the
-buffer.
+buffer. A paged decode plan lays the flat tensors out with its K/V and Q
+capacities and passes each request's lengths: tokens past a request's end
+take its last token's scale, so the buffer never holds a caller's padding.
 """
 
 from dataclasses import dataclass
@@ -66,9 +68,16 @@ class _KSectionSource:
     head_stride: cutlass.Int32
     # Tokens of the section: K tokens, or block summaries.
     length: cutlass.Int32
+    # Leading tokens with scales of their own; later ones repeat the last.
+    valid_length: cutlass.Int32
 
     @staticmethod
-    def create(section: _SageKSection, scales: cute.Tensor) -> "_KSectionSource":
+    def create(
+        section: _SageKSection,
+        scales: cute.Tensor,
+        valid_length: cutlass.Int32 | None = None,
+    ) -> "_KSectionSource":
+        length = cutlass.Int32(section.length)
         return _KSectionSource(
             atom_float4s=cutlass.Int32(section.atom_float4s),
             tokens_per_word=cutlass.Int32(section.tokens_per_word),
@@ -76,8 +85,20 @@ class _KSectionSource:
             log2_block=cutlass.Int32(sage_log2_block_size(section.source_block_size)),
             scale_addr=scales.iterator.toint(),
             head_stride=cutlass.Int32(scales.shape[1]),
-            length=cutlass.Int32(section.length),
+            length=length,
+            valid_length=length if valid_length is None else valid_length,
         )
+
+
+def _clamped_length(length: cutlass.Int32, capacity: int) -> cutlass.Int32:
+    """Clamp one request's token count to ``[1, capacity]``.
+
+    An inactive request's words are never read; the clamp keeps their source
+    index in bounds.
+    """
+    return cute.math.max(
+        cute.math.min(length, cutlass.Int32(capacity)), cutlass.Int32(1)
+    )
 
 
 @cute.jit
@@ -151,6 +172,7 @@ def _write_k_float4(
     batch_idx: cutlass.Int32,
     head_idx: cutlass.Int32,
     float4_in_sequence: cutlass.Int32,
+    k_valid_len: cutlass.Int32 | None = None,
 ) -> None:
     """Write float4 ``float4_idx`` of the buffer: four words of one K atom.
 
@@ -158,10 +180,11 @@ def _write_k_float4(
     the K tokens from ``k_scale``, or the block summaries from
     ``k_summary_scale`` behind them. Word ``w`` of an atom is the section's
     scale of the atom's token ``w * tokens_per_word``; a token past the
-    section's length takes the last scale, and padding words are zero.
+    section's length, or past ``k_valid_len`` K tokens when given, takes the
+    last such token's scale, and padding words are zero.
     """
 
-    section = _KSectionSource.create(layout.k_tokens, k_scale)
+    section = _KSectionSource.create(layout.k_tokens, k_scale, k_valid_len)
     float4_in_section = float4_in_sequence
     if cutlass.const_expr(layout.summaries is not None):
         summaries_first_float4 = layout.summaries.word_offset // _FLOAT4_WORDS
@@ -192,6 +215,7 @@ def _write_k_float4(
                 token_idx=atom_idx * cutlass.Int32(_SAGE_ATOM_TOKENS)
                 + word * section.tokens_per_word,
                 log2_block=section.log2_block,
+                valid_len=section.valid_length,
             )
     _store_float4(scales, float4_idx, words)
 
@@ -206,13 +230,15 @@ def _write_q_float4(
     batch_idx: cutlass.Int32,
     kv_head_idx: cutlass.Int32,
     float4_in_section: cutlass.Int32,
+    q_valid_len: cutlass.Int32 | None = None,
 ) -> None:
     """Write float4 ``float4_idx`` of the buffer: four rows of one Q tile.
 
     ``float4_in_section`` places the float4 in the sequence's Q rows. Row
     ``r`` of the tile takes the Q scale of the token and Q head the section's
     row order maps it to (``_SageQSection.row_token_and_head``);
-    ``load_sage_flat_scale`` gives a token past the sequence's end the last token's.
+    ``load_sage_flat_scale`` gives a token past the sequence's end, or past
+    ``q_valid_len`` tokens when given, the last such token's.
     """
 
     q_rows = layout.q_rows
@@ -237,6 +263,7 @@ def _write_q_float4(
             seq_len=cutlass.Int32(q_rows.seq_len_q),
             token_idx=q_token_idx,
             log2_block=cutlass.Int32(sage_log2_block_size(q_rows.q_block_size)),
+            valid_len=q_valid_len,
         )
     _store_float4(scales, float4_idx, words)
 
@@ -270,10 +297,23 @@ class _PrepareSageScales:
         v_mean: cute.Tensor | None,
         scales: cute.Tensor,
         stream: cuda_drv.CUstream,
+        seq_lens_kv: cute.Tensor | None = None,
+        cu_seqlens_q: cute.Tensor | None = None,
     ) -> None:
+        """Launch the prepare; ``seq_lens_kv`` and ``cu_seqlens_q`` give
+        each request's K tokens and, for packed Q, its Q tokens."""
         # The buffer's float4 count follows the run's batch size.
         num_float4s = scales.shape[0] // _FLOAT4_WORDS
-        self.kernel(q_scale, k_scale, k_summary_scale, v_scale, v_mean, scales).launch(
+        self.kernel(
+            q_scale,
+            k_scale,
+            k_summary_scale,
+            v_scale,
+            v_mean,
+            scales,
+            seq_lens_kv,
+            cu_seqlens_q,
+        ).launch(
             grid=[ceil_div(num_float4s, _THREADS_PER_CTA), 1, 1],
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
@@ -288,6 +328,8 @@ class _PrepareSageScales:
         v_scale: cute.Tensor,
         v_mean: cute.Tensor | None,
         scales: cute.Tensor,
+        seq_lens_kv: cute.Tensor | None,
+        cu_seqlens_q: cute.Tensor | None,
     ) -> None:
         """Write this thread's float4 of a K section, the Q rows or the V rows, if any."""
 
@@ -318,6 +360,12 @@ class _PrepareSageScales:
                     float4_in_section=float4_in_sequence - v_rows_first_float4,
                 )
             elif float4_in_sequence < q_rows_first_float4:
+                k_valid_len = None
+                if cutlass.const_expr(seq_lens_kv is not None):
+                    k_valid_len = _clamped_length(
+                        cutlass.Int32(seq_lens_kv[batch_idx]),
+                        self.layout.k_tokens.length,
+                    )
                 _write_k_float4(
                     k_scale,
                     k_summary_scale,
@@ -327,8 +375,16 @@ class _PrepareSageScales:
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     float4_in_sequence=float4_in_sequence,
+                    k_valid_len=k_valid_len,
                 )
             else:
+                q_valid_len = None
+                if cutlass.const_expr(cu_seqlens_q is not None):
+                    q_valid_len = _clamped_length(
+                        cutlass.Int32(cu_seqlens_q[batch_idx + cutlass.Int32(1)])
+                        - cutlass.Int32(cu_seqlens_q[batch_idx]),
+                        self.layout.q_rows.seq_len_q,
+                    )
                 _write_q_float4(
                     q_scale,
                     scales,
@@ -337,6 +393,7 @@ class _PrepareSageScales:
                     batch_idx=batch_idx,
                     kv_head_idx=head_idx,
                     float4_in_section=float4_in_sequence - q_rows_first_float4,
+                    q_valid_len=q_valid_len,
                 )
 
 

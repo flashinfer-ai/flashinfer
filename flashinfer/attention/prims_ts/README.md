@@ -349,11 +349,14 @@ new maximum.
 ## Sage attention
 
 Sage attention runs attention on 8-bit Q, K and V with dequantization scales
-on two kernels: the contiguous decode kernel, in the dense and block-sparse
-modes of `BlockSparseTSWrapper` and `block_sparse_attention`, and the
-contiguous context kernel, on dense fixed-length plans of
-`BatchPrefillTSWrapper`. The plan fixes the recipe with a
-`SageAttentionConfig` (`sage_config=` for the block-sparse APIs, `sage=` for
+on two kernels: the decode kernel, in the dense and block-sparse modes of
+`BlockSparseTSWrapper` and `block_sparse_attention` over contiguous K/V and
+in the paged decode APIs (`BatchDecodePagedTSWrapper`,
+`batch_decode_with_paged_kv_cache`,
+`prepare_prims_ts_batch_decode_with_kv_cache`), and the contiguous context
+kernel, on dense fixed-length plans of `BatchPrefillTSWrapper`. The plan
+fixes the recipe with a `SageAttentionConfig` (`sage_config=` for the
+block-sparse and paged decode APIs, `sage=` for
 `BatchPrefillTSWrapper.plan`); every run supplies the scales as
 `sage=SageAttentionParams(...)`:
 
@@ -400,6 +403,11 @@ use the trtllm-gen flat layout: within one head, sequence `b` of
 | `v_mean` | `[B, Hkv, D]`; exactly when the recipe sets `v_mean=True` |
 | `k_summary_scale` | `[Hkv, sage_flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
+A paged decode plan keeps this layout with its capacities: `Skv` is the
+plan's `max_kv_len` and `Sq` its `max_seq_len_q`, also for packed Q. Slots
+past a request's K/V or Q length are never read, and the one-shot call
+requires an explicit `max_kv_len`.
+
 With proxy routes, `k_summary` holds the per-block K means in the K dtype,
 quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
 `k_summary_block_size`; `k_summary_scale` holds its scales. `v_summary` holds
@@ -424,10 +432,10 @@ the scores in place in the max pass, which costs more per score.
 
 | | Decode kernel | Context kernel |
 | --- | --- | --- |
-| APIs | `BlockSparseTSWrapper`, `block_sparse_attention` | `BatchPrefillTSWrapper` |
-| K/V storage | Contiguous; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
-| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) | `head_dim=128`; 128-token Q tiles of one Q head |
-| Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
+| APIs | `BlockSparseTSWrapper`, `block_sparse_attention`; paged decode | `BatchPrefillTSWrapper` |
+| K/V storage | Contiguous, or paged in the paged decode APIs; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
+| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`). Paged decode runs the grouped Q128/KV128 tile, paired as its `query_paired` selects | `head_dim=128`; 128-token Q tiles of one Q head |
+| Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask). Paged decode adds causal sliding windows and fixed or packed Q | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
 | K transport | `SMEM` for every K block size: the load warp stages each K tile's scales in shared memory | `GMEM` for 4-token and coarser blocks: the softmax loads them from global memory before the score wait; `SMEM` for 1-token blocks |
 | Score scaling | `DEQUANTIZED` on dense Q128/KV128 tiles, whose score row stays in registers; on Q64/KV256 tiles and block-sparse routes, `BLOCK` for 4-token and coarser blocks and `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
