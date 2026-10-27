@@ -167,6 +167,25 @@ def test_file_config_with_non_invariant_tactic_is_ignored(
         set_autotune_batch_invariant(saved)
 
 
+def test_ranked_shortlist_cached_before_mode_is_reranked(fake_profile, default_mode):
+    tuner = reset_autotuner()
+    runner = SplitRunner()
+    inputs = _inputs()
+    config = TuningConfig()
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [1, 2]
+    fake_profile.clear()
+    set_autotune_batch_invariant(True)
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [2, 0]
+    assert sorted(fake_profile) == [0, 2]
+    # The re-ranked shortlist is invariant, so it is served from the cache.
+    fake_profile.clear()
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("bi_rank", [runner], config, inputs, k=2) == [2, 0]
+    assert not fake_profile
+
+
 # --- autotune_v2 integration: managed cache, replay coverage, default race ---
 
 
