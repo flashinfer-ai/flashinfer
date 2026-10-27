@@ -51,6 +51,7 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
     FmhaConfig,
 )
+from flashinfer.quantization import mxfp8_quantize_bshd
 from flashinfer.utils import is_sm100a_supported
 
 
@@ -885,6 +886,8 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v",
         "qo_indptr",
         "kv_indptr",
+        "q_scales",
+        "k_scales",
         "variable_window_token_starts",
         "variable_window_token_ends",
         "variable_window_cta_starts",
@@ -1303,9 +1306,9 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
     launch = launch_calls[0]
     assert launch[4] is scale_softmax_log2
     assert launch[5] is output_scale
-    assert launch[8].data_ptr() == starts.data_ptr()
-    assert launch[9].data_ptr() == ends.data_ptr()
-    assert launch[10] is state.variable_window_cta_starts
+    assert launch[10].data_ptr() == starts.data_ptr()
+    assert launch[11].data_ptr() == ends.data_ptr()
+    assert launch[12] is state.variable_window_cta_starts
     assert state.variable_window_padded_starts is not None
     assert not hasattr(state, "variable_window_token_starts")
     assert not hasattr(state, "variable_window_token_ends")
@@ -1385,8 +1388,8 @@ def test_attention_ts_context_accepts_precomputed_variable_window_cta_starts(
     )
 
     assert len(launch_calls) == 1
-    assert launch_calls[0][10].data_ptr() == cta_starts.data_ptr()
-    assert launch_calls[0][10].shape == (2,)
+    assert launch_calls[0][12].data_ptr() == cta_starts.data_ptr()
+    assert launch_calls[0][12].shape == (2,)
     assert state.variable_window_cta_starts.tolist() == [123, 123]
     assert torch.all(state.variable_window_padded_starts == 456)
 
@@ -1442,7 +1445,9 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed=False, mask_type="dense", vc=None),
+        geometry=SimpleNamespace(
+            packed=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -2461,8 +2466,36 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
 
         expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
-        context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
+        context_module._default_uses_ldtm_stat(torch.cuda.current_device(), 8, 8)
+        is expected
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_ts_context_sm107_defaults_follow_the_path():
+    """SM107 pairs CTAs and issues K=64 fp8 PV on the bf16-QK paths, deepens the
+    K/V ring and keeps the register row max on the dense fp8-V paths. Other GPUs
+    keep their defaults."""
+    device_index = torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability()
+    sm107 = capability == (10, 7)
+    assert context_module._default_two_cta_umma(device_index, 16) is (
+        sm107 or capability == (10, 3)
+    )
+    assert context_module._default_two_cta_umma(device_index, 8) is (
+        capability == (10, 3)
+    )
+    assert context_module._default_umma_fp8_k64(device_index, 16) is sm107
+    assert context_module._default_umma_fp8_k64(device_index, 8) is False
+    assert context_module._default_kv_ring_stages(device_index, 8, 8) == (
+        6 if sm107 else 0
+    )
+    assert context_module._default_kv_ring_stages(device_index, 16, 8) == (
+        4 if sm107 else 0
+    )
+    assert context_module._default_kv_ring_stages(device_index, 16, 16) == 0
+    if sm107:
+        assert context_module._default_uses_ldtm_stat(device_index, 16, 8) is False
 
 
 @pytest.mark.parametrize("uses_ldtm_stat", (False, True))
@@ -4203,6 +4236,130 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
     _assert_context_correct(output, case.reference)
 
 
+def _plan_mxfp8(*, batch_size: int, seq_len: int, num_heads: int, **overrides):
+    """Plan MXFP8 Q/K: E8M0 Q/K dtype, E4M3 V, bf16 output."""
+    wrapper = BatchPrefillTSWrapper()
+    options = dict(
+        device="cuda:0",
+        batch_size=batch_size,
+        max_seq_len_q=seq_len,
+        max_kv_len=seq_len,
+        num_qo_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=_HEAD_DIM,
+        q_dtype=torch.float8_e8m0fnu,
+        k_dtype=torch.float8_e8m0fnu,
+        out_dtype=torch.bfloat16,
+    )
+    options.update(overrides)
+    wrapper.plan(**options)
+    return wrapper
+
+
+def _dequantize_mxfp8(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Undo ``mxfp8_quantize_bshd``: ``[B, S, H, D]`` fp32 from the data and atoms."""
+    batch_size, seq_len, num_heads, head_dim = data.shape
+    tiles = scales.shape[2]
+    # Atom byte 16 * (r % 32) + 4 * (r // 32) + block holds row r of the tile.
+    per_row = (
+        scales.view(batch_size, num_heads, tiles, 32, 4, head_dim // 32)
+        .permute(0, 1, 2, 4, 3, 5)
+        .reshape(batch_size, num_heads, tiles * 128, head_dim // 32)[:, :, :seq_len]
+    )
+    factor = torch.exp2(per_row.float() - 127.0).permute(0, 2, 1, 3)
+    return data.float() * factor.repeat_interleave(32, dim=-1)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len", "num_heads", "mask_type"),
+    [
+        (1, 128, 2, "dense"),
+        (1, 128, 2, "causal"),
+        (1, 1024, 4, "dense"),
+        (1, 1024, 4, "causal"),
+        (2, 4176, 4, "dense"),
+    ],
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_accuracy(
+    batch_size, seq_len, num_heads, mask_type
+):
+    """The kernel on MXFP8 Q/K equals fp32 attention on the dequantized operands."""
+    torch.manual_seed(0)
+    shape = (batch_size, seq_len, num_heads, _HEAD_DIM)
+    q, k, v = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    q8, q_scales = mxfp8_quantize_bshd(q)
+    k8, k_scales = mxfp8_quantize_bshd(k)
+    v_scale = v.abs().amax().float() / 448.0
+    v8 = (v.float() / v_scale).to(_FP8)
+    sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
+    wrapper = _plan_mxfp8(
+        batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, mask_type=mask_type
+    )
+    out = wrapper.run(
+        q8,
+        k8,
+        v8,
+        q_scales=q_scales,
+        k_scales=k_scales,
+        output_scale=v_scale.reshape(1),
+        scale_softmax_log2=torch.tensor(
+            [sm_scale * math.log2(math.e)], device="cuda", dtype=torch.float32
+        ),
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        _dequantize_mxfp8(q8, q_scales).transpose(1, 2),
+        _dequantize_mxfp8(k8, k_scales).transpose(1, 2),
+        (v8.float() * v_scale).transpose(1, 2),
+        scale=sm_scale,
+        is_causal=mask_type == "causal",
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), expected, rtol=5e-2, atol=5e-2)
+    # E4M3 P and V bound the error; Gaussian data sits at 2.2e-2 to 2.7e-2.
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 3e-2
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_plan_contract():
+    """MXFP8 Q/K takes E4M3 V, and runs need both scale tensors."""
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2, v_dtype=torch.bfloat16)
+    wrapper = _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2)
+    q8 = torch.zeros((1, 128, 2, _HEAD_DIM), device="cuda", dtype=_FP8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8)
+    plain = BatchPrefillTSWrapper()
+    plain.plan(
+        device="cuda:0",
+        batch_size=1,
+        max_seq_len_q=128,
+        max_kv_len=128,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        head_dim=_HEAD_DIM,
+        q_dtype=_FP8,
+        k_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+    )
+    scales = torch.zeros((1, 2, 1, 128, 4), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales, k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(ValueError, match="aligned"):
+        wrapper.run(q8, q8, q8, q_scales=scales.flatten()[1:513], k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(
+            batch_size=1, seq_len=128, num_heads=2, mask_type="causal", window_left=64
+        )
+
+
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize(
     "k_lengths",
@@ -5664,7 +5821,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         case = replace(case, v=case.v.to(_FP8))
 
     monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index: True
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: True
     )
     two_cta = BatchPrefillTSWrapper()
     _plan_wrapper(two_cta, case)
@@ -5674,7 +5831,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
     _assert_context_correct(out_two_cta, case)
 
     monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index: False
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: False
     )
     single_cta = BatchPrefillTSWrapper()
     _plan_wrapper(single_cta, case)
