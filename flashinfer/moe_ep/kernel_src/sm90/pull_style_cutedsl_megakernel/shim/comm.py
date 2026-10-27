@@ -190,6 +190,11 @@ class _CompiledMega:
     launch_key: Optional[tuple] = None
     launch_kwargs: Optional[dict] = None
     launch_output: Optional[torch.Tensor] = None
+    # ``(exe_args, adapted_args)`` of the DSL executor for ``launch_kwargs``:
+    # converting ~20 kwargs to C pointers on every call costs ~0.1 ms of host
+    # time ahead of the launch.  Built on the first launch of a key; the
+    # adapted args own what ``exe_args`` points at.
+    launch_exe: Optional[tuple] = None
 
 
 def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:

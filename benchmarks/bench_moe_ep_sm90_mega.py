@@ -103,7 +103,15 @@ HEUR_CSV_FIELDS = (
 )
 
 
-def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
+def _heuristic_cols(
+    scale_mode: str,
+    operand_order: str,
+    tokens: int,
+    *,
+    world_size: int,
+    num_experts: int,
+    num_topk: int,
+) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if operand_order != "heuristic":
         return [""] * 12
@@ -114,7 +122,13 @@ def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[st
     bootstrap_paths()
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(scale_mode, tokens)
+    sel = select_heuristic_config(
+        scale_mode,
+        tokens,
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=num_topk,
+    )
     c = sel.config
     return [
         str(int(c.swap_ab)),
@@ -484,7 +498,9 @@ def _pingpong_tile_ok(c) -> bool:
     return (n == 128) if not c.swap_ab else (m == 128)
 
 
-def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=None):
+def _megakernel_config(
+    args, scale_mode: str, operand_order: str, tile, tokens=None, world_size=4
+):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
     pingpong = None if args.pingpong == "auto" else args.pingpong == "on"
@@ -512,7 +528,13 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
             bootstrap_paths()
             from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-            c = select_heuristic_config(scale_mode, tokens).config
+            c = select_heuristic_config(
+                scale_mode,
+                tokens,
+                world_size=world_size,
+                num_experts=args.num_experts,
+                num_topk=args.top_k,
+            ).config
             swap_ab = c.swap_ab
             mma_tiler_mnk = tuple(c.mma_tiler_mnk)
             # Explicit geometry flips the shim into manual mode, which fills
@@ -679,7 +701,9 @@ def _run_point(
     result: PointResult | None = None
     error = ""
     try:
-        kcfg = _megakernel_config(args, scale_mode, operand_order, tile, tokens=tokens)
+        kcfg = _megakernel_config(
+            args, scale_mode, operand_order, tile, tokens=tokens, world_size=world_size
+        )
         transformed = _make_transformed_weights(
             args, scale_mode, local_experts, rank, device
         )
@@ -886,7 +910,14 @@ def _emit_row(
     if result.status != "pass" and result.error:
         print(f"# SKIP detail: {result.error}", flush=True)
     if csv_file is not None:
-        heur = _heuristic_cols(scale_mode, operand_order, tokens)
+        heur = _heuristic_cols(
+            scale_mode,
+            operand_order,
+            tokens,
+            world_size=world_size,
+            num_experts=args.num_experts,
+            num_topk=args.top_k,
+        )
         csv_file.write(row + "," + ",".join(heur) + "\n")
         csv_file.flush()
 

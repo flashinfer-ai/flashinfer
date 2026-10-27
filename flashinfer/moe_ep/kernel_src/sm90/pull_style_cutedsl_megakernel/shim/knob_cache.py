@@ -250,7 +250,14 @@ def resolve_knobs(
         return cached, "cache"
     from .tuner import default_knobs
 
-    return default_knobs(max_tokens, fp8_scale_mode=fp8_scale_mode), "heuristic"
+    knobs = default_knobs(
+        max_tokens,
+        fp8_scale_mode=fp8_scale_mode,
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=topk,
+    )
+    return knobs, "heuristic"
 
 
 __all__ = [

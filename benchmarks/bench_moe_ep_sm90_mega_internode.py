@@ -62,6 +62,13 @@ def _args():
     p.add_argument(
         "--scale-mode", choices=["per_tensor", "blockwise"], default="per_tensor"
     )
+    p.add_argument(
+        "--geom",
+        default=None,
+        help="mega modes, developer A/B: explicit launch geometry instead of the "
+        "heuristic, every field given, e.g. "
+        "swap=1,pp=0,tile=128x32x128,cga=1x2x1,tb=epi_warps,gh=264,ts=0",
+    )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--output-csv", default=None)
@@ -104,6 +111,26 @@ def _args():
 
 # Calibrated per-tensor activation dequant scale shared by every mode.
 _ACT_SCALE = 8.0 / (0.95 * 448.0)
+
+
+def _geom_kwargs(spec):
+    """``--geom`` -> explicit session geometry (all fields required, so no
+    knob silently falls back to a manual-mode default)."""
+    if not spec:
+        return {}
+    f = dict(item.split("=", 1) for item in spec.split(","))
+    need = {"swap", "pp", "tile", "cga", "tb", "gh", "ts"}
+    if set(f) != need:
+        raise SystemExit(f"--geom needs exactly {sorted(need)}, got {sorted(f)}")
+    return dict(
+        swap_ab=f["swap"] == "1",
+        pingpong=f["pp"] == "1",
+        mma_tiler_mnk=tuple(int(v) for v in f["tile"].split("x")),
+        cluster_shape_mnk=tuple(int(v) for v in f["cga"].split("x")),
+        token_back_mode=f["tb"],
+        group_hint=None if f["gh"] == "none" else int(f["gh"]),
+        tail_split_pairs=f["ts"] == "1",
+    )
 
 
 def _bf16_weights(rank, experts, hidden, intermediate):
@@ -630,7 +657,13 @@ class _Fc12Experts:
 
         args, e = self.args, self.experts
         h, k, inter = args.hidden, args.top_k, args.intermediate
-        c = select_heuristic_config(args.scale_mode, tokens).config
+        c = select_heuristic_config(
+            args.scale_mode,
+            tokens,
+            world_size=dist.get_world_size(),
+            num_experts=args.num_experts,
+            num_topk=args.top_k,
+        ).config
         if c.swap_ab:
             from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
                 Sm90SwapABSwigluFp8Fc12Kernel as Kernel,
@@ -1165,6 +1198,7 @@ def main():
             fp8_scale_mode=args.scale_mode,
             gate_up_clamp=10.0,
             **gin_kwargs,
+            **_geom_kwargs(args.geom),
         )
         cfg = symm._frontend.config
         hs, tw, ti = _inputs(rank, tokens, args.hidden, args.num_experts, args.top_k)

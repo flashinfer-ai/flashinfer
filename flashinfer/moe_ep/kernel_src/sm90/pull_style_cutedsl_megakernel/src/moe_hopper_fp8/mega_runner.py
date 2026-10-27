@@ -1282,6 +1282,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             else None
         ),
         accum_mode=args.fp8_accum_mode,
+        world_size=world_size,
+        num_experts=args.num_total_experts,
+        num_topk=args.num_topk,
     )
     launch_config = config_selection.config
     # Explicit CLI choice wins; else the table's per-bucket winner.

@@ -49,6 +49,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
         candidates = hopper_fp8_candidates(
             fp8_scale_mode=args.fp8_scale_mode,
             max_tokens=max_tokens,
+            world_size=world_size,
+            num_experts=args.num_experts,
+            num_topk=args.topk,
         )
 
         if args.sweep == "schedule":

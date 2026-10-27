@@ -57,6 +57,55 @@ class TestDefaultKnobs:
         assert pkg.is_valid(knobs)
 
 
+class TestEightRankOverrides:
+    @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
+    @pytest.mark.parametrize("tokens", [8, 256, 1024, 4096])
+    def test_eight_rank_rows(self, scale_mode, tokens, monkeypatch):
+        pkg = _pkg()
+        pkg.bootstrap_paths()
+        from moe_hopper_fp8.heuristic_config import (
+            EP8_OVERRIDES,
+            TAIL_SPLIT_ENV,
+            select_heuristic_config,
+            token_bucket,
+        )
+
+        # The env override would rewrite both rows; compare the table itself.
+        monkeypatch.delenv(TAIL_SPLIT_ENV, raising=False)
+
+        four = select_heuristic_config(scale_mode, tokens).config
+        eight = select_heuristic_config(scale_mode, tokens, world_size=8).config
+        assert eight == EP8_OVERRIDES[scale_mode].get(token_bucket(tokens), four)
+        # Only the tuned model layout takes the eight-rank rows.
+        assert (
+            select_heuristic_config(
+                scale_mode, tokens, world_size=8, num_experts=256
+            ).config
+            == four
+        )
+        knobs = pkg.default_knobs(tokens, fp8_scale_mode=scale_mode, world_size=8)
+        assert knobs["mma_tiler_mnk"] == tuple(eight.mma_tiler_mnk)
+        assert knobs["cluster_shape_mnk"] == tuple(eight.cluster_shape_mnk)
+        assert knobs["group_hint"] == eight.group_hint
+        assert knobs["tail_split_pairs"] == eight.tail_split_pairs
+        assert knobs["token_back_mode"] == eight.token_back_mode
+        assert pkg.is_valid(knobs)
+
+    @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
+    def test_eight_rank_default_leads_candidates(self, scale_mode, monkeypatch):
+        pkg = _pkg()
+        pkg.bootstrap_paths()
+        from moe_hopper_fp8.heuristic_config import TAIL_SPLIT_ENV
+
+        monkeypatch.delenv(TAIL_SPLIT_ENV, raising=False)
+        cands = pkg.hopper_fp8_candidates(
+            fp8_scale_mode=scale_mode, max_tokens=1024, world_size=8
+        )
+        assert cands[0] == pkg.default_knobs(
+            1024, fp8_scale_mode=scale_mode, world_size=8
+        )
+
+
 class TestIsValid:
     def test_geometry_rules(self):
         pkg = _pkg()

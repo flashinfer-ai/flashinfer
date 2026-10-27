@@ -82,14 +82,21 @@ GEOMETRY_KNOBS = (
 
 
 def default_knobs(
-    num_tokens: int, *, fp8_scale_mode: str = "per_tensor"
+    num_tokens: int,
+    *,
+    fp8_scale_mode: str = "per_tensor",
+    world_size: int = 4,
+    num_experts: int = 384,
+    num_topk: int = 6,
 ) -> Dict[str, Any]:
     """Default geometry knobs for a compile-time token count (buffer size).
 
     Wraps the kernel drop's token-bucket heuristic table
     (``heuristic_config.select_heuristic_config``), keyed on
-    ``fp8_scale_mode`` and the buffer capacity, so the ``knobs=None``
-    fallback matches the shim's established default launch configs.  The
+    ``fp8_scale_mode`` and the buffer capacity (eight-rank DeepSeek-V4
+    layouts take the table's measured ``EP8_OVERRIDES``), so the
+    ``knobs=None`` fallback matches the shim's established default launch
+    configs.  The
     table also carries the per-bucket ``token_back_mode``, ``group_hint``
     and ``tail_split_pairs``; perf knobs it does not cover (``flag_batch`` /
     ``epi_flag_batch``) are left unset -- the config defaults apply.
@@ -98,7 +105,13 @@ def default_knobs(
     """
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(fp8_scale_mode, max(int(num_tokens), 1))
+    sel = select_heuristic_config(
+        fp8_scale_mode,
+        max(int(num_tokens), 1),
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=num_topk,
+    )
     c = sel.config
     return {
         "swap_ab": c.swap_ab,

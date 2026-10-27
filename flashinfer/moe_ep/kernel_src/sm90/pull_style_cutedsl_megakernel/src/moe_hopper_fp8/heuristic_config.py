@@ -218,6 +218,34 @@ HEURISTIC_CONFIGS = {
 }
 
 
+# The table was tuned on four ranks with 384 experts and top-6.
+_TUNED_WORLD_SIZE = 4
+_TUNED_NUM_EXPERTS = 384
+_TUNED_NUM_TOPK = 6
+
+# The same model on eight ranks (two nodes x four H100, NCCL GIN; 2026-10-25,
+# interleaved A/B rounds) halves the experts per rank and doubles their rows.
+# Buckets whose measured best beats the four-rank row by >= 3%, reproduced in
+# two rounds: pt 256 -26%, pt 1024 -11%, bw 1024 -4%, bw 4096 -13%.  Blockwise
+# wants weight multicast (cga 2,1,1) with the one-wave group; per-tensor 1024
+# takes the four-rank 2048 row.  Other eight-rank buckets were within noise.
+EP8_OVERRIDES = {
+    "per_tensor": {
+        256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1),
+                     group_hint=264),
+        1024: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
+                      group_hint=264, tail_split_pairs=True,
+                      token_back="reuse_dispatch_warps"),
+    },
+    "blockwise": {
+        1024: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
+                      tail_split_pairs=True),
+        4096: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
+                      tail_split_pairs=True),
+    },
+}
+
+
 def token_bucket(tokens_per_rank: int) -> int:
     """Map a positive token count to the next measured power-of-two bucket."""
     if tokens_per_rank <= 0:
@@ -254,7 +282,12 @@ def _apply_tail_split_env_override(config: HopperFp8Config) -> HopperFp8Config:
 
 
 def select_heuristic_config(
-    scale_mode: str, tokens_per_rank: int
+    scale_mode: str,
+    tokens_per_rank: int,
+    *,
+    world_size: int = _TUNED_WORLD_SIZE,
+    num_experts: int = _TUNED_NUM_EXPERTS,
+    num_topk: int = _TUNED_NUM_TOPK,
 ) -> HopperFp8ConfigSelection:
     normalized_scale_mode = scale_mode.replace("-", "_")
     try:
@@ -262,8 +295,11 @@ def select_heuristic_config(
     except KeyError as error:
         raise ValueError(f"Unsupported FP8 scale mode: {scale_mode!r}") from error
     bucket = token_bucket(tokens_per_rank)
+    config = configs[bucket]
+    if (world_size, num_experts, num_topk) == (8, _TUNED_NUM_EXPERTS, _TUNED_NUM_TOPK):
+        config = EP8_OVERRIDES[normalized_scale_mode].get(bucket, config)
     return HopperFp8ConfigSelection(
-        config=_apply_tail_split_env_override(configs[bucket]),
+        config=_apply_tail_split_env_override(config),
         source="heuristic",
         token_bucket=bucket,
     )
@@ -278,6 +314,9 @@ def resolve_hopper_fp8_config(
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mnk: Optional[Tuple[int, int, int]] = None,
     accum_mode: Optional[str] = None,
+    world_size: int = _TUNED_WORLD_SIZE,
+    num_experts: int = _TUNED_NUM_EXPERTS,
+    num_topk: int = _TUNED_NUM_TOPK,
 ) -> HopperFp8ConfigSelection:
     """Select the heuristic unless geometry or scheduling was set manually."""
     manual = any(
@@ -286,7 +325,13 @@ def resolve_hopper_fp8_config(
     )
     resolved_accum_mode = accum_mode or DEFAULT_ACCUM_MODE
     if not manual:
-        selection = select_heuristic_config(scale_mode, tokens_per_rank)
+        selection = select_heuristic_config(
+            scale_mode,
+            tokens_per_rank,
+            world_size=world_size,
+            num_experts=num_experts,
+            num_topk=num_topk,
+        )
         if resolved_accum_mode == selection.config.accum_mode:
             return selection
         return HopperFp8ConfigSelection(
@@ -322,6 +367,7 @@ __all__ = [
     "HopperFp8Config",
     "HopperFp8ConfigSelection",
     "TAIL_SPLIT_ENV",
+    "EP8_OVERRIDES",
     "TOKEN_BUCKETS",
     "resolve_hopper_fp8_config",
     "select_heuristic_config",

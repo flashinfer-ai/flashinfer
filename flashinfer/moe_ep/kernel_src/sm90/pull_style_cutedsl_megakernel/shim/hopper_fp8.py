@@ -44,6 +44,23 @@ from .comm import (
     sym_zeros,
 )
 
+try:
+    from torch._C import _cuda_getCurrentRawStream as _raw_stream
+except ImportError:  # pragma: no cover - older torch
+    _raw_stream = None
+
+
+def _current_stream_handle(device_index: int) -> int:
+    """Raw handle of the current stream (compared, never dereferenced).
+
+    ``torch.cuda.current_stream()`` builds a Stream object through several
+    Python frames (~20 us); the launch-cache key reads it on every launch.
+    """
+    if _raw_stream is not None:
+        return _raw_stream(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
 _KIND_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
@@ -526,6 +543,7 @@ class MegaMoEHopperFp8Frontend:
             mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
             mega.launch_key = key
             mega.launch_output = launch_inputs.output_activation
+            mega.launch_exe = None
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
         if self.config.in_kernel_fc2_reduce:
@@ -534,7 +552,11 @@ class MegaMoEHopperFp8Frontend:
             # every launch.  Zero the full raw buffer so stale rows beyond a
             # partial num_tokens can't leak from an earlier, larger launch.
             inputs.output_activation.zero_()
-        mega.compiled(**mega.launch_kwargs)
+        if mega.launch_exe is None:
+            mega.launch_exe = mega.compiled.generate_execution_args(
+                **mega.launch_kwargs
+            )
+        mega.compiled.run_compiled_program(mega.launch_exe[0])
         # Zero-break capture gate: a device synchronize would abort stream
         # capture, so skip it there (the graph replays under stream semantics).
         if sync and not torch.cuda.is_current_stream_capturing():
@@ -565,18 +587,23 @@ class MegaMoEHopperFp8Frontend:
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
+        # The thunk holds the adapted args, which own what exe_args points at.
+        exe_args, adapted_args = compiled.generate_execution_args(**runtime_kwargs)
 
         if self.config.in_kernel_fc2_reduce:
             output_activation = inputs.output_activation
 
             def thunk() -> None:
                 output_activation.zero_()
-                compiled(**runtime_kwargs)
+                compiled.run_compiled_program(exe_args)
 
         else:
 
             def thunk() -> None:
-                compiled(**runtime_kwargs)
+                compiled.run_compiled_program(exe_args)
+
+        thunk.adapted_args = adapted_args
+        thunk.runtime_kwargs = runtime_kwargs
 
         return thunk
 
@@ -601,7 +628,7 @@ class MegaMoEHopperFp8Frontend:
             t.fc2_weight_dequant_scale.data_ptr(),
             t.output_activation.data_ptr(),
             num_tokens,
-            torch.cuda.current_stream().cuda_stream,
+            _current_stream_handle(t.activation.device.index),
         )
 
     def _mega_compile_key(self) -> tuple:
@@ -1454,6 +1481,9 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
             accum_mode=fp8_accum_mode,
+            world_size=world_size,
+            num_experts=num_total_experts,
+            num_topk=num_topk,
         )
         launch = selection.config
         swap_ab = launch.swap_ab
@@ -1472,7 +1502,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from .knob_cache import resolve_knobs as _resolve_cached_knobs
         from .tuner import GEOMETRY_KNOBS, default_knobs
 
-        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
+        geometry = default_knobs(
+            num_max_tokens,
+            fp8_scale_mode=fp8_scale_mode,
+            world_size=world_size,
+            num_experts=num_total_experts,
+            num_topk=num_topk,
+        )
         if isinstance(knobs, dict):
             resolved = dict(knobs)
         else:
