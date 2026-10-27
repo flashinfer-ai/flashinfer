@@ -1358,6 +1358,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         storage = utils.SmemAllocator().allocate(self.storage_type)
         a_pipe = PipelineTmaUmma.create(
             barrier_storage=storage.a_barriers.data_ptr(),
+            defer_sync=True,
             num_stages=self.num_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
@@ -1383,6 +1384,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             )
         acc_pipe = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
+            defer_sync=True,
             num_stages=self.acc_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
@@ -1431,8 +1433,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                         storage.sf_ready_barriers.data_ptr() + stage,
                         self.cta_group_size,
                     )
-        if cutlass.const_expr(self.use_clc_scheduler or self.sf_requires_cluster_join):
-            cute.arch.mbarrier_init_fence()
+        # Publish all pipeline barriers once before any role can use them.
+        cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.cta_group_size == 2):
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()

@@ -166,6 +166,7 @@ class PipelineTmaUmma(PipelineAsync):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         mcast_mode_mn: tuple[int, int] = (1, 1),
+        defer_sync: bool = False,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
@@ -178,6 +179,7 @@ class PipelineTmaUmma(PipelineAsync):
             tx_count (int): Number of bytes expected to be written to the transaction barrier for one stage.
             cta_layout_vmnk (cute.Layout | None): Layout of the cluster shape.
             mcast_mode_mn (tuple[int, int]): Tuple of two integers, specifying whether mcast is enabled for the m and n modes. At least one of the two integers must be 1.
+            defer_sync (bool): Defer the barrier initialization fence to the caller.
 
         Returns:
             PipelineTmaUmma: An instance of PipelineTmaUmma with all necessary attributes computed.
@@ -223,7 +225,8 @@ class PipelineTmaUmma(PipelineAsync):
 
         consumer_mask = producer_mask
 
-        pipeline_init_wait(cta_layout_vmnk)
+        if not defer_sync:
+            pipeline_init_wait(cta_layout_vmnk)
 
         return PipelineTmaUmma(
             sync_object_full,
@@ -317,6 +320,7 @@ class PipelineUmmaAsync(PipelineAsync):
         consumer_group: CooperativeGroup,
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
+        defer_sync: bool = False,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineUmmaAsync.
@@ -327,6 +331,7 @@ class PipelineUmmaAsync(PipelineAsync):
             producer_group (CooperativeGroup): CooperativeGroup for the producer agent.
             consumer_group (CooperativeGroup): CooperativeGroup for the consumer agent.
             cta_layout_vmnk (cute.Layout or None): Layout of the cluster shape.
+            defer_sync (bool): Defer the barrier initialization fence to the caller.
 
         Returns:
             PipelineUmmaAsync: An instance of PipelineUmmaAsync.
@@ -371,7 +376,8 @@ class PipelineUmmaAsync(PipelineAsync):
             else cute.nvgpu.tcgen05.CtaGroup.TWO
         )
 
-        pipeline_init_wait(cta_layout_vmnk)
+        if not defer_sync:
+            pipeline_init_wait(cta_layout_vmnk)
 
         return PipelineUmmaAsync(
             sync_object_full,
