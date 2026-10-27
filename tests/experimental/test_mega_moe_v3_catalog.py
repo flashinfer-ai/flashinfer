@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,8 @@ TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
 # shape, the cooperative grid and, last, programmatic stream serialization; the
 # kernel runs the programmatic dependent launch protocol, triggering its
 # dependents on entry and waiting for its predecessor's completion after the
-# setup block, before its first global access.
+# setup block, at kernel scope before the role dispatch, so no role's first
+# global access precedes it.
 LAUNCH_ATTRIBUTES = "  cudaLaunchAttribute attrs[3]{};\n"
 COOPERATIVE_SLOT = (
     "  attrs[n].id = cudaLaunchAttributeCooperative;\n"
@@ -37,6 +39,7 @@ PDL_SLOT = (
 )
 GRID_DEP_LAUNCH = 'asm volatile("griddepcontrol.launch_dependents;" ::: "memory");'
 GRID_DEP_WAIT = 'asm volatile("griddepcontrol.wait;" ::: "memory");'
+ROLE_DISPATCH = "// ---- Role: dispatch ----"
 
 
 def expected_block_m(num_tokens):
@@ -168,10 +171,12 @@ def test_tp_ep_programs_launch_as_programmatic_dependents():
     runs the programmatic dependent launch protocol, each instruction once:
     ``griddepcontrol.launch_dependents`` on entry, before the tensor-map
     prefetches, and ``griddepcontrol.wait`` after the setup block's
-    ``tcgen05.fence::after_thread_sync``, before the first global read
-    (``topk_idx_i32[``). A dependent so launched touches nothing its
-    predecessor writes, pool rows, counters, gates or the output, before the
-    predecessor has exited and flushed."""
+    ``tcgen05.fence::after_thread_sync`` and before the role dispatch, so
+    every role's warps pass it before their first global read (the dispatch
+    role's ``topk_idx_i32[`` is the kernel's first). Up to the wait the kernel
+    names none of its pointer parameters: a dependent so launched touches
+    nothing its predecessor writes, pool rows, counters, gates or the output,
+    before the predecessor has exited and flushed."""
     for name, (kernel, binding) in tp_ep_program_sources().items():
         text = binding.read_text()
         assert text.count("cudaLaunchAttribute attrs[") == 1, name
@@ -188,18 +193,30 @@ def test_tp_ep_programs_launch_as_programmatic_dependents():
         ), name
         text = kernel.read_text()
         body = text.index(f"kernel_{name}(")
+        brace = text.index("{", body)
         assert text.count("griddepcontrol") == 2, name
         assert text.count(GRID_DEP_LAUNCH) == 1, name
         assert text.count(GRID_DEP_WAIT) == 1, name
+        assert text.count(ROLE_DISPATCH) == 1, name
         positions = dict(
             launch_dependents=text.index(GRID_DEP_LAUNCH),
             prefetch=text.index("prefetch.tensormap", body),
             fence=text.index("tcgen05.fence::after_thread_sync", body),
             wait=text.index(GRID_DEP_WAIT),
+            dispatch=text.index(ROLE_DISPATCH, body),
             first_read=text.index("topk_idx_i32[", body),
         )
-        assert body < positions["launch_dependents"], (name, positions)
+        assert brace < positions["launch_dependents"], (name, positions)
         assert list(positions.values()) == sorted(positions.values()), (name, positions)
+        pointers = re.findall(r"\*\s*__restrict__\s+(\w+)", text[body:brace])
+        assert pointers, name
+        before_wait = text[brace : positions["wait"]]
+        touched = [
+            pointer
+            for pointer in pointers
+            if re.search(rf"(?<![.\w]){pointer}\b", before_wait)
+        ]
+        assert not touched, (name, touched)
 
 
 def test_model_programs_keep_their_launch_form():
