@@ -27,16 +27,13 @@ limitations under the License.
 # resolves an identifier
 # to a :class:`ProgramHandle`: the binding's argument names in call order
 # (ending in ``grid_x, grid_y, grid_z``) and the launch callable. A table other
-# than the shipped loader is installed with :func:`set_programs` or named by
-# the environment variable ``FLASHINFER_CAKE_MEGA_MOE_W4A16_PROGRAMS`` as
-# ``module:attr`` (``attr`` a table or a zero-argument factory). The loader is
+# than the shipped loader is installed with :func:`set_programs`. The loader is
 # imported inside the functions that use it.
 
 from __future__ import annotations
 
 import functools
 import importlib
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
@@ -54,7 +51,6 @@ from .cake_plan import (
 )
 
 LOADER_MODULE = "flashinfer.jit.cake_mega_moe_w4a16"
-PROGRAMS_ENV = "FLASHINFER_CAKE_MEGA_MOE_W4A16_PROGRAMS"
 #: Exact targets of the family; a device is admitted when the programs ship
 #: for its capability.
 TARGETS: Dict[Tuple[int, int], str] = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -241,33 +237,19 @@ def set_programs(table: Optional[ProgramTable]) -> None:
     _programs = table
 
 
-def _from_environment() -> Optional[ProgramTable]:
-    spec = os.environ.get(PROGRAMS_ENV)
-    if not spec:
-        return None
-    module_name, separator, attribute = spec.partition(":")
-    if not separator or not module_name or not attribute:
-        raise RuntimeError(
-            f"{PROGRAMS_ENV}={spec!r}: expected module:attr naming a program table"
-        )
-    module = importlib.import_module(module_name)
-    table = getattr(module, attribute)
-    return table() if callable(table) and not hasattr(table, "handle") else table
-
-
 def programs() -> ProgramTable:
-    """The installed table, the environment's, or the shipped loader."""
+    """The installed table or the shipped loader."""
 
     global _programs
     if _programs is None:
-        _programs = _from_environment() or ShippedPrograms()
+        _programs = ShippedPrograms()
     return _programs
 
 
 def programs_available() -> bool:
-    """Whether a program table is installed, named by the environment, or shipped."""
+    """Whether a program table is installed or shipped."""
 
-    if _programs is not None or os.environ.get(PROGRAMS_ENV):
+    if _programs is not None:
         return True
     return ShippedPrograms.available()
 
@@ -291,7 +273,6 @@ def fused_handle(cell: Cell, hidden: int, device: torch.device) -> ProgramHandle
 
 __all__ = [
     "LOADER_MODULE",
-    "PROGRAMS_ENV",
     "TARGETS",
     "ProgramHandle",
     "ProgramTable",

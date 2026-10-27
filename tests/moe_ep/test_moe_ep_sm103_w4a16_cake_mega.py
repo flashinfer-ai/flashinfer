@@ -112,8 +112,8 @@ def skip_unless_supported() -> tuple[int, int]:
 
     if not programs_available():
         pytest.skip(
-            "no Cake W4A16 MegaMoE programs (ship the loader or set "
-            "FLASHINFER_CAKE_MEGA_MOE_W4A16_PROGRAMS=module:attr)"
+            "no Cake W4A16 MegaMoE programs (ship the loader or install a table "
+            "with set_programs)"
         )
     return rank, world_size
 
