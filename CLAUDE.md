@@ -432,6 +432,14 @@ its purpose is to make review easier for reviewers and contributors alike by cat
 issues before a human looks. Changes made only to test something locally, with no PR intended,
 do not need one.
 
+**Triggering CI: targeted tests are the default.** Public CI: `@flashinfer-bot run tests/<dir-or-file> [tests/...]`;
+internal CI: `/bot run tests/<dir-or-file> [tests/...]`. Targets are whitespace-separated paths under
+`tests/` (files or directories, no `::` selectors), written as real paths relative to the repo
+root, e.g. `tests/gemm/test_mm_fp4.py tests/utils/`; name the test files or directories the
+change touches. A bare `run` with no target starts the **full** suite, which
+is expensive. That is appropriate in select cases — a cross-cutting change, or a final
+pre-merge check — and the PR template has a checkbox to declare and justify it.
+
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
 ## Code Review
