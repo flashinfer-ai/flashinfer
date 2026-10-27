@@ -140,8 +140,10 @@ def run_once(plan):
 def check_route_contract(plan, expected):
     """Reference match at the FP4 tolerance on the first launch and a direct
     replay, bitwise agreement between the launches, one kernel node per
-    captured run(), bitwise graph replays and a clean self-cleaning workspace.
-    Returns the first launch's output."""
+    captured run(), bitwise graph replays and a clean self-cleaning workspace;
+    then three consecutive run() in one captured graph, chained by the
+    programmatic dependencies their launch attribute records, replaying bit
+    for bit with a clean workspace. Returns the first launch's output."""
     cleared = scratch_cleared(plan)
     first = None
     for _ in range(2):
@@ -163,6 +165,7 @@ def check_route_contract(plan, expected):
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, first, atol=0, rtol=0)
         check_v3_workspace(plan, scratch_cleared=cleared)
+    check_programmatic_dependent_graph(plan, first, scratch_cleared=cleared)
     return first
 
 
@@ -186,15 +189,17 @@ def model_reference(inputs, x_scales):
     return fixtures.model_reference(inputs, x_scales)
 
 
+def checked(result):
+    """Payload of a ``cuda.bindings.driver`` call: its value after the
+    success status, or the tuple of values after it."""
+    assert int(result[0]) == 0, repr(result)
+    return result[1] if len(result) == 2 else result[1:]
+
+
 def graph_node_names(graph):
     """Names of the nodes captured in ``graph`` (kept, not yet instantiated):
     kernel function names, or ``<memset>`` for memset nodes."""
     driver = pytest.importorskip("cuda.bindings.driver")
-
-    def checked(result):
-        assert int(result[0]) == 0, repr(result)
-        return result[1] if len(result) == 2 else result[1:]
-
     raw = driver.CUgraph(graph.raw_cuda_graph())
     _, count = checked(driver.cuGraphGetNodes(raw, 0))
     nodes, count = checked(driver.cuGraphGetNodes(raw, count))
@@ -217,6 +222,70 @@ def check_single_kernel_graph(names):
     kernels = [name for name in names if name.startswith("kernel_")]
     assert len(kernels) == 1, names
     assert len(names) == 1, names
+
+
+def graph_edges(graph):
+    """``(from, to, dependency type)`` of every edge of ``graph`` (kept, not
+    yet instantiated) between kernel nodes, the ends named as in
+    ``graph_node_names`` and the type the edge data's ``CUgraphDependencyType``
+    name: a launch captured with the programmatic stream serialization
+    attribute records a ``CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC`` edge from
+    the kernel node before it on the stream; a plain launch records the
+    default full dependency."""
+    driver = pytest.importorskip("cuda.bindings.driver")
+    raw = driver.CUgraph(graph.raw_cuda_graph())
+    # The edge-data form of the query: suffixed in cuda-bindings 12, the plain
+    # name in 13.
+    get_edges = getattr(driver, "cuGraphGetEdges_v2", None) or driver.cuGraphGetEdges
+    *_, count = checked(get_edges(raw, 0))
+    edges = checked(get_edges(raw, count))
+    assert len(edges) == 4, f"{get_edges.__name__} exposes no edge data: {edges!r}"
+    sources, targets, data, count = edges
+
+    def kernel_name(node):
+        params = checked(driver.cuGraphKernelNodeGetParams(node))
+        return checked(driver.cuFuncGetName(params.func)).decode()
+
+    return [
+        (
+            kernel_name(source),
+            kernel_name(target),
+            driver.CUgraphDependencyType(edge.type).name,
+        )
+        for source, target, edge in zip(
+            sources[:count], targets[:count], data[:count], strict=True
+        )
+    ]
+
+
+def check_programmatic_dependent_graph(
+    plan, expected, *, scratch_cleared=False, calls=3
+):
+    """``calls`` consecutive run() captured in one graph: one kernel node per
+    call and, between consecutive calls, the programmatic dependency the TP/EP
+    launch attribute records, so a call's CTAs may become resident while its
+    predecessor still runs and ``griddepcontrol.wait`` orders every global
+    access after the predecessor's exit; two replays write ``expected`` bit
+    for bit and leave the self-cleaning workspace clean."""
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        for _ in range(calls):
+            plan.run()
+    names = graph_node_names(graph)
+    assert len(names) == calls and len(set(names)) == 1, names
+    assert names[0].startswith("kernel_"), names
+    edges = graph_edges(graph)
+    assert len(edges) == calls - 1, edges
+    for source, target, kind in edges:
+        assert (source, target) == (names[0], names[0]), edges
+        assert kind == "CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC", edges
+    graph.instantiate()
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, expected, atol=0, rtol=0)
+        check_v3_workspace(plan, scratch_cleared=scratch_cleared)
 
 
 def check_v3_workspace(plan, *, scratch_cleared=False):
@@ -500,8 +569,9 @@ def test_grouped_l2_update_scales_and_graph_replay():
 def test_tp_ep_route_contract(case, num_tokens):
     """Rank 0 of every tensor-parallel and expert-parallel route: reference
     match at the FP4 tolerance, bitwise replay, one kernel node per captured
-    run(), bitwise graph replay, a clean workspace, and a second preparation
-    of the same inputs that reproduces the output bit for bit. On the
+    run(), bitwise graph replay, a clean workspace, three consecutive run()
+    captured as programmatic dependents replaying bit for bit, and a second
+    preparation of the same inputs that reproduces the output bit for bit. On the
     expert-parallel cases rank 0 holds a quarter or an eighth of the experts
     and the global ids spread over every rank, so the output is the rank's
     partial sum: a slot routed to another rank takes no row and a token

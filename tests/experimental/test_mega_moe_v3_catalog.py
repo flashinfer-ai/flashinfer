@@ -17,6 +17,27 @@ ROOT = Path(__file__).resolve().parents[2]
 TP_EP_SHAPES = ((384, 640), (384, 384), (96, 2304), (48, 2304))
 TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
 
+# The launch form of the TP/EP programs: the generated binding's Run() launches
+# through cudaLaunchKernelExC with three counted attribute slots, the cluster
+# shape, the cooperative grid and, last, programmatic stream serialization; the
+# kernel runs the programmatic dependent launch protocol, triggering its
+# dependents on entry and waiting for its predecessor's completion after the
+# setup block, before its first global access.
+LAUNCH_ATTRIBUTES = "  cudaLaunchAttribute attrs[3]{};\n"
+COOPERATIVE_SLOT = (
+    "  attrs[n].id = cudaLaunchAttributeCooperative;\n"
+    "  attrs[n].val.cooperative = 1;\n"
+    "  ++n;\n"
+)
+PDL_ATTRIBUTE = "cudaLaunchAttributeProgrammaticStreamSerialization"
+PDL_SLOT = (
+    f"  attrs[n].id = {PDL_ATTRIBUTE};\n"
+    "  attrs[n].val.programmaticStreamSerializationAllowed = 1;\n"
+    "  ++n;\n"
+)
+GRID_DEP_LAUNCH = 'asm volatile("griddepcontrol.launch_dependents;" ::: "memory");'
+GRID_DEP_WAIT = 'asm volatile("griddepcontrol.wait;" ::: "memory");'
+
 
 def expected_block_m(num_tokens):
     """Source tile height of a TP/EP row: 16 rows up to 512 tokens, 32 at 1024, 128 at 4096."""
@@ -45,6 +66,38 @@ def expected_w1_expert_map(num_experts, intermediate):
 
 def _catalog():
     return runtime.catalog()
+
+
+def tp_ep_route_key(num_experts, intermediate, num_tokens):
+    """Catalog key of the FP4 pipeline route of a TP/EP shape at ``num_tokens``."""
+    return runtime.key(
+        "pipeline",
+        dict(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=6,
+            hidden=5120,
+            intermediate=intermediate,
+            routed_weight_dtype="fp4",
+            activation_clamp=10.0,
+        ),
+    )
+
+
+def tp_ep_program_sources():
+    """``{program name: (kernel source, binding source)}`` of the TP/EP routes of sm_103a."""
+    catalog = _catalog()
+    records = json.loads(catalog.path.read_text())["programs"]
+    routes = catalog.routes("sm_103a")
+    sources = {}
+    for num_experts, intermediate in TP_EP_SHAPES:
+        for num_tokens in TP_EP_TOKENS:
+            key = tp_ep_route_key(num_experts, intermediate, num_tokens)
+            assert key in routes, (num_experts, intermediate, num_tokens)
+            (stage,) = routes[key]["stages"]
+            name = runtime.stage_program(stage, "sm_103a")
+            sources[name] = tuple(ROOT / src for src in records[name]["sources"])
+    return sources
 
 
 def test_catalog_is_the_merged_layout_with_both_architectures():
@@ -80,18 +133,7 @@ def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
     routes = catalog.routes("sm_103a")
     for num_experts, intermediate in TP_EP_SHAPES:
         for num_tokens in TP_EP_TOKENS:
-            key = runtime.key(
-                "pipeline",
-                dict(
-                    num_tokens=num_tokens,
-                    num_experts=num_experts,
-                    top_k=6,
-                    hidden=5120,
-                    intermediate=intermediate,
-                    routed_weight_dtype="fp4",
-                    activation_clamp=10.0,
-                ),
-            )
+            key = tp_ep_route_key(num_experts, intermediate, num_tokens)
             shape = (num_experts, intermediate, num_tokens)
             assert key in routes, shape
             route = routes[key]
@@ -117,6 +159,63 @@ def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
                 f"_t{num_tokens}_sm103a"
             ), shape
             assert key not in catalog.routes("sm_100a"), shape
+
+
+def test_tp_ep_programs_launch_as_programmatic_dependents():
+    """Every TP/EP program launches with programmatic stream serialization
+    beside the cluster shape and the cooperative attribute, one counted slot
+    each in a three-slot array with the programmatic slot last; its kernel
+    runs the programmatic dependent launch protocol, each instruction once:
+    ``griddepcontrol.launch_dependents`` on entry, before the tensor-map
+    prefetches, and ``griddepcontrol.wait`` after the setup block's
+    ``tcgen05.fence::after_thread_sync``, before the first global read
+    (``topk_idx_i32[``). A dependent so launched touches nothing its
+    predecessor writes, pool rows, counters, gates or the output, before the
+    predecessor has exited and flushed."""
+    for name, (kernel, binding) in tp_ep_program_sources().items():
+        text = binding.read_text()
+        assert text.count("cudaLaunchAttribute attrs[") == 1, name
+        assert text.count(LAUNCH_ATTRIBUTES) == 1, name
+        assert text.count("cudaLaunchAttributeCooperative") == 1, name
+        assert text.count(COOPERATIVE_SLOT) == 1, name
+        assert text.count(PDL_ATTRIBUTE) == 1, name
+        assert text.count(PDL_SLOT) == 1, name
+        assert (
+            text.index("cudaLaunchAttributeClusterDimension")
+            < text.index(COOPERATIVE_SLOT)
+            < text.index(PDL_SLOT)
+            < text.index("config.attrs = attrs;")
+        ), name
+        text = kernel.read_text()
+        body = text.index(f"kernel_{name}(")
+        assert text.count("griddepcontrol") == 2, name
+        assert text.count(GRID_DEP_LAUNCH) == 1, name
+        assert text.count(GRID_DEP_WAIT) == 1, name
+        positions = dict(
+            launch_dependents=text.index(GRID_DEP_LAUNCH),
+            prefetch=text.index("prefetch.tensormap", body),
+            fence=text.index("tcgen05.fence::after_thread_sync", body),
+            wait=text.index(GRID_DEP_WAIT),
+            first_read=text.index("topk_idx_i32[", body),
+        )
+        assert body < positions["launch_dependents"], (name, positions)
+        assert list(positions.values()) == sorted(positions.values()), (name, positions)
+
+
+def test_model_programs_keep_their_launch_form():
+    """The programs no TP/EP route uses, the model routes of both
+    architectures and the grouped routes, are carried from the base commit and
+    keep its launch form: no programmatic stream serialization attribute in
+    the binding and no ``griddepcontrol`` instruction in the kernel."""
+    records = json.loads(_catalog().path.read_text())["programs"]
+    tp_ep = tp_ep_program_sources()
+    assert len(tp_ep) == len(TP_EP_SHAPES) * len(TP_EP_TOKENS)
+    others = [name for name in records if name not in tp_ep]
+    assert others
+    for name in others:
+        kernel, binding = (ROOT / src for src in records[name]["sources"])
+        assert "griddepcontrol" not in kernel.read_text(), name
+        assert PDL_ATTRIBUTE not in binding.read_text(), name
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
