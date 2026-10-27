@@ -177,8 +177,9 @@ def test_support_probe_on_the_local_device():
 
 
 def test_mirrored_sparse_tile_vocabulary():
-    """The sparse core's body knob as this module mirrors it (``check_vendored_rules`` re-reads every value off the vendored heuristics):
-    the vocabulary, the two bodies' kernel_template names, the AUTO placement bound; the light gate refuses another spelling by name."""
+    """The sparse core's body knob as this module mirrors it (``check_vendored_rules`` re-reads every value off the vendored rules module
+    ``sdpa.fwd.sparse_tile_rules``): the vocabulary, the two bodies' kernel_template names, the AUTO placement bound in CTAs per chunk and
+    its unit as the rule's reading over (batch, q_len) cells; the light gate refuses another spelling by name."""
     from flashinfer.experimental.qwen_3_8_block import api, support
 
     assert (
@@ -190,6 +191,17 @@ def test_mirrored_sparse_tile_vocabulary():
         and support.SPARSE_TILE_TCGEN05 == "sparse_d256_f16"
     )
     assert support.SPARSE_TILE_LEAN_MAX_UNITS == 4
+    # the unit: True iff batch x 2 <= 4 at every step width (the 7301fad21 pin's B x H_kv x q_len count read (1, 3) / (1, 4) / (2, 4) False)
+    assert support.SPARSE_TILE_LEAN_RULE_CELLS == (
+        (1, 1, True),
+        (1, 3, True),
+        (1, 4, True),
+        (2, 1, True),
+        (2, 4, True),
+        (3, 1, False),
+        (4, 1, False),
+        (4, 4, False),
+    )
     g = _flash_next()
     for form in support.SPARSE_TILE_FORMS:
         api._light_decode_gates(g, 16, 1, None, None, form)
@@ -211,6 +223,6 @@ def test_version_probe_is_the_qwen_3_5_tree():
 
     a, b = s38.source(), s35.source()
     assert Qwen38BlockSource is type(b) and a == b
-    assert a.commit.startswith("7301fad21") and a.version == "1.32.0" and a.files == 117
+    assert a.commit.startswith("977757763") and a.version == "1.33.0" and a.files == 118
     assert a.validated_cutedsl == "4.8.0" and a.validated_compute_capability == "10.7"
     assert qwen_3_8_block_support.is_experimental is True

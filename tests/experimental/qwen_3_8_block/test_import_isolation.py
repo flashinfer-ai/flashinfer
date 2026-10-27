@@ -62,7 +62,7 @@ assert q.Qwen38BlockWrapper.is_experimental is True and q.Qwen38BlockWrapper.pla
 import torch
 g = q.Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_8_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("7301fad21")
+assert sup.served is False and sup.source.commit.startswith("977757763")
 # the probe on a CPU host reads no vendored tree and imports no kernel module (FlashInfer's own cute_dsl availability probe may load the
 # DSL's Python frontend: the Qwen 3.5 package's rule, not this package's)
 assert not any(k.startswith("flashinfer.experimental.qwen_3_5_block._cudnn_frost") for k in sys.modules), "the probe on CPU reads no vendored tree"
@@ -150,7 +150,9 @@ added = ("sdpa.fwd.sparse_gqa_sm107", "sdpa.fwd.kernels.sm107.sparse_d256_f16", 
          "gated_attention_block.kernels.qsa_compress", "gated_attention_block.kernels.qsa_score_paged", "QSA.selection_paged",
          "gated_attention_block.kernels.qsa_topk_decode", "gated_attention_block.qsa_topk", "QSA.selection", "QSA", "_tupledict",
          # the 7301fad21 pin: the lean decode tile, the shared visible-set helper it and the tcgen05 core import, the THD origins module
-         "sdpa.fwd.kernels.sm107.sparse_lean_d256_f16", "sdpa.fwd.kernels.sm107._sparse_item_common", "sdpa.fwd.kernels.thd_origins")
+         "sdpa.fwd.kernels.sm107.sparse_lean_d256_f16", "sdpa.fwd.kernels.sm107._sparse_item_common", "sdpa.fwd.kernels.thd_origins",
+         # the 977757763 pin: the DSL-free rules module (the tile_form vocabulary, the lean placement rule in CTAs per chunk) the heuristics re-export
+         "sdpa.fwd.sparse_tile_rules")
 failed, declined = [], []
 for name in added:
     try:

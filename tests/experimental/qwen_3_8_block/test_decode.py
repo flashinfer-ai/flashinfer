@@ -153,7 +153,7 @@ def test_decode_matches_the_two_stage_oracle(name, q_len):
     assert d["indexer_launches"] == 2 and d["n_blocks_max"] == case.block_table.shape[
         1
     ] * (16 // 4)
-    # the sparse core's body under the AUTO knob at batch 4 (8 units at two KV heads, past the lean bound of 4): the tcgen05 core
+    # the sparse core's body under the AUTO knob at batch 4 (8 CTAs per chunk at two KV heads, past the lean bound of 4): the tcgen05 core
     assert (
         d["sparse_tile_form_requested"] == "auto"
         and plan.sparse_tile_form == d["sparse_tile_form"] == "tcgen05"
@@ -385,7 +385,7 @@ def _kernel_names(plan, case, **outputs):
 def test_launch_census_matches_the_declaration():
     """The number of kernels one step launches (the profiler's count) equals the declaration's ``launches_per_execute``: 8 at a split
     (the slab GEMM, the prepare, the scorer, the top-k, the sparse tile, the combine, the out projection, its reducer), no memset / memcpy.
-    At batch 1 (2 units) the AUTO body knob resolves the LEAN decode tile on cc 10.7: the census names ONE ``cudnn_sparse_lean_kernel``
+    At batch 1 (2 CTAs per chunk) the AUTO body knob resolves the LEAN decode tile on cc 10.7: the census names ONE ``cudnn_sparse_lean_kernel``
     and NO ``cudnn_kernel__kernel`` sparse core; the explicit ``"tcgen05"`` pin on the same bucket names the core and no lean kernel at
     the same launch count (the lean tile replaces the core one for one; both routes run their split combine)."""
     g = _geometry("24_2")

@@ -106,8 +106,10 @@ def _declare(geometry, q_len, page, batch=2, **knobs):
 
 def test_sparse_tile_form_facts_through_the_envelope_and_the_host_declaration():
     """The sparse core's body knob, device-free: (1) the per-cell reading ``support.sparse_tile`` (the vendored envelope's own rule at the
-    cc 10.7 part) -- ``"auto"`` is the LEAN tile at batch 1 x q_len 1 (2 units) and batch 2 (4 units, the bound), the tcgen05 core at
-    batch 3 and 4 (6 / 8 units) and at q_len 2 (the in-block indexer's per-row list past one row is the core's); the explicit bodies read
+    cc 10.7 part) -- ``"auto"`` is the LEAN tile at batch 1 x q_len 1 (2 CTAs per chunk) and batch 2 (4, the bound), the tcgen05 core at
+    batch 3 and 4 (6 / 8 CTAs per chunk) and at q_len 2 (the in-block indexer's per-row list past one row is the core's: the list form, not
+    the bound); the bound's UNIT read on the shared-list geometry the tree serves (B 1 / B 2 x q_len 3 / 4 the lean tile, B 4 the core at
+    every step width -- the 7301fad21 pin counted B x H_kv x q_len and read those B 1 / B 2 cells as the core); the explicit bodies read
     back as named; over e4m3 pools no body runs (None); on a CPU part (no cc) the form is not served, so no body (None) -- and (2) the vendored declaration
     ``api.prepare`` builds, with the explicit bodies: ``"lean"`` resolves the lean tile at its lean split (65 at top_k 512, k 1),
     ``"tcgen05"`` the core, and the requested form reads back; the facts of (1) and (2) are the same spelling (``kernel_template``)."""
@@ -125,13 +127,36 @@ def test_sparse_tile_form_facts_through_the_envelope_and_the_host_declaration():
     )  # noqa: E731
     lean, core = support.SPARSE_TILE_LEAN, support.SPARSE_TILE_TCGEN05
     assert cell(1, 1) == lean and cell(2, 1) == lean, (
-        "the AUTO pin on cc 10.7 inside the bound (B x H_kv x q_len <= 4 units)"
+        "the AUTO pin on cc 10.7 inside the bound (B x H_kv <= 4 CTAs per chunk)"
     )
     assert cell(3, 1) == core and cell(4, 1) == core and cell(32, 1) == core, (
         "past the bound: the tcgen05 core"
     )
     assert cell(1, 2) == core and cell(1, 4) == core, (
-        "under the in-block indexer the per-row list past one row is the core's"
+        "under the in-block indexer the per-row list past one row is the core's (the list form, not the bound)"
+    )
+    # the bound's UNIT (the 977757763 pin): the vendored placement rule counts the CTAs per chunk, B x H_kv, not B x H_kv x q_len -- read
+    # through the envelope's own rule on the SHARED-list geometry the tree serves (one list per sequence, the step's rows inside one CTA):
+    # B 1 x q_len 3 / 4 and B 2 x q_len 4 are the lean tile (2 / 4 CTAs per chunk; the 7301fad21 pin read them as 6 / 8 / 16 units, the
+    # core), B 3 / B 4 the core at every step width (6 / 8 per chunk).  This entry declines the shared form by name (the in-block indexer
+    # selects per row), so the route a caller reaches is the per-row one above; the rule is what the vendored tree changed, pinned here.
+    shared = _geometry(index_list_form="shared")
+    assert "per row" in shared.unsupported_reason(), (
+        "the shared list is not a route of this entry: the cells below read the vendored rule, not a served step"
+    )
+    cs = lambda b, q, **kw: support.sparse_tile(
+        torch.device("cpu"),
+        shared,
+        batch_size=b,
+        q_len_per_req=q,
+        device_cc_override=(10, 7),
+        **kw,
+    )  # noqa: E731
+    assert cs(1, 3) == lean and cs(1, 4) == lean and cs(2, 4) == lean, (
+        "the bound counts the CTAs per chunk: B 1 / B 2 x q_len 3 / 4 inside it"
+    )
+    assert cs(3, 1) == core and cs(4, 1) == core and cs(4, 4) == core, (
+        "6 / 8 CTAs per chunk: past the bound at every step width"
     )
     assert (
         cell(1, 1, sparse_tile_form="tcgen05") == core
@@ -236,6 +261,22 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
         == ("sparse_d256_f16", "sparse_lean_d256_f16")
     )
     assert facts["sparse_tile_lean_default_cc107"] is True
+    # the bound's unit as behaviour: the rule's reading over (batch, q_len) cells at cc 10.7 / top_k 512 / two KV heads -- True iff
+    # batch x 2 <= 4 whatever the step width (the 7301fad21 pin's B x H_kv x q_len count read (1, 3) / (1, 4) / (2, 4) False)
+    assert (
+        facts["sparse_tile_lean_rule_cells"]
+        == support.SPARSE_TILE_LEAN_RULE_CELLS
+        == (
+            (1, 1, True),
+            (1, 3, True),
+            (1, 4, True),
+            (2, 1, True),
+            (2, 4, True),
+            (3, 1, False),
+            (4, 1, False),
+            (4, 4, False),
+        )
+    )
     plants = [
         ("INDEX_HEAD_DIM", 64, "index_head_dims"),
         ("INDEX_KV_HEADS", (2,), "index_kv_heads"),
@@ -255,6 +296,21 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
         ("SPARSE_TILE_LEAN", "sparse_lean_d256", "sparse_tile_names"),
         ("SPARSE_TILE_TCGEN05", "sparse_d256", "sparse_tile_names"),
         ("SPARSE_TILE_LEAN_MAX_UNITS", 8, "sparse_tile_lean_max_units"),
+        # the previous unit's reading (B x H_kv x q_len): a tree counting that way, or a mirror still spelling it, is a drift by name
+        (
+            "SPARSE_TILE_LEAN_RULE_CELLS",
+            (
+                (1, 1, True),
+                (1, 3, False),
+                (1, 4, False),
+                (2, 1, True),
+                (2, 4, False),
+                (3, 1, False),
+                (4, 1, False),
+                (4, 4, False),
+            ),
+            "sparse_tile_lean_rule_cells",
+        ),
     ]
     for name, planted, token in plants:
         keep = getattr(support, name)
