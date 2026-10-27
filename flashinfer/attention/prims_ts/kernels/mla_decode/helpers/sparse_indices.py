@@ -121,11 +121,11 @@ class SparseKVIndices:
 
         NVFP4 block scales have already been applied in the loader. The FP8
         primary bytes remain unchanged, so score/output arithmetic consumes
-        this scalar instead of rounding scaled K/V back into E4M3.
+        the host-runtime FP32 scalar instead of rounding scaled K/V back into E4M3.
         """
         scale = cutlass.Float32(1)
         if not self.tensor_scale_is_extra(tile_start, query_row):
-            scale = cutlass.Float32(self.primary_tensor_scale[0])
+            scale = cutlass.Float32(self.primary_tensor_scale)
         return scale
 
     @cute.jit
@@ -144,7 +144,7 @@ class SparseKVIndices:
             if self.tensor_scale_is_extra(
                 current, query_row
             ) and not self.tensor_scale_is_extra(previous, query_row):
-                ratio = cutlass.Float32(self.primary_tensor_scale[0])
+                ratio = cutlass.Float32(self.primary_tensor_scale)
         return ratio
 
     @cute.jit

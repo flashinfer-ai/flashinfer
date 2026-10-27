@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
+from tests.test_helpers.parametrize import parametrize_product
 import torch
 
 pytest.importorskip(
@@ -2285,15 +2286,19 @@ def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
         assert bool((trt_block_offsets[:, 1] == poison_page).all().item())
 
 
-@pytest.mark.parametrize(
-    (
-        "case_kwargs",
-        "expected_policy",
-        "correction_pattern",
-        "overprovision",
-        "exercise_all_paths",
+# Regular runs retain public eager/standalone/graph anchors and FP8 2CTA.
+# The broader policy/shape sweep remains available through --full.
+@parametrize_product(
+    {
+        "case_kwargs,expected_policy,correction_pattern,overprovision,exercise_all_paths": tuple(
+            case.values for case in _MLA_CASES
+        )
+    },
+    regular=tuple(
+        (case.values,)
+        for case in _MLA_CASES
+        if case.values[-1] or case.id == "fp8-2cta-reference-reduction"
     ),
-    _MLA_CASES,
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_compact_variable_k_acceptance(
@@ -2474,13 +2479,11 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Page endpoints exercise the distinct TMA boundaries; page 32/64 also
+# appear in the head, packed-query and live-metadata tests.
+@parametrize_product(
+    {"page_size": (16, 32, 64, 128), "qkv_dtype": (torch.bfloat16, _FP8)},
+    regular=((16, torch.bfloat16), (128, torch.bfloat16), (16, _FP8), (128, _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_page_size_dtype_product(
@@ -2555,13 +2558,9 @@ def test_attention_ts_mla_decode_fp8_2cta_page_window(
     _assert_case_correct(_run_case(wrapper, case), case, policy)
 
 
-@pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@parametrize_product(
+    {"page_size": (16, 32, 64, 128), "qkv_dtype": (torch.bfloat16, _FP8)},
+    regular=((16, torch.bfloat16), (128, torch.bfloat16), (16, _FP8), (128, _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_2cta_page_size_dtype_product(
@@ -2623,8 +2622,10 @@ def test_attention_ts_mla_decode_head_dtype_product(
     _exercise_auto_mla_case(case)
 
 
-@pytest.mark.parametrize("num_qo_heads", (12, 96), ids=("h12", "h96"))
-@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+@parametrize_product(
+    {"num_qo_heads": (12, 96), "packed_query": (False, True)},
+    regular=((12, False), (96, True)),
+)
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     num_qo_heads: int,
@@ -2662,19 +2663,14 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     assert first_state.compiled is second_state.compiled
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q",
-    (
-        pytest.param(6, 8, id="h6-sq8"),
-        pytest.param(12, 4, id="h12-sq4"),
-        pytest.param(24, 2, id="h24-sq2"),
-        pytest.param(48, 1, id="h48-sq1"),
-    ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Keep the multi-query and single-query endpoints; all four equivalent
+# flat-row factorizations with both dtypes are exercised under --full.
+@parametrize_product(
+    {
+        "num_qo_heads,seq_len_q": ((6, 8), (12, 4), (24, 2), (48, 1)),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(((6, 8), torch.bfloat16), ((48, 1), _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
@@ -2757,19 +2753,12 @@ def test_attention_ts_mla_decode_one_cta_multiwave_progress(
     )
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q",
-    (
-        pytest.param(96, 4, id="h96-sq4"),
-        pytest.param(48, 8, id="h48-sq8"),
-        pytest.param(24, 16, id="h24-sq16"),
-        pytest.param(12, 32, id="h12-sq32"),
-    ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@parametrize_product(
+    {
+        "num_qo_heads,seq_len_q": ((96, 4), (48, 8), (24, 16), (12, 32)),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(((96, 4), torch.bfloat16), ((12, 32), _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
@@ -2825,13 +2814,21 @@ def test_attention_ts_mla_decode_non_power_heads_2cta_split_reduction(
     assert int(policy["split_kv"]) > 1
 
 
-@pytest.mark.parametrize("num_qo_heads", (8, 16, 32, 64), ids=lambda value: f"h{value}")
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Cover every head count and each dtype/mask pair without compiling the
+# full three-axis product. SQ1 dtype coverage is kept separately above.
+@parametrize_product(
+    {
+        "num_qo_heads": (8, 16, 32, 64),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+        "mask_type": ("dense", "causal"),
+    },
+    regular=(
+        (8, torch.bfloat16, "dense"),
+        (16, _FP8, "causal"),
+        (32, torch.bfloat16, "causal"),
+        (64, _FP8, "dense"),
+    ),
 )
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     num_qo_heads: int,
@@ -2854,13 +2851,19 @@ def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     _exercise_auto_mla_case(case)
 
 
-@pytest.mark.parametrize("page_size", (16, 64), ids=lambda value: f"page{value}")
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@parametrize_product(
+    {
+        "page_size": (16, 64),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+        "mask_type": ("dense", "causal"),
+    },
+    regular=(
+        (16, torch.bfloat16, "dense"),
+        (16, _FP8, "causal"),
+        (64, torch.bfloat16, "causal"),
+        (64, _FP8, "dense"),
+    ),
 )
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     page_size: int,
@@ -2894,17 +2897,18 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     assert policy["source"] == "auto"
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,expected_kernel",
-    (
-        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
-        pytest.param(96, "throughput_2cta", id="h96-2cta"),
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (6, "throughput_latency_1cta"),
+            (96, "throughput_2cta"),
+        ),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(
+        ((6, "throughput_latency_1cta"), torch.bfloat16),
+        ((96, "throughput_2cta"), _FP8),
     ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
@@ -2966,12 +2970,16 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,expected_kernel",
-    (
-        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
-        pytest.param(96, "throughput_2cta", id="h96-2cta"),
-    ),
+# Empty queries bypass kernel execution, so one family covers the no-op
+# contract in regular runs; retain both planned families under --full.
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (6, "throughput_latency_1cta"),
+            (96, "throughput_2cta"),
+        )
+    },
+    regular=(((6, "throughput_latency_1cta"),),),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_all_empty_packed_query_noop(
@@ -3054,17 +3062,18 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
 
 
-@pytest.mark.parametrize(
-    ("num_qo_heads", "expected_kernel"),
-    (
-        pytest.param(16, "throughput_latency_1cta", id="1cta"),
-        pytest.param(128, "throughput_2cta", id="2cta"),
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (16, "throughput_latency_1cta"),
+            (128, "throughput_2cta"),
+        ),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(
+        ((16, "throughput_latency_1cta"), torch.bfloat16),
+        ((128, "throughput_2cta"), _FP8),
     ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_runtime_k_pruning_product(

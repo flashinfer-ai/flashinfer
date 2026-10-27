@@ -186,7 +186,7 @@ def build_mla_decode_task_manager(
     logical_seq_len_q=1,
     tiled_mma_qk=None,
     verbose=False,
-    exhaustive_deadlock_race_check=True,
+    exhaustive_deadlock_race_check: bool | None = None,
 ) -> "tuple[TaskManager, list[MemoryResource], dict[str, MemoryResource]]":
     """Build the MLA decode TaskManager with all resources, tasks, and dependency graph.
 
@@ -195,7 +195,10 @@ def build_mla_decode_task_manager(
     the next window is also prefetched), QK/PV MMA, softmax, and
     correction/store tasks. Validation-only
     calls pass a concrete integer ``domain`` and no runtime tensors; JIT calls
-    pass symbolic runtime state and skip schedule validation. The dependency
+    pass symbolic runtime state and retain structural checks as warnings.
+    Exhaustive interleaving checks default to validation-only calls, whose
+    concrete domains permit meaningful simulation; an explicit Boolean
+    overrides that default. The dependency
     graph relies on TaskManager DMA-order validation to keep SMEM producers
     alive until async TMEM consumers have launched.
 
@@ -836,6 +839,11 @@ def build_mla_decode_task_manager(
     # Create TaskManager
     # ──────────────────────────────────────────────────────────────
     skip = not isinstance(domain, int)
+    # skip_validation only downgrades failures to warnings in the DSL. Avoid
+    # repeating the expensive interleaving search for every JIT specialization
+    # with a symbolic domain, which the checker approximates as one iteration.
+    if exhaustive_deadlock_race_check is None:
+        exhaustive_deadlock_race_check = not skip
     task_manager = TaskManager(
         tasks=task_list,
         resource_dependency_graph=resource_dependency_graph,
@@ -997,7 +1005,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         self.kv_cache_format = "native"
         self.extra_kv_cache_format = "native"
         self.assume_valid_prefix = False
-        self.direct_static_scales = False
         self.direct_sparse_capacities = (0, 0)
         self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
@@ -1063,7 +1070,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             self.direct_sparse,
             self.assume_valid_prefix,
-            self.direct_static_scales,
             self.direct_sparse_capacities,
             self.sparse_gather_warps,
             self.sparse_kv_stages,
@@ -1719,7 +1725,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks, ks = block_split_kvs
+            si, ci, sl, cl, sinks, ks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1749,10 +1755,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 has_extra=self.direct_sparse_capacities[1] > 0,
                 primary_tensor_scale=ks if self.kv_cache_format == "fp8" else None,
             )
-            if cutlass.const_expr(not self.direct_static_scales):
-                # Caller scales already include Q/K/V descales.
-                softmax_scale_log2 = Float32(sm[0]) * LOG2_E
-                output_scale = Float32(os[0])
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
@@ -2390,7 +2392,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         atten_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
-            atten_sinks = block_split_kvs[6]
+            atten_sinks = block_split_kvs[4]
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(

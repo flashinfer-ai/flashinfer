@@ -1789,7 +1789,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
         self.assume_valid_prefix = False
-        self.direct_static_scales = False
         self.direct_sparse_capacities = (0, 0)
 
         cfg = self._make_config()
@@ -1960,7 +1959,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 finalize_output=self.finalize_output,
                 direct_inputs=self.direct_sparse,
                 assume_valid_prefix=self.assume_valid_prefix,
-                static_scales=self.direct_static_scales,
                 source_capacities=self.direct_sparse_capacities,
             )
         return cfg
@@ -2407,7 +2405,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 reducer_cfg, topology, elements = self._parallel_reduction_setup(cfg)
                 atten_sinks = None
                 if cutlass.const_expr(cfg.fuse_sparse_reduction):
-                    atten_sinks = block_split_kvs[6]
+                    atten_sinks = block_split_kvs[4]
                 reduction_grid, reduction_cluster = (
                     parallel_gmem_reduction_launch_shape(
                         reducer_cfg,
@@ -2529,7 +2527,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks, ks = sparse_inputs
+            si, ci, sl, cl, sinks, ks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
@@ -2544,10 +2542,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
                 primary_tensor_scale=ks if cfg.kv_cache_format == "fp8" else None,
             )
-            if cutlass.const_expr(not cfg.sparse_static_scales):
-                # Caller scales already include Q/K/V descales.
-                softmax_scale_log2 = cutlass.Float32(sm[0]) * LOG2_E
-                output_scale = cutlass.Float32(os[0])
             sparse_epilogue_params = sinks
         else:
             sparse_epilogue_params = None

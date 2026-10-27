@@ -17,7 +17,10 @@ upstream. K/V use one shared latent head; output has 512 channels.
 These are architectural/model recipes; the API takes capability and format
 parameters. NVFP4 has embedded block16 E4M3 scales and no global storage scale.
 Only the primary pool may use per-tensor FP8 in a mixed recipe. Its
-`kv_cache_scale` is a positive Python number or scalar CUDA FP32 tensor.
+`kv_cache_scale` is a positive Python number passed as a runtime FP32 kernel
+argument, as are `softmax_scale` and `output_scale`. Scale values do not create
+JIT variants. CUDA graphs capture these values; use graph parameter updates or
+recapture when changing them for replay.
 D512 includes rotated channels in the ordinary 512-channel storage; D576 has a
 separate QK-only 64-channel RoPE tail. Record diagrams and scale-byte ordering
 are documented in [helpers/nvfp4_kv.py](helpers/nvfp4_kv.py).

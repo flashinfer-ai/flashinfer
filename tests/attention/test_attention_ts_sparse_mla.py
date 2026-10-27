@@ -306,9 +306,7 @@ def test_rope_quant_graph(
         )
         extra, extra_reference = make_nvfp4_cache(256, 1)
         if cache_format == "fp8":
-            primary_tensor_scale = torch.tensor(
-                [0.25], device="cuda", dtype=torch.float32
-            )
+            primary_tensor_scale = 0.25
     # Duplicates are intentional: output fusion must preserve sparse semantics.
     indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
     extra_indices = torch.randint(
@@ -377,11 +375,6 @@ def test_rope_quant_graph(
     )
     if primary_tensor_scale is not None:
         kwargs["kv_cache_scale"] = primary_tensor_scale
-    if packed:
-        # Cover graph-live effective scales with fused output as well as the
-        # Python-number path exercised by the fixed-query cases.
-        kwargs["softmax_scale"] = torch.tensor(kwargs["softmax_scale"], device=q.device)
-        kwargs["output_scale"] = torch.tensor(kwargs["output_scale"], device=q.device)
     output, scales, lse = wrapper.run(q, kv, **metadata, extra_kv_cache=extra, **kwargs)
     channels = heads // groups * 512
     assert output.shape == (rows, groups, channels)
@@ -422,7 +415,6 @@ def test_rope_quant_graph(
     # Query positions are graph-live, including packed/chunked query batches.
     positions.add_(7)
     if primary_tensor_scale is not None:
-        primary_tensor_scale.fill_(0.5)
         kv_reference = kv_reference.float() * primary_tensor_scale
     graph.replay()
     if output_padding:
@@ -726,10 +718,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         bl[0] = 0
     sinks = torch.randn(heads, device="cuda")
     sinks[0], sinks[1] = torch.inf, -torch.inf
-    kv_scale = torch.tensor(
-        0.75 if dtype == torch.float8_e4m3fn else 1.0, device="cuda"
-    )
-    q_scale = torch.tensor(1.25 if dtype == torch.float8_e4m3fn else 1.0, device="cuda")
+    kv_scale = 0.75 if dtype == torch.float8_e4m3fn else 1.0
+    q_scale = 1.25 if dtype == torch.float8_e4m3fn else 1.0
     offsets = (
         torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32) if packed else None
     )
@@ -753,22 +743,16 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         return_lse=True,
         assume_valid_prefix=prefix,
     )
-    attention_scale = torch.tensor(512**-0.5, device=q.device)
-    output_multiplier = torch.tensor(0.75, device=q.device)
-    effective_softmax_scale = torch.empty_like(attention_scale)
-    effective_output_scale = torch.empty_like(output_multiplier)
+    attention_scale = 512**-0.5
+    output_multiplier = 0.75
     scales = dict(
-        softmax_scale=effective_softmax_scale,
-        output_scale=effective_output_scale,
+        softmax_scale=attention_scale * q_scale * kv_scale,
+        output_scale=output_multiplier * kv_scale,
         sinks=sinks,
     )
 
     def prepare(out=None):
-        # Upstream work combines descales into stable graph inputs. The oracle
-        # below keeps the original Q/K/V factors to check equivalence.
-        torch.mul(attention_scale, q_scale, out=effective_softmax_scale)
-        effective_softmax_scale.mul_(kv_scale)
-        torch.mul(output_multiplier, kv_scale, out=effective_output_scale)
+        # Metadata tensors remain graph-live; host scales are launch arguments.
         return prepare_sparse_mla_indices(
             w,
             q,
@@ -808,10 +792,10 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             bi.reshape(*prefix_shape, kb) if extra else None,
             lengths=al.reshape(prefix_shape),
             extra_lengths=bl.reshape(prefix_shape) if extra else None,
-            q_scale=q_scale.item(),
-            kv_scale=kv_scale.item(),
-            softmax_scale=attention_scale.item(),
-            output_scale=output_multiplier.item(),
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            softmax_scale=attention_scale,
+            output_scale=output_multiplier,
             sinks=sinks,
         )
         if dtype == torch.float8_e4m3fn:
@@ -835,16 +819,23 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         bi.copy_(bi.flip(-1))
         bi[:, 3::11] = -1
         bl[0], bl[-1] = 1, 0
-    if dtype == torch.float8_e4m3fn:
-        kv_scale.fill_(1.25)
-        q_scale.fill_(0.5)
-    attention_scale.mul_(0.75)
-    output_multiplier.fill_(1.25)
     graph.replay()
     torch.cuda.synchronize()
     check()
     assert torch.count_nonzero(out.reshape(rows, heads, 512)[-1]) == 0
     assert torch.isneginf(lse.reshape(rows, heads)[-1]).all()
+    # A new host-scale launch reuses the same plan; graph replay above used
+    # the values captured before the metadata changed.
+    if dtype == torch.float8_e4m3fn:
+        kv_scale, q_scale = 1.25, 0.5
+    attention_scale *= 0.75
+    output_multiplier = 1.25
+    scales.update(
+        softmax_scale=attention_scale * q_scale * kv_scale,
+        output_scale=output_multiplier * kv_scale,
+    )
+    run()
+    check()
     if packed:
         unaligned = torch.empty(lse.numel() + 1, device=q.device)[1:].view_as(lse)
         with pytest.raises(ValueError, match="16-byte-aligned"):
@@ -1398,7 +1389,7 @@ def test_d512_nvfp4_sources_graph(
     prefix=False,
     tuning=None,
 ):
-    """Check packed-pool layouts, live source scales and optional probability scaling."""
+    """Check packed-pool layouts, host source scales and optional probability scaling."""
     torch.manual_seed(124)
     q = (torch.randn(rows, 1, heads, 512 + rope_dim, device="cuda") * 0.2).to(
         torch.float8_e4m3fn
@@ -1445,16 +1436,12 @@ def test_d512_nvfp4_sources_graph(
         assume_valid_prefix=prefix,
         tuning=tuning,
     )
-    primary_scale = (
-        torch.tensor([0.3], device="cuda", dtype=torch.float32)
-        if primary_format == "fp8"
-        else 1.0
-    )
+    primary_scale = 0.3 if primary_format == "fp8" else 1.0
     out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
     lse = torch.empty(rows, 1, heads, device="cuda", dtype=torch.float32)
 
     def run():
-        """Run the selected cache recipe with graph-live primary scale and stable output storage."""
+        """Run the selected cache recipe with a host primary scale and stable output storage."""
         w.run(
             q,
             primary,
@@ -1475,8 +1462,13 @@ def test_d512_nvfp4_sources_graph(
         run()
     for changed in (False, True):
         if changed:
-            if isinstance(primary_scale, torch.Tensor):
-                primary_scale.fill_(1.7)
+            if primary_format == "fp8":
+                # Recapture the changed host scalar before mutating GPU inputs,
+                # so replay still verifies live query/index/length reads.
+                primary_scale = 1.7
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
             q.copy_((q.float() * -0.5).to(q.dtype))
             lengths.copy_(lengths.roll(1))
             extra_lengths.copy_(extra_lengths.roll(-1))
@@ -1544,7 +1536,7 @@ def test_nvfp4_format_contract():
     + [(8, 2, 33, 17), (128, 32, 129, 2049)],
 )
 def test_tensor_fp8_nvfp4_sources_graph(heads, rows, topk, extra):
-    """Check FP8-primary/NVFP4-extra attention with changing tensor scales and source boundaries."""
+    """Check FP8-primary/NVFP4-extra attention with host scales and live source boundaries."""
     test_d512_nvfp4_sources_graph(heads, rows, topk, extra, primary_format="fp8")
 
 
@@ -1591,3 +1583,113 @@ def test_tensor_fp8_nvfp4_rescale_threshold_graph(heads):
         primary_format="fp8",
         tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=2.0),
     )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads):
+    """One host-scale plan serves varying row counts; graphs retain captured scales."""
+    from unittest.mock import patch
+    import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
+
+    torch.manual_seed(127)
+    capacity, topk = 32, 129
+    query = (torch.randn(capacity + 1, heads, 512, device="cuda") * 0.2).to(
+        torch.float8_e4m3fn
+    )
+    primary, primary_ref = make_tensor_fp8_cache(4, 64)
+    extra, extra_ref = make_nvfp4_cache(4, 32)
+    # The first page avoids a stride adapter while list capacities span tiles.
+    indices = torch.randint(64, (capacity, topk), device="cuda", dtype=torch.int32)
+    extra_indices = torch.randint(
+        32, (capacity, topk), device="cuda", dtype=torch.int32
+    )
+    lengths = torch.full((capacity,), topk, device="cuda", dtype=torch.int32)
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    owners = []
+    with patch.object(
+        mla_decode_module,
+        "_get_compiled_mla_decode",
+        wraps=mla_decode_module._get_compiled_mla_decode,
+    ) as compile_calls:
+        wrapper.plan(
+            "cuda",
+            1,
+            heads,
+            max_topk=topk,
+            max_extra_topk=topk,
+            max_seq_len_q=capacity,
+            packed_query=True,
+            q_data_type=query.dtype,
+            kv_cache_format="fp8",
+            extra_kv_cache_format="nvfp4",
+            return_lse=True,
+        )
+        assert compile_calls.call_count == 1
+        for rows in (1, 7, capacity):
+            qo_indptr = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+            kwargs = dict(
+                qo_indptr=qo_indptr,
+                extra_kv_cache=extra,
+                extra_indices=extra_indices[:rows],
+                extra_lengths=lengths[:rows],
+                kv_cache_scale=0.5,
+                softmax_scale=512**-0.5,
+                output_scale=1.0,
+            )
+            out, lse = wrapper.run(
+                query[:rows], primary, indices[:rows], lengths[:rows], **kwargs
+            )
+
+            def check():
+                """Compare the current host-scale launch against the independent oracle."""
+                ref, ref_lse, bound = _reference(
+                    query[:rows],
+                    primary_ref * kwargs["kv_cache_scale"],
+                    extra_ref,
+                    indices[:rows],
+                    extra_indices[:rows],
+                    lengths=lengths[:rows],
+                    extra_lengths=lengths[:rows],
+                    softmax_scale=kwargs["softmax_scale"],
+                    output_scale=kwargs["output_scale"],
+                )
+                assert ((out.double() - ref).abs() <= bound).all()
+                torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+            check()
+            expected, expected_lse = out.clone(), lse.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                wrapper.run(
+                    query[:rows],
+                    primary,
+                    indices[:rows],
+                    lengths[:rows],
+                    out=out,
+                    lse=lse,
+                    validate=False,
+                    **kwargs,
+                )
+            # Host values change at launch, with no new plan or compilation.
+            kwargs.update(kv_cache_scale=0.25, softmax_scale=0.04, output_scale=0.75)
+            wrapper.run(
+                query[:rows],
+                primary,
+                indices[:rows],
+                lengths[:rows],
+                out=out,
+                lse=lse,
+                **kwargs,
+            )
+            check()
+            graph.replay()
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+            owners.append((graph, out, lse, qo_indptr))
+        assert compile_calls.call_count == 1
+        for name in ("softmax_scale", "output_scale", "kv_cache_scale"):
+            invalid = dict(kwargs, **{name: torch.tensor(1.0, device="cuda")})
+            with pytest.raises(TypeError, match="Python int or float"):
+                wrapper.run(query[:capacity], primary, indices, lengths, **invalid)
+        with pytest.raises(ValueError, match="packed query total rows"):
+            wrapper.run(query, primary, indices, lengths)

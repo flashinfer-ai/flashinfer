@@ -1255,9 +1255,6 @@ def _get_compiled_mla_decode(
                 assumed_align=4,
             )
 
-        scalar = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
-        )
         sink = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (num_heads,), stride_order=(0,), assumed_align=4
         )
@@ -1266,10 +1263,8 @@ def _get_compiled_mla_decode(
             sparse_indices(kernel.direct_sparse_capacities[1]),
             cache_seqs_fake,
             cache_seqs_fake,
-            scalar,
-            scalar,
             sink,
-            scalar,
+            cutlass.Float32(1.0),
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -2448,13 +2443,21 @@ class BatchSparseMLADecodePagedTSWrapper:
     warmup, stable addresses, preallocated outputs, and validate=False.
     Input/output/workspace storage must not overlap; this is an unchecked
     caller precondition. Separate wrappers/workspaces are needed per stream.
+
+    Planning compiles one kernel with host-runtime FP32 scale arguments.
+    Scale values may change between launches without recompiling. CUDA graphs
+    capture their values, so new values require graph parameter updates or
+    recapture. For a
+    fixed dispatch profile over a range of independent sparse query rows,
+    plan with ``batch_size=1``, ``packed_query=True`` and
+    ``max_seq_len_q=row_capacity``. Run with ``[rows,H,D]`` queries and
+    ``qo_indptr=[0,rows]`` for any ``rows <= row_capacity``.
     """
 
     @flashinfer_experimental_api
     def __init__(self, workspace_buffer=None):
         self._workspace_buffer = workspace_buffer
         self._state = None
-        self._scalar_cache = {}
         self.workspace_size_bytes = 0
 
     def plan(
@@ -2579,15 +2582,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             spec, kernel=kernel, kernel_signature=_mla_kernel_compile_signature(kernel)
         )
         compiled = _get_compiled_mla_decode(spec)
-        static_kernel = copy.copy(kernel)
-        static_kernel.direct_static_scales = True
-        compiled_static = _get_compiled_mla_decode(
-            replace(
-                spec,
-                kernel=static_kernel,
-                kernel_signature=_mla_kernel_compile_signature(static_kernel),
-            )
-        )
         self._state = dict(
             device=device,
             batch=batch_size,
@@ -2613,7 +2607,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             buffers=buffers,
             workspace=workspace,
             compiled=compiled,
-            compiled_static=compiled_static,
             assume_valid_prefix=assume_valid_prefix,
             splits=splits,
             default_cl=torch.full(
@@ -2635,41 +2628,21 @@ class BatchSparseMLADecodePagedTSWrapper:
         )
 
         self.workspace_size_bytes = byte_end
-        self._scalar_cache.clear()
 
-    def _scalar(self, value, name, validate):
-        state = self._state
-        if isinstance(value, torch.Tensor):
-            if (
-                value.dtype != torch.float32
-                or value.device != state["device"]
-                or value.numel() != 1
-                or not value.is_contiguous()
-            ):
-                raise ValueError(f"{name} must be a scalar CUDA FP32 tensor")
-            if validate and (
-                not torch.isfinite(value).all().item() or (value <= 0).any().item()
-            ):
-                raise ValueError(f"{name} must be positive and finite")
-            return value.reshape(1)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+    @staticmethod
+    def host_scale(value, name):
+        """Validate and round a host scalar to the runtime kernel's FP32 ABI."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a Python int or float")
+        if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be positive and finite")
         try:
-            key = struct.unpack("f", struct.pack("f", float(value)))[0]
+            rounded = struct.unpack("f", struct.pack("f", float(value)))[0]
         except OverflowError as error:
             raise ValueError(f"{name} must be representable in float32") from error
-        if not math.isfinite(key) or key <= 0:
+        if not math.isfinite(rounded) or rounded <= 0:
             raise ValueError(f"{name} must be positive finite float32")
-        if key not in self._scalar_cache:
-            self._scalar_cache[key] = torch.full(
-                (1,), key, device=state["device"], dtype=torch.float32
-            )
-        return self._scalar_cache[key]
+        return rounded
 
     def _pool(self, cache, name):
         """Validate one cache pool and expose its physical rows without repacking storage."""
@@ -2790,26 +2763,26 @@ class BatchSparseMLADecodePagedTSWrapper:
         execution spans internally and bounds all source reads.
 
         ``softmax_scale`` and ``output_scale`` are positive finite Python
-        scalars or scalar CUDA FP32 tensors. They are already combined:
+        host scalars, passed as runtime FP32 kernel arguments. They are already combined:
         softmax_scale = attention_scale * q_descale * kv_descale;
         output_scale = output_multiplier * kv_descale. Both pools share that
         KV descale. These multiply QK scores and the weighted stored V values,
         respectively; sink logits are not multiplied by softmax_scale. The
         output multiplier applies before fused RoPE/quantization. ``out_scale``
         instead holds the generated per-block quantization scales.
-        Combine dynamic scales in upstream work before each launch/replay and
-        keep their tensor addresses stable for CUDA Graphs.
+        Combine scales on the host before each launch. Their values are not
+        compilation keys. CUDA graphs capture the supplied values; changing
+        them for replay requires graph parameter updates or recapture.
 
         For ``kv_cache_format="fp8"``, ``kv_cache_scale`` is the independent
-        positive per-tensor descale of the primary pool. It accepts a Python
-        scalar or scalar CUDA FP32 tensor; leave it at the Python default 1.0
+        positive host-runtime per-tensor descale of the primary pool. It accepts
+        a Python scalar; leave it at the default 1.0
         for other formats. The extra pool is NVFP4 and has no tensor descale.
         The primary scale is applied internally to both K and V; do not also
-        fold it into softmax_scale/output_scale. Scalar tensor contents may
-        change between captured graph replays.
+        fold it into softmax_scale/output_scale.
 
         Caller-owned inputs and plan workspace must outlive graph replay,
-        including tensor scales and sinks, and must not alias writable output
+        including sinks, and must not alias writable output
         or workspace storage. Q and native KV are used directly; flattening
         padded pages only creates a tensor view. Required attention reductions
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
@@ -2908,18 +2881,11 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("sinks must be contiguous CUDA FP32[H]")
         if validate and torch.isnan(sinks).any().item():
             raise ValueError("sinks must not contain NaN")
-        scale_tensors = [
-            self._scalar(v, n, validate)
-            for v, n in (
-                (softmax_scale, "softmax_scale"),
-                (output_scale, "output_scale"),
-            )
-        ]
-        if state["kv_cache_format"] != "fp8" and (
-            isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
-        ):
+        softmax_scale = self.host_scale(softmax_scale, "softmax_scale")
+        output_scale = self.host_scale(output_scale, "output_scale")
+        kv_cache_scale = self.host_scale(kv_cache_scale, "kv_cache_scale")
+        if state["kv_cache_format"] != "fp8" and kv_cache_scale != 1.0:
             raise ValueError("kv_cache_scale is only supported for an FP8 primary pool")
-        scale_tensors.append(self._scalar(kv_cache_scale, "kv_cache_scale", validate))
         quant = state["output_quant"]
         output_quant_args = None
         if quant is not None:
@@ -2969,22 +2935,13 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError(
                 "lse must be contiguous, 16-byte-aligned FP32 with one value per query/head"
             )
-        static_scales = all(
-            not isinstance(v, torch.Tensor) for v in (softmax_scale, output_scale)
-        )
-        # Both paths consume the same effective scales; no Q/K/V scale
-        # composition or auxiliary preparation is performed here.
-        bmm1_scale = float(softmax_scale) if static_scales else 1.0
-        bmm2_scale = float(output_scale) if static_scales else 1.0
         sparse_inputs = (
             si,
             ci,
             sl,
             cl,
-            scale_tensors[0],
-            scale_tensors[1],
             sinks,
-            scale_tensors[2],
+            kv_cache_scale,
         )
         if rows:
             buffers = state["buffers"]
@@ -3003,8 +2960,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                     primary,
                     core_out,
                     primary.shape[0],
-                    bmm1_scale,
-                    bmm2_scale,
+                    softmax_scale,
+                    output_scale,
                     extra_cache=extra,
                     sparse_inputs=sparse_inputs,
                     output_quant_args=output_quant_args,
@@ -3019,9 +2976,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                     buffers["core"] if buffers["core"].numel() else None,
                     lse.view(rows, 1, state["heads"]),
                 ),
-                compiled=state["compiled_static"]
-                if static_scales
-                else state["compiled"],
+                compiled=state["compiled"],
             )
         if quant is not None:
             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
