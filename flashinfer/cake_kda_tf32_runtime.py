@@ -905,6 +905,31 @@ class _CorrectionMergeUnavailable(Exception):
     """The chain's correction module has no merging build on this device."""
 
 
+def _is_fused_m128_row(factory) -> bool:
+    """``factory`` is the plain fused M128 factory row.
+
+    That is ``partial(_factory, "compiled_bf16_fused_m128", ...)``.  The fold
+    and merge interceptors rewrite only this factory; they raise their
+    ``...Unavailable`` exception for every other one (fail closed).
+    """
+    return getattr(factory, "func", None) is _factory and factory.args == (
+        "compiled_bf16_fused_m128",
+    )
+
+
+def _built_from_table(launch, table: str) -> bool:
+    """``launch``'s body is a program the loader table ``table`` names on this device.
+
+    A fold or merge route drops another launch (the map pass, the pair-map
+    producer, the epilogue) on the strength of its body; the composite checks
+    the body it actually got before it does.
+    """
+    programs = getattr(_kda_registry, table, {}).get(detect_gpu_arch(), {})
+    return getattr(getattr(launch, "module", None), "name", None) in set(
+        programs.values()
+    )
+
+
 def _correction_merge_factory(
     name,
     *args,
@@ -946,16 +971,32 @@ _PAIR_PROBE_PTX = b"""
 \x00"""
 
 
-@cache
+_M64_PAIR_CLUSTER_CAPACITY: dict = {}
+_M64_PAIR_PROBE_WARNED = False
+
+
 def _m64_pair_cluster_capacity(device: torch.device) -> int:
     """How many 2-CTA clusters of the M64 value split's CTA the device holds at once.
 
     ``cuOccupancyMaxActiveClusters`` for a probe kernel launched with the M64
     CTA's threads and dynamic shared memory (one CTA per SM) in clusters of
     two.  The driver's answer follows the part's floorsweeping, which can leave
-    it below ``sm_count // 2``.  0 when the driver cannot answer: the runtime
-    then keeps the routed program.
+    it below ``sm_count // 2``.  Only an answer is cached (per device): when
+    the driver cannot answer, the call returns 0 (the runtime keeps the routed
+    program), logs one warning per process and probes again on the next call.
     """
+    capacity = _M64_PAIR_CLUSTER_CAPACITY.get(device)
+    if capacity is None:
+        capacity = _probe_m64_pair_cluster_capacity(device)
+        if capacity is None:
+            return 0
+        _M64_PAIR_CLUSTER_CAPACITY[device] = capacity
+    return capacity
+
+
+def _probe_m64_pair_cluster_capacity(device: torch.device) -> Optional[int]:
+    """The driver's answer for ``_m64_pair_cluster_capacity``; ``None`` on failure."""
+    global _M64_PAIR_PROBE_WARNED
     import torch
 
     try:
@@ -1001,8 +1042,19 @@ def _m64_pair_cluster_capacity(device: torch.device) -> int:
                 return int(check(driver.cuOccupancyMaxActiveClusters(function, config)))
             finally:
                 driver.cuModuleUnload(module)
-    except Exception:
-        return 0
+    except Exception as error:
+        if not _M64_PAIR_PROBE_WARNED:
+            _M64_PAIR_PROBE_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the M64 pair-share cluster capacity probe failed "
+                "(%s: %s); M64 launches keep the routed program until a probe "
+                "succeeds",
+                type(error).__name__,
+                error,
+            )
+        return None
 
 
 # Long M64 value-split launches whose clusters fit one wave take the loader's
@@ -3797,17 +3849,16 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch(
 
     @staticmethod
     def _build_kda_module(factory, *args, **kwargs):
-        if getattr(factory, "func", None) is _factory and factory.args == (
-            "compiled_bf16_fused_m128",
+        # Fail closed: any other factory (a wrapper included) has no fold
+        # build here, and the composite then keeps the pair-map producer.
+        if not _is_fused_m128_row(factory) or (
+            _pair_map_fold_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
+            )
+            is None
         ):
-            if (
-                _pair_map_fold_program(
-                    *factory.args, *args, **{**factory.keywords, **kwargs}
-                )
-                is None
-            ):
-                raise _PairMapFoldUnavailable
-            factory = partial(_pair_map_fold_factory, *factory.args, **factory.keywords)
+            raise _PairMapFoldUnavailable
+        factory = partial(_pair_map_fold_factory, *factory.args, **factory.keywords)
         return _build_kda_module(factory, *args, **kwargs)
 
 
@@ -3824,19 +3875,16 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch(
 
     @staticmethod
     def _build_kda_module(factory, *args, **kwargs):
-        if getattr(factory, "func", None) is _factory and factory.args == (
-            "compiled_bf16_fused_m128",
-        ):
-            if (
-                _chain_map_fold_program(
-                    *factory.args, *args, **{**factory.keywords, **kwargs}
-                )
-                is None
-            ):
-                raise _ChainMapFoldUnavailable
-            factory = partial(
-                _chain_map_fold_factory, *factory.args, **factory.keywords
+        # Fail closed: any other factory (a wrapper included) has no map-fold
+        # build here, and the composite then keeps the map pass.
+        if not _is_fused_m128_row(factory) or (
+            _chain_map_fold_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
             )
+            is None
+        ):
+            raise _ChainMapFoldUnavailable
+        factory = partial(_chain_map_fold_factory, *factory.args, **factory.keywords)
         return _build_kda_module(factory, *args, **kwargs)
 
 
@@ -4042,12 +4090,11 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch(
 
     @staticmethod
     def _build_kda_module(factory, *args, **kwargs):
-        if getattr(factory, "func", None) is _factory and factory.args == (
-            "compiled_bf16_fused_m128",
-        ):
-            factory = partial(
-                _correction_merge_factory, *factory.args, **factory.keywords
-            )
+        # Fail closed: any other factory (a wrapper included) has no merging
+        # build here, and the composite then keeps the epilogue.
+        if not _is_fused_m128_row(factory):
+            raise _CorrectionMergeUnavailable
+        factory = partial(_correction_merge_factory, *factory.args, **factory.keywords)
         return _build_kda_module(factory, *args, **kwargs)
 
 
@@ -4614,6 +4661,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     *main_args, **main_kwargs
                 )
             )
+        # The map pass / pair-map producer is dropped only when the main body is
+        # the fold build the loader names; any other body takes the fallback
+        # above.
+        if self._chain_map_fold and not _built_from_table(
+            self._main, "_RENDERED_MAP_FOLD_ROUTES"
+        ):
+            self._chain_map_fold = False
+            self._main = FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch(
+                *main_args, **main_kwargs
+            )
+        if self._pair_map_fold and not _built_from_table(
+            self._main, "_RENDERED_FOLD_ROUTES"
+        ):
+            self._pair_map_fold = False
+            self._main = (
+                FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
+                    *main_args, **main_kwargs
+                )
+            )
         self._main.args.update(
             state_indices_addr=self._part_state_indices.data_ptr(),
             state_slot_stride=initial_state.stride(0),
@@ -4672,6 +4738,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     )
                 ),
             )
+            if self._correction_merge and not _built_from_table(
+                self._correction, "_RENDERED_MERGE_ROUTES"
+            ):
+                # Not the merging build: rebuild with the epilogue (``__init__``).
+                raise _CorrectionMergeUnavailable
             if self._correction_merge:
                 # The merging body reads the per-window pool offsets through
                 # ``state_indices_addr``, the main windows' final states through
