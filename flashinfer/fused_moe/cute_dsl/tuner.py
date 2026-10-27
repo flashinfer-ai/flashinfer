@@ -88,12 +88,18 @@ BLACKWELL_ROUTE_TILES = (16, 32, 64, 128, 256)
 
 
 def get_blackwell_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Block-scaled FC1: physical M is output channels and N is routed tokens."""
+    """Get valid Blackwell tactics for GEMM1 (Gather + SwiGLU Fusion).
+
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    """
     return get_blackwell_gemm2_valid_tactics(tile_size)
 
 
 def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Channel tilings shared by both phases; can_implement checks capacity."""
+    """Get valid Blackwell tactics for GEMM2 (Finalize Fusion).
+
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    """
     if tile_size not in BLACKWELL_ROUTE_TILES:
         raise ValueError(f"Unsupported Blackwell routing tile: {tile_size}")
     return [
@@ -107,7 +113,10 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 
 
 def get_blackwell_moe_valid_tactics() -> List[Tuple]:
-    """Pair geometry and reduction depths with one shared phase scheduler."""
+    """Get all valid Blackwell MoE tactic combinations.
+
+    Returns: List of (tile_size, gemm1_tactic, gemm2_tactic, k_steps_pair, use_clc)
+    """
     return [
         (route_tile, gemm1, gemm2, k_steps, use_clc)
         for route_tile in BLACKWELL_ROUTE_TILES
@@ -119,7 +128,7 @@ def get_blackwell_moe_valid_tactics() -> List[Tuple]:
 
 
 def get_w4a8_moe_valid_tactics() -> List[Tuple]:
-    """W4A8 uses the same token-on-N geometry as the other Blackwell modes."""
+    """Get the Blackwell tactics for W4A8 mixed-format MoE."""
     return get_blackwell_moe_valid_tactics()
 
 
@@ -350,6 +359,11 @@ def _split_moe_tactic(tactic: Tuple) -> Tuple:
 
 
 def _is_rubin_tactic(tactic: Tuple) -> bool:
+    """Detect whether a tactic is Rubin format by checking sub-tactic length.
+
+    Blackwell sub-tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m) — 3 elements
+    Rubin sub-tactic: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m) — 4 elements
+    """
     return _split_moe_tactic(tactic)[4]
 
 

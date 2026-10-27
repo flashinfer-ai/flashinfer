@@ -336,7 +336,7 @@ def create_finalize_fusion_tensors(
     mma_tiler_mn: Tuple[int, int],
     final_scale_dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Create tensors required for Blackwell finalize fusion.
+    """Create tensors required for finalize fusion.
 
     This function creates the mapping tensor and final scale tensor needed
     for the fused finalize operation in GEMM2.
@@ -471,8 +471,7 @@ def _get_compiled_finalize_kernel(
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    The Blackwell path uses the shared runtime-N launcher. This cache serves
-    Rubin (SM107) via mma_tiler + mma_inst_shape.
+    Supports Rubin (SM107, via mma_tiler + mma_inst_shape).
 
     This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
@@ -643,12 +642,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
         sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
-        mma_tiler_mn: Physical MMA tile shape (M, N). Blackwell uses channels on M
-            and routed tokens on N. Default: (256, 128).
+        mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128).
+            Blackwell uses channels on M and routed tokens on N.
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Blackwell uses
-            (1, 1) with M128 or (2, 1) with M256/M512. Resource admission
-            checks the selected channel and token widths.
-            Default: (2, 1).
+            (1, 1) with M128 or (2, 1) with M256/M512. Default: (2, 1).
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
         domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.

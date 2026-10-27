@@ -1,7 +1,7 @@
-"""Host checks for the shared blockscaled MoE operand contract.
+"""Directed host-side checks for blockscaled MoE kernel contracts.
 
-All SM100 types put channel tiles on M and routed tokens on N.
-These checks exercise the existing classmethod hooks without GPU work.
+All SM100 types put channel tiles on M and routed tokens on N. These are
+pure classmethod checks -- no GPU work.
 """
 
 import pytest

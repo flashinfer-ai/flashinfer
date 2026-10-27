@@ -24,7 +24,7 @@ Contiguous grouped GEMM API with logical token gather and fused FC1 activation
 for MoE workloads.
 
 This module provides a FlashInfer-style API for CuTe DSL MoE GEMM1 layers:
-- Input A: (seq_len, k) - original unpermuted tokens; no caller-side moe_permute
+- Input A: (seq_len, k) - original unpermuted tokens (no need for moe_permute!)
 - Input B: expert projection weights, interleaved for gated activations
 - Output C: activated outputs in permuted order
 
@@ -39,14 +39,10 @@ Key features:
 - Original-token mapping through token_id_mapping
 - No caller-side permutation; Blackwell performs preparation inside the wrapper
 - Fused FC1 activation in the epilogue
-- Fused FP4 or MXFP8 output quantization with scale factor generation
+- Optional FP4 or MXFP8 quantization of output with scale factor generation
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
 - Support for SM100 (Blackwell) and SM107 (Rubin) architectures
-
-The gather API accepts original unpermuted inputs. Blackwell prepares the routed
-inputs before regular-TMA GEMM; Rubin gathers inputs inside GEMM. Both retain
-FC1 activation fusion in the epilogue.
 """
 
 import functools
@@ -79,6 +75,7 @@ from .moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 
+# Import the Blackwell (SM100) kernel implementation
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
@@ -287,8 +284,7 @@ def _get_compiled_gather_kernel(
     This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
-    The Blackwell path uses the shared runtime-N launcher. This cache serves
-    Rubin (SM107) via mma_tiler + mma_inst_shape.
+    Supports Rubin (SM107, via mma_tiler + mma_inst_shape).
     """
     global _gather_kernel_cache
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
@@ -498,7 +494,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     and canonical scales before regular-TMA GEMM. SM107 retains in-kernel gather.
 
     This API is designed for Mixture of Experts (MoE) GEMM1 layers where:
-    - Input tokens are unpermuted; callers do not invoke moe_permute
+    - Input tokens are NOT pre-permuted (no need for moe_permute kernel!)
     - token_id_mapping identifies the source token for each routed row
     - Gated activations use interleaved gate and up projection weights
     - The configured activation is fused into the GEMM epilogue
@@ -546,11 +542,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             block-scaled format and generate out_scale. This is separate from
             c_dtype because float8_e4m3fn may also be used as a plain output
             dtype without MXFP8 scale generation.
-        mma_tiler_mn: Channel/token tile shape (M, N). For Blackwell, M
-            covers weight channels and N covers routed tokens. M128/M256 use
-            N16/32/64/128/256; logical M512 uses the widths admitted by the
-            resource planner and shares one activation tile across two physical
-            M256 MMAs. Default: (256, 128).
+        mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128).
+            Blackwell uses channels on M and routed tokens on N.
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Blackwell uses
             (1, 1) with M128 or (2, 1) with M256/M512. Default: (2, 1).
         vectorized_f32: Use vectorized f32x2 operations. Default: True
@@ -592,7 +585,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
 
     Example:
-        >>> # Setup for MoE GEMM1 with 8 experts; no caller-side moe_permute.
+        >>> # Setup for MoE GEMM1 with 8 experts, no moe_permute needed!
         >>> num_experts, hidden_dim, intermediate_dim = 8, 4096, 14336
         >>> seq_len, topk = 4096, 8
         >>>
@@ -602,7 +595,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     seq_len=seq_len, topk=topk, group_m_list=group_m.tolist(), mma_tiler_m=128
         ... )
         >>>
-        >>> # Run the gather API with fused SwiGLU; preparation is internal.
+        >>> # Run gathered GEMM with SwiGLU fusion - NO moe_permute needed!
         >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     a=original_input_fp4,            # (seq_len, hidden_dim//2) - UNPERMUTED!
         ...     b=expert_gate_up_weights_fp4,    # (num_experts, 2*intermediate_dim, hidden_dim//2)
@@ -781,7 +774,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion_impl(
             raise ValueError(
                 "global_scale is required for normalized block-scaled output"
             )
-        # Blackwell pads SF storage independently of the routed-token tile.
+        # The output scale-factor tensor is laid out in whole 128-row MMA atoms.
         # Rubin requires the routed rows themselves to fill 128-row atoms.
         if is_rubin and permuted_m % 128 != 0:
             raise ValueError(

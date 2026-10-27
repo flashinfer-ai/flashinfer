@@ -2533,10 +2533,10 @@ def prepare_cute_dsl_weights(
     """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
+    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
     Blackwell SM100/SM103 pairs 16 up rows with 16 gate rows so both operands
     stay in one epilogue warp. Rubin SM107 retains its 64-row pairing.
-    Previously prepared Blackwell gated weights must be prepared again;
-    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
+    Previously prepared Blackwell gated weights must be prepared again.
     ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
     (CuTe-DSL W4A16). Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both

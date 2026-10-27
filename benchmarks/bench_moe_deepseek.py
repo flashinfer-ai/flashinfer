@@ -535,8 +535,8 @@ def bench_cute_dsl(
     """Benchmark CuteDSL MoE.
 
     Args:
-        use_wrapper: Select the public CuteDslMoEWrapper (recommended for CUDA
-            graph) or cute_dsl_fused_moe API for every CuTe DSL quant mode.
+        use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
+                    If False, use cute_dsl_fused_moe functional API.
         do_autotune: If True, run the pre-warm pass under autotune(True) so the
                     autotuner profiles all buckets and populates its cache. The
                     measurement loop runs OUTSIDE the autotune context so that
@@ -576,13 +576,17 @@ def bench_cute_dsl(
         )
 
     n, dev = inputs["router_logits"].shape[0], inputs["hidden_bf16"].device
+    # Expert range for this EP partition
     expert_start = local_expert_offset
     expert_end = local_expert_offset + num_local_experts
+    # Slice weights to LOCAL experts only
     w1_local = inputs["w1_bf16"][expert_start:expert_end]
     w2_local = inputs["w2_bf16"][expert_start:expert_end]
     gated_group_size = _cute_dsl_gated_weight_group_size(dev)
     tv, ti = _routing_tensors(inputs)
+    # Alpha sized for LOCAL experts only
     alpha = torch.ones(num_local_experts, dtype=torch.float32, device=dev)
+    # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()
 
     if quant_mode in ("w4a4", "w4a16"):
@@ -1754,7 +1758,7 @@ def _print_header(
     use_fused_finalize=True,
     quant_family="nvfp4",
 ):
-    """Print either precision family's comparison with the same table layout."""
+    """Print benchmark header."""
     _, backends, baselines, winner_width, table_width = _table_layout(quant_family)
     print("\n" + "=" * table_width)
     if quant_family == "mxfp":
@@ -1860,7 +1864,8 @@ def _print_header(
 
 
 def _print_row(results, histogram_record, quant_family="nvfp4"):
-    """Print latency, throughput and the explicitly paired TRTLLM comparisons."""
+    """Print a single row of benchmark results."""
+    # Extract values by backend
     rows = {result.backend: result for result in results}
     _, backends, baselines, winner_width, _ = _table_layout(quant_family)
     for key, _, _ in backends:
@@ -1885,6 +1890,7 @@ def _print_row(results, histogram_record, quant_family="nvfp4"):
             else:
                 speedups.append(f"{'N/A':>{ratio_width}}")
         fields.append(f"{' '.join(speedups):>{width}}")
+    # Find winner
     if winner_width:
         available = [entry for entry in backends if entry[0] in rows]
         _, winner, _ = min(available, key=lambda entry: rows[entry[0]].latency_ms)

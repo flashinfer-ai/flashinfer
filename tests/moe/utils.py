@@ -826,7 +826,7 @@ def create_moe_tensors(
 ):
     """Create properly quantized MoE tensors for testing.
 
-    CuTe kernels consume architecture-specific gated interleaves and exercise
+    CuTe SM100 kernels consume interleaved gated weights and the tests exercise
     nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
     callers should use :func:`create_b12x_moe_tensors` for that configuration.
     """

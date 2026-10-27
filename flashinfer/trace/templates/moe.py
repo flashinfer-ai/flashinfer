@@ -5006,7 +5006,7 @@ def _cute_dsl_fused_moe_reference(
     local_expert_offset=0,
     **_unused,
 ):
-    """Approximate numerical reference for CuteDSL block-scaled MoE."""
+    """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     quant_mode = quant_mode.lower()
@@ -5027,6 +5027,7 @@ def _cute_dsl_fused_moe_reference(
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
     is_mxfp = quant_mode in ("w4a8", "mxfp8")
     sf_vec_size = 32 if is_mxfp else 16
+    # FP4 weights pack two values per byte; FP8 weights are unpacked.
     weight_packing = 1 if quant_mode == "mxfp8" else 2
 
     def mma_scales_to_logical(scales, weight):

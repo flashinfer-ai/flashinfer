@@ -1746,8 +1746,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         """Fit SM100 operand stages around the epilogue's working storage.
 
         ``num_stages=None`` selects capacity at compile time. An explicit depth
-        remains available for controlled tuning. Rubin owns a separate policy
-        because its operand, TMEM and epilogue layouts differ.
+        remains available for controlled tuning.
         """
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
         stage_bytes = self._operand_bytes(self._operand_layouts(tiled_mma, 1))

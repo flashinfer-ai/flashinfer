@@ -936,7 +936,7 @@ class NVFP4QuantizePerTokenKernel:
         self.warps = threads // WARP_SIZE
         self.blocks_per_thread = (self.num_sf_blocks_per_row + threads - 1) // threads
         self.register_resident = self.blocks_per_thread <= _PER_TOKEN_MAX_REG_BLOCKS
-        # Launch-bounds budget: keep 1024 threads/SM worth of CTAs resident
+        # launch-bounds hint: keep 1024 threads/SM worth of CTAs resident
         self.min_blocks_per_mp = max(1, _MAX_THREADS_PER_BLOCK // threads)
 
     @cute.jit
@@ -1283,7 +1283,7 @@ class NVFP4QuantizePerTokenKernel:
         if tidx == Int32(0):
             mPerTokenScale[row_idx] = per_token_scale
 
-        # Pass 2: quantise only owned blocks; tail lanes still joined the amax pass.
+        # Pass 2: quantise the register copy.
         for j in cutlass.range_constexpr(self.blocks_per_thread):
             sf_col_idx = tidx + Int32(j * self.threads)
             if sf_col_idx < num_sf_blocks_per_row:
