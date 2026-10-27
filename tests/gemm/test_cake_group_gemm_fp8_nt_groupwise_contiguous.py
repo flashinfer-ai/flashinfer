@@ -21,13 +21,16 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N256_S16_ROUTE,
     BS_ROUTES,
     BS_STORE16_ROUTES,
+    BS_SWAP_C1_ROUTE,
     BS_SWAP_CARRY_ROUTE,
     BS_SWAP_CARRY_S16_ROUTE,
     BS_SWAP_ROUTE,
     BS_SWAP_ROUTES,
     BS_SWAP_RP32_ROUTE,
+    BS_SWAP_RP32_S11_ROUTE,
     BS_SWAP_RUN32_ROUTE,
     BS_SWAP_S16_ROUTE,
+    BS_SWAP_SMALL_ARCHS,
     DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
     DEEPK_C2_AB6_SCALE1_ROUTE,
     DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
@@ -50,6 +53,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     bs_route_for_shape,
     bs_store16,
     bs_swap_route_for_shape,
+    bs_swap_small_route,
     device_sm_count,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
     launch_plan,
@@ -1178,6 +1182,77 @@ def test_block_scaled_swap_rp32_rule():
         )
 
 
+def test_block_scaled_swap_small_block_rule():
+    """The small-block programs take sm_103a launches of one wave of CTAs.
+
+    The 11-stage two-CTA program takes K >= 2048 when ``2 * ceil(m / 32) *
+    n / 256`` CTAs fit ``sm_count``; the one-CTA program takes the 32-row
+    alignment at 256 <= K <= 512 and N <= 512 when ``ceil(m / 32) * n / 128``
+    CTAs fit.  sm_100a and an unknown ``sm_count`` keep the other routes.
+    """
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=8)
+    # K 4096, N 256: 2 * 76 = 152 CTAs of 32-row blocks fit 152 SMs, not 148.
+    s11 = functools.partial(rule, 2432, 256, 4096, alignment=128)
+    assert s11(arch="sm_103a", sm_count=152) == BS_SWAP_RP32_S11_ROUTE
+    assert s11(arch="sm_103a", sm_count=148) == BS_SWAP_ROUTE
+    assert s11(arch="sm_103a") == BS_SWAP_ROUTE
+    assert s11(arch="sm_100a", sm_count=152) == BS_SWAP_ROUTE
+    # Any alignment: 2 * 16 * 4 = 128 CTAs at K 2048, not at K 1920.
+    for k, sm_103a in ((2048, BS_SWAP_RP32_S11_ROUTE), (1920, BS_SWAP_RP32_ROUTE)):
+        assert rule(512, 1024, k, alignment=32, arch="sm_103a", sm_count=152) == sm_103a
+    assert (
+        rule(512, 1024, 2048, alignment=32, arch="sm_103a", sm_count=120)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert (
+        rule(512, 1024, 2048, alignment=32, arch="sm_100a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    # The one-CTA program: 36 * 4 = 144 CTAs fit 152 SMs, not 140.
+    c1 = functools.partial(rule, 1152, 512, alignment=32)
+    for k in (256, 512):
+        assert c1(k, arch="sm_103a", sm_count=152) == BS_SWAP_C1_ROUTE
+        assert c1(k, arch="sm_103a", sm_count=140) == BS_SWAP_RP32_ROUTE
+        assert c1(k, arch="sm_103a") == BS_SWAP_RUN32_ROUTE
+        assert c1(k, arch="sm_100a", sm_count=152) == BS_SWAP_RP32_ROUTE
+    # Its K range, its largest N and its alignment.
+    for k in (128, 640, 1024):
+        assert c1(k, arch="sm_103a", sm_count=152) == BS_SWAP_RP32_ROUTE
+    assert (
+        rule(384, 1024, 256, alignment=32, arch="sm_103a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert (
+        rule(1152, 512, 256, alignment=64, arch="sm_103a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert sorted(BS_SWAP_SMALL_ARCHS) == ["sm_103a"]
+    for arch in ("sm_100a", "sm_120a"):
+        assert (
+            bs_swap_small_route(1152, 512, 256, alignment=32, arch=arch, sm_count=152)
+            is None
+        )
+    assert {BS_SWAP_RP32_S11_ROUTE, BS_SWAP_C1_ROUTE} <= BS_SWAP_ROUTES
+
+
+def test_launch_plan_takes_the_small_block_routes_on_sm_103a():
+    """The small-block launches: two-CTA clusters of 32 x 256 tiles, one CTA per 32 x 128 tile."""
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, sm_count=152
+    )
+    route, grid = plan(512, 1024, 2048, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_RP32_S11_ROUTE and grid == (2 * 16 * 4, 1, 1)
+    route, grid = plan(2432, 256, 4096, alignment=128, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_RP32_S11_ROUTE and grid == (2 * 76, 1, 1)
+    route, grid = plan(1152, 512, 256, alignment=32, num_groups=12, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (36 * 4, 1, 1)
+    assert route_geometry(BS_SWAP_RP32_S11_ROUTE) == (32, 256, 2)
+    assert route_geometry(BS_SWAP_C1_ROUTE) == (32, 128, 1)
+    for arch in ("sm_100a", None):
+        route, _ = plan(1152, 512, 256, alignment=32, num_groups=12, arch=arch)
+        assert route != BS_SWAP_C1_ROUTE
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "num_groups", "alignment", "sm_100a", "sm_103a"),
     [
@@ -1346,6 +1421,80 @@ def test_block_scaled_swap_routes_match_the_non_swapped_routes(
             assert prepared.route in BS_ROUTES
         elif bs_store16(m, alignment=alignment, num_groups=len(group_counts)):
             assert prepared.route == BS_STORE16_ROUTES[expected_route]
+        else:
+            assert prepared.route == expected_route
+        prepared.launch()
+        outs.append(out)
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[0], expected, m_indices)
+    routed = m_indices >= 0
+    assert torch.equal(
+        outs[0][routed].view(torch.int16), outs[1][routed].view(torch.int16)
+    )
+
+
+# (group_counts, N, K, alignment, route): compact layouts the small-block rule
+# sends to each small-block route on sm_103a (at most 80 CTAs: one wave).
+BLOCK_SCALED_SMALL_CASES = [
+    pytest.param(
+        [5, 33, 0, 0, 97, 32, 1, 129],
+        256,
+        2048,
+        32,
+        BS_SWAP_RP32_S11_ROUTE,
+        id="rp32_s11",
+    ),
+    pytest.param(
+        [20, 0, 31, 7, 64, 1, 2, 40],
+        256,
+        2048,
+        128,
+        BS_SWAP_RP32_S11_ROUTE,
+        id="rp32_s11_single_run",
+    ),
+    pytest.param([10, 3, 0, 17, 20, 9, 12, 9], 512, 512, 32, BS_SWAP_C1_ROUTE, id="c1"),
+    pytest.param(
+        [100, 0, 3, 69, 128, 200, 1, 64],
+        256,
+        256,
+        32,
+        BS_SWAP_C1_ROUTE,
+        id="c1_k256",
+    ),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment,route", BLOCK_SCALED_SMALL_CASES)
+def test_block_scaled_small_block_routes_match_the_non_swapped_routes(
+    group_counts, n, k, alignment, route
+):
+    """A small-block route writes the bits of the non-swapped route on the same problem."""
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) not in BS_SWAP_SMALL_ARCHS:
+        pytest.skip("the small-block swap-AB programs are registered on sm_103a only")
+    inputs = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=alignment, seed=4790 + k, device=device
+    )
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = inputs
+    m = int(m_indices.numel())
+    block_rows = _make_block_scaled_inputs(
+        group_counts,
+        n,
+        k,
+        alignment=alignment,
+        seed=4790 + k,
+        device=device,
+        weight_rows_repeated=False,
+    )[5]
+    outs = []
+    for weight_scale, expected_route in ((b_packed, route), (block_rows, None)):
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, weight_scale, m_indices, out=out, alignment=alignment
+        )
+        if expected_route is None:
+            assert prepared.route in BS_ROUTES
         else:
             assert prepared.route == expected_route
         prepared.launch()

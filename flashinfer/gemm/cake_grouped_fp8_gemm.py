@@ -389,6 +389,8 @@ BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
 BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
 BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
 BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
+BS_SWAP_RP32_S11_ROUTE = "bs_ue8m0_swap_rp32_s11"
+BS_SWAP_C1_ROUTE = "bs_ue8m0_swap_c1"
 BS_SWAP_ROUTES = frozenset(
     {
         BS_SWAP_ROUTE,
@@ -397,6 +399,8 @@ BS_SWAP_ROUTES = frozenset(
         BS_SWAP_S16_ROUTE,
         BS_SWAP_CARRY_S16_ROUTE,
         BS_SWAP_RP32_ROUTE,
+        BS_SWAP_RP32_S11_ROUTE,
+        BS_SWAP_C1_ROUTE,
     }
 )
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
@@ -417,6 +421,62 @@ BS_SWAP_RP32_TILE_BOUND = {"sm_100a": (BS_SUB_ROWS, 1), "sm_103a": (BS_BLOCK_M, 
 BS_SWAP_RP32_ARCHS = frozenset(BS_SWAP_RP32_TILE_BOUND)
 BS_SWAP_RP32_MAX_ALIGNMENT = 64
 BS_SWAP_RP32_MAX_ROWS = 1536
+# The small-block swap-AB programs (32-row M blocks on a compact A slot, so
+# more stages fit in shared memory) serve these architectures, ahead of the
+# other swap-AB routes, while their launch is one wave on the device:
+# BS_SWAP_RP32_S11_ROUTE (two-CTA clusters, 11 stages) for any alignment at
+# K of at least BS_SWAP_RP32_S11_MIN_K, ``2 * ceil(m / 32) * n / 256``
+# CTAs of at most ``sm_count``; BS_SWAP_C1_ROUTE (one CTA per 32-row block
+# and 128-row weight tile, no cluster) for the 32-row alignment at
+# BS_SWAP_C1_MIN_K <= K <= BS_SWAP_C1_MAX_K and N of at most
+# BS_SWAP_C1_MAX_N, ``ceil(m / 32) * n / 128`` CTAs of at most ``sm_count``.
+# Without ``sm_count`` neither is taken.
+BS_SWAP_SMALL_ARCHS = frozenset({"sm_103a"})
+BS_SWAP_RP32_S11_MIN_K = 2048
+BS_SWAP_C1_ALIGNMENT = 32
+BS_SWAP_C1_MIN_K = 256
+BS_SWAP_C1_MAX_K = 512
+BS_SWAP_C1_MAX_N = 512
+
+
+def bs_swap_small_route(
+    m: int, n: int, k: int, *, alignment: int, arch: str, sm_count: int | None
+) -> str | None:
+    """Select a small-block swap-AB route, or ``None`` for the other swap-AB routes.
+
+    Only on ``BS_SWAP_SMALL_ARCHS`` with a known ``sm_count``, N a multiple of
+    256 and K a multiple of 128, and only while the launch is one wave:
+
+    - ``BS_SWAP_RP32_S11_ROUTE`` for K >= ``BS_SWAP_RP32_S11_MIN_K`` when
+      ``2 * ceil(m / 32) * n / 256 <= sm_count`` (two CTAs per 32 x 256 tile);
+    - ``BS_SWAP_C1_ROUTE`` for an alignment of ``BS_SWAP_C1_ALIGNMENT`` rows,
+      ``BS_SWAP_C1_MIN_K <= k <= BS_SWAP_C1_MAX_K`` and
+      ``n <= BS_SWAP_C1_MAX_N`` when ``ceil(m / 32) * n / 128 <= sm_count``
+      (one CTA per 32 x 128 tile).
+
+    Every 32-row block of a layout whose alignment is a multiple of 32 holds
+    one group's rows, so both programs serve the single-run and the multi-run
+    layouts.
+    """
+    if (
+        arch not in BS_SWAP_SMALL_ARCHS
+        or sm_count is None
+        or n % 256
+        or k % BS_BLOCK_K
+        or alignment % BS_SUB_ROWS
+    ):
+        return None
+    blocks = math.ceil(m / BS_SUB_ROWS)
+    if k >= BS_SWAP_RP32_S11_MIN_K and 2 * blocks * (n // 256) <= sm_count:
+        return BS_SWAP_RP32_S11_ROUTE
+    if (
+        alignment == BS_SWAP_C1_ALIGNMENT
+        and BS_SWAP_C1_MIN_K <= k <= BS_SWAP_C1_MAX_K
+        and n <= BS_SWAP_C1_MAX_N
+        and blocks * (n // 128) <= sm_count
+    ):
+        return BS_SWAP_C1_ROUTE
+    return None
 
 
 def bs_swap_route_for_shape(
@@ -437,6 +497,8 @@ def bs_swap_route_for_shape(
 
     - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
       tile height) or the group count is unknown.
+    - Take the route of :func:`bs_swap_small_route` when it selects one
+      (``BS_SWAP_SMALL_ARCHS`` only, one wave of CTAs, any group count).
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
       multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
       ``BS_SWAP_RP32_ARCHS``, an alignment of at most
@@ -462,6 +524,11 @@ def bs_swap_route_for_shape(
     """
     if arch not in BS_SWAP_ARCHS or n % 256 or k % BS_BLOCK_K:
         return None
+    small = bs_swap_small_route(
+        m, n, k, alignment=alignment, arch=arch, sm_count=sm_count
+    )
+    if small is not None:
+        return small
     single_run = alignment % BS_BLOCK_M == 0
     if not single_run:
         if (
