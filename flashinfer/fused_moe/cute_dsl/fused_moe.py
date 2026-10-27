@@ -805,6 +805,7 @@ def _moe_core_impl(
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
                 nvfp4_4over6=nvfp4_4over6,
+                valid_rows=total_num_padded_tokens,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(

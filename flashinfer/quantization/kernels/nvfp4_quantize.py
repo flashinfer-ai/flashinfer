@@ -883,7 +883,8 @@ def _per_token_cta_threads_default(k: int, m: int) -> int:
 
 class NVFP4QuantizePerTokenKernel:
     """
-    One CTA per token row. Every thread owns a fixed set of 16-element blocks
+    Each CTA quantizes independent token rows in a bounded grid-stride loop.
+    Every thread owns a fixed set of 16-element blocks
     (``blocks_per_thread`` of them, chosen from K at trace time) and keeps
     their 8 packed 32-bit words in registers: the row is read from global
     memory once, the amax reduction and the quantisation pass both work on
@@ -933,7 +934,7 @@ class NVFP4QuantizePerTokenKernel:
         self.warps = threads // WARP_SIZE
         self.blocks_per_thread = (self.num_sf_blocks_per_row + threads - 1) // threads
         self.register_resident = self.blocks_per_thread <= _PER_TOKEN_MAX_REG_BLOCKS
-        # launch-bounds hint: keep 2048 threads/SM worth of CTAs resident
+        # Launch-bounds budget: keep 1024 threads/SM worth of CTAs resident
         self.min_blocks_per_mp = max(1, _MAX_THREADS_PER_BLOCK // threads)
 
     @cute.jit
@@ -992,8 +993,10 @@ class NVFP4QuantizePerTokenKernel:
         mPerTokenScale: cute.Tensor,
         M: Int32,
         padded_M: Int32,
+        num_blocks: Int32,
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
+        mValidRows: Optional[cute.Tensor],
         stream,
     ):
         self.kernel(
@@ -1005,8 +1008,9 @@ class NVFP4QuantizePerTokenKernel:
             padded_M,
             mGlobalScaleInv,
             mOutScale,
+            mValidRows,
         ).launch(
-            grid=[padded_M, 1, 1],
+            grid=[num_blocks, 1, 1],
             block=[self.threads, 1, 1],
             max_number_threads=[self.threads, 1, 1],
             min_blocks_per_mp=self.min_blocks_per_mp,
@@ -1025,6 +1029,7 @@ class NVFP4QuantizePerTokenKernel:
         padded_M: Int32,
         mGlobalScaleInv: cute.Tensor,
         mOutScale: cute.Tensor,
+        mValidRows: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -1045,132 +1050,153 @@ class NVFP4QuantizePerTokenKernel:
             byte_alignment=4,
         )
 
-        row_idx = bidx
+        if cutlass.const_expr(mValidRows is not None):
+            # The count is produced on device, so read it after the dependency
+            # wait. Only complete SF atoms containing live rows need padding.
+            M = mValidRows[0]
+            if cutlass.const_expr(self.sf_is_128x4):
+                padded_M = cute.ceil_div(M, 128) * 128
+            elif cutlass.const_expr(self.sf_is_8x4):
+                padded_M = cute.ceil_div(M, 8) * 8
+            else:
+                padded_M = M
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
         threads = Int32(self.threads)
-        if row_idx >= M:
-            # Padding row: no token owns it, but the GEMM reads whole 128x4
-            # scale atoms, so its slots still have to be defined.
-            if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+        grid_stride, _, _ = cute.arch.grid_dim()
+        for row_idx in cutlass.range(bidx, padded_M, grid_stride):
+            if row_idx >= M:
+                # Padding row: no token owns it, but the GEMM reads whole 128x4
+                # scale atoms, so its slots still have to be defined.
+                if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+                    sf_col_idx = tidx
+                    while sf_col_idx < padded_sf_cols:
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + threads
+            elif cutlass.const_expr(self.register_resident):
+                self._quantize_row_register_resident(
+                    mInput,
+                    mOutput,
+                    mScales,
+                    mPerTokenScale,
+                    mGlobalScaleInv,
+                    mOutScale,
+                    reduction_buffer,
+                    row_idx,
+                    tidx,
+                )
+            else:
+                # Build the row views from 64-bit byte addresses. Slicing with
+                # mInput[row_idx, None] computes the row offset row_idx * K in
+                # Int32, which wraps once row_idx * K exceeds 2**31 - 1 (reached by
+                # the MoE per-token intermediate, e.g. M=851456 x K=2688) and makes
+                # the loads fault.
+                input_row_addr = get_ptr_as_int64(mInput, Int32(0)) + Int64(
+                    row_idx
+                ) * Int64(self.K * (mInput.element_type.width // 8))
+                row_input = cute.make_tensor(
+                    cute.make_ptr(
+                        mInput.element_type,
+                        input_row_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((self.K,)),
+                )
+                output_row_addr = get_ptr_as_int64(mOutput, Int32(0)) + Int64(
+                    row_idx
+                ) * Int64(self.K // 2)
+                row_output = cute.make_tensor(
+                    cute.make_ptr(
+                        mOutput.element_type,
+                        output_row_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=8,
+                    ),
+                    cute.make_layout((self.K // 2,)),
+                )
+
+                local_amax = Float32(0.0)
                 sf_col_idx = tidx
-                while sf_col_idx < padded_sf_cols:
+                while sf_col_idx < num_sf_blocks_per_row:
+                    elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
+                    ptr0 = get_ptr_as_int64(row_input, elem_base)
+                    ptr1 = get_ptr_as_int64(row_input, elem_base + Int32(8))
+                    h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+                    h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+                    if cutlass.const_expr(self.is_bfloat16):
+                        block_max_h2 = bfloat2_max_abs_8_fn(
+                            h0, h1, h2, h3, h4, h5, h6, h7
+                        )
+                        block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+                    else:
+                        block_max_h2 = half2_max_abs_8_fn(
+                            h0, h1, h2, h3, h4, h5, h6, h7
+                        )
+                        block_max = hmax_reduce_to_f32(block_max_h2)
+                    local_amax = fmax_f32(local_amax, block_max)
+                    sf_col_idx = sf_col_idx + threads
+
+                warp_amax = warp_reduce(local_amax, fmax_f32)
+                row_amax = block_reduce(
+                    warp_amax, fmax_f32, reduction_buffer, Float32(0.0)
+                )
+                global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
+                global_encode_scale, per_token_scale = self._row_scales(
+                    row_amax, global_scale_inv
+                )
+                if cutlass.const_expr(self.fold_out_scale):
+                    per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
+                if tidx == Int32(0):
+                    mPerTokenScale[row_idx] = per_token_scale
+                cute.arch.barrier()
+
+                sf_col_idx = tidx
+                while sf_col_idx < num_sf_blocks_per_row:
+                    elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
+                    if cutlass.const_expr(self.is_bfloat16):
+                        scale_fp8, packed64 = process_nvfp4_block_bfloat(
+                            row_input,
+                            elem_base,
+                            global_encode_scale,
+                            self.disable_fp4_quant_fast_math,
+                            self.nvfp4_4over6_config,
+                            row_amax,
+                        )
+                    else:
+                        scale_fp8, packed64 = process_nvfp4_block_half(
+                            row_input,
+                            elem_base,
+                            global_encode_scale,
+                            self.disable_fp4_quant_fast_math,
+                            self.nvfp4_4over6_config,
+                            row_amax,
+                        )
+
                     sf_offset = self._compute_sf_offset(
                         row_idx, sf_col_idx, padded_sf_cols
                     )
-                    mScales[sf_offset] = Uint8(0)
+                    mScales[sf_offset] = scale_fp8
+
+                    out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
+                    out_ptr = get_ptr_as_int64(row_output, out_base)
+                    st_global_u64(out_ptr, packed64)
+
                     sf_col_idx = sf_col_idx + threads
-        elif cutlass.const_expr(self.register_resident):
-            self._quantize_row_register_resident(
-                mInput,
-                mOutput,
-                mScales,
-                mPerTokenScale,
-                mGlobalScaleInv,
-                mOutScale,
-                reduction_buffer,
-                row_idx,
-                tidx,
-            )
-        else:
-            # Build the row views from 64-bit byte addresses. Slicing with
-            # mInput[row_idx, None] computes the row offset row_idx * K in
-            # Int32, which wraps once row_idx * K exceeds 2**31 - 1 (reached by
-            # the MoE per-token intermediate, e.g. M=851456 x K=2688) and makes
-            # the loads fault.
-            input_row_addr = get_ptr_as_int64(mInput, Int32(0)) + Int64(
-                row_idx
-            ) * Int64(self.K * (mInput.element_type.width // 8))
-            row_input = cute.make_tensor(
-                cute.make_ptr(
-                    mInput.element_type,
-                    input_row_addr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                ),
-                cute.make_layout((self.K,)),
-            )
-            output_row_addr = get_ptr_as_int64(mOutput, Int32(0)) + Int64(
-                row_idx
-            ) * Int64(self.K // 2)
-            row_output = cute.make_tensor(
-                cute.make_ptr(
-                    mOutput.element_type,
-                    output_row_addr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=8,
-                ),
-                cute.make_layout((self.K // 2,)),
-            )
 
-            local_amax = Float32(0.0)
-            sf_col_idx = tidx
-            while sf_col_idx < num_sf_blocks_per_row:
-                elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
-                ptr0 = get_ptr_as_int64(row_input, elem_base)
-                ptr1 = get_ptr_as_int64(row_input, elem_base + Int32(8))
-                h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
-                h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
-                if cutlass.const_expr(self.is_bfloat16):
-                    block_max_h2 = bfloat2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
-                    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
-                else:
-                    block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
-                    block_max = hmax_reduce_to_f32(block_max_h2)
-                local_amax = fmax_f32(local_amax, block_max)
-                sf_col_idx = sf_col_idx + threads
-
-            warp_amax = warp_reduce(local_amax, fmax_f32)
-            row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
-            global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
-            global_encode_scale, per_token_scale = self._row_scales(
-                row_amax, global_scale_inv
-            )
-            if cutlass.const_expr(self.fold_out_scale):
-                per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
-            if tidx == Int32(0):
-                mPerTokenScale[row_idx] = per_token_scale
+                if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+                    sf_col_idx = num_sf_blocks_per_row + tidx
+                    while sf_col_idx < padded_sf_cols:
+                        sf_offset = self._compute_sf_offset(
+                            row_idx, sf_col_idx, padded_sf_cols
+                        )
+                        mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + threads
+            # A subsequent row reuses the CTA-wide reduction buffer.
             cute.arch.barrier()
-
-            sf_col_idx = tidx
-            while sf_col_idx < num_sf_blocks_per_row:
-                elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
-                if cutlass.const_expr(self.is_bfloat16):
-                    scale_fp8, packed64 = process_nvfp4_block_bfloat(
-                        row_input,
-                        elem_base,
-                        global_encode_scale,
-                        self.disable_fp4_quant_fast_math,
-                        self.nvfp4_4over6_config,
-                        row_amax,
-                    )
-                else:
-                    scale_fp8, packed64 = process_nvfp4_block_half(
-                        row_input,
-                        elem_base,
-                        global_encode_scale,
-                        self.disable_fp4_quant_fast_math,
-                        self.nvfp4_4over6_config,
-                        row_amax,
-                    )
-
-                sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
-                mScales[sf_offset] = scale_fp8
-
-                out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
-                out_ptr = get_ptr_as_int64(row_output, out_base)
-                st_global_u64(out_ptr, packed64)
-
-                sf_col_idx = sf_col_idx + threads
-
-            if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
-                sf_col_idx = num_sf_blocks_per_row + tidx
-                while sf_col_idx < padded_sf_cols:
-                    sf_offset = self._compute_sf_offset(
-                        row_idx, sf_col_idx, padded_sf_cols
-                    )
-                    mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + threads
 
     @cute.jit
     def _quantize_row_register_resident(
@@ -1859,10 +1885,13 @@ def _nvfp4_kernel_name(
     pair_fp8_blocks: bool = False,
     fold_out_scale: bool = False,
     threads: int | None = None,
+    has_valid_rows: bool = False,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
     """
+    if has_valid_rows:
+        variant += "_validrows"
     name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
     if not global_scale_is_tensor:
         name += "_host_sf"
@@ -2315,6 +2344,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     fold_out_scale: bool = False,
     threads: int | None = None,
+    has_valid_rows: bool = False,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -2343,6 +2373,11 @@ def _get_compiled_kernel_nvfp4_per_token(
     out_scale_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
+    valid_rows_fake = (
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+        if has_valid_rows
+        else None
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     kernel_obj = NVFP4QuantizePerTokenKernel(
@@ -2369,6 +2404,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             nvfp4_4over6_config=nvfp4_4over6_config,
             fold_out_scale=fold_out_scale,
             threads=threads,
+            has_valid_rows=has_valid_rows,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -2378,8 +2414,10 @@ def _get_compiled_kernel_nvfp4_per_token(
             per_token_scale_fake,
             Int32(1),
             Int32(1),
+            Int32(1),
             global_scale_inv_fake,
             out_scale_fake,
+            valid_rows_fake,
             stream_fake,
             options="--enable-tvm-ffi",
         ),
@@ -3135,6 +3173,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     out_scale: torch.Tensor | None = None,
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    valid_rows: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -3181,6 +3220,14 @@ def nvfp4_quantize_per_token_cute_dsl(
         - :class:`NVFP44Over6Config`: on with exactly that recipe. The
           environment is ignored.
 
+    valid_rows : torch.Tensor, optional
+        Contiguous CUDA int32 tensor of shape ``[1]`` on the input device,
+        containing the live prefix length in ``[0, M]``. The count may change
+        between CUDA graph replays. Only that prefix is quantized; scale-factor
+        padding through its final layout tile is zeroed. Values and scales
+        beyond that prefix and its scale padding are unspecified. Omit to
+        quantize all rows. Output allocation shapes remain unchanged.
+
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -3211,6 +3258,17 @@ def nvfp4_quantize_per_token_cute_dsl(
 
     enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
     input = input.contiguous()
+    if valid_rows is not None:
+        if (
+            valid_rows.dtype != torch.int32
+            or valid_rows.shape != (1,)
+            or valid_rows.device != input.device
+            or not valid_rows.is_contiguous()
+        ):
+            raise ValueError(
+                "valid_rows must be a contiguous int32 tensor of shape [1] "
+                "on the input device"
+            )
     m, k = input.shape
     assert k % NVFP4_SF_VEC_SIZE == 0, (
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
@@ -3252,6 +3310,12 @@ def nvfp4_quantize_per_token_cute_dsl(
         # Same contract as global_scale_inv: the compiled entry takes a
         # contiguous float32 (1,) tensor on the input's device.
         out_scale = out_scale.float().reshape(1).contiguous().to(input.device)
+    threads = _per_token_cta_threads(k, m)
+    # Match the compiled minimum-occupancy budget instead of launching a CTA
+    # for every row in the worst-case allocation.
+    num_blocks = min(
+        padded_m, get_num_sm(input.device) * (_MAX_THREADS_PER_BLOCK // threads)
+    )
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,
         k,
@@ -3260,7 +3324,8 @@ def nvfp4_quantize_per_token_cute_dsl(
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
         fold_out_scale,
-        _per_token_cta_threads(k, m),
+        threads,
+        valid_rows is not None,
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
@@ -3276,8 +3341,10 @@ def nvfp4_quantize_per_token_cute_dsl(
         per_token_scale,
         m,
         padded_m,
+        num_blocks,
         global_scale_inv_tensor,
         out_scale if fold_out_scale else global_scale_inv_tensor,
+        valid_rows,
     )
 
     scale_output = scale_output.reshape(-1, padded_sf_cols)
