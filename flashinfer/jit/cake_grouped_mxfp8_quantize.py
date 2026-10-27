@@ -20,7 +20,10 @@ each shipped for sm_100a and sm_103a. The per-K forms read the group's mask word
 and exit a CTA whose first row is past the group's valid rows. In a partial group a CTA
 that stays warms L2 with its rows of the group three (K = 7168, K = 2048) or two (K =
 4096) groups ahead when that group is partial too; the K = 7168 and K = 2048 forms first
-warm L2 with the CTA's second row step. The host module
+warm L2 with the CTA's second row step. The K = 4096 form also pairs up to twelve early
+groups with late ones: when both groups of a pair hold at most 32 valid rows and the
+tile their CTAs share holds valid rows of each, the early group's CTA also runs the late
+group's tile and the late group's CTA exits. The host module
 ``flashinfer.quantization.fp8_quantization`` selects the program from the problem's
 shape, computes the grid and launches it.
 
@@ -212,12 +215,12 @@ BULK_F16 = cake_program.CakeProgram(
 )
 
 TILED_BF16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89",
+    name="cake_grouped_mxfp8_quantize_57c461d57749a545cd83",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89",
+    kernel="kernel_cake_grouped_mxfp8_quantize_57c461d57749a545cd83",
     sources=(
-        "cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89_kernel.cu",
-        "cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89_binding.cu",
+        "cake_grouped_mxfp8_quantize_57c461d57749a545cd83_kernel.cu",
+        "cake_grouped_mxfp8_quantize_57c461d57749a545cd83_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -249,12 +252,12 @@ TILED_BF16 = cake_program.CakeProgram(
 )
 
 TILED_F16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
+    name="cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
+    kernel="kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
     sources=(
-        "cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89_kernel.cu",
-        "cake_grouped_mxfp8_quantize_f35c2dbed745af4d1a89_binding.cu",
+        "cake_grouped_mxfp8_quantize_57c461d57749a545cd83_kernel.cu",
+        "cake_grouped_mxfp8_quantize_57c461d57749a545cd83_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -263,8 +266,8 @@ TILED_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
             ),
         ),
         (
@@ -272,8 +275,8 @@ TILED_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_bf9f2215ff58ae1b0988",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_1dd4abd3b665713c0df0",
             ),
         ),
     ),
@@ -305,12 +308,12 @@ TILED_F16 = cake_program.CakeProgram(
 )
 
 TILED_WIDE_BF16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_559e9b14f5065226387a",
+    name="cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_559e9b14f5065226387a",
+    kernel="kernel_cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df",
     sources=(
-        "cake_grouped_mxfp8_quantize_559e9b14f5065226387a_kernel.cu",
-        "cake_grouped_mxfp8_quantize_559e9b14f5065226387a_binding.cu",
+        "cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df_kernel.cu",
+        "cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -342,12 +345,12 @@ TILED_WIDE_BF16 = cake_program.CakeProgram(
 )
 
 TILED_WIDE_F16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
+    name="cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
+    kernel="kernel_cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
     sources=(
-        "cake_grouped_mxfp8_quantize_559e9b14f5065226387a_kernel.cu",
-        "cake_grouped_mxfp8_quantize_559e9b14f5065226387a_binding.cu",
+        "cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df_kernel.cu",
+        "cake_grouped_mxfp8_quantize_5548fcc17e49b16db1df_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -356,8 +359,8 @@ TILED_WIDE_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
             ),
         ),
         (
@@ -365,8 +368,8 @@ TILED_WIDE_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_4f8c996b4169948acb88",
             ),
         ),
     ),
@@ -398,12 +401,12 @@ TILED_WIDE_F16 = cake_program.CakeProgram(
 )
 
 TILED_K4096_BF16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d",
+    name="cake_grouped_mxfp8_quantize_377d98aae57150017fb0",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d",
+    kernel="kernel_cake_grouped_mxfp8_quantize_377d98aae57150017fb0",
     sources=(
-        "cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d_kernel.cu",
-        "cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d_binding.cu",
+        "cake_grouped_mxfp8_quantize_377d98aae57150017fb0_kernel.cu",
+        "cake_grouped_mxfp8_quantize_377d98aae57150017fb0_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -435,12 +438,12 @@ TILED_K4096_BF16 = cake_program.CakeProgram(
 )
 
 TILED_K4096_F16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
+    name="cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
+    kernel="kernel_cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
     sources=(
-        "cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d_kernel.cu",
-        "cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d_binding.cu",
+        "cake_grouped_mxfp8_quantize_377d98aae57150017fb0_kernel.cu",
+        "cake_grouped_mxfp8_quantize_377d98aae57150017fb0_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -449,8 +452,8 @@ TILED_K4096_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
             ),
         ),
         (
@@ -458,8 +461,8 @@ TILED_K4096_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_93255ff718a35b75ab2b",
             ),
         ),
     ),
@@ -491,12 +494,12 @@ TILED_K4096_F16 = cake_program.CakeProgram(
 )
 
 TILED_K2048_BF16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171",
+    name="cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171",
+    kernel="kernel_cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc",
     sources=(
-        "cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171_kernel.cu",
-        "cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171_binding.cu",
+        "cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc_kernel.cu",
+        "cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -528,12 +531,12 @@ TILED_K2048_BF16 = cake_program.CakeProgram(
 )
 
 TILED_K2048_F16 = cake_program.CakeProgram(
-    name="cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
+    name="cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
     operator_dir="cake_grouped_mxfp8_quantize",
-    kernel="kernel_cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
+    kernel="kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
     sources=(
-        "cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171_kernel.cu",
-        "cake_grouped_mxfp8_quantize_68d8a7b2c0ade47e7171_binding.cu",
+        "cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc_kernel.cu",
+        "cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -542,8 +545,8 @@ TILED_K2048_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
             ),
         ),
         (
@@ -551,8 +554,8 @@ TILED_K2048_F16 = cake_program.CakeProgram(
             (
                 "--fmad=true",
                 "-DCAKE_PROGRAM_VARIANT=1",
-                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
-                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_0fe0a4c582778ad611a1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46",
             ),
         ),
     ),

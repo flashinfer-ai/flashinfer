@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_ee6861f421c1074d1700 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_10880bc62476fde7de46 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_10880bc62476fde7de46.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_0b198af0ce3fd48455dc
 #endif
 
 typedef signed char        int8_t;
@@ -63,8 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 256
-#define LAUNCH_MIN_BLOCKS 5
+#define THREADS 128
 
 #include <math_constants.h>
 
@@ -97,7 +96,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(128) void
 CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, CakeFastDivmod BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS, unsigned int ROWS, unsigned int SUBROWS)
 {
     const int tid = threadIdx.x;
@@ -120,24 +119,31 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
     unsigned int tile = blockIdx.y;
     if (tile * (ROWS * SUBROWS) < valid_rows) {
         if (tid == 0) {
-            unsigned int far_group = group + 2;
-            if (ROWS > 1 && valid_rows < (unsigned int)M && far_group < (unsigned int)gridDim.z) {
-                int _vec_load_3[1];
-                {
-                    _vec_load_3[0] = *reinterpret_cast<const int*>(mask + far_group);
+            if (ROWS > 1 && valid_rows < (unsigned int)M) {
+                unsigned int k_lo = (unsigned int)blockIdx.x * 4096;
+                unsigned int cta_span = (((unsigned int)K - k_lo) < (4096) ? ((unsigned int)K - k_lo) : (4096));
+                unsigned int first = tile * (ROWS * SUBROWS);
+                unsigned int next_first = first + SUBROWS;
+                if (next_first < valid_rows) {
+                    unsigned int next_rows = ((valid_rows - next_first) < (SUBROWS) ? (valid_rows - next_first) : (SUBROWS));
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)group * (unsigned long long)M + (unsigned long long)next_first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(((next_rows - 1) * (unsigned int)K + cta_span) * 2)) : "memory");
                 }
-                unsigned int far_valid = (((unsigned int)_vec_load_3[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_3[0]) : ((unsigned int)M));
-                unsigned int far_first = tile * (ROWS * SUBROWS);
-                if (far_first < far_valid && far_valid < (unsigned int)M) {
-                    unsigned int far_k_lo = (unsigned int)blockIdx.x * 8192;
-                    unsigned int far_rows = ((far_valid - far_first) < (ROWS * SUBROWS) ? (far_valid - far_first) : (ROWS * SUBROWS));
-                    unsigned int _min_0 = (((unsigned int)K - far_k_lo) < (8192) ? ((unsigned int)K - far_k_lo) : (8192));
-                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)far_group * (unsigned long long)M + (unsigned long long)far_first) * (unsigned long long)K + (unsigned long long)far_k_lo)), "r"((uint32_t)(((far_rows - 1) * (unsigned int)K + _min_0) * 2)) : "memory");
+                unsigned int ahead = group + 3;
+                if (ahead < (unsigned int)gridDim.z) {
+                    int _vec_load_2[1];
+                    {
+                        _vec_load_2[0] = *reinterpret_cast<const int*>(mask + ahead);
+                    }
+                    unsigned int ahead_valid = (((unsigned int)_vec_load_2[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_2[0]) : ((unsigned int)M));
+                    if (first < ahead_valid && ahead_valid < (unsigned int)M) {
+                        unsigned int ahead_rows = ((ahead_valid - first) < (ROWS * SUBROWS) ? (ahead_valid - first) : (ROWS * SUBROWS));
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)ahead * (unsigned long long)M + (unsigned long long)first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(((ahead_rows - 1) * (unsigned int)K + cta_span) * 2)) : "memory");
+                    }
                 }
             }
         }
         unsigned int tid_0 = (unsigned int)tid;
-        unsigned int flat = (unsigned int)blockIdx.x * 256 + tid_0;
+        unsigned int flat = (unsigned int)blockIdx.x * 128 + tid_0;
         uint32_t _fast_div_q_0 = (BLOCKS_PER_ROW.divisor != 1) ? (__umulhi((uint32_t)(flat), BLOCKS_PER_ROW.multiplier) >> BLOCKS_PER_ROW.shift_right) : (uint32_t)(flat);
         uint32_t _fast_div_r_0 = (uint32_t)(flat) - _fast_div_q_0 * (uint32_t)(BLOCKS_PER_ROW.divisor);
         if (_fast_div_q_0 < SUBROWS) {
@@ -157,6 +163,25 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         if (k0 < (unsigned int)K) {
                             unsigned long long x_offset = x_row + (unsigned long long)k0;
                             {
+                                uint32_t _iv_0_0;
+                                uint32_t _iv_0_1;
+                                uint32_t _iv_0_2;
+                                uint32_t _iv_0_3;
+                                uint32_t _iv_0_4;
+                                uint32_t _iv_0_5;
+                                uint32_t _iv_0_6;
+                                uint32_t _iv_0_7;
+                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(x + x_offset + (0))) : "memory");
+                                words[0 + 0] = (uint32_t)_iv_0_0;
+                                words[0 + 1] = (uint32_t)_iv_0_1;
+                                words[0 + 2] = (uint32_t)_iv_0_2;
+                                words[0 + 3] = (uint32_t)_iv_0_3;
+                                words[0 + 4] = (uint32_t)_iv_0_4;
+                                words[0 + 5] = (uint32_t)_iv_0_5;
+                                words[0 + 6] = (uint32_t)_iv_0_6;
+                                words[0 + 7] = (uint32_t)_iv_0_7;
+                            }
+                            {
                                 uint32_t _iv_1_0;
                                 uint32_t _iv_1_1;
                                 uint32_t _iv_1_2;
@@ -165,34 +190,15 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                 uint32_t _iv_1_5;
                                 uint32_t _iv_1_6;
                                 uint32_t _iv_1_7;
-                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(x + x_offset + (0))) : "memory");
-                                words[0 + 0] = (uint32_t)_iv_1_0;
-                                words[0 + 1] = (uint32_t)_iv_1_1;
-                                words[0 + 2] = (uint32_t)_iv_1_2;
-                                words[0 + 3] = (uint32_t)_iv_1_3;
-                                words[0 + 4] = (uint32_t)_iv_1_4;
-                                words[0 + 5] = (uint32_t)_iv_1_5;
-                                words[0 + 6] = (uint32_t)_iv_1_6;
-                                words[0 + 7] = (uint32_t)_iv_1_7;
-                            }
-                            {
-                                uint32_t _iv_2_0;
-                                uint32_t _iv_2_1;
-                                uint32_t _iv_2_2;
-                                uint32_t _iv_2_3;
-                                uint32_t _iv_2_4;
-                                uint32_t _iv_2_5;
-                                uint32_t _iv_2_6;
-                                uint32_t _iv_2_7;
-                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_2_0), "=r"(_iv_2_1), "=r"(_iv_2_2), "=r"(_iv_2_3), "=r"(_iv_2_4), "=r"(_iv_2_5), "=r"(_iv_2_6), "=r"(_iv_2_7) : "l"((const void*)(x + (x_offset + 16) + (0))) : "memory");
-                                words[8 + 0] = (uint32_t)_iv_2_0;
-                                words[8 + 1] = (uint32_t)_iv_2_1;
-                                words[8 + 2] = (uint32_t)_iv_2_2;
-                                words[8 + 3] = (uint32_t)_iv_2_3;
-                                words[8 + 4] = (uint32_t)_iv_2_4;
-                                words[8 + 5] = (uint32_t)_iv_2_5;
-                                words[8 + 6] = (uint32_t)_iv_2_6;
-                                words[8 + 7] = (uint32_t)_iv_2_7;
+                                asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(x + (x_offset + 16) + (0))) : "memory");
+                                words[8 + 0] = (uint32_t)_iv_1_0;
+                                words[8 + 1] = (uint32_t)_iv_1_1;
+                                words[8 + 2] = (uint32_t)_iv_1_2;
+                                words[8 + 3] = (uint32_t)_iv_1_3;
+                                words[8 + 4] = (uint32_t)_iv_1_4;
+                                words[8 + 5] = (uint32_t)_iv_1_5;
+                                words[8 + 6] = (uint32_t)_iv_1_6;
+                                words[8 + 7] = (uint32_t)_iv_1_7;
                             }
                         } else {
                             #pragma unroll
@@ -281,9 +287,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         uint32_t _f16x2_max_15;
                         asm("max.f16x2 %0, %1, %2;" : "=r"(_f16x2_max_15) : "r"(tree[0]), "r"(tree[0] >> 16));
                         tree[0] = _f16x2_max_15;
-                        float _cvt_f32_f16_3;
-                        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_3) : "h"((uint16_t)(tree[0] & 65535)));
-                        unsigned int magnitude = __as_u32(_cvt_f32_f16_3) & 2147483647;
+                        float _cvt_f32_f16_2;
+                        asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_2) : "h"((uint16_t)(tree[0] & 65535)));
+                        unsigned int magnitude = __as_u32(_cvt_f32_f16_2) & 2147483647;
 #else
                         uint32_t _bf16x2_abs_0;
                         asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_0) : "r"(words[0]));
@@ -369,11 +375,11 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
 #endif
                         int shifted = (int)(magnitude - 65011713) >> 23;
 #if CAKE_PROGRAM_VARIANT == 1
-                        int _max_4 = ((shifted) > (0) ? (shifted) : (0));
-                        unsigned int finite_byte = (unsigned int)_max_4;
-#else
                         int _max_3 = ((shifted) > (0) ? (shifted) : (0));
                         unsigned int finite_byte = (unsigned int)_max_3;
+#else
+                        int _max_2 = ((shifted) > (0) ? (shifted) : (0));
+                        unsigned int finite_byte = (unsigned int)_max_2;
 #endif
                         unsigned int saturated_byte = 254;
                         unsigned int scale_byte = ((magnitude > 2139095039) ? saturated_byte : finite_byte);
@@ -687,16 +693,16 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
 #endif
                         }
 #if CAKE_PROGRAM_VARIANT == 1
-                        const float2 _scale2_5 = {inverse, inverse};
-#else
                         const float2 _scale2_4 = {inverse, inverse};
+#else
+                        const float2 _scale2_3 = {inverse, inverse};
 #endif
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
 #if CAKE_PROGRAM_VARIANT == 1
-                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_5);
-#else
                             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_4);
+#else
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_3);
 #endif
                         unsigned long long q_offset = q_row + (unsigned long long)(_fast_div_r_0 * 32);
                         unsigned int _packed_0[8];
@@ -806,16 +812,16 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         }
                         {
 #if CAKE_PROGRAM_VARIANT == 1
-                            const unsigned* _raw_stv8_6 = reinterpret_cast<const unsigned*>(_packed_0);
-#else
                             const unsigned* _raw_stv8_5 = reinterpret_cast<const unsigned*>(_packed_0);
+#else
+                            const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(_packed_0);
 #endif
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
 #if CAKE_PROGRAM_VARIANT == 1
-                                :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_6[0]), "r"(_raw_stv8_6[1]), "r"(_raw_stv8_6[2]), "r"(_raw_stv8_6[3]), "r"(_raw_stv8_6[4]), "r"(_raw_stv8_6[5]), "r"(_raw_stv8_6[6]), "r"(_raw_stv8_6[7]) : "memory");
-#else
                                 :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
+#else
+                                :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
 #endif
                         }
                         unsigned int m_tile = row / 128;
