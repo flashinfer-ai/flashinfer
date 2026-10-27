@@ -21,7 +21,8 @@ of the compact MoE layout (skipped, output rows unspecified) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
 schedule, other multiples of 32 the slower multi-run schedule).  When the
 packed words are DeepGEMM's MN-major activation words and the row-repeated
-weight words and ``N`` is a multiple of 256, the host may route a problem to
+weight words and ``N`` is a multiple of 256 (on sm_103a also an odd multiple
+of 128, see :func:`bs_swap_small_route`), the host may route a problem to
 the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
 the 256-row side of a two-CTA MMA and the routed tokens its N side.  With the
 same words, a single-run layout of at most 128 routed rows per group runs the
@@ -430,13 +431,19 @@ BS_SWAP_RP32_MAX_ROWS = 1536
 # and 128-row weight tile, no cluster) for the 32-row alignment at
 # BS_SWAP_C1_MIN_K <= K <= BS_SWAP_C1_MAX_K and N of at most
 # BS_SWAP_C1_MAX_N, ``ceil(m / 32) * n / 128`` CTAs of at most ``sm_count``.
-# Without ``sm_count`` neither is taken.
+# The other swap-AB programs need N a multiple of 256; BS_SWAP_C1_ROUTE's
+# 128-row weight tile also serves N an odd multiple of 128 for the multi-run
+# layouts (an alignment of 32, 64 or 96 rows modulo 128) at
+# BS_SWAP_C1_N128_MIN_K <= K <= BS_SWAP_C1_N128_MAX_K, with the same one-wave
+# bound.  Without ``sm_count`` none of these is taken.
 BS_SWAP_SMALL_ARCHS = frozenset({"sm_103a"})
 BS_SWAP_RP32_S11_MIN_K = 2048
 BS_SWAP_C1_ALIGNMENT = 32
 BS_SWAP_C1_MIN_K = 256
 BS_SWAP_C1_MAX_K = 512
 BS_SWAP_C1_MAX_N = 512
+BS_SWAP_C1_N128_MIN_K = 128
+BS_SWAP_C1_N128_MAX_K = 512
 
 
 def bs_swap_small_route(
@@ -445,14 +452,18 @@ def bs_swap_small_route(
     """Select a small-block swap-AB route, or ``None`` for the other swap-AB routes.
 
     Only on ``BS_SWAP_SMALL_ARCHS`` with a known ``sm_count``, N a multiple of
-    256 and K a multiple of 128, and only while the launch is one wave:
+    128 and K a multiple of 128, and only while the launch is one wave:
 
-    - ``BS_SWAP_RP32_S11_ROUTE`` for K >= ``BS_SWAP_RP32_S11_MIN_K`` when
+    - ``BS_SWAP_RP32_S11_ROUTE`` for N a multiple of 256 and
+      K >= ``BS_SWAP_RP32_S11_MIN_K`` when
       ``2 * ceil(m / 32) * n / 256 <= sm_count`` (two CTAs per 32 x 256 tile);
-    - ``BS_SWAP_C1_ROUTE`` for an alignment of ``BS_SWAP_C1_ALIGNMENT`` rows,
-      ``BS_SWAP_C1_MIN_K <= k <= BS_SWAP_C1_MAX_K`` and
-      ``n <= BS_SWAP_C1_MAX_N`` when ``ceil(m / 32) * n / 128 <= sm_count``
-      (one CTA per 32 x 128 tile).
+    - ``BS_SWAP_C1_ROUTE`` when ``ceil(m / 32) * n / 128 <= sm_count`` (one
+      CTA per 32 x 128 tile): for N a multiple of 256, an alignment of
+      ``BS_SWAP_C1_ALIGNMENT`` rows, ``BS_SWAP_C1_MIN_K <= k <=
+      BS_SWAP_C1_MAX_K`` and ``n <= BS_SWAP_C1_MAX_N``; for N an odd
+      multiple of 128, an alignment that is not a multiple of 128 (the
+      multi-run layouts) and ``BS_SWAP_C1_N128_MIN_K <= k <=
+      BS_SWAP_C1_N128_MAX_K``.
 
     Every 32-row block of a layout whose alignment is a multiple of 32 holds
     one group's rows, so both programs serve the single-run and the multi-run
@@ -461,12 +472,20 @@ def bs_swap_small_route(
     if (
         arch not in BS_SWAP_SMALL_ARCHS
         or sm_count is None
-        or n % 256
+        or n % 128
         or k % BS_BLOCK_K
         or alignment % BS_SUB_ROWS
     ):
         return None
     blocks = math.ceil(m / BS_SUB_ROWS)
+    if n % 256:
+        if (
+            alignment % BS_BLOCK_M
+            and BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K
+            and blocks * (n // 128) <= sm_count
+        ):
+            return BS_SWAP_C1_ROUTE
+        return None
     if k >= BS_SWAP_RP32_S11_MIN_K and 2 * blocks * (n // 256) <= sm_count:
         return BS_SWAP_RP32_S11_ROUTE
     if (
@@ -495,10 +514,11 @@ def bs_swap_route_for_shape(
     per group, ``(m - num_groups * (alignment - 1)) / num_groups``: the compact
     layout less each group's largest alignment padding.
 
-    - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
-      tile height) or the group count is unknown.
     - Take the route of :func:`bs_swap_small_route` when it selects one
-      (``BS_SWAP_SMALL_ARCHS`` only, one wave of CTAs, any group count).
+      (``BS_SWAP_SMALL_ARCHS`` only, one wave of CTAs, any group count; its
+      one-CTA program also takes N an odd multiple of 128).
+    - Otherwise keep the non-swapped routes when N is not a multiple of 256
+      (the swapped tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
       multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
       ``BS_SWAP_RP32_ARCHS``, an alignment of at most
@@ -522,13 +542,15 @@ def bs_swap_route_for_shape(
     The choice never changes the output bits: every route accumulates each
     output in the same K order.
     """
-    if arch not in BS_SWAP_ARCHS or n % 256 or k % BS_BLOCK_K:
+    if arch not in BS_SWAP_ARCHS or n % 128 or k % BS_BLOCK_K:
         return None
     small = bs_swap_small_route(
         m, n, k, alignment=alignment, arch=arch, sm_count=sm_count
     )
     if small is not None:
         return small
+    if n % 256:
+        return None
     single_run = alignment % BS_BLOCK_M == 0
     if not single_run:
         if (
@@ -1372,7 +1394,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         Block-scaled family only: the row alignment of expert runs in the
         compact layout, a positive multiple of 32.  Multiples of 128 run the
         single-run schedule; other values the slower 32-row multi-run schedule.
-        The swap-AB routes need ``N`` a multiple of 256, ``M`` a multiple of
+        The swap-AB routes need ``N`` a multiple of 256 (128 for the one-CTA
+        program of :func:`bs_swap_small_route`), ``M`` a multiple of
         128, the MN-major ``a_scale`` words and the row-repeated ``b_scale``
         words; other problems run the non-swapped routes.  The store16
         programs need the same ``M`` and words, an ``alignment`` multiple of

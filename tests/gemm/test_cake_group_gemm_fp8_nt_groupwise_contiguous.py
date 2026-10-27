@@ -913,15 +913,28 @@ def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignmen
         alignment=alignment,
     )
     assert prepared.route in BS_ROUTES | BS_SWAP_ROUTES
-    assert (
-        prepared.route
-        in (
-            BS_N128_RUN32_ROUTE,
-            BS_N256_RUN32_ROUTE,
-            BS_SWAP_RUN32_ROUTE,
-            BS_SWAP_RP32_ROUTE,
-        )
-    ) == (alignment % 128 != 0)
+    # The small-block programs hold one group's rows per 32-row block, so they
+    # serve the single-run and the multi-run layouts; the rule names the program.
+    small = bs_swap_small_route(
+        int(m_indices.numel()),
+        n,
+        k,
+        alignment=alignment,
+        arch=device_arch(torch.cuda.current_device()),
+        sm_count=device_sm_count(torch.cuda.current_device()),
+    )
+    if small is not None:
+        assert prepared.route == small
+    else:
+        assert (
+            prepared.route
+            in (
+                BS_N128_RUN32_ROUTE,
+                BS_N256_RUN32_ROUTE,
+                BS_SWAP_RUN32_ROUTE,
+                BS_SWAP_RP32_ROUTE,
+            )
+        ) == (alignment % 128 != 0)
     assert (prepared.route in BS_STORE16_ROUTES.values()) == bs_store16(
         int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
     )
@@ -1235,6 +1248,65 @@ def test_block_scaled_swap_small_block_rule():
     assert {BS_SWAP_RP32_S11_ROUTE, BS_SWAP_C1_ROUTE} <= BS_SWAP_ROUTES
 
 
+def test_block_scaled_swap_c1_rule_for_odd_multiples_of_128():
+    """The one-CTA program takes N an odd multiple of 128 on sm_103a launches of one wave.
+
+    The multi-run layouts (an alignment of 32, 64 or 96 rows modulo 128) at
+    128 <= K <= 512 take it when ``ceil(m / 32) * n / 128`` CTAs fit
+    ``sm_count``.  A single-run layout, a longer K, a second wave, sm_100a and
+    an unknown ``sm_count`` keep the non-swapped routes; N a multiple of 256
+    keeps its own rules.
+    """
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=4)
+    # (m, n, CTAs): 36 x 1, 36 x 3 and 12 x 9 tiles of 32 x 128.
+    for m, n, ctas in ((1152, 128, 36), (1152, 384, 108), (384, 1152, 108)):
+        for alignment in (32, 64, 96):
+            c1 = functools.partial(rule, m, n, alignment=alignment)
+            for k in (128, 256, 512):
+                assert c1(k, arch="sm_103a", sm_count=152) == BS_SWAP_C1_ROUTE
+            for k in (640, 1024):
+                assert c1(k, arch="sm_103a", sm_count=152) is None
+            # The wave edge: ``ctas`` CTAs fit ``ctas`` SMs, not ``ctas - 1``.
+            assert c1(512, arch="sm_103a", sm_count=ctas) == BS_SWAP_C1_ROUTE
+            assert c1(512, arch="sm_103a", sm_count=ctas - 1) is None
+            assert c1(512, arch="sm_103a") is None
+            assert c1(512, arch="sm_100a", sm_count=152) is None
+            assert (
+                bs_swap_small_route(
+                    m, n, 128, alignment=alignment, arch="sm_100a", sm_count=152
+                )
+                is None
+            )
+        for alignment in (128, 256):
+            assert (
+                rule(m, n, 256, alignment=alignment, arch="sm_103a", sm_count=152)
+                is None
+            )
+    # N a multiple of 256 keeps its rules: the one-CTA program at alignment 32 only.
+    for alignment, route in (
+        (32, BS_SWAP_C1_ROUTE),
+        (64, BS_SWAP_RP32_ROUTE),
+        (96, BS_SWAP_RUN32_ROUTE),
+    ):
+        assert (
+            rule(1152, 512, 256, alignment=alignment, arch="sm_103a", sm_count=152)
+            == route
+        )
+    assert (
+        rule(1152, 512, 128, alignment=32, arch="sm_103a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    # N not a multiple of 128 is never swapped.
+    for n in (192, 320):
+        assert (
+            bs_swap_small_route(
+                1152, n, 256, alignment=32, arch="sm_103a", sm_count=152
+            )
+            is None
+        )
+        assert rule(1152, n, 256, alignment=32, arch="sm_103a", sm_count=152) is None
+
+
 def test_launch_plan_takes_the_small_block_routes_on_sm_103a():
     """The small-block launches: two-CTA clusters of 32 x 256 tiles, one CTA per 32 x 128 tile."""
     plan = functools.partial(
@@ -1251,6 +1323,29 @@ def test_launch_plan_takes_the_small_block_routes_on_sm_103a():
     for arch in ("sm_100a", None):
         route, _ = plan(1152, 512, 256, alignment=32, num_groups=12, arch=arch)
         assert route != BS_SWAP_C1_ROUTE
+
+
+def test_launch_plan_takes_the_one_cta_program_for_odd_multiples_of_128():
+    """One CTA per 32 x 128 tile for N an odd multiple of 128 while it is one wave.
+
+    A second wave, sm_100a and no swap-AB arch keep the 128-column run32
+    route; a single-run layout keeps the non-swapped routes.
+    """
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, num_groups=5
+    )
+    for alignment in (32, 64, 96):
+        shape = functools.partial(plan, 1152, 384, 256, alignment=alignment)
+        for sm_count in (152, 108):
+            route, grid = shape(sm_count=sm_count, arch="sm_103a")
+            assert route == BS_SWAP_C1_ROUTE and grid == (36 * 3, 1, 1)
+        route, _ = shape(sm_count=107, arch="sm_103a")
+        assert route == BS_N128_RUN32_ROUTE
+        for arch in ("sm_100a", None):
+            route, _ = shape(sm_count=152, arch=arch)
+            assert route == BS_N128_RUN32_ROUTE
+    route, _ = plan(1152, 384, 256, sm_count=152, alignment=128, arch="sm_103a")
+    assert route not in BS_SWAP_ROUTES
 
 
 @pytest.mark.parametrize(
@@ -1462,6 +1557,24 @@ BLOCK_SCALED_SMALL_CASES = [
         BS_SWAP_C1_ROUTE,
         id="c1_k256",
     ),
+    # N an odd multiple of 128 on the multi-run layouts.
+    pytest.param(
+        [10, 3, 0, 17, 20, 9, 12, 9],
+        384,
+        128,
+        32,
+        BS_SWAP_C1_ROUTE,
+        id="c1_n384_a32_k128",
+    ),
+    pytest.param(
+        [20, 0, 31, 7, 64, 1, 2, 40],
+        128,
+        512,
+        64,
+        BS_SWAP_C1_ROUTE,
+        id="c1_n128_a64_k512",
+    ),
+    pytest.param([5, 33, 0, 40], 640, 256, 96, BS_SWAP_C1_ROUTE, id="c1_n640_a96"),
 ]
 
 
