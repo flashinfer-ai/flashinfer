@@ -353,6 +353,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     const int amax_reduction_addr = smem + 217088;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 218112);
     const int task_infos_addr = smem + 218112;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFB1))) : "memory"); }
@@ -520,6 +521,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
         { // dispatch_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             int disp_warp = warp;
             int disp_tid = disp_warp * 32 + lane;
             int total_pairs = num_tokens * top_k;
@@ -919,6 +921,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp == 4) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // load_a_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task[8];
             unsigned int a_stage = 0;
             unsigned int _phase_empty = 1;
@@ -991,6 +994,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp == 5) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // load_b_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task_1[8];
             unsigned int b_stage = 0;
             unsigned int _phase_empty_1 = 1;
@@ -1042,6 +1046,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp == 6) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // mma_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task_2[8];
             unsigned int mma_stage = 0;
             int completed_tasks = 0;
@@ -1117,6 +1122,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp == 7) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // schedule_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int counts[3];
             unsigned int state[2];
             unsigned int task_3[8];
@@ -1393,6 +1399,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
     if (warp >= 8 && warp <= 15) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
         { // epilogue_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task_4[8];
             #pragma unroll 1
             for (int task_iteration_3 = 0; task_iteration_3 < 10945; task_iteration_3++) {

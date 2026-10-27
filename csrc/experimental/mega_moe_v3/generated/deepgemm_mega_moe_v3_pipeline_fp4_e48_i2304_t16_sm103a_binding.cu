@@ -710,7 +710,7 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   dim3 block(512u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
-  cudaLaunchAttribute attrs[2]{};
+  cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = 2u;
@@ -719,6 +719,9 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   ++n;
   attrs[n].id = cudaLaunchAttributeCooperative;
   attrs[n].val.cooperative = 1;
+  ++n;
+  attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[n].val.programmaticStreamSerializationAllowed = 1;
   ++n;
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
