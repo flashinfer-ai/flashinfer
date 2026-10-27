@@ -14,7 +14,9 @@ launches asking for work bins take instead, ``_RENDERED_OWNER_HELPER_ROUTES``
 the owner/helper program a call takes when the device holds its grid, and
 ``_RENDERED_OWNER_HELPER_POOL_ROUTES`` its pooled program;
 ``_RENDERED_MAP_FOLD_ROUTES`` names the chain main bodies that also write the
-window maps, which the chain composite launches instead of the map pass.
+window maps, which the chain composite launches instead of the map pass, and
+``_RENDERED_PAIR_SHARE_ROUTES`` the M64 value-split programs that run a task's
+two value halves as a 2-CTA cluster, which long launches take instead.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -160,6 +162,15 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_PAIR_SHARE_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_PAIR_SHARE_ROUTES.items():
+        for module, program in modules.items():
+            # Short launches of the module keep its route.
+            assert module in registry._RENDERED_ROUTES[arch], (arch, module)
+            assert program != registry._RENDERED_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -203,6 +214,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_OWNER_HELPER_POOL_ROUTES[arch].items(),
             *registry._RENDERED_FOLD_ROUTES[arch].items(),
             *registry._RENDERED_MAP_FOLD_ROUTES[arch].items(),
+            *registry._RENDERED_PAIR_SHARE_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
