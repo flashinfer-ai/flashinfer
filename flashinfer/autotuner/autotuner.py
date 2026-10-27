@@ -3417,7 +3417,14 @@ class AutoTuner:
             ranked_cache = self._ranked_cache()
             cached = ranked_cache.get(cache_key)
             if _all_ranks_hit_cache(
-                cached is not None and cached[0] == policy,
+                cached is not None
+                and cached[0] == policy
+                # A shortlist ranked before batch-invariant mode was enabled
+                # may hold tactics the mode now rejects; re-rank it.
+                and all(
+                    self._batch_invariance_allows(runner, t, custom_op, "ranked")
+                    for t in cached[1]
+                ),
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
             ):
                 assert cached is not None
