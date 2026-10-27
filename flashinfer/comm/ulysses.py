@@ -287,10 +287,11 @@ class UlyssesCommunicator:
     collective whose ``out`` was registered with :meth:`allocate_output`
     writes every rank's blocks straight into the peers' registered outputs
     instead of passing them through the staging buffer; the two Cake kernels
-    share the signal protocol and may alternate call by call. The raw entry
-    points (``init_ulysses_a2a`` / ``ulysses_a2a`` / ``dispose_ulysses_a2a``)
-    always drive the portable kernel; a communicator's own collectives never
-    mix the portable and the Cake kernels on its signal words.
+    use disjoint words of one signal allocation and may alternate call by
+    call. The raw entry points (``init_ulysses_a2a`` / ``ulysses_a2a`` /
+    ``dispose_ulysses_a2a``) always drive the portable kernel; a
+    communicator's own collectives never mix the portable and the Cake
+    kernels on its signal words.
 
     Constraints
     -----------

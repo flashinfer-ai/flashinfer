@@ -42,6 +42,15 @@ Host design (the knobs are keywords; no environment variable):
 - The backward workspace is sized for every backward program of the device's
   architecture (the bias programs' partials carry a fifth, dbias, slab), so one
   buffer serves every route, token count and CUDA Graph.
+- The forward (the dynamic token-chunk programs) takes its token chunks from
+  int32 counters, two per channel tile, in a forward workspace that is zero
+  before its first launch and that every launch leaves zero: a caller-owned
+  buffer (``workspace=``, from :func:`cake_causal_conv1d_train_forward_workspace`)
+  or, when omitted, a zeroed buffer this module keeps per (device, current
+  stream), grown as needed and never zeroed again; inside a CUDA Graph capture
+  an omitted workspace is a zeroed buffer of the call's own (its zeroing is
+  captured with the launch), so a graph never shares counters with eager
+  calls or with another graph.
 """
 
 from __future__ import annotations
@@ -65,7 +74,9 @@ from .cake_jit import (
     WIDTH,
     arch_for_capability,
     backward_route,
+    counter_words,
     forward_route,
+    forward_workspace_words,
     launch_grid,
     partial_bytes,
     partial_rows,
@@ -85,6 +96,11 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 PARAMETER_DTYPES = (torch.float32, torch.bfloat16)
 # The two SiLU'-evaluation policies of the weight gradient (``silu_grad_preactivation``).
 SILU_GRAD_PREACTIVATIONS = ("bf16", "fp32")
+# The forward workspaces of the calls that pass none: (device index, CUDA stream
+# handle) -> a zeroed int32 buffer, grown as needed.  The launches of one stream
+# run in order and each leaves its counters zero, so the stream's buffer serves
+# every later forward call on it.
+_FORWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -336,7 +352,13 @@ def _launch(
     x threads x vec`` channels is refused rather than left partly unwritten.
     """
 
-    scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
+    scalars = plan(
+        S,
+        C,
+        num_docs,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+    )
     grid_x = launch_grid(record, device_index=device_index)[0]
     if scalars["n_ch_tiles"] > grid_x:
         raise ValueError(
@@ -393,6 +415,84 @@ def cake_causal_conv1d_train_backward_workspace(
     return torch.empty(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
+def cake_causal_conv1d_train_forward_workspace_bytes(
+    S: int, C: int, device: torch.device
+) -> int:
+    """Bytes of the caller-owned forward workspace for ``C`` channels on ``device``.
+
+    The forward's programs take their token chunks from int32 counters, two
+    per channel tile (the next-chunk counter and the done-CTA counter of the
+    tile), sized by the most over every forward program of every forward route
+    of the architecture (``cake_jit.forward_workspace_words``), so one buffer
+    serves every route; the size depends on ``C`` only (``S`` is checked and
+    otherwise unused, as for the backward helper).  The buffer must be zero
+    before its first launch; every launch leaves it zero, so one buffer serves
+    every later forward call of one stream, CUDA Graph replays included,
+    without zeroing.  Two launches that may run at once (on two streams, or
+    two graphs replayed concurrently) need two buffers.
+    """
+
+    device = torch.device(device)
+    S, C = int(S), int(C)
+    if S < 0:
+        raise ValueError("S must be non-negative")
+    if C <= 0 or C % CHANNEL_MULTIPLE:
+        raise ValueError(
+            f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
+        )
+    return 4 * forward_workspace_words(_device_arch(device), C)
+
+
+def cake_causal_conv1d_train_forward_workspace(
+    S: int, C: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate a zeroed int32 forward workspace (see ``..._workspace_bytes``); keep it for every later forward
+    call of one stream."""
+
+    nbytes = cake_causal_conv1d_train_forward_workspace_bytes(S, C, device)
+    return torch.zeros(nbytes // 4, dtype=torch.int32, device=torch.device(device))
+
+
+def _forward_work(
+    workspace: object, words: int, *, device: torch.device, device_index: int
+) -> Optional[torch.Tensor]:
+    """The ``work`` counters of one forward launch needing ``words`` int32 words.
+
+    A caller-owned ``workspace`` (1-D int32, contiguous, on ``device``, at least
+    ``words`` words, zero before its first launch) is used as is.  Without one:
+    inside a CUDA Graph capture a fresh zeroed buffer (its zeroing is captured
+    with the launch, so the graph shares no counters with eager calls or other
+    graphs); else the zeroed buffer this module keeps for the device and the
+    current stream, replaced by a larger zeroed one when it is too small (the
+    stream-ordered allocator frees the old one after the launches queued on
+    the stream).  ``None`` when the program takes no counters.
+    """
+
+    if workspace is not None:
+        ws = _require_tensor(workspace, "workspace")
+        if ws.ndim != 1:
+            raise ValueError(
+                f"workspace must be a 1-D int32 CUDA tensor, got shape {tuple(ws.shape)}"
+            )
+        _check_placement(ws, "workspace", device=device, dtype=torch.int32)
+        if ws.numel() < words:
+            raise ValueError(
+                f"workspace holds {ws.numel()} int32 words; this call needs at least "
+                f"{words}; allocate cake_causal_conv1d_train_forward_workspace(S, C, device)"
+            )
+        return ws
+    if words == 0:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(words, dtype=torch.int32, device=device)
+    key = (device_index, int(torch.cuda.current_stream(device_index).cuda_stream))
+    held = _FORWARD_WORKSPACES.get(key)
+    if held is None or held.numel() < words:
+        held = torch.zeros(words, dtype=torch.int32, device=device)
+        _FORWARD_WORKSPACES[key] = held
+    return held
+
+
 def _partial_view(
     workspace: object, record: dict, *, C: int, rows: int, device: torch.device
 ) -> torch.Tensor:
@@ -429,6 +529,7 @@ def cake_causal_conv1d_train_forward(
     *,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
 
@@ -449,6 +550,14 @@ def cake_causal_conv1d_train_forward(
         independent of ``weight``'s), added after the four taps.
     out : torch.Tensor, optional
         Preallocated BF16 output of ``x``'s shape, contiguous.
+    workspace : torch.Tensor, optional
+        Caller-owned int32 buffer from
+        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
+        counters, zero before its first launch; every launch leaves it zero,
+        so one buffer serves every later call of one stream).  Two launches
+        that may run at once need two buffers.  When omitted the package
+        uses a zeroed buffer it keeps per (device, current stream), or a
+        fresh zeroed one inside a CUDA Graph capture.
 
     Returns
     -------
@@ -484,6 +593,12 @@ def cake_causal_conv1d_train_forward(
     }
     if b is not None:
         values["b"] = b
+    words = max(
+        counter_words(_loader.MODULES[name], scalars["n_ch_tiles"]) for name in names
+    )
+    work = _forward_work(workspace, words, device=device, device_index=device_index)
+    if work is not None:
+        values["work"] = work
     for name in names:
         run_module(name, values, device_index=device_index)
     return y
@@ -736,5 +851,7 @@ __all__ = [
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",
     "cake_causal_conv1d_train_forward",
+    "cake_causal_conv1d_train_forward_workspace",
+    "cake_causal_conv1d_train_forward_workspace_bytes",
     "is_cake_causal_conv1d_train_supported",
 ]

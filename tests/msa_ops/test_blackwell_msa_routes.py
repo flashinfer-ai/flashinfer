@@ -18,8 +18,6 @@ is one the dispatcher derives from its inputs, and the input-derived
 predicates select exactly the registered programs.
 """
 
-from unittest import mock
-
 import pytest
 import torch
 
@@ -122,9 +120,8 @@ def _derive(route):
             max_pages=32 if paged else 0,
         )
     if kind == "decode_uniform_fp8":
-        # the single-token program serves every seqlen_q while lever D4b(dynpair) ships with its route off;
-        # a registered ``paged_dynpair`` route must be selectable by the mirror (even seqlen_q)
-        return backend._uniform_fp8_route(8 if fields == ["paged_dynpair"] else 1)
+        # the single-token program serves every seqlen_q (no other uniform-FP8 route is registered)
+        return backend._UNIFORM_FP8_SINGLE_ROUTE
     raise AssertionError(f"unknown route kind {kind!r} in {route}")
 
 
@@ -255,27 +252,15 @@ def test_prefill_route_selects_the_gqa16_paged_mask_family():
     ).endswith(":any")
 
 
-def test_uniform_fp8_route_is_the_single_token_program_unless_dynpair_is_opted_in():
-    # Lever D4b(dynpair) ships with its route off by default: every
-    # seqlen_q takes the single-token program and only that route is registered.  The
-    # mirror switch keeps the dispatcher's predicate (even seqlen_q in [2, 32]); turning
-    # it on needs a re-export that registers the ``paged_dynpair`` route again.
-    assert backend._UNIFORM_FP8_DYNPAIR_ROUTE is False
-    single = "decode_uniform_fp8:paged"
-    for seqlen_q in range(1, 35):
-        assert backend._uniform_fp8_route(seqlen_q) == single, seqlen_q
-    with mock.patch.object(backend, "_UNIFORM_FP8_DYNPAIR_ROUTE", True):
-        for seqlen_q in range(1, 33):
-            expected = (
-                "decode_uniform_fp8:paged_dynpair"
-                if seqlen_q % 2 == 0
-                else "decode_uniform_fp8:paged"
-            )
-            assert backend._uniform_fp8_route(seqlen_q) == expected, seqlen_q
-        assert backend._uniform_fp8_route(34) == "decode_uniform_fp8:paged"
+def test_uniform_fp8_route_is_the_single_token_program():
+    # every seqlen_q takes the single-token program; no other uniform-FP8 route is registered
+    single = backend._UNIFORM_FP8_SINGLE_ROUTE
+    assert single == "decode_uniform_fp8:paged"
     for target in ("sm100a", "sm103a"):
-        assert "decode_uniform_fp8:paged:main" in _route_keys(target)
-        assert "decode_uniform_fp8:paged_dynpair:main" not in _route_keys(target)
+        keys = _route_keys(target)
+        assert [key for key in keys if key.startswith("decode_uniform_fp8:")] == [
+            f"{single}:main"
+        ]
 
 
 _KMAJ_COMMON = dict(

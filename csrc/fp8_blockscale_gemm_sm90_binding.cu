@@ -74,7 +74,7 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     } else if (name == "configure_workspace") {
       return Function::FromTyped([this](TensorView workspace) { configureWorkspace(workspace); });
     }
-    return Function(nullptr);
+    return std::nullopt;
   }
 
  private:
