@@ -335,10 +335,10 @@ _SM107_MODULES = {
     "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_6525b7c5e5",
     "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_792581145e",
     "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_22c42493f3",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_eb7449d516",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_e580ac0245",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_06f84d83d9",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_65831794ea",
     "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_2a81d9c914",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_407b0c247c",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_4f267b43ad",
     "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_3dd1c85941",
     "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_c5c1370e4d",
     "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_9e250c660a",
@@ -422,6 +422,12 @@ _EXACTPRE_SMEM_BYTES = 232320
 # mbarrier); refreshed by the Cake export with the ``exactpre_*_tail`` table
 # entries.
 _EXACTPRE_TAIL_SMEM_BYTES = 232320
+# Main dynamic SMEM of the sm_107a varlen tail-pair programs (the
+# ``_SM107_MODULES`` entries of ``exactpre_*_varlen_tail``): they keep each
+# chunk's segment bounds in shared memory, 8 bytes past the pool of the other
+# tail programs, which keep ``_EXACTPRE_TAIL_SMEM_BYTES``; the Cake export
+# reads it for the launch of those table entries.
+_EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES = 232448
 # Main dynamic SMEM of the sm_107a claim programs (``exactpre_*_claim``: the
 # two-kernel varlen ring programs with the 8-byte item hand-off slots and the
 # two claim mbarrier pairs); the Cake export reads it for the launch of the
@@ -708,6 +714,13 @@ _VARIANT_SMEM_BYTES = {
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
     ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
 }
+# Main dynamic SMEM of the sm_107a renders (``_SM107_MODULES`` entries) whose
+# pool differs from their family and variant literal, by (family, mode,
+# variant); every other program, and every program on sm_100a and sm_103a,
+# launches with the literal above.
+_SM107_VARIANT_SMEM_BYTES = {
+    ("exactpre", "varlen", "tail"): _EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES,
+}
 # Cluster shape of the main kernels (the Cake export checks the generated
 # sources against it): the ``_tail`` pair programs launch as 2-CTA clusters
 # (``__cluster_dims__(2, 1, 1)`` in the device source, honored by a plain
@@ -798,8 +811,9 @@ def _main_module(name: str, arch: str) -> str:
 
 def _arch_program(name: str, arch: str) -> _Program:
     """Program ``name`` as built for ``arch``: the table binding with its main
-    kernel rebound to :func:`_main_module` and, on sm_107a, its segment
-    preprocess rebound to ``_SM107_SEGMENT_PREPROCESS`` -- or to its
+    kernel rebound to :func:`_main_module` and, on sm_107a, its main dynamic
+    SMEM to ``_SM107_VARIANT_SMEM_BYTES`` for a render of a kind it lists and
+    its segment preprocess rebound to ``_SM107_SEGMENT_PREPROCESS`` -- or to its
     early-trigger twin ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` when the main
     kernel launches with programmatic dependent launch (:func:`_main_pdl`) and
     the family is in ``_PDL_TRIGGER_FAMILIES`` (the same symbol, thread count
@@ -816,9 +830,21 @@ def _arch_program(name: str, arch: str) -> _Program:
             if _main_pdl(name, arch) and program.family in _PDL_TRIGGER_FAMILIES
             else _SM107_SEGMENT_PREPROCESS
         )
-    if main is program.main and preprocess is program.preprocess:
+    smem_bytes = program.main_smem_bytes
+    if arch == _SM107_ARCH and name in _SM107_MODULES:
+        mode = name.split("_")[2]
+        smem_bytes = _SM107_VARIANT_SMEM_BYTES.get(
+            (program.family, mode, program.variant), smem_bytes
+        )
+    if (
+        main is program.main
+        and preprocess is program.preprocess
+        and smem_bytes == program.main_smem_bytes
+    ):
         return program
-    return replace(program, main=main, preprocess=preprocess)
+    return replace(
+        program, main=main, preprocess=preprocess, main_smem_bytes=smem_bytes
+    )
 
 
 # The sm_107a two-kernel programs whose main kernel waits on the preprocess

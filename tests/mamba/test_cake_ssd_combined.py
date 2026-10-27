@@ -5866,7 +5866,8 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
     """``_main_module`` / ``_arch_program``: on sm_107a (Rubin) a program in
     ``_SM107_MODULES`` builds the table module -- the same kernel symbol,
     thread count and build flags behind the same host template and SMEM
-    literal -- and every other program (the retained start
+    literal, or the render's own literal for a kind
+    ``_SM107_VARIANT_SMEM_BYTES`` lists -- and every other program (the retained start
     ``exact_*`` programs, the SM100-only ``exactmeta_*`` programs and the
     programs whose fold source selects the Rubin descriptor mask by
     ``__CUDA_ARCH__``) its fold module; sm_100a and sm_103a always build the
@@ -5939,8 +5940,17 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
         assert rubin.main == module._scan(expected)
         assert rubin.main.kernel == program.main.kernel
         assert rubin.main.threads == 512 and rubin.main.fast_math
+        kind = (program.family, name.split("_")[2], program.variant)
+        assert rubin.main_smem_bytes == module._SM107_VARIANT_SMEM_BYTES.get(
+            kind, program.main_smem_bytes
+        )
         assert (
-            module.replace(rubin, main=program.main, preprocess=program.preprocess)
+            module.replace(
+                rubin,
+                main=program.main,
+                preprocess=program.preprocess,
+                main_smem_bytes=program.main_smem_bytes,
+            )
             == program
         )
 
@@ -8541,6 +8551,39 @@ def test_source_tail_programs_are_bound():
         module._program_name("exactpre", torch.bfloat16, False, "tail")
         == "exactpre_bf16_batched_tail"
     )
+
+
+def test_source_sm107_varlen_tail_programs_launch_with_their_smem():
+    """On sm_107a the varlen tail-pair renders (``_SM107_MODULES``) launch with
+    ``_EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES`` (their segment-bounds words sit
+    past the pool of the other tail programs); the batched tail-pair programs,
+    every program on sm_100a / sm_103a and every other sm_107a program keep
+    their table literal."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    own_smem = module._EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES
+    assert {
+        ("exactpre", "varlen", "tail"): own_smem
+    } == module._SM107_VARIANT_SMEM_BYTES
+    assert (own_smem, module._EXACTPRE_TAIL_SMEM_BYTES) == (232448, 232320)
+    owners = set()
+    for name, program in module._PROGRAMS.items():
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            built = module._arch_program(name, arch)
+            own = (
+                arch == "sm_107a"
+                and name in module._SM107_MODULES
+                and name.startswith("exactpre_")
+                and name.endswith("_varlen_tail")
+            )
+            if own:
+                owners.add(name)
+            expected = own_smem if own else program.main_smem_bytes
+            assert built.main_smem_bytes == expected, (name, arch)
+            assert built.cluster_dims == program.cluster_dims
+    assert owners == {
+        f"exactpre_{state}_varlen_tail" for state in ("bf16", "f16", "f32")
+    }
 
 
 # ---- every name the route composes ships; every shipped program is named ------
