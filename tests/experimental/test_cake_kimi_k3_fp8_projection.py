@@ -1529,7 +1529,7 @@ def test_decode_config_round6_continuation_rules(arch):
     n192 = {k for k, e in narrow.items() if e["gemm_bn"] == 192}
     n384 = {k for k, e in narrow.items() if e["gemm_bn"] == 384}
     # Round 12 (FTP-N / FTP-W): the sm_100a o_proj M 512 cells 56,48,512 (tp1, ``gemm_pf`` 2) and 56,6,512 (tp8,
-    # ``gemm_bk`` 128 + ``gemm_gs`` 1) take the 224-wide tile (32 tiles of 224 = 7168 columns, no padded column; B200 tart-level
+    # ``gemm_bk`` 128 + ``gemm_gs`` 1) take the 224-wide tile (32 tiles of 224 = 7168 columns, no padded column; B200 kernel-level
     # paired 1.0903 / 1.0291, 8/8 rounds, bit-identical) and the sm_100a 96,28,512 cell (tp1 q_proj, N = 12288) the 352-wide
     # tile (35 tiles, the last one 320 columns wide instead of the 384-wide tile's 96 padded columns; 1.0273 8/8, bit-identical);
     # both TMA-store only, sm_103a keeps its cells.
