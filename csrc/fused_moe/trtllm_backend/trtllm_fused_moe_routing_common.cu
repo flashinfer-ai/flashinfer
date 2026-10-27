@@ -38,6 +38,9 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Token count up to which the single-cluster permutation beats the cooperative kernel.
+static constexpr int32_t MaxNumTokensSingleClusterWithCoop = 4096;
+
 // Implementation of shared post-topK pipeline for all routing methods.
 // When topK is already computed (mPtrTopKIds or mPtrTopKPacked), we don't need
 // routing-method-specific logic, so all methods can use the same workflow.
@@ -84,9 +87,17 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
   // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
   // for both input types (LoadExpertIdxFromGlobal=true), so the capacity is
-  // NumBlocksPerCluster * NumThreads = 8192 tokens.
-  bool const useSingleCluster =
-      (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
+  // NumBlocksPerCluster * NumThreads = 8192 tokens. Past MaxNumTokensSingleClusterWithCoop
+  // tokens the cooperative kernel, which spreads the permutation over all SMs, is faster.
+  // Requires SM90+ (grid-sync), numExperts <= 1024.
+  // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
+  // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
+  bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) &&
+                          (data.mPtrPermutedIdxSize != nullptr) &&
+                          (data.mPtrExpertCounts != nullptr);
+  int32_t const maxNumTokensSingleCluster =
+      canUseCoop ? MaxNumTokensSingleClusterWithCoop : routingCustom::MaxNumTokensSingleCluster;
+  bool const useSingleCluster = (smMajor >= 9) && (data.mNumTokens <= maxNumTokensSingleCluster);
 
   if (useDynBlock) {
     bool const launched = routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
@@ -111,13 +122,6 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
                      "Tier<E, K> to (Cluster)PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in "
                      "RoutingCustomPolicy.cuh.");
   } else {
-    // Check if we can use the coop path (more efficient for medium token counts)
-    // Requires SM90+ (grid-sync), numExperts <= 1024.
-    // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
-    // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
-    bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) &&
-                            (data.mPtrPermutedIdxSize != nullptr) &&
-                            (data.mPtrExpertCounts != nullptr);
     bool useCoop = false;
     CoopLaunchSMCounts coopLaunchSMCounts{0, 0};
     int numBlocksCoop = 0;
