@@ -1788,6 +1788,10 @@ class Sm100BlockScaledGroupedGemmKernel:
                 # One empty completion protects all operand storage, including SF.
                 a_pipe.producer_tail(producer.clone())
         elif warp < (8 if self.overlap_epilogue else 4):
+            # Normalization is invariant across experts and scheduled tiles.
+            norm = cutlass.Float32(1.0)
+            if cutlass.const_expr(norm_const is not None):
+                norm = norm_const[0]
             consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.acc_stages
             )
@@ -1820,9 +1824,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                     _iket.range_pop()
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_push("epi_body")
-                norm = cutlass.Float32(1.0)
-                if cutlass.const_expr(norm_const is not None):
-                    norm = norm_const[0]
                 if cutlass.const_expr(self.overlap_activation_accumulators):
                     epi_accumulator = cute.make_tensor(
                         tmem_ptr
