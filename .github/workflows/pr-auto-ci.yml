@@ -166,7 +166,8 @@ jobs:
               --jq '.id' 2>/dev/null) || WORKFLOW_ID=""
 
             if [[ -n "$WORKFLOW_ID" ]]; then
-              STALE_RUNS=$(gh api "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?branch=${HEAD_REF}&event=pull_request&per_page=50" \
+              STALE_RUNS=$(gh api -X GET "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" \
+                -f branch="$HEAD_REF" -f event=pull_request -F per_page=50 \
                 --jq "[.workflow_runs[]
                   | select(.head_sha != \"${HEAD_SHA}\"
                     and (.status == \"in_progress\" or .status == \"queued\")
