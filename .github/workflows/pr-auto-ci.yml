@@ -8,8 +8,12 @@
 # issued @flashinfer-bot run for the current commit.
 #
 # Scope preservation:
-#   If the PR's comment history contains a previous `@flashinfer-bot run <paths>`
-#   command, the auto-trigger reuses that scope (the most recent one wins).
+#   If the PR's comment history contains previous `@flashinfer-bot run <paths>`
+#   commands from authorized users, the auto-trigger reuses that scope. Multiple
+#   scoped commands for the same commit are aggregated (union of paths) — the
+#   assumption is that the user requested one scope, then extended it. A new
+#   commit with its own scoped commands replaces the previous scope; a new
+#   commit without any inherits the most recent scope.
 #   If no scoped run was ever requested, the full suite runs.
 #   The scope is published as ci/test-scope-N commit statuses on the HEAD SHA,
 #   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
@@ -18,6 +22,9 @@
 #   - PR author must be a member of the flashinfer-ci GitHub org.
 #   - At least one approving review must exist for the PR.
 #   - A CI run must not already be in-flight or passed for the HEAD SHA.
+#   - On new pushes (synchronize), any queued or in-progress runs for the
+#     previous HEAD SHA are cancelled before the new run starts — no wasted
+#     GPU time on stale commits.
 #   - The run-ci label is applied via the bot PAT so the labeled event
 #     triggers pr-test.yml (GITHUB_TOKEN events don't trigger workflows).
 
@@ -128,6 +135,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           # Check if this SHA already has a passing or active run.
           PASSED=$(gh run list \
@@ -147,13 +155,20 @@ jobs:
           # For synchronize events (new push), cancel any stale runs from the
           # previous HEAD. The new commit supersedes the old one, so letting
           # those runs finish wastes GPU time and blocks runners.
+          #
+          # Filter by head repository to avoid cancelling runs from a different
+          # fork that happens to share the same branch name.
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             STALE_RUNS=$(gh run list \
               --repo "${{ github.repository }}" \
               --workflow "pr-test.yml" \
               --branch "$HEAD_REF" \
-              --json databaseId,status,headSha \
-              --jq "[.[] | select(.headSha != \"${HEAD_SHA}\" and (.status == \"in_progress\" or .status == \"queued\"))] | .[].databaseId" \
+              --json databaseId,status,headSha,headRepository \
+              --jq "[.[]
+                | select(.headSha != \"${HEAD_SHA}\"
+                  and (.status == \"in_progress\" or .status == \"queued\")
+                  and (.headRepository.full_name // .headRepository.name) == \"${HEAD_REPO}\")]
+                | .[].databaseId" \
               2>/dev/null) || STALE_RUNS=""
 
             for RUN_ID in $STALE_RUNS; do
@@ -180,13 +195,20 @@ jobs:
             echo "needs_ci=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Scan the PR's comment history for the most recent `@flashinfer-bot run <paths>`
-      # command. If found, publish the same ci/test-scope-N commit statuses that
-      # ci-bot-commands.yml would have, so pr-test.yml picks up the scope. If no scoped
-      # run was ever requested (only bare `@flashinfer-bot run` or no bot command at
-      # all), no scope statuses are published and pr-test.yml runs the full suite.
+      # Scan the PR's comment history for `@flashinfer-bot run <paths>` commands
+      # from authorized users via the timeline API (which interleaves commits
+      # and comments chronologically). The scope rules are:
       #
-      # Comments are fetched newest-first; the first match wins (most recent command).
+      #   - Multiple scoped commands on the SAME commit are aggregated (union
+      #     of paths): successive runs on one commit extend the scope.
+      #   - A new commit that has its OWN scoped commands replaces the previous
+      #     scope entirely.
+      #   - A new commit with NO scoped commands inherits the most recent
+      #     scope — the scope carries forward until explicitly overridden.
+      #
+      # If no scoped run was ever requested, scope_args is empty and the
+      # publish-scope step will clear any stale scope statuses so the full
+      # suite runs cleanly.
       - name: Detect previous scoped run from comments
         id: scope
         if: >-
@@ -196,6 +218,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           REPO: ${{ github.repository }}
           ORG: ${{ github.repository_owner }}
           TEAM: ci-users
@@ -231,22 +254,47 @@ jobs:
             return 1
           }
 
-          # Fetch all comments (oldest-first from API). Each line is
-          # LOGIN<TAB>BODY; we walk in reverse so the newest match wins.
-          COMMENTS_JSON=$(gh api --paginate \
-            "/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | @base64' 2>/dev/null) || COMMENTS_JSON=""
+          # Use the PR timeline API to associate comments with commits.
+          # The timeline interleaves "committed" and "commented" events
+          # chronologically. We track which SHA was HEAD when each comment
+          # was posted. Only scoped commands on the CURRENT HEAD SHA matter.
+          # Multiple scoped commands on the same (current) commit are
+          # aggregated; scopes on older commits are discarded entirely.
 
-          # Walk comments in reverse (newest first) to find the most recent
-          # `@flashinfer-bot run <paths>` command. A bare `@flashinfer-bot run`
-          # (no paths) means "full suite" — treat the same as no match.
-          SCOPE_ARGS=""
+          TIMELINE=$(gh api --paginate \
+            "/repos/${REPO}/issues/${PR_NUMBER}/timeline" \
+            -H "Accept: application/vnd.github.mockingbird-preview+json" \
+            --jq '.[] | @base64' 2>/dev/null) || TIMELINE=""
+
+          CURRENT_SHA=""
+          LAST_SCOPE=""         # most recent commit's aggregated scope (carries forward)
+          PENDING_SCOPE=""      # scope being built for the current commit
           while IFS= read -r encoded; do
             [[ -z "$encoded" ]] && continue
-            COMMENT_BODY=$(echo "$encoded" | base64 -d | jq -r '.body // ""')
-            COMMENT_LOGIN=$(echo "$encoded" | base64 -d | jq -r '.user.login // ""')
+            EVENT=$(echo "$encoded" | base64 -d | jq -r '.event // ""')
 
-            # Only consider comments containing a scoped bot command.
+            # Track the most recent commit SHA seen so far.
+            if [[ "$EVENT" == "committed" ]]; then
+              NEW_SHA=$(echo "$encoded" | base64 -d | jq -r '.sha // ""')
+              if [[ -n "$NEW_SHA" && "$NEW_SHA" != "$CURRENT_SHA" ]]; then
+                # Finalise the previous commit: if it had any scoped commands,
+                # promote them to LAST_SCOPE (overriding whatever came before).
+                # If it had none, LAST_SCOPE carries forward unchanged.
+                if [[ -n "$PENDING_SCOPE" ]]; then
+                  LAST_SCOPE="$PENDING_SCOPE"
+                fi
+                CURRENT_SHA="$NEW_SHA"
+                PENDING_SCOPE=""
+              fi
+              continue
+            fi
+
+            # Only process issue comments.
+            [[ "$EVENT" == "commented" ]] || continue
+
+            COMMENT_BODY=$(echo "$encoded" | base64 -d | jq -r '.body // ""')
+            COMMENT_LOGIN=$(echo "$encoded" | base64 -d | jq -r '.actor.login // .user.login // ""')
+
             MATCH=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
               | awk '
                   /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 }; next }
@@ -258,35 +306,44 @@ jobs:
               | sed -E 's/[[:space:]]+$//') || MATCH=""
 
             if [[ -n "$MATCH" ]]; then
-              # Verify the commenter is authorized (repo role or ci-users).
               if is_authorized "$COMMENT_LOGIN"; then
-                SCOPE_ARGS="$MATCH"
-                # Don't break — keep going so the LAST (newest) authorized
-                # scoped command wins after we finish the oldest-first list.
+                if [[ -n "$PENDING_SCOPE" ]]; then
+                  PENDING_SCOPE="$PENDING_SCOPE $MATCH"
+                else
+                  PENDING_SCOPE="$MATCH"
+                fi
               else
                 echo "Skipping scope from unauthorized commenter: $COMMENT_LOGIN"
               fi
             fi
-          done <<< "$COMMENTS_JSON"
+          done <<< "$TIMELINE"
 
-          if [[ -z "$SCOPE_ARGS" ]]; then
+          # Finalise the last commit in the timeline.
+          if [[ -n "$PENDING_SCOPE" ]]; then
+            LAST_SCOPE="$PENDING_SCOPE"
+          fi
+
+          if [[ -z "$LAST_SCOPE" ]]; then
             echo "No previous scoped run found; full suite will run"
             echo "scope_args=" >> "$GITHUB_OUTPUT"
           else
-            echo "Found previous scope: $SCOPE_ARGS"
-            echo "scope_args=$SCOPE_ARGS" >> "$GITHUB_OUTPUT"
+            echo "Found scope: $LAST_SCOPE"
+            echo "scope_args=$LAST_SCOPE" >> "$GITHUB_OUTPUT"
           fi
 
       # Publish the scope as ci/test-scope-N commit statuses, mirroring
       # ci-bot-commands.yml exactly so pr-test.yml reads it the same way.
       # Uses the validated-and-chunked output from experimental_test_scope.py.
+      #
+      # This step runs even when scope_args is empty — it clears any stale
+      # scope statuses left by a previous ci-bot-commands run on this SHA,
+      # ensuring pr-test.yml sees a clean slate and runs the full suite.
       - name: Publish test scope
         id: publish-scope
         if: >-
           steps.org-check.outputs.is_member == 'true'
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
-          && steps.scope.outputs.scope_args != ''
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -311,6 +368,13 @@ jobs:
             done
           }
 
+          # If no scope was detected, just clear any stale statuses and exit.
+          if [[ -z "$SCOPE_ARGS" ]]; then
+            echo "No scope to publish; clearing any stale scope statuses"
+            clear_stale_scopes
+            exit 0
+          fi
+
           # Validate and chunk the scope paths using the same script as
           # ci-bot-commands.yml. If validation fails, clear any stale scope
           # statuses and fall back to the full suite rather than blocking —
@@ -334,11 +398,13 @@ jobs:
           mapfile -t CHUNKS <<< "$CHUNKED"
 
           # Find the high-water mark of existing scope statuses on this SHA.
+          # Fail the step if the API call fails — publishing new chunks without
+          # knowing PREV_MAX could leave stale higher-numbered chunks in place,
+          # creating a corrupted scope.
           PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
             --jq '[.statuses[].context
               | select(test("^ci/test-scope-[0-9]+$"))
-              | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
-            || PREV_MAX=0
+              | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
           PREV_MAX=${PREV_MAX:-0}
 
           publish_chunk() {
