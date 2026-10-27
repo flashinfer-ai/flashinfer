@@ -139,18 +139,73 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+def _mxfp8_grouped_test_input(batch_shape, dtype, init_data):
+    if init_data == "random":
+        return (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(
+            dtype
+        )
+    elif init_data == "boundaries":
+        assert dtype == torch.bfloat16
+        # Build on CPU so input construction itself preserves subnormals and -0.
+        tiny = torch.finfo(dtype).tiny
+        threshold = torch.tensor(448.0 * 2.0**-127, dtype=dtype)
+        maxima = torch.tensor(
+            [0.0, 2.0**-133, tiny, 2.0**-118, 448 * tiny, torch.finfo(dtype).max],
+            dtype=dtype,
+        )
+        maxima = torch.cat(
+            (
+                maxima,
+                torch.stack(
+                    (
+                        torch.nextafter(threshold, torch.tensor(0.0, dtype=dtype)),
+                        threshold,
+                        torch.nextafter(
+                            threshold, torch.tensor(torch.inf, dtype=dtype)
+                        ),
+                    )
+                ),
+            )
+        )
+        blocks = maxima[:, None].expand(-1, 32).clone()
+        blocks[:, 1::2] = -blocks[:, 1::2]
+        # Test tiny nonzero payloads inside blocks with a nonzero scale byte.
+        blocks[3:5, 2:6] = torch.tensor(
+            [2.0**-127, -(2.0**-127), 2.0**-133, -(2.0**-133)], dtype=dtype
+        )
+        blocks[:, 6] = 0.0
+        blocks[:, 7] = -0.0
+        num_blocks = batch_shape[0] * batch_shape[1] * batch_shape[2] // 32
+        return (
+            blocks[torch.arange(num_blocks) % blocks.shape[0]]
+            .reshape(batch_shape)
+            .cuda()
+        )
+    else:
+        raise ValueError(f"Unsupported grouped MXFP8 input pattern: {init_data}")
+
+
 @pytest.mark.parametrize("batch_shape", [(1, 120, 64), (2, 128, 128), (3, 256, 160)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype,init_data",
+    [
+        (torch.float16, "random"),
+        (torch.bfloat16, "random"),
+        (torch.bfloat16, "boundaries"),
+    ],
+)
 @pytest.mark.parametrize("backend", ["cuda", "cutile"])
 @torch.inference_mode()
-def test_mxfp8_grouped_quantize(batch_shape, dtype, backend):
+def test_mxfp8_grouped_quantize(batch_shape, dtype, init_data, backend):
     _skip_unless_grouped_backend(backend)
 
     torch.manual_seed(0)
     b, m, k = batch_shape
-    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    x = _mxfp8_grouped_test_input(batch_shape, dtype, init_data)
     x = x.contiguous()
     mask = torch.randint(low=1, high=m + 1, size=(b,), dtype=torch.int32, device="cuda")
+    if init_data == "boundaries":
+        mask[0] = m
 
     out, out_scale = mxfp8_grouped_quantize(x, mask, backend=backend)
     out = out.permute(2, 0, 1)
@@ -1245,11 +1300,18 @@ def test_mxfp8_experts_quantize_masked_gemm(batch_shape, use_silu_and_mul):
         (2, 64, 7168),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype,init_data",
+    [
+        (torch.float16, "random"),
+        (torch.bfloat16, "random"),
+        (torch.bfloat16, "boundaries"),
+    ],
+)
 @pytest.mark.parametrize("other_backend", ["cutile", "cake"])
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
-    batch_shape, dtype, other_backend
+    batch_shape, dtype, init_data, other_backend
 ):
     """The ``cuda`` backend reproduces the other backends' valid-row bits."""
     _skip_unless_grouped_backend("cuda")
@@ -1257,7 +1319,7 @@ def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
 
     torch.manual_seed(0)
     b, m, k = batch_shape
-    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    x = _mxfp8_grouped_test_input(batch_shape, dtype, init_data)
     mask_values = [m, 0, m // 2, max(1, m - 7)][:b]
     mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
 
@@ -1542,11 +1604,43 @@ def test_mxfp8_grouped_quantize_cuda_invalid_inputs():
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
 @pytest.mark.parametrize("k", [512, 1024])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("input_case", ["random", "boundaries"])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
+def test_mxfp8_quantize_torch_host(m, k, input_case, is_sf_swizzled_layout):
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).cpu().contiguous()
+    if input_case == "boundaries":
+        zero = torch.tensor(0.0)
+        infinity = torch.tensor(float("inf"))
+        thresholds = torch.tensor([448.0 * 2.0**-127, 448.0 * 2.0**-126, 448.0])
+        maxima = torch.cat(
+            (
+                torch.stack(
+                    (
+                        torch.nextafter(thresholds, zero),
+                        thresholds,
+                        torch.nextafter(thresholds, infinity),
+                    ),
+                    dim=1,
+                ).flatten(),
+                torch.tensor(
+                    [
+                        0.0,
+                        2.0**-149,
+                        2.0**-133,
+                        2.0**-126,
+                        2.0**-118,
+                        torch.finfo(torch.float32).max,
+                        torch.finfo(torch.bfloat16).max,
+                    ]
+                ),
+            )
+        )
+        blocks = maxima[:, None].expand(-1, 32).clone()
+        blocks[:, 1::2].neg_()
+        # Positive SF must preserve subnormal payloads; byte zero keeps -0.
+        blocks[4, 1:4] = torch.tensor([2.0**-127, -(2.0**-127), -0.0])
+        a = blocks.flatten().repeat(m * k // blocks.numel()).reshape(m, k)
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout)
 
@@ -1804,16 +1898,48 @@ def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, b
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backend):
+    """Scale thresholds and subnormal payloads share one exact backend contract."""
     if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
 
-    a = torch.zeros((2, 128), dtype=dtype, device="cuda")
-    a[:, 32:64] = float("inf")
-    a[:, 64:96] = 448.0
-    a[:, 96:128] = -448.0
+    # Construct on CPU so input generation preserves BF16 subnormals and -0.
+    a = torch.zeros((2, 128), dtype=dtype)
+    a[0, 1:32:2] = -0.0
+    a[0, 32:64] = float("inf")
+    a[0, 64:96] = 448.0
+    a[0, 96:128] = -448.0
+    zero = torch.tensor(0.0, dtype=dtype)
+    infinity = torch.tensor(float("inf"), dtype=dtype)
+    threshold = torch.tensor(448.0, dtype=dtype)
+    a[1, :32] = torch.nextafter(threshold, zero)
+    a[1, 32:64] = torch.nextafter(threshold, infinity)
+    a[1, 64:96:2] = torch.finfo(dtype).max
+    a[1, 65:96:2] = -torch.finfo(dtype).max
+    a[1, 96:128] = -0.0
+
+    if dtype == torch.bfloat16:
+        tiny = torch.zeros((2, 128), dtype=dtype)
+        # amax / 448 is FP32 subnormal, but its rounded E8M0 byte is 1.
+        tiny[0, :32] = 2.0**-118
+        # SF=1 gives inverse scale 2**126: ±2**-127 must quantize to ±0.5.
+        tiny[0, 32:64] = 448.0 * 2.0**-126
+        tiny[0, 33] = 2.0**-127
+        tiny[0, 34] = -(2.0**-127)
+        tiny[0, 35] = -0.0
+        # The minimum E8M0 threshold keeps the midpoint at byte 0 and rounds
+        # its successor to byte 1; test both neighboring BF16 inputs.
+        threshold = torch.tensor(448.0 * 2.0**-127, dtype=dtype)
+        tiny[0, 64:96] = torch.nextafter(threshold, zero)
+        tiny[0, 96:128] = threshold
+        tiny[1, :32] = torch.nextafter(threshold, infinity)
+        tiny[1, 32:64] = torch.finfo(dtype).tiny
+        tiny[1, 64:96] = 2.0**-133
+        tiny[1, 96:128] = -(2.0**-133)
+        a = torch.cat((a, tiny))
+    a = a.cuda().contiguous()
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
 
@@ -1984,41 +2110,15 @@ def test_mxfp8_quantize_layout_backend_parity(m, k, dtype, sf_layout):
         a, sf_swizzle_layout=sf_layout, backend="cute-dsl"
     )
 
-    assert a_fp8_cuda.shape == a_fp8_cute.shape, (
-        f"Quantized output shape mismatch for {sf_layout.name}: "
-        f"cuda={a_fp8_cuda.shape}, cute={a_fp8_cute.shape}"
+    _assert_mxfp8_quantize_exact(a, a_fp8_cuda, a_sf_cuda, sf_swizzle_layout=sf_layout)
+    _assert_mxfp8_quantize_exact(a, a_fp8_cute, a_sf_cute, sf_swizzle_layout=sf_layout)
+    torch.testing.assert_close(
+        a_fp8_cuda.contiguous().view(torch.uint8),
+        a_fp8_cute.contiguous().view(torch.uint8),
+        rtol=0,
+        atol=0,
     )
-    if not torch.equal(a_fp8_cuda, a_fp8_cute):
-        mismatch = a_fp8_cuda != a_fp8_cute
-        mismatch_count = int(mismatch.sum().item())
-        first_index = tuple(
-            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
-        )
-        raise AssertionError(
-            f"Quantized output element mismatch for {sf_layout.name}: "
-            f"{mismatch_count}/{a_fp8_cuda.numel()} elements differ; "
-            f"first mismatch at index {first_index}: "
-            f"cuda={a_fp8_cuda[first_index].float().item()}, "
-            f"cute={a_fp8_cute[first_index].float().item()}"
-        )
-
-    assert a_sf_cuda.shape == a_sf_cute.shape, (
-        f"Scale factor shape mismatch for {sf_layout.name}: "
-        f"cuda={a_sf_cuda.shape}, cute={a_sf_cute.shape}"
-    )
-    if not torch.equal(a_sf_cuda, a_sf_cute):
-        mismatch = a_sf_cuda != a_sf_cute
-        mismatch_count = int(mismatch.sum().item())
-        first_index = tuple(
-            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
-        )
-        raise AssertionError(
-            f"Scale factor element mismatch for {sf_layout.name}: "
-            f"{mismatch_count}/{a_sf_cuda.numel()} elements differ; "
-            f"first mismatch at index {first_index}: "
-            f"cuda={int(a_sf_cuda[first_index].item())}, "
-            f"cute={int(a_sf_cute[first_index].item())}"
-        )
+    torch.testing.assert_close(a_sf_cuda, a_sf_cute, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
