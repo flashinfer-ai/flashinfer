@@ -994,12 +994,26 @@ def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
     "dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
 )
 # Token counts at which the decode kernel splits the KV and runs the separate reduction kernel.
+# max_q_len > 1 groups the tokens into requests of max_q_len, max_q_len - 1, ..., 1 tokens.
 @pytest.mark.parametrize(
-    ("num_heads", "num_tokens"), ((64, 8), (64, 48), (64, 72), (128, 4), (128, 16))
+    ("num_heads", "num_tokens", "max_q_len"),
+    (
+        (64, 8, 1),
+        (64, 48, 1),
+        (64, 72, 1),
+        (128, 4, 1),
+        (128, 16, 1),
+        (64, 24, 4),
+        (128, 10, 4),
+    ),
 )
 @torch.inference_mode()
 def test_trtllm_gen_sparse_mla_dsv4_split_kv_attention_sinks(
-    num_heads: int, num_tokens: int, dtype: torch.dtype, enable_pdl: bool
+    num_heads: int,
+    num_tokens: int,
+    max_q_len: int,
+    dtype: torch.dtype,
+    enable_pdl: bool,
 ) -> None:
     """Split-KV decode where the attention sinks hold a large share of the softmax mass.
 
@@ -1010,7 +1024,7 @@ def test_trtllm_gen_sparse_mla_dsv4_split_kv_attention_sinks(
     check. Each token reads a different number of entries, so rows reduce different split counts.
     """
     _skip_unless_sm100_or_sm103_or_sm107()
-    torch.manual_seed(TEST_SEED_BASE + 7 * num_tokens + num_heads)
+    torch.manual_seed(TEST_SEED_BASE + 7 * num_tokens + num_heads + 1000 * max_q_len)
     device = torch.device("cuda")
     compressed_topk = _c4_topk(num_heads)
     num_swa_tokens, num_compressed_tokens = 4096, 16384
@@ -1036,9 +1050,26 @@ def test_trtllm_gen_sparse_mla_dsv4_split_kv_attention_sinks(
     compressed_indices[is_padding] = -1
     sparse_indices = torch.cat((swa_indices, compressed_indices), dim=1).int()
     sparse_topk_lens = (DSV4_SWA_TOPK + num_compressed).int()
-    seq_lens = torch.full(
-        (num_tokens,), num_swa_tokens, dtype=torch.int32, device=device
-    )
+    varlen_kwargs = {}
+    if max_q_len == 1:
+        seq_lens = torch.full(
+            (num_tokens,), num_swa_tokens, dtype=torch.int32, device=device
+        )
+    else:
+        q_lens: list[int] = []
+        while sum(q_lens) < num_tokens:
+            q_len = max_q_len - len(q_lens) % max_q_len
+            q_lens.append(min(q_len, num_tokens - sum(q_lens)))
+        seq_lens = torch.full(
+            (len(q_lens),), num_swa_tokens, dtype=torch.int32, device=device
+        )
+        varlen_kwargs = dict(
+            cum_seq_lens_q=_make_cum_seq_lens(
+                torch.tensor(q_lens, dtype=torch.int32, device=device)
+            ),
+            max_q_len=max_q_len,
+        )
+        query = query.view(num_tokens, num_heads, DSV4_HEAD_DIM)
     # The scores have a standard deviation of ~1.5, so a row's log-sum-exp is ~6-8.
     sm_scale = 1.5 / math.sqrt(DSV4_HEAD_DIM)
     sinks = (6.8 + torch.linspace(-4.0, 3.0, num_heads, device=device))[
@@ -1061,6 +1092,7 @@ def test_trtllm_gen_sparse_mla_dsv4_split_kv_attention_sinks(
         sinks=sinks,
         enable_pdl=enable_pdl,
         backend="trtllm-gen",
+        **varlen_kwargs,
     )
 
     kv = torch.cat(

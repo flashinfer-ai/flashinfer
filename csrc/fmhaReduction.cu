@@ -118,22 +118,29 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   bool constexpr ComputesSinkTermPerRow{false};
 #endif
   // The prologue ends with a __syncthreads() that every thread must reach, and which threads exit
-  // early depends on the sequence lengths loaded below. So, on that path, wait for the primary
-  // kernel before loading them.
-  if (ComputesSinkTermPerRow && params.ptrAttentionSinks != nullptr) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
+  // early depends on cumSeqLensQ. So, on that path, two threads load it and share it through
+  // shared memory, and every thread of the CTA uses the same values.
+  __shared__ int32_t sharedCumSeqLensQ[2];
+  bool const sharesCumSeqLensQ{ComputesSinkTermPerRow && params.ptrAttentionSinks != nullptr &&
+                               params.ptrCumSeqLensQ != nullptr};
+  if (sharesCumSeqLensQ) {
+    if (warpGrpThreadIdx < 2) {
+      sharedCumSeqLensQ[warpGrpThreadIdx] = params.ptrCumSeqLensQ[batchIdx + warpGrpThreadIdx];
+    }
+    __syncthreads();
   }
 
   // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
   // Fixed-Q batches are packed by mMaxSeqLenQ; grouped CTA coverage can include padded rows.
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
+                           : sharesCumSeqLensQ              ? sharedCumSeqLensQ[0]
                                                             : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
-  int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
-                            ? params.mMaxSeqLenQ
-                            : (params.ptrCumSeqLensQ[batchIdx + 1] - seqOffsetQ)};
+  int32_t const seqLenQ{
+      params.ptrCumSeqLensQ == nullptr
+          ? params.mMaxSeqLenQ
+          : (sharesCumSeqLensQ ? sharedCumSeqLensQ[1] : params.ptrCumSeqLensQ[batchIdx + 1]) -
+                seqOffsetQ};
   // The number of validTokens.
   int32_t const numValidTokens{
       min(seqLenQ - ctaIdxQ * params.mNumTokensPerCtaQ, params.mNumTokensPerCtaQ)};
@@ -236,15 +243,18 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The attention sink term is evaluated in FP64 (M_LOG2E is a double), and all threads of a row
   // need the same value. Compute capability 10.3 runs FP64 at 1/64 of the FP32 rate, so there one
-  // thread per row computes it here, from the same max (the same fmaxf sequence as the reduction
-  // loop below) and with the same expression, so the result is bit-identical to computing it in
-  // every thread. Where FP64 is fast, this extra pass costs more than it saves. The primary kernel
-  // was waited for at the top of this kernel.
+  // thread per row computes it here, from the same max (fmaxf over the same partial stats, which
+  // does not depend on the order) and with the same expression, so the result is bit-identical to
+  // computing it in every thread. Where FP64 is fast, this extra pass costs more than it saves.
   __shared__ float attentionSinkVals[ComputesSinkTermPerRow ? TileSizePerCtaQ : 1];
   // The first row and the number of rows processed by this CTA.
   int32_t const firstRowIdx{startSliceIdx * NumRowsPerSlice};
   int32_t const numRowsPerCta{(endSliceIdx - startSliceIdx) * NumRowsPerSlice};
   if (ComputesSinkTermPerRow && attentionSinksPtr != nullptr && numRowsPerCta > 0) {
+// Wait for the primary kernel to complete.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
     for (int32_t ii = warpGrpThreadIdx; ii < numRowsPerCta; ii += NumThreadsPerCta) {
       int32_t const validRowIdx{min(firstRowIdx + ii, numValidRows - 1)};
       // The local headIdxO (see the mapping of validRowIdx in the reduction loop).
