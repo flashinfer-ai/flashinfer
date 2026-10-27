@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Token-bucket launch heuristics for Hopper BF16 MegaMoE.
 
-The table is derived from the 2026-08-19 four-rank H200 DeepSeek-V4 P03
+The table is derived from a four-rank H200 DeepSeek-V4 P03
 sweep. Each entry maximizes the slowest-rank effective TFLOPS over operand
 order, tile shape, CGA shape, and legacy/ping-pong scheduling.
 """
@@ -33,7 +33,7 @@ class HopperBf16Config:
     mma_tiler_mnk: Tuple[int, int, int]
     cluster_shape_mnk: Tuple[int, int, int]
     # Cross-rank fc2 write-back placement; epi_warps won every bucket
-    # (4x H200 SXM, 2026-09-17, 5-6% ahead of reuse_dispatch_warps at 16384+).
+    # (4x H200 SXM, 5-6% ahead of reuse_dispatch_warps at 16384+).
     token_back_mode: str = DEFAULT_TOKEN_BACK_MODE
     # Scheduler group size in FC1 cluster tiles (None = one wave of clusters).
     # Several experts per group keep FC2 tiles from spinning on fc1_done right
@@ -101,7 +101,7 @@ def _config(
 
 
 HEURISTIC_CONFIGS = {
-    # BF16 schedule-twin study (a 4x H200 SXM node, 2026-09-09, 2 rounds each):
+    # BF16 schedule-twin study (a 4x H200 SXM node, 2 rounds each):
     # every bucket was measured against its basic / ping-pong / cooperative twin
     # (operand order, CGA and token-back preserved).  Cooperative (two epilogue
     # warpgroups: non-swap M64N256, swap M256xN) is either infeasible under
@@ -110,7 +110,7 @@ HEURISTIC_CONFIGS = {
     # and ping-pong differ by <1% the faster median is taken as-is.
     # 8 / 16: basic beat ping-pong by 0.9% / 0.4% (1492 vs 1506, 2455 vs 2466 us).
     #
-    # Tile K = 64 everywhere (two 4x H200 SXM nodes, 2026-09-11): with 2-byte
+    # Tile K = 64 everywhere (two 4x H200 SXM nodes): with 2-byte
     # operands a K=128 stage holds two 128 B swizzle atoms and the AB ring gets
     # only half the FP8-era stage count (e.g. Mega M64N128: 3 vs 7).  K=64
     # halves the bytes per stage, doubles the stages (the per-stage WGMMA
@@ -120,7 +120,7 @@ HEURISTIC_CONFIGS = {
     # bound buckets 8 / 32 / 64 / 128 / 256 are within +-1% on both nodes
     # (3-round A/B: -0.6 / +0.7 / +0.3 / +0.9 / -1.1%), so the table is kept
     # uniform at K=64 instead of mixing K.
-    # 8-1024 (4x H200, 2026-09-19, two interleaved rounds): several experts per
+    # 8-1024 (4x H200, two interleaved rounds): several experts per
     # scheduler group stop FC2 tiles from spinning on fc1_done right behind
     # their FC1 tiles (25% of the activation TMA producer on FP8 at 16 tokens);
     # group_hint 264 -5/-8/-5/-5/-6/-6/-8/-15% at 8..1024, one group for all
@@ -129,7 +129,7 @@ HEURISTIC_CONFIGS = {
                group_hint=264),
     16: _config(swap_ab=True, pingpong=False, tile=(128, 16, 64), cga=(1, 2, 1),
                 group_hint=264),
-    # Swap-AB token tile N=8 (a 4x H200 SXM node, 2026-09-10, 2 rounds each vs the
+    # Swap-AB token tile N=8 (a 4x H200 SXM node, 2 rounds each vs the
     # previous entry): with 32-128 tokens/rank an expert receives only a few
     # tokens, so the N>=16 token tiles are mostly padding and basic swap M128N8
     # wins: 32 non-swap pp M64N128 -> M128N8 CGA1x1 (3220 -> 2859 us, +12.6%);
@@ -144,12 +144,12 @@ HEURISTIC_CONFIGS = {
     # 128: basic M128N8 (see the N=8 note above); basic vs ping-pong within 0.4%.
     128: _config(swap_ab=True, pingpong=False, tile=(128, 8, 64), cga=(1, 2, 1),
                  group_hint=264),
-    # BF16 schedule-twin study (a 4x H200 SXM node, 2026-09-09): the cooperative
+    # BF16 schedule-twin study (a 4x H200 SXM node): the cooperative
     # swap M256N32 entry lost to basic swap M128N32 by 27% (4322 vs 3408 us).
     256: _config(swap_ab=True, pingpong=False, tile=(128, 32, 64), cga=(2, 1, 1),
                  group_hint=264),
     # 512: the FP8-era swap-AB M256N64 tile leaves a single AB stage under 2-byte
-    # operands (an 8x H200 NVL node, 2026-09-03); M128N64 CGA1x1 won that A/B and the
+    # operands (an 8x H200 NVL node); M128N64 CGA1x1 won that A/B and the
     # twin study puts basic marginally ahead of ping-pong (3937 vs 3940 us).
     512: _config(swap_ab=True, pingpong=False, tile=(128, 64, 64), cga=(1, 1, 1),
                  group_hint=ALL_EXPERTS_GROUP),
@@ -157,7 +157,7 @@ HEURISTIC_CONFIGS = {
     # busy: 3895 -> 3800 us (-5%).  16 / 128 (N16 / N8) did not gain and stay off.
     1024: _config(swap_ab=True, pingpong=True, tile=(128, 64, 64), cga=(1, 2, 1),
                   group_hint=264, tail_split_pairs=True),
-    # 2048-32768 (4x H200 SXM, 2026-09-17, block-balanced routing): swap ping-pong
+    # 2048-32768 (4x H200 SXM, block-balanced routing): swap ping-pong
     # M128N128 K64 CGA1x2 with tail-split pair tasks.  Ragged expert tails left the
     # second CTA of the 256-token cluster block on an all-padding tile (+43% /
     # +21% / +9% / +5% CTA tiles at 4096 / 8192 / 16384 / 32768, half of every task

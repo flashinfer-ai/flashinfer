@@ -11,6 +11,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
+    Int64,
     Integer,
     extract_mlir_values,
     new_from_mlir_values,
@@ -125,6 +126,12 @@ class _FusedFc12SchedState:
         current_token_offset: Int32,
         current_this_expert_token_cnt: Int32,
         current_work_linear_tile_idx: Int32,
+        # Segment-major order (internode): segment 0 walks every expert's
+        # node-local full token blocks, segment 1 the remaining blocks;
+        # ``current_segment_block_begin`` is the current expert's first
+        # cluster token block of the current segment.
+        current_segment: Int32,
+        current_segment_block_begin: Int32,
     ):
         self.current_group_idx = current_group_idx
         self.current_group_first_expert = current_group_first_expert
@@ -147,6 +154,8 @@ class _FusedFc12SchedState:
         self.current_token_offset = current_token_offset
         self.current_this_expert_token_cnt = current_this_expert_token_cnt
         self.current_work_linear_tile_idx = current_work_linear_tile_idx
+        self.current_segment = current_segment
+        self.current_segment_block_begin = current_segment_block_begin
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values = []
@@ -171,6 +180,8 @@ class _FusedFc12SchedState:
         values.extend(extract_mlir_values(self.current_token_offset))
         values.extend(extract_mlir_values(self.current_this_expert_token_cnt))
         values.extend(extract_mlir_values(self.current_work_linear_tile_idx))
+        values.extend(extract_mlir_values(self.current_segment))
+        values.extend(extract_mlir_values(self.current_segment_block_begin))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_FusedFc12SchedState":
@@ -205,6 +216,8 @@ class _FusedFc12SchedState:
             current_token_offset=_take(self.current_token_offset),
             current_this_expert_token_cnt=_take(self.current_this_expert_token_cnt),
             current_work_linear_tile_idx=_take(self.current_work_linear_tile_idx),
+            current_segment=_take(self.current_segment),
+            current_segment_block_begin=_take(self.current_segment_block_begin),
         )
 
 
@@ -302,6 +315,20 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         expert_token_sizes: Optional[cute.Tensor] = None,
         expert_token_prefix_sum: Optional[cute.Tensor] = None,
         tail_split_pairs: bool = False,
+        # Segment-major order (internode pull): per-source receive counts
+        # ``[source_rank, expert]`` (int64, count in the low word) and the
+        # source-rank range whose rows open every expert's pool segment.
+        # Node-local full token blocks of all experts are scheduled before
+        # any block that needs remote rows, which land much later.
+        expert_source_counts: Optional[cute.Tensor] = None,
+        local_source_begin: int = 0,
+        local_source_count: int = 0,
+        # Within one expert, iterate the token blocks fastest (default: the
+        # weight blocks fastest).  Token-fast keeps all token blocks of an
+        # expert on the same weight tile at the same time, so a weight tile is
+        # read from DRAM once even when the expert's weights exceed L2.
+        fc1_token_fast: bool = False,
+        fc2_token_fast: bool = False,
     ):
         """Create fused fc12 scheduler params.
 
@@ -359,9 +386,24 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
                 f"and 1 along the weight axis, got cluster_shape_mn={tuple(self.cluster_shape_mn)}"
             )
         self.tail_split_pairs = bool(tail_split_pairs)
+        if tail_split_pairs and (fc1_token_fast or fc2_token_fast):
+            raise ValueError("token-fast tile order is not combined with tail_split_pairs")
+        self.fc1_token_fast = bool(fc1_token_fast)
+        self.fc2_token_fast = bool(fc2_token_fast)
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
+        if expert_source_counts is not None and local_source_count <= 0:
+            raise ValueError("expert_source_counts needs local_source_count > 0")
+        if expert_source_counts is not None and (fc1_token_fast or fc2_token_fast):
+            raise ValueError("token-fast tile order is not combined with the segment-major order")
+        self.expert_source_counts = expert_source_counts
+        self.local_source_begin = int(local_source_begin)
+        self.local_source_count = int(local_source_count)
+
+    @property
+    def segmented(self) -> bool:
+        return self.expert_source_counts is not None
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -408,6 +450,8 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             values.extend(extract_mlir_values(self.expert_token_sizes))
         else:
             values.extend(extract_mlir_values(self.expert_token_prefix_sum))
+        if self.expert_source_counts is not None:
+            values.extend(extract_mlir_values(self.expert_source_counts))
         return values
 
     def __new_from_mlir_values__(
@@ -427,6 +471,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.sf_padding_block = self.sf_padding_block
         result.load_balance_mode = self.load_balance_mode
         result.tail_split_pairs = self.tail_split_pairs
+        result.local_source_begin = self.local_source_begin
+        result.local_source_count = self.local_source_count
+        result.fc1_token_fast = self.fc1_token_fast
+        result.fc2_token_fast = self.fc2_token_fast
 
         # Type-discriminated rebind: Python int fields copy from
         # prototype (``self``), Int32 fields consume from ``values``.
@@ -474,6 +522,14 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             )
             idx += t_len
             result.expert_token_sizes = None
+        if self.expert_source_counts is not None:
+            t_len = len(extract_mlir_values(self.expert_source_counts))
+            result.expert_source_counts = new_from_mlir_values(
+                self.expert_source_counts, values[idx : idx + t_len]
+            )
+            idx += t_len
+        else:
+            result.expert_source_counts = None
         assert idx == len(values), (
             f"Fused fc12 sched params type-discrim mismatch: idx={idx} "
             f"len(values)={len(values)}"
@@ -671,6 +727,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             current_token_offset=Int32(0),
             current_this_expert_token_cnt=Int32(0),
             current_work_linear_tile_idx=Int32(bidz),
+            current_segment=Int32(0),
+            current_segment_block_begin=Int32(0),
         )
 
         # Cached derived constants (scheduler-wide, computed once).
@@ -990,6 +1048,58 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
     @dsl_user_op
     @cute.jit
+    def _local_full_blocks(
+        self,
+        expert_idx,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Int32:
+        """Cluster token blocks of ``expert_idx`` holding only node-local rows.
+
+        The pull fills an expert's pool rows source by source, node-local
+        sources first, so its first ``floor(local_rows / cluster_tile_m)``
+        blocks never wait for remote rows.
+        """
+        params = self.params
+        local_rows = Int32(0)
+        for j in cutlass.range_constexpr(params.local_source_count):
+            local_rows = local_rows + Int32(
+                Int64(params.expert_source_counts[params.local_source_begin + j, expert_idx])
+                & Int64(0xFFFFFFFF)
+            )
+        return local_rows // Int32(params.cluster_tile_m)
+
+    @dsl_user_op
+    @cute.jit
+    def _segment_phase_tiles(
+        self,
+        token_count,
+        local_blocks,
+        num_weight_blocks,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Int32:
+        """Tasks one expert contributes to one phase of the current segment."""
+        params = self.params
+        tiles = fc12_expert_phase_tiles(
+            token_count,
+            num_weight_blocks,
+            params.cluster_tile_m,
+            params.cta_tile_shape_mnk[0],
+            params.tail_split_pairs,
+        )
+        if cutlass.const_expr(params.segmented):
+            local_tiles = local_blocks * num_weight_blocks
+            if self._fused_state.current_segment == Int32(0):
+                tiles = local_tiles
+            else:
+                tiles = tiles - local_tiles
+        return tiles
+
+    @dsl_user_op
+    @cute.jit
     def _advance_expert_within_phase(
         self,
         *,
@@ -1052,25 +1162,27 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             this_expert_token_cnt + Int32(cluster_tile_m) - 1
         ) // Int32(cluster_tile_m)
 
+        local_blocks = Int32(0)
+        if cutlass.const_expr(params.segmented):
+            local_blocks = self._local_full_blocks(state.current_expert_idx)
+            # Branch-free: state fields are not carried out of a dynamic if.
+            state.current_segment_block_begin = local_blocks * state.current_segment
+
         # --- Step 3: slide expert_tile_start / expert_tile_end.
         state.current_expert_tile_start = state.current_expert_tile_end
         # Prebind due to DSL AST.
         tiles_in_expert = Int32(0)
         if state.current_phase == Int32(BlockPhase.Linear1):
-            tiles_in_expert = fc12_expert_phase_tiles(
+            tiles_in_expert = self._segment_phase_tiles(
                 this_expert_token_cnt,
+                local_blocks,
                 self._num_fc1_intermediate_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
             )
         else:
-            tiles_in_expert = fc12_expert_phase_tiles(
+            tiles_in_expert = self._segment_phase_tiles(
                 this_expert_token_cnt,
+                local_blocks,
                 self._num_fc2_hidden_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
             )
         state.current_expert_tile_end = (
             state.current_expert_tile_start + tiles_in_expert
@@ -1136,6 +1248,28 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state.current_token_block_cumul = (
             state.current_token_block_cumul + state.current_token_block_count
         )
+        if cutlass.const_expr(params.segmented):
+            # Segment 0 covered every expert: walk them again for the blocks
+            # that need remote rows.  Branch-free (state fields are not
+            # carried out of a dynamic if): keep = 0 rewinds the walk.
+            switch = Int32(0)
+            if (state.current_segment == Int32(0)) and (
+                state.current_group_last_expert_exclusive >= self.expert_cnt
+            ):
+                switch = Int32(1)
+            keep = Int32(1) - switch
+            state.current_segment = state.current_segment + switch
+            state.current_group_last_expert_exclusive = (
+                state.current_group_last_expert_exclusive * keep
+            )
+            state.current_data_cumul = state.current_data_cumul * keep
+            state.current_sf_cumul = state.current_sf_cumul * keep
+            state.current_token_block_cumul = state.current_token_block_cumul * keep
+            state.current_token_offset = state.current_token_offset * keep
+            state.current_this_expert_token_cnt = (
+                state.current_this_expert_token_cnt * keep
+            )
+            state.current_token_block_count = state.current_token_block_count * keep
 
         # --- Step 3: snapshot new group_start cumul checkpoint.
         state.group_start_data_cumul = state.current_data_cumul
@@ -1174,19 +1308,18 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     loc=loc,
                     ip=ip,
                 )
-            cumulative_fc1 = cumulative_fc1 + fc12_expert_phase_tiles(
+            local_blocks_e = Int32(0)
+            if cutlass.const_expr(params.segmented):
+                local_blocks_e = self._local_full_blocks(expert_cursor)
+            cumulative_fc1 = cumulative_fc1 + self._segment_phase_tiles(
                 token_count_e,
+                local_blocks_e,
                 self._num_fc1_intermediate_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
             )
-            cumulative_fc2 = cumulative_fc2 + fc12_expert_phase_tiles(
+            cumulative_fc2 = cumulative_fc2 + self._segment_phase_tiles(
                 token_count_e,
+                local_blocks_e,
                 self._num_fc2_hidden_blocks,
-                cluster_tile_m,
-                params.cta_tile_shape_mnk[0],
-                params.tail_split_pairs,
             )
             expert_cursor = expert_cursor + Int32(1)
 
@@ -1239,19 +1372,42 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_intermediate_or_hidden_block_idx = Int32(0)
 
         is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
+        num_token_blocks = state.current_token_block_count
+        if cutlass.const_expr(params.segmented):
+            # Tile ids count from the segment's first block.
+            if is_fc1:
+                local_id = local_id + state.current_segment_block_begin * Int32(
+                    self._num_fc1_intermediate_blocks
+                )
+            else:
+                local_id = local_id + state.current_segment_block_begin * Int32(
+                    self._num_fc2_hidden_blocks
+                )
         if is_fc1:
             num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
-            cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
-            )
+            if const_expr(params.fc1_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
+                )
         else:
             num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
-            # Keep token-block as the slow axis in both phases.
-            cluster_token_block_idx = local_id // num_fc2_hidden_blocks
-            cluster_intermediate_or_hidden_block_idx = (
-                local_id - cluster_token_block_idx * num_fc2_hidden_blocks
-            )
+            if const_expr(params.fc2_token_fast):
+                cluster_intermediate_or_hidden_block_idx = local_id // num_token_blocks
+                cluster_token_block_idx = (
+                    local_id - cluster_intermediate_or_hidden_block_idx * num_token_blocks
+                )
+            else:
+                # Token-block as the slow axis (default).
+                cluster_token_block_idx = local_id // num_fc2_hidden_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id - cluster_token_block_idx * num_fc2_hidden_blocks
+                )
 
         # Cluster → CTA granularity (mirrors MoESchedulerBase._get_work_tile_for_linear_idx)
         cta_token_block_idx = (
@@ -1402,19 +1558,34 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # DSL carry for mutated self and while-condition fields.
         outer_group_end = state.current_group_end
         outer_group_last_expert_exclusive = state.current_group_last_expert_exclusive
-        while (
-            cluster_linear_tile_idx >= outer_group_end
-            and outer_group_last_expert_exclusive < self.expert_cnt
-        ):
-            self._advance_group(loc=loc, ip=ip)
-            self._fused_state = self._fused_state  # DSL carry
-            state = (
-                self._fused_state
-            )  # re-bind alias inside body so refresh below sees new SSA
-            outer_group_end = state.current_group_end
-            outer_group_last_expert_exclusive = (
-                state.current_group_last_expert_exclusive
-            )
+        if cutlass.const_expr(self.params.segmented):
+            outer_segment = state.current_segment
+            while cluster_linear_tile_idx >= outer_group_end and (
+                outer_group_last_expert_exclusive < self.expert_cnt
+                or outer_segment == Int32(0)
+            ):
+                self._advance_group(loc=loc, ip=ip)
+                self._fused_state = self._fused_state  # DSL carry
+                state = self._fused_state
+                outer_group_end = state.current_group_end
+                outer_group_last_expert_exclusive = (
+                    state.current_group_last_expert_exclusive
+                )
+                outer_segment = state.current_segment
+        else:
+            while (
+                cluster_linear_tile_idx >= outer_group_end
+                and outer_group_last_expert_exclusive < self.expert_cnt
+            ):
+                self._advance_group(loc=loc, ip=ip)
+                self._fused_state = self._fused_state  # DSL carry
+                state = (
+                    self._fused_state
+                )  # re-bind alias inside body so refresh below sees new SSA
+                outer_group_end = state.current_group_end
+                outer_group_last_expert_exclusive = (
+                    state.current_group_last_expert_exclusive
+                )
         state = self._fused_state  # re-bind alias to the post-while yielded SSA
 
         is_valid = cluster_linear_tile_idx < state.current_group_end

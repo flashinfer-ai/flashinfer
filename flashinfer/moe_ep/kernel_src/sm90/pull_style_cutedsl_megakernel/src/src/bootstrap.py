@@ -436,7 +436,12 @@ def init_dist_and_nvshmem() -> tuple[int, int, int, Device]:
     # here would have one rank-0 per node, all colliding in NVSHMEM init.
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
+    # The UID is host metadata; use the existing Gloo backend without
+    # initializing a CUDA/NCCL communicator. Preserve externally supplied
+    # process groups that only support the original CUDA broadcast path.
+    uid_tensor = torch.from_numpy(uid_bytes)
+    if "gloo" not in dist.get_backend():
+        uid_tensor = uid_tensor.cuda()
     dist.broadcast(uid_tensor, src=0)
     dist.barrier()
     uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)

@@ -94,14 +94,21 @@ GEOMETRY_KNOBS = (
 
 
 def default_knobs(
-    num_tokens: int, *, fp8_scale_mode: str = "per_tensor"
+    num_tokens: int,
+    *,
+    fp8_scale_mode: str = "per_tensor",
+    world_size: int = 4,
+    num_experts: int = 384,
+    num_topk: int = 6,
 ) -> Dict[str, Any]:
     """Default geometry knobs for a compile-time token count (buffer size).
 
     Wraps the kernel drop's token-bucket heuristic table
     (``heuristic_config.select_heuristic_config``), keyed on
-    ``fp8_scale_mode`` and the buffer capacity, so the ``knobs=None``
-    fallback matches the shim's established default launch configs.  The
+    ``fp8_scale_mode`` and the buffer capacity (eight-rank DeepSeek-V4
+    layouts take the table's measured ``EP8_OVERRIDES``), so the
+    ``knobs=None`` fallback matches the shim's established default launch
+    configs.  The
     table also carries the per-bucket ``token_back_mode``, ``group_hint``
     and ``tail_split_pairs``; perf knobs it does not cover (``flag_batch`` /
     ``epi_flag_batch``) are left unset -- the config defaults apply.
@@ -110,7 +117,13 @@ def default_knobs(
     """
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(fp8_scale_mode, max(int(num_tokens), 1))
+    sel = select_heuristic_config(
+        fp8_scale_mode,
+        max(int(num_tokens), 1),
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=num_topk,
+    )
     c = sel.config
     return {
         "swap_ab": c.swap_ab,
@@ -126,7 +139,10 @@ def default_knobs(
 
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def is_valid(
-    knobs: Dict[str, Any], *, apply_routing_weights_before_fc2: bool = True
+    knobs: Dict[str, Any],
+    *,
+    apply_routing_weights_before_fc2: bool = True,
+    fp8_scale_mode: str = "per_tensor",
 ) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
@@ -150,6 +166,11 @@ def is_valid(
             return False
         if pingpong and n != 128:
             return False
+    # Blockwise quantizes the FC1 output with one scale per 128 channels,
+    # formed from one task tile's channels (tile N / 2 native, M / 2
+    # swap-AB): only N=256 / M=256 tiles, never ping-pong.
+    if fp8_scale_mode == "blockwise" and (pingpong or (m if swap_ab else n) != 256):
+        return False
     if k % 128 != 0:
         return False
     if ck != 1 or (cm, cn) not in ((1, 1), (2, 1), (1, 2), (2, 2)):
@@ -187,6 +208,13 @@ def is_valid(
             return False
         if in_kernel or not apply_routing_weights_before_fc2:
             return False
+    # Deterministic slots replace the atomic dispatch path that dedup /
+    # grouped token-back reserve on, and the in-kernel reduce adds topk in
+    # arrival order.
+    if knobs.get("deterministic", False) and (
+        in_kernel or grouped or knobs.get("dedup_dispatch", False)
+    ):
+        return False
     return True
 
 
@@ -194,12 +222,14 @@ def iter_candidates(
     *,
     include_correctness: bool = False,
     base: Optional[Dict[str, Any]] = None,
+    fp8_scale_mode: str = "per_tensor",
 ) -> Iterator[Dict[str, Any]]:
     """Yield valid knob dicts (cross-product), each merged onto ``base``.
 
     ``include_correctness=False`` (default) sweeps only the perf knobs
     (output invariant); set ``True`` to also enumerate the correctness
-    knobs.  Illegal combos (per :func:`is_valid`) are skipped.
+    knobs.  Illegal combos (per :func:`is_valid` for ``fp8_scale_mode``)
+    are skipped.
     """
     space = dict(PERF_KNOBS)
     if include_correctness:
@@ -208,7 +238,7 @@ def iter_candidates(
     for values in itertools.product(*(space[n] for n in names)):
         knobs = dict(base or {})
         knobs.update(zip(names, values, strict=False))
-        if is_valid(knobs):
+        if is_valid(knobs, fp8_scale_mode=fp8_scale_mode):
             yield knobs
 
 

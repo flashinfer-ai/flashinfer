@@ -43,6 +43,9 @@ from common.megamoe_constants import (
     Fp8E5M2RcpLimit,
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
+    Fp8Fc2ActSfKTilesPerGroup,
+    Fp8Mxfp4HybridFc2ActivationScaleK,
+    fp8_fc2_act_sf_k_tiles_per_group,
     Fp8GateUpInterleave,
     Fp8WeightScaleBlockK,
     Fp8WeightScaleBlockN,
@@ -261,6 +264,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.wgmma_tile_m = 128
         self.wgmma_tile_n = n
         self.mma_tiler = self.mma_tiler_mnk
+        # The swap-AB FC1 epilogue forms one h scale block from the output
+        # channels of one task tile (raw tile M / 2): M256 for 1x128.
+        if (
+            self.fp8_scale_mode == "blockwise"
+            and (self.mma_tiler[0] // 2) % Fp8Fc2ActivationScaleK != 0
+        ):
+            raise ValueError(
+                "blockwise FP8 swap-AB needs tile M // 2 output channels "
+                f"divisible by the h scale block {Fp8Fc2ActivationScaleK}; got "
+                f"mma_tiler_mnk={self.mma_tiler} (use M=256)."
+            )
         self.token_tile_size = n
         self.wgmma_m_splits = self.mma_tiler[0] // self.wgmma_tile_m
         if self.pingpong and self.wgmma_m_splits != 1:
@@ -840,6 +854,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # MegaMoE subclass passes a zero-copy ``i32 stride=(2,)`` view onto
         # ``expert_recv_count_sum`` filled by the dispatch warps.
         expert_token_sizes: Optional[cute.Tensor] = None,
+        # Internode segment-major schedule: ``(world_size, experts)`` int64
+        # per-source receive counts; None keeps the single expert-major walk.
+        expert_source_counts: Optional[cute.Tensor] = None,
         # ── MegaMoE token-comm bundle (None on the lean path) ────────────
         # All MegaMoE-specific device branches are gated by
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
@@ -1084,7 +1101,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             # phase:
             #   activation_sf     : (tokens, hidden // 128)
             #   fc1_weight_sf     : (experts, intermediate_gateup // 128, hidden // 128)
-            #   fc1_output_sf     : (tokens, intermediate_downproj // 64)
+            #   fc1_output_sf     : (tokens, intermediate_downproj // Fp8Fc2ActivationScaleK)
             #   fc2_weight_sf     : (experts, hidden // 128, intermediate_downproj // 128)
             activation_sf_gemm = cute.make_tensor(
                 activation_sf.iterator,
@@ -1153,7 +1170,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 cute.make_layout(
                     (
                         fc1_output_sf.shape[0],
-                        intermediate_downproj // Fp8Fc2ActivationScaleK,
+                        intermediate_downproj // Fp8Mxfp4HybridFc2ActivationScaleK,
                         1,
                     ),
                     stride=(
@@ -1323,6 +1340,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
             tail_split_pairs=self.tail_split_pairs,
+            expert_source_counts=expert_source_counts,
+            local_source_begin=self.sched_local_source_begin,
+            local_source_count=self.sched_local_source_count,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
 
@@ -1632,7 +1652,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     1
                     if self.fp8_scale_mode == "mxfp4_hybrid"
                     and self.mma_tiler[2] == 256
-                    else 2
+                    else fp8_fc2_act_sf_k_tiles_per_group(self.fp8_scale_mode)
                 ),
                 tma_cta_coord=tma_cta_coord,
                 tma_cta_layout=tma_cta_layout,
@@ -1729,6 +1749,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        # Internode: materialize the NCCL GIN handles while the by-value
+        # DevComm argument dominates the whole kernel (no-op otherwise).
+        if cutlass.const_expr(token_comm_args is not None):
+            self.token_comm_hook_prepare_device_resources(token_comm_args)
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 

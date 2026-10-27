@@ -120,6 +120,8 @@ FC2_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
 # Shim per-layout default tiles (K fixed at 128 = Fp8DispatchScaleAtomK), and
 # the drop reference CSV each default maps to (see module docstring).
 DEFAULT_TILE = {"non_swap_ab": (64, 128), "swap_ab": (256, 32)}
+# Blockwise forms each 1x128 FC2-activation scale from one N256 task tile.
+DEFAULT_TILE_BLOCKWISE = {**DEFAULT_TILE, "non_swap_ab": (64, 256)}
 REF_DATE = "20260720"  # Vincent's reference run under benchmark_data/<date>/
 
 CSV_FIELDS = (
@@ -150,7 +152,14 @@ HEUR_CSV_FIELDS = (
 
 
 def _heuristic_cols(
-    backend: str, scale_mode: str, operand_order: str, tokens: int
+    backend: str,
+    scale_mode: str,
+    operand_order: str,
+    tokens: int,
+    *,
+    world_size: int,
+    num_experts: int,
+    num_topk: int,
 ) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if backend != FP8_BACKEND or operand_order != "heuristic":
@@ -162,7 +171,13 @@ def _heuristic_cols(
     bootstrap_paths()
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(scale_mode, tokens)
+    sel = select_heuristic_config(
+        scale_mode,
+        tokens,
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=num_topk,
+    )
     c = sel.config
     return [
         str(int(c.swap_ab)),
@@ -415,6 +430,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=False,
         help="training forward: also write the raw pre-SwiGLU fc1 gate+up "
         "tensor (generate_c=True on every point, both layouts); default off",
+    )
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help="launch-order-independent dispatch slots (reproducible pool row "
+        "order) on every point; default off",
     )
     p.add_argument(
         "--epi-mode",
@@ -680,6 +702,7 @@ _MANUAL_TACTIC_OPTIONS = (
         "--compact-pull-buffer",
         "--no-compact-pull-buffer",
         "--generate-c",
+        "--deterministic",
     }
 )
 
@@ -717,6 +740,7 @@ def _resolve_sweep(
                 "--generate-c",
                 "--compact-pull-buffer",
                 "--no-compact-pull-buffer",
+                "--deterministic",
             }
         )
         if fp8_only:
@@ -808,7 +832,27 @@ def _resolve_sweep(
         )
     scale_mode = args.scale_mode
     scale_modes = ("per_tensor", "blockwise") if scale_mode == "both" else (scale_mode,)
+    epi_mode = getattr(args, "epi_mode", "auto")
+    if (
+        "blockwise" in scale_modes
+        and args.operand_order == "heuristic"
+        and epi_mode in ("basic", "pingpong")
+    ):
+        raise ValueError(
+            f"--epi-mode {epi_mode} runs 128-wide task tiles, which blockwise "
+            "rejects (its 1x128 FC2-activation scales need cooperative N256 / "
+            "M256 tiles); pass --scale-mode per_tensor"
+        )
     if args.knobs is not None:
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            is_valid,
+        )
+
+        for mode in scale_modes:
+            if not is_valid(args.knobs, fp8_scale_mode=mode):
+                raise ValueError(
+                    f"--fp8-knobs-json is not a valid Hopper FP8 {mode} tactic"
+                )
         mma = args.knobs["mma_tiler_mnk"]
         order = "swap_ab" if args.knobs["swap_ab"] else "non_swap_ab"
         return scale_modes, (order,), mma[:2]
@@ -1050,7 +1094,9 @@ def _pingpong_tile_ok(c) -> bool:
     return (n == 128) if not c.swap_ab else (m == 128)
 
 
-def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=None):
+def _megakernel_config(
+    args, scale_mode: str, operand_order: str, tile, tokens=None, world_size=4
+):
     if args.backend == MXFP4_BACKEND:
         from flashinfer.moe_ep import (
             Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
@@ -1108,7 +1154,13 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
             bootstrap_paths()
             from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-            c = select_heuristic_config(scale_mode, tokens).config
+            c = select_heuristic_config(
+                scale_mode,
+                tokens,
+                world_size=world_size,
+                num_experts=args.num_experts,
+                num_topk=args.top_k,
+            ).config
             swap_ab = c.swap_ab
             mma_tiler_mnk = tuple(c.mma_tiler_mnk)
             # Explicit geometry flips the shim into manual mode, which fills
@@ -1191,6 +1243,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         fold_producer_warps=args.fold_producer_warps,
         knobs=fp8_knobs,
         generate_c=args.generate_c,
+        deterministic=args.deterministic,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -1321,7 +1374,9 @@ def _run_point(
     bench_workspace = None
     compute_call = None
     try:
-        kcfg = _megakernel_config(args, scale_mode, operand_order, tile, tokens=tokens)
+        kcfg = _megakernel_config(
+            args, scale_mode, operand_order, tile, tokens=tokens, world_size=world_size
+        )
         transformed = _make_transformed_weights(
             args,
             args.backend,
@@ -1566,7 +1621,15 @@ def _emit_row(
     if result.status != "pass" and result.error:
         print(f"# SKIP detail: {result.error}", flush=True)
     if csv_file is not None:
-        heur = _heuristic_cols(args.backend, scale_mode, operand_order, tokens)
+        heur = _heuristic_cols(
+            args.backend,
+            scale_mode,
+            operand_order,
+            tokens,
+            world_size=world_size,
+            num_experts=args.num_experts,
+            num_topk=args.top_k,
+        )
         csv.writer(csv_file, lineterminator="\n").writerow(
             [*row.split(","), *heur, *extra]
         )
@@ -1670,7 +1733,12 @@ def main() -> int:
                 if operand_order == "heuristic":
                     tile = ("auto", "auto")
                 else:
-                    tile = tile_override or DEFAULT_TILE[operand_order]
+                    default_tile = (
+                        DEFAULT_TILE_BLOCKWISE
+                        if scale_mode == "blockwise"
+                        else DEFAULT_TILE
+                    )
+                    tile = tile_override or default_tile[operand_order]
                 for tokens in tokens_list:
                     if rank == 0:
                         print(

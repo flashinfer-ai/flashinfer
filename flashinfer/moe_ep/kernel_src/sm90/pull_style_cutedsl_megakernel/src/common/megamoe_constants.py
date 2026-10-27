@@ -13,7 +13,37 @@ Fp8E8M0SfVecSize = 32
 Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
 Fp8GateUpInterleave = 8
 Fp8BlockScaleK = 128
-Fp8Fc2ActivationScaleK = 64
+# Row-scale block (columns per fp32 scale) of the activation operand the FC1 /
+# dfc2 epilogues quantize in-kernel: the forward h (= SwiGLU output, FC2's A
+# operand) and the backward grad_y1 (dfc1's A operand).  128 = one scale per K
+# tile, promoted once per tile like the 1x128 x / dY operands (a 1x64 block
+# needed two planes and two promotions per K tile).  The epilogue forms
+# one block from the channels one task tile produces, so the kernels require
+# >= 128 output channels per task (non-swap N256, swap-AB M256).
+Fp8Fc2ActivationScaleK = 128
+# The activation scales ride in each AB stage as 4 fp32 planes per token row
+# (one 16-byte TMA row); a K tile consumes Fp8Fc2ActSfPlanesPerKTile of them,
+# so one TMA row serves Fp8Fc2ActSfKTilesPerGroup consecutive K tiles.
+Fp8ActSfPlanes = 4
+Fp8Fc2ActSfPlanesPerKTile = Fp8BlockScaleK // Fp8Fc2ActivationScaleK
+Fp8Fc2ActSfKTilesPerGroup = Fp8ActSfPlanes // Fp8Fc2ActSfPlanesPerKTile
+# The Hopper MXFP4 / NVFP4 x FP8 backends (fp8_scale_mode="mxfp4_hybrid")
+# keep the 1x64 h block: two scale planes per K tile, one TMA row per two K
+# tiles.  Shared kernel code picks the block with the helpers below.
+Fp8Mxfp4HybridFc2ActivationScaleK = 64
+
+
+def fp8_fc2_activation_scale_k(fp8_scale_mode: str) -> int:
+    """Channels per FC2-activation (h) scale for an FP8 scale mode."""
+    if fp8_scale_mode == "mxfp4_hybrid":
+        return Fp8Mxfp4HybridFc2ActivationScaleK
+    return Fp8Fc2ActivationScaleK
+
+
+def fp8_fc2_act_sf_k_tiles_per_group(fp8_scale_mode: str) -> int:
+    """K tiles served by one 16-byte FC2 activation-scale TMA row."""
+    planes_per_k_tile = Fp8BlockScaleK // fp8_fc2_activation_scale_k(fp8_scale_mode)
+    return Fp8ActSfPlanes // planes_per_k_tile
 Fp8WeightScaleBlockN = 128
 Fp8WeightScaleBlockK = 128
 SfPaddingBlock = 128

@@ -81,6 +81,9 @@ _MXFP4_FOLD_K = 128
 _MXFP4_GATE_UP_INTERLEAVE = 8
 _MXFP4_HUMMING_MAX_RANGE = 11
 _MXFP4_EPILOGUE_COMPENSATION = 64
+# Fp8Mxfp4HybridFc2ActivationScaleK: the hybrid FC2 activation keeps 1x64
+# scale blocks (blockwise FP8 moved to 1x128).
+_MXFP4_FC2_ACTIVATION_SCALE_K = 64
 
 # This tuple is intentionally human-readable and embedded verbatim in every
 # compile key.  Changing preprocessing/layout semantics must create a new
@@ -118,6 +121,16 @@ def _validate_complete_mxfp4_tactic(
         return normalize_mxfp4_optimization_tactic(knobs)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{source}: {exc}") from exc
+
+
+class _HybridBlockwiseProxyConfig(MegaMoEHopperFp8Config):
+    """Blockwise FP8 config that runs the shared FP8 validation for hybrid.
+
+    The hybrid kernel follows the blockwise ABI except for its 1x64 FC2
+    activation scale blocks, which every swap-AB task tile can form.
+    """
+
+    _fc2_activation_scale_k: ClassVar[int] = _MXFP4_FC2_ACTIVATION_SCALE_K
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,18 +238,24 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
             raise ValueError(
                 f"the production {self._weight_format} profile requires combine_format='bf16'."
             )
+        if self.deterministic:
+            raise ValueError(
+                f"the production {self._weight_format} profile does not implement "
+                "deterministic dispatch slots."
+            )
 
         # Reuse the target FP8 config's rank, shape, scheduler, cluster,
         # ping-pong, token-back, and flag validation.  The generic base does
         # not recognize the dedicated hybrid string, so validate an otherwise
         # identical blockwise proxy (the common divisibility requirements are
-        # the same) and apply MXFP4-only constraints below.
+        # the same; its FC2 activation scale block stays 1x64) and apply
+        # MXFP4-only constraints below.
         base_kwargs = {
             item.name: getattr(self, item.name)
             for item in dataclasses.fields(MegaMoEHopperFp8Config)
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
-        MegaMoEHopperFp8Config(**base_kwargs)
+        _HybridBlockwiseProxyConfig(**base_kwargs)
 
         tile_m, _tile_n, tile_k = self.mma_tiler_mnk
         if tile_m not in (128, 256):
@@ -408,6 +427,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         """Fail closed if the clean vendor drop changes the Humming layout."""
         MegaMoEHopperFp8Frontend._assert_mirrored_constants()
 
+        from common.megamoe_constants import Fp8Mxfp4HybridFc2ActivationScaleK
         from moe_hopper_fp8.mxfp4_cutedsl import (
             MXFP4_FOLD_M,
             MXFP4_GROUP_SIZE,
@@ -418,6 +438,11 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             ("MXFP4_GROUP_SIZE", MXFP4_GROUP_SIZE, _MXFP4_GROUP_SIZE),
             ("MXFP4_FOLD_M", MXFP4_FOLD_M, _MXFP4_FOLD_M),
             ("MXFP4_K_TILE", MXFP4_K_TILE, _MXFP4_FOLD_K),
+            (
+                "Fp8Mxfp4HybridFc2ActivationScaleK",
+                Fp8Mxfp4HybridFc2ActivationScaleK,
+                _MXFP4_FC2_ACTIVATION_SCALE_K,
+            ),
         )
         for name, source_value, expected in mirrored:
             if source_value != expected:

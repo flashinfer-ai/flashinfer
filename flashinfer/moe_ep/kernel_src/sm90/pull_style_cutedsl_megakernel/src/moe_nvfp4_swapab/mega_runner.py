@@ -47,6 +47,7 @@ Kernel-client contract assumed below (lives in ``megamoe_kernel.py``)::
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 from dataclasses import dataclass
@@ -1190,24 +1191,31 @@ class MegaMoETester:
 
         # Timed: `_perf_iters` back-to-back launches, no host sync between them.
         n_iters = max(1, self._perf_iters)
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-        ) as prof:
-            # Profiler startup is per-process. Align only after every rank has
-            # entered the context so its skew is not counted as NVSHMEM spin
-            # time in the first timed kernel.
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-            ):
-                torch.distributed.barrier()
+        gc.collect()
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            ) as prof:
+                # Profiler startup is per-process. Align only after every rank has
+                # entered the context so its skew is not counted as NVSHMEM spin
+                # time in the first timed kernel.
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    torch.distributed.barrier()
+                    torch.cuda.synchronize()
+                for _ in range(n_iters):
+                    _launch()
                 torch.cuda.synchronize()
-            for _ in range(n_iters):
-                _launch()
-            torch.cuda.synchronize()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
         self._report_torch_profiler_kernel_time(prof, num_iters=n_iters)
 
     def run_kernel(self) -> None:

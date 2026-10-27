@@ -40,6 +40,12 @@ Following the NVFP4 mega kernel, the combine surface is two orthogonal knobs:
     dispatch modes push with ``cp.reduce.async.bulk...add.noftz.bf16``
     (``token_back_reduce_topk``); no reducer kernel runs.
 
+``deterministic`` (default off) makes every launch reproduce its outputs bit
+for bit: the dispatch assigns pool slots by ``(token, topk)`` rank
+(``deterministic_slots`` of the shared token communication) instead of
+arrival-order atomics, and topk collapses in the separate ``TopkReduce`` (fixed
+k order).  The in-kernel reduce adds in arrival order, so it is rejected.
+
 ``static_expert_shape`` is required because dispatch storage and pool sizes are
 codegen-time quantities.
 """
@@ -52,6 +58,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import (
     Int64,
@@ -75,6 +82,7 @@ from moe_hopper_fp8.kernel_mxfp4_fp8_glu_fc12_swapab import (
     Sm90SwapABSwigluMxfp4Fp8Fc12Kernel,
 )
 from moe_nvfp4_swapab.topk_reduce import TopkReduce
+from moe_hopper_fp8.internode_topk_reduce import InternodeTopkReduce
 from src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
@@ -84,6 +92,7 @@ from common.megamoe_constants import (
     Fp8DispatchScaleAtomK,
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
+    fp8_fc2_activation_scale_k,
 )
 
 # Reuse the region-layout helpers + module constants from the NVFP4 mega kernel
@@ -97,6 +106,10 @@ from moe_nvfp4_swapab.megamoe_kernel import (
     _GridSyncSlotCount,
     _NvlinkSlotCount,
 )
+
+# Upper bound on the persistent grid (CTAs) for the per-CTA routing histogram
+# of the deterministic dispatch; the launch asserts sm_count <= this.
+_MaxDispatchCtas = 1024
 
 
 # =============================================================================
@@ -165,6 +178,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # Internode (NCCL GIN rail proxy pull, see TokenInPullTokenBackPush):
+        # ranks per NVLink domain; None = one domain spanning the world.
+        ranks_per_node: Optional[int] = None,
+        enable_nccl_gin: bool = False,
+        # Bitwise-reproducible launches: launch-order-independent dispatch
+        # slots + the separate TopkReduce (see the module docstring).
+        deterministic: bool = False,
+        # Extra keyword arguments forwarded verbatim to the fused-fc12 base
+        # class (used by the backward dGLU wrapper, e.g. ``dfc2_recompute``).
+        **base_kwargs,
     ) -> None:
         if token_back_mode not in (
             "epi_warps", "standalone_warps", "reuse_dispatch_warps",
@@ -191,11 +214,34 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 f"hidden ({hidden}) must equal "
                 f"static_expert_shape[2] ({static_expert_shape[2]})."
             )
+        if enable_nccl_gin:
+            if fc2_in_kernel_topk_reduce:
+                raise NotImplementedError(
+                    "enable_nccl_gin needs the separate internode TopkReduce "
+                    "(fc2_in_kernel_topk_reduce=False): the node partials are "
+                    "added after the kernel."
+                )
+            if not apply_topk_in_fc1:
+                raise NotImplementedError(
+                    "enable_nccl_gin requires apply_topk_in_fc1=True (the rail "
+                    "peer reduce sums already-weighted FC2 rows)."
+                )
         if fc2_in_kernel_topk_reduce and not apply_topk_in_fc1:
             raise ValueError(
                 "fc2_in_kernel_topk_reduce requires apply_topk_in_fc1=True; "
                 "the in-kernel reduce can only atomic-add terms whose topk "
                 "score was already absorbed before fc2."
+            )
+        if deterministic and fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "deterministic=True requires the separate TopkReduce: the "
+                "in-kernel reduce (fc2_in_kernel_topk_reduce) adds the topk "
+                "terms in arrival order."
+            )
+        if deterministic and (dedup_dispatch or grouped_token_back):
+            raise ValueError(
+                "deterministic=True does not combine with dedup_dispatch / "
+                "grouped_token_back (their slots come from the atomic path)."
             )
 
         super().__init__(
@@ -226,11 +272,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             gate_up_clamp=gate_up_clamp,
             generate_c=generate_c,
             tail_split_pairs=tail_split_pairs,
+            **base_kwargs,
         )
 
         self.enable_token_comm = True
         self.fold_producer_warps = _fold
         self.token_back_standalone = token_back_mode == "standalone_warps"
+        self.deterministic = bool(deterministic)
         self._apply_mega_warp_layout()
         # Keep the established swap-AB and non-swap N=256 budgets. Non-swap
         # N=128 has one epilogue warpgroup and can use the architectural
@@ -289,13 +337,28 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             self.combine_sf_slot_bytes = ((sf_len + 15) // 16) * 16
         else:
             self.combine_sf_slot_bytes = 0
+        self.enable_nccl_gin = bool(enable_nccl_gin)
+        if self.enable_nccl_gin and (
+            dedup_dispatch or grouped_token_back or self.combine_format.is_quantized
+        ):
+            raise ValueError(
+                "the internode (NCCL GIN) path supports the plain bf16 combine "
+                "only: dedup_dispatch, grouped_token_back and quantized "
+                "combine formats are single-node features."
+            )
+        self.ranks_per_node = (
+            world_size if ranks_per_node is None else int(ranks_per_node)
+        )
+        self.num_nodes = world_size // self.ranks_per_node
+        # Remote node slots: landing / receive planes are indexed by them.
+        self.num_remote_slots = self.num_nodes - 1 if self.enable_nccl_gin else 0
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
         self.intermediate_gateup = static_expert_shape[1]
         self.intermediate_downproj = self.intermediate_gateup // 2
         logical_fc2_activation_sf_cols = (
-            self.intermediate_downproj // Fp8Fc2ActivationScaleK
+            self.intermediate_downproj // fp8_fc2_activation_scale_k(fp8_scale_mode)
         )
         self.fc2_activation_sf_storage_cols = (
             _round_up(logical_fc2_activation_sf_cols, 4)
@@ -419,13 +482,26 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
             flag_batch=flag_batch,
             dedup_dispatch=dedup_dispatch,
-            max_tokens_per_rank=max_tokens_per_rank,
+            max_tokens_per_rank=self.max_tokens_per_rank,
             active_dispatch_warps=active_dispatch_warps,
             # Only the active dispatch warps get a pull-buffer slot; the idle
             # slots would otherwise cost 3 * hidden_bytes of AB-stage SMEM.
             compact_pull_buffer=compact_pull_buffer,
+            ranks_per_node=self.ranks_per_node,
+            enable_nccl_gin=self.enable_nccl_gin,
+            global_rank=self.local_rank,
+            num_tail_reduce_warps=(
+                len(self.epilogue_warp_id) if self.enable_nccl_gin else 0
+            ),
+            deterministic_slots=self.deterministic,
         )
         self.dedup_dispatch = dedup_dispatch
+        if self.enable_nccl_gin:
+            # Node-local sources fill the first rows of every expert; their
+            # full token blocks are scheduled before any block that needs
+            # remote rows (those land after the RDMA payload).
+            self.sched_local_source_begin = self.token_comm.node_rank_base
+            self.sched_local_source_count = self.token_comm.ranks_per_node
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -461,14 +537,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         """SMEM for dispatch pull mbarriers, expert scratch, and token buffer.
 
         Must match ``TokenInPullTokenBackPush.extra_smem_storage_class``:
-        ``pull_mbar[Int64, 4] + smem_expert_count[Int32, num_total_experts]
+        ``pull_mbar[Int64, 4] + smem_expert_count[Int32, token_comm.smem_expert_count_slots]
         + pull_buffer[Uint8, token_comm.pull_buffer_bytes()]`` (one slot per
         *active* dispatch warp with ``compact_pull_buffer``).
         Standalone token-back adds ``tb_pull_mbar[Int64, 4]`` and
         ``tb_pull_buffer[Uint8, 4 * tb_chunk_bytes]``.
         """
         pull_mbar_bytes = _DispatchWarpCount * 8
-        expert_count_bytes = self.num_total_experts * 4
+        expert_count_bytes = self.token_comm.smem_expert_count_slots * 4
         pull_buffer_bytes = self.token_comm.pull_buffer_bytes()
         total = (
             _round_up(pull_mbar_bytes, 16)
@@ -568,7 +644,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             _RegionSpec(
                 "expert_send_count",
                 cutlass.Int64,
-                (num_total_experts,),
+                # One reservation set per source this rank prepares: its own
+                # tokens, plus (internode) every remote origin it proxies.
+                (num_total_experts * (1 + self.num_remote_slots),),
                 16,
             ),
             _RegionSpec(
@@ -601,6 +679,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     "load_balance_counter",
                     cutlass.Int32,
                     (1,),
+                    16,
+                )
+            )
+
+        if self.enable_nccl_gin:
+            # [0] = this rank's valid-token count, [1 + s] = the count of the
+            # remote origin proxied under slot s (atomicMax of token + 1).
+            counter_specs.append(
+                _RegionSpec(
+                    "gin_token_count",
+                    cutlass.Int32,
+                    (1 + self.num_remote_slots,),
                     16,
                 )
             )
@@ -660,6 +750,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
             _RegionSpec(
                 "nvlink_barrier_counter",
+                cutlass.Int32,
+                (1,),
+                16,
+            ),
+            # Persistent launch counter (internode payload flags compare
+            # against it); outside the reset prefix like the NVLink phase.
+            _RegionSpec(
+                "gin_epoch",
                 cutlass.Int32,
                 (1,),
                 16,
@@ -734,7 +832,55 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
 
+        specs.append(self._expert_token_sizes_snapshot_spec())
+        if self.deterministic:
+            specs.append(self._cta_expert_hist_spec())
         return specs
+
+    def _expert_token_sizes_snapshot_spec(self) -> _RegionSpec:
+        """Per-expert routed token counts preserved past the kernel tail.
+
+        ``expert_recv_count_sum`` (shared workspace) is re-zeroed by the tail
+        for the next launch; CTA 0 copies its low 32 bits here first so the
+        host can derive the per-expert pool layout (weight-gradient prefix
+        sums) after the launch.  Lives in the data area, outside the
+        zero-prefix that the tail resets.
+        """
+        return _RegionSpec(
+            "expert_token_sizes_snapshot",
+            cutlass.Int32,
+            (self.num_experts_per_rank,),
+            16,
+        )
+
+    # =========================================================================
+    # Public: host-side region lookup
+    # =========================================================================
+
+    def region_view(self, name: str, *, shared: bool = False):
+        """Return ``(byte_offset, nbytes, cute_dtype, shape)`` of a workspace
+        region so a host can view the raw byte buffer after the launch
+        (e.g. ``fc1_output``, ``fc1_output_sf``, ``token_src_metadata``,
+        ``expert_token_sizes_snapshot``; ``shared=True`` selects the symmetric
+        workspace)."""
+        offsets = self._shared_offsets if shared else self._local_offsets
+        by_name = self._shared_region_by_name if shared else self._local_region_by_name
+        if name not in by_name:
+            raise KeyError(f"unknown {'shared' if shared else 'local'} region {name!r}")
+        spec = by_name[name]
+        return offsets[name], spec.nbytes, spec.cute_dtype, tuple(spec.shape)
+
+    def _cta_expert_hist_spec(self) -> _RegionSpec:
+        """Per-CTA routing histogram consumed by the deterministic dispatch
+        (``TokenInPullTokenBackPush._dispatch_prep_deterministic``): row
+        ``cta`` holds this CTA's route count per global expert; every launch
+        rewrites rows ``[0, sm_count)`` so no reset is needed."""
+        return _RegionSpec(
+            "cta_expert_hist",
+            cutlass.Int32,
+            (_MaxDispatchCtas, self.num_total_experts),
+            16,
+        )
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
         world_size = self.world_size
@@ -774,6 +920,41 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
         ]
 
+        if self.enable_nccl_gin:
+            slots = self.num_remote_slots
+            hidden = self.hidden
+            specs += [
+                # Monotonic per-launch flags: payload of slot s landed here
+                # (read by this node's owners).  Never reset.
+                _RegionSpec("gin_payload_flag", cutlass.Int32, (slots,), 16),
+                # Stage 1 landing planes (RDMA destination, then LSA source).
+                _RegionSpec(
+                    "gin_recv_topk_idx", cutlass.Int64,
+                    (slots, max_tokens_per_rank, num_topk), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_topk_weights", cutlass.Float32,
+                    (slots, max_tokens_per_rank, num_topk), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_token", cutlass.Uint8,
+                    (slots, max_tokens_per_rank, self.hidden_bytes), 128,
+                ),
+                _RegionSpec(
+                    "gin_recv_sf", cutlass.Int32,
+                    (slots, max_tokens_per_rank, self.sf_uint32_per_token), 128,
+                ),
+                # Node partials: return put source here, destination at origin.
+                _RegionSpec(
+                    "gin_reduce_buf", cutlass.BFloat16,
+                    (slots, max_tokens_per_rank, hidden), 128,
+                ),
+                _RegionSpec(
+                    "gin_remote_partial", cutlass.BFloat16,
+                    (slots, max_tokens_per_rank, hidden), 128,
+                ),
+            ]
+
         # The per-topk FC2 plane is an implementation workspace, not public IO.
         # It is the cross-rank STG/TMA target and therefore belongs in the shared
         # symmetric workspace. In-kernel reduce accumulates directly into
@@ -786,11 +967,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             combine_slots = (
                 world_size if self.grouped_token_back else num_topk
             )
+            # Rows [0, T): this rank's own (token, topk) cells.  Internode:
+            # rows T + s*T + t are the landing rows of the remote origin
+            # proxied under slot s (node owners write them like local cells).
             specs.append(
                 _RegionSpec(
                     "unreduced_expert_output",
                     self.combine_format.act_dtype,
-                    (max_tokens_per_rank, combine_slots, self.hidden),
+                    (
+                        max_tokens_per_rank * (1 + self.num_remote_slots),
+                        combine_slots,
+                        self.hidden,
+                    ),
                     128,
                 )
             )
@@ -903,6 +1091,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             byte_workspace, offsets[spec.name], dt, sh, st, spec.align,
         )
 
+    @cute.jit
+    def _cta_expert_hist_view(self, local_workspace: cute.Pointer, sm_count):
+        """Typed view of ``cta_expert_hist`` (None unless deterministic)."""
+        if cutlass.const_expr(not self.deterministic):
+            return None
+        if cutlass.const_expr(sm_count > _MaxDispatchCtas):
+            raise ValueError(
+                f"deterministic dispatch supports at most {_MaxDispatchCtas} CTAs, "
+                f"got sm_count={sm_count}."
+            )
+        return self._view_local(local_workspace, "cta_expert_hist")
+
     # =========================================================================
     # Fused entrypoint
     # =========================================================================
@@ -953,6 +1153,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
         stream,
+        # Internode only: nccl4py ``DevComm`` / ``Window`` of the registered
+        # arena (every peer-visible buffer above lives inside that window).
+        gin_dev_comm=None,
+        gin_window=None,
+        # Int64 allocator address of the window start (window offsets of the
+        # arena regions are ``address - gin_window_base``).
+        gin_window_base=None,
     ) -> None:
         """Launch the FP8 MegaMoE-complete fused kernel.
 
@@ -1029,6 +1236,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
         expert_send_count = self._view_local(local_workspace, "expert_send_count")
         grid_sync_counter = self._view_local(local_workspace, "grid_sync_counter")
+        cta_expert_hist = self._cta_expert_hist_view(local_workspace, sm_count)
         nvlink_barrier_counter = self._view_local(
             local_workspace, "nvlink_barrier_counter",
         )
@@ -1154,6 +1362,31 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         else:
             combine_sf_view = None
 
+        gin_views = {}
+        if cutlass.const_expr(self.enable_nccl_gin):
+            gin_views = dict(
+                gin_dev_comm=gin_dev_comm,
+                gin_window=gin_window,
+                gin_window_base=gin_window_base,
+                gin_recv_topk_idx=self._view_shared(
+                    shared_workspace, "gin_recv_topk_idx",
+                ),
+                gin_recv_topk_weights=self._view_shared(
+                    shared_workspace, "gin_recv_topk_weights",
+                ),
+                gin_recv_token=self._view_shared(shared_workspace, "gin_recv_token"),
+                gin_recv_sf=self._view_shared(shared_workspace, "gin_recv_sf"),
+                gin_reduce_buf=self._view_shared(shared_workspace, "gin_reduce_buf"),
+                gin_remote_partial=self._view_shared(
+                    shared_workspace, "gin_remote_partial",
+                ),
+                gin_payload_flag=self._view_shared(
+                    shared_workspace, "gin_payload_flag",
+                ),
+                gin_token_count=self._view_local(local_workspace, "gin_token_count"),
+                gin_epoch=self._view_local(local_workspace, "gin_epoch"),
+            )
+
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
@@ -1194,6 +1427,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
             sm_count=sm_count,
+            cta_expert_hist=cta_expert_hist,
+            **gin_views,
         )
 
         _fc12_kwargs = dict(
@@ -1217,6 +1452,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             stream=stream,
             load_balance_counter=load_balance_counter,
             expert_token_sizes=expert_token_sizes,
+            expert_source_counts=(
+                expert_recv_count if self.sched_local_source_count > 0 else None
+            ),
             token_comm_args=token_comm_args,
             fc1_c=fc1_c,
         )
@@ -1229,7 +1467,25 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # into the SwiGLU output before FC1-output quantization, while the
         # transformers graph leaves each term unweighted and applies scores in
         # this standalone reducer.
-        if cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
+        if cutlass.const_expr(self.enable_nccl_gin):
+            # Node-ordered reduce (I11): local cells of this node's experts in
+            # top-k order, then one returned partial per remote node.
+            InternodeTopkReduce(
+                self.hidden,
+                self.num_topk,
+                num_experts_per_rank=self.num_experts_per_rank,
+                ranks_per_node=self.ranks_per_node,
+                num_nodes=self.num_nodes,
+                my_node=self.local_rank // self.ranks_per_node,
+                max_tokens_per_rank=self.max_tokens_per_rank,
+            )(
+                combine_target,
+                topk_idx,
+                self._view_shared(shared_workspace, "gin_remote_partial"),
+                output_activation,
+                stream,
+            )
+        elif cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1)
                 else None
@@ -1273,6 +1529,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
     def token_comm_extra_smem_storage_class(self) -> type:
         return self.token_comm.extra_smem_storage_class()
+
+    def token_comm_hook_prepare_device_resources(self, token_comm_args):
+        self.token_comm.prepare_device_resources(token_comm_args)
 
     def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
         return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
@@ -1350,6 +1609,38 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
+        # Snapshot the dispatch-produced per-expert token counts before the
+        # generic tail zeroes expert_recv_count_sum between its NVLink
+        # barriers.  CTA 0 copies the low 32 bits into the persistent local
+        # region; the tail's first grid sync orders this copy before any
+        # CTA's shared-prefix reset.  The copy is spread over every thread of
+        # the CTA, including warps with no dispatch role that reach this point
+        # early: join the whole CTA first (the tail's own barrier, all
+        # threads) so the dispatch warps have passed dispatch_barrier, after
+        # which expert_recv_count_sum is final.
+        pipeline.NamedBarrier(
+            barrier_id=self.token_comm.kernel_tail_named_barrier_id,
+            num_threads=self.token_comm.kernel_tail_threads,
+        ).arrive_and_wait()
+        cta_linear_id = self.token_comm._cta_linear_id()
+        if cta_linear_id == Int32(0):
+            snapshot_ptr = cute.make_ptr(
+                cutlass.Int32,
+                token_comm_args.local_zero_prefix.iterator.toint()
+                + Int64(self._local_offsets["expert_token_sizes_snapshot"]),
+                AddressSpace.gmem,
+                assumed_align=16,
+            )
+            snapshot = cute.make_tensor(
+                snapshot_ptr, cute.make_layout((self.num_experts_per_rank,)),
+            )
+            block_dim_x, _, _ = cute.arch.block_dim()
+            expert_idx = Int32(tidx)
+            while expert_idx < Int32(self.num_experts_per_rank):
+                packed_count = Int64(token_comm_args.expert_recv_count_sum[expert_idx])
+                snapshot[expert_idx] = Int32(packed_count & Int64(0xFFFFFFFF))
+                expert_idx = expert_idx + block_dim_x
+
         self.token_comm.kernel_tail(
             token_comm_args,
             warp_idx=warp_idx,

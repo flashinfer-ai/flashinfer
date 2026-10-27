@@ -26,9 +26,9 @@ KNOB_TABLE = {
         16384: (None, True), 32768: (None, True),
     },
     "blockwise": {
-        8: (264, False), 16: (264, False), 32: (264, True), 64: (264, False),
+        8: (264, False), 16: (264, False), 32: (264, False), 64: (264, False),
         128: (264, False), 256: (264, False), 512: (264, False), 1024: (264, False),
-        2048: (264, False), 8192: (264, True),
+        2048: (264, False), 4096: (264, True), 8192: (264, True),
     },
 }
 BLOCKWISE_REUSE_BUCKETS = {16384, 32768}
@@ -57,7 +57,7 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
                 )
 
     def test_token_back_modes(self) -> None:
-        # per_tensor: epi_warps everywhere (2026-09-18 four-rank H200 A/B: the
+        # per_tensor: epi_warps everywhere (four-rank H200 A/B: the
         # swap-AB N128 tail-split entries tie reuse_dispatch_warps at 16384+).
         # blockwise: reuse_dispatch_warps only where it measured ahead.
         reuse_buckets = {"per_tensor": set(), "blockwise": BLOCKWISE_REUSE_BUCKETS}
@@ -104,9 +104,39 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
         blockwise = select_heuristic_config("blockwise", 256)
         self.assertEqual(blockwise.token_bucket, 256)
         self.assertTrue(blockwise.config.swap_ab)
-        self.assertTrue(blockwise.config.pingpong)
-        self.assertEqual(blockwise.config.mma_tiler_mnk, (128, 32, 128))
-        self.assertEqual(blockwise.config.cluster_shape_mnk, (1, 2, 1))
+        self.assertFalse(blockwise.config.pingpong)
+        self.assertEqual(blockwise.config.mma_tiler_mnk, (256, 32, 128))
+        self.assertEqual(blockwise.config.cluster_shape_mnk, (2, 1, 1))
+
+    def test_manual_blockwise_defaults_to_tiles_with_128_channels(self) -> None:
+        # Only a cluster override: the manual default tile must still be a
+        # legal blockwise geometry (N256 non-swap, M256 swap-AB).
+        selection = resolve_hopper_fp8_config("blockwise", 128, cluster_shape_mnk=(1, 1, 1))
+        self.assertEqual(selection.source, "manual")
+        self.assertEqual(selection.config.mma_tiler_mnk, (64, 256, 128))
+        swap = resolve_hopper_fp8_config("blockwise", 128, swap_ab=True)
+        self.assertEqual(swap.config.mma_tiler_mnk, (256, 32, 128))
+        with self.assertRaises(ValueError):
+            resolve_hopper_fp8_config("blockwise", 128, pingpong=True)
+        with self.assertRaises(ValueError):
+            resolve_hopper_fp8_config("blockwise", 128, swap_ab=True, pingpong=True)
+        # per-tensor keeps its legacy defaults
+        self.assertEqual(
+            resolve_hopper_fp8_config("per_tensor", 128, cluster_shape_mnk=(1, 1, 1)).config.mma_tiler_mnk,
+            (64, 128, 128),
+        )
+
+    def test_blockwise_tasks_cover_a_1x128_h_scale_block(self) -> None:
+        # The FC1 epilogue forms one h scale block (128 channels) per task
+        # tile: non-swap tiles need N=256, swap-AB tiles raw M=256, hence no
+        # blockwise ping-pong (an N128 / M128 schedule).
+        for bucket, config in HEURISTIC_CONFIGS["blockwise"].items():
+            with self.subTest(bucket=bucket):
+                self.assertFalse(config.pingpong)
+                channels = (
+                    config.mma_tiler_mnk[0] if config.swap_ab else config.mma_tiler_mnk[1]
+                ) // 2
+                self.assertEqual(channels % 128, 0)
 
     def test_manual_geometry_disables_heuristic(self) -> None:
         selection = resolve_hopper_fp8_config(
@@ -140,8 +170,8 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
             select_heuristic_config("invalid", 128)
 
     def test_group_hint_and_tail_split_table_values(self) -> None:
-        # Only the buckets with a measured win carry the knobs (2026-09-18
-        # four-rank H200 A/B); every other entry keeps the defaults.
+        # Only the buckets with a measured win carry the knobs (four-rank
+        # H200 A/B); every other entry keeps the defaults.
         self.assertEqual(ALL_EXPERTS_GROUP, 1 << 20)
         for scale_mode in SCALE_MODES:
             for bucket, config in HEURISTIC_CONFIGS[scale_mode].items():
@@ -184,8 +214,8 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
         spot_checks = {
             "per_tensor": {16: True, 2048: True, 4096: True, 16384: True,
                            8: False, 512: False, 256: False},
-            "blockwise": {32: True, 256: True, 8192: True, 32768: True,
-                          16: False, 1024: False, 16384: False, 4096: False},
+            "blockwise": {4096: True, 8192: True, 32768: True,
+                          16: False, 32: False, 256: False, 1024: False, 16384: False},
         }
         with patch.dict(os.environ, {TAIL_SPLIT_ENV: "1"}):
             self.assertTrue(tail_split_env_enabled())

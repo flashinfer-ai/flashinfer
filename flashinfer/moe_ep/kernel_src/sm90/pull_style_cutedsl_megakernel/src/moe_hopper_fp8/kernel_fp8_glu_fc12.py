@@ -39,6 +39,10 @@ from common.megamoe_constants import (
     Fp8E5M2RcpLimit,
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
+    Fp8Fc2ActSfKTilesPerGroup,
+    Fp8Fc2ActSfPlanesPerKTile,
+    fp8_fc2_activation_scale_k,
+    fp8_fc2_act_sf_k_tiles_per_group,
     Fp8GateUpInterleave,
     Fp8WeightScaleBlockK,
     Fp8WeightScaleBlockN,
@@ -46,6 +50,10 @@ from common.megamoe_constants import (
     SupportedMmaTileN,
 )
 from moe_nvfp4_swapab.moe_utils import spin_wait, _nanosleep
+
+# Per-K-tile IKET events (operand waits, WGMMA issue/wait, TMA issue) fire
+# every K tile and swamp the trace; task-level ranges are always emitted.
+_IKET_PER_K_BLOCK = os.environ.get("MEGA_IKET_PER_K_BLOCK", "0") == "1"
 
 
 # =============================================================================
@@ -55,6 +63,10 @@ from moe_nvfp4_swapab.moe_utils import spin_wait, _nanosleep
 class Sm90SwigluFp8Fc12Kernel:
 
     _setmaxnreg_min = 24
+    # Source ranks whose pool rows open each expert (segment-major schedule,
+    # set by the internode MegaMoE subclass); 0 = expert-major walk.
+    sched_local_source_begin = 0
+    sched_local_source_count = 0
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
     _sm90_cta_register_budget = 65536
@@ -534,7 +546,7 @@ class Sm90SwigluFp8Fc12Kernel:
         )
         _epi_common["fc1_store_offload"] = self.fc1_store_offload
         _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
-        self.epilogue = Fp8GluEpilogue(**_epi_common)
+        self.epilogue = self._make_epilogue(_epi_common)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
@@ -545,7 +557,10 @@ class Sm90SwigluFp8Fc12Kernel:
         self.num_c_stage = (
             self.epilogue_warpgroup_count * self.epilogue.store_buffer_stages
         )
-        c_bytes_total = self.epilogue.bytes_per_stage * self.num_c_stage
+        c_bytes_total = (
+            self.epilogue.bytes_per_stage * self.num_c_stage
+            + self.epilogue.fc1_amax_smem_bytes
+        )
 
         (
             self.num_acc_stage,
@@ -584,10 +599,22 @@ class Sm90SwigluFp8Fc12Kernel:
         self.fc2_c_smem_layout_staged = self.epilogue.fc2_staged_smem_layout(
             self.num_c_stage,
         )
-        if self.epilogue.fc2_bytes_per_stage != self.epilogue.bytes_per_stage:
+        # sD (FC2) overlays sC (FC1, allocated at FC1 size).  A smaller FC2
+        # stage still fits, but its per-WG stage offsets no longer line up
+        # with FC1's, so the two WGs must not run different phases at once:
+        # not allowed with ping-pong.  The forward FC1 FP8 M64xN64 and FC2
+        # BF16 M64xN32 stages are both 4 KiB; the relaxed form is for
+        # subclasses (backward dGLU) whose two phases differ.
+        fc1_stage_bytes = self.epilogue.bytes_per_stage
+        fc2_stage_bytes = self.epilogue.fc2_bytes_per_stage
+        if fc2_stage_bytes > fc1_stage_bytes or (
+            fc2_stage_bytes != fc1_stage_bytes and self.pingpong
+        ):
             raise ValueError(
-                "FC1 FP8 and FC2 BF16 epilogue scratch stages must have "
-                "the same byte size for SMEM reuse."
+                "FC2 epilogue scratch stages must not exceed the FC1 stages they "
+                "overlay (and must match them under ping-pong); got "
+                f"fc1={fc1_stage_bytes} B, fc2={fc2_stage_bytes} B, "
+                f"pingpong={self.pingpong}."
             )
 
         # Read epilogue's autonomous decisions.
@@ -606,6 +633,11 @@ class Sm90SwigluFp8Fc12Kernel:
             + b_copy_size
             + self._activation_sf_bytes_per_stage()
         ) * atom_thr_size
+
+    def _make_epilogue(self, epi_common: dict):
+        """Construct the epilogue object; the backward (dGLU) kernel overrides
+        this to plug in its own epilogue class with the same geometry."""
+        return Fp8GluEpilogue(**epi_common)
 
     def _activation_sf_bytes_per_stage(self) -> int:
         if self.fp8_scale_mode not in ("blockwise", "mxfp4_hybrid"):
@@ -909,14 +941,26 @@ class Sm90SwigluFp8Fc12Kernel:
         )
 
         if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
-            if intermediate_downproj % Fp8Fc2ActivationScaleK != 0:
+            h_scale_k = fp8_fc2_activation_scale_k(self.fp8_scale_mode)
+            if intermediate_downproj % h_scale_k != 0:
                 raise ValueError(
                     "blockwise/hybrid FP8 requires intermediate_downproj divisible by "
-                    f"{Fp8Fc2ActivationScaleK}, got {intermediate_downproj}."
+                    f"{h_scale_k}, got {intermediate_downproj}."
+                )
+            # The FC1 epilogue forms one h scale block from the channels of
+            # one task tile (tile N / 2 for the non-swap kernel).
+            if (
+                not getattr(self, "is_swap_ab", False)
+                and (self.mma_tiler[1] // 2) % h_scale_k != 0
+            ):
+                raise ValueError(
+                    "blockwise FP8 needs tile N // 2 output channels divisible "
+                    f"by the h scale block {h_scale_k}; got "
+                    f"mma_tiler_mnk={self.mma_tiler} (use N=256)."
                 )
             fc1_output_sf_bytes = (
                 data_total_rows
-                * ((intermediate_downproj // Fp8Fc2ActivationScaleK + 3) // 4 * 4)
+                * ((intermediate_downproj // h_scale_k + 3) // 4 * 4)
                 * 4
             )
         else:
@@ -1012,6 +1056,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Accumulate every K tile directly into one long-lived fragment."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         if local_warp_idx < self.epilogue_warps_per_warpgroup:
             k_pipe_mmas = 1
             assert 0 < k_pipe_mmas < self.num_ab_stage
@@ -1124,6 +1170,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Promote one K tile at a time into a long-lived accumulator."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         if local_warp_idx < self.epilogue_warps_per_warpgroup:
             accumulators.fill(0.0)
             num_k_blocks = cute.size(tCrA, mode=[2])
@@ -1299,6 +1347,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Run one blockwise WGMMA task tile and promote each scaled partial."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         accumulators.fill(0.0)
         activation_scale_layout = self._activation_scale_rmem_layout()
         activation_scales = cute.make_rmem_tensor(
@@ -1312,13 +1362,23 @@ class Sm90SwigluFp8Fc12Kernel:
         )
         overlap_fc2 = has_overlap_register_budget and cute.size(accumulators) <= 64
         num_k_blocks = cute.size(tCrA, mode=[2])
+        # One activation scale per K tile (Fp8Fc2ActivationScaleK == K tile):
+        # FC2 promotes once per tile exactly like FC1.  The half-K branch
+        # below is the 1x64 form (two scale planes, two promotions per tile),
+        # still used by the MXFP4-hybrid h scales.
+        if cutlass.const_expr(
+            fp8_fc2_activation_scale_k(self.fp8_scale_mode) == Fp8BlockScaleK
+        ):
+            full_k_path = k_tile_cnt > cutlass.Int32(-1)  # every phase
+        else:
+            full_k_path = is_phase_linear1
         for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
             if iket_active:
                 iket.range_push("ab_consumer_wait")
             ab_pipeline.consumer_wait(ab_consumer_state)
             if iket_active:
                 iket.range_pop()
-            if is_phase_linear1:
+            if full_k_path:
                 tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                 cute.nvgpu.warpgroup.fence()
                 if iket_active:
@@ -1583,6 +1643,10 @@ class Sm90SwigluFp8Fc12Kernel:
         """
         return 1
 
+    def token_comm_hook_prepare_device_resources(self, token_comm_args):
+        """Kernel entry: materialize comm handles (NCCL GIN).  No-op base."""
+        pass
+
     @cute.jit
     def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
         """Sched warp: wait for dispatch barrier before reading sizes.  No-op base."""
@@ -1625,7 +1689,16 @@ class Sm90SwigluFp8Fc12Kernel:
         """Copy one K128 weight scale per WGMMA warpgroup into this stage."""
         lane_idx = tidx % cutlass.Int32(32)
         if lane_idx < cutlass.Int32(self.wgmma_warpgroup_count):
-            output_scale_block = output_scale_block_base + lane_idx
+            # A partial last N tile (hidden an odd multiple of 128 under
+            # N256) has no scale block for its second warpgroup; its outputs
+            # are masked by valid_hidden, so clamp the read instead of
+            # letting cp.async run past the scale tensor.
+            last_scale_block = (
+                cute.size(weight_sf_gemm, mode=[0]) - cutlass.Int32(1)
+            )
+            output_scale_block = cutlass.min(
+                output_scale_block_base + lane_idx, last_scale_block
+            )
             gmem_scale = cute.make_tensor(
                 weight_sf_gemm.iterator
                 + cute.crd2idx(
@@ -1679,6 +1752,8 @@ class Sm90SwigluFp8Fc12Kernel:
         _iket_active,
         reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1759,6 +1834,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gB_nkl = cute.local_tile(
             real_b,
             cute.slice_(self.mma_tiler, (0, None, None)),
@@ -1833,6 +1910,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1892,6 +1971,8 @@ class Sm90SwigluFp8Fc12Kernel:
         _iket_active,
         reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1980,6 +2061,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gB_nkl = cute.local_tile(
             real_b,
             cute.slice_(self.mma_tiler, (0, None, None)),
@@ -2043,6 +2126,8 @@ class Sm90SwigluFp8Fc12Kernel:
         reuse_single_scale_tile: cutlass.Constexpr = False,
         fc1_ready_counter_ptr=None,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         # The activation-scale box may use a different (non-)multicast split than
         # B: a (n / cluster_m) x 16 B sub-box is misaligned for TMA when n=8, so
         # the caller passes the sf box's own CTA coord / layout / mask (equal to
@@ -2186,6 +2271,9 @@ class Sm90SwigluFp8Fc12Kernel:
         # MegaMoE subclass passes a zero-copy ``i32 stride=(2,)`` view onto
         # ``expert_recv_count_sum`` filled by the dispatch warps.
         expert_token_sizes: Optional[cute.Tensor] = None,
+        # Internode segment-major schedule: ``(world_size, experts)`` int64
+        # per-source receive counts; None keeps the single expert-major walk.
+        expert_source_counts: Optional[cute.Tensor] = None,
         # ── MegaMoE token-comm bundle (None on the lean path) ────────────
         # All MegaMoE-specific device branches are gated by
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
@@ -2445,7 +2533,7 @@ class Sm90SwigluFp8Fc12Kernel:
             # phase:
             #   activation_sf     : (tokens, hidden // 128)
             #   fc1_weight_sf     : (experts, intermediate_gateup // 128, hidden // 128)
-            #   fc1_output_sf     : (tokens, intermediate_downproj // 64)
+            #   fc1_output_sf     : (tokens, intermediate_downproj // Fp8Fc2ActivationScaleK)
             #   fc2_weight_sf     : (experts, hidden // 128, intermediate_downproj // 128)
             activation_sf_gemm = cute.make_tensor(
                 activation_sf.iterator,
@@ -2474,7 +2562,8 @@ class Sm90SwigluFp8Fc12Kernel:
                 cute.make_layout(
                     (
                         fc1_output_sf.shape[0],
-                        intermediate_downproj // Fp8Fc2ActivationScaleK,
+                        intermediate_downproj
+                        // fp8_fc2_activation_scale_k(self.fp8_scale_mode),
                         1,
                     ),
                     stride=(fc1_output_sf.stride[0], fc1_output_sf.stride[1], 0),
@@ -2640,6 +2729,9 @@ class Sm90SwigluFp8Fc12Kernel:
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
             tail_split_pairs=self.tail_split_pairs,
+            expert_source_counts=expert_source_counts,
+            local_source_begin=self.sched_local_source_begin,
+            local_source_count=self.sched_local_source_count,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
         epilogue_fc2_output = (
@@ -2779,6 +2871,10 @@ class Sm90SwigluFp8Fc12Kernel:
         loop (acc consumer state, subtile dispatch, TMA commit/drain, and
         the piggyback ``red.release.gpu.add.s32`` to ``fc1_done_counter``).
         """
+        # Internode: materialize the NCCL GIN handles while the by-value
+        # DevComm argument dominates the whole kernel (no-op otherwise).
+        if cutlass.const_expr(token_comm_args is not None):
+            self.token_comm_hook_prepare_device_resources(token_comm_args)
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
@@ -3304,7 +3400,9 @@ class Sm90SwigluFp8Fc12Kernel:
                                 sf_token_base
                                 // cutlass.Int32(self.token_tile_size),
                                 k_tile_cnt,
-                                k_tiles_per_scale_group=2,
+                                k_tiles_per_scale_group=fp8_fc2_act_sf_k_tiles_per_group(
+                                    self.fp8_scale_mode
+                                ),
                                 tma_cta_coord=a_cta_coord,
                                 tma_cta_layout=a_cta_layout,
                                 mcast_mask=a_mcast_mask,
@@ -3666,6 +3764,13 @@ class Sm90SwigluFp8Fc12Kernel:
             byte_alignment=128,
             swizzle=c_smem_layout_staged.inner,
         )
+        # Per-row amax exchange between the two epilogue WGs of a blockwise
+        # FC1 scale block (one element when the block is WG-local).
+        sFc1Amax = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=self.epilogue.fc1_amax_smem_layout,
+            byte_alignment=16,
+        )
         # FC2 reuses the same WG-private bytes: FP8 64x64 and BF16 64x32
         # are both 4 KiB per stage, so this adds no dynamic SMEM.
         sD = cute.make_tensor(
@@ -3720,6 +3825,7 @@ class Sm90SwigluFp8Fc12Kernel:
                 sched_consumer=sched_consumer,
                 sched_ext=ext,
                 smem_fc1_output_buffer=sC,
+                smem_fc1_amax=sFc1Amax,
                 tma_atom_fc1_output=tma_atom_fc1_output,
                 smem_fc2_output_buffer=sD,
                 tma_atom_fc2_output=tma_atom_fc2_output,

@@ -35,6 +35,50 @@ Import adaptation (both kernels; re-apply on every resync): the drop's
 vendored; the vendored copies import it from `moe_nvfp4_swapab.custom_ext`
 instead (one-line edit each).
 
+2026-10-27 sync of the Hopper FP8 / BF16 forward from the kernel repo's
+`main` (`41a45039`, which merged `vincent/hopper_megamoe_fp8_bwd`; per-file
+baseline `6505ccfbe`): 1x128 blockwise h scales (`67770f82`), the
+partial-tile weight-scale read clamp and blockwise manual defaults
+(`250ec72b`), the training hooks (`c381bed8` / `59908e56`: `_make_epilogue`,
+`region_view`, `expert_token_sizes_snapshot`, `**base_kwargs`), the
+`deterministic` dispatch and token-fast scheduler order (`e863875f`),
+`runner_fc12_common.py` dropping its `moe_mxfp8_glu` import (`37fd5b03`),
+the GC-free profiling window of `moe_nvfp4_swapab/mega_runner.py` (from
+the backward commit `a0e78bc3`), and the host-side (Gloo) NVSHMEM UID
+broadcast of `src/bootstrap.py` (`c4e33825`).
+The kernel repo moved these packages under `pre_unification/`
+(`pre_unification/comm` = this tree's `src/`); map the imports back
+(`pre_unification.comm.` -> `src.`, `pre_unification.<pkg>.` -> `<pkg>.`,
+`moe_bf16_glu.custom_ext_base` -> `moe_nvfp4_swapab.custom_ext`) and 3-way
+merge against the baseline, because this tree carries local changes in the
+same files.  Not synced: the backward packages, the vLLM / SonicMoE TFLOPS
+summarizers, the Blackwell-only `moe_nvfp4_swapab` changes
+(`skip_topk_reduce`, the SM100 `QuantImpl` amax) and the typed route
+outputs / NVFP4 staging scales of `src/inputs_process.py` (no Hopper
+user), plus the vLLM comparison scripts the tree never vendored.
+
+Interactions resolved by hand:
+
+- The Hopper MXFP4 / NVFP4 x FP8 backends (`fp8_scale_mode="mxfp4_hybrid"`)
+  share the swap-AB epilogue, the FC2 scale TMA path and the base mainloop
+  with FP8 blockwise and keep the 1x64 h block, so shared code picks the
+  block with `common.megamoe_constants.fp8_fc2_activation_scale_k(mode)` /
+  `fp8_fc2_act_sf_k_tiles_per_group(mode)` instead of the bare
+  `Fp8Fc2ActivationScaleK` (128, FP8 blockwise only).  On the shim side the
+  MXFP4 / NVFP4 configs run the FP8 validation through a blockwise proxy
+  (`_HybridBlockwiseProxyConfig`) whose `_fc2_activation_scale_k` stays 64,
+  so the FP8 rule "tile N / 2 (M / 2 swap-AB) is a multiple of the h block"
+  admits their M=128 tiles.
+- The same backends build on the top-k dedup / grouped combine of the FP8
+  mega kernel, so that code stays; the internode NCCL GIN path and
+  `deterministic` reject `dedup_dispatch`, `grouped_token_back` and the
+  quantized combine formats.  `dispatch_prep` (single node: dedup, zero-count
+  skipping, deterministic slots) and `dispatch_prep_gin` (internode
+  `count_group` / `token_count_ptr`) are separate functions;
+  `dispatch_prep` takes the dedup `token_rank_mask` as a keyword so the
+  drop's positional calls (`src/dispatch_kernel.py`) keep upstream's order.
+- The segment-major (internode) schedule rejects the token-fast orders.
+
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
 

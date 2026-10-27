@@ -29,7 +29,7 @@ import dataclasses
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, Tuple  # noqa: F401
+from typing import Any, Callable, ClassVar, Dict, Literal, Optional, Tuple  # noqa: F401
 
 import torch
 
@@ -47,6 +47,23 @@ from .comm import (
     sym_zeros,
 )
 
+try:
+    from torch._C import _cuda_getCurrentRawStream as _raw_stream
+except ImportError:  # pragma: no cover - older torch
+    _raw_stream = None
+
+
+def _current_stream_handle(device_index: int) -> int:
+    """Raw handle of the current stream (compared, never dereferenced).
+
+    ``torch.cuda.current_stream()`` builds a Stream object through several
+    Python frames (~20 us); the launch-cache key reads it on every launch.
+    """
+    if _raw_stream is not None:
+        return _raw_stream(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
 _KIND_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
@@ -63,6 +80,7 @@ _E8M0_SCALE_DTYPE = torch.float8_e8m0fnu
 # them fails loudly instead of silently mis-sizing staging buffers.
 _FP8_E8M0_SF_VEC_SIZE = 32  # Fp8E8M0SfVecSize: elements per E8M0 SF byte
 _FP8_BLOCK_SCALE_K = 128  # Fp8BlockScaleK: elements per blockwise FP32 act scale
+_FP8_FC2_ACTIVATION_SCALE_K = 128  # Fp8Fc2ActivationScaleK: h channels per scale
 _FP8_WEIGHT_SCALE_BLOCK_N = 128  # Fp8WeightScaleBlockN
 _FP8_WEIGHT_SCALE_BLOCK_K = 128  # Fp8WeightScaleBlockK
 _FP8_DISPATCH_SCALE_ATOM_K = 128  # Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
@@ -115,6 +133,11 @@ class MegaMoEHopperFp8Config:
     ``2 * intermediate`` (= ``static_expert_shape[1]``, the drop driver's
     ``problem.intermediate``).
     """
+
+    # FC1-output (FC2 activation) channels per blockwise scale block.  The
+    # fused MXFP4 / NVFP4 x FP8 configs run this validation through a
+    # blockwise proxy whose hybrid FC2 activation keeps 1x64 blocks.
+    _fc2_activation_scale_k: ClassVar[int] = _FP8_FC2_ACTIVATION_SCALE_K
 
     rank: int
     world_size: int
@@ -210,6 +233,13 @@ class MegaMoEHopperFp8Config:
     # 1-CTA weight cluster: swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
     # Output-invariant; the heuristic table turns it on per bucket.
     tail_split_pairs: bool = False
+    # Bitwise-reproducible dispatch pool: slots are assigned by (token, topk)
+    # rank instead of arrival-order atomics, so the expert-major pool row
+    # order (and ``fc1_c`` under generate_c) is identical on every launch.
+    # The output is already reproducible without it unless the in-kernel
+    # topk reduce is on, which this rejects.  Single-node only; does not
+    # combine with dedup_dispatch / grouped_token_back.
+    deterministic: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -217,6 +247,10 @@ class MegaMoEHopperFp8Config:
     apply_routing_weights_before_fc2: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    # Internode (NCCL GIN rail proxy pull): ranks per NVLink domain (None =
+    # one domain spanning the world) and the GIN transport switch.
+    ranks_per_node: Optional[int] = None
+    enable_nccl_gin: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in _KIND_TO_TORCH_DTYPE:
@@ -318,11 +352,33 @@ class MegaMoEHopperFp8Config:
                     "apply_routing_weights_before_fc2=True "
                     "(the group pre-reduce is a plain sum)."
                 )
+        if self.enable_nccl_gin and (
+            self.dedup_dispatch
+            or self.grouped_token_back
+            or self.combine_format != "bf16"
+        ):
+            raise ValueError(
+                "the internode (NCCL GIN) path supports the plain bf16 combine "
+                "only: dedup_dispatch, grouped_token_back and quantized "
+                "combine formats are single-node features."
+            )
         if self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
             raise ValueError(
                 "in_kernel_fc2_reduce requires apply_routing_weights_before_fc2=True."
+            )
+        if self.deterministic and self.in_kernel_fc2_reduce:
+            raise ValueError(
+                "deterministic requires the separate TopkReduce: the in-kernel "
+                "reduce adds the topk terms in arrival order."
+            )
+        if self.deterministic and (
+            self.enable_nccl_gin or self.dedup_dispatch or self.grouped_token_back
+        ):
+            raise ValueError(
+                "deterministic is single-node only and does not combine with "
+                "dedup_dispatch / grouped_token_back."
             )
         if not self.force_static_sched:
             raise ValueError(
@@ -357,6 +413,18 @@ class MegaMoEHopperFp8Config:
                     "native Hopper FP8 ping-pong requires mma_tiler N=128; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
+        scale_k = self._fc2_activation_scale_k
+        if self.blockwise and ((m if self.swap_ab else n) // 2) % scale_k != 0:
+            # The FC1 epilogue forms each FC2-activation scale block from the
+            # channels of one task tile (tile N / 2 native, M / 2 swap-AB; a
+            # ping-pong warpgroup owns a whole N=128 / M=128 tile).  At 1x128
+            # that leaves N=256 native / M=256 swap-AB without ping-pong.
+            raise ValueError(
+                f"blockwise FP8 needs a multiple of {scale_k} output channels "
+                "per task tile (mma_tiler N / 2 native, M / 2 swap-AB); got "
+                f"mma_tiler_mnk={self.mma_tiler_mnk}, swap_ab={self.swap_ab}, "
+                f"pingpong={self.pingpong}."
+            )
         if self.swap_ab:
             if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
                 raise ValueError(
@@ -484,6 +552,10 @@ class MegaMoEHopperFp8Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        # Internode: the session's NCCL GIN arena and the shared-workspace
+        # slice carved from it (set by get_symm_buffer_for_hopper_fp8_mega_moe).
+        self._gin_arena: Optional[Any] = None
+        self._gin_shared_workspace: Optional[torch.Tensor] = None
 
     @property
     def config(self) -> MegaMoEHopperFp8Config:
@@ -600,6 +672,7 @@ class MegaMoEHopperFp8Frontend:
             mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
             mega.launch_key = key
             mega.launch_output = launch_inputs.output_activation
+            mega.launch_exe = None
         if reset_counters:
             reset_compiled_mega_workspaces(mega)
         if self.config.in_kernel_fc2_reduce:
@@ -608,7 +681,11 @@ class MegaMoEHopperFp8Frontend:
             # every launch.  Zero the full raw buffer so stale rows beyond a
             # partial num_tokens can't leak from an earlier, larger launch.
             inputs.output_activation.zero_()
-        mega.compiled(**mega.launch_kwargs)
+        if mega.launch_exe is None:
+            mega.launch_exe = mega.compiled.generate_execution_args(
+                **mega.launch_kwargs
+            )
+        mega.compiled.run_compiled_program(mega.launch_exe[0])
         # Zero-break capture gate: a device synchronize would abort stream
         # capture, so skip it there (the graph replays under stream semantics).
         if sync and not torch.cuda.is_current_stream_capturing():
@@ -639,18 +716,23 @@ class MegaMoEHopperFp8Frontend:
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
+        # The thunk holds the adapted args, which own what exe_args points at.
+        exe_args, adapted_args = compiled.generate_execution_args(**runtime_kwargs)
 
         if self.config.in_kernel_fc2_reduce:
             output_activation = inputs.output_activation
 
             def thunk() -> None:
                 output_activation.zero_()
-                compiled(**runtime_kwargs)
+                compiled.run_compiled_program(exe_args)
 
         else:
 
             def thunk() -> None:
-                compiled(**runtime_kwargs)
+                compiled.run_compiled_program(exe_args)
+
+        thunk.adapted_args = adapted_args
+        thunk.runtime_kwargs = runtime_kwargs
 
         return thunk
 
@@ -675,7 +757,7 @@ class MegaMoEHopperFp8Frontend:
             t.fc2_weight_dequant_scale.data_ptr(),
             t.output_activation.data_ptr(),
             num_tokens,
-            torch.cuda.current_stream().cuda_stream,
+            _current_stream_handle(t.activation.device.index),
         )
 
     def _mega_compile_key(self) -> tuple:
@@ -723,6 +805,9 @@ class MegaMoEHopperFp8Frontend:
             c.fold_producer_warps,
             self._gate_up_clamp,
             c.enable_iket,
+            c.ranks_per_node,
+            c.enable_nccl_gin,
+            c.deterministic,
         )
 
     @staticmethod
@@ -732,6 +817,7 @@ class MegaMoEHopperFp8Frontend:
             Fp8BlockScaleK,
             Fp8DispatchScaleAtomK,
             Fp8E8M0SfVecSize,
+            Fp8Fc2ActivationScaleK,
             Fp8WeightScaleBlockK,
             Fp8WeightScaleBlockN,
         )
@@ -739,6 +825,11 @@ class MegaMoEHopperFp8Frontend:
         mirrored = (
             ("Fp8E8M0SfVecSize", Fp8E8M0SfVecSize, _FP8_E8M0_SF_VEC_SIZE),
             ("Fp8BlockScaleK", Fp8BlockScaleK, _FP8_BLOCK_SCALE_K),
+            (
+                "Fp8Fc2ActivationScaleK",
+                Fp8Fc2ActivationScaleK,
+                _FP8_FC2_ACTIVATION_SCALE_K,
+            ),
             ("Fp8WeightScaleBlockN", Fp8WeightScaleBlockN, _FP8_WEIGHT_SCALE_BLOCK_N),
             ("Fp8WeightScaleBlockK", Fp8WeightScaleBlockK, _FP8_WEIGHT_SCALE_BLOCK_K),
             (
@@ -756,15 +847,12 @@ class MegaMoEHopperFp8Frontend:
                     "shapes."
                 )
 
-    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
-        key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
-            return self._mega
+    def _build_kernel(self):
+        """Instantiate the mega kernel object for the current config.
 
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
-        self._release_workspace()
-
-        import cutlass.cute as cute
+        Returns ``(kernel, max_active_clusters)``; no compile, no allocation
+        (the internode arena sizes the shared workspace from it).
+        """
         import cutlass.utils as cutlass_utils
         from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
         from moe_hopper_fp8.megamoe_kernel_fp8 import (
@@ -838,7 +926,25 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            ranks_per_node=c.ranks_per_node,
+            enable_nccl_gin=c.enable_nccl_gin,
+            deterministic=c.deterministic,
         )
+
+        return kernel, max_active_clusters
+
+    def _ensure_mega_compiled(self, inputs: MegaMoEHopperFp8Inputs) -> _CompiledMega:
+        key = self._mega_compile_key()
+        if self._mega is not None and self._mega_key == key:
+            return self._mega
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        self._release_workspace()
+
+        import cutlass.cute as cute
+
+        kernel, max_active_clusters = self._build_kernel()
+        c = self.config
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -846,7 +952,24 @@ class MegaMoEHopperFp8Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+        if c.enable_nccl_gin:
+            # Internode: the shared workspace is a slice of the session's
+            # registered NCCL arena (pre-sized at symm-buffer creation; the
+            # shared regions do not depend on the launch geometry).
+            arena = self._gin_arena
+            shared_workspace = self._gin_shared_workspace
+            if arena is None or shared_workspace is None:
+                raise RuntimeError(
+                    "enable_nccl_gin sessions must be created with "
+                    "get_symm_buffer_for_hopper_fp8_mega_moe(enable_nccl_gin=True)."
+                )
+            if shared_workspace.numel() < shared_ws_bytes:
+                raise RuntimeError(
+                    f"GIN arena shared workspace too small: {shared_workspace.numel()} "
+                    f"< {shared_ws_bytes} bytes."
+                )
+        else:
+            shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
         # Publish ownership immediately after the collective allocation. If
         # peer-offset discovery or compilation fails on one rank, the shared
         # autotuner can still release this tensor in all-rank order.
@@ -860,10 +983,14 @@ class MegaMoEHopperFp8Frontend:
         )
         self._mega = mega
         self._mega_key = None
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
+        if c.enable_nccl_gin:
+            symmetric_base = arena.base
+            peer_offsets_list = arena.peer_offsets
+        else:
+            symmetric_base, peer_offsets_list = _compute_peer_offsets(
+                shared_workspace,
+                c.world_size,
+            )
 
         mega.symmetric_base = symmetric_base
         mega.peer_offsets_list = tuple(peer_offsets_list)
@@ -905,7 +1032,9 @@ class MegaMoEHopperFp8Frontend:
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
-            free_sym_tensor(self._mega.shared_workspace)
+            # Internode: the shared workspace belongs to the GIN arena.
+            if not self._config.enable_nccl_gin:
+                free_sym_tensor(self._mega.shared_workspace)
         # The cache entry dies with the workspace: if a recompile fails after
         # the free, a stale (_mega, _mega_key) hit would launch against freed
         # symmetric memory.
@@ -1229,12 +1358,25 @@ class MegaMoEHopperFp8Frontend:
             )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # The offset table covers this NVLink domain only (= the world on a
+        # single node); internode traffic goes through the GIN arena.
+        node_ranks = c.ranks_per_node if c.enable_nccl_gin else c.world_size
         peer_rank_ptr_mapper_host = SymBufferHost(
             base_addr=mega.symmetric_base,
             offsets=tuple(mega.peer_offsets_list),
-            rank_idx=c.rank,
-            num_max_ranks=c.world_size,
+            rank_idx=c.rank % node_ranks,
+            num_max_ranks=node_ranks,
         )
+        gin_kwargs = {}
+        if c.enable_nccl_gin:
+            import cutlass
+
+            gin_dev_comm, gin_window = self._gin_arena.kernel_handles()
+            gin_kwargs = dict(
+                gin_dev_comm=gin_dev_comm,
+                gin_window=gin_window,
+                gin_window_base=cutlass.Int64(self._gin_arena.base),
+            )
 
         return dict(
             activation=self._to_cute(inputs.activation),
@@ -1265,6 +1407,7 @@ class MegaMoEHopperFp8Frontend:
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
+            **gin_kwargs,
         )
 
 
@@ -1352,6 +1495,8 @@ class MegaMoEHopperFp8SymmBuffer:
     # launch cache keys (data_ptrs) stay stable across launches.
     _unit_scales: Dict[Tuple[str, int], torch.Tensor] = field(default_factory=dict)
     _destroyed: bool = False
+    # Internode: the registered NCCL GIN arena every buffer above lives in.
+    _gin_arena: Optional[Any] = None
 
     @property
     def fc1_c(self) -> Optional[torch.Tensor]:
@@ -1367,6 +1512,9 @@ class MegaMoEHopperFp8SymmBuffer:
             free_sym_tensor(root)
         self._sym_roots.clear()
         self._unit_scales.clear()
+        if self._gin_arena is not None:
+            self._gin_arena.close()
+            self._gin_arena = None
         self._destroyed = True
 
     @property
@@ -1416,6 +1564,7 @@ def resolve_hopper_fp8_mega_moe_config(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
+    deterministic: bool = False,
     apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
@@ -1426,6 +1575,8 @@ def resolve_hopper_fp8_mega_moe_config(
     num_sched_stages: Optional[int] = None,
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
+    ranks_per_node: Optional[int] = None,
+    enable_nccl_gin: bool = False,
 ) -> MegaMoEHopperFp8Config:
     """Resolve the complete constructor config without GPU work or allocation."""
     if hidden % 64 != 0 or intermediate % 64 != 0:
@@ -1465,6 +1616,9 @@ def resolve_hopper_fp8_mega_moe_config(
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
             accum_mode=fp8_accum_mode,
+            world_size=world_size,
+            num_experts=num_total_experts,
+            num_topk=num_topk,
         )
         launch = selection.config
         swap_ab = launch.swap_ab
@@ -1483,7 +1637,13 @@ def resolve_hopper_fp8_mega_moe_config(
         from .knob_cache import resolve_knobs as _resolve_cached_knobs
         from .tuner import GEOMETRY_KNOBS, default_knobs
 
-        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
+        geometry = default_knobs(
+            num_max_tokens,
+            fp8_scale_mode=fp8_scale_mode,
+            world_size=world_size,
+            num_experts=num_total_experts,
+            num_topk=num_topk,
+        )
         if isinstance(knobs, dict):
             resolved = dict(knobs)
         else:
@@ -1561,6 +1721,7 @@ def resolve_hopper_fp8_mega_moe_config(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
+        deterministic=deterministic,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
@@ -1569,6 +1730,8 @@ def resolve_hopper_fp8_mega_moe_config(
         num_sched_stages=num_sched_stages,
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
+        ranks_per_node=ranks_per_node,
+        enable_nccl_gin=enable_nccl_gin,
     )
     if knob_overrides:
         # Non-geometry knobs from the cache/dict (token_back_mode,
@@ -1618,6 +1781,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
+    deterministic: bool = False,
     apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1626,6 +1790,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     num_sched_stages: Optional[int] = None,
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
+    ranks_per_node: Optional[int] = None,
+    enable_nccl_gin: bool = False,
 ) -> MegaMoEHopperFp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one SM90 FP8 session.
 
@@ -1643,8 +1809,9 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     ``num_max_tokens``) when ALL four are ``None``.  Setting any one of them
     switches to manual mode: unset knobs fall back to the drop driver's
     defaults (``swap_ab=False``, ``pingpong=False``, tiler (64, 128, 128)
-    native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
-    cluster (1, 1, 1)).
+    native ((64, 256, 128) blockwise) / (256, 32, 128) swap-AB / (128, 32,
+    128) swap-AB ping-pong, cluster (1, 1, 1)).  Blockwise needs N=256
+    native / M=256 swap-AB tiles and no ping-pong.
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is
     a deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
@@ -1684,6 +1851,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
+        deterministic=deterministic,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
@@ -1692,6 +1860,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         num_sched_stages=num_sched_stages,
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
+        ranks_per_node=ranks_per_node,
+        enable_nccl_gin=enable_nccl_gin,
     )
     return _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(cfg)
 
@@ -1710,6 +1880,8 @@ def _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
     intermediate = cfg.intermediate
     rank = cfg.rank
     world_size = cfg.world_size
+    if cfg.enable_nccl_gin:
+        return _get_internode_symm_buffer(cfg, frontend)
 
     sym_roots: list[torch.Tensor] = []
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
@@ -1764,6 +1936,87 @@ def _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
         output_activation=output_activation,
         _frontend=frontend,
         _sym_roots=sym_roots,
+    )
+
+
+def _get_internode_symm_buffer(
+    cfg: MegaMoEHopperFp8Config,
+    frontend: MegaMoEHopperFp8Frontend,
+) -> MegaMoEHopperFp8SymmBuffer:
+    """Internode session: carve every peer-visible buffer out of one GIN arena.
+
+    The arena is registered once (window registration is collective), so it is
+    sized here for the inputs, the output and the kernel's shared workspace
+    (whose regions depend only on the problem shape, not on the launch
+    geometry a later knob change may pick).  NVSHMEM is never initialised.
+    """
+    from src.token_comm import TokenInPullTokenBackPush
+
+    from .gin_arena import GinArena
+
+    if cfg.ranks_per_node is None:
+        raise ValueError("enable_nccl_gin requires ranks_per_node.")
+    if cfg.in_kernel_fc2_reduce:
+        raise NotImplementedError(
+            "enable_nccl_gin requires the separate (internode) TopkReduce."
+        )
+    num_nodes = cfg.world_size // cfg.ranks_per_node
+    t_max = cfg.num_tokens_per_rank
+    hidden = cfg.hidden
+    kernel, _ = frontend._build_kernel()
+    _, shared_ws_bytes = kernel.get_workspace_sizes()
+    if cfg.blockwise:
+        sf_shape = (t_max, _round_up(hidden // _FP8_BLOCK_SCALE_K, 4))
+        sf_dtype = torch.float32
+    else:
+        sf_shape = (t_max, _round_up(_ceil_div(hidden, _FP8_E8M0_SF_VEC_SIZE), 4))
+        sf_dtype = torch.uint8
+    plan = [
+        ((t_max, hidden), torch.uint8),
+        (sf_shape, sf_dtype),
+        ((t_max, cfg.num_topk), torch.int64),
+        ((t_max, cfg.num_topk), torch.float32),
+        ((t_max, hidden), torch.bfloat16),
+        ((shared_ws_bytes,), torch.uint8),
+    ]
+    capacity = sum(GinArena.padded_bytes(sh, dt) for sh, dt in plan) + 4096
+    arena = GinArena(
+        rank=cfg.rank,
+        world_size=cfg.world_size,
+        ranks_per_node=cfg.ranks_per_node,
+        capacity_bytes=capacity,
+        signal_count=TokenInPullTokenBackPush.internode_signal_count(num_nodes),
+    )
+    x = arena.alloc((t_max, hidden), torch.uint8).view(cfg.torch_ab_dtype)
+    if cfg.blockwise:
+        x_sf = arena.alloc(sf_shape, torch.float32)
+    else:
+        x_sf = arena.alloc(sf_shape, torch.uint8).view(_E8M0_SCALE_DTYPE)
+    topk_idx = arena.alloc((t_max, cfg.num_topk), torch.int64)
+    topk_idx.fill_(-1)
+    topk_weights = arena.alloc((t_max, cfg.num_topk), torch.float32)
+    output_activation = arena.alloc((t_max, hidden), torch.bfloat16)
+    frontend._gin_arena = arena
+    frontend._gin_shared_workspace = arena.alloc((shared_ws_bytes,), torch.uint8)
+    torch.cuda.synchronize()
+    return MegaMoEHopperFp8SymmBuffer(
+        num_total_experts=cfg.num_total_experts,
+        num_max_tokens=t_max,
+        num_topk=cfg.num_topk,
+        hidden=hidden,
+        intermediate=cfg.intermediate,
+        rank=cfg.rank,
+        world_size=cfg.world_size,
+        kind=cfg.kind,
+        fp8_scale_mode=cfg.fp8_scale_mode,
+        x=x,
+        x_sf=x_sf,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        output_activation=output_activation,
+        _frontend=frontend,
+        _sym_roots=[],
+        _gin_arena=arena,
     )
 
 

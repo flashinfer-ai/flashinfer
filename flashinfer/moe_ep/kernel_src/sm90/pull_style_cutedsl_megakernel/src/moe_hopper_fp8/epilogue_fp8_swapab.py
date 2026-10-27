@@ -24,6 +24,8 @@ from src.ptx_helpers import red_add_relaxed_sys_v2_bf16x2
 from src.ptx_helpers import red_add_release_gpu_s32
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from common.megamoe_constants import (
+    Fp8Fc2ActivationScaleK,
+    fp8_fc2_activation_scale_k,
     Fp8GateUpInterleave,
     Fp8E4M3RcpLimit,
 )
@@ -270,6 +272,21 @@ class SwapABFp8GluEpilogue:
             )
         self._wg_raw_tile_m = 128
         self._wg_output_tile_m = self._wg_raw_tile_m // 2
+        # Blockwise h scale block (Fp8Fc2ActivationScaleK channels) is formed
+        # from the output channels of one task tile; it spans this many WGMMA
+        # fragments / epilogue warpgroups (64 channels each).
+        self._fc1_scale_block_fragments = 1
+        if self.fp8_scale_mode == "blockwise":
+            channels_per_task = self._wgmma_fragment_count * self._wg_output_tile_m
+            if channels_per_task % Fp8Fc2ActivationScaleK != 0:
+                raise ValueError(
+                    "blockwise FP8 swap-AB FC1 epilogue needs the task tile's "
+                    f"output channels ({channels_per_task}) divisible by the h "
+                    f"scale block {Fp8Fc2ActivationScaleK} (raw tile M=256)."
+                )
+            self._fc1_scale_block_fragments = (
+                Fp8Fc2ActivationScaleK // self._wg_output_tile_m
+            )
         self._mma_tiler_k = mma_tiler_mnk[2]
         self._token_group_count = self._token_tile_n // 8
         self._accum_regs_per_m64 = self._token_tile_n // 2 # n // 8 * 4 = n // 2
@@ -944,6 +961,34 @@ class SwapABFp8GluEpilogue:
                     smem_fc1_amax[n_half, 3, token1],
                 ),
             )
+            if cutlass.const_expr(self._fc1_scale_block_fragments == 2):
+                other = 1 - n_half
+                token0_max = fmax(
+                    token0_max,
+                    fmax(
+                        fmax(
+                            smem_fc1_amax[other, 0, token0],
+                            smem_fc1_amax[other, 1, token0],
+                        ),
+                        fmax(
+                            smem_fc1_amax[other, 2, token0],
+                            smem_fc1_amax[other, 3, token0],
+                        ),
+                    ),
+                )
+                token1_max = fmax(
+                    token1_max,
+                    fmax(
+                        fmax(
+                            smem_fc1_amax[other, 0, token1],
+                            smem_fc1_amax[other, 1, token1],
+                        ),
+                        fmax(
+                            smem_fc1_amax[other, 2, token1],
+                            smem_fc1_amax[other, 3, token1],
+                        ),
+                    ),
+                )
             scale0 = fmax(
                 token0_max * self.fp8_output_rcp_limit, scale_epsilon
             )
@@ -952,22 +997,26 @@ class SwapABFp8GluEpilogue:
             )
             r_scale[pair_base + 0] = scale0
             r_scale[pair_base + 1] = scale1
-            if local_warp_idx == cutlass.Int32(0):
-                if lane_group == cutlass.Int32(0):
-                    if token0 < work_tile_info.valid_tokens_in_cta_tile:
-                        stg_fc1_block_scale_row(
-                            gmem_fc1_output_sf,
-                            scale_col_idx,
-                            global_token_base + token0,
-                            scale0,
-                        )
-                    if token1 < work_tile_info.valid_tokens_in_cta_tile:
-                        stg_fc1_block_scale_row(
-                            gmem_fc1_output_sf,
-                            scale_col_idx,
-                            global_token_base + token1,
-                            scale1,
-                        )
+            # One scale per block: warpgroup 0 writes it for a two-WG block.
+            if cutlass.const_expr(
+                self._fc1_scale_block_fragments == 1 or n_half == 0
+            ):
+                if local_warp_idx == cutlass.Int32(0):
+                    if lane_group == cutlass.Int32(0):
+                        if token0 < work_tile_info.valid_tokens_in_cta_tile:
+                            stg_fc1_block_scale_row(
+                                gmem_fc1_output_sf,
+                                scale_col_idx,
+                                global_token_base + token0,
+                                scale0,
+                            )
+                        if token1 < work_tile_info.valid_tokens_in_cta_tile:
+                            stg_fc1_block_scale_row(
+                                gmem_fc1_output_sf,
+                                scale_col_idx,
+                                global_token_base + token1,
+                                scale1,
+                            )
 
     @cute.jit
     def _publish_fc1_scale_rcp_chunk_swapab_blockwise(
@@ -1180,19 +1229,31 @@ class SwapABFp8GluEpilogue:
             self._reuse_fc1_accum_temp_scratch
             and scratch_regs <= cute.size(accum_temp)
         )
-        amax_bar = pipeline.NamedBarrier(
-            barrier_id=self._fc1_amax_sync_bar_id + storage_group_idx,
-            num_threads=EpiWarpCount * WarpThreadCount,
-        )
+        if cutlass.const_expr(self._fc1_scale_block_fragments == 2):
+            # The scale block spans both fragments: the two epilogue
+            # warpgroups meet on one barrier and fold each other's amax.
+            amax_bar = pipeline.NamedBarrier(
+                barrier_id=self._fc1_amax_sync_bar_id,
+                num_threads=2 * EpiWarpCount * WarpThreadCount,
+            )
+        else:
+            amax_bar = pipeline.NamedBarrier(
+                barrier_id=self._fc1_amax_sync_bar_id + storage_group_idx,
+                num_threads=EpiWarpCount * WarpThreadCount,
+            )
         scale_epsilon = Float32(1.0e-30)
         global_token_base = (
             work_tile_info.cumulative_data_physical_row
             + work_tile_info.tile_n_idx * cutlass.Int32(self._token_tile_n)
         )
         scale_col_idx = (
-            work_tile_info.tile_m_idx
-            * cutlass.Int32(self._wgmma_fragment_count)
-            + cutlass.Int32(n_half)
+            (
+                work_tile_info.tile_m_idx
+                * cutlass.Int32(self._wgmma_fragment_count)
+                + cutlass.Int32(n_half)
+            )
+            * cutlass.Int32(self._wg_output_tile_m)
+            // cutlass.Int32(fp8_fc2_activation_scale_k(self.fp8_scale_mode))
         )
         sC_stage = cute.slice_(
             smem_fc1_output_buffer, (None, None, store_stage_idx)

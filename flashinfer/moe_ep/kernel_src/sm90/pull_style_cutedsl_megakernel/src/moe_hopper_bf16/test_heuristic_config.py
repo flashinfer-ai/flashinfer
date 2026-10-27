@@ -36,7 +36,7 @@ class HopperBf16HeuristicConfigTest(unittest.TestCase):
             )
 
     def test_token_back_is_epi_warps_everywhere(self) -> None:
-        # epi_warps won every bucket in the 2026-09-17 token-back sweep.
+        # epi_warps won every bucket in the token-back sweep.
         for bucket, config in HEURISTIC_CONFIGS.items():
             with self.subTest(bucket=bucket):
                 self.assertEqual(config.token_back_mode, "epi_warps")
@@ -71,7 +71,7 @@ class HopperBf16HeuristicConfigTest(unittest.TestCase):
     def test_representative_configs(self) -> None:
         selection = select_heuristic_config(32768)
         self.assertEqual(selection.token_bucket, 32768)
-        # Tile-K=64 twins on a 4x H200 SXM node (2026-09-11): swap ping-pong
+        # Tile-K=64 twins on a 4x H200 SXM node: swap ping-pong
         # M128N128 K64 CGA1x2 is the measured best for the 32768 bucket.
         self.assertTrue(selection.config.swap_ab)
         self.assertTrue(selection.config.pingpong)

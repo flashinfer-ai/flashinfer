@@ -933,6 +933,11 @@ class Bf16GluEpilogue:
                 sD_stage = cute.slice_(
                     smem_fc2_output_buffer, (None, None, store_stage_idx),
                 )
+                # The staging stage holds one M64 fragment: rows relative to
+                # this fragment (M128 tiles have two; the TMA store places
+                # fragment m_sub at M64 tile tile_m_idx * 2 + m_sub).
+                frag_row0 = token_row0 - cutlass.Int32(m_sub * self._accum_fragment_tile_m)
+                frag_row1 = token_row1 - cutlass.Int32(m_sub * self._accum_fragment_tile_m)
                 for rep in cutlass.range_constexpr(Fc2SubtileN // 8):
                     col_pair = (
                         cutlass.Int32(rep * 8)
@@ -948,10 +953,10 @@ class Bf16GluEpilogue:
                         cute.make_layout(2),
                     )
                     s_row0 = cute.local_tile(
-                        sD_stage, (1, 2), (token_row0, col_pair_tile),
+                        sD_stage, (1, 2), (frag_row0, col_pair_tile),
                     )
                     s_row1 = cute.local_tile(
-                        sD_stage, (1, 2), (token_row1, col_pair_tile),
+                        sD_stage, (1, 2), (frag_row1, col_pair_tile),
                     )
                     cute.copy(stg_atom, row0_regs, cute.coalesce(s_row0))
                     cute.copy(stg_atom, row1_regs, cute.coalesce(s_row1))
@@ -1074,7 +1079,9 @@ class Bf16GluEpilogue:
                             physical_store_stage,
                             tma_atom_fc2_output,
                             g_fc2_output_tile,
-                            work_tile_info.valid_tokens_in_cta_tile,
+                            # valid rows of this M64 fragment (skip empty ones)
+                            work_tile_info.valid_tokens_in_cta_tile
+                            - cutlass.Int32(m_sub * self._accum_fragment_tile_m),
                         )
                         fc2_store_pipeline.producer_commit()
                         fc2_store_pipeline.producer_acquire()

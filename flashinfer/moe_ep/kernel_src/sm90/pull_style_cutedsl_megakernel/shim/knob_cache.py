@@ -491,11 +491,33 @@ def resolve_knobs(
         live_tokens=live_tokens,
         gate_up_clamp=gate_up_clamp,
     )
-    if cached is not None:
-        return cached, "cache"
-    from .tuner import default_knobs
+    from .tuner import GEOMETRY_KNOBS, default_knobs, is_valid
 
-    return default_knobs(max_tokens, fp8_scale_mode=fp8_scale_mode), "heuristic"
+    if cached is not None and fp8_scale_mode not in ("per_tensor", "blockwise"):
+        return cached, "cache"
+    knobs = default_knobs(
+        max_tokens,
+        fp8_scale_mode=fp8_scale_mode,
+        world_size=world_size,
+        num_experts=num_experts,
+        num_topk=topk,
+    )
+    if cached is not None:
+        # FP8 entries carry no kernel-version axis: skip a winner the current
+        # kernel rejects (e.g. a blockwise M128 / ping-pong tile recorded
+        # before the 1x128 FC2-activation scales) instead of failing at
+        # workspace creation.  Geometry an entry omits comes from the table,
+        # as in the shim's merge.
+        table_geometry = {k: knobs[k] for k in GEOMETRY_KNOBS}
+        if is_valid({**table_geometry, **cached}, fp8_scale_mode=fp8_scale_mode):
+            return cached, "cache"
+        warnings.warn(
+            f"[moe_ep-knob-cache] ignoring cached knobs {cached} for "
+            f"fp8_scale_mode={fp8_scale_mode!r}: the current kernel rejects "
+            "them; using the built-in heuristic.",
+            stacklevel=2,
+        )
+    return knobs, "heuristic"
 
 
 __all__ = [

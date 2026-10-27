@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
@@ -77,6 +77,17 @@ class ProblemDesc(_BaseProblemDesc):
         super().__post_init__()
 
 
+def check_deterministic_config(deterministic: bool, in_kernel_fc2_reduce: bool) -> None:
+    """Reject ``deterministic`` together with the in-kernel topk reduce: the
+    REDG / ``cp.reduce`` adds land in arrival order, so the reduced output is
+    not reproducible.  The separate ``TopkReduce`` sums topk in fixed order."""
+    if deterministic and in_kernel_fc2_reduce:
+        raise ValueError(
+            "deterministic requires the separate TopkReduce; "
+            "turn off in_kernel_fc2_reduce (--in_kernel_fc2_reduce)."
+        )
+
+
 @dataclass
 class ImplDesc(_BaseImplDesc):
     """Hopper BF16 impl descriptor with the swap-AB short-N specializations.
@@ -91,10 +102,20 @@ class ImplDesc(_BaseImplDesc):
     token tile against adjacent weight tiles).  It requires a token-side
     cluster of 2 (swap-AB cga (1,2,1), non-swap cga (2,1,1)) and defaults to
     False so the default build is unchanged.
+
+    ``deterministic`` (MegaMoE, default off) makes launches bitwise
+    reproducible: launch-order-independent dispatch slots and the separate
+    fixed-order ``TopkReduce``.  It cannot be combined with
+    ``in_kernel_fc2_reduce``, whose atomic adds follow arrival order.
     """
 
     generate_c: bool = False
     tail_split_pairs: bool = False
+    deterministic: bool = False
+    # Non-swap CTA tile M choices; the forward publicly supports M=64 (the
+    # retained M=128 implementation spills in the Mega kernels).  The
+    # backward descriptor subclass widens this to (64, 128).
+    non_swap_tile_m_choices: ClassVar[Tuple[int, ...]] = NonSwapTileMChoices
 
     def _validate_mma_cta_mode(self, m: int) -> None:
         if self.use_2cta_instrs:
@@ -104,6 +125,7 @@ class ImplDesc(_BaseImplDesc):
             )
 
     def __post_init__(self) -> None:
+        check_deterministic_config(self.deterministic, self.in_kernel_fc2_reduce)
         m, n, k = self.mma_tiler_mnk
         supported_clusters = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
         if self.cluster_shape_mnk not in supported_clusters:
@@ -112,13 +134,13 @@ class ImplDesc(_BaseImplDesc):
                 f"{supported_clusters}, got {self.cluster_shape_mnk}."
             )
         non_swap_geometry = (
-            m in NonSwapTileMChoices and n in NonSwapTileNChoices
+            m in self.non_swap_tile_m_choices and n in NonSwapTileNChoices
         )
         if n not in SwapABTokenTileNChoices and not non_swap_geometry:
             raise ValueError(
                 "Hopper BF16 mma_tiler_mnk must use swap-AB N in "
                 f"{SwapABTokenTileNChoices} or a non-swap geometry in "
-                f"M={NonSwapTileMChoices}, N={NonSwapTileNChoices}; "
+                f"M={self.non_swap_tile_m_choices}, N={NonSwapTileNChoices}; "
                 f"got ({m}, {n}, {k})."
             )
 
@@ -161,7 +183,7 @@ class SwigluBf16Fc12Tester(Fc12TesterBase):
         valid_geometry = (
             m in SwapABTileMChoices and n in SwapABTokenTileNChoices
             if self.swap_ab
-            else m in NonSwapTileMChoices and n in NonSwapTileNChoices
+            else m in impl.non_swap_tile_m_choices and n in NonSwapTileNChoices
         )
         if not valid_geometry or impl.use_2cta_instrs:
             raise ValueError(

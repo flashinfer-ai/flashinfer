@@ -59,8 +59,9 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # token-bucket heuristics (keyed on fp8_scale_mode and max tokens per
     # rank); setting any one switches to manual mode with the drop driver's
     # defaults for the rest (swap_ab=False, pingpong=False, (64, 128, 128)
-    # native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
-    # cluster (1, 1, 1)).
+    # native ((64, 256, 128) blockwise) / (256, 32, 128) swap-AB / (128, 32,
+    # 128) swap-AB ping-pong, cluster (1, 1, 1)).  Blockwise needs N=256
+    # native / M=256 swap-AB tiles and no ping-pong.
     swap_ab: bool | None = None
     pingpong: bool | None = None
     mma_tiler_mnk: tuple[int, int, int] | None = None
@@ -121,6 +122,11 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # per-bucket choice; True/False forces it.  Legal only with swap-AB cga
     # (1, 2, 1) or non-swap cga (2, 1, 1).  Output-invariant.
     tail_split_pairs: bool | None = None
+    # Launch-order-independent dispatch slots: the expert-major pool row
+    # order (and ``fc1_c``) repeats bit for bit across launches.  Rejects
+    # enable_in_kernel_fc2_reduce, dedup_dispatch and grouped_token_back;
+    # single-node only.
+    deterministic: bool = False
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

@@ -37,14 +37,15 @@ from .tuner import default_knobs, is_valid
 
 def _sweep_geometries() -> List[Dict[str, Any]]:
     """Every geometry that wins at least one bucket of the kernel drop's
-    four-rank sweep: ``heuristic_config.HEURISTIC_CONFIGS``, both scale
-    modes, deduplicated.  Derived from the table so a
-    future table refresh updates the candidate set automatically."""
-    from moe_hopper_fp8.heuristic_config import HEURISTIC_CONFIGS
+    four-rank sweep (``heuristic_config.HEURISTIC_CONFIGS``) or of the
+    eight-rank overrides (``EP8_OVERRIDES``), both scale modes, deduplicated.
+    Derived from the tables so a future refresh updates the candidate set
+    automatically."""
+    from moe_hopper_fp8.heuristic_config import EP8_OVERRIDES, HEURISTIC_CONFIGS
 
     out: List[Dict[str, Any]] = []
     seen = set()
-    for table in HEURISTIC_CONFIGS.values():
+    for table in (*HEURISTIC_CONFIGS.values(), *EP8_OVERRIDES.values()):
         for c in table.values():
             # The scheduler companions (group_hint / tail_split_pairs) were
             # tuned with the geometry, so they travel with it.
@@ -77,10 +78,14 @@ def hopper_fp8_candidates(
     *,
     fp8_scale_mode: str = "per_tensor",
     max_tokens: int = 0,
+    world_size: int = 4,
+    num_experts: int = 384,
+    num_topk: int = 6,
 ) -> List[Dict[str, Any]]:
     """Default candidate knob dicts: heuristic winner first, then every
-    geometry that wins some bucket of the drop's sweep.  The heuristic
-    winner leads so a tie keeps the established default."""
+    geometry that wins some bucket of the drop's sweep and is legal for
+    ``fp8_scale_mode``.  The heuristic winner leads so a tie keeps the
+    established default."""
     out: List[Dict[str, Any]] = []
     seen = set()
 
@@ -90,11 +95,19 @@ def hopper_fp8_candidates(
                 (k, tuple(v) if isinstance(v, tuple) else v) for k, v in knobs.items()
             )
         )
-        if key not in seen and is_valid(knobs):
+        if key not in seen and is_valid(knobs, fp8_scale_mode=fp8_scale_mode):
             seen.add(key)
             out.append(knobs)
 
-    _add(default_knobs(max_tokens, fp8_scale_mode=fp8_scale_mode))
+    _add(
+        default_knobs(
+            max_tokens,
+            fp8_scale_mode=fp8_scale_mode,
+            world_size=world_size,
+            num_experts=num_experts,
+            num_topk=num_topk,
+        )
+    )
     # Each geometry is swept under both validated token-back modes (the
     # epi/reuse crossover is bucket-dependent; ``standalone_warps`` stays
     # out of the perf candidates until it has measured numbers).
@@ -409,6 +422,9 @@ def autotune_hopper_fp8_mega_moe(
         candidates = hopper_fp8_candidates(
             fp8_scale_mode=cfg.fp8_scale_mode,
             max_tokens=cfg.num_tokens_per_rank,
+            world_size=cfg.world_size,
+            num_experts=cfg.num_total_experts,
+            num_topk=cfg.num_topk,
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:

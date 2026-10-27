@@ -190,23 +190,38 @@ class _CompiledMega:
     launch_key: Optional[tuple] = None
     launch_kwargs: Optional[dict] = None
     launch_output: Optional[torch.Tensor] = None
+    # ``(exe_args, adapted_args)`` of the DSL executor for ``launch_kwargs``:
+    # converting ~20 kwargs to C pointers on every call costs ~0.1 ms of host
+    # time ahead of the launch.  Built on the first launch of a key; the
+    # adapted args own what ``exe_args`` points at.
+    launch_exe: Optional[tuple] = None
 
 
 def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:
+    """Zero the local workspace except the persistent cross-launch counters.
+
+    ``nvlink_barrier_counter`` (NVLink barrier phase) and, on the internode
+    path, ``gin_epoch`` (compared against the never-reset payload flags of the
+    node peers) must survive a host reset.
+    """
     kernel = mega.kernel
-    name = "nvlink_barrier_counter"
-    if name not in kernel._local_offsets:
+    keep = []
+    for name in ("nvlink_barrier_counter", "gin_epoch"):
+        if name in kernel._local_offsets:
+            off = int(kernel._local_offsets[name])
+            keep.append((off, off + int(kernel._local_region_by_name[name].nbytes)))
+    if not keep:
         mega.local_workspace.zero_()
         return
-
-    off = int(kernel._local_offsets[name])
-    nbytes = int(kernel._local_region_by_name[name].nbytes)
+    keep.sort()
+    cursor = 0
+    for start, end in keep:
+        if start > cursor:
+            mega.local_workspace[cursor:start].zero_()
+        cursor = max(cursor, end)
     total = mega.local_workspace.numel()
-    if off > 0:
-        mega.local_workspace[:off].zero_()
-    end = off + nbytes
-    if end < total:
-        mega.local_workspace[end:].zero_()
+    if cursor < total:
+        mega.local_workspace[cursor:].zero_()
 
 
 def reset_compiled_mega_workspaces(mega: _CompiledMega) -> None:

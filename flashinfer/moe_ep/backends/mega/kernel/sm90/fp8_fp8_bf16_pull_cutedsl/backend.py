@@ -217,6 +217,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             "fold_producer_warps": k.fold_producer_warps,
             "generate_c": k.generate_c,
             "tail_split_pairs": k.tail_split_pairs,
+            "deterministic": k.deterministic,
         }
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:

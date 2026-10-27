@@ -402,7 +402,11 @@ def build_heuristic_jobs(
         for selected_scale_mode in scale_modes:
             for tokens_per_rank in token_sizes:
                 config = select_heuristic_config(
-                    selected_scale_mode, tokens_per_rank
+                    selected_scale_mode,
+                    tokens_per_rank,
+                    world_size=world_size,
+                    num_experts=TOTAL_EXPERTS,
+                    num_topk=TOPK,
                 ).config
                 if training_geometry:
                     swap_ab, pingpong = False, False

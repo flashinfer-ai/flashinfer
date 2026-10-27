@@ -168,6 +168,30 @@ def test_shim_config_validation():
         pkg.MegaMoEHopperFp8Config(
             **{**base, "fp8_scale_mode": "blockwise", "hidden": 1088}
         )
+    # Blockwise forms one 1x128 FC2-activation scale per task tile: N=256
+    # native / M=256 swap-AB tiles, no ping-pong.
+    bw = {**base, "fp8_scale_mode": "blockwise"}
+    pkg.MegaMoEHopperFp8Config(**{**bw, "mma_tiler_mnk": (64, 256, 128)})
+    pkg.MegaMoEHopperFp8Config(
+        **{**bw, "swap_ab": True, "mma_tiler_mnk": (256, 8, 128)}
+    )
+    for geometry in (
+        {"mma_tiler_mnk": (64, 128, 128)},
+        {"swap_ab": True, "mma_tiler_mnk": (128, 32, 128)},
+        {"swap_ab": True, "pingpong": True, "mma_tiler_mnk": (128, 32, 128)},
+    ):
+        with pytest.raises(ValueError, match="128 output channels"):
+            pkg.MegaMoEHopperFp8Config(**{**bw, **geometry})
+    # deterministic needs the separate TopkReduce and the single-node path.
+    assert pkg.MegaMoEHopperFp8Config(**{**base, "deterministic": True}).deterministic
+    with pytest.raises(ValueError, match="deterministic"):
+        pkg.MegaMoEHopperFp8Config(
+            **{**base, "deterministic": True, "in_kernel_fc2_reduce": True}
+        )
+    with pytest.raises(ValueError, match="deterministic"):
+        pkg.MegaMoEHopperFp8Config(
+            **{**base, "deterministic": True, "enable_nccl_gin": True}
+        )
     # swap-AB default geometry is valid.
     swab = dataclasses.replace(cfg, swap_ab=True, mma_tiler_mnk=(256, 32, 128))
     assert swab.swap_ab
