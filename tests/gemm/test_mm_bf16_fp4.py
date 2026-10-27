@@ -13,6 +13,7 @@ from flashinfer.gemm.gemm_bf16_fp4 import (
     _unswizzle_sf_128x4,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.pdl import late_store
 
 
 # E2M1 (FP4) value table, signed (codes 0-7 positive, 8-15 negative), matching
@@ -615,3 +616,30 @@ def test_alpha_dtype_must_be_float32():
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(TypeError):
         prepare_bf16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "cute-dsl-native"])
+def test_mm_bf16_fp4_pdl_waits_for_alpha(backend):
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    m, n, k = SMOKE_MNK
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
+    out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+
+    def run():
+        mm_bf16_fp4(a, b_p, sf_p, alpha_p, out=out, backend=backend, enable_pdl=True)
+        return out.clone()
+
+    expected = run()
+
+    # alpha is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    alpha_value = alpha_p.item()
+    alpha_p.fill_(alpha_value * 4)
+    late_store(alpha_p, alpha_value)
+    actual = run()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
