@@ -66,6 +66,12 @@ class GinArena:
         )
         from nccl.core.interop.torch import empty as nccl_empty
 
+        from .nccl_bitcode import use_inline_nccl_device_bitcode
+
+        # Before any GIN kernel is traced: link NCCL device code that fully
+        # inlines (a call left in the kernel serializes its wgmma).
+        use_inline_nccl_device_bitcode()
+
         if world_size % ranks_per_node != 0:
             raise ValueError(
                 f"ranks_per_node={ranks_per_node} must divide world_size={world_size}."
