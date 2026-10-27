@@ -371,9 +371,13 @@ def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
     lengths, heads, seed
 ):
     call = _run_prepared_bf16_export(lengths, heads, seed, checkpoints=True)
-    assert str(call.schedule) == "fused_m64_independent_dvsplit_fp32_state", str(
-        call.schedule
-    )
+    # Long rows whose 2-CTA clusters fit one wave take the pair-share build of
+    # the same split (schedule suffix ``_pair_share``, the same bits).
+    schedule = str(call.schedule)
+    assert (
+        schedule.removesuffix("_pair_share")
+        == "fused_m64_independent_dvsplit_fp32_state"
+    ), schedule
 
 
 # ---------------------------------------------------------------------------

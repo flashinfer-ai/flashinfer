@@ -911,6 +911,7 @@ def unrouted(monkeypatch):
             "_RENDERED_OWNER_HELPER_POOL_ROUTES",
             "_RENDERED_FOLD_ROUTES",
             "_RENDERED_MAP_FOLD_ROUTES",
+            "_RENDERED_PAIR_SHARE_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 

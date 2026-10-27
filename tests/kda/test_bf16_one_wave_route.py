@@ -103,7 +103,10 @@ def _prepare(lengths, heads, *, active_beta):
     ],
 )
 def test_one_wave_bf16_grid_uses_m64_value_split(lengths, heads, active_beta, expected):
-    assert _prepare(lengths, heads, active_beta=active_beta) == expected
+    # A long launch whose 2-CTA clusters fit one wave takes the pair-share build
+    # of the same split (schedule suffix ``_pair_share``, the same bits).
+    schedule = _prepare(lengths, heads, active_beta=active_beta)
+    assert schedule.removesuffix("_pair_share") == expected
 
 
 def test_short_h12_logit_beta_keeps_direct_n16_tile():
