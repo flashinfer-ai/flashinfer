@@ -394,6 +394,38 @@ _STAGE23_SLAB_FLAGS_BY_CAPABILITY: dict[tuple[int, int], dict[tuple[int, int], i
 }
 
 
+# Two-launch chains of single cells per device (capability, SM count): (vocab, batch) -> the stage-2/3
+# ``variant_flags`` the (256, 4) slab dispatches there, for 768 < top_k_max <= 1024; the chain's stage 1 also takes
+# its build's no-tail twin (launch_flags bit 12).  Round 18: on the 212-SM R200 the V = 32768 rows at batch 1, 2 and 4
+# (the (4, 16) resident's chain) run `c4_e16_nt` + `t256_i4_int_sel1`; at k = 1000 batch 1 at 0.979-0.987 of the
+# `c4_e16` + `t256_i4` chain's time (two nodes, 12 rounds, multi-cell, single-cell and first-in-process layouts, both
+# buffer placements, eager and graph, same sampled tokens) and batch 2 and 4 at 0.985-0.994 (multi-cell layout).  The
+# one-launch whole-CTA tail is not taken at batch 1: alone in a process it runs at 0.888-0.985, but its single CTA's
+# cold-L2 time moves between 11.1 and 14.4 us with the process's allocation history (up to 1.133 of the chain in
+# multi-cell processes).
+_CHAIN_CELL_FORMS_BY_DEVICE: dict[tuple[int, int, int], dict[tuple[int, int], int]] = {
+    (10, 7, 212): {(32768, 1): 3, (32768, 2): 3, (32768, 4): 3},
+}
+
+
+def _chain_cell_form(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+) -> Optional[int]:
+    """The ``_CHAIN_CELL_FORMS_BY_DEVICE`` stage-2/3 form of this device's cell, else None."""
+    if top_k_max is None or not (
+        _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
+    ):
+        return None
+    forms = _CHAIN_CELL_FORMS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    )
+    return forms.get((int(vocab), int(batch)))
+
+
 def _stage23_plan_flags(device_index: int, threads: int, items: int) -> int:
     """``variant_flags`` of the stage-2/3 form a plan with the ``(threads, items)`` slab dispatches on the device:
     its ``_STAGE23_SLAB_FLAGS_BY_CAPABILITY`` exception, else the per-capability form."""
@@ -535,6 +567,37 @@ _C12_BLOCK_TAIL_CELLS: dict[
     (10, 3): {(262144, 128): (1, 32, True)},
     (10, 7): {(262144, 128): (1, 32, True)},
 }
+# Further cluster-1 whole-CTA-tail cells per device (capability, SM count): (vocab, batch) -> the smallest top_k_max
+# (up to the slab) whose launch runs the (1, 32) stream's speculative-sample whole-CTA-tail build
+# (``_C1_BLOCK_TAIL_PICK_BUILD``, through ``_c12_block_tail``) although the cost model picks another variant there.
+# Round 18: on the 212-SM R200 the V = 32768 rows at batch 8 and 16 from k = 800 and at batch 32 from k = 769 (the
+# cost model's (4, 16) resident runs them as a two-launch chain) run `c1_e32s_bt_sp_tia` at 0.927-0.982 of the chain
+# at k = 1000, 0.945-0.989 at k = 800 and 0.865-0.942 at k = 1024 (two nodes, 12 rounds, both buffer placements,
+# eager and graph, same sampled tokens).  The chain's time grows with k, the tail's does not: at k = 769 the tail is
+# 1.019-1.045 of the chain at batch 8 and 16 (0.937-0.949 at batch 32), so those rows keep the chain below 800.
+# Batch 1, 2 and 4 keep the chain in its ``_CHAIN_CELL_FORMS_BY_DEVICE`` form (the tail runs at 0.966-1.032 of the
+# chain at batch 2 and 4).
+_C1_BLOCK_TAIL_PICKS_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int], int]
+] = {
+    (10, 7, 212): {(32768, 8): 800, (32768, 16): 800, (32768, 32): 769},
+}
+_C1_BLOCK_TAIL_PICK_BUILD = (1, 32, True)
+
+
+def _c1_block_tail_pick_cell(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+) -> bool:
+    """Whether this device's ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` lists the cell for ``top_k_max``."""
+    picks = _C1_BLOCK_TAIL_PICKS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    )
+    min_k = picks.get((int(vocab), int(batch)))
+    return min_k is not None and top_k_max is not None and int(top_k_max) >= min_k
 
 
 def _c12_block_tail(
@@ -546,8 +609,9 @@ def _c12_block_tail(
     smem_limit: Optional[int] = None,
 ) -> Optional[tuple[int, int, bool]]:
     """The (cluster, ept, spec_sample) of the cluster-1 / cluster-2 whole-CTA-tail stream build this call launches
-    (``_C12_BLOCK_TAIL_CELLS``): 768 < top_k_max <= the slab, the build ships and fits ``smem_limit``, and its
-    stage-1 grid is a single wave; else None."""
+    (``_C12_BLOCK_TAIL_CELLS``, and ``_C1_BLOCK_TAIL_PICK_BUILD`` on the device's ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE``
+    cells from their smallest top_k_max): 768 < top_k_max <= the slab, the build ships and fits ``smem_limit``, and
+    its stage-1 grid is a single wave; else None."""
     if top_k_max is None or not (
         _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
     ):
@@ -555,6 +619,10 @@ def _c12_block_tail(
     build = _C12_BLOCK_TAIL_CELLS.get((int(capability[0]), int(capability[1])), {}).get(
         (int(vocab), int(batch))
     )
+    if build is None and _c1_block_tail_pick_cell(
+        capability, sm_count, batch, vocab, top_k_max
+    ):
+        build = _C1_BLOCK_TAIL_PICK_BUILD
     if build is None:
         return None
     cluster, ept, spec = build
@@ -876,8 +944,13 @@ _LOCAL_SELECT_WIDE_MAX_CHUNKS = 2
 # build (`_bt_tia` twin).  The tail's f64 target product, cut tests and sample tests run as the stage-2/3 `int_tests`
 # integer emulation, bit-identical; it pays only where the FP64 pipe is slow (GB300 served cluster-8 ept-16 k = 1000 / 200
 # cells 0.916-0.955); B200's full-rate FP64 loses 3-7 % with it and keeps the f64 `_bt` twin.
+# ``_INT_TAIL_DEVICES`` adds devices (capability, SM count).  Round 18: on the 212-SM R200 the cluster-1 cell
+# V = 262144, B = 128, k = 1000 runs `c1_e32s_bt_sp_tia` at 0.923-0.957 of the f64 `_bt_sp` launch (two nodes,
+# 12 rounds, multi-cell and first-in-process layouts, both buffer placements, eager and graph, same sampled tokens);
+# the 208-SM board keeps `_bt_sp`.
 _FLAG_INT_TAIL = 2048
 _INT_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 3)})
+_INT_TAIL_DEVICES: frozenset[tuple[int, int, int]] = frozenset({(10, 7, 212)})
 # Stage-1 launch_flags bit 12: the no-tail form (`_nt` twin) of a fused-tail build, taken by a two-launch chain, whose
 # stage 1 never runs a tail; built without the tail code, the passes keep the registers it took.
 _FLAG_NO_TAIL = 4096
@@ -1524,17 +1597,19 @@ def _int_tail_flag(
     stream: bool,
     launch_flags: int,
     capability: Optional[tuple[int, int]] = None,
+    sm_count: Optional[int] = None,
 ) -> int:
     """Stage-1 ``launch_flags`` bit 11 for a whole-CTA-tail launch (``launch_flags`` carries bit 3): the integer-tested
-    tail of a streaming variant that ships it, on the capabilities in ``_INT_TAIL_CAPABILITIES`` (``capability`` None:
-    taken)."""
+    tail of a streaming variant that ships it, on the capabilities in ``_INT_TAIL_CAPABILITIES`` and the devices
+    (capability, ``sm_count``) in ``_INT_TAIL_DEVICES`` (``capability`` None: taken)."""
     if not stream or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) == 0:
         return 0
-    if (
-        capability is not None
-        and (int(capability[0]), int(capability[1])) not in _INT_TAIL_CAPABILITIES
-    ):
-        return 0
+    if capability is not None:
+        cap = (int(capability[0]), int(capability[1]))
+        if cap not in _INT_TAIL_CAPABILITIES and (
+            sm_count is None or (*cap, int(sm_count)) not in _INT_TAIL_DEVICES
+        ):
+            return 0
     return _FLAG_INT_TAIL if _stage1_has_int_tail(cluster, ept, True) else 0
 
 
@@ -2400,7 +2475,9 @@ def _launch_plan(
     elif fused_block:
         spec_block = c12_fused and c12_block is not None and c12_block[2]
         launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if spec_block else 0)
-        launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
+        launch_flags |= _int_tail_flag(
+            cluster, ept, stream, launch_flags, capability, sm_count
+        )
         if lp_block:
             launch_flags |= _FLAG_LEADER_PUSH
             if _LEADER_PUSH_BLOCK_TAIL_ROW_SPAN:
@@ -2426,6 +2503,13 @@ def _launch_plan(
         launch_flags |= _no_tail_flag(
             cluster, ept, stream, launch_flags, batch, capability
         )
+    stage23_flags = _stage23_plan_flags(device_index, threads, items)
+    cell_form = None
+    if not (fused or fused_block) and (threads, items) == (256, 4):
+        cell_form = _chain_cell_form(capability, sm_count, batch, vocab, top_k_max)
+    if cell_form is not None:
+        launch_flags |= _no_tail_flag(cluster, ept, stream, launch_flags, batch, None)
+        stage23_flags = cell_form
     return _LaunchPlan(
         cluster,
         ept,
@@ -2434,7 +2518,7 @@ def _launch_plan(
         items,
         launch_flags,
         fused or fused_block,
-        _stage23_plan_flags(device_index, threads, items),
+        stage23_flags,
     )
 
 

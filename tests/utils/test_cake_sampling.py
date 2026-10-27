@@ -1714,7 +1714,9 @@ def test_round16_sm12x_resident_samples_bitwise(monkeypatch):
 def test_stage23_slab_form_exceptions(monkeypatch):
     """Each per-slab stage-2/3 form exception names a form the frozen module exports for that slab.  On the emulated
     devices every two-launch plan dispatches the per-capability form, except the (256, 4) slab on RTX PRO 6000
-    (12, 0), which dispatches the int_tests + one_cmp_select form: its 24 top-k 1000 owner cells."""
+    (12, 0), which dispatches the int_tests + one_cmp_select form: its 24 top-k 1000 owner cells, and (round 18) the
+    212-SM R200's ``_CHAIN_CELL_FORMS_BY_DEVICE`` cells V = 32768 batch 1, 2 and 4 k = 1000, which dispatch the same
+    form."""
     if not torch.cuda.is_available():
         # without CUDA every k > 64 launch plans the two-launch chain
         pytest.skip("CUDA required")
@@ -1726,6 +1728,11 @@ def test_stage23_slab_form_exceptions(monkeypatch):
         for (threads, items), flags in slabs.items():
             assert (threads, items, flags) in forms, (cap, threads, items, flags)
     assert cs._STAGE23_SLAB_FLAGS_BY_CAPABILITY == {(12, 0): {(256, 4): 3}}
+    for device, cells in cs._CHAIN_CELL_FORMS_BY_DEVICE.items():
+        for cell, flags in cells.items():
+            assert (256, 4, flags) in forms, (device, cell, flags)
+    chain_forms = {(32768, b): 3 for b in _R18_CHAIN_BATCHES}
+    assert {(10, 7, 212): chain_forms} == cs._CHAIN_CELL_FORMS_BY_DEVICE
     table = cake_sampling_jit.stage23_flags_by_capability()
     excepted = []
     for (name, vocab, batch, k), plan in _emulated_launch_plans(monkeypatch).items():
@@ -1736,6 +1743,12 @@ def test_stage23_slab_form_exceptions(monkeypatch):
         if cap == (12, 0) and (plan.threads, plan.items) == (256, 4):
             want = 3
             excepted.append((vocab, batch, k))
+        if (
+            name == "R200"
+            and (vocab, k) == (32768, 1000)
+            and batch in _R18_CHAIN_BATCHES
+        ):
+            want = 3
         assert plan.stage23_flags == want, (name, vocab, batch, k, plan)
     assert sorted(excepted) == sorted(
         itertools.product(
@@ -1801,6 +1814,114 @@ _MULTI_WAVE_CHAIN_PLAN_CHANGES = {
     ("RTX PRO 6000", 128256, 128, 10): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
     ("RTX PRO 6000", 128256, 128, 50): ("8_32_0 f1 1L", "8_32_0 f4096 2L"),
 }
+
+
+# Round 18 (R200): (device, vocab, batch, top-k) -> (plan without the round-18 rules, plan with them, stage-2/3 form
+# with them) of every owner cell they change.  The rules are keyed by device (capability, SM count) and list only the
+# 212-SM board: the integer-tested whole-CTA tail (``_INT_TAIL_DEVICES``) moves the cluster-1 cell V = 262144 B = 128
+# k = 1000 from `_bt_sp` (launch_flags bits 3 + 6) to `_bt_sp_tia` (bit 11 added); ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE``
+# moves the V = 32768 k = 1000 rows at batch 8, 16 and 32 from the (4, 16) resident's two-launch chain to that
+# one-launch tail (from top-k 800 at batch 8 and 16, from 769 at batch 32: ``_R18_PICK_MIN_K``);
+# ``_CHAIN_CELL_FORMS_BY_DEVICE`` keeps the batch 1, 2 and 4 rows on the chain, with the stage-1 no-tail twin (bit 12)
+# and the (256, 4) slab's int_tests + one_cmp_select form (3).  The 208-SM board keeps its plans.
+_R18_PICK_MIN_K = {8: 800, 16: 800, 32: 769}
+_R18_PICK_BATCHES = tuple(_R18_PICK_MIN_K)
+_R18_CHAIN_BATCHES = (1, 2, 4)
+_R18_PLAN_CHANGES = {
+    **{
+        ("R200", 32768, batch, 1000): ("4_16_0 f2 2L", "1_32_1 f2120 1L", 0)
+        for batch in _R18_PICK_BATCHES
+    },
+    **{
+        ("R200", 32768, batch, 1000): ("4_16_0 f2 2L", "4_16_0 f4098 2L", 3)
+        for batch in _R18_CHAIN_BATCHES
+    },
+    ("R200", 262144, 128, 1000): ("1_32_1 f72 1L", "1_32_1 f2120 1L", 0),
+}
+
+
+def test_round18_r200_rules_change_only_their_cells(monkeypatch):
+    """The round-18 R200 rules (the integer-tested whole-CTA tail of ``_INT_TAIL_DEVICES``, the V = 32768 cluster-1
+    cells of ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` and the chain form of ``_CHAIN_CELL_FORMS_BY_DEVICE``, all for
+    the 212-SM board) change the launch plans of the owner cells on the emulated devices exactly on the cells of
+    ``_R18_PLAN_CHANGES``, against the plans without them.  On a wide grid (vocab on both sides of 32768, batch 1-129,
+    top-k on both sides of the whole-CTA tail's range) they change only 212-SM R200 rows with 768 < top-k <=
+    fused_block_tail_kcap: the V = 32768 rows at batch 8, 16 and 32 (from their ``_R18_PICK_MIN_K``) into the (1, 32)
+    stream's one launch with bits 3 + 6 + 11, the V = 32768 batch 1, 2 and 4 rows' chain by bit 12 and stage-2/3
+    form 3, and the V = 262144 B = 128 rows by bit 11 alone; the 208-SM board and every other device keep every
+    plan."""
+    assert sorted(cs._INT_TAIL_DEVICES) == [(10, 7, 212)]
+    picks = {(32768, b): k for b, k in _R18_PICK_MIN_K.items()}
+    assert {(10, 7, 212): picks} == cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE
+    chain_forms = {(32768, b): 3 for b in _R18_CHAIN_BATCHES}
+    assert {(10, 7, 212): chain_forms} == cs._CHAIN_CELL_FORMS_BY_DEVICE
+
+    def without_rules(cells=_PLAN_CELLS, emulated=None):
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_INT_TAIL_DEVICES", frozenset())
+            m.setattr(cs, "_C1_BLOCK_TAIL_PICKS_BY_DEVICE", {})
+            m.setattr(cs, "_CHAIN_CELL_FORMS_BY_DEVICE", {})
+            return _emulated_launch_plans(m, emulated, cells)
+
+    new = _emulated_launch_plans(monkeypatch)
+    old = without_rules()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan), plan.stage23_flags)
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert changed == _R18_PLAN_CHANGES
+    assert all(old[cell].stage23_flags == 0 for cell in changed)
+    cells = tuple(
+        itertools.product(
+            (16385, 24576, 30000, 32768, 32769, 65536, 262144),
+            (1, 2, 3, 4, 7, 8, 9, 16, 31, 32, 33, 64, 128, 129),
+            (64, 65, 768, 769, 799, 800, 1000, 1024),
+        )
+    )
+    new = _emulated_launch_plans(monkeypatch, None, cells)
+    old = without_rules(cells)
+    tail = cs._BLOCK_TAIL_MIN_K, cs._fused_block_tail_kcap()
+    moved = 0
+    for cell, plan in new.items():
+        name, vocab, batch, k = cell
+        before = old[cell]
+        in_range = tail[0] < k <= tail[1]
+        if (
+            name == "R200"
+            and vocab == 32768
+            and batch in _R18_PICK_BATCHES
+            and in_range
+            and k >= _R18_PICK_MIN_K[batch]
+        ):
+            assert _plan_text(plan) == "1_32_1 f2120 1L", cell
+            assert (plan.threads, plan.items, plan.stage23_flags) == (
+                before.threads,
+                before.items,
+                before.stage23_flags,
+            ), cell
+            moved += 1
+        elif name == "R200" and (vocab, batch) == (262144, 128) and in_range:
+            assert plan == before._replace(
+                launch_flags=before.launch_flags | cs._FLAG_INT_TAIL
+            ), cell
+            moved += 1
+        elif (
+            name == "R200"
+            and vocab == 32768
+            and batch in _R18_CHAIN_BATCHES
+            and in_range
+        ):
+            assert not before.one_launch and (before.threads, before.items) == (256, 4)
+            assert plan == before._replace(
+                launch_flags=before.launch_flags | cs._FLAG_NO_TAIL, stage23_flags=3
+            ), cell
+            moved += 1
+        else:
+            assert plan == before, cell
+    # pick rows: batch 8 / 16 at k 800, 1000, 1024; batch 32 at k 769, 799, 800, 1000, 1024; then the batch 1, 2 and 4
+    # chain rows and row A at k 769, 799, 800, 1000, 1024
+    assert moved == 3 + 3 + 5 + 3 * 5 + 5
 
 
 def test_multi_wave_chain_changes_only_its_cells(monkeypatch):
@@ -3339,9 +3460,28 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
     for cc in ((9, 0), (11, 0), (12, 0)):
         assert cs._c12_block_tail(128, 262144, 1000, cc, 148) is None
     fused_flags = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_SPEC_SAMPLE
+    # round 18: the 212-SM R200's V = 32768 cells (``_C1_BLOCK_TAIL_PICKS_BY_DEVICE``, from the cell's smallest
+    # top_k_max) launch the same build, by device only
+    assert row_a == cs._C1_BLOCK_TAIL_PICK_BUILD
+    for batch, min_k in _R18_PICK_MIN_K.items():
+        assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 212) == row_a
+        assert cs._c12_block_tail(batch, 32768, min_k, (10, 7), 212) == row_a
+        assert cs._c12_block_tail(batch, 32768, min_k - 1, (10, 7), 212) is None
+        assert cs._c12_block_tail(batch, 32768, kcap, (10, 7), 212) == row_a
+        assert cs._c12_block_tail(batch, 32768, kcap + 1, (10, 7), 212) is None
+        assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 212, 99 * 1024) is None
+        assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 208) is None
+        for cc in ((10, 0), (10, 3)):
+            assert cs._c12_block_tail(batch, 32768, 1000, cc, 212) is None
+    for batch in (1, 2, 4, 3, 64):
+        assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 212) is None
     assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 3)) == cs._FLAG_INT_TAIL
     assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 0)) == 0
     assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 7)) == 0
+    assert (
+        cs._int_tail_flag(1, 32, True, fused_flags, (10, 7), 212) == cs._FLAG_INT_TAIL
+    )
+    assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 7), 208) == 0
     device = torch.cuda.current_device()
     capability = cs._device_capability(device)
     batch, vocab = 128, 262144
@@ -3385,7 +3525,7 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
         ), plan
         assert plan.launch_flags & fused_flags == fused_flags, plan
         assert plan.launch_flags & cs._FLAG_INT_TAIL == cs._int_tail_flag(
-            1, 32, True, fused_flags, capability
+            1, 32, True, fused_flags, capability, cs._sm_count(device)
         )
         fused, _ = _run_and_check(probs, k, p, 0x1368, 3)
         label = k if isinstance(k, int) else "row"
@@ -3401,6 +3541,159 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
                 two.renorm[r, :kr].view(np.uint32),
                 fused.renorm[r, :kr].view(np.uint32),
             ), (label, r)
+    cs._launch_plan.cache_clear()
+
+
+def test_c1_block_tail_picks_match_two_launch_forms(monkeypatch):
+    """Round 18: a ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` cell of this device (the 212-SM R200's V = 32768 rows at batch 8,
+    16 and 32, from the cell's smallest top_k_max up to 1024) runs the (1, 32) stream's one launch with the whole-CTA
+    tail (bits 3 + 6, and bit 11 on an ``_INT_TAIL_DEVICES`` device).  Its outputs are bitwise identical to the (1, 32)
+    stream's two-launch form, and its samples, counts and per-index values / renorm weights to the two-launch chain the
+    host runs without the rule (the cost model's stage 1), on adversarial rows, per-row k and per-row p.  Skipped on
+    other devices."""
+    _require_supported_device()
+    device = torch.cuda.current_device()
+    capability = cs._device_capability(device)
+    sm_count = cs._sm_count(device)
+    cells = cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE.get((*capability, sm_count), {})
+    if not cells or not _device_streams():
+        pytest.skip("no round-18 cluster-1 tail cells on this device")
+    kcap = int(load_manifest()["fused_block_tail_kcap"])
+    fused_flags = cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_SPEC_SAMPLE
+    for vocab, batch in sorted(cells):
+        probs = _probs(batch, vocab, seed=1368 + batch)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1200) * 13) % vocab] = np.float32(
+            2**-11
+        )  # ties across the k cut and the p boundary
+        pn[1, [7, 4096]] = np.inf
+        pn[2, : vocab // 2] = 0.0  # a half-zero row
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        k_row = torch.randint(1, kcap + 1, (batch,), device="cuda", dtype=torch.int32)
+        k_row[0] = kcap
+        k_row[-1] = 32
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        for k, p in (
+            (1000, 0.9),
+            (kcap, 0.5),
+            (cells[(vocab, batch)], 1e-6),
+            (k_row, p_row),
+        ):
+            top_k_max = k if isinstance(k, int) else int(k.max().item())
+            label = (vocab, batch, k if isinstance(k, int) else "row")
+            cs._launch_plan.cache_clear()
+            plan = cs._launch_plan(device, batch, vocab, top_k_max)
+            assert (plan.cluster, plan.ept, plan.stream, plan.one_launch) == (
+                1,
+                32,
+                True,
+                True,
+            ), (label, plan)
+            assert plan.launch_flags & fused_flags == fused_flags, (label, plan)
+            assert plan.launch_flags & cs._FLAG_INT_TAIL == cs._int_tail_flag(
+                1, 32, True, fused_flags, capability, sm_count
+            ), (label, plan)
+            fused, _ = _run_and_check(probs, k, p, 0x1368, 3)
+            with monkeypatch.context() as m:  # the (1, 32) stream's own two-launch form
+                m.setattr(cs, "_c12_block_tail", lambda *a, **kw: None)
+                m.setattr(cs, "_measured_stage1_pick", lambda *a, **kw: (1, 32, True))
+                cs._launch_plan.cache_clear()
+                plan1 = cs._launch_plan(device, batch, vocab, top_k_max)
+                assert (plan1.cluster, plan1.ept, plan1.stream, plan1.one_launch) == (
+                    1,
+                    32,
+                    True,
+                    False,
+                ), (label, plan1)
+                two, _ = _run_and_check(probs, k, p, 0x1368, 3)
+            # without the rule: the cost model's two-launch chain
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_C1_BLOCK_TAIL_PICKS_BY_DEVICE", {})
+                cs._launch_plan.cache_clear()
+                plan0 = cs._launch_plan(device, batch, vocab, top_k_max)
+                assert not plan0.one_launch, (label, plan0)
+                chain, _ = _run_and_check(probs, k, p, 0x1368, 3)
+            cs._launch_plan.cache_clear()
+            for ref in (two, chain):
+                assert np.array_equal(ref.samples, fused.samples), label
+                assert np.array_equal(ref.count, fused.count), label
+            for r in range(batch):
+                kr = int(two.count[r])
+                assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (label, r)
+                assert np.array_equal(
+                    two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+                ), (label, r)
+                assert np.array_equal(
+                    two.renorm[r, :kr].view(np.uint32),
+                    fused.renorm[r, :kr].view(np.uint32),
+                ), (label, r)
+                a, b = np.argsort(chain.idx[r, :kr]), np.argsort(fused.idx[r, :kr])
+                assert np.array_equal(chain.idx[r, :kr][a], fused.idx[r, :kr][b]), (
+                    label,
+                    r,
+                )
+                for name in ("vals", "renorm"):
+                    x = getattr(chain, name)[r, :kr][a].view(np.uint32)
+                    y = getattr(fused, name)[r, :kr][b].view(np.uint32)
+                    assert np.array_equal(x, y), (label, r, name)
+    cs._launch_plan.cache_clear()
+
+
+def test_chain_cell_form_matches_default_chain(monkeypatch):
+    """Round 18: a ``_CHAIN_CELL_FORMS_BY_DEVICE`` cell of this device (the 212-SM R200's V = 32768 rows at batch 1, 2
+    and 4, 768 < top_k_max <= 1024) runs the cost model's two-launch chain with the stage-1 no-tail twin (bit 12) and
+    the listed (256, 4) stage-2/3 form; its samples and counts are bitwise identical to the default chain's (no rule),
+    and so are its per-index values and renorm weights, on adversarial rows.  Skipped on other devices."""
+    _require_supported_device()
+    device = torch.cuda.current_device()
+    capability = cs._device_capability(device)
+    cells = cs._CHAIN_CELL_FORMS_BY_DEVICE.get((*capability, cs._sm_count(device)), {})
+    if not cells:
+        pytest.skip("no round-18 chain cells on this device")
+    kcap = int(load_manifest()["fused_block_tail_kcap"])
+    for (vocab, batch), form in sorted(cells.items()):
+        for seed, k, p in (
+            (1368, 1000, 0.9),
+            (1369, kcap, 0.5),
+            (1370, cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+            (1371, 1000, 1.0),
+        ):
+            probs = _probs(batch, vocab, seed=seed)
+            pn = probs.cpu().numpy()
+            if seed == 1369:
+                pn[0, (np.arange(1200) * 13) % vocab] = np.float32(2**-11)
+            if seed == 1371:
+                pn[0, [7, 4096]] = np.inf
+            probs.copy_(torch.tensor(pn, device="cuda"))
+            label = (vocab, batch, k, p)
+            cs._launch_plan.cache_clear()
+            plan = cs._launch_plan(device, batch, vocab, k)
+            assert not plan.one_launch and (plan.threads, plan.items) == (256, 4)
+            assert plan.stage23_flags == form, (label, plan)
+            assert plan.launch_flags & cs._FLAG_NO_TAIL, (label, plan)
+            got, _ = _run_and_check(probs, k, p, 0x1368, 3)
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_CHAIN_CELL_FORMS_BY_DEVICE", {})
+                cs._launch_plan.cache_clear()
+                plan0 = cs._launch_plan(device, batch, vocab, k)
+                assert plan0 == plan._replace(
+                    launch_flags=plan.launch_flags & ~cs._FLAG_NO_TAIL,
+                    stage23_flags=plan0.stage23_flags,
+                ), (label, plan0, plan)
+                assert plan0.stage23_flags != form, (label, plan0)
+                ref, _ = _run_and_check(probs, k, p, 0x1368, 3)
+            cs._launch_plan.cache_clear()
+            assert np.array_equal(ref.samples, got.samples), label
+            assert np.array_equal(ref.count, got.count), label
+            for r in range(batch):
+                kr = int(ref.count[r])
+                a, b = np.argsort(ref.idx[r, :kr]), np.argsort(got.idx[r, :kr])
+                ia, ib = ref.idx[r, :kr][a], got.idx[r, :kr][b]
+                assert np.array_equal(ia, ib), (label, r)
+                for name in ("vals", "renorm"):
+                    x = getattr(ref, name)[r, :kr][a].view(np.uint32)
+                    y = getattr(got, name)[r, :kr][b].view(np.uint32)
+                    assert np.array_equal(x, y), (label, r, name)
     cs._launch_plan.cache_clear()
 
 
@@ -4937,8 +5230,9 @@ def test_int_tail_build_matches_block_tail_build():
     for v in _stage1_builds(man):
         if not v["stream"]:
             assert not cs._stage1_has_int_tail(v["cluster"], v["ept"], False)
-    # policy: whole-CTA-tail launches on compute capability 10.3 only
+    # policy: whole-CTA-tail launches on compute capability 10.3 and (round 18) the 212-SM R200
     assert frozenset({(10, 3)}) == cs._INT_TAIL_CAPABILITIES
+    assert frozenset({(10, 7, 212)}) == cs._INT_TAIL_DEVICES
     assert cs._int_tail_flag(8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
     # (cluster, ept, extra launch_flags of the build): the speculative-sample build also carries bit 6
     tail_builds = [(c, e, 0) for c, e in itail_streams] + [
@@ -4953,6 +5247,14 @@ def test_int_tail_build_matches_block_tail_build():
             cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, None)
             == cs._FLAG_INT_TAIL
         )
+        assert (
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, (10, 7), 212)
+            == cs._FLAG_INT_TAIL
+        )
+        assert (
+            cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, (10, 7), 208)
+            == 0
+        )
         for cap in ((9, 0), (10, 0), (10, 7), (12, 0)):
             assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_BLOCK_TAIL | x, cap) == 0
         assert cs._int_tail_flag(c, e, True, cs._FLAG_FUSE_TAIL, (10, 3)) == 0
@@ -4960,6 +5262,9 @@ def test_int_tail_build_matches_block_tail_build():
     assert cs._int_tail_flag(8, 16, False, cs._FLAG_FUSE_BLOCK_TAIL, (10, 3)) == 0
     dev = torch.cuda.current_device()
     cap = cs._device_capability(dev)
+    int_tail_device = cap in cs._INT_TAIL_CAPABILITIES or (
+        (*cap, cs._sm_count(dev)) in cs._INT_TAIL_DEVICES
+    )
     for vocab, batch, k in (
         (151936, 1, 1000),
         (151936, 8, 800),
@@ -4974,9 +5279,9 @@ def test_int_tail_build_matches_block_tail_build():
         flags = plan.launch_flags
         if flags & cs._FLAG_INT_TAIL:
             assert flags & cs._FLAG_FUSE_BLOCK_TAIL and plan.stream
-            assert cap in cs._INT_TAIL_CAPABILITIES
+            assert int_tail_device
         elif flags & cs._FLAG_FUSE_BLOCK_TAIL and plan.stream:
-            assert cap not in cs._INT_TAIL_CAPABILITIES
+            assert not int_tail_device
     if not _device_streams():
         pytest.skip(
             "165 KB streaming variants exceed this device's shared-memory opt-in"
