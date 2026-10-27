@@ -10,7 +10,7 @@ selection pairs a ``None`` plan. Sage recipes are covered in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -27,7 +27,9 @@ from tests.attention.test_attention_ts_decode import (
     _make_decode_case,
     _pack_decode_case,
     _plan_case,
+    _run_case,
     _seq_lens_from_csr,
+    _with_reference,
 )
 
 
@@ -41,6 +43,8 @@ class _PairedCase:
     dtype: torch.dtype = torch.bfloat16
     # A per-tensor E4M3 plan's 16-bit output; None takes the Q dtype.
     o_dtype: torch.dtype | None = None
+    # E4M3 V beside BF16 Q/K (QK-BF16/PV-FP8); None takes the Q dtype.
+    v_dtype: torch.dtype | None = None
     batch_size: int = 2
     num_kv_heads: int = 2
     persistent: bool = False
@@ -79,6 +83,13 @@ _CASES = (
         o_dtype=torch.float16,
         mask_type="causal",
     ),
+    _PairedCase(
+        "qk16_pv8_causal",
+        seq_len_q=64,
+        seq_len_kv=1072,
+        v_dtype=_FP8,
+        mask_type="causal",
+    ),
 )
 
 
@@ -109,6 +120,7 @@ def _plan(case: _PairedCase, *, query_paired: bool) -> BlockSparseTSWrapper:
                 use_block_sparse=False,
                 mask_type=case.mask_type,
                 q_data_type=case.dtype,
+                v_data_type=case.v_dtype,
                 o_data_type=case.o_dtype,
                 query_paired=query_paired,
             )
@@ -149,18 +161,19 @@ def test_dense_plan_matches_fp32(case: _PairedCase, query_paired: bool) -> None:
     """
 
     torch.manual_seed(20261018)
+    dtypes = (case.dtype, case.dtype, case.v_dtype or case.dtype)
     shape_q = (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM)
     shape_kv = (case.batch_size, case.seq_len_kv, case.num_kv_heads, _HEAD_DIM)
     tensors = [
         torch.randn(shape, device="cuda") for shape in (shape_q, shape_kv, shape_kv)
     ]
     scales = [
-        tensor.abs().amax().item() / 448.0 if case.dtype == _FP8 else 1.0
-        for tensor in tensors
+        tensor.abs().amax().item() / 448.0 if dtype == _FP8 else 1.0
+        for tensor, dtype in zip(tensors, dtypes, strict=True)
     ]
     q, k, v = (
-        (tensor / scale).to(case.dtype)
-        for tensor, scale in zip(tensors, scales, strict=True)
+        (tensor / scale).to(dtype)
+        for tensor, scale, dtype in zip(tensors, scales, dtypes, strict=True)
     )
     sm_scale = _HEAD_DIM**-0.5
     out = _plan(case, query_paired=query_paired).run(
@@ -175,7 +188,11 @@ def test_dense_plan_matches_fp32(case: _PairedCase, query_paired: bool) -> None:
         sm_scale,
         case.mask_type,
     )
-    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+    if case.v_dtype == _FP8:
+        # E4M3 probabilities bound the error, as on every PV-FP8 tile.
+        assert (out.float() - expected).norm() / expected.norm() < 0.04
+    else:
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
 
 @dataclass(frozen=True)
@@ -195,6 +212,8 @@ class _PagedPairedCase:
     # Per-request Q lengths of a packed batch, cycled over the batch.
     q_lens: tuple[int, ...] | None = None
     window_left: int = -1
+    # E4M3 V next to 16-bit Q/K (QK-BF16/PV-FP8).
+    fp8_v: bool = False
 
     @property
     def kv_lens(self) -> tuple[int, ...]:
@@ -250,6 +269,23 @@ _PAGED_CASES = (
 )
 
 
+def _with_e4m3_v(decode_case):
+    """Store V in E4M3 at scale 1/64 and recompute the FP32 reference."""
+
+    v_scale = 1.0 / 64
+    k_cache, v_cache = decode_case.paged_kv_cache
+    v8 = (v_cache.float() / v_scale).to(_FP8)
+    return _with_reference(
+        replace(
+            decode_case,
+            paged_kv_cache=(k_cache, v8),
+            v_cache=v8,
+            v_scale=v_scale,
+            bmm2_scale=v_scale / decode_case.o_scale,
+        )
+    )
+
+
 def _paged_decode_case(case: _PagedPairedCase):
     """Build ``case``'s inputs and reference; packed cases also return Q offsets."""
 
@@ -268,6 +304,8 @@ def _paged_decode_case(case: _PagedPairedCase):
         device="cuda",
         seed=20261020,
     )
+    if case.fp8_v:
+        decode_case = _with_e4m3_v(decode_case)
     if case.q_lens is None:
         return decode_case, None
     q_lens = [case.q_lens[i % len(case.q_lens)] for i in range(case.batch_size)]
@@ -306,3 +344,35 @@ def test_paged_query_paired_public_paths(case: _PagedPairedCase) -> None:
         qo_indptr=qo_indptr,
         max_seq_len_q=case.seq_len_q,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("query_paired", (False, True), ids=("unpaired", "paired"))
+@torch.no_grad()
+def test_paged_qk16_pv8_matches_fp32(query_paired: bool) -> None:
+    """BF16 Q/K with E4M3 V plan as 16-bit launches, within E4M3 P error."""
+
+    case = _PagedPairedCase(
+        "group8_packed_causal",
+        heads_q_per_kv=8,
+        seq_len_q=64,
+        mask_type="causal",
+        q_lens=(64, 5, 33, 48, 17),
+        fp8_v=True,
+    )
+    decode_case, qo_indptr = _paged_decode_case(case)
+    wrapper = _plan_case(
+        decode_case,
+        max_kv_len=max(case.kv_lens),
+        qo_indptr=qo_indptr,
+        max_seq_len_q=case.seq_len_q,
+        query_paired=query_paired,
+    )
+    policy = dict(wrapper._policy)
+    assert policy["query_paired"] is query_paired
+    out = _run_case(wrapper, decode_case, qo_indptr=qo_indptr)
+    torch.cuda.synchronize()
+    expected = decode_case.reference_real
+    error = (out.float() - expected).norm() / expected.norm()
+    assert error < 0.04

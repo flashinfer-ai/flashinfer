@@ -44,6 +44,13 @@ if TYPE_CHECKING:
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+# Dense (Q, K, V, output) recipes beyond matching 16-bit dtypes: per-tensor
+# E4M3 Q/K/V with a 16-bit output, and BF16 Q/K with E4M3 V (QK-BF16/PV-FP8).
+# The run's sm_scale carries the Q and K scales and bmm2_scale the V scale.
+_DENSE_SCALED_RECIPES = frozenset(
+    [(torch.float8_e4m3fn,) * 3 + (out,) for out in _SUPPORTED_DTYPES]
+    + [(torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16)]
+)
 # KV128 is the general prepared-route geometry. The qualified Q64/D128
 # 16-bit profiles consume one native KV256 route for coarse KV blocks.
 _BLOCK_SPARSE_DEFAULT_KV_ROUTE_SIZE = _PREPARED_KV_ROUTE_SIZE
@@ -402,10 +409,8 @@ def _resolve_plan_dtypes(
             output_dtype = q_dtype
         if (
             not use_block_sparse
-            and q_dtype == kv_dtype == v_dtype == torch.float8_e4m3fn
-            and output_dtype in _SUPPORTED_DTYPES
+            and (q_dtype, kv_dtype, v_dtype, output_dtype) in _DENSE_SCALED_RECIPES
         ):
-            # Dense per-tensor FP8: the run's bmm1/bmm2 scales carry Q/K/V scales.
             return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
         return (
             kv_dtype,

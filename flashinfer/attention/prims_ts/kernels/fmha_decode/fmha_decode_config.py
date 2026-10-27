@@ -139,10 +139,6 @@ _SAGE_GROUPED_KEEPS_PROFILES = {
     for qk_dtype in (Float8E4M3FN, Int8)
     for out_dtype in (Float16, BFloat16)
 }
-# Dense per-tensor E4M3 Q128 recipes: the Sage Q128 resources without scales.
-_CONTIGUOUS_FP8_GROUPED_KEEPS_PROFILES = {
-    profile for profile in _SAGE_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
-}
 # (Q, K, output) dtype triples of the Sage recipes; V is E4M3 in every one.
 _SAGE_DTYPE_RECIPES = {
     (profile[0], profile[1], profile[3]) for profile in _SAGE_GROUPED_KEEPS_PROFILES
@@ -166,6 +162,11 @@ _GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE: _GroupedKeepsProfileKey = (
     2,
     2,
 )
+# Dense Q128-only recipes: per-tensor E4M3 Q/K/V on the Sage Q128 resources
+# without scales, and QK-BF16/PV-FP8.
+_CONTIGUOUS_Q128_GROUPED_KEEPS_PROFILES = {
+    profile for profile in _SAGE_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
+} | {_GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE}
 
 # Per-thread register budgets for the Q64/KV256 warp groups once the launch
 # bound enables ``setmaxnreg``. The MMA, load, and scheduler warps keep 56, so
@@ -293,12 +294,13 @@ _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES.update(
     profile for profile in _D192_GROUPED_KEEPS_PROFILES if profile[0] == Float8E4M3FN
 )
 
-# FP16/BF16 grouped Keeps Q128 recipes on paged K/V: the contiguous 16-bit Q128
-# resources with the paged FP8 Q128 K/V loads. Paged 16-bit Q64 keeps its own
-# profile below.
+# 16-bit Q/K grouped Keeps Q128 recipes on paged K/V, with 16-bit V or, for
+# QK-BF16/PV-FP8, E4M3 V: the contiguous Q128 resources with the paged FP8
+# Q128 K/V loads. Paged 16-bit Q64 keeps its own profile below.
 _GROUPED_KEEPS_PAGED_16BIT_Q128_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
     (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
+    _GROUPED_KEEPS_MIXED_KV_DTYPE_PROFILE,
 }
 
 
@@ -2459,7 +2461,7 @@ class FmhaDecodeConfig:
         if self.use_sage_attention:
             return profile in _SAGE_GROUPED_KEEPS_PROFILES
         return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES or (
-            profile in _CONTIGUOUS_FP8_GROUPED_KEEPS_PROFILES
+            profile in _CONTIGUOUS_Q128_GROUPED_KEEPS_PROFILES
             and self.tile_size_q == 128
             and not self.use_block_sparse
         )
@@ -5115,14 +5117,6 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
             "query_paired requires the grouped Keeps Q128/KV128 profile with "
             "two instances and head dim 64 or 128"
         )
-    if not (
-        cfg._uses_contiguous_grouped_keeps_recipe
-        or (
-            cfg.use_paged_kv
-            and cfg._grouped_keeps_profile_key in _GROUPED_KEEPS_PAGED_FP8_PROFILES
-        )
-    ):
-        raise ValueError("query_paired supports FP16, BF16, FP8 and Sage recipes")
     if (
         cfg.use_block_sparse
         or cfg.use_split_kv
