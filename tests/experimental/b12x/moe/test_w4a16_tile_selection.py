@@ -1,6 +1,6 @@
 import pytest
 
-from b12x.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _TC_DECODE_MAX_M,
     _TC_DECODE_PACK_COLLIDING_PAIRS,
     _TC_DECODE_PACK_SM_COVERAGE_CAP,

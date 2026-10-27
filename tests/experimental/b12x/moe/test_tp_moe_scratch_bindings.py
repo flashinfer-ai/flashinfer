@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import b12x.moe._shared.kernels.w4a16.kernel.execution as w4a16_execution
+
+
 from types import SimpleNamespace
 
 import pytest
@@ -974,7 +977,8 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
             for token_count in token_counts
         }
         workspace.planned_topk_sum_launches = {
-            int(token_count): object() for token_count in token_counts
+            (int(token_count), torch.int32, False): object()
+            for token_count in token_counts
         }
         workspace.planned_collect_activation_amax = bool(collect_activation_amax)
 
@@ -998,6 +1002,12 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
             core_token_counts=(4,),
             route_num_experts=0,
             collect_activation_amax=True,
+            decode_config=MoeDecodeConfig(
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="packed",
+            ),
         ),
     )
 
@@ -1048,13 +1058,11 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     assert tuple(binding.expert_counts.shape) == (8,)
     calls = {}
 
-    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
-
     def _fake_run_w4a16(*args, **kwargs):
         calls.update(kwargs)
         return kwargs["output"]
 
-    monkeypatch.setattr(w4a16_kernel, "run_w4a16_moe", _fake_run_w4a16)
+    monkeypatch.setattr(w4a16_execution, "run_w4a16_moe", _fake_run_w4a16)
 
     result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 

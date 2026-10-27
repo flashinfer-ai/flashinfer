@@ -515,7 +515,7 @@ def test_w8a8_weight_plan_lowers_to_the_mxfp8_engine() -> None:
 
 def test_dynamic_kernel_w8a8_shares_mxf8_geometry_without_fp6_packing() -> None:
     """w8a8_mx shares the MXF8 geometry without FP6 packing."""
-    from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+    from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 
     backend = MoEDynamicKernelBackend(
         32, (128, 128), quant_recipe="w8a8_mx", activation="silu"

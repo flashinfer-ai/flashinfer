@@ -9,7 +9,7 @@ from b12x.moe._shared.kernels.reference import (
     moe_reference_w4a16_fp4_e8m0_k32,
 )
 
-from b12x.moe._shared.kernels.micro import (
+from b12x.moe._shared.kernels.micro.kernel import (
     MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend,
 )
 from b12x.testing.reference.w4a16_reference import moe_reference_w4a16

@@ -1,5 +1,10 @@
 """IQ2_XS stage records across supported CTA geometries and live row counts."""
 
+import b12x.moe._shared.kernels.w4a16.kernel.execution as w4a16_execution
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+import b12x.moe._shared.kernels.w4a16.kernel.sum_launch as w4a16_sum_launch
+
+
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -9,7 +14,6 @@ import torch
 
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe import fused_moe as moe
-from b12x.moe._shared.kernels.w4a16 import kernel
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from benchmarks.experimental.b12x.benchmark_iq2_xs_moe import (
     capture_lifetime,
@@ -66,7 +70,7 @@ def test_stage_records_with_alternate_tiles(tile_k, tile_n, codec):
         if tile_k > 128
         else nullcontext()
     ):
-        fused = kernel.compile_w4a16_fused_moe(
+        fused = w4a16_fused_launch.compile_w4a16_fused_moe(
             size_m=8,
             hidden_size=1024,
             intermediate_size=1280,
@@ -95,15 +99,15 @@ def test_stage_records_with_alternate_tiles(tile_k, tile_n, codec):
 
     with (
         kernel_resolution_guard("IQ2_XS alternate stage tiles"),
-        patch.object(kernel, "compile_w4a16_fused_moe", forbidden),
-        patch.object(kernel, "compile_w4a16_topk_sum", forbidden),
+        patch.object(w4a16_fused_launch, "compile_w4a16_fused_moe", forbidden),
+        patch.object(w4a16_sum_launch, "compile_w4a16_topk_sum", forbidden),
     ):
         for rows in (1, 2, 4, 8):
             inputs = make_inputs(layer, rows, device, mapped=False)
             expected = reference(layer, inputs, activation="relu2")
 
             def run():
-                return kernel.run_w4a16_moe(
+                return w4a16_execution.run_w4a16_moe(
                     inputs.x,
                     prepared,
                     inputs.probabilities,

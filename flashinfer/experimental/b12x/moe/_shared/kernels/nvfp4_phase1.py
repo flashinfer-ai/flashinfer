@@ -6,8 +6,9 @@ swizzle) domain.  This kernel consumes that domain as M64xN128 tasks,
 computes gate and up together in one K sweep with the SM120 native NVFP4
 block-scaled QMMA (``kind::mxf4nvf4`` ``scale_vec::4X`` m16n8k64), applies
 SiLU(gate)*up with the monolithic kernel's alpha semantics, and requantizes
-the intermediate to NVFP4 (per-16 E4M3 block scale, ``quantize_block_fp4``
-semantics) into the caller-owned intermediate workspace.
+the intermediate to NVFP4 (per-16 E4M3 block scale) into the caller-owned
+intermediate workspace. ``fast_math`` selects reciprocal-based FP4 conversion;
+otherwise quantization uses FP4 rounding thresholds, matching the dynamic kernel.
 
 The published weight contract is the original (non-repacked) swizzled
 block-scale FP4 tensors: ``w13_b`` is the packed E2M1 payload
@@ -36,12 +37,6 @@ import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics.atomics import (
-    ld_shared_bf16_to_f32,
-    ld_shared_u32,
-    st_shared_u32,
-)
-from b12x._lib.intrinsics.math import fabs_f32
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -50,9 +45,18 @@ from b12x._lib.intrinsics.memory import (
     st_global_u64,
     st_global_u32,
 )
+from b12x._lib.intrinsics.math import fabs_f32
+from b12x._lib.intrinsics.atomics import (
+    ld_shared_bf16_to_f32,
+    ld_shared_u32,
+    st_shared_u32,
+)
 from b12x._lib.intrinsics.mma import nvfp4_mma_m16n8k64_f32_e2m1
 from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
-from b12x._lib.intrinsics.quantization import quantize_block_fp4
+from b12x._lib.intrinsics.quantization import (
+    quantize_block_fp4,
+    quantize_block_fp4_fast,
+)
 
 
 class Nvfp4MaterializedPhase1Kernel:
@@ -98,6 +102,7 @@ class Nvfp4MaterializedPhase1Kernel:
         source_tile_m: int = 128,
         activation: str = "silu",
         swiglu_limit: float | None = None,
+        swiglu_clamp_after_silu: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -110,6 +115,7 @@ class Nvfp4MaterializedPhase1Kernel:
         self.fast_math = bool(fast_math)
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
+        self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
 
@@ -304,8 +310,9 @@ class Nvfp4MaterializedPhase1Kernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            if cutlass.const_expr(not self.swiglu_clamp_after_silu):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -313,7 +320,11 @@ class Nvfp4MaterializedPhase1Kernel:
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
-        return gate * sigmoid * up
+        activated = gate * sigmoid
+        if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
+            if activated > cutlass.Float32(self.swiglu_limit):
+                activated = cutlass.Float32(self.swiglu_limit)
+        return activated * up
 
     @cute.jit
     def _run_task(
@@ -594,7 +605,14 @@ class Nvfp4MaterializedPhase1Kernel:
                     abs_value = fabs_f32(value)
                     if abs_value > block_max:
                         block_max = abs_value
-                payload, scale_byte = quantize_block_fp4(values, block_max, quant_gs)
+                if cutlass.const_expr(self.fast_math):
+                    payload, scale_byte = quantize_block_fp4_fast(
+                        values, block_max, quant_gs
+                    )
+                else:
+                    payload, scale_byte = quantize_block_fp4(
+                        values, block_max, quant_gs
+                    )
                 dst_word = Int64(phys_row) * Int64(words_per_row) + Int64(
                     output_tile * Int32(16) + Int32(block * 2)
                 )

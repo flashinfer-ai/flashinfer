@@ -60,7 +60,11 @@ def test_candidates_expose_tiles_routes_and_pipeline(codec, capacity):
 @pytest.mark.parametrize("codec", ("iq2_xs", "iq2_xxs", "q8_0"))
 def test_every_candidate_constructs_resource_valid_kernel(codec, monkeypatch):
     import torch
-    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.kernel.config import (
+        _DEFAULT_SHARED_MEM_PER_SM,
+        _resident_cta_shared_bytes,
+    )
 
     # This is a metadata/resource check, never a GPU qualification or timing.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -91,6 +95,13 @@ def test_every_candidate_constructs_resource_valid_kernel(codec, monkeypatch):
             w13_layout="packed",
         )
         assert kernel.shared_words * 4 <= 101376
+        assert not kernel.lut_e4m3_smem
+        assert not kernel.fc1.lut_e4m3_smem
+        assert not kernel.fc2.lut_e4m3_smem
+        assert (
+            kernel.blocks_per_sm * _resident_cta_shared_bytes(kernel.shared_words * 4)
+            <= _DEFAULT_SHARED_MEM_PER_SM
+        )
         assert kernel.fc1.stages == kernel.fc2.stages == c.w4a16_pipeline_stages
         assert kernel.__cache_key__ not in keys
         keys.add(kernel.__cache_key__)

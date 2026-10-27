@@ -10,10 +10,12 @@ from b12x._lib.intrinsics.reference import (
     swizzle_block_scale,
 )
 import b12x.moe.fused_moe._impl as tp_moe
+from b12x.moe import fused_moe
 from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 
 from b12x.testing.reference.helpers import (
+    make_tp_moe_fp4_binding,
     prepare_tp_moe_fp4_experts,
     require_b12x,
     run_tp_moe_fp4,
@@ -180,6 +182,7 @@ def _run_single_token_multi_expert_case(
     activation: str,
     topk_ids_dtype: torch.dtype,
     micro_dynamic_cutover: int,
+    expected_implementation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = require_b12x()
     torch.manual_seed(7)
@@ -235,15 +238,18 @@ def _run_single_token_multi_expert_case(
         clear_tp_moe_caches()
         tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE["nvfp4"] = micro_dynamic_cutover
 
-        output = run_tp_moe_fp4(
+        with make_tp_moe_fp4_binding(
             a=x,
             experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             input_scales_static=True,
             fast_math=False,
-        )
-        torch.cuda.synchronize()
+        ) as binding:
+            if expected_implementation is not None:
+                assert binding.implementation == expected_implementation
+            output = fused_moe.run(binding=binding)
+            torch.cuda.synchronize()
     finally:
         clear_tp_moe_caches()
         tp_moe._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.update(previous_cutover)
@@ -315,26 +321,17 @@ def test_single_token_multi_expert_micro_matches_int32_with_int64_topk_ids(
 
 
 def test_single_token_multi_expert_situ_avoids_micro_and_matches_reference() -> None:
-    implementation, _, _ = tp_moe._resolve_workspace_layout(
-        num_tokens=1,
-        weight_E=4,
-        num_topk=3,
-        k=128,
-        n=128,
-        activation="situ",
-        quant_mode="nvfp4",
-    )
-    assert implementation == "dynamic"
-
     output_i64, reference = _run_single_token_multi_expert_case(
         activation="situ",
         topk_ids_dtype=torch.int64,
         micro_dynamic_cutover=128,
+        expected_implementation="dynamic",
     )
     output_i32, _ = _run_single_token_multi_expert_case(
         activation="situ",
         topk_ids_dtype=torch.int32,
         micro_dynamic_cutover=128,
+        expected_implementation="dynamic",
     )
     pair_metrics = compare_to_reference(output_i64, output_i32)
     assert pair_metrics.cos > 0.9999, f"situ int64 vs int32: {pair_metrics}"

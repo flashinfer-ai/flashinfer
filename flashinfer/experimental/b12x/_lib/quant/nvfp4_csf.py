@@ -13,15 +13,17 @@ from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import numpy as np
 import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.program_cache import program_cache
+from b12x._lib.program_cache import program_cache, register_program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
+
+_LAUNCH_PROGRAMS = {}
+register_program_cache(_LAUNCH_PROGRAMS)
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,11 @@ class Nvfp4CsfBatch:
     codec: int = 0
     layout: int = 0
     value_lut: torch.Tensor | None = None
+    # Planes whose rows are not a multiple of 128 or whose k-groups are not a
+    # multiple of four are stored padded to the native F8_128x4 scale grid
+    # (rows/columns above); these hold their unpadded geometry.
+    logical_rows: int | None = None
+    logical_columns: int | None = None
 
     @property
     def num_experts(self):
@@ -107,144 +114,49 @@ def make_nvfp4_csf_batch(
     row_rotation=0,
     value_lut=None,
 ):
-    """Upload compressed CPU planes and build immutable exception partitions."""
-    if len(fixed_planes) == 0 or len(fixed_planes) != len(exception_planes):
-        raise ValueError("NVFP4-CSF component lists must be nonempty and equally sized")
-    alignment = 4 if codec == 0 else 8
-    if (
-        rows <= 0
-        or rows % 128
-        or columns <= 0
-        or columns % alignment
-        or codec not in (0, 1, 2)
-    ):
-        raise ValueError("Unsupported NVFP4-CSF geometry or codec")
-    position_bits = 19 if codec == 2 else 24
-    if rows * columns > 1 << position_bits:
-        raise ValueError("NVFP4-CSF position field is too small for the matrix")
-    fixed_list, exception_list, partitions = [], [], []
-    cursor = 0
-    for fixed, exceptions in zip(fixed_planes, exception_planes, strict=True):
-        f = np.asarray(fixed, dtype=np.uint8).reshape(
-            rows // 16, 16 * (1 + columns // 2)
-        )
-        e = np.asarray(exceptions).view(np.uint8).reshape(-1)
-        width = 3 if codec == 2 else 4
-        if len(e) % width:
-            raise ValueError("Invalid NVFP4-CSF exception record length")
-        if width == 4:
-            words = e.copy().view("<u4")
-        else:
-            b = e.reshape(-1, 3).astype(np.uint32)
-            words = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
-        positions = words & ((1 << position_bits) - 1)
-        if len(words) and (
-            positions[-1] >= rows * columns or np.any(positions[1:] <= positions[:-1])
-        ):
-            raise ValueError("NVFP4-CSF exceptions must be unique, sorted and in range")
-        if row_rotation:
-            if codec or not 0 < row_rotation < rows:
-                raise ValueError(
-                    "Row rotation requires the byte-window codec and a valid split"
-                )
-            bases = np.roll(f[:, :16].reshape(rows), -row_rotation)
-            codes = np.roll(
-                f[:, 16:].reshape(rows, columns // 2), -row_rotation, axis=0
-            )
-            f = np.concatenate(
-                (bases.reshape(rows // 16, 16), codes.reshape(rows // 16, -1)), 1
-            )
-            positions = (
-                (positions // columns + rows - row_rotation) % rows
-            ) * columns + positions % columns
-            words = (words & np.uint32(0xFF000000)) | positions
-            order = np.argsort(positions)
-            words, positions = words[order], positions[order]
-            e = words.astype("<u4").view(np.uint8)
-        bounds = np.arange(rows // 128 + 1, dtype=np.int64) * (128 * columns)
-        partitions.append(np.searchsorted(positions, bounds).astype(np.int64) + cursor)
-        cursor += len(words)
-        if codec == 0:
-            # Store nibbles in native scale-byte order. This changes only the
-            # resident layout; checkpoint slabs remain TP-independent.
-            bases = f[:, :16].reshape(rows)
-            packed = f[:, 16:].reshape(rows, columns // 2)
-            logical = np.empty((rows, columns), dtype=np.uint8)
-            logical[:, ::2], logical[:, 1::2] = packed & 15, packed >> 4
-            if layout == 0:
-                bases = bases.reshape(rows // 128, 4, 32).transpose(0, 2, 1)
-                native = logical.reshape(rows // 128, 4, 32, columns // 4, 4)
-                native = native.transpose(0, 3, 2, 1, 4).reshape(rows // 128, -1)
-            else:
-                # Match W4A16's 64-row scale transpose and adjacent pair swap.
-                perm = (
-                    np.arange(64)
-                    .reshape(8, 8)
-                    .T.reshape(-1)
-                    .reshape(-1, 4)[:, [0, 2, 1, 3]]
-                    .reshape(-1)
-                )
-                bases = bases.reshape(rows // 128, 2, 64)[:, :, perm]
-                native = logical.reshape(rows // 128, 2, 64, columns)[:, :, perm, :]
-                native = (
-                    native.reshape(rows // 128, 128, columns)
-                    .transpose(0, 2, 1)
-                    .reshape(rows // 128, -1)
-                )
-            nibbles = native[:, ::2] | (native[:, 1::2] << 4)
-            f = np.concatenate((bases.reshape(rows // 128, 128), nibbles), axis=1)
-        fixed_list.append(f)
-        exception_list.append(e)
-    result = Nvfp4CsfBatch(
-        torch.from_numpy(np.stack(fixed_list)).to(device),
-        torch.from_numpy(np.concatenate(exception_list)).to(device),
-        torch.from_numpy(np.stack(partitions)).to(device),
-        int(rows),
-        int(columns),
-        int(codec),
-        int(layout),
-        value_lut,
+    """Upload checkpoint planes and convert their compressed layout on CUDA."""
+    from ._nvfp4_csf_prepare import upload_and_convert
+
+    return upload_and_convert(
+        fixed_planes,
+        exception_planes,
+        rows=rows,
+        columns=columns,
+        device=device,
+        codec=codec,
+        layout=layout,
+        row_rotation=row_rotation,
+        value_lut=value_lut,
     )
-    result.validate()
-    return result
 
 
 def repack_nvfp4_csf_batch(batch, *, row_rotation, value_lut):
-    """Permute resident compressed slabs for the standard W4A16 scale layout."""
+    """Permute resident compressed slabs for W4A16 entirely on CUDA."""
+    from ._nvfp4_csf_prepare import convert_nvfp4_csf_storage
+
     if batch.codec or batch.layout:
         raise ValueError("MMA repacking requires native byte-window slabs")
+    batch.validate()
     e, r, c = batch.num_experts, batch.rows, batch.columns
-    native = batch.fixed.cpu().numpy()
+    native = batch.fixed
     bases = (
         native[:, :, :128]
         .reshape(e, r // 128, 32, 4)
-        .transpose(0, 1, 3, 2)
+        .transpose(2, 3)
         .reshape(e, r // 16, 16)
     )
-    packed = native[:, :, 128:]
-    offsets = np.empty((e, r // 128, 128 * c), dtype=np.uint8)
-    offsets[:, :, ::2], offsets[:, :, 1::2] = packed & 15, packed >> 4
-    logical = (
-        offsets.reshape(e, r // 128, c // 4, 32, 4, 4)
-        .transpose(0, 1, 4, 3, 2, 5)
-        .reshape(e, r, c)
-    )
-    fixed = np.concatenate(
-        (
-            bases,
-            (logical[:, :, ::2] | (logical[:, :, 1::2] << 4)).reshape(e, r // 16, -1),
-        ),
-        2,
-    )
-    words = batch.exceptions.cpu().numpy().view("<u4")
-    bounds = batch.task_offsets.cpu().numpy()
-    exceptions = [words[start:end] for start, end in bounds[:, [0, -1]]]
-    return make_nvfp4_csf_batch(
+    packed = native[:, :, 128:].reshape(e, r // 128, c // 4, 32, 4, 2)
+    packed = packed.permute(0, 1, 4, 3, 2, 5).reshape(e, r // 16, -1)
+    fixed = torch.cat((bases, packed), dim=2)
+    starts = torch.cat((batch.task_offsets[:, 0], batch.task_offsets[-1:, -1]))
+    return convert_nvfp4_csf_storage(
         fixed,
-        exceptions,
+        batch.exceptions,
+        starts,
         rows=r,
         columns=c,
-        device=batch.fixed.device,
+        row_range=(0, batch.logical_rows or r),
+        column_range=(0, batch.logical_columns or c),
         layout=1,
         row_rotation=row_rotation,
         value_lut=value_lut,
@@ -452,13 +364,30 @@ class _Pair:
     def __init__(self, first, second, indexed=False):
         plane = _Plane
         if indexed:
-            from b12x._lib.quant.nvfp4_csf_inline import IndexedNvfp4Plane
+            from b12x._lib.quant.nvfp4_csf_indexed import IndexedNvfp4Plane
 
             plane = IndexedNvfp4Plane
         from b12x._lib.quant.nvfp4_csf_packed import PackedStoragePlane
+        from b12x._lib.quant.csf_blocks import (
+            CompactBlockStoragePlane,
+            Nvfp4BlockStoragePlane,
+        )
 
-        self.first = (PackedStoragePlane if first[3] == 2 else plane)(first)
-        self.second = (PackedStoragePlane if second[3] == 2 else plane)(second)
+        readers = {
+            2: PackedStoragePlane,
+            3: Nvfp4BlockStoragePlane,
+            4: CompactBlockStoragePlane,
+            5: CompactBlockStoragePlane,
+            6: CompactBlockStoragePlane,
+            7: CompactBlockStoragePlane,
+            8: CompactBlockStoragePlane,
+            9: CompactBlockStoragePlane,
+        }
+        self.first = readers.get(first[3], plane)(first)
+        self.second = readers.get(second[3], plane)(second)
+        self.threads = max(
+            getattr(self.first, "threads", 256), getattr(self.second, "threads", 256)
+        )
 
     @cute.jit
     def __call__(
@@ -505,7 +434,7 @@ class _Pair:
             barrier_slots,
         ).launch(
             grid=(capacity * Int32(self.first.tasks + self.second.tasks), 1, 1),
-            block=(256, 1, 1),
+            block=(self.threads, 1, 1),
             stream=stream,
         )
 
@@ -531,7 +460,7 @@ class _Pair:
             while slot_to_reset < barrier_slots:
                 barrier_count[slot_to_reset] = Int32(0)
                 barrier_epoch[slot_to_reset] = Int32(0)
-                slot_to_reset += Int32(256)
+                slot_to_reset += Int32(self.threads)
         slot = Int32(block) // Int32(self.first.tasks + self.second.tasks)
         task = Int32(block) % Int32(self.first.tasks + self.second.tasks)
         expert = slot
@@ -601,6 +530,27 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
     )
 
 
+def _matches_scale_output(plane, output):
+    if plane.geometry[3] in range(4, 10):
+        return (
+            output.dtype
+            in (torch.uint8, torch.int32, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            and output.ndim >= 1
+            and output.shape[0] == plane.num_experts
+            and output.numel() * output.element_size()
+            == plane.num_experts * plane.rows * plane.columns
+        )
+    expected = (
+        (plane.num_experts, plane.columns, plane.rows)
+        if plane.layout
+        else (plane.num_experts, plane.rows, plane.columns)
+    )
+    return (
+        output.dtype in (torch.uint8, torch.float8_e4m3fn)
+        and tuple(output.shape) == expected
+    )
+
+
 def decode_nvfp4_csf_pair(
     first,
     second,
@@ -624,13 +574,7 @@ def decode_nvfp4_csf_pair(
         raise ValueError("NVFP4-CSF routes must be contiguous CUDA int32/int64")
     for batch, out in ((first, out13), (second, out2)):
         if (
-            out.dtype not in (torch.uint8, torch.float8_e4m3fn)
-            or tuple(out.shape)
-            != (
-                (batch.num_experts, batch.columns, batch.rows)
-                if batch.layout
-                else (batch.num_experts, batch.rows, batch.columns)
-            )
+            not _matches_scale_output(batch, out)
             or not out.is_contiguous()
             or out.device != batch.fixed.device
         ):
@@ -671,27 +615,74 @@ def decode_nvfp4_csf_pair(
             indexed_scales is not None,
         )
 
+    sources = []
+    for index, batch in enumerate((first, second)):
+        sources.extend(
+            (
+                batch.fixed
+                if indexed_scales is None
+                else indexed_scales[index].storage,
+                batch.exceptions,
+                batch.task_offsets,
+                batch.fixed if batch.value_lut is None else batch.value_lut,
+            )
+        )
+    handle = id(program)
+    _LAUNCH_PROGRAMS[handle] = program
+    _decode_pair_op(
+        sources,
+        ids,
+        out13,
+        out2,
+        None if barriers is None else barriers[0],
+        None if barriers is None else barriers[1],
+        first.num_experts,
+        capacity,
+        mode,
+        handle,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::nvfp4_csf_pair",
+    mutates_args=("out13", "out2", "barrier_count", "barrier_epoch"),
+)
+def _decode_pair_op(
+    sources: list[torch.Tensor],
+    ids: torch.Tensor,
+    out13: torch.Tensor,
+    out2: torch.Tensor,
+    barrier_count: torch.Tensor | None,
+    barrier_epoch: torch.Tensor | None,
+    num_experts: int,
+    capacity: int,
+    routing_mode: int,
+    program_handle: int,
+) -> None:
+    program = _LAUNCH_PROGRAMS[program_handle]
+
     def device_ptr(t, dtype, align):
         return make_ptr(
             dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
         )
 
     args = []
-    for index, (batch, out) in enumerate(((first, out13), (second, out2))):
+    for index, out in enumerate((out13, out2)):
+        fixed, exceptions, task_offsets, value_lut = sources[
+            index * 4 : (index + 1) * 4
+        ]
         args.extend(
             (
                 device_ptr(
-                    batch.fixed
-                    if indexed_scales is None
-                    else indexed_scales[index].storage,
+                    fixed,
                     cutlass.Uint8,
                     16,
                 ),
-                device_ptr(batch.exceptions, cutlass.Uint8, 16),
-                device_ptr(batch.task_offsets, cutlass.Int64, 8),
+                device_ptr(exceptions, cutlass.Uint8, 16),
+                device_ptr(task_offsets, cutlass.Int64, 8),
                 device_ptr(out, cutlass.Uint8, 16),
                 device_ptr(
-                    batch.fixed if batch.value_lut is None else batch.value_lut,
+                    value_lut,
                     cutlass.Uint8,
                     16,
                 ),
@@ -704,20 +695,36 @@ def decode_nvfp4_csf_pair(
             cutlass.Int64 if ids.dtype == torch.int64 else cutlass.Int32,
             8 if ids.dtype == torch.int64 else 4,
         ),
-        first.num_experts,
-        first.exceptions.numel(),
-        second.exceptions.numel(),
+        num_experts,
+        sources[1].numel(),
+        sources[5].numel(),
         capacity,
-        mode,
+        routing_mode,
         device_ptr(
-            first.task_offsets if barriers is None else barriers[0], cutlass.Int32, 4
+            sources[2] if barrier_count is None else barrier_count, cutlass.Int32, 4
         ),
         device_ptr(
-            first.task_offsets if barriers is None else barriers[1], cutlass.Int32, 4
+            sources[2] if barrier_epoch is None else barrier_epoch, cutlass.Int32, 4
         ),
-        0 if barriers is None else barriers[0].numel(),
+        0 if barrier_count is None else barrier_count.numel(),
         current_cuda_stream(),
     )
+
+
+@_decode_pair_op.register_fake
+def _decode_pair_fake(
+    sources,
+    ids,
+    out13,
+    out2,
+    barrier_count,
+    barrier_epoch,
+    num_experts,
+    capacity,
+    routing_mode,
+    program_handle,
+) -> None:
+    pass
 
 
 @dataclass(frozen=True)
@@ -729,23 +736,19 @@ class Nvfp4CsfDecoder:
     programs: tuple
     routing_programs: tuple
     active: torch.Tensor
-    inline_scales: tuple | None = None
+    indexed_scales: tuple | None = None
     indexed_programs: tuple | None = None
+    bitmap_routes: bool = False
+    direct_routes: bool = False
 
     @classmethod
-    def prepare(cls, first, second, out13, out2, *, inline_scales=None):
+    def prepare(cls, first, second, out13, out2, *, indexed_scales=None):
         from b12x._lib.quant.csf_routing import compile_csf_active_experts
 
         for plane, output in ((first, out13), (second, out2)):
             plane.validate()
-            expected = (
-                (plane.num_experts, plane.columns, plane.rows)
-                if plane.layout
-                else (plane.num_experts, plane.rows, plane.columns)
-            )
             if (
-                tuple(output.shape) != expected
-                or output.dtype != torch.float8_e4m3fn
+                not _matches_scale_output(plane, output)
                 or output.device != plane.fixed.device
                 or not output.is_contiguous()
             ):
@@ -770,17 +773,23 @@ class Nvfp4CsfDecoder:
             first,
             second,
             programs,
-            tuple(compile_csf_active_experts(ids64) for ids64 in (False, True)),
+            tuple(
+                compile_csf_active_experts(
+                    ids64, first.num_experts if first.geometry[3] in range(4, 10) else 0
+                )
+                for ids64 in (False, True)
+            ),
             torch.empty(
                 first.num_experts, dtype=torch.int32, device=first.fixed.device
             ),
-            inline_scales=inline_scales,
+            indexed_scales=indexed_scales,
+            bitmap_routes=first.geometry[3] in range(4, 10),
             indexed_programs=(
                 tuple(
                     compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64, True)
                     for ids64 in (False, True)
                 )
-                if inline_scales is not None
+                if indexed_scales is not None
                 else None
             ),
         )
@@ -806,7 +815,7 @@ class Nvfp4CsfDecoder:
         mode = 0
         if ids.numel() >= 16 * self.first.num_experts:
             mode = 3
-        elif ids.numel() >= 64:
+        elif ids.numel() >= 64 and not self.direct_routes:
             mark_active_experts(
                 ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
             )
@@ -825,5 +834,5 @@ class Nvfp4CsfDecoder:
             mode=mode,
             program=programs[int(ids.dtype == torch.int64)],
             barriers=barriers,
-            indexed_scales=self.inline_scales if indexed else None,
+            indexed_scales=self.indexed_scales if indexed else None,
         )

@@ -345,8 +345,10 @@ def _build_domain(
     }
 
 
-def _compile_phase1(domain, *, spec_name="tests.nvfp4_phase_kernels.p1"):
-    kernel = Nvfp4MaterializedPhase1Kernel(source_tile_m=_TILE_M)
+def _compile_phase1(
+    domain, *, spec_name="tests.nvfp4_phase_kernels.p1", fast_math=False
+):
+    kernel = Nvfp4MaterializedPhase1Kernel(source_tile_m=_TILE_M, fast_math=fast_math)
     E, K, n = domain["E"], domain["K"], domain["n"]
 
     def _fake_u32(shape):
@@ -379,6 +381,7 @@ def _compile_phase1(domain, *, spec_name="tests.nvfp4_phase_kernels.p1"):
             ("hidden", K),
             ("intermediate", n),
             ("source_tile_m", _TILE_M),
+            ("fast_math", fast_math),
         ),
     )
 
@@ -655,6 +658,74 @@ def test_nvfp4_phase_intermediate_matches_torch() -> None:
             worst = max(worst, diff)
             checked += 1
     assert worst <= 1e-6, f"intermediate mismatch: max abs {worst}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_nvfp4_phase_intermediate_quantization_mode(fast_math) -> None:
+    require_b12x()
+    domain = _build_domain(E=1, K=128, n=128, m=1, top_k=1, seed=442)
+    device = domain["packed_a"].device
+    values = torch.tensor(
+        [
+            512,
+            1408,
+            52,
+            0.5625,
+            36,
+            22,
+            1.75,
+            26,
+            60,
+            7,
+            256,
+            0.625,
+            1024,
+            1.625,
+            36,
+            16,
+        ],
+        dtype=torch.float32,
+        device=device,
+    ).repeat(8)
+    domain["packed_a"].zero_()
+    domain["packed_a"][0] = 2
+    domain["scale_flat"].fill_(0x38)
+    domain["w13_packed"].zero_()
+    domain["w13_packed"][0, :, 0] = 2
+    scales = torch.ones((256, 8), device=device)
+    scales[:128, 0] = values / 16
+    scales[128:, 0] = 16
+    domain["w13_sfb"] = _swizzle_scale_plane(scales, 256)
+
+    intermediate = _allocate_intermediate(domain)
+    compiled = _compile_phase1(domain, fast_math=fast_math)
+    _launch_phase1(
+        compiled,
+        domain,
+        intermediate,
+        torch.ones(1, device=device),
+        torch.full((1,), 0.3, device=device),
+    )
+    torch.cuda.synchronize()
+
+    # SiLU(16)*up rounds to values in BF16. With scale 72 and global scale
+    # 0.3, the value 60 rounds to zero in reciprocal mode and 0.5 in threshold mode.
+    expected = torch.tensor(
+        [0x74, 0, 0, 0, 0 if fast_math else 1, 2, 6, 0],
+        dtype=torch.uint8,
+        device=device,
+    ).repeat(8)
+    raw = intermediate.view(torch.uint8)
+    torch.testing.assert_close(raw[:64], expected, rtol=0, atol=0)
+    scale_start = domain["rows_capacity"] * 64
+    expected_scales = torch.full((8,), 72.0, device=device).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        raw[scale_start : scale_start + 8],
+        expected_scales.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

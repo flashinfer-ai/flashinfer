@@ -18,21 +18,27 @@ from ..conftest import require_b12x
 
 
 @pytest.mark.parametrize("fast_math", [False, True])
-@pytest.mark.parametrize("intermediate", [160, 192, 320])
+@pytest.mark.parametrize("intermediate", [160, 192, 256, 272, 320])
 @pytest.mark.parametrize(
-    "tile_m,planner,share_input,topk",
+    "tile_m,planner,share_input,topk,mma_warps",
     [
-        (16, "internal", False, 2),
-        (16, "triton", False, 2),
-        (32, "internal", False, 2),
-        (16, "internal", True, 2),
-        (16, "triton", True, 2),
-        (16, "triton", True, 8),
-        (16, "triton", True, 10),
+        (16, "internal", False, 2, None),
+        (16, "internal", False, 2, 4),
+        (16, "triton", False, 2, None),
+        (16, "triton", False, 2, 4),
+        (32, "internal", False, 2, None),
+        (16, "internal", True, 2, None),
+        (16, "internal", True, 2, 4),
+        (16, "triton", True, 2, None),
+        (16, "triton", True, 2, 4),
+        (16, "triton", True, 8, None),
+        (16, "triton", True, 8, 4),
+        (16, "triton", True, 10, None),
+        (16, "triton", True, 10, 4),
     ],
 )
 def test_swapped_token_tile_live_replay(
-    intermediate, tile_m, planner, share_input, topk, fast_math
+    intermediate, tile_m, planner, share_input, topk, mma_warps, fast_math
 ):
     device = require_b12x()
     capacity, hidden, num_experts = min(33, 256 // topk), 512, max(4, 2 * topk)
@@ -95,6 +101,7 @@ def test_swapped_token_tile_live_replay(
         route_planner=planner,
         max_active_clusters=None,
         dynamic_tile_m=tile_m,
+        dynamic_mma_warps=mma_warps,
         dynamic_route_mode="grouped",
         nvfp4_share_input=share_input,
     )

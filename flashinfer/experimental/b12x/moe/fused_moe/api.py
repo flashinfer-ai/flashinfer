@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from ..._lib.gating import default_is_supported
+from ..._lib.scratch import scratch_tensor
 from ...preparation.types import FrozenMapping, Plan, require_prepared
 from . import META
 from ._compat import Caps
@@ -23,6 +24,7 @@ from ._impl import (
     plan_tp_moe_scratch as plan,
 )
 from .config import TrellisConfig
+from ._routing_ops import route_topk_out
 from ._tuning import MoeDecodeConfig, MoeDecodeQuery
 from ._preparation import (
     FC2Invocation,
@@ -52,7 +54,7 @@ from .source import (
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
-    CsfScalePlanes,
+    CsfBlockPlanes,
     Nvfp4CsfWeights,
     Mxfp4CsfWeights,
     IQ2XSWeights,
@@ -124,9 +126,16 @@ def _canonical_prepare_weights(
     | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
+    scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
-    return _prepare_weights(plan=plan, weights=weights, device=device, staging=staging)
+    return _prepare_weights(
+        plan=plan,
+        weights=weights,
+        device=device,
+        staging=staging,
+        scale_scratch=scale_scratch,
+    )
 
 
 def _canonical_plan_execution(
@@ -136,6 +145,7 @@ def _canonical_plan_execution(
     routing: RoutingSpec | None = None,
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
+    scale_expansion=None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
     return _plan_execution(
@@ -144,6 +154,25 @@ def _canonical_plan_execution(
         routing=routing,
         invocation=invocation,
         override=override,
+        scale_expansion=scale_expansion,
+    )
+
+
+def plan_scale_expansion(
+    experts, *, routes, ids_dtype=torch.int32, invocation=FrozenMapping()
+):
+    """Declare native scale expansion; MoE requests depend on this prepared plan."""
+    from b12x._lib.quant.csf_blocks_tuning import plan_csf_block_expansion
+
+    decoder = experts._impl.nvfp4_csf
+    if decoder is None:
+        raise ValueError("Scale expansion requires compressed expert scales")
+    return plan_csf_block_expansion(
+        decoder.first,
+        decoder.second,
+        routes=routes,
+        ids_dtype=ids_dtype,
+        invocation=invocation,
     )
 
 
@@ -180,7 +209,13 @@ def bind(plan: Plan, **kwargs: Any) -> Binding:
     if isinstance(plan, TPMoEScratchPlan):
         return plan.bind(**kwargs)
     state = require_prepared(plan, "moe.decode")
-    return replace(state.bind(**kwargs), plan=plan)
+    scratch = scratch_tensor(kwargs["scratch"], plan.scratch_specs(), owner="TP MoE")
+    return replace(
+        state.bind(**kwargs),
+        plan=plan,
+        compiler_scratch=scratch,
+        compiler_a4_prefill=kwargs.get("a4_prefill"),
+    )
 
 
 def run(*, binding: Binding):
@@ -188,6 +223,38 @@ def run(*, binding: Binding):
     plan = binding.plan
     if plan is not None:
         require_prepared(plan, "moe.decode", binding.a.device)
+    if (
+        plan is not None
+        and binding.compiler_scratch is not None
+        and binding.output is not None
+    ):
+        from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+        if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+            from ._binding_ops import prepared_moe_out
+
+            output = (
+                binding.output_cast_target
+                if binding.output_cast_target is not None
+                else binding.output
+            )
+            prepared_moe_out(
+                binding.a,
+                binding.topk_weights,
+                binding.topk_ids,
+                output,
+                binding.compiler_scratch,
+                plan._handle,
+                binding.input_scales_static,
+                binding.fast_math,
+                binding.activation_amax,
+                binding.layer_idx,
+                binding.route_expert_map,
+                binding.output_expert_map,
+                binding.scales_expanded,
+                binding.compiler_a4_prefill,
+            )
+            return output
     return _run(binding=binding)
 
 
@@ -205,13 +272,52 @@ def expand_scales(experts: PreparedExperts) -> bool:
     decoder = getattr(impl, "nvfp4_csf", None)
     if decoder is None:
         return False
-    expanded = impl.w4a16_expanded
     with torch.cuda.device(experts.device):
-        if expanded is None:
-            decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
-        else:
-            decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
+        decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
     return True
+
+
+def uses_expanded_nvfp4_scales(
+    plan: Plan,
+    *,
+    num_tokens: int,
+    a4_prefill: bool | None = None,
+    route_ids_dtype: torch.dtype = torch.int32,
+    has_route_map: bool = False,
+    collect_activation_amax: bool = False,
+    scales_expanded: bool = False,
+) -> bool:
+    """Whether a prepared invocation consumes the shared NVFP4-CSF expansion.
+
+    This metadata-only query uses the same variant, precision, scratch-fit,
+    and scale-consumer selection as binding. It does not prepare a plan or
+    launch GPU work. A caller may skip scale prefetch when it returns False.
+    Route mappings and activation calibration must describe the later bind.
+    ``scales_expanded=True`` queries a call whose scale expansion is already
+    ordered before execution, or a prospective call for which the caller will
+    arrange that ordering. Inline plans return False regardless of this flag;
+    their kernels reconstruct scales from the resident compact blocks.
+    """
+    if getattr(plan, "_prepared", None) is None:
+        raise RuntimeError("scale-consumer queries require a prepared MoE plan")
+    state = require_prepared(plan, "moe.decode")
+    if hasattr(state, "for_tokens"):
+        state = state.for_tokens(
+            num_tokens,
+            a4_prefill=a4_prefill,
+            route_ids_dtype=route_ids_dtype,
+            has_route_map=has_route_map,
+            collect_activation_amax=collect_activation_amax,
+            scales_expanded=scales_expanded,
+        )
+    return state.uses_expanded_nvfp4_scales(
+        num_tokens=num_tokens,
+        a4_prefill=a4_prefill,
+        route_ids_dtype=route_ids_dtype,
+        has_route_map=has_route_map,
+        collect_activation_amax=collect_activation_amax,
+        scales_expanded=scales_expanded,
+    )
 
 
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
@@ -231,7 +337,27 @@ def route_topk(
 ) -> None:
     """Run caller-owned top-k buffers through their retained route launcher."""
     state = require_prepared(plan, "moe.route_topk", router_logits.device)
-    state.run(router_logits, topk_logits, topk_ids, topk_weights, **kwargs)
+    for name in ("renormalize", "score_func", "routed_scaling_factor"):
+        expected = getattr(state.query, name)
+        if kwargs.pop(name, expected) != expected:
+            raise ValueError(f"{name} differs from the prepared route invocation")
+    correction_bias = kwargs.pop("correction_bias", None)
+    image_correction_bias = kwargs.pop("image_correction_bias", None)
+    image_mask = kwargs.pop("image_mask", None)
+    num_valid_tokens = kwargs.pop("num_valid_tokens", None)
+    if kwargs:
+        raise TypeError(f"unexpected route_topk arguments: {', '.join(kwargs)}")
+    route_topk_out(
+        router_logits,
+        topk_logits,
+        topk_ids,
+        topk_weights,
+        plan.handle,
+        correction_bias,
+        image_correction_bias,
+        image_mask,
+        num_valid_tokens,
+    )
 
 
 def bind_route(
@@ -320,7 +446,7 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "Mxfp4CsfWeights",
-    "CsfScalePlanes",
+    "CsfBlockPlanes",
     "Nvfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
@@ -341,8 +467,10 @@ __all__ = [
     "bind_route",
     "bind_sparse",
     "expand_scales",
+    "uses_expanded_nvfp4_scales",
     "is_supported",
     "plan_execution",
+    "plan_scale_expansion",
     "plan_route_topk",
     "plan_fc2",
     "plan_weights",

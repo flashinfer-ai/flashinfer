@@ -86,6 +86,7 @@ def prepare_tp_moe_fp4_experts(
     quant_mode: str = "nvfp4",
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    a16_max_tokens: int = 0,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -119,6 +120,7 @@ def prepare_tp_moe_fp4_experts(
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            a16_max_tokens=a16_max_tokens,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=int(w1_fp4.shape[0]),
@@ -136,12 +138,13 @@ def prepare_tp_moe_fp4_experts(
     return fused_moe.prepare_weights(
         plan=weight_plan,
         weights=fused_moe.PackedWeights(
-            w13=w1_fp4,
-            w2=w2_fp4,
-            w13_block_scales=w1_blockscale,
-            w2_block_scales=w2_blockscale,
-            w13_global_scales=w1_global_scale,
-            w2_global_scales=w2_global_scale,
+            # Preparation may repack in place; references retain source layouts.
+            w13=w1_fp4.clone(),
+            w2=w2_fp4.clone(),
+            w13_block_scales=w1_blockscale.clone(),
+            w2_block_scales=w2_blockscale.clone(),
+            w13_global_scales=w1_global_scale.clone(),
+            w2_global_scales=w2_global_scale.clone(),
             input_scale=input_scale,
             intermediate_scale=intermediate_scale,
         ),

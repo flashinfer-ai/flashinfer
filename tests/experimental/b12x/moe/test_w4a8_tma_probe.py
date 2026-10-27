@@ -33,10 +33,10 @@ from cutlass import Int32, Uint32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from b12x._lib.intrinsics.atomics import ld_shared_u32
 from b12x._lib.intrinsics.conversion import e2m1x8_to_e4m3x8
-from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+from b12x._lib.intrinsics.atomics import ld_shared_u32
 from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
 from b12x._lib.dense_gemm.kernel import DenseGemmKernel
 from tests.experimental.b12x.moe.test_w4a8_fragment_probe import _e4m3_bytes, _pack_b
 
