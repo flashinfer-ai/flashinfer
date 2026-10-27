@@ -493,8 +493,12 @@ def _canonical_arm(candidate):
 
 def _routes_as_measured() -> bool:
     """The paired row-major programs are chosen by program heads per SM: the expected names of the test cases
-    hold on B200 (148 SMs) and GB300 (152 SMs)."""
-    return cake._sm_count(torch.cuda.current_device()) in (148, 152)
+    hold on B200 (sm_100a, 148 SMs) and GB300 (sm_103a, 152 SMs)."""
+    device = torch.cuda.current_device()
+    return (torch.cuda.get_device_capability(device), cake._sm_count(device)) in (
+        ((10, 0), 148),
+        ((10, 3), 152),
+    )
 
 
 # (name, batch, state dtype, program, groups): 128 heads of 64 rows, 64 program heads when paired.
