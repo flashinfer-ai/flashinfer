@@ -134,7 +134,7 @@ class Fp8MoeGemmRunner : public tvm::ffi::ModuleObj {
                           shape_k, scales_a, scales_b, trusted_offsets);
           });
     }
-    return Function(nullptr);
+    return std::nullopt;
   }
 
  private:

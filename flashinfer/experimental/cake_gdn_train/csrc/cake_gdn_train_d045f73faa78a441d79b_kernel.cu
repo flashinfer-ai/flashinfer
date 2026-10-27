@@ -5883,6 +5883,22 @@ kernel_cake_gdn_train_d045f73faa78a441d79b(const __grid_constant__ CUtensorMap q
     if (warp == 4) {
         { // load_main
             unsigned int vst_l = 0;
+#if __CUDA_ARCH__ == 1070
+#else
+            int lane_l = lane;
+            int lin_n = chunk + gridDim.x * hq + 152;
+            int c_n = lin_n % gridDim.x;
+            int hq_n = lin_n / gridDim.x;
+            int ext0_n = chunk_bos[c_n];
+            int clen_n = chunk_len[c_n];
+            int nrow_n = ((hq_n < gridDim.y) ? clen_n : 0);
+            long long tokp0 = (long long)(ext0_n + lane_l) * (long long)num_heads + (long long)(hq_n * group);
+            long long tokp1 = (long long)(ext0_n + 32 + lane_l) * (long long)num_heads + (long long)(hq_n * group);
+            if (lane_l < nrow_n) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(g + tokp0))); }
+            if (lane_l < nrow_n) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(beta + tokp0))); }
+            if (32 + lane_l < nrow_n) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(g + tokp1))); }
+            if (32 + lane_l < nrow_n) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(beta + tokp1))); }
+#endif
             unsigned int _phase_v_empty = 1;
             if (clen > 0) {
                 if (elect_sync()) {
@@ -5905,6 +5921,21 @@ kernel_cake_gdn_train_d045f73faa78a441d79b(const __grid_constant__ CUtensorMap q
                         vst_l += 1;
                         if (vst_l == 2) { vst_l = 0; _phase_v_empty ^= 1; }
                     }
+#if __CUDA_ARCH__ == 1070
+#else
+                    if (nrow_n > 0) {
+                        asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&q_tma))), "r"((int)(0)), "r"((int)(hq_n)), "r"((int)(ext0_n)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&k_tma))), "r"((int)(0)), "r"((int)(hq_n)), "r"((int)(ext0_n)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&q_tma))), "r"((int)(64)), "r"((int)(hq_n)), "r"((int)(ext0_n)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&k_tma))), "r"((int)(64)), "r"((int)(hq_n)), "r"((int)(ext0_n)) : "memory");
+                        #pragma unroll 1
+                        for (int jp = 0; jp < group; jp++) {
+                            int hv_n = hq_n * group + jp;
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&v_tma))), "r"((int)(0)), "r"((int)(hv_n)), "r"((int)(ext0_n)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&v_tma))), "r"((int)(64)), "r"((int)(hv_n)), "r"((int)(ext0_n)) : "memory");
+                        }
+                    }
+#endif
                 }
             }
         }
