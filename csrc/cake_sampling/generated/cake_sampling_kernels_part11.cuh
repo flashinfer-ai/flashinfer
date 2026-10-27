@@ -23864,6 +23864,12518 @@ kernel_cake_radix_topk_c1_e32s_bt_sp_tia(float* __restrict__ probs, int* __restr
 #undef xbuf1b_addr
 #undef xbuf64_addr
 
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_HIST0_OFF 0
+#define SMEM_HIST0_STAGE_BYTES 8192
+#define SMEM_HIST0_STRIDE 8192
+#define SMEM_XBUF64_OFF 0
+#define SMEM_XBUF64_STAGE_BYTES 512
+#define SMEM_XBUF64_STRIDE 512
+#define SMEM_TOT64_OFF 512
+#define SMEM_TOT64_STAGE_BYTES 32
+#define SMEM_TOT64_STRIDE 32
+#define SMEM_SCAL32_OFF 544
+#define SMEM_SCAL32_STAGE_BYTES 16
+#define SMEM_SCAL32_STRIDE 16
+#define SMEM_XBUF0B_OFF 0
+#define SMEM_XBUF0B_STAGE_BYTES 8192
+#define SMEM_XBUF0B_STRIDE 8192
+#define SMEM_XBUF1B_OFF 8192
+#define SMEM_XBUF1B_STAGE_BYTES 8192
+#define SMEM_XBUF1B_STRIDE 8192
+#define SMEM_WSUM64_OFF 19072
+#define SMEM_WSUM64_STAGE_BYTES 128
+#define SMEM_WSUM64_STRIDE 128
+#define SMEM_SCAL_BU_OFF 19200
+#define SMEM_SCAL_BU_STAGE_BYTES 32
+#define SMEM_SCAL_BU_STRIDE 32
+#define SMEM_SCAL_BU64_OFF 19200
+#define SMEM_SCAL_BU64_STAGE_BYTES 32
+#define SMEM_SCAL_BU64_STRIDE 32
+#define SMEM_HIST1_OFF 8192
+#define SMEM_HIST1_STAGE_BYTES 8192
+#define SMEM_HIST1_STRIDE 8192
+#define SMEM_WARP_SUMS_OFF 16384
+#define SMEM_WARP_SUMS_STAGE_BYTES 64
+#define SMEM_WARP_SUMS_STRIDE 64
+#define SMEM_SCAL_OFF 16448
+#define SMEM_SCAL_STAGE_BYTES 64
+#define SMEM_SCAL_STRIDE 64
+#define SMEM_CNT_OFF 16512
+#define SMEM_CNT_STAGE_BYTES 2560
+#define SMEM_CNT_STRIDE 2560
+#define SMEM_CLIST_OFF 19072
+#define SMEM_CLIST_STAGE_BYTES 16384
+#define SMEM_CLIST_STRIDE 16384
+#define SMEM_COARSE_OFF 35456
+#define SMEM_COARSE_STAGE_BYTES 512
+#define SMEM_COARSE_STRIDE 512
+#define SMEM_TOTAL 35968
+#define THREADS 512
+
+extern "C" {
+
+__global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
+kernel_cake_radix_topk_c8_e40(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 8;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    unsigned int* hist0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
+    const int hist0_addr = smem + 0;
+    unsigned long long* xbuf64 = reinterpret_cast<unsigned long long*>(smem_raw + 0);
+    const int xbuf64_addr = smem + 0;
+    unsigned long long* tot64 = reinterpret_cast<unsigned long long*>(smem_raw + 512);
+    const int tot64_addr = smem + 512;
+    unsigned int* scal32 = reinterpret_cast<unsigned int*>(smem_raw + 544);
+    const int scal32_addr = smem + 544;
+    unsigned long long* xbuf0b = reinterpret_cast<unsigned long long*>(smem_raw + 0);
+    const int xbuf0b_addr = smem + 0;
+    unsigned long long* xbuf1b = reinterpret_cast<unsigned long long*>(smem_raw + 8192);
+    const int xbuf1b_addr = smem + 8192;
+    unsigned long long* wsum64 = reinterpret_cast<unsigned long long*>(smem_raw + 19072);
+    const int wsum64_addr = smem + 19072;
+    unsigned int* scal_bu = reinterpret_cast<unsigned int*>(smem_raw + 19200);
+    const int scal_bu_addr = smem + 19200;
+    unsigned long long* scal_bu64 = reinterpret_cast<unsigned long long*>(smem_raw + 19200);
+    const int scal_bu64_addr = smem + 19200;
+    unsigned int* hist1 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int hist1_addr = smem + 8192;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int warp_sums_addr = smem + 16384;
+    unsigned int* scal = reinterpret_cast<unsigned int*>(smem_raw + 16448);
+    const int scal_addr = smem + 16448;
+    unsigned int* cnt = reinterpret_cast<unsigned int*>(smem_raw + 16512);
+    const int cnt_addr = smem + 16512;
+    unsigned int* clist = reinterpret_cast<unsigned int*>(smem_raw + 19072);
+    const int clist_addr = smem + 19072;
+    unsigned int* coarse = reinterpret_cast<unsigned int*>(smem_raw + 35456);
+    const int coarse_addr = smem + 35456;
+
+    // === Task calls (declaration order) ===
+    int row = 0;
+    int rank = 0;
+    row = cluster_id;
+    rank = cta_rank;
+    int k_req = ((topk_kind == 2) ? topk_arr[row] : topk_scalar);
+    int _min_1 = ((k_req) < (vocab) ? (k_req) : (vocab));
+    int _min_0 = ((_min_1) < (1024) ? (_min_1) : (1024));
+    int k = ((_min_0) > (1) ? (_min_0) : (1));
+    unsigned int k_u = (unsigned int)k;
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab;
+    unsigned long long out_base = (unsigned long long)row * 1024;
+    int start = rank * 20480;
+    bool aligned = (vocab & 3) == 0;
+    float vals[40];
+    int base_t = start + tid * 4;
+    if (aligned) {
+        int i = start + tid * 4;
+        if (i < vocab) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            vals[0] = _vec_load_0[0];
+            vals[1] = _vec_load_0[1];
+            vals[2] = _vec_load_0[2];
+            vals[3] = _vec_load_0[3];
+        } else {
+            vals[0] = 0.0f;
+            vals[1] = 0.0f;
+            vals[2] = 0.0f;
+            vals[3] = 0.0f;
+        }
+        int i_0 = start + 2048 + tid * 4;
+        if (i_0 < vocab) {
+            float _vec_load_1[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0);
+                _vec_load_1[0 + 0] = _v4.x;
+                _vec_load_1[0 + 1] = _v4.y;
+                _vec_load_1[0 + 2] = _v4.z;
+                _vec_load_1[0 + 3] = _v4.w;
+            }
+            vals[4] = _vec_load_1[0];
+            vals[5] = _vec_load_1[1];
+            vals[6] = _vec_load_1[2];
+            vals[7] = _vec_load_1[3];
+        } else {
+            vals[4] = 0.0f;
+            vals[5] = 0.0f;
+            vals[6] = 0.0f;
+            vals[7] = 0.0f;
+        }
+        int i_1 = start + 4096 + tid * 4;
+        if (i_1 < vocab) {
+            float _vec_load_2[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1);
+                _vec_load_2[0 + 0] = _v4.x;
+                _vec_load_2[0 + 1] = _v4.y;
+                _vec_load_2[0 + 2] = _v4.z;
+                _vec_load_2[0 + 3] = _v4.w;
+            }
+            vals[8] = _vec_load_2[0];
+            vals[9] = _vec_load_2[1];
+            vals[10] = _vec_load_2[2];
+            vals[11] = _vec_load_2[3];
+        } else {
+            vals[8] = 0.0f;
+            vals[9] = 0.0f;
+            vals[10] = 0.0f;
+            vals[11] = 0.0f;
+        }
+        int i_2 = start + 6144 + tid * 4;
+        if (i_2 < vocab) {
+            float _vec_load_3[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2);
+                _vec_load_3[0 + 0] = _v4.x;
+                _vec_load_3[0 + 1] = _v4.y;
+                _vec_load_3[0 + 2] = _v4.z;
+                _vec_load_3[0 + 3] = _v4.w;
+            }
+            vals[12] = _vec_load_3[0];
+            vals[13] = _vec_load_3[1];
+            vals[14] = _vec_load_3[2];
+            vals[15] = _vec_load_3[3];
+        } else {
+            vals[12] = 0.0f;
+            vals[13] = 0.0f;
+            vals[14] = 0.0f;
+            vals[15] = 0.0f;
+        }
+        int i_3 = start + 8192 + tid * 4;
+        if (i_3 < vocab) {
+            float _vec_load_4[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3);
+                _vec_load_4[0 + 0] = _v4.x;
+                _vec_load_4[0 + 1] = _v4.y;
+                _vec_load_4[0 + 2] = _v4.z;
+                _vec_load_4[0 + 3] = _v4.w;
+            }
+            vals[16] = _vec_load_4[0];
+            vals[17] = _vec_load_4[1];
+            vals[18] = _vec_load_4[2];
+            vals[19] = _vec_load_4[3];
+        } else {
+            vals[16] = 0.0f;
+            vals[17] = 0.0f;
+            vals[18] = 0.0f;
+            vals[19] = 0.0f;
+        }
+        int i_4 = start + 10240 + tid * 4;
+        if (i_4 < vocab) {
+            float _vec_load_5[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4);
+                _vec_load_5[0 + 0] = _v4.x;
+                _vec_load_5[0 + 1] = _v4.y;
+                _vec_load_5[0 + 2] = _v4.z;
+                _vec_load_5[0 + 3] = _v4.w;
+            }
+            vals[20] = _vec_load_5[0];
+            vals[21] = _vec_load_5[1];
+            vals[22] = _vec_load_5[2];
+            vals[23] = _vec_load_5[3];
+        } else {
+            vals[20] = 0.0f;
+            vals[21] = 0.0f;
+            vals[22] = 0.0f;
+            vals[23] = 0.0f;
+        }
+        int i_5 = start + 12288 + tid * 4;
+        if (i_5 < vocab) {
+            float _vec_load_6[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_5);
+                _vec_load_6[0 + 0] = _v4.x;
+                _vec_load_6[0 + 1] = _v4.y;
+                _vec_load_6[0 + 2] = _v4.z;
+                _vec_load_6[0 + 3] = _v4.w;
+            }
+            vals[24] = _vec_load_6[0];
+            vals[25] = _vec_load_6[1];
+            vals[26] = _vec_load_6[2];
+            vals[27] = _vec_load_6[3];
+        } else {
+            vals[24] = 0.0f;
+            vals[25] = 0.0f;
+            vals[26] = 0.0f;
+            vals[27] = 0.0f;
+        }
+        int i_6 = start + 14336 + tid * 4;
+        if (i_6 < vocab) {
+            float _vec_load_7[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_6);
+                _vec_load_7[0 + 0] = _v4.x;
+                _vec_load_7[0 + 1] = _v4.y;
+                _vec_load_7[0 + 2] = _v4.z;
+                _vec_load_7[0 + 3] = _v4.w;
+            }
+            vals[28] = _vec_load_7[0];
+            vals[29] = _vec_load_7[1];
+            vals[30] = _vec_load_7[2];
+            vals[31] = _vec_load_7[3];
+        } else {
+            vals[28] = 0.0f;
+            vals[29] = 0.0f;
+            vals[30] = 0.0f;
+            vals[31] = 0.0f;
+        }
+        int i_7 = start + 16384 + tid * 4;
+        if (i_7 < vocab) {
+            float _vec_load_8[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_7);
+                _vec_load_8[0 + 0] = _v4.x;
+                _vec_load_8[0 + 1] = _v4.y;
+                _vec_load_8[0 + 2] = _v4.z;
+                _vec_load_8[0 + 3] = _v4.w;
+            }
+            vals[32] = _vec_load_8[0];
+            vals[33] = _vec_load_8[1];
+            vals[34] = _vec_load_8[2];
+            vals[35] = _vec_load_8[3];
+        } else {
+            vals[32] = 0.0f;
+            vals[33] = 0.0f;
+            vals[34] = 0.0f;
+            vals[35] = 0.0f;
+        }
+        int i_8 = start + 18432 + tid * 4;
+        if (i_8 < vocab) {
+            float _vec_load_9[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_8);
+                _vec_load_9[0 + 0] = _v4.x;
+                _vec_load_9[0 + 1] = _v4.y;
+                _vec_load_9[0 + 2] = _v4.z;
+                _vec_load_9[0 + 3] = _v4.w;
+            }
+            vals[36] = _vec_load_9[0];
+            vals[37] = _vec_load_9[1];
+            vals[38] = _vec_load_9[2];
+            vals[39] = _vec_load_9[3];
+        } else {
+            vals[36] = 0.0f;
+            vals[37] = 0.0f;
+            vals[38] = 0.0f;
+            vals[39] = 0.0f;
+        }
+    } else {
+        int i_9 = start + tid * 4;
+        if (i_9 < vocab) {
+            vals[0] = probs[row_base + (unsigned long long)i_9];
+        } else {
+            vals[0] = 0.0f;
+        }
+        if (i_9 + 1 < vocab) {
+            vals[1] = probs[row_base + (unsigned long long)(i_9 + 1)];
+        } else {
+            vals[1] = 0.0f;
+        }
+        if (i_9 + 2 < vocab) {
+            vals[2] = probs[row_base + (unsigned long long)(i_9 + 2)];
+        } else {
+            vals[2] = 0.0f;
+        }
+        if (i_9 + 3 < vocab) {
+            vals[3] = probs[row_base + (unsigned long long)(i_9 + 3)];
+        } else {
+            vals[3] = 0.0f;
+        }
+        int i_0_1 = start + 2048 + tid * 4;
+        if (i_0_1 < vocab) {
+            vals[4] = probs[row_base + (unsigned long long)i_0_1];
+        } else {
+            vals[4] = 0.0f;
+        }
+        if (i_0_1 + 1 < vocab) {
+            vals[5] = probs[row_base + (unsigned long long)(i_0_1 + 1)];
+        } else {
+            vals[5] = 0.0f;
+        }
+        if (i_0_1 + 2 < vocab) {
+            vals[6] = probs[row_base + (unsigned long long)(i_0_1 + 2)];
+        } else {
+            vals[6] = 0.0f;
+        }
+        if (i_0_1 + 3 < vocab) {
+            vals[7] = probs[row_base + (unsigned long long)(i_0_1 + 3)];
+        } else {
+            vals[7] = 0.0f;
+        }
+        int i_1_1 = start + 4096 + tid * 4;
+        if (i_1_1 < vocab) {
+            vals[8] = probs[row_base + (unsigned long long)i_1_1];
+        } else {
+            vals[8] = 0.0f;
+        }
+        if (i_1_1 + 1 < vocab) {
+            vals[9] = probs[row_base + (unsigned long long)(i_1_1 + 1)];
+        } else {
+            vals[9] = 0.0f;
+        }
+        if (i_1_1 + 2 < vocab) {
+            vals[10] = probs[row_base + (unsigned long long)(i_1_1 + 2)];
+        } else {
+            vals[10] = 0.0f;
+        }
+        if (i_1_1 + 3 < vocab) {
+            vals[11] = probs[row_base + (unsigned long long)(i_1_1 + 3)];
+        } else {
+            vals[11] = 0.0f;
+        }
+        int i_2_1 = start + 6144 + tid * 4;
+        if (i_2_1 < vocab) {
+            vals[12] = probs[row_base + (unsigned long long)i_2_1];
+        } else {
+            vals[12] = 0.0f;
+        }
+        if (i_2_1 + 1 < vocab) {
+            vals[13] = probs[row_base + (unsigned long long)(i_2_1 + 1)];
+        } else {
+            vals[13] = 0.0f;
+        }
+        if (i_2_1 + 2 < vocab) {
+            vals[14] = probs[row_base + (unsigned long long)(i_2_1 + 2)];
+        } else {
+            vals[14] = 0.0f;
+        }
+        if (i_2_1 + 3 < vocab) {
+            vals[15] = probs[row_base + (unsigned long long)(i_2_1 + 3)];
+        } else {
+            vals[15] = 0.0f;
+        }
+        int i_3_1 = start + 8192 + tid * 4;
+        if (i_3_1 < vocab) {
+            vals[16] = probs[row_base + (unsigned long long)i_3_1];
+        } else {
+            vals[16] = 0.0f;
+        }
+        if (i_3_1 + 1 < vocab) {
+            vals[17] = probs[row_base + (unsigned long long)(i_3_1 + 1)];
+        } else {
+            vals[17] = 0.0f;
+        }
+        if (i_3_1 + 2 < vocab) {
+            vals[18] = probs[row_base + (unsigned long long)(i_3_1 + 2)];
+        } else {
+            vals[18] = 0.0f;
+        }
+        if (i_3_1 + 3 < vocab) {
+            vals[19] = probs[row_base + (unsigned long long)(i_3_1 + 3)];
+        } else {
+            vals[19] = 0.0f;
+        }
+        int i_4_1 = start + 10240 + tid * 4;
+        if (i_4_1 < vocab) {
+            vals[20] = probs[row_base + (unsigned long long)i_4_1];
+        } else {
+            vals[20] = 0.0f;
+        }
+        if (i_4_1 + 1 < vocab) {
+            vals[21] = probs[row_base + (unsigned long long)(i_4_1 + 1)];
+        } else {
+            vals[21] = 0.0f;
+        }
+        if (i_4_1 + 2 < vocab) {
+            vals[22] = probs[row_base + (unsigned long long)(i_4_1 + 2)];
+        } else {
+            vals[22] = 0.0f;
+        }
+        if (i_4_1 + 3 < vocab) {
+            vals[23] = probs[row_base + (unsigned long long)(i_4_1 + 3)];
+        } else {
+            vals[23] = 0.0f;
+        }
+        int i_5_1 = start + 12288 + tid * 4;
+        if (i_5_1 < vocab) {
+            vals[24] = probs[row_base + (unsigned long long)i_5_1];
+        } else {
+            vals[24] = 0.0f;
+        }
+        if (i_5_1 + 1 < vocab) {
+            vals[25] = probs[row_base + (unsigned long long)(i_5_1 + 1)];
+        } else {
+            vals[25] = 0.0f;
+        }
+        if (i_5_1 + 2 < vocab) {
+            vals[26] = probs[row_base + (unsigned long long)(i_5_1 + 2)];
+        } else {
+            vals[26] = 0.0f;
+        }
+        if (i_5_1 + 3 < vocab) {
+            vals[27] = probs[row_base + (unsigned long long)(i_5_1 + 3)];
+        } else {
+            vals[27] = 0.0f;
+        }
+        int i_6_1 = start + 14336 + tid * 4;
+        if (i_6_1 < vocab) {
+            vals[28] = probs[row_base + (unsigned long long)i_6_1];
+        } else {
+            vals[28] = 0.0f;
+        }
+        if (i_6_1 + 1 < vocab) {
+            vals[29] = probs[row_base + (unsigned long long)(i_6_1 + 1)];
+        } else {
+            vals[29] = 0.0f;
+        }
+        if (i_6_1 + 2 < vocab) {
+            vals[30] = probs[row_base + (unsigned long long)(i_6_1 + 2)];
+        } else {
+            vals[30] = 0.0f;
+        }
+        if (i_6_1 + 3 < vocab) {
+            vals[31] = probs[row_base + (unsigned long long)(i_6_1 + 3)];
+        } else {
+            vals[31] = 0.0f;
+        }
+        int i_7_1 = start + 16384 + tid * 4;
+        if (i_7_1 < vocab) {
+            vals[32] = probs[row_base + (unsigned long long)i_7_1];
+        } else {
+            vals[32] = 0.0f;
+        }
+        if (i_7_1 + 1 < vocab) {
+            vals[33] = probs[row_base + (unsigned long long)(i_7_1 + 1)];
+        } else {
+            vals[33] = 0.0f;
+        }
+        if (i_7_1 + 2 < vocab) {
+            vals[34] = probs[row_base + (unsigned long long)(i_7_1 + 2)];
+        } else {
+            vals[34] = 0.0f;
+        }
+        if (i_7_1 + 3 < vocab) {
+            vals[35] = probs[row_base + (unsigned long long)(i_7_1 + 3)];
+        } else {
+            vals[35] = 0.0f;
+        }
+        int i_8_1 = start + 18432 + tid * 4;
+        if (i_8_1 < vocab) {
+            vals[36] = probs[row_base + (unsigned long long)i_8_1];
+        } else {
+            vals[36] = 0.0f;
+        }
+        if (i_8_1 + 1 < vocab) {
+            vals[37] = probs[row_base + (unsigned long long)(i_8_1 + 1)];
+        } else {
+            vals[37] = 0.0f;
+        }
+        if (i_8_1 + 2 < vocab) {
+            vals[38] = probs[row_base + (unsigned long long)(i_8_1 + 2)];
+        } else {
+            vals[38] = 0.0f;
+        }
+        if (i_8_1 + 3 < vocab) {
+            vals[39] = probs[row_base + (unsigned long long)(i_8_1 + 3)];
+        } else {
+            vals[39] = 0.0f;
+        }
+    }
+    if ((launch_flags & 2) != 0) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
+    for (int i_10 = tid; i_10 < 2048; i_10 += 512) {
+        hist0[i_10] = 0;
+        hist1[i_10] = 0;
+    }
+    if (tid < 16) {
+        scal[tid] = 0;
+    }
+    __syncthreads();
+    unsigned int bits = __as_u32(vals[0]);
+    unsigned int key = ((bits <= 2139095040) ? bits : 0);
+    unsigned int bucket = key >> 21 & 2047;
+    atomicAdd(&hist0[bucket], 1);
+    unsigned int bits_0 = __as_u32(vals[1]);
+    unsigned int key_1 = ((bits_0 <= 2139095040) ? bits_0 : 0);
+    unsigned int bucket_2 = key_1 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_2], 1);
+    unsigned int bits_3 = __as_u32(vals[2]);
+    unsigned int key_4 = ((bits_3 <= 2139095040) ? bits_3 : 0);
+    unsigned int bucket_5 = key_4 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_5], 1);
+    unsigned int bits_6 = __as_u32(vals[3]);
+    unsigned int key_7 = ((bits_6 <= 2139095040) ? bits_6 : 0);
+    unsigned int bucket_8 = key_7 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_8], 1);
+    unsigned int bits_9 = __as_u32(vals[4]);
+    unsigned int key_10 = ((bits_9 <= 2139095040) ? bits_9 : 0);
+    unsigned int bucket_11 = key_10 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_11], 1);
+    unsigned int bits_12 = __as_u32(vals[5]);
+    unsigned int key_13 = ((bits_12 <= 2139095040) ? bits_12 : 0);
+    unsigned int bucket_14 = key_13 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_14], 1);
+    unsigned int bits_15 = __as_u32(vals[6]);
+    unsigned int key_16 = ((bits_15 <= 2139095040) ? bits_15 : 0);
+    unsigned int bucket_17 = key_16 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_17], 1);
+    unsigned int bits_18 = __as_u32(vals[7]);
+    unsigned int key_19 = ((bits_18 <= 2139095040) ? bits_18 : 0);
+    unsigned int bucket_20 = key_19 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_20], 1);
+    unsigned int bits_21 = __as_u32(vals[8]);
+    unsigned int key_22 = ((bits_21 <= 2139095040) ? bits_21 : 0);
+    unsigned int bucket_23 = key_22 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_23], 1);
+    unsigned int bits_24 = __as_u32(vals[9]);
+    unsigned int key_25 = ((bits_24 <= 2139095040) ? bits_24 : 0);
+    unsigned int bucket_26 = key_25 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_26], 1);
+    unsigned int bits_27 = __as_u32(vals[10]);
+    unsigned int key_28 = ((bits_27 <= 2139095040) ? bits_27 : 0);
+    unsigned int bucket_29 = key_28 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_29], 1);
+    unsigned int bits_30 = __as_u32(vals[11]);
+    unsigned int key_31 = ((bits_30 <= 2139095040) ? bits_30 : 0);
+    unsigned int bucket_32 = key_31 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_32], 1);
+    unsigned int bits_33 = __as_u32(vals[12]);
+    unsigned int key_34 = ((bits_33 <= 2139095040) ? bits_33 : 0);
+    unsigned int bucket_35 = key_34 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_35], 1);
+    unsigned int bits_36 = __as_u32(vals[13]);
+    unsigned int key_37 = ((bits_36 <= 2139095040) ? bits_36 : 0);
+    unsigned int bucket_38 = key_37 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_38], 1);
+    unsigned int bits_39 = __as_u32(vals[14]);
+    unsigned int key_40 = ((bits_39 <= 2139095040) ? bits_39 : 0);
+    unsigned int bucket_41 = key_40 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_41], 1);
+    unsigned int bits_42 = __as_u32(vals[15]);
+    unsigned int key_43 = ((bits_42 <= 2139095040) ? bits_42 : 0);
+    unsigned int bucket_44 = key_43 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_44], 1);
+    unsigned int bits_45 = __as_u32(vals[16]);
+    unsigned int key_46 = ((bits_45 <= 2139095040) ? bits_45 : 0);
+    unsigned int bucket_47 = key_46 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_47], 1);
+    unsigned int bits_48 = __as_u32(vals[17]);
+    unsigned int key_49 = ((bits_48 <= 2139095040) ? bits_48 : 0);
+    unsigned int bucket_50 = key_49 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_50], 1);
+    unsigned int bits_51 = __as_u32(vals[18]);
+    unsigned int key_52 = ((bits_51 <= 2139095040) ? bits_51 : 0);
+    unsigned int bucket_53 = key_52 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_53], 1);
+    unsigned int bits_54 = __as_u32(vals[19]);
+    unsigned int key_55 = ((bits_54 <= 2139095040) ? bits_54 : 0);
+    unsigned int bucket_56 = key_55 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_56], 1);
+    unsigned int bits_57 = __as_u32(vals[20]);
+    unsigned int key_58 = ((bits_57 <= 2139095040) ? bits_57 : 0);
+    unsigned int bucket_59 = key_58 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_59], 1);
+    unsigned int bits_60 = __as_u32(vals[21]);
+    unsigned int key_61 = ((bits_60 <= 2139095040) ? bits_60 : 0);
+    unsigned int bucket_62 = key_61 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_62], 1);
+    unsigned int bits_63 = __as_u32(vals[22]);
+    unsigned int key_64 = ((bits_63 <= 2139095040) ? bits_63 : 0);
+    unsigned int bucket_65 = key_64 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_65], 1);
+    unsigned int bits_66 = __as_u32(vals[23]);
+    unsigned int key_67 = ((bits_66 <= 2139095040) ? bits_66 : 0);
+    unsigned int bucket_68 = key_67 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_68], 1);
+    unsigned int bits_69 = __as_u32(vals[24]);
+    unsigned int key_70 = ((bits_69 <= 2139095040) ? bits_69 : 0);
+    unsigned int bucket_71 = key_70 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_71], 1);
+    unsigned int bits_72 = __as_u32(vals[25]);
+    unsigned int key_73 = ((bits_72 <= 2139095040) ? bits_72 : 0);
+    unsigned int bucket_74 = key_73 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_74], 1);
+    unsigned int bits_75 = __as_u32(vals[26]);
+    unsigned int key_76 = ((bits_75 <= 2139095040) ? bits_75 : 0);
+    unsigned int bucket_77 = key_76 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_77], 1);
+    unsigned int bits_78 = __as_u32(vals[27]);
+    unsigned int key_79 = ((bits_78 <= 2139095040) ? bits_78 : 0);
+    unsigned int bucket_80 = key_79 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_80], 1);
+    unsigned int bits_81 = __as_u32(vals[28]);
+    unsigned int key_82 = ((bits_81 <= 2139095040) ? bits_81 : 0);
+    unsigned int bucket_83 = key_82 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_83], 1);
+    unsigned int bits_84 = __as_u32(vals[29]);
+    unsigned int key_85 = ((bits_84 <= 2139095040) ? bits_84 : 0);
+    unsigned int bucket_86 = key_85 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_86], 1);
+    unsigned int bits_87 = __as_u32(vals[30]);
+    unsigned int key_88 = ((bits_87 <= 2139095040) ? bits_87 : 0);
+    unsigned int bucket_89 = key_88 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_89], 1);
+    unsigned int bits_90 = __as_u32(vals[31]);
+    unsigned int key_91 = ((bits_90 <= 2139095040) ? bits_90 : 0);
+    unsigned int bucket_92 = key_91 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_92], 1);
+    unsigned int bits_93 = __as_u32(vals[32]);
+    unsigned int key_94 = ((bits_93 <= 2139095040) ? bits_93 : 0);
+    unsigned int bucket_95 = key_94 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_95], 1);
+    unsigned int bits_96 = __as_u32(vals[33]);
+    unsigned int key_97 = ((bits_96 <= 2139095040) ? bits_96 : 0);
+    unsigned int bucket_98 = key_97 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_98], 1);
+    unsigned int bits_99 = __as_u32(vals[34]);
+    unsigned int key_100 = ((bits_99 <= 2139095040) ? bits_99 : 0);
+    unsigned int bucket_101 = key_100 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_101], 1);
+    unsigned int bits_102 = __as_u32(vals[35]);
+    unsigned int key_103 = ((bits_102 <= 2139095040) ? bits_102 : 0);
+    unsigned int bucket_104 = key_103 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_104], 1);
+    unsigned int bits_105 = __as_u32(vals[36]);
+    unsigned int key_106 = ((bits_105 <= 2139095040) ? bits_105 : 0);
+    unsigned int bucket_107 = key_106 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_107], 1);
+    unsigned int bits_108 = __as_u32(vals[37]);
+    unsigned int key_109 = ((bits_108 <= 2139095040) ? bits_108 : 0);
+    unsigned int bucket_110 = key_109 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_110], 1);
+    unsigned int bits_111 = __as_u32(vals[38]);
+    unsigned int key_112 = ((bits_111 <= 2139095040) ? bits_111 : 0);
+    unsigned int bucket_113 = key_112 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_113], 1);
+    unsigned int bits_114 = __as_u32(vals[39]);
+    unsigned int key_115 = ((bits_114 <= 2139095040) ? bits_114 : 0);
+    unsigned int bucket_116 = key_115 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_116], 1);
+    unsigned int lo[4];
+    __syncthreads();
+    unsigned int local = hist0[tid * 4] + hist0[tid * 4 + 1] + hist0[tid * 4 + 2] + hist0[tid * 4 + 3];
+    unsigned int _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, local, 1);
+    local = local + _shfl_xor_sync_12;
+    unsigned int _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, local, 2);
+    local = local + _shfl_xor_sync_13;
+    if ((lane & 3) == 0) {
+        coarse[tid >> 2] = local;
+    }
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (warp == 0) {
+        unsigned int cc[4];
+        unsigned int lo_0[4];
+        cc[0] = 0;
+        lo_0[0] = 0;
+        cc[1] = 0;
+        lo_0[1] = 0;
+        cc[2] = 0;
+        lo_0[2] = 0;
+        cc[3] = 0;
+        lo_0[3] = 0;
+        unsigned int words[4];
+        uint32_t _cluster_mapa_14;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_14) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
+            : "r"(_cluster_mapa_14));
+        cc[0] = cc[0] + words[0];
+        cc[1] = cc[1] + words[1];
+        cc[2] = cc[2] + words[2];
+        cc[3] = cc[3] + words[3];
+        if (rank > 0) {
+            lo_0[0] = lo_0[0] + words[0];
+            lo_0[1] = lo_0[1] + words[1];
+            lo_0[2] = lo_0[2] + words[2];
+            lo_0[3] = lo_0[3] + words[3];
+        }
+        unsigned int words_1[4];
+        uint32_t _cluster_mapa_15;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_15) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+            : "r"(_cluster_mapa_15));
+        cc[0] = cc[0] + words_1[0];
+        cc[1] = cc[1] + words_1[1];
+        cc[2] = cc[2] + words_1[2];
+        cc[3] = cc[3] + words_1[3];
+        if (rank > 1) {
+            lo_0[0] = lo_0[0] + words_1[0];
+            lo_0[1] = lo_0[1] + words_1[1];
+            lo_0[2] = lo_0[2] + words_1[2];
+            lo_0[3] = lo_0[3] + words_1[3];
+        }
+        unsigned int words_2[4];
+        uint32_t _cluster_mapa_16;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_16) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 3]))
+            : "r"(_cluster_mapa_16));
+        cc[0] = cc[0] + words_2[0];
+        cc[1] = cc[1] + words_2[1];
+        cc[2] = cc[2] + words_2[2];
+        cc[3] = cc[3] + words_2[3];
+        if (rank > 2) {
+            lo_0[0] = lo_0[0] + words_2[0];
+            lo_0[1] = lo_0[1] + words_2[1];
+            lo_0[2] = lo_0[2] + words_2[2];
+            lo_0[3] = lo_0[3] + words_2[3];
+        }
+        unsigned int words_3[4];
+        uint32_t _cluster_mapa_17;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_17) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 3]))
+            : "r"(_cluster_mapa_17));
+        cc[0] = cc[0] + words_3[0];
+        cc[1] = cc[1] + words_3[1];
+        cc[2] = cc[2] + words_3[2];
+        cc[3] = cc[3] + words_3[3];
+        if (rank > 3) {
+            lo_0[0] = lo_0[0] + words_3[0];
+            lo_0[1] = lo_0[1] + words_3[1];
+            lo_0[2] = lo_0[2] + words_3[2];
+            lo_0[3] = lo_0[3] + words_3[3];
+        }
+        unsigned int words_4[4];
+        uint32_t _cluster_mapa_18;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_18) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 3]))
+            : "r"(_cluster_mapa_18));
+        cc[0] = cc[0] + words_4[0];
+        cc[1] = cc[1] + words_4[1];
+        cc[2] = cc[2] + words_4[2];
+        cc[3] = cc[3] + words_4[3];
+        if (rank > 4) {
+            lo_0[0] = lo_0[0] + words_4[0];
+            lo_0[1] = lo_0[1] + words_4[1];
+            lo_0[2] = lo_0[2] + words_4[2];
+            lo_0[3] = lo_0[3] + words_4[3];
+        }
+        unsigned int words_5[4];
+        uint32_t _cluster_mapa_19;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_19) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 3]))
+            : "r"(_cluster_mapa_19));
+        cc[0] = cc[0] + words_5[0];
+        cc[1] = cc[1] + words_5[1];
+        cc[2] = cc[2] + words_5[2];
+        cc[3] = cc[3] + words_5[3];
+        if (rank > 5) {
+            lo_0[0] = lo_0[0] + words_5[0];
+            lo_0[1] = lo_0[1] + words_5[1];
+            lo_0[2] = lo_0[2] + words_5[2];
+            lo_0[3] = lo_0[3] + words_5[3];
+        }
+        unsigned int words_6[4];
+        uint32_t _cluster_mapa_20;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_20) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 3]))
+            : "r"(_cluster_mapa_20));
+        cc[0] = cc[0] + words_6[0];
+        cc[1] = cc[1] + words_6[1];
+        cc[2] = cc[2] + words_6[2];
+        cc[3] = cc[3] + words_6[3];
+        if (rank > 6) {
+            lo_0[0] = lo_0[0] + words_6[0];
+            lo_0[1] = lo_0[1] + words_6[1];
+            lo_0[2] = lo_0[2] + words_6[2];
+            lo_0[3] = lo_0[3] + words_6[3];
+        }
+        unsigned int words_7[4];
+        uint32_t _cluster_mapa_21;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_21) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 3]))
+            : "r"(_cluster_mapa_21));
+        cc[0] = cc[0] + words_7[0];
+        cc[1] = cc[1] + words_7[1];
+        cc[2] = cc[2] + words_7[2];
+        cc[3] = cc[3] + words_7[3];
+        if (rank > 7) {
+            lo_0[0] = lo_0[0] + words_7[0];
+            lo_0[1] = lo_0[1] + words_7[1];
+            lo_0[2] = lo_0[2] + words_7[2];
+            lo_0[3] = lo_0[3] + words_7[3];
+        }
+        unsigned int local_8 = cc[0] + cc[1] + cc[2] + cc[3];
+        uint32_t _warp_scan_sum_22 = local_8;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(16));
+        unsigned int above = _warp_scan_sum_22 - local_8;
+        unsigned int lo_local = lo_0[0] + lo_0[1] + lo_0[2] + lo_0[3];
+        uint32_t _warp_scan_sum_23 = lo_local;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(16));
+        unsigned int lo_above = _warp_scan_sum_23 - lo_local;
+        unsigned int is_owner = 0;
+        unsigned int pos = 0;
+        unsigned int rem_after = 0;
+        unsigned int cnt_9 = 0;
+        unsigned int lo_sel = 0;
+        if (above < k_u && k_u <= above + local_8) {
+            is_owner = 1;
+            unsigned int s3 = above + cc[3];
+            unsigned int s2 = s3 + cc[2];
+            unsigned int s1 = s2 + cc[1];
+            if (k_u <= s3) {
+                pos = (unsigned int)(lane * 4 + 3);
+                rem_after = k_u - above;
+                cnt_9 = cc[3];
+                lo_sel = lo_above;
+            } else if (k_u <= s2) {
+                pos = (unsigned int)(lane * 4 + 2);
+                rem_after = k_u - s3;
+                cnt_9 = cc[2];
+                lo_sel = lo_above + lo_0[3];
+            } else {
+                if (k_u <= s1) {
+                    pos = (unsigned int)(lane * 4 + 1);
+                    rem_after = k_u - s2;
+                    cnt_9 = cc[1];
+                    lo_sel = lo_above + lo_0[3] + lo_0[2];
+                } else {
+                    pos = (unsigned int)(lane * 4);
+                    rem_after = k_u - s1;
+                    cnt_9 = cc[0];
+                    lo_sel = lo_above + lo_0[3] + lo_0[2] + lo_0[1];
+                }
+            }
+        }
+        unsigned int owner;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner) : "r"(((is_owner != 0) ? (unsigned int)lane : 0)));
+        unsigned int found;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found) : "r"(is_owner));
+        unsigned int pos_b = __shfl_sync(0xFFFFFFFF, pos, owner);
+        unsigned int rem_b = __shfl_sync(0xFFFFFFFF, rem_after, owner);
+        unsigned int cnt_b = __shfl_sync(0xFFFFFFFF, cnt_9, owner);
+        unsigned int lo_b = __shfl_sync(0xFFFFFFFF, lo_sel, owner);
+        unsigned int ff[4];
+        unsigned int lf[4];
+        ff[0] = 0;
+        lf[0] = 0;
+        ff[1] = 0;
+        lf[1] = 0;
+        ff[2] = 0;
+        lf[2] = 0;
+        ff[3] = 0;
+        lf[3] = 0;
+        int quad = lane & 3;
+        int off = ((int)pos_b * 16 + quad * 4) * 4;
+        int r = lane >> 2;
+        if (r < 8) {
+            unsigned int words_0[4];
+            uint32_t _cluster_mapa_24;
+            asm volatile(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_cluster_mapa_24) : "r"(hist0_addr + (unsigned int)off), "r"(r));
+            asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 3]))
+                : "r"(_cluster_mapa_24));
+            ff[0] = ff[0] + words_0[0];
+            ff[1] = ff[1] + words_0[1];
+            ff[2] = ff[2] + words_0[2];
+            ff[3] = ff[3] + words_0[3];
+            if (r < rank) {
+                lf[0] = lf[0] + words_0[0];
+                lf[1] = lf[1] + words_0[1];
+                lf[2] = lf[2] + words_0[2];
+                lf[3] = lf[3] + words_0[3];
+            }
+        }
+        unsigned int _shfl_xor_sync_25 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 4);
+        ff[0] = ff[0] + _shfl_xor_sync_25;
+        unsigned int _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 4);
+        lf[0] = lf[0] + _shfl_xor_sync_26;
+        unsigned int _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 4);
+        ff[1] = ff[1] + _shfl_xor_sync_27;
+        unsigned int _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 4);
+        lf[1] = lf[1] + _shfl_xor_sync_28;
+        unsigned int _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 4);
+        ff[2] = ff[2] + _shfl_xor_sync_29;
+        unsigned int _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 4);
+        lf[2] = lf[2] + _shfl_xor_sync_30;
+        unsigned int _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 4);
+        ff[3] = ff[3] + _shfl_xor_sync_31;
+        unsigned int _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 4);
+        lf[3] = lf[3] + _shfl_xor_sync_32;
+        unsigned int _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 8);
+        ff[0] = ff[0] + _shfl_xor_sync_33;
+        unsigned int _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 8);
+        lf[0] = lf[0] + _shfl_xor_sync_34;
+        unsigned int _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 8);
+        ff[1] = ff[1] + _shfl_xor_sync_35;
+        unsigned int _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 8);
+        lf[1] = lf[1] + _shfl_xor_sync_36;
+        unsigned int _shfl_xor_sync_37 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 8);
+        ff[2] = ff[2] + _shfl_xor_sync_37;
+        unsigned int _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 8);
+        lf[2] = lf[2] + _shfl_xor_sync_38;
+        unsigned int _shfl_xor_sync_39 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 8);
+        ff[3] = ff[3] + _shfl_xor_sync_39;
+        unsigned int _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 8);
+        lf[3] = lf[3] + _shfl_xor_sync_40;
+        unsigned int _shfl_xor_sync_41 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 16);
+        ff[0] = ff[0] + _shfl_xor_sync_41;
+        unsigned int _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 16);
+        lf[0] = lf[0] + _shfl_xor_sync_42;
+        unsigned int _shfl_xor_sync_43 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 16);
+        ff[1] = ff[1] + _shfl_xor_sync_43;
+        unsigned int _shfl_xor_sync_44 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 16);
+        lf[1] = lf[1] + _shfl_xor_sync_44;
+        unsigned int _shfl_xor_sync_45 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 16);
+        ff[2] = ff[2] + _shfl_xor_sync_45;
+        unsigned int _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 16);
+        lf[2] = lf[2] + _shfl_xor_sync_46;
+        unsigned int _shfl_xor_sync_47 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 16);
+        ff[3] = ff[3] + _shfl_xor_sync_47;
+        unsigned int _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 16);
+        lf[3] = lf[3] + _shfl_xor_sync_48;
+        if (lane >= 4) {
+            ff[0] = 0;
+            lf[0] = 0;
+            ff[1] = 0;
+            lf[1] = 0;
+            ff[2] = 0;
+            lf[2] = 0;
+            ff[3] = 0;
+            lf[3] = 0;
+        }
+        unsigned int local_10 = ff[0] + ff[1] + ff[2] + ff[3];
+        uint32_t _warp_scan_sum_49 = local_10;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(16));
+        unsigned int above_11 = _warp_scan_sum_49 - local_10;
+        unsigned int lo_local_12 = lf[0] + lf[1] + lf[2] + lf[3];
+        uint32_t _warp_scan_sum_50 = lo_local_12;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(16));
+        unsigned int lo_above_13 = _warp_scan_sum_50 - lo_local_12;
+        unsigned int is_owner_14 = 0;
+        unsigned int pos_15 = 0;
+        unsigned int rem_after_16 = 0;
+        unsigned int cnt_17 = 0;
+        unsigned int lo_sel_18 = 0;
+        if (above_11 < rem_b && rem_b <= above_11 + local_10) {
+            is_owner_14 = 1;
+            unsigned int s3_1 = above_11 + ff[3];
+            unsigned int s2_1 = s3_1 + ff[2];
+            unsigned int s1_1 = s2_1 + ff[1];
+            if (rem_b <= s3_1) {
+                pos_15 = (unsigned int)(lane * 4 + 3);
+                rem_after_16 = rem_b - above_11;
+                cnt_17 = ff[3];
+                lo_sel_18 = lo_above_13;
+            } else if (rem_b <= s2_1) {
+                pos_15 = (unsigned int)(lane * 4 + 2);
+                rem_after_16 = rem_b - s3_1;
+                cnt_17 = ff[2];
+                lo_sel_18 = lo_above_13 + lf[3];
+            } else {
+                if (rem_b <= s1_1) {
+                    pos_15 = (unsigned int)(lane * 4 + 1);
+                    rem_after_16 = rem_b - s2_1;
+                    cnt_17 = ff[1];
+                    lo_sel_18 = lo_above_13 + lf[3] + lf[2];
+                } else {
+                    pos_15 = (unsigned int)(lane * 4);
+                    rem_after_16 = rem_b - s1_1;
+                    cnt_17 = ff[0];
+                    lo_sel_18 = lo_above_13 + lf[3] + lf[2] + lf[1];
+                }
+            }
+        }
+        unsigned int owner_19;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_19) : "r"(((is_owner_14 != 0) ? (unsigned int)lane : 0)));
+        unsigned int found_20;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_20) : "r"(is_owner_14));
+        unsigned int pos_b_21 = __shfl_sync(0xFFFFFFFF, pos_15, owner_19);
+        unsigned int rem_b_22 = __shfl_sync(0xFFFFFFFF, rem_after_16, owner_19);
+        unsigned int cnt_b_23 = __shfl_sync(0xFFFFFFFF, cnt_17, owner_19);
+        unsigned int lo_b_24 = __shfl_sync(0xFFFFFFFF, lo_sel_18, owner_19);
+        if (lane == 0) {
+            scal[0] = pos_b * 16 + pos_b_21;
+            scal[1] = rem_b_22;
+            scal[2] = cnt_b_23;
+            scal[5] = lo_b + lo_b_24;
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel = scal[0];
+    unsigned int remaining = scal[1];
+    unsigned int cnt_sel = scal[2];
+    unsigned int fuse_small = 0;
+    unsigned int fuse_block = 0;
+    if ((launch_flags & 9) != 0 && k <= 64) {
+        fuse_small = 1;
+    }
+    unsigned int fuse_on = fuse_small | fuse_block;
+    if (cnt_sel <= 2048) {
+        unsigned int v = 0;
+        if (tid == 0) {
+            v = scal[5];
+        }
+        unsigned int lo_above_1 = v;
+        bool is_cand[40];
+        unsigned int keys_c[40];
+        unsigned int ncand = 0;
+        unsigned int bits_1 = __as_u32(vals[0]);
+        unsigned int key_2 = ((bits_1 <= 2139095040) ? bits_1 : 0);
+        keys_c[0] = key_2;
+        int i_11 = base_t;
+        int ij = i_11;
+        is_cand[0] = keys_c[0] >> 21 == bucket_sel && ij < vocab;
+        ncand = ncand + ((is_cand[0]) ? 1 : 0);
+        unsigned int bits_4 = __as_u32(vals[1]);
+        unsigned int key_5 = ((bits_4 <= 2139095040) ? bits_4 : 0);
+        keys_c[1] = key_5;
+        int i_6_2 = base_t + 1;
+        int ij_7 = i_6_2;
+        is_cand[1] = keys_c[1] >> 21 == bucket_sel && ij_7 < vocab;
+        ncand = ncand + ((is_cand[1]) ? 1 : 0);
+        unsigned int bits_8 = __as_u32(vals[2]);
+        unsigned int key_9 = ((bits_8 <= 2139095040) ? bits_8 : 0);
+        keys_c[2] = key_9;
+        int i_10_1 = base_t + 2;
+        int ij_11 = i_10_1;
+        is_cand[2] = keys_c[2] >> 21 == bucket_sel && ij_11 < vocab;
+        ncand = ncand + ((is_cand[2]) ? 1 : 0);
+        unsigned int bits_13 = __as_u32(vals[3]);
+        unsigned int key_14 = ((bits_13 <= 2139095040) ? bits_13 : 0);
+        keys_c[3] = key_14;
+        int i_15 = base_t + 3;
+        int ij_16 = i_15;
+        is_cand[3] = keys_c[3] >> 21 == bucket_sel && ij_16 < vocab;
+        ncand = ncand + ((is_cand[3]) ? 1 : 0);
+        unsigned int bits_17 = __as_u32(vals[4]);
+        unsigned int key_18 = ((bits_17 <= 2139095040) ? bits_17 : 0);
+        keys_c[4] = key_18;
+        int i_19 = base_t + 2048;
+        int ij_20 = i_19;
+        is_cand[4] = keys_c[4] >> 21 == bucket_sel && ij_20 < vocab;
+        ncand = ncand + ((is_cand[4]) ? 1 : 0);
+        unsigned int bits_22 = __as_u32(vals[5]);
+        unsigned int key_23 = ((bits_22 <= 2139095040) ? bits_22 : 0);
+        keys_c[5] = key_23;
+        int i_24 = base_t + 2049;
+        int ij_25 = i_24;
+        is_cand[5] = keys_c[5] >> 21 == bucket_sel && ij_25 < vocab;
+        ncand = ncand + ((is_cand[5]) ? 1 : 0);
+        unsigned int bits_26 = __as_u32(vals[6]);
+        unsigned int key_27 = ((bits_26 <= 2139095040) ? bits_26 : 0);
+        keys_c[6] = key_27;
+        int i_28 = base_t + 2050;
+        int ij_29 = i_28;
+        is_cand[6] = keys_c[6] >> 21 == bucket_sel && ij_29 < vocab;
+        ncand = ncand + ((is_cand[6]) ? 1 : 0);
+        unsigned int bits_31 = __as_u32(vals[7]);
+        unsigned int key_32 = ((bits_31 <= 2139095040) ? bits_31 : 0);
+        keys_c[7] = key_32;
+        int i_33 = base_t + 2051;
+        int ij_34 = i_33;
+        is_cand[7] = keys_c[7] >> 21 == bucket_sel && ij_34 < vocab;
+        ncand = ncand + ((is_cand[7]) ? 1 : 0);
+        unsigned int bits_35 = __as_u32(vals[8]);
+        unsigned int key_36 = ((bits_35 <= 2139095040) ? bits_35 : 0);
+        keys_c[8] = key_36;
+        int i_37 = base_t + 4096;
+        int ij_38 = i_37;
+        is_cand[8] = keys_c[8] >> 21 == bucket_sel && ij_38 < vocab;
+        ncand = ncand + ((is_cand[8]) ? 1 : 0);
+        unsigned int bits_40 = __as_u32(vals[9]);
+        unsigned int key_41 = ((bits_40 <= 2139095040) ? bits_40 : 0);
+        keys_c[9] = key_41;
+        int i_42 = base_t + 4097;
+        int ij_43 = i_42;
+        is_cand[9] = keys_c[9] >> 21 == bucket_sel && ij_43 < vocab;
+        ncand = ncand + ((is_cand[9]) ? 1 : 0);
+        unsigned int bits_44 = __as_u32(vals[10]);
+        unsigned int key_45 = ((bits_44 <= 2139095040) ? bits_44 : 0);
+        keys_c[10] = key_45;
+        int i_46 = base_t + 4098;
+        int ij_47 = i_46;
+        is_cand[10] = keys_c[10] >> 21 == bucket_sel && ij_47 < vocab;
+        ncand = ncand + ((is_cand[10]) ? 1 : 0);
+        unsigned int bits_49 = __as_u32(vals[11]);
+        unsigned int key_50 = ((bits_49 <= 2139095040) ? bits_49 : 0);
+        keys_c[11] = key_50;
+        int i_51 = base_t + 4099;
+        int ij_52 = i_51;
+        is_cand[11] = keys_c[11] >> 21 == bucket_sel && ij_52 < vocab;
+        ncand = ncand + ((is_cand[11]) ? 1 : 0);
+        unsigned int bits_53 = __as_u32(vals[12]);
+        unsigned int key_54 = ((bits_53 <= 2139095040) ? bits_53 : 0);
+        keys_c[12] = key_54;
+        int i_55 = base_t + 6144;
+        int ij_56 = i_55;
+        is_cand[12] = keys_c[12] >> 21 == bucket_sel && ij_56 < vocab;
+        ncand = ncand + ((is_cand[12]) ? 1 : 0);
+        unsigned int bits_58 = __as_u32(vals[13]);
+        unsigned int key_59 = ((bits_58 <= 2139095040) ? bits_58 : 0);
+        keys_c[13] = key_59;
+        int i_60 = base_t + 6145;
+        int ij_61 = i_60;
+        is_cand[13] = keys_c[13] >> 21 == bucket_sel && ij_61 < vocab;
+        ncand = ncand + ((is_cand[13]) ? 1 : 0);
+        unsigned int bits_62 = __as_u32(vals[14]);
+        unsigned int key_63 = ((bits_62 <= 2139095040) ? bits_62 : 0);
+        keys_c[14] = key_63;
+        int i_64 = base_t + 6146;
+        int ij_65 = i_64;
+        is_cand[14] = keys_c[14] >> 21 == bucket_sel && ij_65 < vocab;
+        ncand = ncand + ((is_cand[14]) ? 1 : 0);
+        unsigned int bits_67 = __as_u32(vals[15]);
+        unsigned int key_68 = ((bits_67 <= 2139095040) ? bits_67 : 0);
+        keys_c[15] = key_68;
+        int i_69 = base_t + 6147;
+        int ij_70 = i_69;
+        is_cand[15] = keys_c[15] >> 21 == bucket_sel && ij_70 < vocab;
+        ncand = ncand + ((is_cand[15]) ? 1 : 0);
+        unsigned int bits_71 = __as_u32(vals[16]);
+        unsigned int key_72 = ((bits_71 <= 2139095040) ? bits_71 : 0);
+        keys_c[16] = key_72;
+        int i_73 = base_t + 8192;
+        int ij_74 = i_73;
+        is_cand[16] = keys_c[16] >> 21 == bucket_sel && ij_74 < vocab;
+        ncand = ncand + ((is_cand[16]) ? 1 : 0);
+        unsigned int bits_76 = __as_u32(vals[17]);
+        unsigned int key_77 = ((bits_76 <= 2139095040) ? bits_76 : 0);
+        keys_c[17] = key_77;
+        int i_78 = base_t + 8193;
+        int ij_79 = i_78;
+        is_cand[17] = keys_c[17] >> 21 == bucket_sel && ij_79 < vocab;
+        ncand = ncand + ((is_cand[17]) ? 1 : 0);
+        unsigned int bits_80 = __as_u32(vals[18]);
+        unsigned int key_81 = ((bits_80 <= 2139095040) ? bits_80 : 0);
+        keys_c[18] = key_81;
+        int i_82 = base_t + 8194;
+        int ij_83 = i_82;
+        is_cand[18] = keys_c[18] >> 21 == bucket_sel && ij_83 < vocab;
+        ncand = ncand + ((is_cand[18]) ? 1 : 0);
+        unsigned int bits_85 = __as_u32(vals[19]);
+        unsigned int key_86 = ((bits_85 <= 2139095040) ? bits_85 : 0);
+        keys_c[19] = key_86;
+        int i_87 = base_t + 8195;
+        int ij_88 = i_87;
+        is_cand[19] = keys_c[19] >> 21 == bucket_sel && ij_88 < vocab;
+        ncand = ncand + ((is_cand[19]) ? 1 : 0);
+        unsigned int bits_89 = __as_u32(vals[20]);
+        unsigned int key_90 = ((bits_89 <= 2139095040) ? bits_89 : 0);
+        keys_c[20] = key_90;
+        int i_91 = base_t + 10240;
+        int ij_92 = i_91;
+        is_cand[20] = keys_c[20] >> 21 == bucket_sel && ij_92 < vocab;
+        ncand = ncand + ((is_cand[20]) ? 1 : 0);
+        unsigned int bits_94 = __as_u32(vals[21]);
+        unsigned int key_95 = ((bits_94 <= 2139095040) ? bits_94 : 0);
+        keys_c[21] = key_95;
+        int i_96 = base_t + 10241;
+        int ij_97 = i_96;
+        is_cand[21] = keys_c[21] >> 21 == bucket_sel && ij_97 < vocab;
+        ncand = ncand + ((is_cand[21]) ? 1 : 0);
+        unsigned int bits_98 = __as_u32(vals[22]);
+        unsigned int key_99 = ((bits_98 <= 2139095040) ? bits_98 : 0);
+        keys_c[22] = key_99;
+        int i_100 = base_t + 10242;
+        int ij_101 = i_100;
+        is_cand[22] = keys_c[22] >> 21 == bucket_sel && ij_101 < vocab;
+        ncand = ncand + ((is_cand[22]) ? 1 : 0);
+        unsigned int bits_103 = __as_u32(vals[23]);
+        unsigned int key_104 = ((bits_103 <= 2139095040) ? bits_103 : 0);
+        keys_c[23] = key_104;
+        int i_105 = base_t + 10243;
+        int ij_106 = i_105;
+        is_cand[23] = keys_c[23] >> 21 == bucket_sel && ij_106 < vocab;
+        ncand = ncand + ((is_cand[23]) ? 1 : 0);
+        unsigned int bits_107 = __as_u32(vals[24]);
+        unsigned int key_108 = ((bits_107 <= 2139095040) ? bits_107 : 0);
+        keys_c[24] = key_108;
+        int i_109 = base_t + 12288;
+        int ij_110 = i_109;
+        is_cand[24] = keys_c[24] >> 21 == bucket_sel && ij_110 < vocab;
+        ncand = ncand + ((is_cand[24]) ? 1 : 0);
+        unsigned int bits_112 = __as_u32(vals[25]);
+        unsigned int key_113 = ((bits_112 <= 2139095040) ? bits_112 : 0);
+        keys_c[25] = key_113;
+        int i_114 = base_t + 12289;
+        int ij_115 = i_114;
+        is_cand[25] = keys_c[25] >> 21 == bucket_sel && ij_115 < vocab;
+        ncand = ncand + ((is_cand[25]) ? 1 : 0);
+        unsigned int bits_116 = __as_u32(vals[26]);
+        unsigned int key_117 = ((bits_116 <= 2139095040) ? bits_116 : 0);
+        keys_c[26] = key_117;
+        int i_118 = base_t + 12290;
+        int ij_119 = i_118;
+        is_cand[26] = keys_c[26] >> 21 == bucket_sel && ij_119 < vocab;
+        ncand = ncand + ((is_cand[26]) ? 1 : 0);
+        unsigned int bits_120 = __as_u32(vals[27]);
+        unsigned int key_121 = ((bits_120 <= 2139095040) ? bits_120 : 0);
+        keys_c[27] = key_121;
+        int i_122 = base_t + 12291;
+        int ij_123 = i_122;
+        is_cand[27] = keys_c[27] >> 21 == bucket_sel && ij_123 < vocab;
+        ncand = ncand + ((is_cand[27]) ? 1 : 0);
+        unsigned int bits_124 = __as_u32(vals[28]);
+        unsigned int key_125 = ((bits_124 <= 2139095040) ? bits_124 : 0);
+        keys_c[28] = key_125;
+        int i_126 = base_t + 14336;
+        int ij_127 = i_126;
+        is_cand[28] = keys_c[28] >> 21 == bucket_sel && ij_127 < vocab;
+        ncand = ncand + ((is_cand[28]) ? 1 : 0);
+        unsigned int bits_128 = __as_u32(vals[29]);
+        unsigned int key_129 = ((bits_128 <= 2139095040) ? bits_128 : 0);
+        keys_c[29] = key_129;
+        int i_130 = base_t + 14337;
+        int ij_131 = i_130;
+        is_cand[29] = keys_c[29] >> 21 == bucket_sel && ij_131 < vocab;
+        ncand = ncand + ((is_cand[29]) ? 1 : 0);
+        unsigned int bits_132 = __as_u32(vals[30]);
+        unsigned int key_133 = ((bits_132 <= 2139095040) ? bits_132 : 0);
+        keys_c[30] = key_133;
+        int i_134 = base_t + 14338;
+        int ij_135 = i_134;
+        is_cand[30] = keys_c[30] >> 21 == bucket_sel && ij_135 < vocab;
+        ncand = ncand + ((is_cand[30]) ? 1 : 0);
+        unsigned int bits_136 = __as_u32(vals[31]);
+        unsigned int key_137 = ((bits_136 <= 2139095040) ? bits_136 : 0);
+        keys_c[31] = key_137;
+        int i_138 = base_t + 14339;
+        int ij_139 = i_138;
+        is_cand[31] = keys_c[31] >> 21 == bucket_sel && ij_139 < vocab;
+        ncand = ncand + ((is_cand[31]) ? 1 : 0);
+        unsigned int bits_140 = __as_u32(vals[32]);
+        unsigned int key_141 = ((bits_140 <= 2139095040) ? bits_140 : 0);
+        keys_c[32] = key_141;
+        int i_142 = base_t + 16384;
+        int ij_143 = i_142;
+        is_cand[32] = keys_c[32] >> 21 == bucket_sel && ij_143 < vocab;
+        ncand = ncand + ((is_cand[32]) ? 1 : 0);
+        unsigned int bits_144 = __as_u32(vals[33]);
+        unsigned int key_145 = ((bits_144 <= 2139095040) ? bits_144 : 0);
+        keys_c[33] = key_145;
+        int i_146 = base_t + 16385;
+        int ij_147 = i_146;
+        is_cand[33] = keys_c[33] >> 21 == bucket_sel && ij_147 < vocab;
+        ncand = ncand + ((is_cand[33]) ? 1 : 0);
+        unsigned int bits_148 = __as_u32(vals[34]);
+        unsigned int key_149 = ((bits_148 <= 2139095040) ? bits_148 : 0);
+        keys_c[34] = key_149;
+        int i_150 = base_t + 16386;
+        int ij_151 = i_150;
+        is_cand[34] = keys_c[34] >> 21 == bucket_sel && ij_151 < vocab;
+        ncand = ncand + ((is_cand[34]) ? 1 : 0);
+        unsigned int bits_152 = __as_u32(vals[35]);
+        unsigned int key_153 = ((bits_152 <= 2139095040) ? bits_152 : 0);
+        keys_c[35] = key_153;
+        int i_154 = base_t + 16387;
+        int ij_155 = i_154;
+        is_cand[35] = keys_c[35] >> 21 == bucket_sel && ij_155 < vocab;
+        ncand = ncand + ((is_cand[35]) ? 1 : 0);
+        unsigned int bits_156 = __as_u32(vals[36]);
+        unsigned int key_157 = ((bits_156 <= 2139095040) ? bits_156 : 0);
+        keys_c[36] = key_157;
+        int i_158 = base_t + 18432;
+        int ij_159 = i_158;
+        is_cand[36] = keys_c[36] >> 21 == bucket_sel && ij_159 < vocab;
+        ncand = ncand + ((is_cand[36]) ? 1 : 0);
+        unsigned int bits_160 = __as_u32(vals[37]);
+        unsigned int key_161 = ((bits_160 <= 2139095040) ? bits_160 : 0);
+        keys_c[37] = key_161;
+        int i_162 = base_t + 18433;
+        int ij_163 = i_162;
+        is_cand[37] = keys_c[37] >> 21 == bucket_sel && ij_163 < vocab;
+        ncand = ncand + ((is_cand[37]) ? 1 : 0);
+        unsigned int bits_164 = __as_u32(vals[38]);
+        unsigned int key_165 = ((bits_164 <= 2139095040) ? bits_164 : 0);
+        keys_c[38] = key_165;
+        int i_166 = base_t + 18434;
+        int ij_167 = i_166;
+        is_cand[38] = keys_c[38] >> 21 == bucket_sel && ij_167 < vocab;
+        ncand = ncand + ((is_cand[38]) ? 1 : 0);
+        unsigned int bits_168 = __as_u32(vals[39]);
+        unsigned int key_169 = ((bits_168 <= 2139095040) ? bits_168 : 0);
+        keys_c[39] = key_169;
+        int i_170 = base_t + 18435;
+        int ij_171 = i_170;
+        is_cand[39] = keys_c[39] >> 21 == bucket_sel && ij_171 < vocab;
+        ncand = ncand + ((is_cand[39]) ? 1 : 0);
+        unsigned int ncand_172 = ncand;
+        uint32_t incl = ncand_172;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        unsigned int before = 0;
+        unsigned int total = 0;
+        unsigned int ws = warp_sums[0];
+        total = total + ws;
+        if (warp > 0) {
+            before = before + ws;
+        }
+        unsigned int ws_173 = warp_sums[1];
+        total = total + ws_173;
+        if (warp > 1) {
+            before = before + ws_173;
+        }
+        unsigned int ws_174 = warp_sums[2];
+        total = total + ws_174;
+        if (warp > 2) {
+            before = before + ws_174;
+        }
+        unsigned int ws_175 = warp_sums[3];
+        total = total + ws_175;
+        if (warp > 3) {
+            before = before + ws_175;
+        }
+        unsigned int ws_176 = warp_sums[4];
+        total = total + ws_176;
+        if (warp > 4) {
+            before = before + ws_176;
+        }
+        unsigned int ws_177 = warp_sums[5];
+        total = total + ws_177;
+        if (warp > 5) {
+            before = before + ws_177;
+        }
+        unsigned int ws_178 = warp_sums[6];
+        total = total + ws_178;
+        if (warp > 6) {
+            before = before + ws_178;
+        }
+        unsigned int ws_179 = warp_sums[7];
+        total = total + ws_179;
+        if (warp > 7) {
+            before = before + ws_179;
+        }
+        unsigned int ws_180 = warp_sums[8];
+        total = total + ws_180;
+        if (warp > 8) {
+            before = before + ws_180;
+        }
+        unsigned int ws_181 = warp_sums[9];
+        total = total + ws_181;
+        if (warp > 9) {
+            before = before + ws_181;
+        }
+        unsigned int ws_182 = warp_sums[10];
+        total = total + ws_182;
+        if (warp > 10) {
+            before = before + ws_182;
+        }
+        unsigned int ws_183 = warp_sums[11];
+        total = total + ws_183;
+        if (warp > 11) {
+            before = before + ws_183;
+        }
+        unsigned int ws_184 = warp_sums[12];
+        total = total + ws_184;
+        if (warp > 12) {
+            before = before + ws_184;
+        }
+        unsigned int ws_185 = warp_sums[13];
+        total = total + ws_185;
+        if (warp > 13) {
+            before = before + ws_185;
+        }
+        unsigned int ws_186 = warp_sums[14];
+        total = total + ws_186;
+        if (warp > 14) {
+            before = before + ws_186;
+        }
+        unsigned int ws_187 = warp_sums[15];
+        total = total + ws_187;
+        if (warp > 15) {
+            before = before + ws_187;
+        }
+        unsigned int excl = before + incl - ncand_172;
+        __syncthreads();
+        unsigned int slot = excl;
+        if (is_cand[0]) {
+            int i_0_2 = base_t;
+            int ij_1 = i_0_2;
+            clist[slot * 2] = keys_c[0];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1;
+            slot = slot + 1;
+        }
+        if (is_cand[1]) {
+            int i_0_3 = base_t + 1;
+            int ij_1_1 = i_0_3;
+            clist[slot * 2] = keys_c[1];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_1;
+            slot = slot + 1;
+        }
+        if (is_cand[2]) {
+            int i_0_4 = base_t + 2;
+            int ij_1_2 = i_0_4;
+            clist[slot * 2] = keys_c[2];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_2;
+            slot = slot + 1;
+        }
+        if (is_cand[3]) {
+            int i_0_5 = base_t + 3;
+            int ij_1_3 = i_0_5;
+            clist[slot * 2] = keys_c[3];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_3;
+            slot = slot + 1;
+        }
+        if (is_cand[4]) {
+            int i_0_6 = base_t + 2048;
+            int ij_1_4 = i_0_6;
+            clist[slot * 2] = keys_c[4];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_4;
+            slot = slot + 1;
+        }
+        if (is_cand[5]) {
+            int i_0_7 = base_t + 2049;
+            int ij_1_5 = i_0_7;
+            clist[slot * 2] = keys_c[5];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_5;
+            slot = slot + 1;
+        }
+        if (is_cand[6]) {
+            int i_0_8 = base_t + 2050;
+            int ij_1_6 = i_0_8;
+            clist[slot * 2] = keys_c[6];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_6;
+            slot = slot + 1;
+        }
+        if (is_cand[7]) {
+            int i_0_9 = base_t + 2051;
+            int ij_1_7 = i_0_9;
+            clist[slot * 2] = keys_c[7];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_7;
+            slot = slot + 1;
+        }
+        if (is_cand[8]) {
+            int i_0_10 = base_t + 4096;
+            int ij_1_8 = i_0_10;
+            clist[slot * 2] = keys_c[8];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_8;
+            slot = slot + 1;
+        }
+        if (is_cand[9]) {
+            int i_0_11 = base_t + 4097;
+            int ij_1_9 = i_0_11;
+            clist[slot * 2] = keys_c[9];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_9;
+            slot = slot + 1;
+        }
+        if (is_cand[10]) {
+            int i_0_12 = base_t + 4098;
+            int ij_1_10 = i_0_12;
+            clist[slot * 2] = keys_c[10];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_10;
+            slot = slot + 1;
+        }
+        if (is_cand[11]) {
+            int i_0_13 = base_t + 4099;
+            int ij_1_11 = i_0_13;
+            clist[slot * 2] = keys_c[11];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_11;
+            slot = slot + 1;
+        }
+        if (is_cand[12]) {
+            int i_0_14 = base_t + 6144;
+            int ij_1_12 = i_0_14;
+            clist[slot * 2] = keys_c[12];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_12;
+            slot = slot + 1;
+        }
+        if (is_cand[13]) {
+            int i_0_15 = base_t + 6145;
+            int ij_1_13 = i_0_15;
+            clist[slot * 2] = keys_c[13];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_13;
+            slot = slot + 1;
+        }
+        if (is_cand[14]) {
+            int i_0_16 = base_t + 6146;
+            int ij_1_14 = i_0_16;
+            clist[slot * 2] = keys_c[14];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_14;
+            slot = slot + 1;
+        }
+        if (is_cand[15]) {
+            int i_0_17 = base_t + 6147;
+            int ij_1_15 = i_0_17;
+            clist[slot * 2] = keys_c[15];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_15;
+            slot = slot + 1;
+        }
+        if (is_cand[16]) {
+            int i_0_18 = base_t + 8192;
+            int ij_1_16 = i_0_18;
+            clist[slot * 2] = keys_c[16];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_16;
+            slot = slot + 1;
+        }
+        if (is_cand[17]) {
+            int i_0_19 = base_t + 8193;
+            int ij_1_17 = i_0_19;
+            clist[slot * 2] = keys_c[17];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_17;
+            slot = slot + 1;
+        }
+        if (is_cand[18]) {
+            int i_0_20 = base_t + 8194;
+            int ij_1_18 = i_0_20;
+            clist[slot * 2] = keys_c[18];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_18;
+            slot = slot + 1;
+        }
+        if (is_cand[19]) {
+            int i_0_21 = base_t + 8195;
+            int ij_1_19 = i_0_21;
+            clist[slot * 2] = keys_c[19];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_19;
+            slot = slot + 1;
+        }
+        if (is_cand[20]) {
+            int i_0_22 = base_t + 10240;
+            int ij_1_20 = i_0_22;
+            clist[slot * 2] = keys_c[20];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_20;
+            slot = slot + 1;
+        }
+        if (is_cand[21]) {
+            int i_0_23 = base_t + 10241;
+            int ij_1_21 = i_0_23;
+            clist[slot * 2] = keys_c[21];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_21;
+            slot = slot + 1;
+        }
+        if (is_cand[22]) {
+            int i_0_24 = base_t + 10242;
+            int ij_1_22 = i_0_24;
+            clist[slot * 2] = keys_c[22];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_22;
+            slot = slot + 1;
+        }
+        if (is_cand[23]) {
+            int i_0_25 = base_t + 10243;
+            int ij_1_23 = i_0_25;
+            clist[slot * 2] = keys_c[23];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_23;
+            slot = slot + 1;
+        }
+        if (is_cand[24]) {
+            int i_0_26 = base_t + 12288;
+            int ij_1_24 = i_0_26;
+            clist[slot * 2] = keys_c[24];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_24;
+            slot = slot + 1;
+        }
+        if (is_cand[25]) {
+            int i_0_27 = base_t + 12289;
+            int ij_1_25 = i_0_27;
+            clist[slot * 2] = keys_c[25];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_25;
+            slot = slot + 1;
+        }
+        if (is_cand[26]) {
+            int i_0_28 = base_t + 12290;
+            int ij_1_26 = i_0_28;
+            clist[slot * 2] = keys_c[26];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_26;
+            slot = slot + 1;
+        }
+        if (is_cand[27]) {
+            int i_0_29 = base_t + 12291;
+            int ij_1_27 = i_0_29;
+            clist[slot * 2] = keys_c[27];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_27;
+            slot = slot + 1;
+        }
+        if (is_cand[28]) {
+            int i_0_30 = base_t + 14336;
+            int ij_1_28 = i_0_30;
+            clist[slot * 2] = keys_c[28];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_28;
+            slot = slot + 1;
+        }
+        if (is_cand[29]) {
+            int i_0_31 = base_t + 14337;
+            int ij_1_29 = i_0_31;
+            clist[slot * 2] = keys_c[29];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_29;
+            slot = slot + 1;
+        }
+        if (is_cand[30]) {
+            int i_0_32 = base_t + 14338;
+            int ij_1_30 = i_0_32;
+            clist[slot * 2] = keys_c[30];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_30;
+            slot = slot + 1;
+        }
+        if (is_cand[31]) {
+            int i_0_33 = base_t + 14339;
+            int ij_1_31 = i_0_33;
+            clist[slot * 2] = keys_c[31];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_31;
+            slot = slot + 1;
+        }
+        if (is_cand[32]) {
+            int i_0_34 = base_t + 16384;
+            int ij_1_32 = i_0_34;
+            clist[slot * 2] = keys_c[32];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_32;
+            slot = slot + 1;
+        }
+        if (is_cand[33]) {
+            int i_0_35 = base_t + 16385;
+            int ij_1_33 = i_0_35;
+            clist[slot * 2] = keys_c[33];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_33;
+            slot = slot + 1;
+        }
+        if (is_cand[34]) {
+            int i_0_36 = base_t + 16386;
+            int ij_1_34 = i_0_36;
+            clist[slot * 2] = keys_c[34];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_34;
+            slot = slot + 1;
+        }
+        if (is_cand[35]) {
+            int i_0_37 = base_t + 16387;
+            int ij_1_35 = i_0_37;
+            clist[slot * 2] = keys_c[35];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_35;
+            slot = slot + 1;
+        }
+        if (is_cand[36]) {
+            int i_0_38 = base_t + 18432;
+            int ij_1_36 = i_0_38;
+            clist[slot * 2] = keys_c[36];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_36;
+            slot = slot + 1;
+        }
+        if (is_cand[37]) {
+            int i_0_39 = base_t + 18433;
+            int ij_1_37 = i_0_39;
+            clist[slot * 2] = keys_c[37];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_37;
+            slot = slot + 1;
+        }
+        if (is_cand[38]) {
+            int i_0_40 = base_t + 18434;
+            int ij_1_38 = i_0_40;
+            clist[slot * 2] = keys_c[38];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_38;
+            slot = slot + 1;
+        }
+        if (is_cand[39]) {
+            int i_0_41 = base_t + 18435;
+            int ij_1_39 = i_0_41;
+            clist[slot * 2] = keys_c[39];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_39;
+            slot = slot + 1;
+        }
+        if (tid == 0) {
+            scal[3] = total;
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int lens[8];
+        unsigned long long comps[4];
+        unsigned int total_c = 0;
+        uint32_t _mapa_0;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_0) : "r"(scal_addr + 12), "r"(0));
+        unsigned int cluster_value[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value[0])) : "r"(_mapa_0) : "memory");
+        lens[0] = cluster_value[0];
+        total_c = total_c + lens[0];
+        uint32_t _mapa_1;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_1) : "r"(scal_addr + 12), "r"(1));
+        unsigned int cluster_value_188[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_188[0])) : "r"(_mapa_1) : "memory");
+        lens[1] = cluster_value_188[0];
+        total_c = total_c + lens[1];
+        uint32_t _mapa_2;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_2) : "r"(scal_addr + 12), "r"(2));
+        unsigned int cluster_value_189[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_189[0])) : "r"(_mapa_2) : "memory");
+        lens[2] = cluster_value_189[0];
+        total_c = total_c + lens[2];
+        uint32_t _mapa_3;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_3) : "r"(scal_addr + 12), "r"(3));
+        unsigned int cluster_value_190[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_190[0])) : "r"(_mapa_3) : "memory");
+        lens[3] = cluster_value_190[0];
+        total_c = total_c + lens[3];
+        uint32_t _mapa_4;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_4) : "r"(scal_addr + 12), "r"(4));
+        unsigned int cluster_value_191[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_191[0])) : "r"(_mapa_4) : "memory");
+        lens[4] = cluster_value_191[0];
+        total_c = total_c + lens[4];
+        uint32_t _mapa_5;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_5) : "r"(scal_addr + 12), "r"(5));
+        unsigned int cluster_value_192[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_192[0])) : "r"(_mapa_5) : "memory");
+        lens[5] = cluster_value_192[0];
+        total_c = total_c + lens[5];
+        uint32_t _mapa_6;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_6) : "r"(scal_addr + 12), "r"(6));
+        unsigned int cluster_value_193[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_193[0])) : "r"(_mapa_6) : "memory");
+        lens[6] = cluster_value_193[0];
+        total_c = total_c + lens[6];
+        uint32_t _mapa_7;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_7) : "r"(scal_addr + 12), "r"(7));
+        unsigned int cluster_value_194[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_194[0])) : "r"(_mapa_7) : "memory");
+        lens[7] = cluster_value_194[0];
+        total_c = total_c + lens[7];
+        comps[0] = 9214364837600034816;
+        unsigned int g = (unsigned int)tid;
+        if (g < total_c) {
+            unsigned int acc = 0;
+            if (g >= acc && g < acc + lens[0]) {
+                unsigned int ls = g - acc;
+                unsigned int pair[2];
+                uint32_t _cluster_mapa_51;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_51) : "r"(clist_addr + ls * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair[(0) + 1]))
+                    : "r"(_cluster_mapa_51));
+                comps[0] = (unsigned long long)pair[0] << 32 | (unsigned long long)pair[1];
+            }
+            acc = acc + lens[0];
+            if (g >= acc && g < acc + lens[1]) {
+                unsigned int ls_1 = g - acc;
+                unsigned int pair_1[2];
+                uint32_t _cluster_mapa_52;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_52) : "r"(clist_addr + ls_1 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_1[(0) + 1]))
+                    : "r"(_cluster_mapa_52));
+                comps[0] = (unsigned long long)pair_1[0] << 32 | (unsigned long long)pair_1[1];
+            }
+            acc = acc + lens[1];
+            if (g >= acc && g < acc + lens[2]) {
+                unsigned int ls_2 = g - acc;
+                unsigned int pair_2[2];
+                uint32_t _cluster_mapa_53;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_53) : "r"(clist_addr + ls_2 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_2[(0) + 1]))
+                    : "r"(_cluster_mapa_53));
+                comps[0] = (unsigned long long)pair_2[0] << 32 | (unsigned long long)pair_2[1];
+            }
+            acc = acc + lens[2];
+            if (g >= acc && g < acc + lens[3]) {
+                unsigned int ls_3 = g - acc;
+                unsigned int pair_3[2];
+                uint32_t _cluster_mapa_54;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_54) : "r"(clist_addr + ls_3 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_3[(0) + 1]))
+                    : "r"(_cluster_mapa_54));
+                comps[0] = (unsigned long long)pair_3[0] << 32 | (unsigned long long)pair_3[1];
+            }
+            acc = acc + lens[3];
+            if (g >= acc && g < acc + lens[4]) {
+                unsigned int ls_4 = g - acc;
+                unsigned int pair_4[2];
+                uint32_t _cluster_mapa_55;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_55) : "r"(clist_addr + ls_4 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_4[(0) + 1]))
+                    : "r"(_cluster_mapa_55));
+                comps[0] = (unsigned long long)pair_4[0] << 32 | (unsigned long long)pair_4[1];
+            }
+            acc = acc + lens[4];
+            if (g >= acc && g < acc + lens[5]) {
+                unsigned int ls_5 = g - acc;
+                unsigned int pair_5[2];
+                uint32_t _cluster_mapa_56;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_56) : "r"(clist_addr + ls_5 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_5[(0) + 1]))
+                    : "r"(_cluster_mapa_56));
+                comps[0] = (unsigned long long)pair_5[0] << 32 | (unsigned long long)pair_5[1];
+            }
+            acc = acc + lens[5];
+            if (g >= acc && g < acc + lens[6]) {
+                unsigned int ls_6 = g - acc;
+                unsigned int pair_6[2];
+                uint32_t _cluster_mapa_57;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_57) : "r"(clist_addr + ls_6 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_6[(0) + 1]))
+                    : "r"(_cluster_mapa_57));
+                comps[0] = (unsigned long long)pair_6[0] << 32 | (unsigned long long)pair_6[1];
+            }
+            acc = acc + lens[6];
+            if (g >= acc && g < acc + lens[7]) {
+                unsigned int ls_7 = g - acc;
+                unsigned int pair_7[2];
+                uint32_t _cluster_mapa_58;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_58) : "r"(clist_addr + ls_7 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_7[(0) + 1]))
+                    : "r"(_cluster_mapa_58));
+                comps[0] = (unsigned long long)pair_7[0] << 32 | (unsigned long long)pair_7[1];
+            }
+            acc = acc + lens[7];
+        }
+        comps[1] = 9214364837600034816;
+        unsigned int g_195 = (unsigned int)(tid + 512);
+        if (g_195 < total_c) {
+            unsigned int acc_1 = 0;
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[0]) {
+                unsigned int ls_8 = g_195 - acc_1;
+                unsigned int pair_8[2];
+                uint32_t _cluster_mapa_59;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_59) : "r"(clist_addr + ls_8 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_8[(0) + 1]))
+                    : "r"(_cluster_mapa_59));
+                comps[1] = (unsigned long long)pair_8[0] << 32 | (unsigned long long)pair_8[1];
+            }
+            acc_1 = acc_1 + lens[0];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[1]) {
+                unsigned int ls_9 = g_195 - acc_1;
+                unsigned int pair_9[2];
+                uint32_t _cluster_mapa_60;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_60) : "r"(clist_addr + ls_9 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_9[(0) + 1]))
+                    : "r"(_cluster_mapa_60));
+                comps[1] = (unsigned long long)pair_9[0] << 32 | (unsigned long long)pair_9[1];
+            }
+            acc_1 = acc_1 + lens[1];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[2]) {
+                unsigned int ls_10 = g_195 - acc_1;
+                unsigned int pair_10[2];
+                uint32_t _cluster_mapa_61;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_61) : "r"(clist_addr + ls_10 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_10[(0) + 1]))
+                    : "r"(_cluster_mapa_61));
+                comps[1] = (unsigned long long)pair_10[0] << 32 | (unsigned long long)pair_10[1];
+            }
+            acc_1 = acc_1 + lens[2];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[3]) {
+                unsigned int ls_11 = g_195 - acc_1;
+                unsigned int pair_11[2];
+                uint32_t _cluster_mapa_62;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_62) : "r"(clist_addr + ls_11 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_11[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_11[(0) + 1]))
+                    : "r"(_cluster_mapa_62));
+                comps[1] = (unsigned long long)pair_11[0] << 32 | (unsigned long long)pair_11[1];
+            }
+            acc_1 = acc_1 + lens[3];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[4]) {
+                unsigned int ls_12 = g_195 - acc_1;
+                unsigned int pair_12[2];
+                uint32_t _cluster_mapa_63;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_63) : "r"(clist_addr + ls_12 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_12[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_12[(0) + 1]))
+                    : "r"(_cluster_mapa_63));
+                comps[1] = (unsigned long long)pair_12[0] << 32 | (unsigned long long)pair_12[1];
+            }
+            acc_1 = acc_1 + lens[4];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[5]) {
+                unsigned int ls_13 = g_195 - acc_1;
+                unsigned int pair_13[2];
+                uint32_t _cluster_mapa_64;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_64) : "r"(clist_addr + ls_13 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_13[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_13[(0) + 1]))
+                    : "r"(_cluster_mapa_64));
+                comps[1] = (unsigned long long)pair_13[0] << 32 | (unsigned long long)pair_13[1];
+            }
+            acc_1 = acc_1 + lens[5];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[6]) {
+                unsigned int ls_14 = g_195 - acc_1;
+                unsigned int pair_14[2];
+                uint32_t _cluster_mapa_65;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_65) : "r"(clist_addr + ls_14 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_14[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_14[(0) + 1]))
+                    : "r"(_cluster_mapa_65));
+                comps[1] = (unsigned long long)pair_14[0] << 32 | (unsigned long long)pair_14[1];
+            }
+            acc_1 = acc_1 + lens[6];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[7]) {
+                unsigned int ls_15 = g_195 - acc_1;
+                unsigned int pair_15[2];
+                uint32_t _cluster_mapa_66;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_66) : "r"(clist_addr + ls_15 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_15[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_15[(0) + 1]))
+                    : "r"(_cluster_mapa_66));
+                comps[1] = (unsigned long long)pair_15[0] << 32 | (unsigned long long)pair_15[1];
+            }
+            acc_1 = acc_1 + lens[7];
+        }
+        comps[2] = 9214364837600034816;
+        unsigned int g_196 = (unsigned int)(tid + 1024);
+        if (g_196 < total_c) {
+            unsigned int acc_2 = 0;
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[0]) {
+                unsigned int ls_16 = g_196 - acc_2;
+                unsigned int pair_16[2];
+                uint32_t _cluster_mapa_67;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_67) : "r"(clist_addr + ls_16 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_16[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_16[(0) + 1]))
+                    : "r"(_cluster_mapa_67));
+                comps[2] = (unsigned long long)pair_16[0] << 32 | (unsigned long long)pair_16[1];
+            }
+            acc_2 = acc_2 + lens[0];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[1]) {
+                unsigned int ls_17 = g_196 - acc_2;
+                unsigned int pair_17[2];
+                uint32_t _cluster_mapa_68;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_68) : "r"(clist_addr + ls_17 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_17[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_17[(0) + 1]))
+                    : "r"(_cluster_mapa_68));
+                comps[2] = (unsigned long long)pair_17[0] << 32 | (unsigned long long)pair_17[1];
+            }
+            acc_2 = acc_2 + lens[1];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[2]) {
+                unsigned int ls_18 = g_196 - acc_2;
+                unsigned int pair_18[2];
+                uint32_t _cluster_mapa_69;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_69) : "r"(clist_addr + ls_18 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_18[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_18[(0) + 1]))
+                    : "r"(_cluster_mapa_69));
+                comps[2] = (unsigned long long)pair_18[0] << 32 | (unsigned long long)pair_18[1];
+            }
+            acc_2 = acc_2 + lens[2];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[3]) {
+                unsigned int ls_19 = g_196 - acc_2;
+                unsigned int pair_19[2];
+                uint32_t _cluster_mapa_70;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_70) : "r"(clist_addr + ls_19 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_19[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_19[(0) + 1]))
+                    : "r"(_cluster_mapa_70));
+                comps[2] = (unsigned long long)pair_19[0] << 32 | (unsigned long long)pair_19[1];
+            }
+            acc_2 = acc_2 + lens[3];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[4]) {
+                unsigned int ls_20 = g_196 - acc_2;
+                unsigned int pair_20[2];
+                uint32_t _cluster_mapa_71;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_71) : "r"(clist_addr + ls_20 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_20[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_20[(0) + 1]))
+                    : "r"(_cluster_mapa_71));
+                comps[2] = (unsigned long long)pair_20[0] << 32 | (unsigned long long)pair_20[1];
+            }
+            acc_2 = acc_2 + lens[4];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[5]) {
+                unsigned int ls_21 = g_196 - acc_2;
+                unsigned int pair_21[2];
+                uint32_t _cluster_mapa_72;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_72) : "r"(clist_addr + ls_21 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_21[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_21[(0) + 1]))
+                    : "r"(_cluster_mapa_72));
+                comps[2] = (unsigned long long)pair_21[0] << 32 | (unsigned long long)pair_21[1];
+            }
+            acc_2 = acc_2 + lens[5];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[6]) {
+                unsigned int ls_22 = g_196 - acc_2;
+                unsigned int pair_22[2];
+                uint32_t _cluster_mapa_73;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_73) : "r"(clist_addr + ls_22 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_22[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_22[(0) + 1]))
+                    : "r"(_cluster_mapa_73));
+                comps[2] = (unsigned long long)pair_22[0] << 32 | (unsigned long long)pair_22[1];
+            }
+            acc_2 = acc_2 + lens[6];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[7]) {
+                unsigned int ls_23 = g_196 - acc_2;
+                unsigned int pair_23[2];
+                uint32_t _cluster_mapa_74;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_74) : "r"(clist_addr + ls_23 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_23[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_23[(0) + 1]))
+                    : "r"(_cluster_mapa_74));
+                comps[2] = (unsigned long long)pair_23[0] << 32 | (unsigned long long)pair_23[1];
+            }
+            acc_2 = acc_2 + lens[7];
+        }
+        comps[3] = 9214364837600034816;
+        unsigned int g_197 = (unsigned int)(tid + 1536);
+        if (g_197 < total_c) {
+            unsigned int acc_3 = 0;
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[0]) {
+                unsigned int ls_24 = g_197 - acc_3;
+                unsigned int pair_24[2];
+                uint32_t _cluster_mapa_75;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_75) : "r"(clist_addr + ls_24 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_24[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_24[(0) + 1]))
+                    : "r"(_cluster_mapa_75));
+                comps[3] = (unsigned long long)pair_24[0] << 32 | (unsigned long long)pair_24[1];
+            }
+            acc_3 = acc_3 + lens[0];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[1]) {
+                unsigned int ls_25 = g_197 - acc_3;
+                unsigned int pair_25[2];
+                uint32_t _cluster_mapa_76;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_76) : "r"(clist_addr + ls_25 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_25[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_25[(0) + 1]))
+                    : "r"(_cluster_mapa_76));
+                comps[3] = (unsigned long long)pair_25[0] << 32 | (unsigned long long)pair_25[1];
+            }
+            acc_3 = acc_3 + lens[1];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[2]) {
+                unsigned int ls_26 = g_197 - acc_3;
+                unsigned int pair_26[2];
+                uint32_t _cluster_mapa_77;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_77) : "r"(clist_addr + ls_26 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_26[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_26[(0) + 1]))
+                    : "r"(_cluster_mapa_77));
+                comps[3] = (unsigned long long)pair_26[0] << 32 | (unsigned long long)pair_26[1];
+            }
+            acc_3 = acc_3 + lens[2];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[3]) {
+                unsigned int ls_27 = g_197 - acc_3;
+                unsigned int pair_27[2];
+                uint32_t _cluster_mapa_78;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_78) : "r"(clist_addr + ls_27 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_27[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_27[(0) + 1]))
+                    : "r"(_cluster_mapa_78));
+                comps[3] = (unsigned long long)pair_27[0] << 32 | (unsigned long long)pair_27[1];
+            }
+            acc_3 = acc_3 + lens[3];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[4]) {
+                unsigned int ls_28 = g_197 - acc_3;
+                unsigned int pair_28[2];
+                uint32_t _cluster_mapa_79;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_79) : "r"(clist_addr + ls_28 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_28[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_28[(0) + 1]))
+                    : "r"(_cluster_mapa_79));
+                comps[3] = (unsigned long long)pair_28[0] << 32 | (unsigned long long)pair_28[1];
+            }
+            acc_3 = acc_3 + lens[4];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[5]) {
+                unsigned int ls_29 = g_197 - acc_3;
+                unsigned int pair_29[2];
+                uint32_t _cluster_mapa_80;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_80) : "r"(clist_addr + ls_29 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_29[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_29[(0) + 1]))
+                    : "r"(_cluster_mapa_80));
+                comps[3] = (unsigned long long)pair_29[0] << 32 | (unsigned long long)pair_29[1];
+            }
+            acc_3 = acc_3 + lens[5];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[6]) {
+                unsigned int ls_30 = g_197 - acc_3;
+                unsigned int pair_30[2];
+                uint32_t _cluster_mapa_81;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_81) : "r"(clist_addr + ls_30 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_30[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_30[(0) + 1]))
+                    : "r"(_cluster_mapa_81));
+                comps[3] = (unsigned long long)pair_30[0] << 32 | (unsigned long long)pair_30[1];
+            }
+            acc_3 = acc_3 + lens[6];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[7]) {
+                unsigned int ls_31 = g_197 - acc_3;
+                unsigned int pair_31[2];
+                uint32_t _cluster_mapa_82;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_82) : "r"(clist_addr + ls_31 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_31[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_31[(0) + 1]))
+                    : "r"(_cluster_mapa_82));
+                comps[3] = (unsigned long long)pair_31[0] << 32 | (unsigned long long)pair_31[1];
+            }
+            acc_3 = acc_3 + lens[7];
+        }
+        unsigned int total_c_198 = total_c;
+        if (fuse_on == 0) {
+            asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        }
+        unsigned long long c = comps[0];
+        unsigned int bucket_199 = (unsigned int)(c >> 42 & 2047);
+        if (c >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_199], 1);
+        }
+        unsigned long long c_200 = comps[1];
+        unsigned int bucket_201 = (unsigned int)(c_200 >> 42 & 2047);
+        if (c_200 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_201], 1);
+        }
+        unsigned long long c_202 = comps[2];
+        unsigned int bucket_203 = (unsigned int)(c_202 >> 42 & 2047);
+        if (c_202 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_203], 1);
+        }
+        unsigned long long c_204 = comps[3];
+        unsigned int bucket_205 = (unsigned int)(c_204 >> 42 & 2047);
+        if (c_204 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_205], 1);
+        }
+        for (int i_1_2 = tid; i_1_2 < 2048; i_1_2 += 512) {
+            hist0[i_1_2] = 0;
+        }
+        __syncthreads();
+        unsigned int c0 = 0;
+        unsigned int c1 = 0;
+        unsigned int c2 = 0;
+        unsigned int c3 = 0;
+        c0 = hist1[tid * 4];
+        c1 = hist1[tid * 4 + 1];
+        c2 = hist1[tid * 4 + 2];
+        c3 = hist1[tid * 4 + 3];
+        unsigned int local_206 = c0 + c1 + c2 + c3;
+        uint32_t _warp_scan_sum_83 = local_206;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(16));
+        unsigned int lane_suffix = _warp_scan_sum_83 - local_206;
+        unsigned int warp_total;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total) : "r"(local_206));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total;
+        }
+        __syncthreads();
+        unsigned int peer = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_1 = ((lane > warp) ? peer : 0);
+        unsigned int warps_above;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above) : "r"(above_1));
+        unsigned int suffix = lane_suffix + warps_above;
+        bool hit = 0;
+        unsigned int bucket_207 = 0;
+        unsigned int rest = 0;
+        unsigned int count = 0;
+        if (suffix < remaining && remaining <= suffix + local_206) {
+            hit = 1;
+            unsigned int s3_2 = suffix + c3;
+            unsigned int s2_2 = s3_2 + c2;
+            unsigned int s1_2 = s2_2 + c1;
+            if (remaining <= s3_2) {
+                bucket_207 = (unsigned int)(tid * 4 + 3);
+                rest = remaining - suffix;
+                count = c3;
+            } else if (remaining <= s2_2) {
+                bucket_207 = (unsigned int)(tid * 4 + 2);
+                rest = remaining - s3_2;
+                count = c2;
+            } else {
+                if (remaining <= s1_2) {
+                    bucket_207 = (unsigned int)(tid * 4 + 1);
+                    rest = remaining - s2_2;
+                    count = c1;
+                } else {
+                    bucket_207 = (unsigned int)(tid * 4);
+                    rest = remaining - s1_2;
+                    count = c0;
+                }
+            }
+        }
+        if (hit) {
+            scal[0] = bucket_207;
+            scal[1] = rest;
+            scal[2] = count;
+        }
+        __syncthreads();
+        unsigned int bucket_208 = scal[0];
+        unsigned int rem = scal[1];
+        unsigned int cnt_209 = scal[2];
+        unsigned long long prefix1 = (unsigned long long)bucket_sel << 11 | (unsigned long long)bucket_208;
+        unsigned long long c_210 = comps[0];
+        unsigned int bucket_211 = (unsigned int)(c_210 >> 32 & 1023);
+        if (c_210 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_211], 1);
+        }
+        unsigned long long c_212 = comps[1];
+        unsigned int bucket_213 = (unsigned int)(c_212 >> 32 & 1023);
+        if (c_212 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_213], 1);
+        }
+        unsigned long long c_214 = comps[2];
+        unsigned int bucket_215 = (unsigned int)(c_214 >> 32 & 1023);
+        if (c_214 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_215], 1);
+        }
+        unsigned long long c_216 = comps[3];
+        unsigned int bucket_217 = (unsigned int)(c_216 >> 32 & 1023);
+        if (c_216 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_217], 1);
+        }
+        for (int i_1_3 = tid; i_1_3 < 2048; i_1_3 += 512) {
+            hist1[i_1_3] = 0;
+        }
+        __syncthreads();
+        unsigned int c0_218 = 0;
+        unsigned int c1_219 = 0;
+        unsigned int c2_220 = 0;
+        unsigned int c3_221 = 0;
+        c0_218 = hist0[tid * 4];
+        c1_219 = hist0[tid * 4 + 1];
+        c2_220 = hist0[tid * 4 + 2];
+        c3_221 = hist0[tid * 4 + 3];
+        unsigned int local_222 = c0_218 + c1_219 + c2_220 + c3_221;
+        uint32_t _warp_scan_sum_84 = local_222;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(16));
+        unsigned int lane_suffix_223 = _warp_scan_sum_84 - local_222;
+        unsigned int warp_total_224;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_224) : "r"(local_222));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_224;
+        }
+        __syncthreads();
+        unsigned int peer_225 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_226 = ((lane > warp) ? peer_225 : 0);
+        unsigned int warps_above_227;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_227) : "r"(above_226));
+        unsigned int suffix_228 = lane_suffix_223 + warps_above_227;
+        bool hit_229 = 0;
+        unsigned int bucket_230 = 0;
+        unsigned int rest_231 = 0;
+        unsigned int count_232 = 0;
+        if (suffix_228 < rem && rem <= suffix_228 + local_222) {
+            hit_229 = 1;
+            unsigned int s3_3 = suffix_228 + c3_221;
+            unsigned int s2_3 = s3_3 + c2_220;
+            unsigned int s1_3 = s2_3 + c1_219;
+            if (rem <= s3_3) {
+                bucket_230 = (unsigned int)(tid * 4 + 3);
+                rest_231 = rem - suffix_228;
+                count_232 = c3_221;
+            } else if (rem <= s2_3) {
+                bucket_230 = (unsigned int)(tid * 4 + 2);
+                rest_231 = rem - s3_3;
+                count_232 = c2_220;
+            } else {
+                if (rem <= s1_3) {
+                    bucket_230 = (unsigned int)(tid * 4 + 1);
+                    rest_231 = rem - s2_3;
+                    count_232 = c1_219;
+                } else {
+                    bucket_230 = (unsigned int)(tid * 4);
+                    rest_231 = rem - s1_3;
+                    count_232 = c0_218;
+                }
+            }
+        }
+        if (hit_229) {
+            scal[0] = bucket_230;
+            scal[1] = rest_231;
+            scal[2] = count_232;
+        }
+        __syncthreads();
+        unsigned int bucket_233 = scal[0];
+        unsigned int rem_234 = scal[1];
+        unsigned int cnt_235 = scal[2];
+        unsigned int threshold = (unsigned int)(prefix1 << 10 | (unsigned long long)bucket_233);
+        unsigned int nidx_min = 0;
+        if (cnt_235 != rem_234) {
+            unsigned long long tprefix = (unsigned long long)threshold << 11 | 2047;
+            unsigned long long c_0 = comps[0];
+            unsigned int bucket_1 = (unsigned int)(c_0 >> 10 & 2047);
+            if (c_0 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_1], 1);
+            }
+            unsigned long long c_2 = comps[1];
+            unsigned int bucket_3 = (unsigned int)(c_2 >> 10 & 2047);
+            if (c_2 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_3], 1);
+            }
+            unsigned long long c_4 = comps[2];
+            unsigned int bucket_6 = (unsigned int)(c_4 >> 10 & 2047);
+            if (c_4 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_6], 1);
+            }
+            unsigned long long c_7 = comps[3];
+            unsigned int bucket_9 = (unsigned int)(c_7 >> 10 & 2047);
+            if (c_7 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_9], 1);
+            }
+            for (int i_1_4 = tid; i_1_4 < 2048; i_1_4 += 512) {
+                hist0[i_1_4] = 0;
+            }
+            __syncthreads();
+            unsigned int c0_10 = 0;
+            unsigned int c1_11 = 0;
+            unsigned int c2_12 = 0;
+            unsigned int c3_13 = 0;
+            c0_10 = hist1[tid * 4];
+            c1_11 = hist1[tid * 4 + 1];
+            c2_12 = hist1[tid * 4 + 2];
+            c3_13 = hist1[tid * 4 + 3];
+            unsigned int local_14 = c0_10 + c1_11 + c2_12 + c3_13;
+            uint32_t _warp_scan_sum_85 = local_14;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(16));
+            unsigned int lane_suffix_15 = _warp_scan_sum_85 - local_14;
+            unsigned int warp_total_16;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_16) : "r"(local_14));
+            if (lane == 0) {
+                warp_sums[warp] = warp_total_16;
+            }
+            __syncthreads();
+            unsigned int peer_17 = ((lane < 16) ? warp_sums[lane] : 0);
+            unsigned int above_18 = ((lane > warp) ? peer_17 : 0);
+            unsigned int warps_above_19;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_19) : "r"(above_18));
+            unsigned int suffix_20 = lane_suffix_15 + warps_above_19;
+            bool hit_21 = 0;
+            unsigned int bucket_22 = 0;
+            unsigned int rest_23 = 0;
+            unsigned int count_24 = 0;
+            if (suffix_20 < rem_234 && rem_234 <= suffix_20 + local_14) {
+                hit_21 = 1;
+                unsigned int s3_4 = suffix_20 + c3_13;
+                unsigned int s2_4 = s3_4 + c2_12;
+                unsigned int s1_4 = s2_4 + c1_11;
+                if (rem_234 <= s3_4) {
+                    bucket_22 = (unsigned int)(tid * 4 + 3);
+                    rest_23 = rem_234 - suffix_20;
+                    count_24 = c3_13;
+                } else if (rem_234 <= s2_4) {
+                    bucket_22 = (unsigned int)(tid * 4 + 2);
+                    rest_23 = rem_234 - s3_4;
+                    count_24 = c2_12;
+                } else {
+                    if (rem_234 <= s1_4) {
+                        bucket_22 = (unsigned int)(tid * 4 + 1);
+                        rest_23 = rem_234 - s2_4;
+                        count_24 = c1_11;
+                    } else {
+                        bucket_22 = (unsigned int)(tid * 4);
+                        rest_23 = rem_234 - s1_4;
+                        count_24 = c0_10;
+                    }
+                }
+            }
+            if (hit_21) {
+                scal[0] = bucket_22;
+                scal[1] = rest_23;
+                scal[2] = count_24;
+            }
+            __syncthreads();
+            unsigned int bucket_25 = scal[0];
+            unsigned int rem_26 = scal[1];
+            unsigned int cnt_27 = scal[2];
+            unsigned long long tprefix2 = tprefix << 11 | (unsigned long long)bucket_25;
+            unsigned long long c_28 = comps[0];
+            unsigned int bucket_30 = (unsigned int)(c_28 & 1023);
+            if (c_28 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_30], 1);
+            }
+            unsigned long long c_31 = comps[1];
+            unsigned int bucket_33 = (unsigned int)(c_31 & 1023);
+            if (c_31 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_33], 1);
+            }
+            unsigned long long c_34 = comps[2];
+            unsigned int bucket_36 = (unsigned int)(c_34 & 1023);
+            if (c_34 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_36], 1);
+            }
+            unsigned long long c_37 = comps[3];
+            unsigned int bucket_39 = (unsigned int)(c_37 & 1023);
+            if (c_37 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_39], 1);
+            }
+            for (int i_1_5 = tid; i_1_5 < 2048; i_1_5 += 512) {
+                hist1[i_1_5] = 0;
+            }
+            __syncthreads();
+            unsigned int c0_40 = 0;
+            unsigned int c1_41 = 0;
+            unsigned int c2_42 = 0;
+            unsigned int c3_43 = 0;
+            c0_40 = hist0[tid * 4];
+            c1_41 = hist0[tid * 4 + 1];
+            c2_42 = hist0[tid * 4 + 2];
+            c3_43 = hist0[tid * 4 + 3];
+            unsigned int local_44 = c0_40 + c1_41 + c2_42 + c3_43;
+            uint32_t _warp_scan_sum_86 = local_44;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(16));
+            unsigned int lane_suffix_45 = _warp_scan_sum_86 - local_44;
+            unsigned int warp_total_46;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_46) : "r"(local_44));
+            if (lane == 0) {
+                warp_sums[warp] = warp_total_46;
+            }
+            __syncthreads();
+            unsigned int peer_47 = ((lane < 16) ? warp_sums[lane] : 0);
+            unsigned int above_48 = ((lane > warp) ? peer_47 : 0);
+            unsigned int warps_above_49;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_49) : "r"(above_48));
+            unsigned int suffix_50 = lane_suffix_45 + warps_above_49;
+            bool hit_51 = 0;
+            unsigned int bucket_52 = 0;
+            unsigned int rest_53 = 0;
+            unsigned int count_54 = 0;
+            if (suffix_50 < rem_26 && rem_26 <= suffix_50 + local_44) {
+                hit_51 = 1;
+                unsigned int s3_5 = suffix_50 + c3_43;
+                unsigned int s2_5 = s3_5 + c2_42;
+                unsigned int s1_5 = s2_5 + c1_41;
+                if (rem_26 <= s3_5) {
+                    bucket_52 = (unsigned int)(tid * 4 + 3);
+                    rest_53 = rem_26 - suffix_50;
+                    count_54 = c3_43;
+                } else if (rem_26 <= s2_5) {
+                    bucket_52 = (unsigned int)(tid * 4 + 2);
+                    rest_53 = rem_26 - s3_5;
+                    count_54 = c2_42;
+                } else {
+                    if (rem_26 <= s1_5) {
+                        bucket_52 = (unsigned int)(tid * 4 + 1);
+                        rest_53 = rem_26 - s2_5;
+                        count_54 = c1_41;
+                    } else {
+                        bucket_52 = (unsigned int)(tid * 4);
+                        rest_53 = rem_26 - s1_5;
+                        count_54 = c0_40;
+                    }
+                }
+            }
+            if (hit_51) {
+                scal[0] = bucket_52;
+                scal[1] = rest_53;
+                scal[2] = count_54;
+            }
+            __syncthreads();
+            unsigned int bucket_55 = scal[0];
+            unsigned int rem_56 = scal[1];
+            unsigned int cnt_57 = scal[2];
+            nidx_min = 4292870144u | bucket_25 << 10 | bucket_55;
+        }
+        bool sel[40];
+        unsigned long long tcomp = (unsigned long long)threshold << 32 | (unsigned long long)nidx_min;
+        unsigned long long nstart = (unsigned long long)~(unsigned int)start;
+        unsigned int cand_lo = 0;
+        unsigned long long cg = comps[0];
+        bool lo_sel_1 = cg >= tcomp && cg < 9214364837600034816 && nstart < (cg & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_1) ? 1 : 0);
+        unsigned long long cg_236 = comps[1];
+        bool lo_sel_237 = cg_236 >= tcomp && cg_236 < 9214364837600034816 && nstart < (cg_236 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_237) ? 1 : 0);
+        unsigned long long cg_238 = comps[2];
+        bool lo_sel_239 = cg_238 >= tcomp && cg_238 < 9214364837600034816 && nstart < (cg_238 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_239) ? 1 : 0);
+        unsigned long long cg_240 = comps[3];
+        bool lo_sel_241 = cg_240 >= tcomp && cg_240 < 9214364837600034816 && nstart < (cg_240 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_241) ? 1 : 0);
+        unsigned int nsel = 0;
+        int i_242 = base_t;
+        int ij_243 = i_242;
+        unsigned long long cj = (unsigned long long)keys_c[0] << 32 | (unsigned long long)~(unsigned int)ij_243;
+        sel[0] = cj >= tcomp && ij_243 < vocab;
+        nsel = nsel + ((sel[0]) ? 1 : 0);
+        int i_244 = base_t + 1;
+        int ij_245 = i_244;
+        unsigned long long cj_246 = (unsigned long long)keys_c[1] << 32 | (unsigned long long)~(unsigned int)ij_245;
+        sel[1] = cj_246 >= tcomp && ij_245 < vocab;
+        nsel = nsel + ((sel[1]) ? 1 : 0);
+        int i_247 = base_t + 2;
+        int ij_248 = i_247;
+        unsigned long long cj_249 = (unsigned long long)keys_c[2] << 32 | (unsigned long long)~(unsigned int)ij_248;
+        sel[2] = cj_249 >= tcomp && ij_248 < vocab;
+        nsel = nsel + ((sel[2]) ? 1 : 0);
+        int i_250 = base_t + 3;
+        int ij_251 = i_250;
+        unsigned long long cj_252 = (unsigned long long)keys_c[3] << 32 | (unsigned long long)~(unsigned int)ij_251;
+        sel[3] = cj_252 >= tcomp && ij_251 < vocab;
+        nsel = nsel + ((sel[3]) ? 1 : 0);
+        int i_253 = base_t + 2048;
+        int ij_254 = i_253;
+        unsigned long long cj_255 = (unsigned long long)keys_c[4] << 32 | (unsigned long long)~(unsigned int)ij_254;
+        sel[4] = cj_255 >= tcomp && ij_254 < vocab;
+        nsel = nsel + ((sel[4]) ? 1 : 0);
+        int i_256 = base_t + 2049;
+        int ij_257 = i_256;
+        unsigned long long cj_258 = (unsigned long long)keys_c[5] << 32 | (unsigned long long)~(unsigned int)ij_257;
+        sel[5] = cj_258 >= tcomp && ij_257 < vocab;
+        nsel = nsel + ((sel[5]) ? 1 : 0);
+        int i_259 = base_t + 2050;
+        int ij_260 = i_259;
+        unsigned long long cj_261 = (unsigned long long)keys_c[6] << 32 | (unsigned long long)~(unsigned int)ij_260;
+        sel[6] = cj_261 >= tcomp && ij_260 < vocab;
+        nsel = nsel + ((sel[6]) ? 1 : 0);
+        int i_262 = base_t + 2051;
+        int ij_263 = i_262;
+        unsigned long long cj_264 = (unsigned long long)keys_c[7] << 32 | (unsigned long long)~(unsigned int)ij_263;
+        sel[7] = cj_264 >= tcomp && ij_263 < vocab;
+        nsel = nsel + ((sel[7]) ? 1 : 0);
+        int i_265 = base_t + 4096;
+        int ij_266 = i_265;
+        unsigned long long cj_267 = (unsigned long long)keys_c[8] << 32 | (unsigned long long)~(unsigned int)ij_266;
+        sel[8] = cj_267 >= tcomp && ij_266 < vocab;
+        nsel = nsel + ((sel[8]) ? 1 : 0);
+        int i_268 = base_t + 4097;
+        int ij_269 = i_268;
+        unsigned long long cj_270 = (unsigned long long)keys_c[9] << 32 | (unsigned long long)~(unsigned int)ij_269;
+        sel[9] = cj_270 >= tcomp && ij_269 < vocab;
+        nsel = nsel + ((sel[9]) ? 1 : 0);
+        int i_271 = base_t + 4098;
+        int ij_272 = i_271;
+        unsigned long long cj_273 = (unsigned long long)keys_c[10] << 32 | (unsigned long long)~(unsigned int)ij_272;
+        sel[10] = cj_273 >= tcomp && ij_272 < vocab;
+        nsel = nsel + ((sel[10]) ? 1 : 0);
+        int i_274 = base_t + 4099;
+        int ij_275 = i_274;
+        unsigned long long cj_276 = (unsigned long long)keys_c[11] << 32 | (unsigned long long)~(unsigned int)ij_275;
+        sel[11] = cj_276 >= tcomp && ij_275 < vocab;
+        nsel = nsel + ((sel[11]) ? 1 : 0);
+        int i_277 = base_t + 6144;
+        int ij_278 = i_277;
+        unsigned long long cj_279 = (unsigned long long)keys_c[12] << 32 | (unsigned long long)~(unsigned int)ij_278;
+        sel[12] = cj_279 >= tcomp && ij_278 < vocab;
+        nsel = nsel + ((sel[12]) ? 1 : 0);
+        int i_280 = base_t + 6145;
+        int ij_281 = i_280;
+        unsigned long long cj_282 = (unsigned long long)keys_c[13] << 32 | (unsigned long long)~(unsigned int)ij_281;
+        sel[13] = cj_282 >= tcomp && ij_281 < vocab;
+        nsel = nsel + ((sel[13]) ? 1 : 0);
+        int i_283 = base_t + 6146;
+        int ij_284 = i_283;
+        unsigned long long cj_285 = (unsigned long long)keys_c[14] << 32 | (unsigned long long)~(unsigned int)ij_284;
+        sel[14] = cj_285 >= tcomp && ij_284 < vocab;
+        nsel = nsel + ((sel[14]) ? 1 : 0);
+        int i_286 = base_t + 6147;
+        int ij_287 = i_286;
+        unsigned long long cj_288 = (unsigned long long)keys_c[15] << 32 | (unsigned long long)~(unsigned int)ij_287;
+        sel[15] = cj_288 >= tcomp && ij_287 < vocab;
+        nsel = nsel + ((sel[15]) ? 1 : 0);
+        int i_289 = base_t + 8192;
+        int ij_290 = i_289;
+        unsigned long long cj_291 = (unsigned long long)keys_c[16] << 32 | (unsigned long long)~(unsigned int)ij_290;
+        sel[16] = cj_291 >= tcomp && ij_290 < vocab;
+        nsel = nsel + ((sel[16]) ? 1 : 0);
+        int i_292 = base_t + 8193;
+        int ij_293 = i_292;
+        unsigned long long cj_294 = (unsigned long long)keys_c[17] << 32 | (unsigned long long)~(unsigned int)ij_293;
+        sel[17] = cj_294 >= tcomp && ij_293 < vocab;
+        nsel = nsel + ((sel[17]) ? 1 : 0);
+        int i_295 = base_t + 8194;
+        int ij_296 = i_295;
+        unsigned long long cj_297 = (unsigned long long)keys_c[18] << 32 | (unsigned long long)~(unsigned int)ij_296;
+        sel[18] = cj_297 >= tcomp && ij_296 < vocab;
+        nsel = nsel + ((sel[18]) ? 1 : 0);
+        int i_298 = base_t + 8195;
+        int ij_299 = i_298;
+        unsigned long long cj_300 = (unsigned long long)keys_c[19] << 32 | (unsigned long long)~(unsigned int)ij_299;
+        sel[19] = cj_300 >= tcomp && ij_299 < vocab;
+        nsel = nsel + ((sel[19]) ? 1 : 0);
+        int i_301 = base_t + 10240;
+        int ij_302 = i_301;
+        unsigned long long cj_303 = (unsigned long long)keys_c[20] << 32 | (unsigned long long)~(unsigned int)ij_302;
+        sel[20] = cj_303 >= tcomp && ij_302 < vocab;
+        nsel = nsel + ((sel[20]) ? 1 : 0);
+        int i_304 = base_t + 10241;
+        int ij_305 = i_304;
+        unsigned long long cj_306 = (unsigned long long)keys_c[21] << 32 | (unsigned long long)~(unsigned int)ij_305;
+        sel[21] = cj_306 >= tcomp && ij_305 < vocab;
+        nsel = nsel + ((sel[21]) ? 1 : 0);
+        int i_307 = base_t + 10242;
+        int ij_308 = i_307;
+        unsigned long long cj_309 = (unsigned long long)keys_c[22] << 32 | (unsigned long long)~(unsigned int)ij_308;
+        sel[22] = cj_309 >= tcomp && ij_308 < vocab;
+        nsel = nsel + ((sel[22]) ? 1 : 0);
+        int i_310 = base_t + 10243;
+        int ij_311 = i_310;
+        unsigned long long cj_312 = (unsigned long long)keys_c[23] << 32 | (unsigned long long)~(unsigned int)ij_311;
+        sel[23] = cj_312 >= tcomp && ij_311 < vocab;
+        nsel = nsel + ((sel[23]) ? 1 : 0);
+        int i_313 = base_t + 12288;
+        int ij_314 = i_313;
+        unsigned long long cj_315 = (unsigned long long)keys_c[24] << 32 | (unsigned long long)~(unsigned int)ij_314;
+        sel[24] = cj_315 >= tcomp && ij_314 < vocab;
+        nsel = nsel + ((sel[24]) ? 1 : 0);
+        int i_316 = base_t + 12289;
+        int ij_317 = i_316;
+        unsigned long long cj_318 = (unsigned long long)keys_c[25] << 32 | (unsigned long long)~(unsigned int)ij_317;
+        sel[25] = cj_318 >= tcomp && ij_317 < vocab;
+        nsel = nsel + ((sel[25]) ? 1 : 0);
+        int i_319 = base_t + 12290;
+        int ij_320 = i_319;
+        unsigned long long cj_321 = (unsigned long long)keys_c[26] << 32 | (unsigned long long)~(unsigned int)ij_320;
+        sel[26] = cj_321 >= tcomp && ij_320 < vocab;
+        nsel = nsel + ((sel[26]) ? 1 : 0);
+        int i_322 = base_t + 12291;
+        int ij_323 = i_322;
+        unsigned long long cj_324 = (unsigned long long)keys_c[27] << 32 | (unsigned long long)~(unsigned int)ij_323;
+        sel[27] = cj_324 >= tcomp && ij_323 < vocab;
+        nsel = nsel + ((sel[27]) ? 1 : 0);
+        int i_325 = base_t + 14336;
+        int ij_326 = i_325;
+        unsigned long long cj_327 = (unsigned long long)keys_c[28] << 32 | (unsigned long long)~(unsigned int)ij_326;
+        sel[28] = cj_327 >= tcomp && ij_326 < vocab;
+        nsel = nsel + ((sel[28]) ? 1 : 0);
+        int i_328 = base_t + 14337;
+        int ij_329 = i_328;
+        unsigned long long cj_330 = (unsigned long long)keys_c[29] << 32 | (unsigned long long)~(unsigned int)ij_329;
+        sel[29] = cj_330 >= tcomp && ij_329 < vocab;
+        nsel = nsel + ((sel[29]) ? 1 : 0);
+        int i_331 = base_t + 14338;
+        int ij_332 = i_331;
+        unsigned long long cj_333 = (unsigned long long)keys_c[30] << 32 | (unsigned long long)~(unsigned int)ij_332;
+        sel[30] = cj_333 >= tcomp && ij_332 < vocab;
+        nsel = nsel + ((sel[30]) ? 1 : 0);
+        int i_334 = base_t + 14339;
+        int ij_335 = i_334;
+        unsigned long long cj_336 = (unsigned long long)keys_c[31] << 32 | (unsigned long long)~(unsigned int)ij_335;
+        sel[31] = cj_336 >= tcomp && ij_335 < vocab;
+        nsel = nsel + ((sel[31]) ? 1 : 0);
+        int i_337 = base_t + 16384;
+        int ij_338 = i_337;
+        unsigned long long cj_339 = (unsigned long long)keys_c[32] << 32 | (unsigned long long)~(unsigned int)ij_338;
+        sel[32] = cj_339 >= tcomp && ij_338 < vocab;
+        nsel = nsel + ((sel[32]) ? 1 : 0);
+        int i_340 = base_t + 16385;
+        int ij_341 = i_340;
+        unsigned long long cj_342 = (unsigned long long)keys_c[33] << 32 | (unsigned long long)~(unsigned int)ij_341;
+        sel[33] = cj_342 >= tcomp && ij_341 < vocab;
+        nsel = nsel + ((sel[33]) ? 1 : 0);
+        int i_343 = base_t + 16386;
+        int ij_344 = i_343;
+        unsigned long long cj_345 = (unsigned long long)keys_c[34] << 32 | (unsigned long long)~(unsigned int)ij_344;
+        sel[34] = cj_345 >= tcomp && ij_344 < vocab;
+        nsel = nsel + ((sel[34]) ? 1 : 0);
+        int i_346 = base_t + 16387;
+        int ij_347 = i_346;
+        unsigned long long cj_348 = (unsigned long long)keys_c[35] << 32 | (unsigned long long)~(unsigned int)ij_347;
+        sel[35] = cj_348 >= tcomp && ij_347 < vocab;
+        nsel = nsel + ((sel[35]) ? 1 : 0);
+        int i_349 = base_t + 18432;
+        int ij_350 = i_349;
+        unsigned long long cj_351 = (unsigned long long)keys_c[36] << 32 | (unsigned long long)~(unsigned int)ij_350;
+        sel[36] = cj_351 >= tcomp && ij_350 < vocab;
+        nsel = nsel + ((sel[36]) ? 1 : 0);
+        int i_352 = base_t + 18433;
+        int ij_353 = i_352;
+        unsigned long long cj_354 = (unsigned long long)keys_c[37] << 32 | (unsigned long long)~(unsigned int)ij_353;
+        sel[37] = cj_354 >= tcomp && ij_353 < vocab;
+        nsel = nsel + ((sel[37]) ? 1 : 0);
+        int i_355 = base_t + 18434;
+        int ij_356 = i_355;
+        unsigned long long cj_357 = (unsigned long long)keys_c[38] << 32 | (unsigned long long)~(unsigned int)ij_356;
+        sel[38] = cj_357 >= tcomp && ij_356 < vocab;
+        nsel = nsel + ((sel[38]) ? 1 : 0);
+        int i_358 = base_t + 18435;
+        int ij_359 = i_358;
+        unsigned long long cj_360 = (unsigned long long)keys_c[39] << 32 | (unsigned long long)~(unsigned int)ij_359;
+        sel[39] = cj_360 >= tcomp && ij_359 < vocab;
+        nsel = nsel + ((sel[39]) ? 1 : 0);
+        unsigned int packed = nsel | lo_above_1 + cand_lo << 12;
+        uint32_t incl_361 = packed;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl_361;
+        }
+        __syncthreads();
+        unsigned int before_362 = 0;
+        unsigned int total_363 = 0;
+        unsigned int ws_364 = warp_sums[0];
+        total_363 = total_363 + ws_364;
+        if (warp > 0) {
+            before_362 = before_362 + ws_364;
+        }
+        unsigned int ws_365 = warp_sums[1];
+        total_363 = total_363 + ws_365;
+        if (warp > 1) {
+            before_362 = before_362 + ws_365;
+        }
+        unsigned int ws_366 = warp_sums[2];
+        total_363 = total_363 + ws_366;
+        if (warp > 2) {
+            before_362 = before_362 + ws_366;
+        }
+        unsigned int ws_367 = warp_sums[3];
+        total_363 = total_363 + ws_367;
+        if (warp > 3) {
+            before_362 = before_362 + ws_367;
+        }
+        unsigned int ws_368 = warp_sums[4];
+        total_363 = total_363 + ws_368;
+        if (warp > 4) {
+            before_362 = before_362 + ws_368;
+        }
+        unsigned int ws_369 = warp_sums[5];
+        total_363 = total_363 + ws_369;
+        if (warp > 5) {
+            before_362 = before_362 + ws_369;
+        }
+        unsigned int ws_370 = warp_sums[6];
+        total_363 = total_363 + ws_370;
+        if (warp > 6) {
+            before_362 = before_362 + ws_370;
+        }
+        unsigned int ws_371 = warp_sums[7];
+        total_363 = total_363 + ws_371;
+        if (warp > 7) {
+            before_362 = before_362 + ws_371;
+        }
+        unsigned int ws_372 = warp_sums[8];
+        total_363 = total_363 + ws_372;
+        if (warp > 8) {
+            before_362 = before_362 + ws_372;
+        }
+        unsigned int ws_373 = warp_sums[9];
+        total_363 = total_363 + ws_373;
+        if (warp > 9) {
+            before_362 = before_362 + ws_373;
+        }
+        unsigned int ws_374 = warp_sums[10];
+        total_363 = total_363 + ws_374;
+        if (warp > 10) {
+            before_362 = before_362 + ws_374;
+        }
+        unsigned int ws_375 = warp_sums[11];
+        total_363 = total_363 + ws_375;
+        if (warp > 11) {
+            before_362 = before_362 + ws_375;
+        }
+        unsigned int ws_376 = warp_sums[12];
+        total_363 = total_363 + ws_376;
+        if (warp > 12) {
+            before_362 = before_362 + ws_376;
+        }
+        unsigned int ws_377 = warp_sums[13];
+        total_363 = total_363 + ws_377;
+        if (warp > 13) {
+            before_362 = before_362 + ws_377;
+        }
+        unsigned int ws_378 = warp_sums[14];
+        total_363 = total_363 + ws_378;
+        if (warp > 14) {
+            before_362 = before_362 + ws_378;
+        }
+        unsigned int ws_379 = warp_sums[15];
+        total_363 = total_363 + ws_379;
+        if (warp > 15) {
+            before_362 = before_362 + ws_379;
+        }
+        unsigned int excl_380 = before_362 + incl_361 - packed;
+        __syncthreads();
+        unsigned int pos0 = (total_363 >> 12) + (excl_380 & 4095);
+        unsigned int pos_1 = pos0;
+        if (sel[0]) {
+            unsigned long long dst = out_base + (unsigned long long)pos_1;
+            out_vals[dst] = __uint_as_float(keys_c[0]);
+            int i_0_42 = base_t;
+            out_idx[dst] = i_0_42;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[1]) {
+            unsigned long long dst_1 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_1] = __uint_as_float(keys_c[1]);
+            int i_0_43 = base_t + 1;
+            out_idx[dst_1] = i_0_43;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[2]) {
+            unsigned long long dst_2 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_2] = __uint_as_float(keys_c[2]);
+            int i_0_44 = base_t + 2;
+            out_idx[dst_2] = i_0_44;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[3]) {
+            unsigned long long dst_3 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_3] = __uint_as_float(keys_c[3]);
+            int i_0_45 = base_t + 3;
+            out_idx[dst_3] = i_0_45;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[4]) {
+            unsigned long long dst_4 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_4] = __uint_as_float(keys_c[4]);
+            int i_0_46 = base_t + 2048;
+            out_idx[dst_4] = i_0_46;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[5]) {
+            unsigned long long dst_5 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_5] = __uint_as_float(keys_c[5]);
+            int i_0_47 = base_t + 2049;
+            out_idx[dst_5] = i_0_47;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[6]) {
+            unsigned long long dst_6 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_6] = __uint_as_float(keys_c[6]);
+            int i_0_48 = base_t + 2050;
+            out_idx[dst_6] = i_0_48;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[7]) {
+            unsigned long long dst_7 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_7] = __uint_as_float(keys_c[7]);
+            int i_0_49 = base_t + 2051;
+            out_idx[dst_7] = i_0_49;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[8]) {
+            unsigned long long dst_8 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_8] = __uint_as_float(keys_c[8]);
+            int i_0_50 = base_t + 4096;
+            out_idx[dst_8] = i_0_50;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[9]) {
+            unsigned long long dst_9 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_9] = __uint_as_float(keys_c[9]);
+            int i_0_51 = base_t + 4097;
+            out_idx[dst_9] = i_0_51;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[10]) {
+            unsigned long long dst_10 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_10] = __uint_as_float(keys_c[10]);
+            int i_0_52 = base_t + 4098;
+            out_idx[dst_10] = i_0_52;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[11]) {
+            unsigned long long dst_11 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_11] = __uint_as_float(keys_c[11]);
+            int i_0_53 = base_t + 4099;
+            out_idx[dst_11] = i_0_53;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[12]) {
+            unsigned long long dst_12 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_12] = __uint_as_float(keys_c[12]);
+            int i_0_54 = base_t + 6144;
+            out_idx[dst_12] = i_0_54;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[13]) {
+            unsigned long long dst_13 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_13] = __uint_as_float(keys_c[13]);
+            int i_0_55 = base_t + 6145;
+            out_idx[dst_13] = i_0_55;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[14]) {
+            unsigned long long dst_14 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_14] = __uint_as_float(keys_c[14]);
+            int i_0_56 = base_t + 6146;
+            out_idx[dst_14] = i_0_56;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[15]) {
+            unsigned long long dst_15 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_15] = __uint_as_float(keys_c[15]);
+            int i_0_57 = base_t + 6147;
+            out_idx[dst_15] = i_0_57;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[16]) {
+            unsigned long long dst_16 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_16] = __uint_as_float(keys_c[16]);
+            int i_0_58 = base_t + 8192;
+            out_idx[dst_16] = i_0_58;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[17]) {
+            unsigned long long dst_17 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_17] = __uint_as_float(keys_c[17]);
+            int i_0_59 = base_t + 8193;
+            out_idx[dst_17] = i_0_59;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[18]) {
+            unsigned long long dst_18 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_18] = __uint_as_float(keys_c[18]);
+            int i_0_60 = base_t + 8194;
+            out_idx[dst_18] = i_0_60;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[19]) {
+            unsigned long long dst_19 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_19] = __uint_as_float(keys_c[19]);
+            int i_0_61 = base_t + 8195;
+            out_idx[dst_19] = i_0_61;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[20]) {
+            unsigned long long dst_20 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_20] = __uint_as_float(keys_c[20]);
+            int i_0_62 = base_t + 10240;
+            out_idx[dst_20] = i_0_62;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[21]) {
+            unsigned long long dst_21 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_21] = __uint_as_float(keys_c[21]);
+            int i_0_63 = base_t + 10241;
+            out_idx[dst_21] = i_0_63;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[22]) {
+            unsigned long long dst_22 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_22] = __uint_as_float(keys_c[22]);
+            int i_0_64 = base_t + 10242;
+            out_idx[dst_22] = i_0_64;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[23]) {
+            unsigned long long dst_23 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_23] = __uint_as_float(keys_c[23]);
+            int i_0_65 = base_t + 10243;
+            out_idx[dst_23] = i_0_65;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[24]) {
+            unsigned long long dst_24 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_24] = __uint_as_float(keys_c[24]);
+            int i_0_66 = base_t + 12288;
+            out_idx[dst_24] = i_0_66;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[25]) {
+            unsigned long long dst_25 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_25] = __uint_as_float(keys_c[25]);
+            int i_0_67 = base_t + 12289;
+            out_idx[dst_25] = i_0_67;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[26]) {
+            unsigned long long dst_26 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_26] = __uint_as_float(keys_c[26]);
+            int i_0_68 = base_t + 12290;
+            out_idx[dst_26] = i_0_68;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[27]) {
+            unsigned long long dst_27 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_27] = __uint_as_float(keys_c[27]);
+            int i_0_69 = base_t + 12291;
+            out_idx[dst_27] = i_0_69;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[28]) {
+            unsigned long long dst_28 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_28] = __uint_as_float(keys_c[28]);
+            int i_0_70 = base_t + 14336;
+            out_idx[dst_28] = i_0_70;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[29]) {
+            unsigned long long dst_29 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_29] = __uint_as_float(keys_c[29]);
+            int i_0_71 = base_t + 14337;
+            out_idx[dst_29] = i_0_71;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[30]) {
+            unsigned long long dst_30 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_30] = __uint_as_float(keys_c[30]);
+            int i_0_72 = base_t + 14338;
+            out_idx[dst_30] = i_0_72;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[31]) {
+            unsigned long long dst_31 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_31] = __uint_as_float(keys_c[31]);
+            int i_0_73 = base_t + 14339;
+            out_idx[dst_31] = i_0_73;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[32]) {
+            unsigned long long dst_32 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_32] = __uint_as_float(keys_c[32]);
+            int i_0_74 = base_t + 16384;
+            out_idx[dst_32] = i_0_74;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[33]) {
+            unsigned long long dst_33 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_33] = __uint_as_float(keys_c[33]);
+            int i_0_75 = base_t + 16385;
+            out_idx[dst_33] = i_0_75;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[34]) {
+            unsigned long long dst_34 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_34] = __uint_as_float(keys_c[34]);
+            int i_0_76 = base_t + 16386;
+            out_idx[dst_34] = i_0_76;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[35]) {
+            unsigned long long dst_35 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_35] = __uint_as_float(keys_c[35]);
+            int i_0_77 = base_t + 16387;
+            out_idx[dst_35] = i_0_77;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[36]) {
+            unsigned long long dst_36 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_36] = __uint_as_float(keys_c[36]);
+            int i_0_78 = base_t + 18432;
+            out_idx[dst_36] = i_0_78;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[37]) {
+            unsigned long long dst_37 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_37] = __uint_as_float(keys_c[37]);
+            int i_0_79 = base_t + 18433;
+            out_idx[dst_37] = i_0_79;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[38]) {
+            unsigned long long dst_38 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_38] = __uint_as_float(keys_c[38]);
+            int i_0_80 = base_t + 18434;
+            out_idx[dst_38] = i_0_80;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[39]) {
+            unsigned long long dst_39 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_39] = __uint_as_float(keys_c[39]);
+            int i_0_81 = base_t + 18435;
+            out_idx[dst_39] = i_0_81;
+            pos_1 = pos_1 + 1;
+        }
+        if (rank == 0 && tid == 0) {
+            out_count[row] = k;
+        }
+        if (fuse_on == 0) {
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        }
+    } else {
+        unsigned int prefix = bucket_sel;
+        unsigned int bits_1_1 = __as_u32(vals[0]);
+        unsigned int key_2_1 = ((bits_1_1 <= 2139095040) ? bits_1_1 : 0);
+        unsigned int bucket_3_1 = key_2_1 >> 10 & 2047;
+        if (key_2_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_3_1], 1);
+        }
+        unsigned int bits_4_1 = __as_u32(vals[1]);
+        unsigned int key_5_1 = ((bits_4_1 <= 2139095040) ? bits_4_1 : 0);
+        unsigned int bucket_6_1 = key_5_1 >> 10 & 2047;
+        if (key_5_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_6_1], 1);
+        }
+        unsigned int bits_7 = __as_u32(vals[2]);
+        unsigned int key_8 = ((bits_7 <= 2139095040) ? bits_7 : 0);
+        unsigned int bucket_9_1 = key_8 >> 10 & 2047;
+        if (key_8 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_9_1], 1);
+        }
+        unsigned int bits_10 = __as_u32(vals[3]);
+        unsigned int key_11 = ((bits_10 <= 2139095040) ? bits_10 : 0);
+        unsigned int bucket_12 = key_11 >> 10 & 2047;
+        if (key_11 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_12], 1);
+        }
+        unsigned int bits_13_1 = __as_u32(vals[4]);
+        unsigned int key_14_1 = ((bits_13_1 <= 2139095040) ? bits_13_1 : 0);
+        unsigned int bucket_15 = key_14_1 >> 10 & 2047;
+        if (key_14_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_15], 1);
+        }
+        unsigned int bits_16 = __as_u32(vals[5]);
+        unsigned int key_17 = ((bits_16 <= 2139095040) ? bits_16 : 0);
+        unsigned int bucket_18 = key_17 >> 10 & 2047;
+        if (key_17 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_18], 1);
+        }
+        unsigned int bits_19 = __as_u32(vals[6]);
+        unsigned int key_20 = ((bits_19 <= 2139095040) ? bits_19 : 0);
+        unsigned int bucket_21 = key_20 >> 10 & 2047;
+        if (key_20 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_21], 1);
+        }
+        unsigned int bits_22_1 = __as_u32(vals[7]);
+        unsigned int key_23_1 = ((bits_22_1 <= 2139095040) ? bits_22_1 : 0);
+        unsigned int bucket_24 = key_23_1 >> 10 & 2047;
+        if (key_23_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_24], 1);
+        }
+        unsigned int bits_25 = __as_u32(vals[8]);
+        unsigned int key_26 = ((bits_25 <= 2139095040) ? bits_25 : 0);
+        unsigned int bucket_27 = key_26 >> 10 & 2047;
+        if (key_26 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_27], 1);
+        }
+        unsigned int bits_28 = __as_u32(vals[9]);
+        unsigned int key_29 = ((bits_28 <= 2139095040) ? bits_28 : 0);
+        unsigned int bucket_30_1 = key_29 >> 10 & 2047;
+        if (key_29 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_30_1], 1);
+        }
+        unsigned int bits_31_1 = __as_u32(vals[10]);
+        unsigned int key_32_1 = ((bits_31_1 <= 2139095040) ? bits_31_1 : 0);
+        unsigned int bucket_33_1 = key_32_1 >> 10 & 2047;
+        if (key_32_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_33_1], 1);
+        }
+        unsigned int bits_34 = __as_u32(vals[11]);
+        unsigned int key_35 = ((bits_34 <= 2139095040) ? bits_34 : 0);
+        unsigned int bucket_36_1 = key_35 >> 10 & 2047;
+        if (key_35 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_36_1], 1);
+        }
+        unsigned int bits_37 = __as_u32(vals[12]);
+        unsigned int key_38 = ((bits_37 <= 2139095040) ? bits_37 : 0);
+        unsigned int bucket_39_1 = key_38 >> 10 & 2047;
+        if (key_38 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_39_1], 1);
+        }
+        unsigned int bits_40_1 = __as_u32(vals[13]);
+        unsigned int key_41_1 = ((bits_40_1 <= 2139095040) ? bits_40_1 : 0);
+        unsigned int bucket_42 = key_41_1 >> 10 & 2047;
+        if (key_41_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_42], 1);
+        }
+        unsigned int bits_43 = __as_u32(vals[14]);
+        unsigned int key_44 = ((bits_43 <= 2139095040) ? bits_43 : 0);
+        unsigned int bucket_45 = key_44 >> 10 & 2047;
+        if (key_44 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_45], 1);
+        }
+        unsigned int bits_46 = __as_u32(vals[15]);
+        unsigned int key_47 = ((bits_46 <= 2139095040) ? bits_46 : 0);
+        unsigned int bucket_48 = key_47 >> 10 & 2047;
+        if (key_47 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_48], 1);
+        }
+        unsigned int bits_49_1 = __as_u32(vals[16]);
+        unsigned int key_50_1 = ((bits_49_1 <= 2139095040) ? bits_49_1 : 0);
+        unsigned int bucket_51 = key_50_1 >> 10 & 2047;
+        if (key_50_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_51], 1);
+        }
+        unsigned int bits_52 = __as_u32(vals[17]);
+        unsigned int key_53 = ((bits_52 <= 2139095040) ? bits_52 : 0);
+        unsigned int bucket_54 = key_53 >> 10 & 2047;
+        if (key_53 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_54], 1);
+        }
+        unsigned int bits_55 = __as_u32(vals[18]);
+        unsigned int key_56 = ((bits_55 <= 2139095040) ? bits_55 : 0);
+        unsigned int bucket_57 = key_56 >> 10 & 2047;
+        if (key_56 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_57], 1);
+        }
+        unsigned int bits_58_1 = __as_u32(vals[19]);
+        unsigned int key_59_1 = ((bits_58_1 <= 2139095040) ? bits_58_1 : 0);
+        unsigned int bucket_60 = key_59_1 >> 10 & 2047;
+        if (key_59_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_60], 1);
+        }
+        unsigned int bits_61 = __as_u32(vals[20]);
+        unsigned int key_62 = ((bits_61 <= 2139095040) ? bits_61 : 0);
+        unsigned int bucket_63 = key_62 >> 10 & 2047;
+        if (key_62 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_63], 1);
+        }
+        unsigned int bits_64 = __as_u32(vals[21]);
+        unsigned int key_65 = ((bits_64 <= 2139095040) ? bits_64 : 0);
+        unsigned int bucket_66 = key_65 >> 10 & 2047;
+        if (key_65 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_66], 1);
+        }
+        unsigned int bits_67_1 = __as_u32(vals[22]);
+        unsigned int key_68_1 = ((bits_67_1 <= 2139095040) ? bits_67_1 : 0);
+        unsigned int bucket_69 = key_68_1 >> 10 & 2047;
+        if (key_68_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_69], 1);
+        }
+        unsigned int bits_70 = __as_u32(vals[23]);
+        unsigned int key_71 = ((bits_70 <= 2139095040) ? bits_70 : 0);
+        unsigned int bucket_72 = key_71 >> 10 & 2047;
+        if (key_71 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_72], 1);
+        }
+        unsigned int bits_73 = __as_u32(vals[24]);
+        unsigned int key_74 = ((bits_73 <= 2139095040) ? bits_73 : 0);
+        unsigned int bucket_75 = key_74 >> 10 & 2047;
+        if (key_74 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_75], 1);
+        }
+        unsigned int bits_76_1 = __as_u32(vals[25]);
+        unsigned int key_77_1 = ((bits_76_1 <= 2139095040) ? bits_76_1 : 0);
+        unsigned int bucket_78 = key_77_1 >> 10 & 2047;
+        if (key_77_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_78], 1);
+        }
+        unsigned int bits_79 = __as_u32(vals[26]);
+        unsigned int key_80 = ((bits_79 <= 2139095040) ? bits_79 : 0);
+        unsigned int bucket_81 = key_80 >> 10 & 2047;
+        if (key_80 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_81], 1);
+        }
+        unsigned int bits_82 = __as_u32(vals[27]);
+        unsigned int key_83 = ((bits_82 <= 2139095040) ? bits_82 : 0);
+        unsigned int bucket_84 = key_83 >> 10 & 2047;
+        if (key_83 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_84], 1);
+        }
+        unsigned int bits_85_1 = __as_u32(vals[28]);
+        unsigned int key_86_1 = ((bits_85_1 <= 2139095040) ? bits_85_1 : 0);
+        unsigned int bucket_87 = key_86_1 >> 10 & 2047;
+        if (key_86_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_87], 1);
+        }
+        unsigned int bits_88 = __as_u32(vals[29]);
+        unsigned int key_89 = ((bits_88 <= 2139095040) ? bits_88 : 0);
+        unsigned int bucket_90 = key_89 >> 10 & 2047;
+        if (key_89 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_90], 1);
+        }
+        unsigned int bits_91 = __as_u32(vals[30]);
+        unsigned int key_92 = ((bits_91 <= 2139095040) ? bits_91 : 0);
+        unsigned int bucket_93 = key_92 >> 10 & 2047;
+        if (key_92 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_93], 1);
+        }
+        unsigned int bits_94_1 = __as_u32(vals[31]);
+        unsigned int key_95_1 = ((bits_94_1 <= 2139095040) ? bits_94_1 : 0);
+        unsigned int bucket_96 = key_95_1 >> 10 & 2047;
+        if (key_95_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_96], 1);
+        }
+        unsigned int bits_97 = __as_u32(vals[32]);
+        unsigned int key_98 = ((bits_97 <= 2139095040) ? bits_97 : 0);
+        unsigned int bucket_99 = key_98 >> 10 & 2047;
+        if (key_98 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_99], 1);
+        }
+        unsigned int bits_100 = __as_u32(vals[33]);
+        unsigned int key_101 = ((bits_100 <= 2139095040) ? bits_100 : 0);
+        unsigned int bucket_102 = key_101 >> 10 & 2047;
+        if (key_101 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_102], 1);
+        }
+        unsigned int bits_103_1 = __as_u32(vals[34]);
+        unsigned int key_104_1 = ((bits_103_1 <= 2139095040) ? bits_103_1 : 0);
+        unsigned int bucket_105 = key_104_1 >> 10 & 2047;
+        if (key_104_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_105], 1);
+        }
+        unsigned int bits_106 = __as_u32(vals[35]);
+        unsigned int key_107 = ((bits_106 <= 2139095040) ? bits_106 : 0);
+        unsigned int bucket_108 = key_107 >> 10 & 2047;
+        if (key_107 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_108], 1);
+        }
+        unsigned int bits_109 = __as_u32(vals[36]);
+        unsigned int key_110 = ((bits_109 <= 2139095040) ? bits_109 : 0);
+        unsigned int bucket_111 = key_110 >> 10 & 2047;
+        if (key_110 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_111], 1);
+        }
+        unsigned int bits_112_1 = __as_u32(vals[37]);
+        unsigned int key_113_1 = ((bits_112_1 <= 2139095040) ? bits_112_1 : 0);
+        unsigned int bucket_114 = key_113_1 >> 10 & 2047;
+        if (key_113_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_114], 1);
+        }
+        unsigned int bits_115 = __as_u32(vals[38]);
+        unsigned int key_116 = ((bits_115 <= 2139095040) ? bits_115 : 0);
+        unsigned int bucket_117 = key_116 >> 10 & 2047;
+        if (key_116 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_117], 1);
+        }
+        unsigned int bits_118 = __as_u32(vals[39]);
+        unsigned int key_119 = ((bits_118 <= 2139095040) ? bits_118 : 0);
+        unsigned int bucket_120 = key_119 >> 10 & 2047;
+        if (key_119 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_120], 1);
+        }
+        __syncthreads();
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int c0_1 = 0;
+        unsigned int c1_1 = 0;
+        unsigned int c2_1 = 0;
+        unsigned int c3_1 = 0;
+        unsigned int words_8[4];
+        uint32_t _cluster_mapa_87;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_87) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 3]))
+            : "r"(_cluster_mapa_87));
+        c0_1 = c0_1 + words_8[0];
+        c1_1 = c1_1 + words_8[1];
+        c2_1 = c2_1 + words_8[2];
+        c3_1 = c3_1 + words_8[3];
+        unsigned int words_121[4];
+        uint32_t _cluster_mapa_88;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_88) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_121[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 3]))
+            : "r"(_cluster_mapa_88));
+        c0_1 = c0_1 + words_121[0];
+        c1_1 = c1_1 + words_121[1];
+        c2_1 = c2_1 + words_121[2];
+        c3_1 = c3_1 + words_121[3];
+        unsigned int words_122[4];
+        uint32_t _cluster_mapa_89;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_89) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_122[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 3]))
+            : "r"(_cluster_mapa_89));
+        c0_1 = c0_1 + words_122[0];
+        c1_1 = c1_1 + words_122[1];
+        c2_1 = c2_1 + words_122[2];
+        c3_1 = c3_1 + words_122[3];
+        unsigned int words_123[4];
+        uint32_t _cluster_mapa_90;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_90) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_123[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 3]))
+            : "r"(_cluster_mapa_90));
+        c0_1 = c0_1 + words_123[0];
+        c1_1 = c1_1 + words_123[1];
+        c2_1 = c2_1 + words_123[2];
+        c3_1 = c3_1 + words_123[3];
+        unsigned int words_124[4];
+        uint32_t _cluster_mapa_91;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_91) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_124[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 3]))
+            : "r"(_cluster_mapa_91));
+        c0_1 = c0_1 + words_124[0];
+        c1_1 = c1_1 + words_124[1];
+        c2_1 = c2_1 + words_124[2];
+        c3_1 = c3_1 + words_124[3];
+        unsigned int words_125[4];
+        uint32_t _cluster_mapa_92;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_92) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_125[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 3]))
+            : "r"(_cluster_mapa_92));
+        c0_1 = c0_1 + words_125[0];
+        c1_1 = c1_1 + words_125[1];
+        c2_1 = c2_1 + words_125[2];
+        c3_1 = c3_1 + words_125[3];
+        unsigned int words_126[4];
+        uint32_t _cluster_mapa_93;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_93) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_126[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 3]))
+            : "r"(_cluster_mapa_93));
+        c0_1 = c0_1 + words_126[0];
+        c1_1 = c1_1 + words_126[1];
+        c2_1 = c2_1 + words_126[2];
+        c3_1 = c3_1 + words_126[3];
+        unsigned int words_127[4];
+        uint32_t _cluster_mapa_94;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_94) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_127[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 3]))
+            : "r"(_cluster_mapa_94));
+        c0_1 = c0_1 + words_127[0];
+        c1_1 = c1_1 + words_127[1];
+        c2_1 = c2_1 + words_127[2];
+        c3_1 = c3_1 + words_127[3];
+        unsigned int local_128 = c0_1 + c1_1 + c2_1 + c3_1;
+        uint32_t _warp_scan_sum_95 = local_128;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(16));
+        unsigned int lane_suffix_1 = _warp_scan_sum_95 - local_128;
+        unsigned int warp_total_1;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_1) : "r"(local_128));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_1;
+        }
+        __syncthreads();
+        unsigned int peer_1 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_2 = ((lane > warp) ? peer_1 : 0);
+        unsigned int warps_above_1;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_1) : "r"(above_2));
+        unsigned int suffix_1 = lane_suffix_1 + warps_above_1;
+        bool hit_1 = 0;
+        unsigned int bucket_129 = 0;
+        unsigned int rest_1 = 0;
+        if (suffix_1 < remaining && remaining <= suffix_1 + local_128) {
+            hit_1 = 1;
+            unsigned int s3_6 = suffix_1 + c3_1;
+            unsigned int s2_6 = s3_6 + c2_1;
+            unsigned int s1_6 = s2_6 + c1_1;
+            if (remaining <= s3_6) {
+                bucket_129 = (unsigned int)(tid * 4 + 3);
+                rest_1 = remaining - suffix_1;
+            } else if (remaining <= s2_6) {
+                bucket_129 = (unsigned int)(tid * 4 + 2);
+                rest_1 = remaining - s3_6;
+            } else {
+                if (remaining <= s1_6) {
+                    bucket_129 = (unsigned int)(tid * 4 + 1);
+                    rest_1 = remaining - s2_6;
+                } else {
+                    bucket_129 = (unsigned int)(tid * 4);
+                    rest_1 = remaining - s1_6;
+                }
+            }
+        }
+        if (hit_1) {
+            scal[0] = bucket_129;
+            scal[1] = rest_1;
+        }
+        __syncthreads();
+        unsigned int bsel = scal[0];
+        remaining = scal[1];
+        prefix = prefix << 11 | bsel;
+        for (int i_12 = tid; i_12 < 2048; i_12 += 512) {
+            hist0[i_12] = 0;
+        }
+        __syncthreads();
+        unsigned int bits_130 = __as_u32(vals[0]);
+        unsigned int key_131 = ((bits_130 <= 2139095040) ? bits_130 : 0);
+        unsigned int bucket_132 = key_131 & 1023;
+        if (key_131 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_132], 1);
+        }
+        unsigned int bits_133 = __as_u32(vals[1]);
+        unsigned int key_134 = ((bits_133 <= 2139095040) ? bits_133 : 0);
+        unsigned int bucket_135 = key_134 & 1023;
+        if (key_134 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_135], 1);
+        }
+        unsigned int bits_136_1 = __as_u32(vals[2]);
+        unsigned int key_137_1 = ((bits_136_1 <= 2139095040) ? bits_136_1 : 0);
+        unsigned int bucket_138 = key_137_1 & 1023;
+        if (key_137_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_138], 1);
+        }
+        unsigned int bits_139 = __as_u32(vals[3]);
+        unsigned int key_140 = ((bits_139 <= 2139095040) ? bits_139 : 0);
+        unsigned int bucket_141 = key_140 & 1023;
+        if (key_140 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_141], 1);
+        }
+        unsigned int bits_142 = __as_u32(vals[4]);
+        unsigned int key_143 = ((bits_142 <= 2139095040) ? bits_142 : 0);
+        unsigned int bucket_144 = key_143 & 1023;
+        if (key_143 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_144], 1);
+        }
+        unsigned int bits_145 = __as_u32(vals[5]);
+        unsigned int key_146 = ((bits_145 <= 2139095040) ? bits_145 : 0);
+        unsigned int bucket_147 = key_146 & 1023;
+        if (key_146 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_147], 1);
+        }
+        unsigned int bits_148_1 = __as_u32(vals[6]);
+        unsigned int key_149_1 = ((bits_148_1 <= 2139095040) ? bits_148_1 : 0);
+        unsigned int bucket_150 = key_149_1 & 1023;
+        if (key_149_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_150], 1);
+        }
+        unsigned int bits_151 = __as_u32(vals[7]);
+        unsigned int key_152 = ((bits_151 <= 2139095040) ? bits_151 : 0);
+        unsigned int bucket_153 = key_152 & 1023;
+        if (key_152 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_153], 1);
+        }
+        unsigned int bits_154 = __as_u32(vals[8]);
+        unsigned int key_155 = ((bits_154 <= 2139095040) ? bits_154 : 0);
+        unsigned int bucket_156 = key_155 & 1023;
+        if (key_155 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_156], 1);
+        }
+        unsigned int bits_157 = __as_u32(vals[9]);
+        unsigned int key_158 = ((bits_157 <= 2139095040) ? bits_157 : 0);
+        unsigned int bucket_159 = key_158 & 1023;
+        if (key_158 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_159], 1);
+        }
+        unsigned int bits_160_1 = __as_u32(vals[10]);
+        unsigned int key_161_1 = ((bits_160_1 <= 2139095040) ? bits_160_1 : 0);
+        unsigned int bucket_162 = key_161_1 & 1023;
+        if (key_161_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_162], 1);
+        }
+        unsigned int bits_163 = __as_u32(vals[11]);
+        unsigned int key_164 = ((bits_163 <= 2139095040) ? bits_163 : 0);
+        unsigned int bucket_165 = key_164 & 1023;
+        if (key_164 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_165], 1);
+        }
+        unsigned int bits_166 = __as_u32(vals[12]);
+        unsigned int key_167 = ((bits_166 <= 2139095040) ? bits_166 : 0);
+        unsigned int bucket_168 = key_167 & 1023;
+        if (key_167 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_168], 1);
+        }
+        unsigned int bits_169 = __as_u32(vals[13]);
+        unsigned int key_170 = ((bits_169 <= 2139095040) ? bits_169 : 0);
+        unsigned int bucket_171 = key_170 & 1023;
+        if (key_170 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_171], 1);
+        }
+        unsigned int bits_172 = __as_u32(vals[14]);
+        unsigned int key_173 = ((bits_172 <= 2139095040) ? bits_172 : 0);
+        unsigned int bucket_174 = key_173 & 1023;
+        if (key_173 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_174], 1);
+        }
+        unsigned int bits_175 = __as_u32(vals[15]);
+        unsigned int key_176 = ((bits_175 <= 2139095040) ? bits_175 : 0);
+        unsigned int bucket_177 = key_176 & 1023;
+        if (key_176 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_177], 1);
+        }
+        unsigned int bits_178 = __as_u32(vals[16]);
+        unsigned int key_179 = ((bits_178 <= 2139095040) ? bits_178 : 0);
+        unsigned int bucket_180 = key_179 & 1023;
+        if (key_179 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_180], 1);
+        }
+        unsigned int bits_181 = __as_u32(vals[17]);
+        unsigned int key_182 = ((bits_181 <= 2139095040) ? bits_181 : 0);
+        unsigned int bucket_183 = key_182 & 1023;
+        if (key_182 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_183], 1);
+        }
+        unsigned int bits_184 = __as_u32(vals[18]);
+        unsigned int key_185 = ((bits_184 <= 2139095040) ? bits_184 : 0);
+        unsigned int bucket_186 = key_185 & 1023;
+        if (key_185 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_186], 1);
+        }
+        unsigned int bits_187 = __as_u32(vals[19]);
+        unsigned int key_188 = ((bits_187 <= 2139095040) ? bits_187 : 0);
+        unsigned int bucket_189 = key_188 & 1023;
+        if (key_188 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_189], 1);
+        }
+        unsigned int bits_190 = __as_u32(vals[20]);
+        unsigned int key_191 = ((bits_190 <= 2139095040) ? bits_190 : 0);
+        unsigned int bucket_192 = key_191 & 1023;
+        if (key_191 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_192], 1);
+        }
+        unsigned int bits_193 = __as_u32(vals[21]);
+        unsigned int key_194 = ((bits_193 <= 2139095040) ? bits_193 : 0);
+        unsigned int bucket_195 = key_194 & 1023;
+        if (key_194 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_195], 1);
+        }
+        unsigned int bits_196 = __as_u32(vals[22]);
+        unsigned int key_197 = ((bits_196 <= 2139095040) ? bits_196 : 0);
+        unsigned int bucket_198 = key_197 & 1023;
+        if (key_197 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_198], 1);
+        }
+        unsigned int bits_199 = __as_u32(vals[23]);
+        unsigned int key_200 = ((bits_199 <= 2139095040) ? bits_199 : 0);
+        unsigned int bucket_201_1 = key_200 & 1023;
+        if (key_200 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_201_1], 1);
+        }
+        unsigned int bits_202 = __as_u32(vals[24]);
+        unsigned int key_203 = ((bits_202 <= 2139095040) ? bits_202 : 0);
+        unsigned int bucket_204 = key_203 & 1023;
+        if (key_203 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_204], 1);
+        }
+        unsigned int bits_205 = __as_u32(vals[25]);
+        unsigned int key_206 = ((bits_205 <= 2139095040) ? bits_205 : 0);
+        unsigned int bucket_207_1 = key_206 & 1023;
+        if (key_206 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_207_1], 1);
+        }
+        unsigned int bits_208 = __as_u32(vals[26]);
+        unsigned int key_209 = ((bits_208 <= 2139095040) ? bits_208 : 0);
+        unsigned int bucket_210 = key_209 & 1023;
+        if (key_209 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_210], 1);
+        }
+        unsigned int bits_211 = __as_u32(vals[27]);
+        unsigned int key_212 = ((bits_211 <= 2139095040) ? bits_211 : 0);
+        unsigned int bucket_213_1 = key_212 & 1023;
+        if (key_212 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_213_1], 1);
+        }
+        unsigned int bits_214 = __as_u32(vals[28]);
+        unsigned int key_215 = ((bits_214 <= 2139095040) ? bits_214 : 0);
+        unsigned int bucket_216 = key_215 & 1023;
+        if (key_215 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_216], 1);
+        }
+        unsigned int bits_217 = __as_u32(vals[29]);
+        unsigned int key_218 = ((bits_217 <= 2139095040) ? bits_217 : 0);
+        unsigned int bucket_219 = key_218 & 1023;
+        if (key_218 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_219], 1);
+        }
+        unsigned int bits_220 = __as_u32(vals[30]);
+        unsigned int key_221 = ((bits_220 <= 2139095040) ? bits_220 : 0);
+        unsigned int bucket_222 = key_221 & 1023;
+        if (key_221 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_222], 1);
+        }
+        unsigned int bits_223 = __as_u32(vals[31]);
+        unsigned int key_224 = ((bits_223 <= 2139095040) ? bits_223 : 0);
+        unsigned int bucket_225 = key_224 & 1023;
+        if (key_224 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_225], 1);
+        }
+        unsigned int bits_226 = __as_u32(vals[32]);
+        unsigned int key_227 = ((bits_226 <= 2139095040) ? bits_226 : 0);
+        unsigned int bucket_228 = key_227 & 1023;
+        if (key_227 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_228], 1);
+        }
+        unsigned int bits_229 = __as_u32(vals[33]);
+        unsigned int key_230 = ((bits_229 <= 2139095040) ? bits_229 : 0);
+        unsigned int bucket_231 = key_230 & 1023;
+        if (key_230 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_231], 1);
+        }
+        unsigned int bits_232 = __as_u32(vals[34]);
+        unsigned int key_233 = ((bits_232 <= 2139095040) ? bits_232 : 0);
+        unsigned int bucket_234 = key_233 & 1023;
+        if (key_233 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_234], 1);
+        }
+        unsigned int bits_235 = __as_u32(vals[35]);
+        unsigned int key_236 = ((bits_235 <= 2139095040) ? bits_235 : 0);
+        unsigned int bucket_237 = key_236 & 1023;
+        if (key_236 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_237], 1);
+        }
+        unsigned int bits_238 = __as_u32(vals[36]);
+        unsigned int key_239 = ((bits_238 <= 2139095040) ? bits_238 : 0);
+        unsigned int bucket_240 = key_239 & 1023;
+        if (key_239 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_240], 1);
+        }
+        unsigned int bits_241 = __as_u32(vals[37]);
+        unsigned int key_242 = ((bits_241 <= 2139095040) ? bits_241 : 0);
+        unsigned int bucket_243 = key_242 & 1023;
+        if (key_242 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_243], 1);
+        }
+        unsigned int bits_244 = __as_u32(vals[38]);
+        unsigned int key_245 = ((bits_244 <= 2139095040) ? bits_244 : 0);
+        unsigned int bucket_246 = key_245 & 1023;
+        if (key_245 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_246], 1);
+        }
+        unsigned int bits_247 = __as_u32(vals[39]);
+        unsigned int key_248 = ((bits_247 <= 2139095040) ? bits_247 : 0);
+        unsigned int bucket_249 = key_248 & 1023;
+        if (key_248 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_249], 1);
+        }
+        __syncthreads();
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int c0_250 = 0;
+        unsigned int c1_251 = 0;
+        unsigned int c2_252 = 0;
+        unsigned int c3_253 = 0;
+        unsigned int words_254[4];
+        uint32_t _cluster_mapa_96;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_96) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_254[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 3]))
+            : "r"(_cluster_mapa_96));
+        c0_250 = c0_250 + words_254[0];
+        c1_251 = c1_251 + words_254[1];
+        c2_252 = c2_252 + words_254[2];
+        c3_253 = c3_253 + words_254[3];
+        unsigned int words_255[4];
+        uint32_t _cluster_mapa_97;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_97) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_255[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 3]))
+            : "r"(_cluster_mapa_97));
+        c0_250 = c0_250 + words_255[0];
+        c1_251 = c1_251 + words_255[1];
+        c2_252 = c2_252 + words_255[2];
+        c3_253 = c3_253 + words_255[3];
+        unsigned int words_256[4];
+        uint32_t _cluster_mapa_98;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_98) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_256[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 3]))
+            : "r"(_cluster_mapa_98));
+        c0_250 = c0_250 + words_256[0];
+        c1_251 = c1_251 + words_256[1];
+        c2_252 = c2_252 + words_256[2];
+        c3_253 = c3_253 + words_256[3];
+        unsigned int words_257[4];
+        uint32_t _cluster_mapa_99;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_99) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_257[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 3]))
+            : "r"(_cluster_mapa_99));
+        c0_250 = c0_250 + words_257[0];
+        c1_251 = c1_251 + words_257[1];
+        c2_252 = c2_252 + words_257[2];
+        c3_253 = c3_253 + words_257[3];
+        unsigned int words_258[4];
+        uint32_t _cluster_mapa_100;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_100) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_258[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 3]))
+            : "r"(_cluster_mapa_100));
+        c0_250 = c0_250 + words_258[0];
+        c1_251 = c1_251 + words_258[1];
+        c2_252 = c2_252 + words_258[2];
+        c3_253 = c3_253 + words_258[3];
+        unsigned int words_259[4];
+        uint32_t _cluster_mapa_101;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_101) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_259[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 3]))
+            : "r"(_cluster_mapa_101));
+        c0_250 = c0_250 + words_259[0];
+        c1_251 = c1_251 + words_259[1];
+        c2_252 = c2_252 + words_259[2];
+        c3_253 = c3_253 + words_259[3];
+        unsigned int words_260[4];
+        uint32_t _cluster_mapa_102;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_102) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_260[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 3]))
+            : "r"(_cluster_mapa_102));
+        c0_250 = c0_250 + words_260[0];
+        c1_251 = c1_251 + words_260[1];
+        c2_252 = c2_252 + words_260[2];
+        c3_253 = c3_253 + words_260[3];
+        unsigned int words_261[4];
+        uint32_t _cluster_mapa_103;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_103) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_261[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 3]))
+            : "r"(_cluster_mapa_103));
+        c0_250 = c0_250 + words_261[0];
+        c1_251 = c1_251 + words_261[1];
+        c2_252 = c2_252 + words_261[2];
+        c3_253 = c3_253 + words_261[3];
+        unsigned int local_262 = c0_250 + c1_251 + c2_252 + c3_253;
+        uint32_t _warp_scan_sum_104 = local_262;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(16));
+        unsigned int lane_suffix_263 = _warp_scan_sum_104 - local_262;
+        unsigned int warp_total_264;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_264) : "r"(local_262));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_264;
+        }
+        __syncthreads();
+        unsigned int peer_265 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_266 = ((lane > warp) ? peer_265 : 0);
+        unsigned int warps_above_267;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_267) : "r"(above_266));
+        unsigned int suffix_268 = lane_suffix_263 + warps_above_267;
+        bool hit_269 = 0;
+        unsigned int bucket_270 = 0;
+        unsigned int rest_271 = 0;
+        if (suffix_268 < remaining && remaining <= suffix_268 + local_262) {
+            hit_269 = 1;
+            unsigned int s3_7 = suffix_268 + c3_253;
+            unsigned int s2_7 = s3_7 + c2_252;
+            unsigned int s1_7 = s2_7 + c1_251;
+            if (remaining <= s3_7) {
+                bucket_270 = (unsigned int)(tid * 4 + 3);
+                rest_271 = remaining - suffix_268;
+            } else if (remaining <= s2_7) {
+                bucket_270 = (unsigned int)(tid * 4 + 2);
+                rest_271 = remaining - s3_7;
+            } else {
+                if (remaining <= s1_7) {
+                    bucket_270 = (unsigned int)(tid * 4 + 1);
+                    rest_271 = remaining - s2_7;
+                } else {
+                    bucket_270 = (unsigned int)(tid * 4);
+                    rest_271 = remaining - s1_7;
+                }
+            }
+        }
+        if (hit_269) {
+            scal[0] = bucket_270;
+            scal[1] = rest_271;
+        }
+        __syncthreads();
+        unsigned int bsel_272 = scal[0];
+        remaining = scal[1];
+        prefix = prefix << 10 | bsel_272;
+        unsigned int threshold_f = prefix;
+        unsigned int gt = 0;
+        unsigned int bits_273 = __as_u32(vals[0]);
+        unsigned int key_274 = ((bits_273 <= 2139095040) ? bits_273 : 0);
+        int i_vec = start + tid * 4;
+        int i_str = start + tid;
+        int i_13 = i_vec;
+        int i_275 = i_13;
+        bool tie = key_274 == threshold_f && i_275 < vocab;
+        unsigned int m = __ballot_sync(0xFFFFFFFF, tie);
+        if (lane == 0) {
+            cnt[warp] = (unsigned int)__popc(m);
+        }
+        if (key_274 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_276 = __as_u32(vals[1]);
+        unsigned int key_277 = ((bits_276 <= 2139095040) ? bits_276 : 0);
+        int i_vec_278 = start + tid * 4 + 1;
+        int i_str_279 = start + 512 + tid;
+        int i_280_1 = i_vec_278;
+        int i_281 = i_280_1;
+        bool tie_282 = key_277 == threshold_f && i_281 < vocab;
+        unsigned int m_283 = __ballot_sync(0xFFFFFFFF, tie_282);
+        if (lane == 0) {
+            cnt[16 + warp] = (unsigned int)__popc(m_283);
+        }
+        if (key_277 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_284 = __as_u32(vals[2]);
+        unsigned int key_285 = ((bits_284 <= 2139095040) ? bits_284 : 0);
+        int i_vec_286 = start + tid * 4 + 2;
+        int i_str_287 = start + 1024 + tid;
+        int i_288 = i_vec_286;
+        int i_289_1 = i_288;
+        bool tie_290 = key_285 == threshold_f && i_289_1 < vocab;
+        unsigned int m_291 = __ballot_sync(0xFFFFFFFF, tie_290);
+        if (lane == 0) {
+            cnt[32 + warp] = (unsigned int)__popc(m_291);
+        }
+        if (key_285 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_292 = __as_u32(vals[3]);
+        unsigned int key_293 = ((bits_292 <= 2139095040) ? bits_292 : 0);
+        int i_vec_294 = start + tid * 4 + 3;
+        int i_str_295 = start + 1536 + tid;
+        int i_296 = i_vec_294;
+        int i_297 = i_296;
+        bool tie_298 = key_293 == threshold_f && i_297 < vocab;
+        unsigned int m_299 = __ballot_sync(0xFFFFFFFF, tie_298);
+        if (lane == 0) {
+            cnt[48 + warp] = (unsigned int)__popc(m_299);
+        }
+        if (key_293 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_300 = __as_u32(vals[4]);
+        unsigned int key_301 = ((bits_300 <= 2139095040) ? bits_300 : 0);
+        int i_vec_302 = start + 2048 + tid * 4;
+        int i_str_303 = start + 2048 + tid;
+        int i_304_1 = i_vec_302;
+        int i_305 = i_304_1;
+        bool tie_306 = key_301 == threshold_f && i_305 < vocab;
+        unsigned int m_307 = __ballot_sync(0xFFFFFFFF, tie_306);
+        if (lane == 0) {
+            cnt[64 + warp] = (unsigned int)__popc(m_307);
+        }
+        if (key_301 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_308 = __as_u32(vals[5]);
+        unsigned int key_309 = ((bits_308 <= 2139095040) ? bits_308 : 0);
+        int i_vec_310 = start + 2048 + tid * 4 + 1;
+        int i_str_311 = start + 2560 + tid;
+        int i_312 = i_vec_310;
+        int i_313_1 = i_312;
+        bool tie_314 = key_309 == threshold_f && i_313_1 < vocab;
+        unsigned int m_315 = __ballot_sync(0xFFFFFFFF, tie_314);
+        if (lane == 0) {
+            cnt[80 + warp] = (unsigned int)__popc(m_315);
+        }
+        if (key_309 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_316 = __as_u32(vals[6]);
+        unsigned int key_317 = ((bits_316 <= 2139095040) ? bits_316 : 0);
+        int i_vec_318 = start + 2048 + tid * 4 + 2;
+        int i_str_319 = start + 3072 + tid;
+        int i_320 = i_vec_318;
+        int i_321 = i_320;
+        bool tie_322 = key_317 == threshold_f && i_321 < vocab;
+        unsigned int m_323 = __ballot_sync(0xFFFFFFFF, tie_322);
+        if (lane == 0) {
+            cnt[96 + warp] = (unsigned int)__popc(m_323);
+        }
+        if (key_317 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_324 = __as_u32(vals[7]);
+        unsigned int key_325 = ((bits_324 <= 2139095040) ? bits_324 : 0);
+        int i_vec_326 = start + 2048 + tid * 4 + 3;
+        int i_str_327 = start + 3584 + tid;
+        int i_328_1 = i_vec_326;
+        int i_329 = i_328_1;
+        bool tie_330 = key_325 == threshold_f && i_329 < vocab;
+        unsigned int m_331 = __ballot_sync(0xFFFFFFFF, tie_330);
+        if (lane == 0) {
+            cnt[112 + warp] = (unsigned int)__popc(m_331);
+        }
+        if (key_325 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_332 = __as_u32(vals[8]);
+        unsigned int key_333 = ((bits_332 <= 2139095040) ? bits_332 : 0);
+        int i_vec_334 = start + 4096 + tid * 4;
+        int i_str_335 = start + 4096 + tid;
+        int i_336 = i_vec_334;
+        int i_337_1 = i_336;
+        bool tie_338 = key_333 == threshold_f && i_337_1 < vocab;
+        unsigned int m_339 = __ballot_sync(0xFFFFFFFF, tie_338);
+        if (lane == 0) {
+            cnt[128 + warp] = (unsigned int)__popc(m_339);
+        }
+        if (key_333 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_340 = __as_u32(vals[9]);
+        unsigned int key_341 = ((bits_340 <= 2139095040) ? bits_340 : 0);
+        int i_vec_342 = start + 4096 + tid * 4 + 1;
+        int i_str_343 = start + 4608 + tid;
+        int i_344 = i_vec_342;
+        int i_345 = i_344;
+        bool tie_346 = key_341 == threshold_f && i_345 < vocab;
+        unsigned int m_347 = __ballot_sync(0xFFFFFFFF, tie_346);
+        if (lane == 0) {
+            cnt[144 + warp] = (unsigned int)__popc(m_347);
+        }
+        if (key_341 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_348 = __as_u32(vals[10]);
+        unsigned int key_349 = ((bits_348 <= 2139095040) ? bits_348 : 0);
+        int i_vec_350 = start + 4096 + tid * 4 + 2;
+        int i_str_351 = start + 5120 + tid;
+        int i_352_1 = i_vec_350;
+        int i_353 = i_352_1;
+        bool tie_354 = key_349 == threshold_f && i_353 < vocab;
+        unsigned int m_355 = __ballot_sync(0xFFFFFFFF, tie_354);
+        if (lane == 0) {
+            cnt[160 + warp] = (unsigned int)__popc(m_355);
+        }
+        if (key_349 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_356 = __as_u32(vals[11]);
+        unsigned int key_357 = ((bits_356 <= 2139095040) ? bits_356 : 0);
+        int i_vec_358 = start + 4096 + tid * 4 + 3;
+        int i_str_359 = start + 5632 + tid;
+        int i_360 = i_vec_358;
+        int i_361 = i_360;
+        bool tie_362 = key_357 == threshold_f && i_361 < vocab;
+        unsigned int m_363 = __ballot_sync(0xFFFFFFFF, tie_362);
+        if (lane == 0) {
+            cnt[176 + warp] = (unsigned int)__popc(m_363);
+        }
+        if (key_357 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_364 = __as_u32(vals[12]);
+        unsigned int key_365 = ((bits_364 <= 2139095040) ? bits_364 : 0);
+        int i_vec_366 = start + 6144 + tid * 4;
+        int i_str_367 = start + 6144 + tid;
+        int i_368 = i_vec_366;
+        int i_369 = i_368;
+        bool tie_370 = key_365 == threshold_f && i_369 < vocab;
+        unsigned int m_371 = __ballot_sync(0xFFFFFFFF, tie_370);
+        if (lane == 0) {
+            cnt[192 + warp] = (unsigned int)__popc(m_371);
+        }
+        if (key_365 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_372 = __as_u32(vals[13]);
+        unsigned int key_373 = ((bits_372 <= 2139095040) ? bits_372 : 0);
+        int i_vec_374 = start + 6144 + tid * 4 + 1;
+        int i_str_375 = start + 6656 + tid;
+        int i_376 = i_vec_374;
+        int i_377 = i_376;
+        bool tie_378 = key_373 == threshold_f && i_377 < vocab;
+        unsigned int m_379 = __ballot_sync(0xFFFFFFFF, tie_378);
+        if (lane == 0) {
+            cnt[208 + warp] = (unsigned int)__popc(m_379);
+        }
+        if (key_373 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_380 = __as_u32(vals[14]);
+        unsigned int key_381 = ((bits_380 <= 2139095040) ? bits_380 : 0);
+        int i_vec_382 = start + 6144 + tid * 4 + 2;
+        int i_str_383 = start + 7168 + tid;
+        int i_384 = i_vec_382;
+        int i_385 = i_384;
+        bool tie_386 = key_381 == threshold_f && i_385 < vocab;
+        unsigned int m_387 = __ballot_sync(0xFFFFFFFF, tie_386);
+        if (lane == 0) {
+            cnt[224 + warp] = (unsigned int)__popc(m_387);
+        }
+        if (key_381 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_388 = __as_u32(vals[15]);
+        unsigned int key_389 = ((bits_388 <= 2139095040) ? bits_388 : 0);
+        int i_vec_390 = start + 6144 + tid * 4 + 3;
+        int i_str_391 = start + 7680 + tid;
+        int i_392 = i_vec_390;
+        int i_393 = i_392;
+        bool tie_394 = key_389 == threshold_f && i_393 < vocab;
+        unsigned int m_395 = __ballot_sync(0xFFFFFFFF, tie_394);
+        if (lane == 0) {
+            cnt[240 + warp] = (unsigned int)__popc(m_395);
+        }
+        if (key_389 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_396 = __as_u32(vals[16]);
+        unsigned int key_397 = ((bits_396 <= 2139095040) ? bits_396 : 0);
+        int i_vec_398 = start + 8192 + tid * 4;
+        int i_str_399 = start + 8192 + tid;
+        int i_400 = i_vec_398;
+        int i_401 = i_400;
+        bool tie_402 = key_397 == threshold_f && i_401 < vocab;
+        unsigned int m_403 = __ballot_sync(0xFFFFFFFF, tie_402);
+        if (lane == 0) {
+            cnt[256 + warp] = (unsigned int)__popc(m_403);
+        }
+        if (key_397 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_404 = __as_u32(vals[17]);
+        unsigned int key_405 = ((bits_404 <= 2139095040) ? bits_404 : 0);
+        int i_vec_406 = start + 8192 + tid * 4 + 1;
+        int i_str_407 = start + 8704 + tid;
+        int i_408 = i_vec_406;
+        int i_409 = i_408;
+        bool tie_410 = key_405 == threshold_f && i_409 < vocab;
+        unsigned int m_411 = __ballot_sync(0xFFFFFFFF, tie_410);
+        if (lane == 0) {
+            cnt[272 + warp] = (unsigned int)__popc(m_411);
+        }
+        if (key_405 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_412 = __as_u32(vals[18]);
+        unsigned int key_413 = ((bits_412 <= 2139095040) ? bits_412 : 0);
+        int i_vec_414 = start + 8192 + tid * 4 + 2;
+        int i_str_415 = start + 9216 + tid;
+        int i_416 = i_vec_414;
+        int i_417 = i_416;
+        bool tie_418 = key_413 == threshold_f && i_417 < vocab;
+        unsigned int m_419 = __ballot_sync(0xFFFFFFFF, tie_418);
+        if (lane == 0) {
+            cnt[288 + warp] = (unsigned int)__popc(m_419);
+        }
+        if (key_413 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_420 = __as_u32(vals[19]);
+        unsigned int key_421 = ((bits_420 <= 2139095040) ? bits_420 : 0);
+        int i_vec_422 = start + 8192 + tid * 4 + 3;
+        int i_str_423 = start + 9728 + tid;
+        int i_424 = i_vec_422;
+        int i_425 = i_424;
+        bool tie_426 = key_421 == threshold_f && i_425 < vocab;
+        unsigned int m_427 = __ballot_sync(0xFFFFFFFF, tie_426);
+        if (lane == 0) {
+            cnt[304 + warp] = (unsigned int)__popc(m_427);
+        }
+        if (key_421 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_428 = __as_u32(vals[20]);
+        unsigned int key_429 = ((bits_428 <= 2139095040) ? bits_428 : 0);
+        int i_vec_430 = start + 10240 + tid * 4;
+        int i_str_431 = start + 10240 + tid;
+        int i_432 = i_vec_430;
+        int i_433 = i_432;
+        bool tie_434 = key_429 == threshold_f && i_433 < vocab;
+        unsigned int m_435 = __ballot_sync(0xFFFFFFFF, tie_434);
+        if (lane == 0) {
+            cnt[320 + warp] = (unsigned int)__popc(m_435);
+        }
+        if (key_429 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_436 = __as_u32(vals[21]);
+        unsigned int key_437 = ((bits_436 <= 2139095040) ? bits_436 : 0);
+        int i_vec_438 = start + 10240 + tid * 4 + 1;
+        int i_str_439 = start + 10752 + tid;
+        int i_440 = i_vec_438;
+        int i_441 = i_440;
+        bool tie_442 = key_437 == threshold_f && i_441 < vocab;
+        unsigned int m_443 = __ballot_sync(0xFFFFFFFF, tie_442);
+        if (lane == 0) {
+            cnt[336 + warp] = (unsigned int)__popc(m_443);
+        }
+        if (key_437 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_444 = __as_u32(vals[22]);
+        unsigned int key_445 = ((bits_444 <= 2139095040) ? bits_444 : 0);
+        int i_vec_446 = start + 10240 + tid * 4 + 2;
+        int i_str_447 = start + 11264 + tid;
+        int i_448 = i_vec_446;
+        int i_449 = i_448;
+        bool tie_450 = key_445 == threshold_f && i_449 < vocab;
+        unsigned int m_451 = __ballot_sync(0xFFFFFFFF, tie_450);
+        if (lane == 0) {
+            cnt[352 + warp] = (unsigned int)__popc(m_451);
+        }
+        if (key_445 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_452 = __as_u32(vals[23]);
+        unsigned int key_453 = ((bits_452 <= 2139095040) ? bits_452 : 0);
+        int i_vec_454 = start + 10240 + tid * 4 + 3;
+        int i_str_455 = start + 11776 + tid;
+        int i_456 = i_vec_454;
+        int i_457 = i_456;
+        bool tie_458 = key_453 == threshold_f && i_457 < vocab;
+        unsigned int m_459 = __ballot_sync(0xFFFFFFFF, tie_458);
+        if (lane == 0) {
+            cnt[368 + warp] = (unsigned int)__popc(m_459);
+        }
+        if (key_453 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_460 = __as_u32(vals[24]);
+        unsigned int key_461 = ((bits_460 <= 2139095040) ? bits_460 : 0);
+        int i_vec_462 = start + 12288 + tid * 4;
+        int i_str_463 = start + 12288 + tid;
+        int i_464 = i_vec_462;
+        int i_465 = i_464;
+        bool tie_466 = key_461 == threshold_f && i_465 < vocab;
+        unsigned int m_467 = __ballot_sync(0xFFFFFFFF, tie_466);
+        if (lane == 0) {
+            cnt[384 + warp] = (unsigned int)__popc(m_467);
+        }
+        if (key_461 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_468 = __as_u32(vals[25]);
+        unsigned int key_469 = ((bits_468 <= 2139095040) ? bits_468 : 0);
+        int i_vec_470 = start + 12288 + tid * 4 + 1;
+        int i_str_471 = start + 12800 + tid;
+        int i_472 = i_vec_470;
+        int i_473 = i_472;
+        bool tie_474 = key_469 == threshold_f && i_473 < vocab;
+        unsigned int m_475 = __ballot_sync(0xFFFFFFFF, tie_474);
+        if (lane == 0) {
+            cnt[400 + warp] = (unsigned int)__popc(m_475);
+        }
+        if (key_469 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_476 = __as_u32(vals[26]);
+        unsigned int key_477 = ((bits_476 <= 2139095040) ? bits_476 : 0);
+        int i_vec_478 = start + 12288 + tid * 4 + 2;
+        int i_str_479 = start + 13312 + tid;
+        int i_480 = i_vec_478;
+        int i_481 = i_480;
+        bool tie_482 = key_477 == threshold_f && i_481 < vocab;
+        unsigned int m_483 = __ballot_sync(0xFFFFFFFF, tie_482);
+        if (lane == 0) {
+            cnt[416 + warp] = (unsigned int)__popc(m_483);
+        }
+        if (key_477 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_484 = __as_u32(vals[27]);
+        unsigned int key_485 = ((bits_484 <= 2139095040) ? bits_484 : 0);
+        int i_vec_486 = start + 12288 + tid * 4 + 3;
+        int i_str_487 = start + 13824 + tid;
+        int i_488 = i_vec_486;
+        int i_489 = i_488;
+        bool tie_490 = key_485 == threshold_f && i_489 < vocab;
+        unsigned int m_491 = __ballot_sync(0xFFFFFFFF, tie_490);
+        if (lane == 0) {
+            cnt[432 + warp] = (unsigned int)__popc(m_491);
+        }
+        if (key_485 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_492 = __as_u32(vals[28]);
+        unsigned int key_493 = ((bits_492 <= 2139095040) ? bits_492 : 0);
+        int i_vec_494 = start + 14336 + tid * 4;
+        int i_str_495 = start + 14336 + tid;
+        int i_496 = i_vec_494;
+        int i_497 = i_496;
+        bool tie_498 = key_493 == threshold_f && i_497 < vocab;
+        unsigned int m_499 = __ballot_sync(0xFFFFFFFF, tie_498);
+        if (lane == 0) {
+            cnt[448 + warp] = (unsigned int)__popc(m_499);
+        }
+        if (key_493 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_500 = __as_u32(vals[29]);
+        unsigned int key_501 = ((bits_500 <= 2139095040) ? bits_500 : 0);
+        int i_vec_502 = start + 14336 + tid * 4 + 1;
+        int i_str_503 = start + 14848 + tid;
+        int i_504 = i_vec_502;
+        int i_505 = i_504;
+        bool tie_506 = key_501 == threshold_f && i_505 < vocab;
+        unsigned int m_507 = __ballot_sync(0xFFFFFFFF, tie_506);
+        if (lane == 0) {
+            cnt[464 + warp] = (unsigned int)__popc(m_507);
+        }
+        if (key_501 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_508 = __as_u32(vals[30]);
+        unsigned int key_509 = ((bits_508 <= 2139095040) ? bits_508 : 0);
+        int i_vec_510 = start + 14336 + tid * 4 + 2;
+        int i_str_511 = start + 15360 + tid;
+        int i_512 = i_vec_510;
+        int i_513 = i_512;
+        bool tie_514 = key_509 == threshold_f && i_513 < vocab;
+        unsigned int m_515 = __ballot_sync(0xFFFFFFFF, tie_514);
+        if (lane == 0) {
+            cnt[480 + warp] = (unsigned int)__popc(m_515);
+        }
+        if (key_509 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_516 = __as_u32(vals[31]);
+        unsigned int key_517 = ((bits_516 <= 2139095040) ? bits_516 : 0);
+        int i_vec_518 = start + 14336 + tid * 4 + 3;
+        int i_str_519 = start + 15872 + tid;
+        int i_520 = i_vec_518;
+        int i_521 = i_520;
+        bool tie_522 = key_517 == threshold_f && i_521 < vocab;
+        unsigned int m_523 = __ballot_sync(0xFFFFFFFF, tie_522);
+        if (lane == 0) {
+            cnt[496 + warp] = (unsigned int)__popc(m_523);
+        }
+        if (key_517 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_524 = __as_u32(vals[32]);
+        unsigned int key_525 = ((bits_524 <= 2139095040) ? bits_524 : 0);
+        int i_vec_526 = start + 16384 + tid * 4;
+        int i_str_527 = start + 16384 + tid;
+        int i_528 = i_vec_526;
+        int i_529 = i_528;
+        bool tie_530 = key_525 == threshold_f && i_529 < vocab;
+        unsigned int m_531 = __ballot_sync(0xFFFFFFFF, tie_530);
+        if (lane == 0) {
+            cnt[512 + warp] = (unsigned int)__popc(m_531);
+        }
+        if (key_525 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_532 = __as_u32(vals[33]);
+        unsigned int key_533 = ((bits_532 <= 2139095040) ? bits_532 : 0);
+        int i_vec_534 = start + 16384 + tid * 4 + 1;
+        int i_str_535 = start + 16896 + tid;
+        int i_536 = i_vec_534;
+        int i_537 = i_536;
+        bool tie_538 = key_533 == threshold_f && i_537 < vocab;
+        unsigned int m_539 = __ballot_sync(0xFFFFFFFF, tie_538);
+        if (lane == 0) {
+            cnt[528 + warp] = (unsigned int)__popc(m_539);
+        }
+        if (key_533 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_540 = __as_u32(vals[34]);
+        unsigned int key_541 = ((bits_540 <= 2139095040) ? bits_540 : 0);
+        int i_vec_542 = start + 16384 + tid * 4 + 2;
+        int i_str_543 = start + 17408 + tid;
+        int i_544 = i_vec_542;
+        int i_545 = i_544;
+        bool tie_546 = key_541 == threshold_f && i_545 < vocab;
+        unsigned int m_547 = __ballot_sync(0xFFFFFFFF, tie_546);
+        if (lane == 0) {
+            cnt[544 + warp] = (unsigned int)__popc(m_547);
+        }
+        if (key_541 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_548 = __as_u32(vals[35]);
+        unsigned int key_549 = ((bits_548 <= 2139095040) ? bits_548 : 0);
+        int i_vec_550 = start + 16384 + tid * 4 + 3;
+        int i_str_551 = start + 17920 + tid;
+        int i_552 = i_vec_550;
+        int i_553 = i_552;
+        bool tie_554 = key_549 == threshold_f && i_553 < vocab;
+        unsigned int m_555 = __ballot_sync(0xFFFFFFFF, tie_554);
+        if (lane == 0) {
+            cnt[560 + warp] = (unsigned int)__popc(m_555);
+        }
+        if (key_549 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_556 = __as_u32(vals[36]);
+        unsigned int key_557 = ((bits_556 <= 2139095040) ? bits_556 : 0);
+        int i_vec_558 = start + 18432 + tid * 4;
+        int i_str_559 = start + 18432 + tid;
+        int i_560 = i_vec_558;
+        int i_561 = i_560;
+        bool tie_562 = key_557 == threshold_f && i_561 < vocab;
+        unsigned int m_563 = __ballot_sync(0xFFFFFFFF, tie_562);
+        if (lane == 0) {
+            cnt[576 + warp] = (unsigned int)__popc(m_563);
+        }
+        if (key_557 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_564 = __as_u32(vals[37]);
+        unsigned int key_565 = ((bits_564 <= 2139095040) ? bits_564 : 0);
+        int i_vec_566 = start + 18432 + tid * 4 + 1;
+        int i_str_567 = start + 18944 + tid;
+        int i_568 = i_vec_566;
+        int i_569 = i_568;
+        bool tie_570 = key_565 == threshold_f && i_569 < vocab;
+        unsigned int m_571 = __ballot_sync(0xFFFFFFFF, tie_570);
+        if (lane == 0) {
+            cnt[592 + warp] = (unsigned int)__popc(m_571);
+        }
+        if (key_565 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_572 = __as_u32(vals[38]);
+        unsigned int key_573 = ((bits_572 <= 2139095040) ? bits_572 : 0);
+        int i_vec_574 = start + 18432 + tid * 4 + 2;
+        int i_str_575 = start + 19456 + tid;
+        int i_576 = i_vec_574;
+        int i_577 = i_576;
+        bool tie_578 = key_573 == threshold_f && i_577 < vocab;
+        unsigned int m_579 = __ballot_sync(0xFFFFFFFF, tie_578);
+        if (lane == 0) {
+            cnt[608 + warp] = (unsigned int)__popc(m_579);
+        }
+        if (key_573 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_580 = __as_u32(vals[39]);
+        unsigned int key_581 = ((bits_580 <= 2139095040) ? bits_580 : 0);
+        int i_vec_582 = start + 18432 + tid * 4 + 3;
+        int i_str_583 = start + 19968 + tid;
+        int i_584 = i_vec_582;
+        int i_585 = i_584;
+        bool tie_586 = key_581 == threshold_f && i_585 < vocab;
+        unsigned int m_587 = __ballot_sync(0xFFFFFFFF, tie_586);
+        if (lane == 0) {
+            cnt[624 + warp] = (unsigned int)__popc(m_587);
+        }
+        if (key_581 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int gt_cnt = gt;
+        __syncthreads();
+        unsigned int local_588 = 0;
+        int f = tid * 2;
+        if (f < 640) {
+            local_588 = local_588 + cnt[f];
+        }
+        int f_589 = tid * 2 + 1;
+        if (f_589 < 640) {
+            local_588 = local_588 + cnt[f_589];
+        }
+        unsigned int packed_1 = gt_cnt | local_588 << 12;
+        uint32_t incl_1 = packed_1;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl_1;
+        }
+        __syncthreads();
+        unsigned int before_1 = 0;
+        unsigned int total_1 = 0;
+        unsigned int ws_1 = warp_sums[0];
+        total_1 = total_1 + ws_1;
+        if (warp > 0) {
+            before_1 = before_1 + ws_1;
+        }
+        unsigned int ws_590 = warp_sums[1];
+        total_1 = total_1 + ws_590;
+        if (warp > 1) {
+            before_1 = before_1 + ws_590;
+        }
+        unsigned int ws_591 = warp_sums[2];
+        total_1 = total_1 + ws_591;
+        if (warp > 2) {
+            before_1 = before_1 + ws_591;
+        }
+        unsigned int ws_592 = warp_sums[3];
+        total_1 = total_1 + ws_592;
+        if (warp > 3) {
+            before_1 = before_1 + ws_592;
+        }
+        unsigned int ws_593 = warp_sums[4];
+        total_1 = total_1 + ws_593;
+        if (warp > 4) {
+            before_1 = before_1 + ws_593;
+        }
+        unsigned int ws_594 = warp_sums[5];
+        total_1 = total_1 + ws_594;
+        if (warp > 5) {
+            before_1 = before_1 + ws_594;
+        }
+        unsigned int ws_595 = warp_sums[6];
+        total_1 = total_1 + ws_595;
+        if (warp > 6) {
+            before_1 = before_1 + ws_595;
+        }
+        unsigned int ws_596 = warp_sums[7];
+        total_1 = total_1 + ws_596;
+        if (warp > 7) {
+            before_1 = before_1 + ws_596;
+        }
+        unsigned int ws_597 = warp_sums[8];
+        total_1 = total_1 + ws_597;
+        if (warp > 8) {
+            before_1 = before_1 + ws_597;
+        }
+        unsigned int ws_598 = warp_sums[9];
+        total_1 = total_1 + ws_598;
+        if (warp > 9) {
+            before_1 = before_1 + ws_598;
+        }
+        unsigned int ws_599 = warp_sums[10];
+        total_1 = total_1 + ws_599;
+        if (warp > 10) {
+            before_1 = before_1 + ws_599;
+        }
+        unsigned int ws_600 = warp_sums[11];
+        total_1 = total_1 + ws_600;
+        if (warp > 11) {
+            before_1 = before_1 + ws_600;
+        }
+        unsigned int ws_601 = warp_sums[12];
+        total_1 = total_1 + ws_601;
+        if (warp > 12) {
+            before_1 = before_1 + ws_601;
+        }
+        unsigned int ws_602 = warp_sums[13];
+        total_1 = total_1 + ws_602;
+        if (warp > 13) {
+            before_1 = before_1 + ws_602;
+        }
+        unsigned int ws_603 = warp_sums[14];
+        total_1 = total_1 + ws_603;
+        if (warp > 14) {
+            before_1 = before_1 + ws_603;
+        }
+        unsigned int ws_604 = warp_sums[15];
+        total_1 = total_1 + ws_604;
+        if (warp > 15) {
+            before_1 = before_1 + ws_604;
+        }
+        unsigned int excl_1 = before_1 + incl_1 - packed_1;
+        __syncthreads();
+        unsigned int running = excl_1 >> 12;
+        int f2 = tid * 2;
+        if (f2 < 640) {
+            unsigned int c_1 = cnt[f2];
+            cnt[f2] = running;
+            running = running + c_1;
+        }
+        int f2_605 = tid * 2 + 1;
+        if (f2_605 < 640) {
+            unsigned int c_3 = cnt[f2_605];
+            cnt[f2_605] = running;
+            running = running + c_3;
+        }
+        __syncthreads();
+        unsigned int gt_slot = excl_1 & 4095;
+        unsigned int gt_total = total_1 & 4095;
+        unsigned int eq_total = total_1 >> 12;
+        if (tid == 0) {
+            scal[2] = gt_total;
+            scal[3] = eq_total;
+        }
+        __syncthreads();
+        unsigned int gt_prefix = 0;
+        unsigned int eq_prefix = 0;
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r_1 = 0; r_1 < 8; r_1++) {
+            if (rank > r_1) {
+                uint32_t _mapa_8;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_8) : "r"(scal_addr + 8), "r"(r_1));
+                unsigned int cluster_value_1[1];
+                asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_1[0])) : "r"(_mapa_8) : "memory");
+                unsigned int gt_peer = cluster_value_1[0];
+                uint32_t _mapa_9;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_9) : "r"(scal_addr + 12), "r"(r_1));
+                unsigned int cluster_value_0[1];
+                asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_0[0])) : "r"(_mapa_9) : "memory");
+                unsigned int eq_peer = cluster_value_0[0];
+                gt_prefix = gt_prefix + gt_peer;
+                eq_prefix = eq_prefix + eq_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int gt_total_606 = k_u - remaining;
+        unsigned int _min_105 = ((eq_total) < (remaining - eq_prefix) ? (eq_total) : (remaining - eq_prefix));
+        unsigned int eq_take = ((eq_prefix < remaining) ? _min_105 : 0);
+        unsigned long long gt_base = out_base + (unsigned long long)gt_prefix;
+        unsigned long long eq_base = out_base + (unsigned long long)(gt_total_606 + eq_prefix);
+        unsigned int lt_mask = (1 << (unsigned int)lane) - 1;
+        unsigned int g_1 = gt_slot;
+        unsigned int keys[4];
+        int idxs[4];
+        bool ties[4];
+        unsigned int strided[4];
+        unsigned int grp_warp = 0;
+        unsigned int grp_lane = 0;
+        unsigned int bits_607 = __as_u32(vals[0]);
+        unsigned int key_608 = ((bits_607 <= 2139095040) ? bits_607 : 0);
+        keys[0] = key_608;
+        int i_vec_609 = start + tid * 4;
+        int i_str_610 = start + tid;
+        int i_611 = i_vec_609;
+        idxs[0] = i_611;
+        ties[0] = keys[0] == threshold_f && idxs[0] < vocab;
+        unsigned int m_612 = __ballot_sync(0xFFFFFFFF, ties[0]);
+        unsigned int lane_before = (unsigned int)__popc(m_612 & lt_mask);
+        unsigned int warp_off = cnt[warp];
+        strided[0] = warp_off + lane_before;
+        grp_warp = grp_warp + (warp_off - cnt[0]);
+        grp_lane = grp_lane + lane_before;
+        unsigned int bits_613 = __as_u32(vals[1]);
+        unsigned int key_614 = ((bits_613 <= 2139095040) ? bits_613 : 0);
+        keys[1] = key_614;
+        int i_vec_615 = start + tid * 4 + 1;
+        int i_str_616 = start + 512 + tid;
+        int i_617 = i_vec_615;
+        idxs[1] = i_617;
+        ties[1] = keys[1] == threshold_f && idxs[1] < vocab;
+        unsigned int m_618 = __ballot_sync(0xFFFFFFFF, ties[1]);
+        unsigned int lane_before_619 = (unsigned int)__popc(m_618 & lt_mask);
+        unsigned int warp_off_620 = cnt[16 + warp];
+        strided[1] = warp_off_620 + lane_before_619;
+        grp_warp = grp_warp + (warp_off_620 - cnt[16]);
+        grp_lane = grp_lane + lane_before_619;
+        unsigned int bits_621 = __as_u32(vals[2]);
+        unsigned int key_622 = ((bits_621 <= 2139095040) ? bits_621 : 0);
+        keys[2] = key_622;
+        int i_vec_623 = start + tid * 4 + 2;
+        int i_str_624 = start + 1024 + tid;
+        int i_625 = i_vec_623;
+        idxs[2] = i_625;
+        ties[2] = keys[2] == threshold_f && idxs[2] < vocab;
+        unsigned int m_626 = __ballot_sync(0xFFFFFFFF, ties[2]);
+        unsigned int lane_before_627 = (unsigned int)__popc(m_626 & lt_mask);
+        unsigned int warp_off_628 = cnt[32 + warp];
+        strided[2] = warp_off_628 + lane_before_627;
+        grp_warp = grp_warp + (warp_off_628 - cnt[32]);
+        grp_lane = grp_lane + lane_before_627;
+        unsigned int bits_629 = __as_u32(vals[3]);
+        unsigned int key_630 = ((bits_629 <= 2139095040) ? bits_629 : 0);
+        keys[3] = key_630;
+        int i_vec_631 = start + tid * 4 + 3;
+        int i_str_632 = start + 1536 + tid;
+        int i_633 = i_vec_631;
+        idxs[3] = i_633;
+        ties[3] = keys[3] == threshold_f && idxs[3] < vocab;
+        unsigned int m_634 = __ballot_sync(0xFFFFFFFF, ties[3]);
+        unsigned int lane_before_635 = (unsigned int)__popc(m_634 & lt_mask);
+        unsigned int warp_off_636 = cnt[48 + warp];
+        strided[3] = warp_off_636 + lane_before_635;
+        grp_warp = grp_warp + (warp_off_636 - cnt[48]);
+        grp_lane = grp_lane + lane_before_635;
+        unsigned int grp_base = cnt[0];
+        unsigned int own = 0;
+        unsigned int vec_rank = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_637 = vec_rank;
+        if (keys[0] > threshold_f) {
+            unsigned long long dst_40 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_40] = __uint_as_float(keys[0]);
+            out_idx[dst_40] = idxs[0];
+            g_1 = g_1 + 1;
+        } else if (ties[0] && rank_637 < eq_take) {
+            unsigned long long dst2 = eq_base + (unsigned long long)rank_637;
+            out_vals[dst2] = __uint_as_float(keys[0]);
+            out_idx[dst2] = idxs[0];
+        }
+        if (ties[0]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_638 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_639 = vec_rank_638;
+        if (keys[1] > threshold_f) {
+            unsigned long long dst_41 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_41] = __uint_as_float(keys[1]);
+            out_idx[dst_41] = idxs[1];
+            g_1 = g_1 + 1;
+        } else if (ties[1] && rank_639 < eq_take) {
+            unsigned long long dst2_1 = eq_base + (unsigned long long)rank_639;
+            out_vals[dst2_1] = __uint_as_float(keys[1]);
+            out_idx[dst2_1] = idxs[1];
+        }
+        if (ties[1]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_640 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_641 = vec_rank_640;
+        if (keys[2] > threshold_f) {
+            unsigned long long dst_42 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_42] = __uint_as_float(keys[2]);
+            out_idx[dst_42] = idxs[2];
+            g_1 = g_1 + 1;
+        } else if (ties[2] && rank_641 < eq_take) {
+            unsigned long long dst2_2 = eq_base + (unsigned long long)rank_641;
+            out_vals[dst2_2] = __uint_as_float(keys[2]);
+            out_idx[dst2_2] = idxs[2];
+        }
+        if (ties[2]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_642 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_643 = vec_rank_642;
+        if (keys[3] > threshold_f) {
+            unsigned long long dst_43 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_43] = __uint_as_float(keys[3]);
+            out_idx[dst_43] = idxs[3];
+            g_1 = g_1 + 1;
+        } else if (ties[3] && rank_643 < eq_take) {
+            unsigned long long dst2_3 = eq_base + (unsigned long long)rank_643;
+            out_vals[dst2_3] = __uint_as_float(keys[3]);
+            out_idx[dst2_3] = idxs[3];
+        }
+        if (ties[3]) {
+            own = own + 1;
+        }
+        unsigned int keys_644[4];
+        int idxs_645[4];
+        bool ties_646[4];
+        unsigned int strided_647[4];
+        unsigned int grp_warp_648 = 0;
+        unsigned int grp_lane_649 = 0;
+        unsigned int bits_650 = __as_u32(vals[4]);
+        unsigned int key_651 = ((bits_650 <= 2139095040) ? bits_650 : 0);
+        keys_644[0] = key_651;
+        int i_vec_652 = start + 2048 + tid * 4;
+        int i_str_653 = start + 2048 + tid;
+        int i_654 = i_vec_652;
+        idxs_645[0] = i_654;
+        ties_646[0] = keys_644[0] == threshold_f && idxs_645[0] < vocab;
+        unsigned int m_655 = __ballot_sync(0xFFFFFFFF, ties_646[0]);
+        unsigned int lane_before_656 = (unsigned int)__popc(m_655 & lt_mask);
+        unsigned int warp_off_657 = cnt[64 + warp];
+        strided_647[0] = warp_off_657 + lane_before_656;
+        grp_warp_648 = grp_warp_648 + (warp_off_657 - cnt[64]);
+        grp_lane_649 = grp_lane_649 + lane_before_656;
+        unsigned int bits_658 = __as_u32(vals[5]);
+        unsigned int key_659 = ((bits_658 <= 2139095040) ? bits_658 : 0);
+        keys_644[1] = key_659;
+        int i_vec_660 = start + 2048 + tid * 4 + 1;
+        int i_str_661 = start + 2560 + tid;
+        int i_662 = i_vec_660;
+        idxs_645[1] = i_662;
+        ties_646[1] = keys_644[1] == threshold_f && idxs_645[1] < vocab;
+        unsigned int m_663 = __ballot_sync(0xFFFFFFFF, ties_646[1]);
+        unsigned int lane_before_664 = (unsigned int)__popc(m_663 & lt_mask);
+        unsigned int warp_off_665 = cnt[80 + warp];
+        strided_647[1] = warp_off_665 + lane_before_664;
+        grp_warp_648 = grp_warp_648 + (warp_off_665 - cnt[80]);
+        grp_lane_649 = grp_lane_649 + lane_before_664;
+        unsigned int bits_666 = __as_u32(vals[6]);
+        unsigned int key_667 = ((bits_666 <= 2139095040) ? bits_666 : 0);
+        keys_644[2] = key_667;
+        int i_vec_668 = start + 2048 + tid * 4 + 2;
+        int i_str_669 = start + 3072 + tid;
+        int i_670 = i_vec_668;
+        idxs_645[2] = i_670;
+        ties_646[2] = keys_644[2] == threshold_f && idxs_645[2] < vocab;
+        unsigned int m_671 = __ballot_sync(0xFFFFFFFF, ties_646[2]);
+        unsigned int lane_before_672 = (unsigned int)__popc(m_671 & lt_mask);
+        unsigned int warp_off_673 = cnt[96 + warp];
+        strided_647[2] = warp_off_673 + lane_before_672;
+        grp_warp_648 = grp_warp_648 + (warp_off_673 - cnt[96]);
+        grp_lane_649 = grp_lane_649 + lane_before_672;
+        unsigned int bits_674 = __as_u32(vals[7]);
+        unsigned int key_675 = ((bits_674 <= 2139095040) ? bits_674 : 0);
+        keys_644[3] = key_675;
+        int i_vec_676 = start + 2048 + tid * 4 + 3;
+        int i_str_677 = start + 3584 + tid;
+        int i_678 = i_vec_676;
+        idxs_645[3] = i_678;
+        ties_646[3] = keys_644[3] == threshold_f && idxs_645[3] < vocab;
+        unsigned int m_679 = __ballot_sync(0xFFFFFFFF, ties_646[3]);
+        unsigned int lane_before_680 = (unsigned int)__popc(m_679 & lt_mask);
+        unsigned int warp_off_681 = cnt[112 + warp];
+        strided_647[3] = warp_off_681 + lane_before_680;
+        grp_warp_648 = grp_warp_648 + (warp_off_681 - cnt[112]);
+        grp_lane_649 = grp_lane_649 + lane_before_680;
+        unsigned int grp_base_682 = cnt[64];
+        unsigned int own_683 = 0;
+        unsigned int vec_rank_684 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_685 = vec_rank_684;
+        if (keys_644[0] > threshold_f) {
+            unsigned long long dst_44 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_44] = __uint_as_float(keys_644[0]);
+            out_idx[dst_44] = idxs_645[0];
+            g_1 = g_1 + 1;
+        } else if (ties_646[0] && rank_685 < eq_take) {
+            unsigned long long dst2_4 = eq_base + (unsigned long long)rank_685;
+            out_vals[dst2_4] = __uint_as_float(keys_644[0]);
+            out_idx[dst2_4] = idxs_645[0];
+        }
+        if (ties_646[0]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_686 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_687 = vec_rank_686;
+        if (keys_644[1] > threshold_f) {
+            unsigned long long dst_45 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_45] = __uint_as_float(keys_644[1]);
+            out_idx[dst_45] = idxs_645[1];
+            g_1 = g_1 + 1;
+        } else if (ties_646[1] && rank_687 < eq_take) {
+            unsigned long long dst2_5 = eq_base + (unsigned long long)rank_687;
+            out_vals[dst2_5] = __uint_as_float(keys_644[1]);
+            out_idx[dst2_5] = idxs_645[1];
+        }
+        if (ties_646[1]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_688 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_689 = vec_rank_688;
+        if (keys_644[2] > threshold_f) {
+            unsigned long long dst_46 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_46] = __uint_as_float(keys_644[2]);
+            out_idx[dst_46] = idxs_645[2];
+            g_1 = g_1 + 1;
+        } else if (ties_646[2] && rank_689 < eq_take) {
+            unsigned long long dst2_6 = eq_base + (unsigned long long)rank_689;
+            out_vals[dst2_6] = __uint_as_float(keys_644[2]);
+            out_idx[dst2_6] = idxs_645[2];
+        }
+        if (ties_646[2]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_690 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_691 = vec_rank_690;
+        if (keys_644[3] > threshold_f) {
+            unsigned long long dst_47 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_47] = __uint_as_float(keys_644[3]);
+            out_idx[dst_47] = idxs_645[3];
+            g_1 = g_1 + 1;
+        } else if (ties_646[3] && rank_691 < eq_take) {
+            unsigned long long dst2_7 = eq_base + (unsigned long long)rank_691;
+            out_vals[dst2_7] = __uint_as_float(keys_644[3]);
+            out_idx[dst2_7] = idxs_645[3];
+        }
+        if (ties_646[3]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int keys_692[4];
+        int idxs_693[4];
+        bool ties_694[4];
+        unsigned int strided_695[4];
+        unsigned int grp_warp_696 = 0;
+        unsigned int grp_lane_697 = 0;
+        unsigned int bits_698 = __as_u32(vals[8]);
+        unsigned int key_699 = ((bits_698 <= 2139095040) ? bits_698 : 0);
+        keys_692[0] = key_699;
+        int i_vec_700 = start + 4096 + tid * 4;
+        int i_str_701 = start + 4096 + tid;
+        int i_702 = i_vec_700;
+        idxs_693[0] = i_702;
+        ties_694[0] = keys_692[0] == threshold_f && idxs_693[0] < vocab;
+        unsigned int m_703 = __ballot_sync(0xFFFFFFFF, ties_694[0]);
+        unsigned int lane_before_704 = (unsigned int)__popc(m_703 & lt_mask);
+        unsigned int warp_off_705 = cnt[128 + warp];
+        strided_695[0] = warp_off_705 + lane_before_704;
+        grp_warp_696 = grp_warp_696 + (warp_off_705 - cnt[128]);
+        grp_lane_697 = grp_lane_697 + lane_before_704;
+        unsigned int bits_706 = __as_u32(vals[9]);
+        unsigned int key_707 = ((bits_706 <= 2139095040) ? bits_706 : 0);
+        keys_692[1] = key_707;
+        int i_vec_708 = start + 4096 + tid * 4 + 1;
+        int i_str_709 = start + 4608 + tid;
+        int i_710 = i_vec_708;
+        idxs_693[1] = i_710;
+        ties_694[1] = keys_692[1] == threshold_f && idxs_693[1] < vocab;
+        unsigned int m_711 = __ballot_sync(0xFFFFFFFF, ties_694[1]);
+        unsigned int lane_before_712 = (unsigned int)__popc(m_711 & lt_mask);
+        unsigned int warp_off_713 = cnt[144 + warp];
+        strided_695[1] = warp_off_713 + lane_before_712;
+        grp_warp_696 = grp_warp_696 + (warp_off_713 - cnt[144]);
+        grp_lane_697 = grp_lane_697 + lane_before_712;
+        unsigned int bits_714 = __as_u32(vals[10]);
+        unsigned int key_715 = ((bits_714 <= 2139095040) ? bits_714 : 0);
+        keys_692[2] = key_715;
+        int i_vec_716 = start + 4096 + tid * 4 + 2;
+        int i_str_717 = start + 5120 + tid;
+        int i_718 = i_vec_716;
+        idxs_693[2] = i_718;
+        ties_694[2] = keys_692[2] == threshold_f && idxs_693[2] < vocab;
+        unsigned int m_719 = __ballot_sync(0xFFFFFFFF, ties_694[2]);
+        unsigned int lane_before_720 = (unsigned int)__popc(m_719 & lt_mask);
+        unsigned int warp_off_721 = cnt[160 + warp];
+        strided_695[2] = warp_off_721 + lane_before_720;
+        grp_warp_696 = grp_warp_696 + (warp_off_721 - cnt[160]);
+        grp_lane_697 = grp_lane_697 + lane_before_720;
+        unsigned int bits_722 = __as_u32(vals[11]);
+        unsigned int key_723 = ((bits_722 <= 2139095040) ? bits_722 : 0);
+        keys_692[3] = key_723;
+        int i_vec_724 = start + 4096 + tid * 4 + 3;
+        int i_str_725 = start + 5632 + tid;
+        int i_726 = i_vec_724;
+        idxs_693[3] = i_726;
+        ties_694[3] = keys_692[3] == threshold_f && idxs_693[3] < vocab;
+        unsigned int m_727 = __ballot_sync(0xFFFFFFFF, ties_694[3]);
+        unsigned int lane_before_728 = (unsigned int)__popc(m_727 & lt_mask);
+        unsigned int warp_off_729 = cnt[176 + warp];
+        strided_695[3] = warp_off_729 + lane_before_728;
+        grp_warp_696 = grp_warp_696 + (warp_off_729 - cnt[176]);
+        grp_lane_697 = grp_lane_697 + lane_before_728;
+        unsigned int grp_base_730 = cnt[128];
+        unsigned int own_731 = 0;
+        unsigned int vec_rank_732 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_733 = vec_rank_732;
+        if (keys_692[0] > threshold_f) {
+            unsigned long long dst_48 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_48] = __uint_as_float(keys_692[0]);
+            out_idx[dst_48] = idxs_693[0];
+            g_1 = g_1 + 1;
+        } else if (ties_694[0] && rank_733 < eq_take) {
+            unsigned long long dst2_8 = eq_base + (unsigned long long)rank_733;
+            out_vals[dst2_8] = __uint_as_float(keys_692[0]);
+            out_idx[dst2_8] = idxs_693[0];
+        }
+        if (ties_694[0]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_734 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_735 = vec_rank_734;
+        if (keys_692[1] > threshold_f) {
+            unsigned long long dst_49 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_49] = __uint_as_float(keys_692[1]);
+            out_idx[dst_49] = idxs_693[1];
+            g_1 = g_1 + 1;
+        } else if (ties_694[1] && rank_735 < eq_take) {
+            unsigned long long dst2_9 = eq_base + (unsigned long long)rank_735;
+            out_vals[dst2_9] = __uint_as_float(keys_692[1]);
+            out_idx[dst2_9] = idxs_693[1];
+        }
+        if (ties_694[1]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_736 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_737 = vec_rank_736;
+        if (keys_692[2] > threshold_f) {
+            unsigned long long dst_50 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_50] = __uint_as_float(keys_692[2]);
+            out_idx[dst_50] = idxs_693[2];
+            g_1 = g_1 + 1;
+        } else if (ties_694[2] && rank_737 < eq_take) {
+            unsigned long long dst2_10 = eq_base + (unsigned long long)rank_737;
+            out_vals[dst2_10] = __uint_as_float(keys_692[2]);
+            out_idx[dst2_10] = idxs_693[2];
+        }
+        if (ties_694[2]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_738 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_739 = vec_rank_738;
+        if (keys_692[3] > threshold_f) {
+            unsigned long long dst_51 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_51] = __uint_as_float(keys_692[3]);
+            out_idx[dst_51] = idxs_693[3];
+            g_1 = g_1 + 1;
+        } else if (ties_694[3] && rank_739 < eq_take) {
+            unsigned long long dst2_11 = eq_base + (unsigned long long)rank_739;
+            out_vals[dst2_11] = __uint_as_float(keys_692[3]);
+            out_idx[dst2_11] = idxs_693[3];
+        }
+        if (ties_694[3]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int keys_740[4];
+        int idxs_741[4];
+        bool ties_742[4];
+        unsigned int strided_743[4];
+        unsigned int grp_warp_744 = 0;
+        unsigned int grp_lane_745 = 0;
+        unsigned int bits_746 = __as_u32(vals[12]);
+        unsigned int key_747 = ((bits_746 <= 2139095040) ? bits_746 : 0);
+        keys_740[0] = key_747;
+        int i_vec_748 = start + 6144 + tid * 4;
+        int i_str_749 = start + 6144 + tid;
+        int i_750 = i_vec_748;
+        idxs_741[0] = i_750;
+        ties_742[0] = keys_740[0] == threshold_f && idxs_741[0] < vocab;
+        unsigned int m_751 = __ballot_sync(0xFFFFFFFF, ties_742[0]);
+        unsigned int lane_before_752 = (unsigned int)__popc(m_751 & lt_mask);
+        unsigned int warp_off_753 = cnt[192 + warp];
+        strided_743[0] = warp_off_753 + lane_before_752;
+        grp_warp_744 = grp_warp_744 + (warp_off_753 - cnt[192]);
+        grp_lane_745 = grp_lane_745 + lane_before_752;
+        unsigned int bits_754 = __as_u32(vals[13]);
+        unsigned int key_755 = ((bits_754 <= 2139095040) ? bits_754 : 0);
+        keys_740[1] = key_755;
+        int i_vec_756 = start + 6144 + tid * 4 + 1;
+        int i_str_757 = start + 6656 + tid;
+        int i_758 = i_vec_756;
+        idxs_741[1] = i_758;
+        ties_742[1] = keys_740[1] == threshold_f && idxs_741[1] < vocab;
+        unsigned int m_759 = __ballot_sync(0xFFFFFFFF, ties_742[1]);
+        unsigned int lane_before_760 = (unsigned int)__popc(m_759 & lt_mask);
+        unsigned int warp_off_761 = cnt[208 + warp];
+        strided_743[1] = warp_off_761 + lane_before_760;
+        grp_warp_744 = grp_warp_744 + (warp_off_761 - cnt[208]);
+        grp_lane_745 = grp_lane_745 + lane_before_760;
+        unsigned int bits_762 = __as_u32(vals[14]);
+        unsigned int key_763 = ((bits_762 <= 2139095040) ? bits_762 : 0);
+        keys_740[2] = key_763;
+        int i_vec_764 = start + 6144 + tid * 4 + 2;
+        int i_str_765 = start + 7168 + tid;
+        int i_766 = i_vec_764;
+        idxs_741[2] = i_766;
+        ties_742[2] = keys_740[2] == threshold_f && idxs_741[2] < vocab;
+        unsigned int m_767 = __ballot_sync(0xFFFFFFFF, ties_742[2]);
+        unsigned int lane_before_768 = (unsigned int)__popc(m_767 & lt_mask);
+        unsigned int warp_off_769 = cnt[224 + warp];
+        strided_743[2] = warp_off_769 + lane_before_768;
+        grp_warp_744 = grp_warp_744 + (warp_off_769 - cnt[224]);
+        grp_lane_745 = grp_lane_745 + lane_before_768;
+        unsigned int bits_770 = __as_u32(vals[15]);
+        unsigned int key_771 = ((bits_770 <= 2139095040) ? bits_770 : 0);
+        keys_740[3] = key_771;
+        int i_vec_772 = start + 6144 + tid * 4 + 3;
+        int i_str_773 = start + 7680 + tid;
+        int i_774 = i_vec_772;
+        idxs_741[3] = i_774;
+        ties_742[3] = keys_740[3] == threshold_f && idxs_741[3] < vocab;
+        unsigned int m_775 = __ballot_sync(0xFFFFFFFF, ties_742[3]);
+        unsigned int lane_before_776 = (unsigned int)__popc(m_775 & lt_mask);
+        unsigned int warp_off_777 = cnt[240 + warp];
+        strided_743[3] = warp_off_777 + lane_before_776;
+        grp_warp_744 = grp_warp_744 + (warp_off_777 - cnt[240]);
+        grp_lane_745 = grp_lane_745 + lane_before_776;
+        unsigned int grp_base_778 = cnt[192];
+        unsigned int own_779 = 0;
+        unsigned int vec_rank_780 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_781 = vec_rank_780;
+        if (keys_740[0] > threshold_f) {
+            unsigned long long dst_52 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_52] = __uint_as_float(keys_740[0]);
+            out_idx[dst_52] = idxs_741[0];
+            g_1 = g_1 + 1;
+        } else if (ties_742[0] && rank_781 < eq_take) {
+            unsigned long long dst2_12 = eq_base + (unsigned long long)rank_781;
+            out_vals[dst2_12] = __uint_as_float(keys_740[0]);
+            out_idx[dst2_12] = idxs_741[0];
+        }
+        if (ties_742[0]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_782 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_783 = vec_rank_782;
+        if (keys_740[1] > threshold_f) {
+            unsigned long long dst_53 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_53] = __uint_as_float(keys_740[1]);
+            out_idx[dst_53] = idxs_741[1];
+            g_1 = g_1 + 1;
+        } else if (ties_742[1] && rank_783 < eq_take) {
+            unsigned long long dst2_13 = eq_base + (unsigned long long)rank_783;
+            out_vals[dst2_13] = __uint_as_float(keys_740[1]);
+            out_idx[dst2_13] = idxs_741[1];
+        }
+        if (ties_742[1]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_784 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_785 = vec_rank_784;
+        if (keys_740[2] > threshold_f) {
+            unsigned long long dst_54 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_54] = __uint_as_float(keys_740[2]);
+            out_idx[dst_54] = idxs_741[2];
+            g_1 = g_1 + 1;
+        } else if (ties_742[2] && rank_785 < eq_take) {
+            unsigned long long dst2_14 = eq_base + (unsigned long long)rank_785;
+            out_vals[dst2_14] = __uint_as_float(keys_740[2]);
+            out_idx[dst2_14] = idxs_741[2];
+        }
+        if (ties_742[2]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_786 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_787 = vec_rank_786;
+        if (keys_740[3] > threshold_f) {
+            unsigned long long dst_55 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_55] = __uint_as_float(keys_740[3]);
+            out_idx[dst_55] = idxs_741[3];
+            g_1 = g_1 + 1;
+        } else if (ties_742[3] && rank_787 < eq_take) {
+            unsigned long long dst2_15 = eq_base + (unsigned long long)rank_787;
+            out_vals[dst2_15] = __uint_as_float(keys_740[3]);
+            out_idx[dst2_15] = idxs_741[3];
+        }
+        if (ties_742[3]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int keys_788[4];
+        int idxs_789[4];
+        bool ties_790[4];
+        unsigned int strided_791[4];
+        unsigned int grp_warp_792 = 0;
+        unsigned int grp_lane_793 = 0;
+        unsigned int bits_794 = __as_u32(vals[16]);
+        unsigned int key_795 = ((bits_794 <= 2139095040) ? bits_794 : 0);
+        keys_788[0] = key_795;
+        int i_vec_796 = start + 8192 + tid * 4;
+        int i_str_797 = start + 8192 + tid;
+        int i_798 = i_vec_796;
+        idxs_789[0] = i_798;
+        ties_790[0] = keys_788[0] == threshold_f && idxs_789[0] < vocab;
+        unsigned int m_799 = __ballot_sync(0xFFFFFFFF, ties_790[0]);
+        unsigned int lane_before_800 = (unsigned int)__popc(m_799 & lt_mask);
+        unsigned int warp_off_801 = cnt[256 + warp];
+        strided_791[0] = warp_off_801 + lane_before_800;
+        grp_warp_792 = grp_warp_792 + (warp_off_801 - cnt[256]);
+        grp_lane_793 = grp_lane_793 + lane_before_800;
+        unsigned int bits_802 = __as_u32(vals[17]);
+        unsigned int key_803 = ((bits_802 <= 2139095040) ? bits_802 : 0);
+        keys_788[1] = key_803;
+        int i_vec_804 = start + 8192 + tid * 4 + 1;
+        int i_str_805 = start + 8704 + tid;
+        int i_806 = i_vec_804;
+        idxs_789[1] = i_806;
+        ties_790[1] = keys_788[1] == threshold_f && idxs_789[1] < vocab;
+        unsigned int m_807 = __ballot_sync(0xFFFFFFFF, ties_790[1]);
+        unsigned int lane_before_808 = (unsigned int)__popc(m_807 & lt_mask);
+        unsigned int warp_off_809 = cnt[272 + warp];
+        strided_791[1] = warp_off_809 + lane_before_808;
+        grp_warp_792 = grp_warp_792 + (warp_off_809 - cnt[272]);
+        grp_lane_793 = grp_lane_793 + lane_before_808;
+        unsigned int bits_810 = __as_u32(vals[18]);
+        unsigned int key_811 = ((bits_810 <= 2139095040) ? bits_810 : 0);
+        keys_788[2] = key_811;
+        int i_vec_812 = start + 8192 + tid * 4 + 2;
+        int i_str_813 = start + 9216 + tid;
+        int i_814 = i_vec_812;
+        idxs_789[2] = i_814;
+        ties_790[2] = keys_788[2] == threshold_f && idxs_789[2] < vocab;
+        unsigned int m_815 = __ballot_sync(0xFFFFFFFF, ties_790[2]);
+        unsigned int lane_before_816 = (unsigned int)__popc(m_815 & lt_mask);
+        unsigned int warp_off_817 = cnt[288 + warp];
+        strided_791[2] = warp_off_817 + lane_before_816;
+        grp_warp_792 = grp_warp_792 + (warp_off_817 - cnt[288]);
+        grp_lane_793 = grp_lane_793 + lane_before_816;
+        unsigned int bits_818 = __as_u32(vals[19]);
+        unsigned int key_819 = ((bits_818 <= 2139095040) ? bits_818 : 0);
+        keys_788[3] = key_819;
+        int i_vec_820 = start + 8192 + tid * 4 + 3;
+        int i_str_821 = start + 9728 + tid;
+        int i_822 = i_vec_820;
+        idxs_789[3] = i_822;
+        ties_790[3] = keys_788[3] == threshold_f && idxs_789[3] < vocab;
+        unsigned int m_823 = __ballot_sync(0xFFFFFFFF, ties_790[3]);
+        unsigned int lane_before_824 = (unsigned int)__popc(m_823 & lt_mask);
+        unsigned int warp_off_825 = cnt[304 + warp];
+        strided_791[3] = warp_off_825 + lane_before_824;
+        grp_warp_792 = grp_warp_792 + (warp_off_825 - cnt[304]);
+        grp_lane_793 = grp_lane_793 + lane_before_824;
+        unsigned int grp_base_826 = cnt[256];
+        unsigned int own_827 = 0;
+        unsigned int vec_rank_828 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_829 = vec_rank_828;
+        if (keys_788[0] > threshold_f) {
+            unsigned long long dst_56 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_56] = __uint_as_float(keys_788[0]);
+            out_idx[dst_56] = idxs_789[0];
+            g_1 = g_1 + 1;
+        } else if (ties_790[0] && rank_829 < eq_take) {
+            unsigned long long dst2_16 = eq_base + (unsigned long long)rank_829;
+            out_vals[dst2_16] = __uint_as_float(keys_788[0]);
+            out_idx[dst2_16] = idxs_789[0];
+        }
+        if (ties_790[0]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_830 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_831 = vec_rank_830;
+        if (keys_788[1] > threshold_f) {
+            unsigned long long dst_57 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_57] = __uint_as_float(keys_788[1]);
+            out_idx[dst_57] = idxs_789[1];
+            g_1 = g_1 + 1;
+        } else if (ties_790[1] && rank_831 < eq_take) {
+            unsigned long long dst2_17 = eq_base + (unsigned long long)rank_831;
+            out_vals[dst2_17] = __uint_as_float(keys_788[1]);
+            out_idx[dst2_17] = idxs_789[1];
+        }
+        if (ties_790[1]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_832 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_833 = vec_rank_832;
+        if (keys_788[2] > threshold_f) {
+            unsigned long long dst_58 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_58] = __uint_as_float(keys_788[2]);
+            out_idx[dst_58] = idxs_789[2];
+            g_1 = g_1 + 1;
+        } else if (ties_790[2] && rank_833 < eq_take) {
+            unsigned long long dst2_18 = eq_base + (unsigned long long)rank_833;
+            out_vals[dst2_18] = __uint_as_float(keys_788[2]);
+            out_idx[dst2_18] = idxs_789[2];
+        }
+        if (ties_790[2]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_834 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_835 = vec_rank_834;
+        if (keys_788[3] > threshold_f) {
+            unsigned long long dst_59 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_59] = __uint_as_float(keys_788[3]);
+            out_idx[dst_59] = idxs_789[3];
+            g_1 = g_1 + 1;
+        } else if (ties_790[3] && rank_835 < eq_take) {
+            unsigned long long dst2_19 = eq_base + (unsigned long long)rank_835;
+            out_vals[dst2_19] = __uint_as_float(keys_788[3]);
+            out_idx[dst2_19] = idxs_789[3];
+        }
+        if (ties_790[3]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int keys_836[4];
+        int idxs_837[4];
+        bool ties_838[4];
+        unsigned int strided_839[4];
+        unsigned int grp_warp_840 = 0;
+        unsigned int grp_lane_841 = 0;
+        unsigned int bits_842 = __as_u32(vals[20]);
+        unsigned int key_843 = ((bits_842 <= 2139095040) ? bits_842 : 0);
+        keys_836[0] = key_843;
+        int i_vec_844 = start + 10240 + tid * 4;
+        int i_str_845 = start + 10240 + tid;
+        int i_846 = i_vec_844;
+        idxs_837[0] = i_846;
+        ties_838[0] = keys_836[0] == threshold_f && idxs_837[0] < vocab;
+        unsigned int m_847 = __ballot_sync(0xFFFFFFFF, ties_838[0]);
+        unsigned int lane_before_848 = (unsigned int)__popc(m_847 & lt_mask);
+        unsigned int warp_off_849 = cnt[320 + warp];
+        strided_839[0] = warp_off_849 + lane_before_848;
+        grp_warp_840 = grp_warp_840 + (warp_off_849 - cnt[320]);
+        grp_lane_841 = grp_lane_841 + lane_before_848;
+        unsigned int bits_850 = __as_u32(vals[21]);
+        unsigned int key_851 = ((bits_850 <= 2139095040) ? bits_850 : 0);
+        keys_836[1] = key_851;
+        int i_vec_852 = start + 10240 + tid * 4 + 1;
+        int i_str_853 = start + 10752 + tid;
+        int i_854 = i_vec_852;
+        idxs_837[1] = i_854;
+        ties_838[1] = keys_836[1] == threshold_f && idxs_837[1] < vocab;
+        unsigned int m_855 = __ballot_sync(0xFFFFFFFF, ties_838[1]);
+        unsigned int lane_before_856 = (unsigned int)__popc(m_855 & lt_mask);
+        unsigned int warp_off_857 = cnt[336 + warp];
+        strided_839[1] = warp_off_857 + lane_before_856;
+        grp_warp_840 = grp_warp_840 + (warp_off_857 - cnt[336]);
+        grp_lane_841 = grp_lane_841 + lane_before_856;
+        unsigned int bits_858 = __as_u32(vals[22]);
+        unsigned int key_859 = ((bits_858 <= 2139095040) ? bits_858 : 0);
+        keys_836[2] = key_859;
+        int i_vec_860 = start + 10240 + tid * 4 + 2;
+        int i_str_861 = start + 11264 + tid;
+        int i_862 = i_vec_860;
+        idxs_837[2] = i_862;
+        ties_838[2] = keys_836[2] == threshold_f && idxs_837[2] < vocab;
+        unsigned int m_863 = __ballot_sync(0xFFFFFFFF, ties_838[2]);
+        unsigned int lane_before_864 = (unsigned int)__popc(m_863 & lt_mask);
+        unsigned int warp_off_865 = cnt[352 + warp];
+        strided_839[2] = warp_off_865 + lane_before_864;
+        grp_warp_840 = grp_warp_840 + (warp_off_865 - cnt[352]);
+        grp_lane_841 = grp_lane_841 + lane_before_864;
+        unsigned int bits_866 = __as_u32(vals[23]);
+        unsigned int key_867 = ((bits_866 <= 2139095040) ? bits_866 : 0);
+        keys_836[3] = key_867;
+        int i_vec_868 = start + 10240 + tid * 4 + 3;
+        int i_str_869 = start + 11776 + tid;
+        int i_870 = i_vec_868;
+        idxs_837[3] = i_870;
+        ties_838[3] = keys_836[3] == threshold_f && idxs_837[3] < vocab;
+        unsigned int m_871 = __ballot_sync(0xFFFFFFFF, ties_838[3]);
+        unsigned int lane_before_872 = (unsigned int)__popc(m_871 & lt_mask);
+        unsigned int warp_off_873 = cnt[368 + warp];
+        strided_839[3] = warp_off_873 + lane_before_872;
+        grp_warp_840 = grp_warp_840 + (warp_off_873 - cnt[368]);
+        grp_lane_841 = grp_lane_841 + lane_before_872;
+        unsigned int grp_base_874 = cnt[320];
+        unsigned int own_875 = 0;
+        unsigned int vec_rank_876 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_877 = vec_rank_876;
+        if (keys_836[0] > threshold_f) {
+            unsigned long long dst_60 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_60] = __uint_as_float(keys_836[0]);
+            out_idx[dst_60] = idxs_837[0];
+            g_1 = g_1 + 1;
+        } else if (ties_838[0] && rank_877 < eq_take) {
+            unsigned long long dst2_20 = eq_base + (unsigned long long)rank_877;
+            out_vals[dst2_20] = __uint_as_float(keys_836[0]);
+            out_idx[dst2_20] = idxs_837[0];
+        }
+        if (ties_838[0]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_878 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_879 = vec_rank_878;
+        if (keys_836[1] > threshold_f) {
+            unsigned long long dst_61 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_61] = __uint_as_float(keys_836[1]);
+            out_idx[dst_61] = idxs_837[1];
+            g_1 = g_1 + 1;
+        } else if (ties_838[1] && rank_879 < eq_take) {
+            unsigned long long dst2_21 = eq_base + (unsigned long long)rank_879;
+            out_vals[dst2_21] = __uint_as_float(keys_836[1]);
+            out_idx[dst2_21] = idxs_837[1];
+        }
+        if (ties_838[1]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_880 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_881 = vec_rank_880;
+        if (keys_836[2] > threshold_f) {
+            unsigned long long dst_62 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_62] = __uint_as_float(keys_836[2]);
+            out_idx[dst_62] = idxs_837[2];
+            g_1 = g_1 + 1;
+        } else if (ties_838[2] && rank_881 < eq_take) {
+            unsigned long long dst2_22 = eq_base + (unsigned long long)rank_881;
+            out_vals[dst2_22] = __uint_as_float(keys_836[2]);
+            out_idx[dst2_22] = idxs_837[2];
+        }
+        if (ties_838[2]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_882 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_883 = vec_rank_882;
+        if (keys_836[3] > threshold_f) {
+            unsigned long long dst_63 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_63] = __uint_as_float(keys_836[3]);
+            out_idx[dst_63] = idxs_837[3];
+            g_1 = g_1 + 1;
+        } else if (ties_838[3] && rank_883 < eq_take) {
+            unsigned long long dst2_23 = eq_base + (unsigned long long)rank_883;
+            out_vals[dst2_23] = __uint_as_float(keys_836[3]);
+            out_idx[dst2_23] = idxs_837[3];
+        }
+        if (ties_838[3]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int keys_884[4];
+        int idxs_885[4];
+        bool ties_886[4];
+        unsigned int strided_887[4];
+        unsigned int grp_warp_888 = 0;
+        unsigned int grp_lane_889 = 0;
+        unsigned int bits_890 = __as_u32(vals[24]);
+        unsigned int key_891 = ((bits_890 <= 2139095040) ? bits_890 : 0);
+        keys_884[0] = key_891;
+        int i_vec_892 = start + 12288 + tid * 4;
+        int i_str_893 = start + 12288 + tid;
+        int i_894 = i_vec_892;
+        idxs_885[0] = i_894;
+        ties_886[0] = keys_884[0] == threshold_f && idxs_885[0] < vocab;
+        unsigned int m_895 = __ballot_sync(0xFFFFFFFF, ties_886[0]);
+        unsigned int lane_before_896 = (unsigned int)__popc(m_895 & lt_mask);
+        unsigned int warp_off_897 = cnt[384 + warp];
+        strided_887[0] = warp_off_897 + lane_before_896;
+        grp_warp_888 = grp_warp_888 + (warp_off_897 - cnt[384]);
+        grp_lane_889 = grp_lane_889 + lane_before_896;
+        unsigned int bits_898 = __as_u32(vals[25]);
+        unsigned int key_899 = ((bits_898 <= 2139095040) ? bits_898 : 0);
+        keys_884[1] = key_899;
+        int i_vec_900 = start + 12288 + tid * 4 + 1;
+        int i_str_901 = start + 12800 + tid;
+        int i_902 = i_vec_900;
+        idxs_885[1] = i_902;
+        ties_886[1] = keys_884[1] == threshold_f && idxs_885[1] < vocab;
+        unsigned int m_903 = __ballot_sync(0xFFFFFFFF, ties_886[1]);
+        unsigned int lane_before_904 = (unsigned int)__popc(m_903 & lt_mask);
+        unsigned int warp_off_905 = cnt[400 + warp];
+        strided_887[1] = warp_off_905 + lane_before_904;
+        grp_warp_888 = grp_warp_888 + (warp_off_905 - cnt[400]);
+        grp_lane_889 = grp_lane_889 + lane_before_904;
+        unsigned int bits_906 = __as_u32(vals[26]);
+        unsigned int key_907 = ((bits_906 <= 2139095040) ? bits_906 : 0);
+        keys_884[2] = key_907;
+        int i_vec_908 = start + 12288 + tid * 4 + 2;
+        int i_str_909 = start + 13312 + tid;
+        int i_910 = i_vec_908;
+        idxs_885[2] = i_910;
+        ties_886[2] = keys_884[2] == threshold_f && idxs_885[2] < vocab;
+        unsigned int m_911 = __ballot_sync(0xFFFFFFFF, ties_886[2]);
+        unsigned int lane_before_912 = (unsigned int)__popc(m_911 & lt_mask);
+        unsigned int warp_off_913 = cnt[416 + warp];
+        strided_887[2] = warp_off_913 + lane_before_912;
+        grp_warp_888 = grp_warp_888 + (warp_off_913 - cnt[416]);
+        grp_lane_889 = grp_lane_889 + lane_before_912;
+        unsigned int bits_914 = __as_u32(vals[27]);
+        unsigned int key_915 = ((bits_914 <= 2139095040) ? bits_914 : 0);
+        keys_884[3] = key_915;
+        int i_vec_916 = start + 12288 + tid * 4 + 3;
+        int i_str_917 = start + 13824 + tid;
+        int i_918 = i_vec_916;
+        idxs_885[3] = i_918;
+        ties_886[3] = keys_884[3] == threshold_f && idxs_885[3] < vocab;
+        unsigned int m_919 = __ballot_sync(0xFFFFFFFF, ties_886[3]);
+        unsigned int lane_before_920 = (unsigned int)__popc(m_919 & lt_mask);
+        unsigned int warp_off_921 = cnt[432 + warp];
+        strided_887[3] = warp_off_921 + lane_before_920;
+        grp_warp_888 = grp_warp_888 + (warp_off_921 - cnt[432]);
+        grp_lane_889 = grp_lane_889 + lane_before_920;
+        unsigned int grp_base_922 = cnt[384];
+        unsigned int own_923 = 0;
+        unsigned int vec_rank_924 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_925 = vec_rank_924;
+        if (keys_884[0] > threshold_f) {
+            unsigned long long dst_64 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_64] = __uint_as_float(keys_884[0]);
+            out_idx[dst_64] = idxs_885[0];
+            g_1 = g_1 + 1;
+        } else if (ties_886[0] && rank_925 < eq_take) {
+            unsigned long long dst2_24 = eq_base + (unsigned long long)rank_925;
+            out_vals[dst2_24] = __uint_as_float(keys_884[0]);
+            out_idx[dst2_24] = idxs_885[0];
+        }
+        if (ties_886[0]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_926 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_927 = vec_rank_926;
+        if (keys_884[1] > threshold_f) {
+            unsigned long long dst_65 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_65] = __uint_as_float(keys_884[1]);
+            out_idx[dst_65] = idxs_885[1];
+            g_1 = g_1 + 1;
+        } else if (ties_886[1] && rank_927 < eq_take) {
+            unsigned long long dst2_25 = eq_base + (unsigned long long)rank_927;
+            out_vals[dst2_25] = __uint_as_float(keys_884[1]);
+            out_idx[dst2_25] = idxs_885[1];
+        }
+        if (ties_886[1]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_928 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_929 = vec_rank_928;
+        if (keys_884[2] > threshold_f) {
+            unsigned long long dst_66 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_66] = __uint_as_float(keys_884[2]);
+            out_idx[dst_66] = idxs_885[2];
+            g_1 = g_1 + 1;
+        } else if (ties_886[2] && rank_929 < eq_take) {
+            unsigned long long dst2_26 = eq_base + (unsigned long long)rank_929;
+            out_vals[dst2_26] = __uint_as_float(keys_884[2]);
+            out_idx[dst2_26] = idxs_885[2];
+        }
+        if (ties_886[2]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_930 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_931 = vec_rank_930;
+        if (keys_884[3] > threshold_f) {
+            unsigned long long dst_67 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_67] = __uint_as_float(keys_884[3]);
+            out_idx[dst_67] = idxs_885[3];
+            g_1 = g_1 + 1;
+        } else if (ties_886[3] && rank_931 < eq_take) {
+            unsigned long long dst2_27 = eq_base + (unsigned long long)rank_931;
+            out_vals[dst2_27] = __uint_as_float(keys_884[3]);
+            out_idx[dst2_27] = idxs_885[3];
+        }
+        if (ties_886[3]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int keys_932[4];
+        int idxs_933[4];
+        bool ties_934[4];
+        unsigned int strided_935[4];
+        unsigned int grp_warp_936 = 0;
+        unsigned int grp_lane_937 = 0;
+        unsigned int bits_938 = __as_u32(vals[28]);
+        unsigned int key_939 = ((bits_938 <= 2139095040) ? bits_938 : 0);
+        keys_932[0] = key_939;
+        int i_vec_940 = start + 14336 + tid * 4;
+        int i_str_941 = start + 14336 + tid;
+        int i_942 = i_vec_940;
+        idxs_933[0] = i_942;
+        ties_934[0] = keys_932[0] == threshold_f && idxs_933[0] < vocab;
+        unsigned int m_943 = __ballot_sync(0xFFFFFFFF, ties_934[0]);
+        unsigned int lane_before_944 = (unsigned int)__popc(m_943 & lt_mask);
+        unsigned int warp_off_945 = cnt[448 + warp];
+        strided_935[0] = warp_off_945 + lane_before_944;
+        grp_warp_936 = grp_warp_936 + (warp_off_945 - cnt[448]);
+        grp_lane_937 = grp_lane_937 + lane_before_944;
+        unsigned int bits_946 = __as_u32(vals[29]);
+        unsigned int key_947 = ((bits_946 <= 2139095040) ? bits_946 : 0);
+        keys_932[1] = key_947;
+        int i_vec_948 = start + 14336 + tid * 4 + 1;
+        int i_str_949 = start + 14848 + tid;
+        int i_950 = i_vec_948;
+        idxs_933[1] = i_950;
+        ties_934[1] = keys_932[1] == threshold_f && idxs_933[1] < vocab;
+        unsigned int m_951 = __ballot_sync(0xFFFFFFFF, ties_934[1]);
+        unsigned int lane_before_952 = (unsigned int)__popc(m_951 & lt_mask);
+        unsigned int warp_off_953 = cnt[464 + warp];
+        strided_935[1] = warp_off_953 + lane_before_952;
+        grp_warp_936 = grp_warp_936 + (warp_off_953 - cnt[464]);
+        grp_lane_937 = grp_lane_937 + lane_before_952;
+        unsigned int bits_954 = __as_u32(vals[30]);
+        unsigned int key_955 = ((bits_954 <= 2139095040) ? bits_954 : 0);
+        keys_932[2] = key_955;
+        int i_vec_956 = start + 14336 + tid * 4 + 2;
+        int i_str_957 = start + 15360 + tid;
+        int i_958 = i_vec_956;
+        idxs_933[2] = i_958;
+        ties_934[2] = keys_932[2] == threshold_f && idxs_933[2] < vocab;
+        unsigned int m_959 = __ballot_sync(0xFFFFFFFF, ties_934[2]);
+        unsigned int lane_before_960 = (unsigned int)__popc(m_959 & lt_mask);
+        unsigned int warp_off_961 = cnt[480 + warp];
+        strided_935[2] = warp_off_961 + lane_before_960;
+        grp_warp_936 = grp_warp_936 + (warp_off_961 - cnt[480]);
+        grp_lane_937 = grp_lane_937 + lane_before_960;
+        unsigned int bits_962 = __as_u32(vals[31]);
+        unsigned int key_963 = ((bits_962 <= 2139095040) ? bits_962 : 0);
+        keys_932[3] = key_963;
+        int i_vec_964 = start + 14336 + tid * 4 + 3;
+        int i_str_965 = start + 15872 + tid;
+        int i_966 = i_vec_964;
+        idxs_933[3] = i_966;
+        ties_934[3] = keys_932[3] == threshold_f && idxs_933[3] < vocab;
+        unsigned int m_967 = __ballot_sync(0xFFFFFFFF, ties_934[3]);
+        unsigned int lane_before_968 = (unsigned int)__popc(m_967 & lt_mask);
+        unsigned int warp_off_969 = cnt[496 + warp];
+        strided_935[3] = warp_off_969 + lane_before_968;
+        grp_warp_936 = grp_warp_936 + (warp_off_969 - cnt[496]);
+        grp_lane_937 = grp_lane_937 + lane_before_968;
+        unsigned int grp_base_970 = cnt[448];
+        unsigned int own_971 = 0;
+        unsigned int vec_rank_972 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_973 = vec_rank_972;
+        if (keys_932[0] > threshold_f) {
+            unsigned long long dst_68 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_68] = __uint_as_float(keys_932[0]);
+            out_idx[dst_68] = idxs_933[0];
+            g_1 = g_1 + 1;
+        } else if (ties_934[0] && rank_973 < eq_take) {
+            unsigned long long dst2_28 = eq_base + (unsigned long long)rank_973;
+            out_vals[dst2_28] = __uint_as_float(keys_932[0]);
+            out_idx[dst2_28] = idxs_933[0];
+        }
+        if (ties_934[0]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_974 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_975 = vec_rank_974;
+        if (keys_932[1] > threshold_f) {
+            unsigned long long dst_69 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_69] = __uint_as_float(keys_932[1]);
+            out_idx[dst_69] = idxs_933[1];
+            g_1 = g_1 + 1;
+        } else if (ties_934[1] && rank_975 < eq_take) {
+            unsigned long long dst2_29 = eq_base + (unsigned long long)rank_975;
+            out_vals[dst2_29] = __uint_as_float(keys_932[1]);
+            out_idx[dst2_29] = idxs_933[1];
+        }
+        if (ties_934[1]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_976 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_977 = vec_rank_976;
+        if (keys_932[2] > threshold_f) {
+            unsigned long long dst_70 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_70] = __uint_as_float(keys_932[2]);
+            out_idx[dst_70] = idxs_933[2];
+            g_1 = g_1 + 1;
+        } else if (ties_934[2] && rank_977 < eq_take) {
+            unsigned long long dst2_30 = eq_base + (unsigned long long)rank_977;
+            out_vals[dst2_30] = __uint_as_float(keys_932[2]);
+            out_idx[dst2_30] = idxs_933[2];
+        }
+        if (ties_934[2]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_978 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_979 = vec_rank_978;
+        if (keys_932[3] > threshold_f) {
+            unsigned long long dst_71 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_71] = __uint_as_float(keys_932[3]);
+            out_idx[dst_71] = idxs_933[3];
+            g_1 = g_1 + 1;
+        } else if (ties_934[3] && rank_979 < eq_take) {
+            unsigned long long dst2_31 = eq_base + (unsigned long long)rank_979;
+            out_vals[dst2_31] = __uint_as_float(keys_932[3]);
+            out_idx[dst2_31] = idxs_933[3];
+        }
+        if (ties_934[3]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int keys_980[4];
+        int idxs_981[4];
+        bool ties_982[4];
+        unsigned int strided_983[4];
+        unsigned int grp_warp_984 = 0;
+        unsigned int grp_lane_985 = 0;
+        unsigned int bits_986 = __as_u32(vals[32]);
+        unsigned int key_987 = ((bits_986 <= 2139095040) ? bits_986 : 0);
+        keys_980[0] = key_987;
+        int i_vec_988 = start + 16384 + tid * 4;
+        int i_str_989 = start + 16384 + tid;
+        int i_990 = i_vec_988;
+        idxs_981[0] = i_990;
+        ties_982[0] = keys_980[0] == threshold_f && idxs_981[0] < vocab;
+        unsigned int m_991 = __ballot_sync(0xFFFFFFFF, ties_982[0]);
+        unsigned int lane_before_992 = (unsigned int)__popc(m_991 & lt_mask);
+        unsigned int warp_off_993 = cnt[512 + warp];
+        strided_983[0] = warp_off_993 + lane_before_992;
+        grp_warp_984 = grp_warp_984 + (warp_off_993 - cnt[512]);
+        grp_lane_985 = grp_lane_985 + lane_before_992;
+        unsigned int bits_994 = __as_u32(vals[33]);
+        unsigned int key_995 = ((bits_994 <= 2139095040) ? bits_994 : 0);
+        keys_980[1] = key_995;
+        int i_vec_996 = start + 16384 + tid * 4 + 1;
+        int i_str_997 = start + 16896 + tid;
+        int i_998 = i_vec_996;
+        idxs_981[1] = i_998;
+        ties_982[1] = keys_980[1] == threshold_f && idxs_981[1] < vocab;
+        unsigned int m_999 = __ballot_sync(0xFFFFFFFF, ties_982[1]);
+        unsigned int lane_before_1000 = (unsigned int)__popc(m_999 & lt_mask);
+        unsigned int warp_off_1001 = cnt[528 + warp];
+        strided_983[1] = warp_off_1001 + lane_before_1000;
+        grp_warp_984 = grp_warp_984 + (warp_off_1001 - cnt[528]);
+        grp_lane_985 = grp_lane_985 + lane_before_1000;
+        unsigned int bits_1002 = __as_u32(vals[34]);
+        unsigned int key_1003 = ((bits_1002 <= 2139095040) ? bits_1002 : 0);
+        keys_980[2] = key_1003;
+        int i_vec_1004 = start + 16384 + tid * 4 + 2;
+        int i_str_1005 = start + 17408 + tid;
+        int i_1006 = i_vec_1004;
+        idxs_981[2] = i_1006;
+        ties_982[2] = keys_980[2] == threshold_f && idxs_981[2] < vocab;
+        unsigned int m_1007 = __ballot_sync(0xFFFFFFFF, ties_982[2]);
+        unsigned int lane_before_1008 = (unsigned int)__popc(m_1007 & lt_mask);
+        unsigned int warp_off_1009 = cnt[544 + warp];
+        strided_983[2] = warp_off_1009 + lane_before_1008;
+        grp_warp_984 = grp_warp_984 + (warp_off_1009 - cnt[544]);
+        grp_lane_985 = grp_lane_985 + lane_before_1008;
+        unsigned int bits_1010 = __as_u32(vals[35]);
+        unsigned int key_1011 = ((bits_1010 <= 2139095040) ? bits_1010 : 0);
+        keys_980[3] = key_1011;
+        int i_vec_1012 = start + 16384 + tid * 4 + 3;
+        int i_str_1013 = start + 17920 + tid;
+        int i_1014 = i_vec_1012;
+        idxs_981[3] = i_1014;
+        ties_982[3] = keys_980[3] == threshold_f && idxs_981[3] < vocab;
+        unsigned int m_1015 = __ballot_sync(0xFFFFFFFF, ties_982[3]);
+        unsigned int lane_before_1016 = (unsigned int)__popc(m_1015 & lt_mask);
+        unsigned int warp_off_1017 = cnt[560 + warp];
+        strided_983[3] = warp_off_1017 + lane_before_1016;
+        grp_warp_984 = grp_warp_984 + (warp_off_1017 - cnt[560]);
+        grp_lane_985 = grp_lane_985 + lane_before_1016;
+        unsigned int grp_base_1018 = cnt[512];
+        unsigned int own_1019 = 0;
+        unsigned int vec_rank_1020 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1021 = vec_rank_1020;
+        if (keys_980[0] > threshold_f) {
+            unsigned long long dst_72 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_72] = __uint_as_float(keys_980[0]);
+            out_idx[dst_72] = idxs_981[0];
+            g_1 = g_1 + 1;
+        } else if (ties_982[0] && rank_1021 < eq_take) {
+            unsigned long long dst2_32 = eq_base + (unsigned long long)rank_1021;
+            out_vals[dst2_32] = __uint_as_float(keys_980[0]);
+            out_idx[dst2_32] = idxs_981[0];
+        }
+        if (ties_982[0]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1022 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1023 = vec_rank_1022;
+        if (keys_980[1] > threshold_f) {
+            unsigned long long dst_73 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_73] = __uint_as_float(keys_980[1]);
+            out_idx[dst_73] = idxs_981[1];
+            g_1 = g_1 + 1;
+        } else if (ties_982[1] && rank_1023 < eq_take) {
+            unsigned long long dst2_33 = eq_base + (unsigned long long)rank_1023;
+            out_vals[dst2_33] = __uint_as_float(keys_980[1]);
+            out_idx[dst2_33] = idxs_981[1];
+        }
+        if (ties_982[1]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1024 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1025 = vec_rank_1024;
+        if (keys_980[2] > threshold_f) {
+            unsigned long long dst_74 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_74] = __uint_as_float(keys_980[2]);
+            out_idx[dst_74] = idxs_981[2];
+            g_1 = g_1 + 1;
+        } else if (ties_982[2] && rank_1025 < eq_take) {
+            unsigned long long dst2_34 = eq_base + (unsigned long long)rank_1025;
+            out_vals[dst2_34] = __uint_as_float(keys_980[2]);
+            out_idx[dst2_34] = idxs_981[2];
+        }
+        if (ties_982[2]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1026 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1027 = vec_rank_1026;
+        if (keys_980[3] > threshold_f) {
+            unsigned long long dst_75 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_75] = __uint_as_float(keys_980[3]);
+            out_idx[dst_75] = idxs_981[3];
+            g_1 = g_1 + 1;
+        } else if (ties_982[3] && rank_1027 < eq_take) {
+            unsigned long long dst2_35 = eq_base + (unsigned long long)rank_1027;
+            out_vals[dst2_35] = __uint_as_float(keys_980[3]);
+            out_idx[dst2_35] = idxs_981[3];
+        }
+        if (ties_982[3]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int keys_1028[4];
+        int idxs_1029[4];
+        bool ties_1030[4];
+        unsigned int strided_1031[4];
+        unsigned int grp_warp_1032 = 0;
+        unsigned int grp_lane_1033 = 0;
+        unsigned int bits_1034 = __as_u32(vals[36]);
+        unsigned int key_1035 = ((bits_1034 <= 2139095040) ? bits_1034 : 0);
+        keys_1028[0] = key_1035;
+        int i_vec_1036 = start + 18432 + tid * 4;
+        int i_str_1037 = start + 18432 + tid;
+        int i_1038 = i_vec_1036;
+        idxs_1029[0] = i_1038;
+        ties_1030[0] = keys_1028[0] == threshold_f && idxs_1029[0] < vocab;
+        unsigned int m_1039 = __ballot_sync(0xFFFFFFFF, ties_1030[0]);
+        unsigned int lane_before_1040 = (unsigned int)__popc(m_1039 & lt_mask);
+        unsigned int warp_off_1041 = cnt[576 + warp];
+        strided_1031[0] = warp_off_1041 + lane_before_1040;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1041 - cnt[576]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1040;
+        unsigned int bits_1042 = __as_u32(vals[37]);
+        unsigned int key_1043 = ((bits_1042 <= 2139095040) ? bits_1042 : 0);
+        keys_1028[1] = key_1043;
+        int i_vec_1044 = start + 18432 + tid * 4 + 1;
+        int i_str_1045 = start + 18944 + tid;
+        int i_1046 = i_vec_1044;
+        idxs_1029[1] = i_1046;
+        ties_1030[1] = keys_1028[1] == threshold_f && idxs_1029[1] < vocab;
+        unsigned int m_1047 = __ballot_sync(0xFFFFFFFF, ties_1030[1]);
+        unsigned int lane_before_1048 = (unsigned int)__popc(m_1047 & lt_mask);
+        unsigned int warp_off_1049 = cnt[592 + warp];
+        strided_1031[1] = warp_off_1049 + lane_before_1048;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1049 - cnt[592]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1048;
+        unsigned int bits_1050 = __as_u32(vals[38]);
+        unsigned int key_1051 = ((bits_1050 <= 2139095040) ? bits_1050 : 0);
+        keys_1028[2] = key_1051;
+        int i_vec_1052 = start + 18432 + tid * 4 + 2;
+        int i_str_1053 = start + 19456 + tid;
+        int i_1054 = i_vec_1052;
+        idxs_1029[2] = i_1054;
+        ties_1030[2] = keys_1028[2] == threshold_f && idxs_1029[2] < vocab;
+        unsigned int m_1055 = __ballot_sync(0xFFFFFFFF, ties_1030[2]);
+        unsigned int lane_before_1056 = (unsigned int)__popc(m_1055 & lt_mask);
+        unsigned int warp_off_1057 = cnt[608 + warp];
+        strided_1031[2] = warp_off_1057 + lane_before_1056;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1057 - cnt[608]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1056;
+        unsigned int bits_1058 = __as_u32(vals[39]);
+        unsigned int key_1059 = ((bits_1058 <= 2139095040) ? bits_1058 : 0);
+        keys_1028[3] = key_1059;
+        int i_vec_1060 = start + 18432 + tid * 4 + 3;
+        int i_str_1061 = start + 19968 + tid;
+        int i_1062 = i_vec_1060;
+        idxs_1029[3] = i_1062;
+        ties_1030[3] = keys_1028[3] == threshold_f && idxs_1029[3] < vocab;
+        unsigned int m_1063 = __ballot_sync(0xFFFFFFFF, ties_1030[3]);
+        unsigned int lane_before_1064 = (unsigned int)__popc(m_1063 & lt_mask);
+        unsigned int warp_off_1065 = cnt[624 + warp];
+        strided_1031[3] = warp_off_1065 + lane_before_1064;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1065 - cnt[624]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1064;
+        unsigned int grp_base_1066 = cnt[576];
+        unsigned int own_1067 = 0;
+        unsigned int vec_rank_1068 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1069 = vec_rank_1068;
+        if (keys_1028[0] > threshold_f) {
+            unsigned long long dst_76 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_76] = __uint_as_float(keys_1028[0]);
+            out_idx[dst_76] = idxs_1029[0];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[0] && rank_1069 < eq_take) {
+            unsigned long long dst2_36 = eq_base + (unsigned long long)rank_1069;
+            out_vals[dst2_36] = __uint_as_float(keys_1028[0]);
+            out_idx[dst2_36] = idxs_1029[0];
+        }
+        if (ties_1030[0]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1070 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1071 = vec_rank_1070;
+        if (keys_1028[1] > threshold_f) {
+            unsigned long long dst_77 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_77] = __uint_as_float(keys_1028[1]);
+            out_idx[dst_77] = idxs_1029[1];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[1] && rank_1071 < eq_take) {
+            unsigned long long dst2_37 = eq_base + (unsigned long long)rank_1071;
+            out_vals[dst2_37] = __uint_as_float(keys_1028[1]);
+            out_idx[dst2_37] = idxs_1029[1];
+        }
+        if (ties_1030[1]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1072 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1073 = vec_rank_1072;
+        if (keys_1028[2] > threshold_f) {
+            unsigned long long dst_78 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_78] = __uint_as_float(keys_1028[2]);
+            out_idx[dst_78] = idxs_1029[2];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[2] && rank_1073 < eq_take) {
+            unsigned long long dst2_38 = eq_base + (unsigned long long)rank_1073;
+            out_vals[dst2_38] = __uint_as_float(keys_1028[2]);
+            out_idx[dst2_38] = idxs_1029[2];
+        }
+        if (ties_1030[2]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1074 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1075 = vec_rank_1074;
+        if (keys_1028[3] > threshold_f) {
+            unsigned long long dst_79 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_79] = __uint_as_float(keys_1028[3]);
+            out_idx[dst_79] = idxs_1029[3];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[3] && rank_1075 < eq_take) {
+            unsigned long long dst2_39 = eq_base + (unsigned long long)rank_1075;
+            out_vals[dst2_39] = __uint_as_float(keys_1028[3]);
+            out_idx[dst2_39] = idxs_1029[3];
+        }
+        if (ties_1030[3]) {
+            own_1067 = own_1067 + 1;
+        }
+        if (rank == 0 && tid == 0) {
+            out_count[row] = k;
+        }
+    }
+    if (fuse_on != 0) {
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        if (rank == 0 && warp < 2) {
+            float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
+            int w = warp;
+            int pos_2 = w * 32 + lane;
+            if (pos_2 == 0) {
+                scal32[1] = 0;
+                tot64[2] = 0;
+            }
+            unsigned long long comp[1];
+            unsigned long long c_in = 0;
+            if (pos_2 < k) {
+                int ix0 = out_idx[out_base + (unsigned long long)pos_2];
+                float v0i = out_vals[out_base + (unsigned long long)pos_2];
+                unsigned int bits_1_2 = __as_u32(v0i);
+                unsigned int key_2_2 = ((bits_1_2 <= 2139095040) ? bits_1_2 : 0);
+                c_in = (unsigned long long)key_2_2 << 32 | (unsigned long long)~(unsigned int)ix0;
+            }
+            comp[0] = c_in;
+            bool keep_max = (tid & 1) == 0;
+            keep_max = ((tid ^ tid >> 1) & 1) == 0;
+            unsigned long long o = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            unsigned long long hi = ((o > comp[0]) ? o : comp[0]);
+            unsigned long long lo_0_1 = ((o > comp[0]) ? comp[0] : o);
+            comp[0] = ((keep_max) ? hi : lo_0_1);
+            bool keep_max_1 = (tid & 2) == 0;
+            keep_max_1 = ((tid >> 1 ^ tid >> 2) & 1) == 0;
+            unsigned long long o_2 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
+            unsigned long long hi_3 = ((o_2 > comp[0]) ? o_2 : comp[0]);
+            unsigned long long lo_4 = ((o_2 > comp[0]) ? comp[0] : o_2);
+            comp[0] = ((keep_max_1) ? hi_3 : lo_4);
+            bool keep_max_5 = (tid & 1) == 0;
+            keep_max_5 = ((tid ^ tid >> 2) & 1) == 0;
+            unsigned long long o_6 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            unsigned long long hi_7 = ((o_6 > comp[0]) ? o_6 : comp[0]);
+            unsigned long long lo_8 = ((o_6 > comp[0]) ? comp[0] : o_6);
+            comp[0] = ((keep_max_5) ? hi_7 : lo_8);
+            bool keep_max_9 = (tid & 4) == 0;
+            keep_max_9 = ((tid >> 2 ^ tid >> 3) & 1) == 0;
+            unsigned long long o_10 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
+            unsigned long long hi_11 = ((o_10 > comp[0]) ? o_10 : comp[0]);
+            unsigned long long lo_12 = ((o_10 > comp[0]) ? comp[0] : o_10);
+            comp[0] = ((keep_max_9) ? hi_11 : lo_12);
+            bool keep_max_13 = (tid & 2) == 0;
+            keep_max_13 = ((tid >> 1 ^ tid >> 3) & 1) == 0;
+            unsigned long long o_14 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
+            unsigned long long hi_15 = ((o_14 > comp[0]) ? o_14 : comp[0]);
+            unsigned long long lo_16 = ((o_14 > comp[0]) ? comp[0] : o_14);
+            comp[0] = ((keep_max_13) ? hi_15 : lo_16);
+            bool keep_max_17 = (tid & 1) == 0;
+            keep_max_17 = ((tid ^ tid >> 3) & 1) == 0;
+            unsigned long long o_18 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            unsigned long long hi_19 = ((o_18 > comp[0]) ? o_18 : comp[0]);
+            unsigned long long lo_20 = ((o_18 > comp[0]) ? comp[0] : o_18);
+            comp[0] = ((keep_max_17) ? hi_19 : lo_20);
+            bool keep_max_21 = (tid & 8) == 0;
+            keep_max_21 = ((tid >> 3 ^ tid >> 4) & 1) == 0;
+            unsigned long long o_22 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 8);
+            unsigned long long hi_23 = ((o_22 > comp[0]) ? o_22 : comp[0]);
+            unsigned long long lo_24 = ((o_22 > comp[0]) ? comp[0] : o_22);
+            comp[0] = ((keep_max_21) ? hi_23 : lo_24);
+            bool keep_max_25 = (tid & 4) == 0;
+            keep_max_25 = ((tid >> 2 ^ tid >> 4) & 1) == 0;
+            unsigned long long o_26 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
+            unsigned long long hi_27 = ((o_26 > comp[0]) ? o_26 : comp[0]);
+            unsigned long long lo_28 = ((o_26 > comp[0]) ? comp[0] : o_26);
+            comp[0] = ((keep_max_25) ? hi_27 : lo_28);
+            bool keep_max_29 = (tid & 2) == 0;
+            keep_max_29 = ((tid >> 1 ^ tid >> 4) & 1) == 0;
+            unsigned long long o_30 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
+            unsigned long long hi_31 = ((o_30 > comp[0]) ? o_30 : comp[0]);
+            unsigned long long lo_32 = ((o_30 > comp[0]) ? comp[0] : o_30);
+            comp[0] = ((keep_max_29) ? hi_31 : lo_32);
+            bool keep_max_33 = (tid & 1) == 0;
+            keep_max_33 = ((tid ^ tid >> 4) & 1) == 0;
+            unsigned long long o_34 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            unsigned long long hi_35 = ((o_34 > comp[0]) ? o_34 : comp[0]);
+            unsigned long long lo_36 = ((o_34 > comp[0]) ? comp[0] : o_34);
+            comp[0] = ((keep_max_33) ? hi_35 : lo_36);
+            bool keep_max_37 = (tid & 16) == 0;
+            keep_max_37 = (tid & 16) == 0;
+            unsigned long long o_38 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 16);
+            unsigned long long hi_39 = ((o_38 > comp[0]) ? o_38 : comp[0]);
+            unsigned long long lo_40 = ((o_38 > comp[0]) ? comp[0] : o_38);
+            comp[0] = ((keep_max_37) ? hi_39 : lo_40);
+            bool keep_max_41 = (tid & 8) == 0;
+            keep_max_41 = (tid & 8) == 0;
+            unsigned long long o_42 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 8);
+            unsigned long long hi_43 = ((o_42 > comp[0]) ? o_42 : comp[0]);
+            unsigned long long lo_44 = ((o_42 > comp[0]) ? comp[0] : o_42);
+            comp[0] = ((keep_max_41) ? hi_43 : lo_44);
+            bool keep_max_45 = (tid & 4) == 0;
+            keep_max_45 = (tid & 4) == 0;
+            unsigned long long o_46 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
+            unsigned long long hi_47 = ((o_46 > comp[0]) ? o_46 : comp[0]);
+            unsigned long long lo_48 = ((o_46 > comp[0]) ? comp[0] : o_46);
+            comp[0] = ((keep_max_45) ? hi_47 : lo_48);
+            bool keep_max_49 = (tid & 2) == 0;
+            keep_max_49 = (tid & 2) == 0;
+            unsigned long long o_50 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
+            unsigned long long hi_51 = ((o_50 > comp[0]) ? o_50 : comp[0]);
+            unsigned long long lo_52 = ((o_50 > comp[0]) ? comp[0] : o_50);
+            comp[0] = ((keep_max_49) ? hi_51 : lo_52);
+            bool keep_max_53 = (tid & 1) == 0;
+            keep_max_53 = (tid & 1) == 0;
+            unsigned long long o_54 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            unsigned long long hi_55 = ((o_54 > comp[0]) ? o_54 : comp[0]);
+            unsigned long long lo_56 = ((o_54 > comp[0]) ? comp[0] : o_54);
+            comp[0] = ((keep_max_53) ? hi_55 : lo_56);
+            unsigned long long rev = __shfl_sync(0xFFFFFFFF, comp[0], 31 - lane);
+            if (w == 1) {
+                comp[0] = rev;
+            }
+            xbuf64[pos_2] = comp[0];
+            asm volatile("barrier.sync 1, 64;" ::: "memory");
+            unsigned long long o_57 = xbuf64[pos_2 ^ 32];
+            bool gt_1 = o_57 > comp[0];
+            bool upper = w == 0;
+            bool take = ((upper) ? gt_1 : !gt_1);
+            comp[0] = ((take) ? o_57 : comp[0]);
+            unsigned long long o2 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 16);
+            bool keep_max_58 = (lane & 16) == 0;
+            bool gt2 = o2 > comp[0];
+            bool take2 = ((keep_max_58) ? gt2 : !gt2);
+            comp[0] = ((take2) ? o2 : comp[0]);
+            unsigned long long o2_59 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 8);
+            bool keep_max_60 = (lane & 8) == 0;
+            bool gt2_61 = o2_59 > comp[0];
+            bool take2_62 = ((keep_max_60) ? gt2_61 : !gt2_61);
+            comp[0] = ((take2_62) ? o2_59 : comp[0]);
+            unsigned long long o2_63 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
+            bool keep_max_64 = (lane & 4) == 0;
+            bool gt2_65 = o2_63 > comp[0];
+            bool take2_66 = ((keep_max_64) ? gt2_65 : !gt2_65);
+            comp[0] = ((take2_66) ? o2_63 : comp[0]);
+            unsigned long long o2_67 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
+            bool keep_max_68 = (lane & 2) == 0;
+            bool gt2_69 = o2_67 > comp[0];
+            bool take2_70 = ((keep_max_68) ? gt2_69 : !gt2_69);
+            comp[0] = ((take2_70) ? o2_67 : comp[0]);
+            unsigned long long o2_71 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
+            bool keep_max_72 = (lane & 1) == 0;
+            bool gt2_73 = o2_71 > comp[0];
+            bool take2_74 = ((keep_max_72) ? gt2_73 : !gt2_73);
+            comp[0] = ((take2_74) ? o2_71 : comp[0]);
+            unsigned long long c_out = comp[0];
+            unsigned int key_75 = (unsigned int)(c_out >> 32);
+            unsigned int payload = ((c_out != 0) ? ~(unsigned int)(c_out & 4294967295) : 4294967295u);
+            int ix_item = ((payload != 4294967295u) ? (int)payload : 0);
+            float v_item = __uint_as_float(key_75);
+            if (pos_2 == 0) {
+                scal32[0] = key_75;
+            }
+            asm volatile("barrier.sync 1, 64;" ::: "memory");
+            unsigned int max_key = scal32[0];
+            bool is_inf = max_key == 2139095040;
+            unsigned int e0 = max_key >> 23;
+            unsigned int eff_e0 = ((e0 != 0) ? e0 : 1);
+            unsigned int m0 = max_key & 8388607 | ((e0 != 0) ? 8388608 : 0);
+            unsigned int e = key_75 >> 23;
+            unsigned int eff_e = ((e != 0) ? e : 1);
+            unsigned int mm = key_75 & 8388607 | ((e != 0) ? 8388608 : 0);
+            unsigned int shift = eff_e0 - eff_e;
+            unsigned long long fixed = ((shift < 64) ? (unsigned long long)mm << 29 >> (unsigned long long)shift : 0);
+            unsigned long long inf_unit = ((key_75 == 2139095040) ? 1 : 0);
+            unsigned long long vint = ((is_inf) ? inf_unit : fixed);
+            unsigned long long s = vint;
+            unsigned long long y = __shfl_up_sync(0xFFFFFFFF, s, 1, 32);
+            if (lane >= 1) {
+                s = s + y;
+            }
+            unsigned long long y_76 = __shfl_up_sync(0xFFFFFFFF, s, 2, 32);
+            if (lane >= 2) {
+                s = s + y_76;
+            }
+            unsigned long long y_77 = __shfl_up_sync(0xFFFFFFFF, s, 4, 32);
+            if (lane >= 4) {
+                s = s + y_77;
+            }
+            unsigned long long y_78 = __shfl_up_sync(0xFFFFFFFF, s, 8, 32);
+            if (lane >= 8) {
+                s = s + y_78;
+            }
+            unsigned long long y_79 = __shfl_up_sync(0xFFFFFFFF, s, 16, 32);
+            if (lane >= 16) {
+                s = s + y_79;
+            }
+            unsigned long long wtot = __shfl_sync(0xFFFFFFFF, s, 31);
+            if (lane == 0) {
+                tot64[w] = wtot;
+            }
+            asm volatile("barrier.sync 1, 64;" ::: "memory");
+            unsigned long long t0 = tot64[0];
+            unsigned long long t1 = tot64[1];
+            unsigned long long total_2 = t0 + t1;
+            unsigned long long excl_2 = s - vint + ((w == 1) ? t0 : 0);
+            unsigned long long incl_2 = excl_2 + vint;
+            double total_f = (double)total_2;
+            float p_eff = ((p_row < 1.0f) ? p_row : 1.0f);
+            double target = (double)p_eff * total_f;
+            if (max_key == 2139095040) {
+                target = total_f;
+            }
+            unsigned int target_pos = ((target > 0.0) ? 1 : 0);
+            if (target_pos == 0) {
+                target = 1.0;
+            }
+            bool kept = target > (double)excl_2 && vint > 0;
+            if (kept && target <= (double)incl_2) {
+                scal32[1] = (unsigned int)pos_2;
+                tot64[2] = incl_2;
+            }
+            asm volatile("barrier.sync 1, 64;" ::: "memory");
+            unsigned int cutoff = scal32[1];
+            unsigned long long kept_int = tot64[2];
+            double kept_f = (double)kept_int;
+            unsigned int c0_2 = offset_lo >> 2 | offset_hi << 30;
+            unsigned int c1_2 = offset_hi >> 2;
+            unsigned int c2_2 = (unsigned int)row;
+            unsigned int c3_2 = 0;
+            unsigned int k0 = seed_lo;
+            unsigned int k1 = seed_hi;
+            unsigned int t0_80 = 0;
+            unsigned int t1_81 = 0;
+            unsigned int t2 = 0;
+            unsigned int t3 = 0;
+            unsigned long long p0 = 0;
+            unsigned long long p1 = 0;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            k0 = k0 + 2654435769u;
+            k1 = k1 + 3144134277u;
+            p0 = (unsigned long long)c0_2 * 3528531795;
+            p1 = (unsigned long long)c2_2 * 3449720151;
+            t0_80 = (unsigned int)(p1 >> 32) ^ c1_2 ^ k0;
+            t1_81 = (unsigned int)p1;
+            t2 = (unsigned int)(p0 >> 32) ^ c3_2 ^ k1;
+            t3 = (unsigned int)p0;
+            c0_2 = t0_80;
+            c1_2 = t1_81;
+            c2_2 = t2;
+            c3_2 = t3;
+            unsigned int state = offset_lo & 3;
+            unsigned int word = ((state == 0) ? c0_2 : ((state == 1) ? c1_2 : ((state == 2) ? c2_2 : c3_2)));
+            float u = __fmaf_rn((float)word, 2.3283064e-10f, 1.1641532e-10f);
+            float u_82 = u;
+            double u_f = (double)u_82 * kept_f;
+            if (u_f < kept_f) {
+                if (kept && u_f >= (double)excl_2 && u_f < (double)incl_2) {
+                    out_samples[row] = ix_item;
+                }
+            } else if ((unsigned int)pos_2 == cutoff) {
+                out_samples[row] = ix_item;
+            }
+            if (payload != 4294967295u) {
+                unsigned long long dst_80 = out_base + (unsigned long long)pos_2;
+                out_idx[dst_80] = ix_item;
+                out_vals[dst_80] = v_item;
+                if (emit_renorm != 0) {
+                    float r_2 = 0.0f;
+                    if (kept && kept_int > 0) {
+                        if (max_key == 2139095040) {
+                            r_2 = (float)(1.0 / kept_f);
+                        } else {
+                            float v0 = __uint_as_float(max_key);
+                            double vint0_f = (double)((unsigned long long)m0 << 29);
+                            double kept_mass = kept_f / vint0_f * (double)v0;
+                            r_2 = (float)((double)v_item / kept_mass);
+                        }
+                    }
+                    out_renorm[dst_80] = r_2;
+                }
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_CLIST_OFF
+#undef SMEM_CLIST_STAGE_BYTES
+#undef SMEM_CLIST_STRIDE
+#undef SMEM_CNT_OFF
+#undef SMEM_CNT_STAGE_BYTES
+#undef SMEM_CNT_STRIDE
+#undef SMEM_COARSE_OFF
+#undef SMEM_COARSE_STAGE_BYTES
+#undef SMEM_COARSE_STRIDE
+#undef SMEM_HIST0_OFF
+#undef SMEM_HIST0_STAGE_BYTES
+#undef SMEM_HIST0_STRIDE
+#undef SMEM_HIST1_OFF
+#undef SMEM_HIST1_STAGE_BYTES
+#undef SMEM_HIST1_STRIDE
+#undef SMEM_SCAL32_OFF
+#undef SMEM_SCAL32_STAGE_BYTES
+#undef SMEM_SCAL32_STRIDE
+#undef SMEM_SCAL_BU64_OFF
+#undef SMEM_SCAL_BU64_STAGE_BYTES
+#undef SMEM_SCAL_BU64_STRIDE
+#undef SMEM_SCAL_BU_OFF
+#undef SMEM_SCAL_BU_STAGE_BYTES
+#undef SMEM_SCAL_BU_STRIDE
+#undef SMEM_SCAL_OFF
+#undef SMEM_SCAL_STAGE_BYTES
+#undef SMEM_SCAL_STRIDE
+#undef SMEM_TOT64_OFF
+#undef SMEM_TOT64_STAGE_BYTES
+#undef SMEM_TOT64_STRIDE
+#undef SMEM_TOTAL
+#undef SMEM_WARP_SUMS_OFF
+#undef SMEM_WARP_SUMS_STAGE_BYTES
+#undef SMEM_WARP_SUMS_STRIDE
+#undef SMEM_WSUM64_OFF
+#undef SMEM_WSUM64_STAGE_BYTES
+#undef SMEM_WSUM64_STRIDE
+#undef SMEM_XBUF0B_OFF
+#undef SMEM_XBUF0B_STAGE_BYTES
+#undef SMEM_XBUF0B_STRIDE
+#undef SMEM_XBUF1B_OFF
+#undef SMEM_XBUF1B_STAGE_BYTES
+#undef SMEM_XBUF1B_STRIDE
+#undef SMEM_XBUF64_OFF
+#undef SMEM_XBUF64_STAGE_BYTES
+#undef SMEM_XBUF64_STRIDE
+#undef THREADS
+#undef clist_addr
+#undef cnt_addr
+#undef coarse_addr
+#undef hist0_addr
+#undef hist1_addr
+#undef scal32_addr
+#undef scal_addr
+#undef scal_bu64_addr
+#undef scal_bu_addr
+#undef tot64_addr
+#undef warp_sums_addr
+#undef wsum64_addr
+#undef xbuf0b_addr
+#undef xbuf1b_addr
+#undef xbuf64_addr
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_HIST0_OFF 0
+#define SMEM_HIST0_STAGE_BYTES 8192
+#define SMEM_HIST0_STRIDE 8192
+#define SMEM_XBUF64_OFF 0
+#define SMEM_XBUF64_STAGE_BYTES 512
+#define SMEM_XBUF64_STRIDE 512
+#define SMEM_TOT64_OFF 512
+#define SMEM_TOT64_STAGE_BYTES 32
+#define SMEM_TOT64_STRIDE 32
+#define SMEM_SCAL32_OFF 544
+#define SMEM_SCAL32_STAGE_BYTES 16
+#define SMEM_SCAL32_STRIDE 16
+#define SMEM_XBUF0B_OFF 0
+#define SMEM_XBUF0B_STAGE_BYTES 8192
+#define SMEM_XBUF0B_STRIDE 8192
+#define SMEM_XBUF1B_OFF 8192
+#define SMEM_XBUF1B_STAGE_BYTES 8192
+#define SMEM_XBUF1B_STRIDE 8192
+#define SMEM_WSUM64_OFF 19072
+#define SMEM_WSUM64_STAGE_BYTES 128
+#define SMEM_WSUM64_STRIDE 128
+#define SMEM_SCAL_BU_OFF 19200
+#define SMEM_SCAL_BU_STAGE_BYTES 32
+#define SMEM_SCAL_BU_STRIDE 32
+#define SMEM_SCAL_BU64_OFF 19200
+#define SMEM_SCAL_BU64_STAGE_BYTES 32
+#define SMEM_SCAL_BU64_STRIDE 32
+#define SMEM_HIST1_OFF 8192
+#define SMEM_HIST1_STAGE_BYTES 8192
+#define SMEM_HIST1_STRIDE 8192
+#define SMEM_WARP_SUMS_OFF 16384
+#define SMEM_WARP_SUMS_STAGE_BYTES 64
+#define SMEM_WARP_SUMS_STRIDE 64
+#define SMEM_SCAL_OFF 16448
+#define SMEM_SCAL_STAGE_BYTES 64
+#define SMEM_SCAL_STRIDE 64
+#define SMEM_CNT_OFF 16512
+#define SMEM_CNT_STAGE_BYTES 2560
+#define SMEM_CNT_STRIDE 2560
+#define SMEM_CLIST_OFF 19072
+#define SMEM_CLIST_STAGE_BYTES 16384
+#define SMEM_CLIST_STRIDE 16384
+#define SMEM_COARSE_OFF 35456
+#define SMEM_COARSE_STAGE_BYTES 512
+#define SMEM_COARSE_STRIDE 512
+#define SMEM_TOTAL 35968
+#define THREADS 512
+
+extern "C" {
+
+__global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
+kernel_cake_radix_topk_c8_e40_nt(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 8;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    unsigned int* hist0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
+    const int hist0_addr = smem + 0;
+    unsigned long long* xbuf64 = reinterpret_cast<unsigned long long*>(smem_raw + 0);
+    const int xbuf64_addr = smem + 0;
+    unsigned long long* tot64 = reinterpret_cast<unsigned long long*>(smem_raw + 512);
+    const int tot64_addr = smem + 512;
+    unsigned int* scal32 = reinterpret_cast<unsigned int*>(smem_raw + 544);
+    const int scal32_addr = smem + 544;
+    unsigned long long* xbuf0b = reinterpret_cast<unsigned long long*>(smem_raw + 0);
+    const int xbuf0b_addr = smem + 0;
+    unsigned long long* xbuf1b = reinterpret_cast<unsigned long long*>(smem_raw + 8192);
+    const int xbuf1b_addr = smem + 8192;
+    unsigned long long* wsum64 = reinterpret_cast<unsigned long long*>(smem_raw + 19072);
+    const int wsum64_addr = smem + 19072;
+    unsigned int* scal_bu = reinterpret_cast<unsigned int*>(smem_raw + 19200);
+    const int scal_bu_addr = smem + 19200;
+    unsigned long long* scal_bu64 = reinterpret_cast<unsigned long long*>(smem_raw + 19200);
+    const int scal_bu64_addr = smem + 19200;
+    unsigned int* hist1 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int hist1_addr = smem + 8192;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int warp_sums_addr = smem + 16384;
+    unsigned int* scal = reinterpret_cast<unsigned int*>(smem_raw + 16448);
+    const int scal_addr = smem + 16448;
+    unsigned int* cnt = reinterpret_cast<unsigned int*>(smem_raw + 16512);
+    const int cnt_addr = smem + 16512;
+    unsigned int* clist = reinterpret_cast<unsigned int*>(smem_raw + 19072);
+    const int clist_addr = smem + 19072;
+    unsigned int* coarse = reinterpret_cast<unsigned int*>(smem_raw + 35456);
+    const int coarse_addr = smem + 35456;
+
+    // === Task calls (declaration order) ===
+    int row = 0;
+    int rank = 0;
+    row = cluster_id;
+    rank = cta_rank;
+    int k_req = ((topk_kind == 2) ? topk_arr[row] : topk_scalar);
+    int _min_1 = ((k_req) < (vocab) ? (k_req) : (vocab));
+    int _min_0 = ((_min_1) < (1024) ? (_min_1) : (1024));
+    int k = ((_min_0) > (1) ? (_min_0) : (1));
+    unsigned int k_u = (unsigned int)k;
+    unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab;
+    unsigned long long out_base = (unsigned long long)row * 1024;
+    int start = rank * 20480;
+    bool aligned = (vocab & 3) == 0;
+    float vals[40];
+    int base_t = start + tid * 4;
+    if (aligned) {
+        int i = start + tid * 4;
+        if (i < vocab) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            vals[0] = _vec_load_0[0];
+            vals[1] = _vec_load_0[1];
+            vals[2] = _vec_load_0[2];
+            vals[3] = _vec_load_0[3];
+        } else {
+            vals[0] = 0.0f;
+            vals[1] = 0.0f;
+            vals[2] = 0.0f;
+            vals[3] = 0.0f;
+        }
+        int i_0 = start + 2048 + tid * 4;
+        if (i_0 < vocab) {
+            float _vec_load_1[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_0);
+                _vec_load_1[0 + 0] = _v4.x;
+                _vec_load_1[0 + 1] = _v4.y;
+                _vec_load_1[0 + 2] = _v4.z;
+                _vec_load_1[0 + 3] = _v4.w;
+            }
+            vals[4] = _vec_load_1[0];
+            vals[5] = _vec_load_1[1];
+            vals[6] = _vec_load_1[2];
+            vals[7] = _vec_load_1[3];
+        } else {
+            vals[4] = 0.0f;
+            vals[5] = 0.0f;
+            vals[6] = 0.0f;
+            vals[7] = 0.0f;
+        }
+        int i_1 = start + 4096 + tid * 4;
+        if (i_1 < vocab) {
+            float _vec_load_2[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_1);
+                _vec_load_2[0 + 0] = _v4.x;
+                _vec_load_2[0 + 1] = _v4.y;
+                _vec_load_2[0 + 2] = _v4.z;
+                _vec_load_2[0 + 3] = _v4.w;
+            }
+            vals[8] = _vec_load_2[0];
+            vals[9] = _vec_load_2[1];
+            vals[10] = _vec_load_2[2];
+            vals[11] = _vec_load_2[3];
+        } else {
+            vals[8] = 0.0f;
+            vals[9] = 0.0f;
+            vals[10] = 0.0f;
+            vals[11] = 0.0f;
+        }
+        int i_2 = start + 6144 + tid * 4;
+        if (i_2 < vocab) {
+            float _vec_load_3[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_2);
+                _vec_load_3[0 + 0] = _v4.x;
+                _vec_load_3[0 + 1] = _v4.y;
+                _vec_load_3[0 + 2] = _v4.z;
+                _vec_load_3[0 + 3] = _v4.w;
+            }
+            vals[12] = _vec_load_3[0];
+            vals[13] = _vec_load_3[1];
+            vals[14] = _vec_load_3[2];
+            vals[15] = _vec_load_3[3];
+        } else {
+            vals[12] = 0.0f;
+            vals[13] = 0.0f;
+            vals[14] = 0.0f;
+            vals[15] = 0.0f;
+        }
+        int i_3 = start + 8192 + tid * 4;
+        if (i_3 < vocab) {
+            float _vec_load_4[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_3);
+                _vec_load_4[0 + 0] = _v4.x;
+                _vec_load_4[0 + 1] = _v4.y;
+                _vec_load_4[0 + 2] = _v4.z;
+                _vec_load_4[0 + 3] = _v4.w;
+            }
+            vals[16] = _vec_load_4[0];
+            vals[17] = _vec_load_4[1];
+            vals[18] = _vec_load_4[2];
+            vals[19] = _vec_load_4[3];
+        } else {
+            vals[16] = 0.0f;
+            vals[17] = 0.0f;
+            vals[18] = 0.0f;
+            vals[19] = 0.0f;
+        }
+        int i_4 = start + 10240 + tid * 4;
+        if (i_4 < vocab) {
+            float _vec_load_5[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_4);
+                _vec_load_5[0 + 0] = _v4.x;
+                _vec_load_5[0 + 1] = _v4.y;
+                _vec_load_5[0 + 2] = _v4.z;
+                _vec_load_5[0 + 3] = _v4.w;
+            }
+            vals[20] = _vec_load_5[0];
+            vals[21] = _vec_load_5[1];
+            vals[22] = _vec_load_5[2];
+            vals[23] = _vec_load_5[3];
+        } else {
+            vals[20] = 0.0f;
+            vals[21] = 0.0f;
+            vals[22] = 0.0f;
+            vals[23] = 0.0f;
+        }
+        int i_5 = start + 12288 + tid * 4;
+        if (i_5 < vocab) {
+            float _vec_load_6[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_5);
+                _vec_load_6[0 + 0] = _v4.x;
+                _vec_load_6[0 + 1] = _v4.y;
+                _vec_load_6[0 + 2] = _v4.z;
+                _vec_load_6[0 + 3] = _v4.w;
+            }
+            vals[24] = _vec_load_6[0];
+            vals[25] = _vec_load_6[1];
+            vals[26] = _vec_load_6[2];
+            vals[27] = _vec_load_6[3];
+        } else {
+            vals[24] = 0.0f;
+            vals[25] = 0.0f;
+            vals[26] = 0.0f;
+            vals[27] = 0.0f;
+        }
+        int i_6 = start + 14336 + tid * 4;
+        if (i_6 < vocab) {
+            float _vec_load_7[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_6);
+                _vec_load_7[0 + 0] = _v4.x;
+                _vec_load_7[0 + 1] = _v4.y;
+                _vec_load_7[0 + 2] = _v4.z;
+                _vec_load_7[0 + 3] = _v4.w;
+            }
+            vals[28] = _vec_load_7[0];
+            vals[29] = _vec_load_7[1];
+            vals[30] = _vec_load_7[2];
+            vals[31] = _vec_load_7[3];
+        } else {
+            vals[28] = 0.0f;
+            vals[29] = 0.0f;
+            vals[30] = 0.0f;
+            vals[31] = 0.0f;
+        }
+        int i_7 = start + 16384 + tid * 4;
+        if (i_7 < vocab) {
+            float _vec_load_8[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_7);
+                _vec_load_8[0 + 0] = _v4.x;
+                _vec_load_8[0 + 1] = _v4.y;
+                _vec_load_8[0 + 2] = _v4.z;
+                _vec_load_8[0 + 3] = _v4.w;
+            }
+            vals[32] = _vec_load_8[0];
+            vals[33] = _vec_load_8[1];
+            vals[34] = _vec_load_8[2];
+            vals[35] = _vec_load_8[3];
+        } else {
+            vals[32] = 0.0f;
+            vals[33] = 0.0f;
+            vals[34] = 0.0f;
+            vals[35] = 0.0f;
+        }
+        int i_8 = start + 18432 + tid * 4;
+        if (i_8 < vocab) {
+            float _vec_load_9[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(probs + row_base + (unsigned long long)i_8);
+                _vec_load_9[0 + 0] = _v4.x;
+                _vec_load_9[0 + 1] = _v4.y;
+                _vec_load_9[0 + 2] = _v4.z;
+                _vec_load_9[0 + 3] = _v4.w;
+            }
+            vals[36] = _vec_load_9[0];
+            vals[37] = _vec_load_9[1];
+            vals[38] = _vec_load_9[2];
+            vals[39] = _vec_load_9[3];
+        } else {
+            vals[36] = 0.0f;
+            vals[37] = 0.0f;
+            vals[38] = 0.0f;
+            vals[39] = 0.0f;
+        }
+    } else {
+        int i_9 = start + tid * 4;
+        if (i_9 < vocab) {
+            vals[0] = probs[row_base + (unsigned long long)i_9];
+        } else {
+            vals[0] = 0.0f;
+        }
+        if (i_9 + 1 < vocab) {
+            vals[1] = probs[row_base + (unsigned long long)(i_9 + 1)];
+        } else {
+            vals[1] = 0.0f;
+        }
+        if (i_9 + 2 < vocab) {
+            vals[2] = probs[row_base + (unsigned long long)(i_9 + 2)];
+        } else {
+            vals[2] = 0.0f;
+        }
+        if (i_9 + 3 < vocab) {
+            vals[3] = probs[row_base + (unsigned long long)(i_9 + 3)];
+        } else {
+            vals[3] = 0.0f;
+        }
+        int i_0_1 = start + 2048 + tid * 4;
+        if (i_0_1 < vocab) {
+            vals[4] = probs[row_base + (unsigned long long)i_0_1];
+        } else {
+            vals[4] = 0.0f;
+        }
+        if (i_0_1 + 1 < vocab) {
+            vals[5] = probs[row_base + (unsigned long long)(i_0_1 + 1)];
+        } else {
+            vals[5] = 0.0f;
+        }
+        if (i_0_1 + 2 < vocab) {
+            vals[6] = probs[row_base + (unsigned long long)(i_0_1 + 2)];
+        } else {
+            vals[6] = 0.0f;
+        }
+        if (i_0_1 + 3 < vocab) {
+            vals[7] = probs[row_base + (unsigned long long)(i_0_1 + 3)];
+        } else {
+            vals[7] = 0.0f;
+        }
+        int i_1_1 = start + 4096 + tid * 4;
+        if (i_1_1 < vocab) {
+            vals[8] = probs[row_base + (unsigned long long)i_1_1];
+        } else {
+            vals[8] = 0.0f;
+        }
+        if (i_1_1 + 1 < vocab) {
+            vals[9] = probs[row_base + (unsigned long long)(i_1_1 + 1)];
+        } else {
+            vals[9] = 0.0f;
+        }
+        if (i_1_1 + 2 < vocab) {
+            vals[10] = probs[row_base + (unsigned long long)(i_1_1 + 2)];
+        } else {
+            vals[10] = 0.0f;
+        }
+        if (i_1_1 + 3 < vocab) {
+            vals[11] = probs[row_base + (unsigned long long)(i_1_1 + 3)];
+        } else {
+            vals[11] = 0.0f;
+        }
+        int i_2_1 = start + 6144 + tid * 4;
+        if (i_2_1 < vocab) {
+            vals[12] = probs[row_base + (unsigned long long)i_2_1];
+        } else {
+            vals[12] = 0.0f;
+        }
+        if (i_2_1 + 1 < vocab) {
+            vals[13] = probs[row_base + (unsigned long long)(i_2_1 + 1)];
+        } else {
+            vals[13] = 0.0f;
+        }
+        if (i_2_1 + 2 < vocab) {
+            vals[14] = probs[row_base + (unsigned long long)(i_2_1 + 2)];
+        } else {
+            vals[14] = 0.0f;
+        }
+        if (i_2_1 + 3 < vocab) {
+            vals[15] = probs[row_base + (unsigned long long)(i_2_1 + 3)];
+        } else {
+            vals[15] = 0.0f;
+        }
+        int i_3_1 = start + 8192 + tid * 4;
+        if (i_3_1 < vocab) {
+            vals[16] = probs[row_base + (unsigned long long)i_3_1];
+        } else {
+            vals[16] = 0.0f;
+        }
+        if (i_3_1 + 1 < vocab) {
+            vals[17] = probs[row_base + (unsigned long long)(i_3_1 + 1)];
+        } else {
+            vals[17] = 0.0f;
+        }
+        if (i_3_1 + 2 < vocab) {
+            vals[18] = probs[row_base + (unsigned long long)(i_3_1 + 2)];
+        } else {
+            vals[18] = 0.0f;
+        }
+        if (i_3_1 + 3 < vocab) {
+            vals[19] = probs[row_base + (unsigned long long)(i_3_1 + 3)];
+        } else {
+            vals[19] = 0.0f;
+        }
+        int i_4_1 = start + 10240 + tid * 4;
+        if (i_4_1 < vocab) {
+            vals[20] = probs[row_base + (unsigned long long)i_4_1];
+        } else {
+            vals[20] = 0.0f;
+        }
+        if (i_4_1 + 1 < vocab) {
+            vals[21] = probs[row_base + (unsigned long long)(i_4_1 + 1)];
+        } else {
+            vals[21] = 0.0f;
+        }
+        if (i_4_1 + 2 < vocab) {
+            vals[22] = probs[row_base + (unsigned long long)(i_4_1 + 2)];
+        } else {
+            vals[22] = 0.0f;
+        }
+        if (i_4_1 + 3 < vocab) {
+            vals[23] = probs[row_base + (unsigned long long)(i_4_1 + 3)];
+        } else {
+            vals[23] = 0.0f;
+        }
+        int i_5_1 = start + 12288 + tid * 4;
+        if (i_5_1 < vocab) {
+            vals[24] = probs[row_base + (unsigned long long)i_5_1];
+        } else {
+            vals[24] = 0.0f;
+        }
+        if (i_5_1 + 1 < vocab) {
+            vals[25] = probs[row_base + (unsigned long long)(i_5_1 + 1)];
+        } else {
+            vals[25] = 0.0f;
+        }
+        if (i_5_1 + 2 < vocab) {
+            vals[26] = probs[row_base + (unsigned long long)(i_5_1 + 2)];
+        } else {
+            vals[26] = 0.0f;
+        }
+        if (i_5_1 + 3 < vocab) {
+            vals[27] = probs[row_base + (unsigned long long)(i_5_1 + 3)];
+        } else {
+            vals[27] = 0.0f;
+        }
+        int i_6_1 = start + 14336 + tid * 4;
+        if (i_6_1 < vocab) {
+            vals[28] = probs[row_base + (unsigned long long)i_6_1];
+        } else {
+            vals[28] = 0.0f;
+        }
+        if (i_6_1 + 1 < vocab) {
+            vals[29] = probs[row_base + (unsigned long long)(i_6_1 + 1)];
+        } else {
+            vals[29] = 0.0f;
+        }
+        if (i_6_1 + 2 < vocab) {
+            vals[30] = probs[row_base + (unsigned long long)(i_6_1 + 2)];
+        } else {
+            vals[30] = 0.0f;
+        }
+        if (i_6_1 + 3 < vocab) {
+            vals[31] = probs[row_base + (unsigned long long)(i_6_1 + 3)];
+        } else {
+            vals[31] = 0.0f;
+        }
+        int i_7_1 = start + 16384 + tid * 4;
+        if (i_7_1 < vocab) {
+            vals[32] = probs[row_base + (unsigned long long)i_7_1];
+        } else {
+            vals[32] = 0.0f;
+        }
+        if (i_7_1 + 1 < vocab) {
+            vals[33] = probs[row_base + (unsigned long long)(i_7_1 + 1)];
+        } else {
+            vals[33] = 0.0f;
+        }
+        if (i_7_1 + 2 < vocab) {
+            vals[34] = probs[row_base + (unsigned long long)(i_7_1 + 2)];
+        } else {
+            vals[34] = 0.0f;
+        }
+        if (i_7_1 + 3 < vocab) {
+            vals[35] = probs[row_base + (unsigned long long)(i_7_1 + 3)];
+        } else {
+            vals[35] = 0.0f;
+        }
+        int i_8_1 = start + 18432 + tid * 4;
+        if (i_8_1 < vocab) {
+            vals[36] = probs[row_base + (unsigned long long)i_8_1];
+        } else {
+            vals[36] = 0.0f;
+        }
+        if (i_8_1 + 1 < vocab) {
+            vals[37] = probs[row_base + (unsigned long long)(i_8_1 + 1)];
+        } else {
+            vals[37] = 0.0f;
+        }
+        if (i_8_1 + 2 < vocab) {
+            vals[38] = probs[row_base + (unsigned long long)(i_8_1 + 2)];
+        } else {
+            vals[38] = 0.0f;
+        }
+        if (i_8_1 + 3 < vocab) {
+            vals[39] = probs[row_base + (unsigned long long)(i_8_1 + 3)];
+        } else {
+            vals[39] = 0.0f;
+        }
+    }
+    if ((launch_flags & 2) != 0) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
+    for (int i_10 = tid; i_10 < 2048; i_10 += 512) {
+        hist0[i_10] = 0;
+        hist1[i_10] = 0;
+    }
+    if (tid < 16) {
+        scal[tid] = 0;
+    }
+    __syncthreads();
+    unsigned int bits = __as_u32(vals[0]);
+    unsigned int key = ((bits <= 2139095040) ? bits : 0);
+    unsigned int bucket = key >> 21 & 2047;
+    atomicAdd(&hist0[bucket], 1);
+    unsigned int bits_0 = __as_u32(vals[1]);
+    unsigned int key_1 = ((bits_0 <= 2139095040) ? bits_0 : 0);
+    unsigned int bucket_2 = key_1 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_2], 1);
+    unsigned int bits_3 = __as_u32(vals[2]);
+    unsigned int key_4 = ((bits_3 <= 2139095040) ? bits_3 : 0);
+    unsigned int bucket_5 = key_4 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_5], 1);
+    unsigned int bits_6 = __as_u32(vals[3]);
+    unsigned int key_7 = ((bits_6 <= 2139095040) ? bits_6 : 0);
+    unsigned int bucket_8 = key_7 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_8], 1);
+    unsigned int bits_9 = __as_u32(vals[4]);
+    unsigned int key_10 = ((bits_9 <= 2139095040) ? bits_9 : 0);
+    unsigned int bucket_11 = key_10 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_11], 1);
+    unsigned int bits_12 = __as_u32(vals[5]);
+    unsigned int key_13 = ((bits_12 <= 2139095040) ? bits_12 : 0);
+    unsigned int bucket_14 = key_13 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_14], 1);
+    unsigned int bits_15 = __as_u32(vals[6]);
+    unsigned int key_16 = ((bits_15 <= 2139095040) ? bits_15 : 0);
+    unsigned int bucket_17 = key_16 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_17], 1);
+    unsigned int bits_18 = __as_u32(vals[7]);
+    unsigned int key_19 = ((bits_18 <= 2139095040) ? bits_18 : 0);
+    unsigned int bucket_20 = key_19 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_20], 1);
+    unsigned int bits_21 = __as_u32(vals[8]);
+    unsigned int key_22 = ((bits_21 <= 2139095040) ? bits_21 : 0);
+    unsigned int bucket_23 = key_22 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_23], 1);
+    unsigned int bits_24 = __as_u32(vals[9]);
+    unsigned int key_25 = ((bits_24 <= 2139095040) ? bits_24 : 0);
+    unsigned int bucket_26 = key_25 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_26], 1);
+    unsigned int bits_27 = __as_u32(vals[10]);
+    unsigned int key_28 = ((bits_27 <= 2139095040) ? bits_27 : 0);
+    unsigned int bucket_29 = key_28 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_29], 1);
+    unsigned int bits_30 = __as_u32(vals[11]);
+    unsigned int key_31 = ((bits_30 <= 2139095040) ? bits_30 : 0);
+    unsigned int bucket_32 = key_31 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_32], 1);
+    unsigned int bits_33 = __as_u32(vals[12]);
+    unsigned int key_34 = ((bits_33 <= 2139095040) ? bits_33 : 0);
+    unsigned int bucket_35 = key_34 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_35], 1);
+    unsigned int bits_36 = __as_u32(vals[13]);
+    unsigned int key_37 = ((bits_36 <= 2139095040) ? bits_36 : 0);
+    unsigned int bucket_38 = key_37 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_38], 1);
+    unsigned int bits_39 = __as_u32(vals[14]);
+    unsigned int key_40 = ((bits_39 <= 2139095040) ? bits_39 : 0);
+    unsigned int bucket_41 = key_40 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_41], 1);
+    unsigned int bits_42 = __as_u32(vals[15]);
+    unsigned int key_43 = ((bits_42 <= 2139095040) ? bits_42 : 0);
+    unsigned int bucket_44 = key_43 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_44], 1);
+    unsigned int bits_45 = __as_u32(vals[16]);
+    unsigned int key_46 = ((bits_45 <= 2139095040) ? bits_45 : 0);
+    unsigned int bucket_47 = key_46 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_47], 1);
+    unsigned int bits_48 = __as_u32(vals[17]);
+    unsigned int key_49 = ((bits_48 <= 2139095040) ? bits_48 : 0);
+    unsigned int bucket_50 = key_49 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_50], 1);
+    unsigned int bits_51 = __as_u32(vals[18]);
+    unsigned int key_52 = ((bits_51 <= 2139095040) ? bits_51 : 0);
+    unsigned int bucket_53 = key_52 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_53], 1);
+    unsigned int bits_54 = __as_u32(vals[19]);
+    unsigned int key_55 = ((bits_54 <= 2139095040) ? bits_54 : 0);
+    unsigned int bucket_56 = key_55 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_56], 1);
+    unsigned int bits_57 = __as_u32(vals[20]);
+    unsigned int key_58 = ((bits_57 <= 2139095040) ? bits_57 : 0);
+    unsigned int bucket_59 = key_58 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_59], 1);
+    unsigned int bits_60 = __as_u32(vals[21]);
+    unsigned int key_61 = ((bits_60 <= 2139095040) ? bits_60 : 0);
+    unsigned int bucket_62 = key_61 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_62], 1);
+    unsigned int bits_63 = __as_u32(vals[22]);
+    unsigned int key_64 = ((bits_63 <= 2139095040) ? bits_63 : 0);
+    unsigned int bucket_65 = key_64 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_65], 1);
+    unsigned int bits_66 = __as_u32(vals[23]);
+    unsigned int key_67 = ((bits_66 <= 2139095040) ? bits_66 : 0);
+    unsigned int bucket_68 = key_67 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_68], 1);
+    unsigned int bits_69 = __as_u32(vals[24]);
+    unsigned int key_70 = ((bits_69 <= 2139095040) ? bits_69 : 0);
+    unsigned int bucket_71 = key_70 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_71], 1);
+    unsigned int bits_72 = __as_u32(vals[25]);
+    unsigned int key_73 = ((bits_72 <= 2139095040) ? bits_72 : 0);
+    unsigned int bucket_74 = key_73 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_74], 1);
+    unsigned int bits_75 = __as_u32(vals[26]);
+    unsigned int key_76 = ((bits_75 <= 2139095040) ? bits_75 : 0);
+    unsigned int bucket_77 = key_76 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_77], 1);
+    unsigned int bits_78 = __as_u32(vals[27]);
+    unsigned int key_79 = ((bits_78 <= 2139095040) ? bits_78 : 0);
+    unsigned int bucket_80 = key_79 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_80], 1);
+    unsigned int bits_81 = __as_u32(vals[28]);
+    unsigned int key_82 = ((bits_81 <= 2139095040) ? bits_81 : 0);
+    unsigned int bucket_83 = key_82 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_83], 1);
+    unsigned int bits_84 = __as_u32(vals[29]);
+    unsigned int key_85 = ((bits_84 <= 2139095040) ? bits_84 : 0);
+    unsigned int bucket_86 = key_85 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_86], 1);
+    unsigned int bits_87 = __as_u32(vals[30]);
+    unsigned int key_88 = ((bits_87 <= 2139095040) ? bits_87 : 0);
+    unsigned int bucket_89 = key_88 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_89], 1);
+    unsigned int bits_90 = __as_u32(vals[31]);
+    unsigned int key_91 = ((bits_90 <= 2139095040) ? bits_90 : 0);
+    unsigned int bucket_92 = key_91 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_92], 1);
+    unsigned int bits_93 = __as_u32(vals[32]);
+    unsigned int key_94 = ((bits_93 <= 2139095040) ? bits_93 : 0);
+    unsigned int bucket_95 = key_94 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_95], 1);
+    unsigned int bits_96 = __as_u32(vals[33]);
+    unsigned int key_97 = ((bits_96 <= 2139095040) ? bits_96 : 0);
+    unsigned int bucket_98 = key_97 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_98], 1);
+    unsigned int bits_99 = __as_u32(vals[34]);
+    unsigned int key_100 = ((bits_99 <= 2139095040) ? bits_99 : 0);
+    unsigned int bucket_101 = key_100 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_101], 1);
+    unsigned int bits_102 = __as_u32(vals[35]);
+    unsigned int key_103 = ((bits_102 <= 2139095040) ? bits_102 : 0);
+    unsigned int bucket_104 = key_103 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_104], 1);
+    unsigned int bits_105 = __as_u32(vals[36]);
+    unsigned int key_106 = ((bits_105 <= 2139095040) ? bits_105 : 0);
+    unsigned int bucket_107 = key_106 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_107], 1);
+    unsigned int bits_108 = __as_u32(vals[37]);
+    unsigned int key_109 = ((bits_108 <= 2139095040) ? bits_108 : 0);
+    unsigned int bucket_110 = key_109 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_110], 1);
+    unsigned int bits_111 = __as_u32(vals[38]);
+    unsigned int key_112 = ((bits_111 <= 2139095040) ? bits_111 : 0);
+    unsigned int bucket_113 = key_112 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_113], 1);
+    unsigned int bits_114 = __as_u32(vals[39]);
+    unsigned int key_115 = ((bits_114 <= 2139095040) ? bits_114 : 0);
+    unsigned int bucket_116 = key_115 >> 21 & 2047;
+    atomicAdd(&hist0[bucket_116], 1);
+    unsigned int lo[4];
+    __syncthreads();
+    unsigned int local = hist0[tid * 4] + hist0[tid * 4 + 1] + hist0[tid * 4 + 2] + hist0[tid * 4 + 3];
+    unsigned int _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, local, 1);
+    local = local + _shfl_xor_sync_12;
+    unsigned int _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, local, 2);
+    local = local + _shfl_xor_sync_13;
+    if ((lane & 3) == 0) {
+        coarse[tid >> 2] = local;
+    }
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (warp == 0) {
+        unsigned int cc[4];
+        unsigned int lo_0[4];
+        cc[0] = 0;
+        lo_0[0] = 0;
+        cc[1] = 0;
+        lo_0[1] = 0;
+        cc[2] = 0;
+        lo_0[2] = 0;
+        cc[3] = 0;
+        lo_0[3] = 0;
+        unsigned int words[4];
+        uint32_t _cluster_mapa_14;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_14) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
+            : "r"(_cluster_mapa_14));
+        cc[0] = cc[0] + words[0];
+        cc[1] = cc[1] + words[1];
+        cc[2] = cc[2] + words[2];
+        cc[3] = cc[3] + words[3];
+        if (rank > 0) {
+            lo_0[0] = lo_0[0] + words[0];
+            lo_0[1] = lo_0[1] + words[1];
+            lo_0[2] = lo_0[2] + words[2];
+            lo_0[3] = lo_0[3] + words[3];
+        }
+        unsigned int words_1[4];
+        uint32_t _cluster_mapa_15;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_15) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+            : "r"(_cluster_mapa_15));
+        cc[0] = cc[0] + words_1[0];
+        cc[1] = cc[1] + words_1[1];
+        cc[2] = cc[2] + words_1[2];
+        cc[3] = cc[3] + words_1[3];
+        if (rank > 1) {
+            lo_0[0] = lo_0[0] + words_1[0];
+            lo_0[1] = lo_0[1] + words_1[1];
+            lo_0[2] = lo_0[2] + words_1[2];
+            lo_0[3] = lo_0[3] + words_1[3];
+        }
+        unsigned int words_2[4];
+        uint32_t _cluster_mapa_16;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_16) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_2[(0) + 3]))
+            : "r"(_cluster_mapa_16));
+        cc[0] = cc[0] + words_2[0];
+        cc[1] = cc[1] + words_2[1];
+        cc[2] = cc[2] + words_2[2];
+        cc[3] = cc[3] + words_2[3];
+        if (rank > 2) {
+            lo_0[0] = lo_0[0] + words_2[0];
+            lo_0[1] = lo_0[1] + words_2[1];
+            lo_0[2] = lo_0[2] + words_2[2];
+            lo_0[3] = lo_0[3] + words_2[3];
+        }
+        unsigned int words_3[4];
+        uint32_t _cluster_mapa_17;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_17) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_3[(0) + 3]))
+            : "r"(_cluster_mapa_17));
+        cc[0] = cc[0] + words_3[0];
+        cc[1] = cc[1] + words_3[1];
+        cc[2] = cc[2] + words_3[2];
+        cc[3] = cc[3] + words_3[3];
+        if (rank > 3) {
+            lo_0[0] = lo_0[0] + words_3[0];
+            lo_0[1] = lo_0[1] + words_3[1];
+            lo_0[2] = lo_0[2] + words_3[2];
+            lo_0[3] = lo_0[3] + words_3[3];
+        }
+        unsigned int words_4[4];
+        uint32_t _cluster_mapa_18;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_18) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_4[(0) + 3]))
+            : "r"(_cluster_mapa_18));
+        cc[0] = cc[0] + words_4[0];
+        cc[1] = cc[1] + words_4[1];
+        cc[2] = cc[2] + words_4[2];
+        cc[3] = cc[3] + words_4[3];
+        if (rank > 4) {
+            lo_0[0] = lo_0[0] + words_4[0];
+            lo_0[1] = lo_0[1] + words_4[1];
+            lo_0[2] = lo_0[2] + words_4[2];
+            lo_0[3] = lo_0[3] + words_4[3];
+        }
+        unsigned int words_5[4];
+        uint32_t _cluster_mapa_19;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_19) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_5[(0) + 3]))
+            : "r"(_cluster_mapa_19));
+        cc[0] = cc[0] + words_5[0];
+        cc[1] = cc[1] + words_5[1];
+        cc[2] = cc[2] + words_5[2];
+        cc[3] = cc[3] + words_5[3];
+        if (rank > 5) {
+            lo_0[0] = lo_0[0] + words_5[0];
+            lo_0[1] = lo_0[1] + words_5[1];
+            lo_0[2] = lo_0[2] + words_5[2];
+            lo_0[3] = lo_0[3] + words_5[3];
+        }
+        unsigned int words_6[4];
+        uint32_t _cluster_mapa_20;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_20) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_6[(0) + 3]))
+            : "r"(_cluster_mapa_20));
+        cc[0] = cc[0] + words_6[0];
+        cc[1] = cc[1] + words_6[1];
+        cc[2] = cc[2] + words_6[2];
+        cc[3] = cc[3] + words_6[3];
+        if (rank > 6) {
+            lo_0[0] = lo_0[0] + words_6[0];
+            lo_0[1] = lo_0[1] + words_6[1];
+            lo_0[2] = lo_0[2] + words_6[2];
+            lo_0[3] = lo_0[3] + words_6[3];
+        }
+        unsigned int words_7[4];
+        uint32_t _cluster_mapa_21;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_21) : "r"(coarse_addr + (unsigned int)(lane * 16)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_7[(0) + 3]))
+            : "r"(_cluster_mapa_21));
+        cc[0] = cc[0] + words_7[0];
+        cc[1] = cc[1] + words_7[1];
+        cc[2] = cc[2] + words_7[2];
+        cc[3] = cc[3] + words_7[3];
+        if (rank > 7) {
+            lo_0[0] = lo_0[0] + words_7[0];
+            lo_0[1] = lo_0[1] + words_7[1];
+            lo_0[2] = lo_0[2] + words_7[2];
+            lo_0[3] = lo_0[3] + words_7[3];
+        }
+        unsigned int local_8 = cc[0] + cc[1] + cc[2] + cc[3];
+        uint32_t _warp_scan_sum_22 = local_8;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_22) : "r"(16));
+        unsigned int above = _warp_scan_sum_22 - local_8;
+        unsigned int lo_local = lo_0[0] + lo_0[1] + lo_0[2] + lo_0[3];
+        uint32_t _warp_scan_sum_23 = lo_local;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_23) : "r"(16));
+        unsigned int lo_above = _warp_scan_sum_23 - lo_local;
+        unsigned int is_owner = 0;
+        unsigned int pos = 0;
+        unsigned int rem_after = 0;
+        unsigned int cnt_9 = 0;
+        unsigned int lo_sel = 0;
+        if (above < k_u && k_u <= above + local_8) {
+            is_owner = 1;
+            unsigned int s3 = above + cc[3];
+            unsigned int s2 = s3 + cc[2];
+            unsigned int s1 = s2 + cc[1];
+            if (k_u <= s3) {
+                pos = (unsigned int)(lane * 4 + 3);
+                rem_after = k_u - above;
+                cnt_9 = cc[3];
+                lo_sel = lo_above;
+            } else if (k_u <= s2) {
+                pos = (unsigned int)(lane * 4 + 2);
+                rem_after = k_u - s3;
+                cnt_9 = cc[2];
+                lo_sel = lo_above + lo_0[3];
+            } else {
+                if (k_u <= s1) {
+                    pos = (unsigned int)(lane * 4 + 1);
+                    rem_after = k_u - s2;
+                    cnt_9 = cc[1];
+                    lo_sel = lo_above + lo_0[3] + lo_0[2];
+                } else {
+                    pos = (unsigned int)(lane * 4);
+                    rem_after = k_u - s1;
+                    cnt_9 = cc[0];
+                    lo_sel = lo_above + lo_0[3] + lo_0[2] + lo_0[1];
+                }
+            }
+        }
+        unsigned int owner;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner) : "r"(((is_owner != 0) ? (unsigned int)lane : 0)));
+        unsigned int found;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found) : "r"(is_owner));
+        unsigned int pos_b = __shfl_sync(0xFFFFFFFF, pos, owner);
+        unsigned int rem_b = __shfl_sync(0xFFFFFFFF, rem_after, owner);
+        unsigned int cnt_b = __shfl_sync(0xFFFFFFFF, cnt_9, owner);
+        unsigned int lo_b = __shfl_sync(0xFFFFFFFF, lo_sel, owner);
+        unsigned int ff[4];
+        unsigned int lf[4];
+        ff[0] = 0;
+        lf[0] = 0;
+        ff[1] = 0;
+        lf[1] = 0;
+        ff[2] = 0;
+        lf[2] = 0;
+        ff[3] = 0;
+        lf[3] = 0;
+        int quad = lane & 3;
+        int off = ((int)pos_b * 16 + quad * 4) * 4;
+        int r = lane >> 2;
+        if (r < 8) {
+            unsigned int words_0[4];
+            uint32_t _cluster_mapa_24;
+            asm volatile(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_cluster_mapa_24) : "r"(hist0_addr + (unsigned int)off), "r"(r));
+            asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_0[(0) + 3]))
+                : "r"(_cluster_mapa_24));
+            ff[0] = ff[0] + words_0[0];
+            ff[1] = ff[1] + words_0[1];
+            ff[2] = ff[2] + words_0[2];
+            ff[3] = ff[3] + words_0[3];
+            if (r < rank) {
+                lf[0] = lf[0] + words_0[0];
+                lf[1] = lf[1] + words_0[1];
+                lf[2] = lf[2] + words_0[2];
+                lf[3] = lf[3] + words_0[3];
+            }
+        }
+        unsigned int _shfl_xor_sync_25 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 4);
+        ff[0] = ff[0] + _shfl_xor_sync_25;
+        unsigned int _shfl_xor_sync_26 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 4);
+        lf[0] = lf[0] + _shfl_xor_sync_26;
+        unsigned int _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 4);
+        ff[1] = ff[1] + _shfl_xor_sync_27;
+        unsigned int _shfl_xor_sync_28 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 4);
+        lf[1] = lf[1] + _shfl_xor_sync_28;
+        unsigned int _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 4);
+        ff[2] = ff[2] + _shfl_xor_sync_29;
+        unsigned int _shfl_xor_sync_30 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 4);
+        lf[2] = lf[2] + _shfl_xor_sync_30;
+        unsigned int _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 4);
+        ff[3] = ff[3] + _shfl_xor_sync_31;
+        unsigned int _shfl_xor_sync_32 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 4);
+        lf[3] = lf[3] + _shfl_xor_sync_32;
+        unsigned int _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 8);
+        ff[0] = ff[0] + _shfl_xor_sync_33;
+        unsigned int _shfl_xor_sync_34 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 8);
+        lf[0] = lf[0] + _shfl_xor_sync_34;
+        unsigned int _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 8);
+        ff[1] = ff[1] + _shfl_xor_sync_35;
+        unsigned int _shfl_xor_sync_36 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 8);
+        lf[1] = lf[1] + _shfl_xor_sync_36;
+        unsigned int _shfl_xor_sync_37 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 8);
+        ff[2] = ff[2] + _shfl_xor_sync_37;
+        unsigned int _shfl_xor_sync_38 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 8);
+        lf[2] = lf[2] + _shfl_xor_sync_38;
+        unsigned int _shfl_xor_sync_39 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 8);
+        ff[3] = ff[3] + _shfl_xor_sync_39;
+        unsigned int _shfl_xor_sync_40 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 8);
+        lf[3] = lf[3] + _shfl_xor_sync_40;
+        unsigned int _shfl_xor_sync_41 = __shfl_xor_sync(0xFFFFFFFF, ff[0], 16);
+        ff[0] = ff[0] + _shfl_xor_sync_41;
+        unsigned int _shfl_xor_sync_42 = __shfl_xor_sync(0xFFFFFFFF, lf[0], 16);
+        lf[0] = lf[0] + _shfl_xor_sync_42;
+        unsigned int _shfl_xor_sync_43 = __shfl_xor_sync(0xFFFFFFFF, ff[1], 16);
+        ff[1] = ff[1] + _shfl_xor_sync_43;
+        unsigned int _shfl_xor_sync_44 = __shfl_xor_sync(0xFFFFFFFF, lf[1], 16);
+        lf[1] = lf[1] + _shfl_xor_sync_44;
+        unsigned int _shfl_xor_sync_45 = __shfl_xor_sync(0xFFFFFFFF, ff[2], 16);
+        ff[2] = ff[2] + _shfl_xor_sync_45;
+        unsigned int _shfl_xor_sync_46 = __shfl_xor_sync(0xFFFFFFFF, lf[2], 16);
+        lf[2] = lf[2] + _shfl_xor_sync_46;
+        unsigned int _shfl_xor_sync_47 = __shfl_xor_sync(0xFFFFFFFF, ff[3], 16);
+        ff[3] = ff[3] + _shfl_xor_sync_47;
+        unsigned int _shfl_xor_sync_48 = __shfl_xor_sync(0xFFFFFFFF, lf[3], 16);
+        lf[3] = lf[3] + _shfl_xor_sync_48;
+        if (lane >= 4) {
+            ff[0] = 0;
+            lf[0] = 0;
+            ff[1] = 0;
+            lf[1] = 0;
+            ff[2] = 0;
+            lf[2] = 0;
+            ff[3] = 0;
+            lf[3] = 0;
+        }
+        unsigned int local_10 = ff[0] + ff[1] + ff[2] + ff[3];
+        uint32_t _warp_scan_sum_49 = local_10;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_49) : "r"(16));
+        unsigned int above_11 = _warp_scan_sum_49 - local_10;
+        unsigned int lo_local_12 = lf[0] + lf[1] + lf[2] + lf[3];
+        uint32_t _warp_scan_sum_50 = lo_local_12;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_50) : "r"(16));
+        unsigned int lo_above_13 = _warp_scan_sum_50 - lo_local_12;
+        unsigned int is_owner_14 = 0;
+        unsigned int pos_15 = 0;
+        unsigned int rem_after_16 = 0;
+        unsigned int cnt_17 = 0;
+        unsigned int lo_sel_18 = 0;
+        if (above_11 < rem_b && rem_b <= above_11 + local_10) {
+            is_owner_14 = 1;
+            unsigned int s3_1 = above_11 + ff[3];
+            unsigned int s2_1 = s3_1 + ff[2];
+            unsigned int s1_1 = s2_1 + ff[1];
+            if (rem_b <= s3_1) {
+                pos_15 = (unsigned int)(lane * 4 + 3);
+                rem_after_16 = rem_b - above_11;
+                cnt_17 = ff[3];
+                lo_sel_18 = lo_above_13;
+            } else if (rem_b <= s2_1) {
+                pos_15 = (unsigned int)(lane * 4 + 2);
+                rem_after_16 = rem_b - s3_1;
+                cnt_17 = ff[2];
+                lo_sel_18 = lo_above_13 + lf[3];
+            } else {
+                if (rem_b <= s1_1) {
+                    pos_15 = (unsigned int)(lane * 4 + 1);
+                    rem_after_16 = rem_b - s2_1;
+                    cnt_17 = ff[1];
+                    lo_sel_18 = lo_above_13 + lf[3] + lf[2];
+                } else {
+                    pos_15 = (unsigned int)(lane * 4);
+                    rem_after_16 = rem_b - s1_1;
+                    cnt_17 = ff[0];
+                    lo_sel_18 = lo_above_13 + lf[3] + lf[2] + lf[1];
+                }
+            }
+        }
+        unsigned int owner_19;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_19) : "r"(((is_owner_14 != 0) ? (unsigned int)lane : 0)));
+        unsigned int found_20;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_20) : "r"(is_owner_14));
+        unsigned int pos_b_21 = __shfl_sync(0xFFFFFFFF, pos_15, owner_19);
+        unsigned int rem_b_22 = __shfl_sync(0xFFFFFFFF, rem_after_16, owner_19);
+        unsigned int cnt_b_23 = __shfl_sync(0xFFFFFFFF, cnt_17, owner_19);
+        unsigned int lo_b_24 = __shfl_sync(0xFFFFFFFF, lo_sel_18, owner_19);
+        if (lane == 0) {
+            scal[0] = pos_b * 16 + pos_b_21;
+            scal[1] = rem_b_22;
+            scal[2] = cnt_b_23;
+            scal[5] = lo_b + lo_b_24;
+        }
+    }
+    __syncthreads();
+    unsigned int bucket_sel = scal[0];
+    unsigned int remaining = scal[1];
+    unsigned int cnt_sel = scal[2];
+    unsigned int fuse_small = 0;
+    unsigned int fuse_block = 0;
+    unsigned int fuse_on = fuse_small | fuse_block;
+    if (cnt_sel <= 2048) {
+        unsigned int v = 0;
+        if (tid == 0) {
+            v = scal[5];
+        }
+        unsigned int lo_above_1 = v;
+        bool is_cand[40];
+        unsigned int keys_c[40];
+        unsigned int ncand = 0;
+        unsigned int bits_1 = __as_u32(vals[0]);
+        unsigned int key_2 = ((bits_1 <= 2139095040) ? bits_1 : 0);
+        keys_c[0] = key_2;
+        int i_11 = base_t;
+        int ij = i_11;
+        is_cand[0] = keys_c[0] >> 21 == bucket_sel && ij < vocab;
+        ncand = ncand + ((is_cand[0]) ? 1 : 0);
+        unsigned int bits_4 = __as_u32(vals[1]);
+        unsigned int key_5 = ((bits_4 <= 2139095040) ? bits_4 : 0);
+        keys_c[1] = key_5;
+        int i_6_2 = base_t + 1;
+        int ij_7 = i_6_2;
+        is_cand[1] = keys_c[1] >> 21 == bucket_sel && ij_7 < vocab;
+        ncand = ncand + ((is_cand[1]) ? 1 : 0);
+        unsigned int bits_8 = __as_u32(vals[2]);
+        unsigned int key_9 = ((bits_8 <= 2139095040) ? bits_8 : 0);
+        keys_c[2] = key_9;
+        int i_10_1 = base_t + 2;
+        int ij_11 = i_10_1;
+        is_cand[2] = keys_c[2] >> 21 == bucket_sel && ij_11 < vocab;
+        ncand = ncand + ((is_cand[2]) ? 1 : 0);
+        unsigned int bits_13 = __as_u32(vals[3]);
+        unsigned int key_14 = ((bits_13 <= 2139095040) ? bits_13 : 0);
+        keys_c[3] = key_14;
+        int i_15 = base_t + 3;
+        int ij_16 = i_15;
+        is_cand[3] = keys_c[3] >> 21 == bucket_sel && ij_16 < vocab;
+        ncand = ncand + ((is_cand[3]) ? 1 : 0);
+        unsigned int bits_17 = __as_u32(vals[4]);
+        unsigned int key_18 = ((bits_17 <= 2139095040) ? bits_17 : 0);
+        keys_c[4] = key_18;
+        int i_19 = base_t + 2048;
+        int ij_20 = i_19;
+        is_cand[4] = keys_c[4] >> 21 == bucket_sel && ij_20 < vocab;
+        ncand = ncand + ((is_cand[4]) ? 1 : 0);
+        unsigned int bits_22 = __as_u32(vals[5]);
+        unsigned int key_23 = ((bits_22 <= 2139095040) ? bits_22 : 0);
+        keys_c[5] = key_23;
+        int i_24 = base_t + 2049;
+        int ij_25 = i_24;
+        is_cand[5] = keys_c[5] >> 21 == bucket_sel && ij_25 < vocab;
+        ncand = ncand + ((is_cand[5]) ? 1 : 0);
+        unsigned int bits_26 = __as_u32(vals[6]);
+        unsigned int key_27 = ((bits_26 <= 2139095040) ? bits_26 : 0);
+        keys_c[6] = key_27;
+        int i_28 = base_t + 2050;
+        int ij_29 = i_28;
+        is_cand[6] = keys_c[6] >> 21 == bucket_sel && ij_29 < vocab;
+        ncand = ncand + ((is_cand[6]) ? 1 : 0);
+        unsigned int bits_31 = __as_u32(vals[7]);
+        unsigned int key_32 = ((bits_31 <= 2139095040) ? bits_31 : 0);
+        keys_c[7] = key_32;
+        int i_33 = base_t + 2051;
+        int ij_34 = i_33;
+        is_cand[7] = keys_c[7] >> 21 == bucket_sel && ij_34 < vocab;
+        ncand = ncand + ((is_cand[7]) ? 1 : 0);
+        unsigned int bits_35 = __as_u32(vals[8]);
+        unsigned int key_36 = ((bits_35 <= 2139095040) ? bits_35 : 0);
+        keys_c[8] = key_36;
+        int i_37 = base_t + 4096;
+        int ij_38 = i_37;
+        is_cand[8] = keys_c[8] >> 21 == bucket_sel && ij_38 < vocab;
+        ncand = ncand + ((is_cand[8]) ? 1 : 0);
+        unsigned int bits_40 = __as_u32(vals[9]);
+        unsigned int key_41 = ((bits_40 <= 2139095040) ? bits_40 : 0);
+        keys_c[9] = key_41;
+        int i_42 = base_t + 4097;
+        int ij_43 = i_42;
+        is_cand[9] = keys_c[9] >> 21 == bucket_sel && ij_43 < vocab;
+        ncand = ncand + ((is_cand[9]) ? 1 : 0);
+        unsigned int bits_44 = __as_u32(vals[10]);
+        unsigned int key_45 = ((bits_44 <= 2139095040) ? bits_44 : 0);
+        keys_c[10] = key_45;
+        int i_46 = base_t + 4098;
+        int ij_47 = i_46;
+        is_cand[10] = keys_c[10] >> 21 == bucket_sel && ij_47 < vocab;
+        ncand = ncand + ((is_cand[10]) ? 1 : 0);
+        unsigned int bits_49 = __as_u32(vals[11]);
+        unsigned int key_50 = ((bits_49 <= 2139095040) ? bits_49 : 0);
+        keys_c[11] = key_50;
+        int i_51 = base_t + 4099;
+        int ij_52 = i_51;
+        is_cand[11] = keys_c[11] >> 21 == bucket_sel && ij_52 < vocab;
+        ncand = ncand + ((is_cand[11]) ? 1 : 0);
+        unsigned int bits_53 = __as_u32(vals[12]);
+        unsigned int key_54 = ((bits_53 <= 2139095040) ? bits_53 : 0);
+        keys_c[12] = key_54;
+        int i_55 = base_t + 6144;
+        int ij_56 = i_55;
+        is_cand[12] = keys_c[12] >> 21 == bucket_sel && ij_56 < vocab;
+        ncand = ncand + ((is_cand[12]) ? 1 : 0);
+        unsigned int bits_58 = __as_u32(vals[13]);
+        unsigned int key_59 = ((bits_58 <= 2139095040) ? bits_58 : 0);
+        keys_c[13] = key_59;
+        int i_60 = base_t + 6145;
+        int ij_61 = i_60;
+        is_cand[13] = keys_c[13] >> 21 == bucket_sel && ij_61 < vocab;
+        ncand = ncand + ((is_cand[13]) ? 1 : 0);
+        unsigned int bits_62 = __as_u32(vals[14]);
+        unsigned int key_63 = ((bits_62 <= 2139095040) ? bits_62 : 0);
+        keys_c[14] = key_63;
+        int i_64 = base_t + 6146;
+        int ij_65 = i_64;
+        is_cand[14] = keys_c[14] >> 21 == bucket_sel && ij_65 < vocab;
+        ncand = ncand + ((is_cand[14]) ? 1 : 0);
+        unsigned int bits_67 = __as_u32(vals[15]);
+        unsigned int key_68 = ((bits_67 <= 2139095040) ? bits_67 : 0);
+        keys_c[15] = key_68;
+        int i_69 = base_t + 6147;
+        int ij_70 = i_69;
+        is_cand[15] = keys_c[15] >> 21 == bucket_sel && ij_70 < vocab;
+        ncand = ncand + ((is_cand[15]) ? 1 : 0);
+        unsigned int bits_71 = __as_u32(vals[16]);
+        unsigned int key_72 = ((bits_71 <= 2139095040) ? bits_71 : 0);
+        keys_c[16] = key_72;
+        int i_73 = base_t + 8192;
+        int ij_74 = i_73;
+        is_cand[16] = keys_c[16] >> 21 == bucket_sel && ij_74 < vocab;
+        ncand = ncand + ((is_cand[16]) ? 1 : 0);
+        unsigned int bits_76 = __as_u32(vals[17]);
+        unsigned int key_77 = ((bits_76 <= 2139095040) ? bits_76 : 0);
+        keys_c[17] = key_77;
+        int i_78 = base_t + 8193;
+        int ij_79 = i_78;
+        is_cand[17] = keys_c[17] >> 21 == bucket_sel && ij_79 < vocab;
+        ncand = ncand + ((is_cand[17]) ? 1 : 0);
+        unsigned int bits_80 = __as_u32(vals[18]);
+        unsigned int key_81 = ((bits_80 <= 2139095040) ? bits_80 : 0);
+        keys_c[18] = key_81;
+        int i_82 = base_t + 8194;
+        int ij_83 = i_82;
+        is_cand[18] = keys_c[18] >> 21 == bucket_sel && ij_83 < vocab;
+        ncand = ncand + ((is_cand[18]) ? 1 : 0);
+        unsigned int bits_85 = __as_u32(vals[19]);
+        unsigned int key_86 = ((bits_85 <= 2139095040) ? bits_85 : 0);
+        keys_c[19] = key_86;
+        int i_87 = base_t + 8195;
+        int ij_88 = i_87;
+        is_cand[19] = keys_c[19] >> 21 == bucket_sel && ij_88 < vocab;
+        ncand = ncand + ((is_cand[19]) ? 1 : 0);
+        unsigned int bits_89 = __as_u32(vals[20]);
+        unsigned int key_90 = ((bits_89 <= 2139095040) ? bits_89 : 0);
+        keys_c[20] = key_90;
+        int i_91 = base_t + 10240;
+        int ij_92 = i_91;
+        is_cand[20] = keys_c[20] >> 21 == bucket_sel && ij_92 < vocab;
+        ncand = ncand + ((is_cand[20]) ? 1 : 0);
+        unsigned int bits_94 = __as_u32(vals[21]);
+        unsigned int key_95 = ((bits_94 <= 2139095040) ? bits_94 : 0);
+        keys_c[21] = key_95;
+        int i_96 = base_t + 10241;
+        int ij_97 = i_96;
+        is_cand[21] = keys_c[21] >> 21 == bucket_sel && ij_97 < vocab;
+        ncand = ncand + ((is_cand[21]) ? 1 : 0);
+        unsigned int bits_98 = __as_u32(vals[22]);
+        unsigned int key_99 = ((bits_98 <= 2139095040) ? bits_98 : 0);
+        keys_c[22] = key_99;
+        int i_100 = base_t + 10242;
+        int ij_101 = i_100;
+        is_cand[22] = keys_c[22] >> 21 == bucket_sel && ij_101 < vocab;
+        ncand = ncand + ((is_cand[22]) ? 1 : 0);
+        unsigned int bits_103 = __as_u32(vals[23]);
+        unsigned int key_104 = ((bits_103 <= 2139095040) ? bits_103 : 0);
+        keys_c[23] = key_104;
+        int i_105 = base_t + 10243;
+        int ij_106 = i_105;
+        is_cand[23] = keys_c[23] >> 21 == bucket_sel && ij_106 < vocab;
+        ncand = ncand + ((is_cand[23]) ? 1 : 0);
+        unsigned int bits_107 = __as_u32(vals[24]);
+        unsigned int key_108 = ((bits_107 <= 2139095040) ? bits_107 : 0);
+        keys_c[24] = key_108;
+        int i_109 = base_t + 12288;
+        int ij_110 = i_109;
+        is_cand[24] = keys_c[24] >> 21 == bucket_sel && ij_110 < vocab;
+        ncand = ncand + ((is_cand[24]) ? 1 : 0);
+        unsigned int bits_112 = __as_u32(vals[25]);
+        unsigned int key_113 = ((bits_112 <= 2139095040) ? bits_112 : 0);
+        keys_c[25] = key_113;
+        int i_114 = base_t + 12289;
+        int ij_115 = i_114;
+        is_cand[25] = keys_c[25] >> 21 == bucket_sel && ij_115 < vocab;
+        ncand = ncand + ((is_cand[25]) ? 1 : 0);
+        unsigned int bits_116 = __as_u32(vals[26]);
+        unsigned int key_117 = ((bits_116 <= 2139095040) ? bits_116 : 0);
+        keys_c[26] = key_117;
+        int i_118 = base_t + 12290;
+        int ij_119 = i_118;
+        is_cand[26] = keys_c[26] >> 21 == bucket_sel && ij_119 < vocab;
+        ncand = ncand + ((is_cand[26]) ? 1 : 0);
+        unsigned int bits_120 = __as_u32(vals[27]);
+        unsigned int key_121 = ((bits_120 <= 2139095040) ? bits_120 : 0);
+        keys_c[27] = key_121;
+        int i_122 = base_t + 12291;
+        int ij_123 = i_122;
+        is_cand[27] = keys_c[27] >> 21 == bucket_sel && ij_123 < vocab;
+        ncand = ncand + ((is_cand[27]) ? 1 : 0);
+        unsigned int bits_124 = __as_u32(vals[28]);
+        unsigned int key_125 = ((bits_124 <= 2139095040) ? bits_124 : 0);
+        keys_c[28] = key_125;
+        int i_126 = base_t + 14336;
+        int ij_127 = i_126;
+        is_cand[28] = keys_c[28] >> 21 == bucket_sel && ij_127 < vocab;
+        ncand = ncand + ((is_cand[28]) ? 1 : 0);
+        unsigned int bits_128 = __as_u32(vals[29]);
+        unsigned int key_129 = ((bits_128 <= 2139095040) ? bits_128 : 0);
+        keys_c[29] = key_129;
+        int i_130 = base_t + 14337;
+        int ij_131 = i_130;
+        is_cand[29] = keys_c[29] >> 21 == bucket_sel && ij_131 < vocab;
+        ncand = ncand + ((is_cand[29]) ? 1 : 0);
+        unsigned int bits_132 = __as_u32(vals[30]);
+        unsigned int key_133 = ((bits_132 <= 2139095040) ? bits_132 : 0);
+        keys_c[30] = key_133;
+        int i_134 = base_t + 14338;
+        int ij_135 = i_134;
+        is_cand[30] = keys_c[30] >> 21 == bucket_sel && ij_135 < vocab;
+        ncand = ncand + ((is_cand[30]) ? 1 : 0);
+        unsigned int bits_136 = __as_u32(vals[31]);
+        unsigned int key_137 = ((bits_136 <= 2139095040) ? bits_136 : 0);
+        keys_c[31] = key_137;
+        int i_138 = base_t + 14339;
+        int ij_139 = i_138;
+        is_cand[31] = keys_c[31] >> 21 == bucket_sel && ij_139 < vocab;
+        ncand = ncand + ((is_cand[31]) ? 1 : 0);
+        unsigned int bits_140 = __as_u32(vals[32]);
+        unsigned int key_141 = ((bits_140 <= 2139095040) ? bits_140 : 0);
+        keys_c[32] = key_141;
+        int i_142 = base_t + 16384;
+        int ij_143 = i_142;
+        is_cand[32] = keys_c[32] >> 21 == bucket_sel && ij_143 < vocab;
+        ncand = ncand + ((is_cand[32]) ? 1 : 0);
+        unsigned int bits_144 = __as_u32(vals[33]);
+        unsigned int key_145 = ((bits_144 <= 2139095040) ? bits_144 : 0);
+        keys_c[33] = key_145;
+        int i_146 = base_t + 16385;
+        int ij_147 = i_146;
+        is_cand[33] = keys_c[33] >> 21 == bucket_sel && ij_147 < vocab;
+        ncand = ncand + ((is_cand[33]) ? 1 : 0);
+        unsigned int bits_148 = __as_u32(vals[34]);
+        unsigned int key_149 = ((bits_148 <= 2139095040) ? bits_148 : 0);
+        keys_c[34] = key_149;
+        int i_150 = base_t + 16386;
+        int ij_151 = i_150;
+        is_cand[34] = keys_c[34] >> 21 == bucket_sel && ij_151 < vocab;
+        ncand = ncand + ((is_cand[34]) ? 1 : 0);
+        unsigned int bits_152 = __as_u32(vals[35]);
+        unsigned int key_153 = ((bits_152 <= 2139095040) ? bits_152 : 0);
+        keys_c[35] = key_153;
+        int i_154 = base_t + 16387;
+        int ij_155 = i_154;
+        is_cand[35] = keys_c[35] >> 21 == bucket_sel && ij_155 < vocab;
+        ncand = ncand + ((is_cand[35]) ? 1 : 0);
+        unsigned int bits_156 = __as_u32(vals[36]);
+        unsigned int key_157 = ((bits_156 <= 2139095040) ? bits_156 : 0);
+        keys_c[36] = key_157;
+        int i_158 = base_t + 18432;
+        int ij_159 = i_158;
+        is_cand[36] = keys_c[36] >> 21 == bucket_sel && ij_159 < vocab;
+        ncand = ncand + ((is_cand[36]) ? 1 : 0);
+        unsigned int bits_160 = __as_u32(vals[37]);
+        unsigned int key_161 = ((bits_160 <= 2139095040) ? bits_160 : 0);
+        keys_c[37] = key_161;
+        int i_162 = base_t + 18433;
+        int ij_163 = i_162;
+        is_cand[37] = keys_c[37] >> 21 == bucket_sel && ij_163 < vocab;
+        ncand = ncand + ((is_cand[37]) ? 1 : 0);
+        unsigned int bits_164 = __as_u32(vals[38]);
+        unsigned int key_165 = ((bits_164 <= 2139095040) ? bits_164 : 0);
+        keys_c[38] = key_165;
+        int i_166 = base_t + 18434;
+        int ij_167 = i_166;
+        is_cand[38] = keys_c[38] >> 21 == bucket_sel && ij_167 < vocab;
+        ncand = ncand + ((is_cand[38]) ? 1 : 0);
+        unsigned int bits_168 = __as_u32(vals[39]);
+        unsigned int key_169 = ((bits_168 <= 2139095040) ? bits_168 : 0);
+        keys_c[39] = key_169;
+        int i_170 = base_t + 18435;
+        int ij_171 = i_170;
+        is_cand[39] = keys_c[39] >> 21 == bucket_sel && ij_171 < vocab;
+        ncand = ncand + ((is_cand[39]) ? 1 : 0);
+        unsigned int ncand_172 = ncand;
+        uint32_t incl = ncand_172;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        unsigned int before = 0;
+        unsigned int total = 0;
+        unsigned int ws = warp_sums[0];
+        total = total + ws;
+        if (warp > 0) {
+            before = before + ws;
+        }
+        unsigned int ws_173 = warp_sums[1];
+        total = total + ws_173;
+        if (warp > 1) {
+            before = before + ws_173;
+        }
+        unsigned int ws_174 = warp_sums[2];
+        total = total + ws_174;
+        if (warp > 2) {
+            before = before + ws_174;
+        }
+        unsigned int ws_175 = warp_sums[3];
+        total = total + ws_175;
+        if (warp > 3) {
+            before = before + ws_175;
+        }
+        unsigned int ws_176 = warp_sums[4];
+        total = total + ws_176;
+        if (warp > 4) {
+            before = before + ws_176;
+        }
+        unsigned int ws_177 = warp_sums[5];
+        total = total + ws_177;
+        if (warp > 5) {
+            before = before + ws_177;
+        }
+        unsigned int ws_178 = warp_sums[6];
+        total = total + ws_178;
+        if (warp > 6) {
+            before = before + ws_178;
+        }
+        unsigned int ws_179 = warp_sums[7];
+        total = total + ws_179;
+        if (warp > 7) {
+            before = before + ws_179;
+        }
+        unsigned int ws_180 = warp_sums[8];
+        total = total + ws_180;
+        if (warp > 8) {
+            before = before + ws_180;
+        }
+        unsigned int ws_181 = warp_sums[9];
+        total = total + ws_181;
+        if (warp > 9) {
+            before = before + ws_181;
+        }
+        unsigned int ws_182 = warp_sums[10];
+        total = total + ws_182;
+        if (warp > 10) {
+            before = before + ws_182;
+        }
+        unsigned int ws_183 = warp_sums[11];
+        total = total + ws_183;
+        if (warp > 11) {
+            before = before + ws_183;
+        }
+        unsigned int ws_184 = warp_sums[12];
+        total = total + ws_184;
+        if (warp > 12) {
+            before = before + ws_184;
+        }
+        unsigned int ws_185 = warp_sums[13];
+        total = total + ws_185;
+        if (warp > 13) {
+            before = before + ws_185;
+        }
+        unsigned int ws_186 = warp_sums[14];
+        total = total + ws_186;
+        if (warp > 14) {
+            before = before + ws_186;
+        }
+        unsigned int ws_187 = warp_sums[15];
+        total = total + ws_187;
+        if (warp > 15) {
+            before = before + ws_187;
+        }
+        unsigned int excl = before + incl - ncand_172;
+        __syncthreads();
+        unsigned int slot = excl;
+        if (is_cand[0]) {
+            int i_0_2 = base_t;
+            int ij_1 = i_0_2;
+            clist[slot * 2] = keys_c[0];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1;
+            slot = slot + 1;
+        }
+        if (is_cand[1]) {
+            int i_0_3 = base_t + 1;
+            int ij_1_1 = i_0_3;
+            clist[slot * 2] = keys_c[1];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_1;
+            slot = slot + 1;
+        }
+        if (is_cand[2]) {
+            int i_0_4 = base_t + 2;
+            int ij_1_2 = i_0_4;
+            clist[slot * 2] = keys_c[2];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_2;
+            slot = slot + 1;
+        }
+        if (is_cand[3]) {
+            int i_0_5 = base_t + 3;
+            int ij_1_3 = i_0_5;
+            clist[slot * 2] = keys_c[3];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_3;
+            slot = slot + 1;
+        }
+        if (is_cand[4]) {
+            int i_0_6 = base_t + 2048;
+            int ij_1_4 = i_0_6;
+            clist[slot * 2] = keys_c[4];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_4;
+            slot = slot + 1;
+        }
+        if (is_cand[5]) {
+            int i_0_7 = base_t + 2049;
+            int ij_1_5 = i_0_7;
+            clist[slot * 2] = keys_c[5];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_5;
+            slot = slot + 1;
+        }
+        if (is_cand[6]) {
+            int i_0_8 = base_t + 2050;
+            int ij_1_6 = i_0_8;
+            clist[slot * 2] = keys_c[6];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_6;
+            slot = slot + 1;
+        }
+        if (is_cand[7]) {
+            int i_0_9 = base_t + 2051;
+            int ij_1_7 = i_0_9;
+            clist[slot * 2] = keys_c[7];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_7;
+            slot = slot + 1;
+        }
+        if (is_cand[8]) {
+            int i_0_10 = base_t + 4096;
+            int ij_1_8 = i_0_10;
+            clist[slot * 2] = keys_c[8];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_8;
+            slot = slot + 1;
+        }
+        if (is_cand[9]) {
+            int i_0_11 = base_t + 4097;
+            int ij_1_9 = i_0_11;
+            clist[slot * 2] = keys_c[9];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_9;
+            slot = slot + 1;
+        }
+        if (is_cand[10]) {
+            int i_0_12 = base_t + 4098;
+            int ij_1_10 = i_0_12;
+            clist[slot * 2] = keys_c[10];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_10;
+            slot = slot + 1;
+        }
+        if (is_cand[11]) {
+            int i_0_13 = base_t + 4099;
+            int ij_1_11 = i_0_13;
+            clist[slot * 2] = keys_c[11];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_11;
+            slot = slot + 1;
+        }
+        if (is_cand[12]) {
+            int i_0_14 = base_t + 6144;
+            int ij_1_12 = i_0_14;
+            clist[slot * 2] = keys_c[12];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_12;
+            slot = slot + 1;
+        }
+        if (is_cand[13]) {
+            int i_0_15 = base_t + 6145;
+            int ij_1_13 = i_0_15;
+            clist[slot * 2] = keys_c[13];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_13;
+            slot = slot + 1;
+        }
+        if (is_cand[14]) {
+            int i_0_16 = base_t + 6146;
+            int ij_1_14 = i_0_16;
+            clist[slot * 2] = keys_c[14];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_14;
+            slot = slot + 1;
+        }
+        if (is_cand[15]) {
+            int i_0_17 = base_t + 6147;
+            int ij_1_15 = i_0_17;
+            clist[slot * 2] = keys_c[15];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_15;
+            slot = slot + 1;
+        }
+        if (is_cand[16]) {
+            int i_0_18 = base_t + 8192;
+            int ij_1_16 = i_0_18;
+            clist[slot * 2] = keys_c[16];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_16;
+            slot = slot + 1;
+        }
+        if (is_cand[17]) {
+            int i_0_19 = base_t + 8193;
+            int ij_1_17 = i_0_19;
+            clist[slot * 2] = keys_c[17];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_17;
+            slot = slot + 1;
+        }
+        if (is_cand[18]) {
+            int i_0_20 = base_t + 8194;
+            int ij_1_18 = i_0_20;
+            clist[slot * 2] = keys_c[18];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_18;
+            slot = slot + 1;
+        }
+        if (is_cand[19]) {
+            int i_0_21 = base_t + 8195;
+            int ij_1_19 = i_0_21;
+            clist[slot * 2] = keys_c[19];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_19;
+            slot = slot + 1;
+        }
+        if (is_cand[20]) {
+            int i_0_22 = base_t + 10240;
+            int ij_1_20 = i_0_22;
+            clist[slot * 2] = keys_c[20];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_20;
+            slot = slot + 1;
+        }
+        if (is_cand[21]) {
+            int i_0_23 = base_t + 10241;
+            int ij_1_21 = i_0_23;
+            clist[slot * 2] = keys_c[21];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_21;
+            slot = slot + 1;
+        }
+        if (is_cand[22]) {
+            int i_0_24 = base_t + 10242;
+            int ij_1_22 = i_0_24;
+            clist[slot * 2] = keys_c[22];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_22;
+            slot = slot + 1;
+        }
+        if (is_cand[23]) {
+            int i_0_25 = base_t + 10243;
+            int ij_1_23 = i_0_25;
+            clist[slot * 2] = keys_c[23];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_23;
+            slot = slot + 1;
+        }
+        if (is_cand[24]) {
+            int i_0_26 = base_t + 12288;
+            int ij_1_24 = i_0_26;
+            clist[slot * 2] = keys_c[24];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_24;
+            slot = slot + 1;
+        }
+        if (is_cand[25]) {
+            int i_0_27 = base_t + 12289;
+            int ij_1_25 = i_0_27;
+            clist[slot * 2] = keys_c[25];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_25;
+            slot = slot + 1;
+        }
+        if (is_cand[26]) {
+            int i_0_28 = base_t + 12290;
+            int ij_1_26 = i_0_28;
+            clist[slot * 2] = keys_c[26];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_26;
+            slot = slot + 1;
+        }
+        if (is_cand[27]) {
+            int i_0_29 = base_t + 12291;
+            int ij_1_27 = i_0_29;
+            clist[slot * 2] = keys_c[27];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_27;
+            slot = slot + 1;
+        }
+        if (is_cand[28]) {
+            int i_0_30 = base_t + 14336;
+            int ij_1_28 = i_0_30;
+            clist[slot * 2] = keys_c[28];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_28;
+            slot = slot + 1;
+        }
+        if (is_cand[29]) {
+            int i_0_31 = base_t + 14337;
+            int ij_1_29 = i_0_31;
+            clist[slot * 2] = keys_c[29];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_29;
+            slot = slot + 1;
+        }
+        if (is_cand[30]) {
+            int i_0_32 = base_t + 14338;
+            int ij_1_30 = i_0_32;
+            clist[slot * 2] = keys_c[30];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_30;
+            slot = slot + 1;
+        }
+        if (is_cand[31]) {
+            int i_0_33 = base_t + 14339;
+            int ij_1_31 = i_0_33;
+            clist[slot * 2] = keys_c[31];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_31;
+            slot = slot + 1;
+        }
+        if (is_cand[32]) {
+            int i_0_34 = base_t + 16384;
+            int ij_1_32 = i_0_34;
+            clist[slot * 2] = keys_c[32];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_32;
+            slot = slot + 1;
+        }
+        if (is_cand[33]) {
+            int i_0_35 = base_t + 16385;
+            int ij_1_33 = i_0_35;
+            clist[slot * 2] = keys_c[33];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_33;
+            slot = slot + 1;
+        }
+        if (is_cand[34]) {
+            int i_0_36 = base_t + 16386;
+            int ij_1_34 = i_0_36;
+            clist[slot * 2] = keys_c[34];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_34;
+            slot = slot + 1;
+        }
+        if (is_cand[35]) {
+            int i_0_37 = base_t + 16387;
+            int ij_1_35 = i_0_37;
+            clist[slot * 2] = keys_c[35];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_35;
+            slot = slot + 1;
+        }
+        if (is_cand[36]) {
+            int i_0_38 = base_t + 18432;
+            int ij_1_36 = i_0_38;
+            clist[slot * 2] = keys_c[36];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_36;
+            slot = slot + 1;
+        }
+        if (is_cand[37]) {
+            int i_0_39 = base_t + 18433;
+            int ij_1_37 = i_0_39;
+            clist[slot * 2] = keys_c[37];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_37;
+            slot = slot + 1;
+        }
+        if (is_cand[38]) {
+            int i_0_40 = base_t + 18434;
+            int ij_1_38 = i_0_40;
+            clist[slot * 2] = keys_c[38];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_38;
+            slot = slot + 1;
+        }
+        if (is_cand[39]) {
+            int i_0_41 = base_t + 18435;
+            int ij_1_39 = i_0_41;
+            clist[slot * 2] = keys_c[39];
+            clist[slot * 2 + 1] = ~(unsigned int)ij_1_39;
+            slot = slot + 1;
+        }
+        if (tid == 0) {
+            scal[3] = total;
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int lens[8];
+        unsigned long long comps[4];
+        unsigned int total_c = 0;
+        uint32_t _mapa_0;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_0) : "r"(scal_addr + 12), "r"(0));
+        unsigned int cluster_value[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value[0])) : "r"(_mapa_0) : "memory");
+        lens[0] = cluster_value[0];
+        total_c = total_c + lens[0];
+        uint32_t _mapa_1;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_1) : "r"(scal_addr + 12), "r"(1));
+        unsigned int cluster_value_188[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_188[0])) : "r"(_mapa_1) : "memory");
+        lens[1] = cluster_value_188[0];
+        total_c = total_c + lens[1];
+        uint32_t _mapa_2;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_2) : "r"(scal_addr + 12), "r"(2));
+        unsigned int cluster_value_189[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_189[0])) : "r"(_mapa_2) : "memory");
+        lens[2] = cluster_value_189[0];
+        total_c = total_c + lens[2];
+        uint32_t _mapa_3;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_3) : "r"(scal_addr + 12), "r"(3));
+        unsigned int cluster_value_190[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_190[0])) : "r"(_mapa_3) : "memory");
+        lens[3] = cluster_value_190[0];
+        total_c = total_c + lens[3];
+        uint32_t _mapa_4;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_4) : "r"(scal_addr + 12), "r"(4));
+        unsigned int cluster_value_191[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_191[0])) : "r"(_mapa_4) : "memory");
+        lens[4] = cluster_value_191[0];
+        total_c = total_c + lens[4];
+        uint32_t _mapa_5;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_5) : "r"(scal_addr + 12), "r"(5));
+        unsigned int cluster_value_192[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_192[0])) : "r"(_mapa_5) : "memory");
+        lens[5] = cluster_value_192[0];
+        total_c = total_c + lens[5];
+        uint32_t _mapa_6;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_6) : "r"(scal_addr + 12), "r"(6));
+        unsigned int cluster_value_193[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_193[0])) : "r"(_mapa_6) : "memory");
+        lens[6] = cluster_value_193[0];
+        total_c = total_c + lens[6];
+        uint32_t _mapa_7;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_mapa_7) : "r"(scal_addr + 12), "r"(7));
+        unsigned int cluster_value_194[1];
+        asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_194[0])) : "r"(_mapa_7) : "memory");
+        lens[7] = cluster_value_194[0];
+        total_c = total_c + lens[7];
+        comps[0] = 9214364837600034816;
+        unsigned int g = (unsigned int)tid;
+        if (g < total_c) {
+            unsigned int acc = 0;
+            if (g >= acc && g < acc + lens[0]) {
+                unsigned int ls = g - acc;
+                unsigned int pair[2];
+                uint32_t _cluster_mapa_51;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_51) : "r"(clist_addr + ls * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair[(0) + 1]))
+                    : "r"(_cluster_mapa_51));
+                comps[0] = (unsigned long long)pair[0] << 32 | (unsigned long long)pair[1];
+            }
+            acc = acc + lens[0];
+            if (g >= acc && g < acc + lens[1]) {
+                unsigned int ls_1 = g - acc;
+                unsigned int pair_1[2];
+                uint32_t _cluster_mapa_52;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_52) : "r"(clist_addr + ls_1 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_1[(0) + 1]))
+                    : "r"(_cluster_mapa_52));
+                comps[0] = (unsigned long long)pair_1[0] << 32 | (unsigned long long)pair_1[1];
+            }
+            acc = acc + lens[1];
+            if (g >= acc && g < acc + lens[2]) {
+                unsigned int ls_2 = g - acc;
+                unsigned int pair_2[2];
+                uint32_t _cluster_mapa_53;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_53) : "r"(clist_addr + ls_2 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_2[(0) + 1]))
+                    : "r"(_cluster_mapa_53));
+                comps[0] = (unsigned long long)pair_2[0] << 32 | (unsigned long long)pair_2[1];
+            }
+            acc = acc + lens[2];
+            if (g >= acc && g < acc + lens[3]) {
+                unsigned int ls_3 = g - acc;
+                unsigned int pair_3[2];
+                uint32_t _cluster_mapa_54;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_54) : "r"(clist_addr + ls_3 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_3[(0) + 1]))
+                    : "r"(_cluster_mapa_54));
+                comps[0] = (unsigned long long)pair_3[0] << 32 | (unsigned long long)pair_3[1];
+            }
+            acc = acc + lens[3];
+            if (g >= acc && g < acc + lens[4]) {
+                unsigned int ls_4 = g - acc;
+                unsigned int pair_4[2];
+                uint32_t _cluster_mapa_55;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_55) : "r"(clist_addr + ls_4 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_4[(0) + 1]))
+                    : "r"(_cluster_mapa_55));
+                comps[0] = (unsigned long long)pair_4[0] << 32 | (unsigned long long)pair_4[1];
+            }
+            acc = acc + lens[4];
+            if (g >= acc && g < acc + lens[5]) {
+                unsigned int ls_5 = g - acc;
+                unsigned int pair_5[2];
+                uint32_t _cluster_mapa_56;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_56) : "r"(clist_addr + ls_5 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_5[(0) + 1]))
+                    : "r"(_cluster_mapa_56));
+                comps[0] = (unsigned long long)pair_5[0] << 32 | (unsigned long long)pair_5[1];
+            }
+            acc = acc + lens[5];
+            if (g >= acc && g < acc + lens[6]) {
+                unsigned int ls_6 = g - acc;
+                unsigned int pair_6[2];
+                uint32_t _cluster_mapa_57;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_57) : "r"(clist_addr + ls_6 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_6[(0) + 1]))
+                    : "r"(_cluster_mapa_57));
+                comps[0] = (unsigned long long)pair_6[0] << 32 | (unsigned long long)pair_6[1];
+            }
+            acc = acc + lens[6];
+            if (g >= acc && g < acc + lens[7]) {
+                unsigned int ls_7 = g - acc;
+                unsigned int pair_7[2];
+                uint32_t _cluster_mapa_58;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_58) : "r"(clist_addr + ls_7 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_7[(0) + 1]))
+                    : "r"(_cluster_mapa_58));
+                comps[0] = (unsigned long long)pair_7[0] << 32 | (unsigned long long)pair_7[1];
+            }
+            acc = acc + lens[7];
+        }
+        comps[1] = 9214364837600034816;
+        unsigned int g_195 = (unsigned int)(tid + 512);
+        if (g_195 < total_c) {
+            unsigned int acc_1 = 0;
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[0]) {
+                unsigned int ls_8 = g_195 - acc_1;
+                unsigned int pair_8[2];
+                uint32_t _cluster_mapa_59;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_59) : "r"(clist_addr + ls_8 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_8[(0) + 1]))
+                    : "r"(_cluster_mapa_59));
+                comps[1] = (unsigned long long)pair_8[0] << 32 | (unsigned long long)pair_8[1];
+            }
+            acc_1 = acc_1 + lens[0];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[1]) {
+                unsigned int ls_9 = g_195 - acc_1;
+                unsigned int pair_9[2];
+                uint32_t _cluster_mapa_60;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_60) : "r"(clist_addr + ls_9 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_9[(0) + 1]))
+                    : "r"(_cluster_mapa_60));
+                comps[1] = (unsigned long long)pair_9[0] << 32 | (unsigned long long)pair_9[1];
+            }
+            acc_1 = acc_1 + lens[1];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[2]) {
+                unsigned int ls_10 = g_195 - acc_1;
+                unsigned int pair_10[2];
+                uint32_t _cluster_mapa_61;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_61) : "r"(clist_addr + ls_10 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_10[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_10[(0) + 1]))
+                    : "r"(_cluster_mapa_61));
+                comps[1] = (unsigned long long)pair_10[0] << 32 | (unsigned long long)pair_10[1];
+            }
+            acc_1 = acc_1 + lens[2];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[3]) {
+                unsigned int ls_11 = g_195 - acc_1;
+                unsigned int pair_11[2];
+                uint32_t _cluster_mapa_62;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_62) : "r"(clist_addr + ls_11 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_11[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_11[(0) + 1]))
+                    : "r"(_cluster_mapa_62));
+                comps[1] = (unsigned long long)pair_11[0] << 32 | (unsigned long long)pair_11[1];
+            }
+            acc_1 = acc_1 + lens[3];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[4]) {
+                unsigned int ls_12 = g_195 - acc_1;
+                unsigned int pair_12[2];
+                uint32_t _cluster_mapa_63;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_63) : "r"(clist_addr + ls_12 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_12[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_12[(0) + 1]))
+                    : "r"(_cluster_mapa_63));
+                comps[1] = (unsigned long long)pair_12[0] << 32 | (unsigned long long)pair_12[1];
+            }
+            acc_1 = acc_1 + lens[4];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[5]) {
+                unsigned int ls_13 = g_195 - acc_1;
+                unsigned int pair_13[2];
+                uint32_t _cluster_mapa_64;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_64) : "r"(clist_addr + ls_13 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_13[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_13[(0) + 1]))
+                    : "r"(_cluster_mapa_64));
+                comps[1] = (unsigned long long)pair_13[0] << 32 | (unsigned long long)pair_13[1];
+            }
+            acc_1 = acc_1 + lens[5];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[6]) {
+                unsigned int ls_14 = g_195 - acc_1;
+                unsigned int pair_14[2];
+                uint32_t _cluster_mapa_65;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_65) : "r"(clist_addr + ls_14 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_14[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_14[(0) + 1]))
+                    : "r"(_cluster_mapa_65));
+                comps[1] = (unsigned long long)pair_14[0] << 32 | (unsigned long long)pair_14[1];
+            }
+            acc_1 = acc_1 + lens[6];
+            if (g_195 >= acc_1 && g_195 < acc_1 + lens[7]) {
+                unsigned int ls_15 = g_195 - acc_1;
+                unsigned int pair_15[2];
+                uint32_t _cluster_mapa_66;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_66) : "r"(clist_addr + ls_15 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_15[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_15[(0) + 1]))
+                    : "r"(_cluster_mapa_66));
+                comps[1] = (unsigned long long)pair_15[0] << 32 | (unsigned long long)pair_15[1];
+            }
+            acc_1 = acc_1 + lens[7];
+        }
+        comps[2] = 9214364837600034816;
+        unsigned int g_196 = (unsigned int)(tid + 1024);
+        if (g_196 < total_c) {
+            unsigned int acc_2 = 0;
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[0]) {
+                unsigned int ls_16 = g_196 - acc_2;
+                unsigned int pair_16[2];
+                uint32_t _cluster_mapa_67;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_67) : "r"(clist_addr + ls_16 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_16[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_16[(0) + 1]))
+                    : "r"(_cluster_mapa_67));
+                comps[2] = (unsigned long long)pair_16[0] << 32 | (unsigned long long)pair_16[1];
+            }
+            acc_2 = acc_2 + lens[0];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[1]) {
+                unsigned int ls_17 = g_196 - acc_2;
+                unsigned int pair_17[2];
+                uint32_t _cluster_mapa_68;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_68) : "r"(clist_addr + ls_17 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_17[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_17[(0) + 1]))
+                    : "r"(_cluster_mapa_68));
+                comps[2] = (unsigned long long)pair_17[0] << 32 | (unsigned long long)pair_17[1];
+            }
+            acc_2 = acc_2 + lens[1];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[2]) {
+                unsigned int ls_18 = g_196 - acc_2;
+                unsigned int pair_18[2];
+                uint32_t _cluster_mapa_69;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_69) : "r"(clist_addr + ls_18 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_18[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_18[(0) + 1]))
+                    : "r"(_cluster_mapa_69));
+                comps[2] = (unsigned long long)pair_18[0] << 32 | (unsigned long long)pair_18[1];
+            }
+            acc_2 = acc_2 + lens[2];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[3]) {
+                unsigned int ls_19 = g_196 - acc_2;
+                unsigned int pair_19[2];
+                uint32_t _cluster_mapa_70;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_70) : "r"(clist_addr + ls_19 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_19[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_19[(0) + 1]))
+                    : "r"(_cluster_mapa_70));
+                comps[2] = (unsigned long long)pair_19[0] << 32 | (unsigned long long)pair_19[1];
+            }
+            acc_2 = acc_2 + lens[3];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[4]) {
+                unsigned int ls_20 = g_196 - acc_2;
+                unsigned int pair_20[2];
+                uint32_t _cluster_mapa_71;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_71) : "r"(clist_addr + ls_20 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_20[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_20[(0) + 1]))
+                    : "r"(_cluster_mapa_71));
+                comps[2] = (unsigned long long)pair_20[0] << 32 | (unsigned long long)pair_20[1];
+            }
+            acc_2 = acc_2 + lens[4];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[5]) {
+                unsigned int ls_21 = g_196 - acc_2;
+                unsigned int pair_21[2];
+                uint32_t _cluster_mapa_72;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_72) : "r"(clist_addr + ls_21 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_21[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_21[(0) + 1]))
+                    : "r"(_cluster_mapa_72));
+                comps[2] = (unsigned long long)pair_21[0] << 32 | (unsigned long long)pair_21[1];
+            }
+            acc_2 = acc_2 + lens[5];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[6]) {
+                unsigned int ls_22 = g_196 - acc_2;
+                unsigned int pair_22[2];
+                uint32_t _cluster_mapa_73;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_73) : "r"(clist_addr + ls_22 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_22[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_22[(0) + 1]))
+                    : "r"(_cluster_mapa_73));
+                comps[2] = (unsigned long long)pair_22[0] << 32 | (unsigned long long)pair_22[1];
+            }
+            acc_2 = acc_2 + lens[6];
+            if (g_196 >= acc_2 && g_196 < acc_2 + lens[7]) {
+                unsigned int ls_23 = g_196 - acc_2;
+                unsigned int pair_23[2];
+                uint32_t _cluster_mapa_74;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_74) : "r"(clist_addr + ls_23 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_23[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_23[(0) + 1]))
+                    : "r"(_cluster_mapa_74));
+                comps[2] = (unsigned long long)pair_23[0] << 32 | (unsigned long long)pair_23[1];
+            }
+            acc_2 = acc_2 + lens[7];
+        }
+        comps[3] = 9214364837600034816;
+        unsigned int g_197 = (unsigned int)(tid + 1536);
+        if (g_197 < total_c) {
+            unsigned int acc_3 = 0;
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[0]) {
+                unsigned int ls_24 = g_197 - acc_3;
+                unsigned int pair_24[2];
+                uint32_t _cluster_mapa_75;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_75) : "r"(clist_addr + ls_24 * 8), "r"(0));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_24[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_24[(0) + 1]))
+                    : "r"(_cluster_mapa_75));
+                comps[3] = (unsigned long long)pair_24[0] << 32 | (unsigned long long)pair_24[1];
+            }
+            acc_3 = acc_3 + lens[0];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[1]) {
+                unsigned int ls_25 = g_197 - acc_3;
+                unsigned int pair_25[2];
+                uint32_t _cluster_mapa_76;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_76) : "r"(clist_addr + ls_25 * 8), "r"(1));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_25[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_25[(0) + 1]))
+                    : "r"(_cluster_mapa_76));
+                comps[3] = (unsigned long long)pair_25[0] << 32 | (unsigned long long)pair_25[1];
+            }
+            acc_3 = acc_3 + lens[1];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[2]) {
+                unsigned int ls_26 = g_197 - acc_3;
+                unsigned int pair_26[2];
+                uint32_t _cluster_mapa_77;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_77) : "r"(clist_addr + ls_26 * 8), "r"(2));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_26[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_26[(0) + 1]))
+                    : "r"(_cluster_mapa_77));
+                comps[3] = (unsigned long long)pair_26[0] << 32 | (unsigned long long)pair_26[1];
+            }
+            acc_3 = acc_3 + lens[2];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[3]) {
+                unsigned int ls_27 = g_197 - acc_3;
+                unsigned int pair_27[2];
+                uint32_t _cluster_mapa_78;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_78) : "r"(clist_addr + ls_27 * 8), "r"(3));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_27[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_27[(0) + 1]))
+                    : "r"(_cluster_mapa_78));
+                comps[3] = (unsigned long long)pair_27[0] << 32 | (unsigned long long)pair_27[1];
+            }
+            acc_3 = acc_3 + lens[3];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[4]) {
+                unsigned int ls_28 = g_197 - acc_3;
+                unsigned int pair_28[2];
+                uint32_t _cluster_mapa_79;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_79) : "r"(clist_addr + ls_28 * 8), "r"(4));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_28[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_28[(0) + 1]))
+                    : "r"(_cluster_mapa_79));
+                comps[3] = (unsigned long long)pair_28[0] << 32 | (unsigned long long)pair_28[1];
+            }
+            acc_3 = acc_3 + lens[4];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[5]) {
+                unsigned int ls_29 = g_197 - acc_3;
+                unsigned int pair_29[2];
+                uint32_t _cluster_mapa_80;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_80) : "r"(clist_addr + ls_29 * 8), "r"(5));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_29[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_29[(0) + 1]))
+                    : "r"(_cluster_mapa_80));
+                comps[3] = (unsigned long long)pair_29[0] << 32 | (unsigned long long)pair_29[1];
+            }
+            acc_3 = acc_3 + lens[5];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[6]) {
+                unsigned int ls_30 = g_197 - acc_3;
+                unsigned int pair_30[2];
+                uint32_t _cluster_mapa_81;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_81) : "r"(clist_addr + ls_30 * 8), "r"(6));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_30[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_30[(0) + 1]))
+                    : "r"(_cluster_mapa_81));
+                comps[3] = (unsigned long long)pair_30[0] << 32 | (unsigned long long)pair_30[1];
+            }
+            acc_3 = acc_3 + lens[6];
+            if (g_197 >= acc_3 && g_197 < acc_3 + lens[7]) {
+                unsigned int ls_31 = g_197 - acc_3;
+                unsigned int pair_31[2];
+                uint32_t _cluster_mapa_82;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_82) : "r"(clist_addr + ls_31 * 8), "r"(7));
+                asm volatile("ld.shared::cluster.v2.b32 {%0,%1}, [%2];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&pair_31[0])), "=r"(*reinterpret_cast<uint32_t*>(&pair_31[(0) + 1]))
+                    : "r"(_cluster_mapa_82));
+                comps[3] = (unsigned long long)pair_31[0] << 32 | (unsigned long long)pair_31[1];
+            }
+            acc_3 = acc_3 + lens[7];
+        }
+        unsigned int total_c_198 = total_c;
+        if (fuse_on == 0) {
+            asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        }
+        unsigned long long c = comps[0];
+        unsigned int bucket_199 = (unsigned int)(c >> 42 & 2047);
+        if (c >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_199], 1);
+        }
+        unsigned long long c_200 = comps[1];
+        unsigned int bucket_201 = (unsigned int)(c_200 >> 42 & 2047);
+        if (c_200 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_201], 1);
+        }
+        unsigned long long c_202 = comps[2];
+        unsigned int bucket_203 = (unsigned int)(c_202 >> 42 & 2047);
+        if (c_202 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_203], 1);
+        }
+        unsigned long long c_204 = comps[3];
+        unsigned int bucket_205 = (unsigned int)(c_204 >> 42 & 2047);
+        if (c_204 >> 53 == (unsigned long long)bucket_sel) {
+            atomicAdd(&hist1[bucket_205], 1);
+        }
+        for (int i_1_2 = tid; i_1_2 < 2048; i_1_2 += 512) {
+            hist0[i_1_2] = 0;
+        }
+        __syncthreads();
+        unsigned int c0 = 0;
+        unsigned int c1 = 0;
+        unsigned int c2 = 0;
+        unsigned int c3 = 0;
+        c0 = hist1[tid * 4];
+        c1 = hist1[tid * 4 + 1];
+        c2 = hist1[tid * 4 + 2];
+        c3 = hist1[tid * 4 + 3];
+        unsigned int local_206 = c0 + c1 + c2 + c3;
+        uint32_t _warp_scan_sum_83 = local_206;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_83) : "r"(16));
+        unsigned int lane_suffix = _warp_scan_sum_83 - local_206;
+        unsigned int warp_total;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total) : "r"(local_206));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total;
+        }
+        __syncthreads();
+        unsigned int peer = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_1 = ((lane > warp) ? peer : 0);
+        unsigned int warps_above;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above) : "r"(above_1));
+        unsigned int suffix = lane_suffix + warps_above;
+        bool hit = 0;
+        unsigned int bucket_207 = 0;
+        unsigned int rest = 0;
+        unsigned int count = 0;
+        if (suffix < remaining && remaining <= suffix + local_206) {
+            hit = 1;
+            unsigned int s3_2 = suffix + c3;
+            unsigned int s2_2 = s3_2 + c2;
+            unsigned int s1_2 = s2_2 + c1;
+            if (remaining <= s3_2) {
+                bucket_207 = (unsigned int)(tid * 4 + 3);
+                rest = remaining - suffix;
+                count = c3;
+            } else if (remaining <= s2_2) {
+                bucket_207 = (unsigned int)(tid * 4 + 2);
+                rest = remaining - s3_2;
+                count = c2;
+            } else {
+                if (remaining <= s1_2) {
+                    bucket_207 = (unsigned int)(tid * 4 + 1);
+                    rest = remaining - s2_2;
+                    count = c1;
+                } else {
+                    bucket_207 = (unsigned int)(tid * 4);
+                    rest = remaining - s1_2;
+                    count = c0;
+                }
+            }
+        }
+        if (hit) {
+            scal[0] = bucket_207;
+            scal[1] = rest;
+            scal[2] = count;
+        }
+        __syncthreads();
+        unsigned int bucket_208 = scal[0];
+        unsigned int rem = scal[1];
+        unsigned int cnt_209 = scal[2];
+        unsigned long long prefix1 = (unsigned long long)bucket_sel << 11 | (unsigned long long)bucket_208;
+        unsigned long long c_210 = comps[0];
+        unsigned int bucket_211 = (unsigned int)(c_210 >> 32 & 1023);
+        if (c_210 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_211], 1);
+        }
+        unsigned long long c_212 = comps[1];
+        unsigned int bucket_213 = (unsigned int)(c_212 >> 32 & 1023);
+        if (c_212 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_213], 1);
+        }
+        unsigned long long c_214 = comps[2];
+        unsigned int bucket_215 = (unsigned int)(c_214 >> 32 & 1023);
+        if (c_214 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_215], 1);
+        }
+        unsigned long long c_216 = comps[3];
+        unsigned int bucket_217 = (unsigned int)(c_216 >> 32 & 1023);
+        if (c_216 >> 42 == prefix1) {
+            atomicAdd(&hist0[bucket_217], 1);
+        }
+        for (int i_1_3 = tid; i_1_3 < 2048; i_1_3 += 512) {
+            hist1[i_1_3] = 0;
+        }
+        __syncthreads();
+        unsigned int c0_218 = 0;
+        unsigned int c1_219 = 0;
+        unsigned int c2_220 = 0;
+        unsigned int c3_221 = 0;
+        c0_218 = hist0[tid * 4];
+        c1_219 = hist0[tid * 4 + 1];
+        c2_220 = hist0[tid * 4 + 2];
+        c3_221 = hist0[tid * 4 + 3];
+        unsigned int local_222 = c0_218 + c1_219 + c2_220 + c3_221;
+        uint32_t _warp_scan_sum_84 = local_222;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_84) : "r"(16));
+        unsigned int lane_suffix_223 = _warp_scan_sum_84 - local_222;
+        unsigned int warp_total_224;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_224) : "r"(local_222));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_224;
+        }
+        __syncthreads();
+        unsigned int peer_225 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_226 = ((lane > warp) ? peer_225 : 0);
+        unsigned int warps_above_227;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_227) : "r"(above_226));
+        unsigned int suffix_228 = lane_suffix_223 + warps_above_227;
+        bool hit_229 = 0;
+        unsigned int bucket_230 = 0;
+        unsigned int rest_231 = 0;
+        unsigned int count_232 = 0;
+        if (suffix_228 < rem && rem <= suffix_228 + local_222) {
+            hit_229 = 1;
+            unsigned int s3_3 = suffix_228 + c3_221;
+            unsigned int s2_3 = s3_3 + c2_220;
+            unsigned int s1_3 = s2_3 + c1_219;
+            if (rem <= s3_3) {
+                bucket_230 = (unsigned int)(tid * 4 + 3);
+                rest_231 = rem - suffix_228;
+                count_232 = c3_221;
+            } else if (rem <= s2_3) {
+                bucket_230 = (unsigned int)(tid * 4 + 2);
+                rest_231 = rem - s3_3;
+                count_232 = c2_220;
+            } else {
+                if (rem <= s1_3) {
+                    bucket_230 = (unsigned int)(tid * 4 + 1);
+                    rest_231 = rem - s2_3;
+                    count_232 = c1_219;
+                } else {
+                    bucket_230 = (unsigned int)(tid * 4);
+                    rest_231 = rem - s1_3;
+                    count_232 = c0_218;
+                }
+            }
+        }
+        if (hit_229) {
+            scal[0] = bucket_230;
+            scal[1] = rest_231;
+            scal[2] = count_232;
+        }
+        __syncthreads();
+        unsigned int bucket_233 = scal[0];
+        unsigned int rem_234 = scal[1];
+        unsigned int cnt_235 = scal[2];
+        unsigned int threshold = (unsigned int)(prefix1 << 10 | (unsigned long long)bucket_233);
+        unsigned int nidx_min = 0;
+        if (cnt_235 != rem_234) {
+            unsigned long long tprefix = (unsigned long long)threshold << 11 | 2047;
+            unsigned long long c_0 = comps[0];
+            unsigned int bucket_1 = (unsigned int)(c_0 >> 10 & 2047);
+            if (c_0 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_1], 1);
+            }
+            unsigned long long c_2 = comps[1];
+            unsigned int bucket_3 = (unsigned int)(c_2 >> 10 & 2047);
+            if (c_2 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_3], 1);
+            }
+            unsigned long long c_4 = comps[2];
+            unsigned int bucket_6 = (unsigned int)(c_4 >> 10 & 2047);
+            if (c_4 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_6], 1);
+            }
+            unsigned long long c_7 = comps[3];
+            unsigned int bucket_9 = (unsigned int)(c_7 >> 10 & 2047);
+            if (c_7 >> 21 == tprefix) {
+                atomicAdd(&hist1[bucket_9], 1);
+            }
+            for (int i_1_4 = tid; i_1_4 < 2048; i_1_4 += 512) {
+                hist0[i_1_4] = 0;
+            }
+            __syncthreads();
+            unsigned int c0_10 = 0;
+            unsigned int c1_11 = 0;
+            unsigned int c2_12 = 0;
+            unsigned int c3_13 = 0;
+            c0_10 = hist1[tid * 4];
+            c1_11 = hist1[tid * 4 + 1];
+            c2_12 = hist1[tid * 4 + 2];
+            c3_13 = hist1[tid * 4 + 3];
+            unsigned int local_14 = c0_10 + c1_11 + c2_12 + c3_13;
+            uint32_t _warp_scan_sum_85 = local_14;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_85) : "r"(16));
+            unsigned int lane_suffix_15 = _warp_scan_sum_85 - local_14;
+            unsigned int warp_total_16;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_16) : "r"(local_14));
+            if (lane == 0) {
+                warp_sums[warp] = warp_total_16;
+            }
+            __syncthreads();
+            unsigned int peer_17 = ((lane < 16) ? warp_sums[lane] : 0);
+            unsigned int above_18 = ((lane > warp) ? peer_17 : 0);
+            unsigned int warps_above_19;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_19) : "r"(above_18));
+            unsigned int suffix_20 = lane_suffix_15 + warps_above_19;
+            bool hit_21 = 0;
+            unsigned int bucket_22 = 0;
+            unsigned int rest_23 = 0;
+            unsigned int count_24 = 0;
+            if (suffix_20 < rem_234 && rem_234 <= suffix_20 + local_14) {
+                hit_21 = 1;
+                unsigned int s3_4 = suffix_20 + c3_13;
+                unsigned int s2_4 = s3_4 + c2_12;
+                unsigned int s1_4 = s2_4 + c1_11;
+                if (rem_234 <= s3_4) {
+                    bucket_22 = (unsigned int)(tid * 4 + 3);
+                    rest_23 = rem_234 - suffix_20;
+                    count_24 = c3_13;
+                } else if (rem_234 <= s2_4) {
+                    bucket_22 = (unsigned int)(tid * 4 + 2);
+                    rest_23 = rem_234 - s3_4;
+                    count_24 = c2_12;
+                } else {
+                    if (rem_234 <= s1_4) {
+                        bucket_22 = (unsigned int)(tid * 4 + 1);
+                        rest_23 = rem_234 - s2_4;
+                        count_24 = c1_11;
+                    } else {
+                        bucket_22 = (unsigned int)(tid * 4);
+                        rest_23 = rem_234 - s1_4;
+                        count_24 = c0_10;
+                    }
+                }
+            }
+            if (hit_21) {
+                scal[0] = bucket_22;
+                scal[1] = rest_23;
+                scal[2] = count_24;
+            }
+            __syncthreads();
+            unsigned int bucket_25 = scal[0];
+            unsigned int rem_26 = scal[1];
+            unsigned int cnt_27 = scal[2];
+            unsigned long long tprefix2 = tprefix << 11 | (unsigned long long)bucket_25;
+            unsigned long long c_28 = comps[0];
+            unsigned int bucket_30 = (unsigned int)(c_28 & 1023);
+            if (c_28 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_30], 1);
+            }
+            unsigned long long c_31 = comps[1];
+            unsigned int bucket_33 = (unsigned int)(c_31 & 1023);
+            if (c_31 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_33], 1);
+            }
+            unsigned long long c_34 = comps[2];
+            unsigned int bucket_36 = (unsigned int)(c_34 & 1023);
+            if (c_34 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_36], 1);
+            }
+            unsigned long long c_37 = comps[3];
+            unsigned int bucket_39 = (unsigned int)(c_37 & 1023);
+            if (c_37 >> 10 == tprefix2) {
+                atomicAdd(&hist0[bucket_39], 1);
+            }
+            for (int i_1_5 = tid; i_1_5 < 2048; i_1_5 += 512) {
+                hist1[i_1_5] = 0;
+            }
+            __syncthreads();
+            unsigned int c0_40 = 0;
+            unsigned int c1_41 = 0;
+            unsigned int c2_42 = 0;
+            unsigned int c3_43 = 0;
+            c0_40 = hist0[tid * 4];
+            c1_41 = hist0[tid * 4 + 1];
+            c2_42 = hist0[tid * 4 + 2];
+            c3_43 = hist0[tid * 4 + 3];
+            unsigned int local_44 = c0_40 + c1_41 + c2_42 + c3_43;
+            uint32_t _warp_scan_sum_86 = local_44;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_86) : "r"(16));
+            unsigned int lane_suffix_45 = _warp_scan_sum_86 - local_44;
+            unsigned int warp_total_46;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_46) : "r"(local_44));
+            if (lane == 0) {
+                warp_sums[warp] = warp_total_46;
+            }
+            __syncthreads();
+            unsigned int peer_47 = ((lane < 16) ? warp_sums[lane] : 0);
+            unsigned int above_48 = ((lane > warp) ? peer_47 : 0);
+            unsigned int warps_above_49;
+            asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_49) : "r"(above_48));
+            unsigned int suffix_50 = lane_suffix_45 + warps_above_49;
+            bool hit_51 = 0;
+            unsigned int bucket_52 = 0;
+            unsigned int rest_53 = 0;
+            unsigned int count_54 = 0;
+            if (suffix_50 < rem_26 && rem_26 <= suffix_50 + local_44) {
+                hit_51 = 1;
+                unsigned int s3_5 = suffix_50 + c3_43;
+                unsigned int s2_5 = s3_5 + c2_42;
+                unsigned int s1_5 = s2_5 + c1_41;
+                if (rem_26 <= s3_5) {
+                    bucket_52 = (unsigned int)(tid * 4 + 3);
+                    rest_53 = rem_26 - suffix_50;
+                    count_54 = c3_43;
+                } else if (rem_26 <= s2_5) {
+                    bucket_52 = (unsigned int)(tid * 4 + 2);
+                    rest_53 = rem_26 - s3_5;
+                    count_54 = c2_42;
+                } else {
+                    if (rem_26 <= s1_5) {
+                        bucket_52 = (unsigned int)(tid * 4 + 1);
+                        rest_53 = rem_26 - s2_5;
+                        count_54 = c1_41;
+                    } else {
+                        bucket_52 = (unsigned int)(tid * 4);
+                        rest_53 = rem_26 - s1_5;
+                        count_54 = c0_40;
+                    }
+                }
+            }
+            if (hit_51) {
+                scal[0] = bucket_52;
+                scal[1] = rest_53;
+                scal[2] = count_54;
+            }
+            __syncthreads();
+            unsigned int bucket_55 = scal[0];
+            unsigned int rem_56 = scal[1];
+            unsigned int cnt_57 = scal[2];
+            nidx_min = 4292870144u | bucket_25 << 10 | bucket_55;
+        }
+        bool sel[40];
+        unsigned long long tcomp = (unsigned long long)threshold << 32 | (unsigned long long)nidx_min;
+        unsigned long long nstart = (unsigned long long)~(unsigned int)start;
+        unsigned int cand_lo = 0;
+        unsigned long long cg = comps[0];
+        bool lo_sel_1 = cg >= tcomp && cg < 9214364837600034816 && nstart < (cg & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_1) ? 1 : 0);
+        unsigned long long cg_236 = comps[1];
+        bool lo_sel_237 = cg_236 >= tcomp && cg_236 < 9214364837600034816 && nstart < (cg_236 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_237) ? 1 : 0);
+        unsigned long long cg_238 = comps[2];
+        bool lo_sel_239 = cg_238 >= tcomp && cg_238 < 9214364837600034816 && nstart < (cg_238 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_239) ? 1 : 0);
+        unsigned long long cg_240 = comps[3];
+        bool lo_sel_241 = cg_240 >= tcomp && cg_240 < 9214364837600034816 && nstart < (cg_240 & 4294967295);
+        cand_lo = cand_lo + ((lo_sel_241) ? 1 : 0);
+        unsigned int nsel = 0;
+        int i_242 = base_t;
+        int ij_243 = i_242;
+        unsigned long long cj = (unsigned long long)keys_c[0] << 32 | (unsigned long long)~(unsigned int)ij_243;
+        sel[0] = cj >= tcomp && ij_243 < vocab;
+        nsel = nsel + ((sel[0]) ? 1 : 0);
+        int i_244 = base_t + 1;
+        int ij_245 = i_244;
+        unsigned long long cj_246 = (unsigned long long)keys_c[1] << 32 | (unsigned long long)~(unsigned int)ij_245;
+        sel[1] = cj_246 >= tcomp && ij_245 < vocab;
+        nsel = nsel + ((sel[1]) ? 1 : 0);
+        int i_247 = base_t + 2;
+        int ij_248 = i_247;
+        unsigned long long cj_249 = (unsigned long long)keys_c[2] << 32 | (unsigned long long)~(unsigned int)ij_248;
+        sel[2] = cj_249 >= tcomp && ij_248 < vocab;
+        nsel = nsel + ((sel[2]) ? 1 : 0);
+        int i_250 = base_t + 3;
+        int ij_251 = i_250;
+        unsigned long long cj_252 = (unsigned long long)keys_c[3] << 32 | (unsigned long long)~(unsigned int)ij_251;
+        sel[3] = cj_252 >= tcomp && ij_251 < vocab;
+        nsel = nsel + ((sel[3]) ? 1 : 0);
+        int i_253 = base_t + 2048;
+        int ij_254 = i_253;
+        unsigned long long cj_255 = (unsigned long long)keys_c[4] << 32 | (unsigned long long)~(unsigned int)ij_254;
+        sel[4] = cj_255 >= tcomp && ij_254 < vocab;
+        nsel = nsel + ((sel[4]) ? 1 : 0);
+        int i_256 = base_t + 2049;
+        int ij_257 = i_256;
+        unsigned long long cj_258 = (unsigned long long)keys_c[5] << 32 | (unsigned long long)~(unsigned int)ij_257;
+        sel[5] = cj_258 >= tcomp && ij_257 < vocab;
+        nsel = nsel + ((sel[5]) ? 1 : 0);
+        int i_259 = base_t + 2050;
+        int ij_260 = i_259;
+        unsigned long long cj_261 = (unsigned long long)keys_c[6] << 32 | (unsigned long long)~(unsigned int)ij_260;
+        sel[6] = cj_261 >= tcomp && ij_260 < vocab;
+        nsel = nsel + ((sel[6]) ? 1 : 0);
+        int i_262 = base_t + 2051;
+        int ij_263 = i_262;
+        unsigned long long cj_264 = (unsigned long long)keys_c[7] << 32 | (unsigned long long)~(unsigned int)ij_263;
+        sel[7] = cj_264 >= tcomp && ij_263 < vocab;
+        nsel = nsel + ((sel[7]) ? 1 : 0);
+        int i_265 = base_t + 4096;
+        int ij_266 = i_265;
+        unsigned long long cj_267 = (unsigned long long)keys_c[8] << 32 | (unsigned long long)~(unsigned int)ij_266;
+        sel[8] = cj_267 >= tcomp && ij_266 < vocab;
+        nsel = nsel + ((sel[8]) ? 1 : 0);
+        int i_268 = base_t + 4097;
+        int ij_269 = i_268;
+        unsigned long long cj_270 = (unsigned long long)keys_c[9] << 32 | (unsigned long long)~(unsigned int)ij_269;
+        sel[9] = cj_270 >= tcomp && ij_269 < vocab;
+        nsel = nsel + ((sel[9]) ? 1 : 0);
+        int i_271 = base_t + 4098;
+        int ij_272 = i_271;
+        unsigned long long cj_273 = (unsigned long long)keys_c[10] << 32 | (unsigned long long)~(unsigned int)ij_272;
+        sel[10] = cj_273 >= tcomp && ij_272 < vocab;
+        nsel = nsel + ((sel[10]) ? 1 : 0);
+        int i_274 = base_t + 4099;
+        int ij_275 = i_274;
+        unsigned long long cj_276 = (unsigned long long)keys_c[11] << 32 | (unsigned long long)~(unsigned int)ij_275;
+        sel[11] = cj_276 >= tcomp && ij_275 < vocab;
+        nsel = nsel + ((sel[11]) ? 1 : 0);
+        int i_277 = base_t + 6144;
+        int ij_278 = i_277;
+        unsigned long long cj_279 = (unsigned long long)keys_c[12] << 32 | (unsigned long long)~(unsigned int)ij_278;
+        sel[12] = cj_279 >= tcomp && ij_278 < vocab;
+        nsel = nsel + ((sel[12]) ? 1 : 0);
+        int i_280 = base_t + 6145;
+        int ij_281 = i_280;
+        unsigned long long cj_282 = (unsigned long long)keys_c[13] << 32 | (unsigned long long)~(unsigned int)ij_281;
+        sel[13] = cj_282 >= tcomp && ij_281 < vocab;
+        nsel = nsel + ((sel[13]) ? 1 : 0);
+        int i_283 = base_t + 6146;
+        int ij_284 = i_283;
+        unsigned long long cj_285 = (unsigned long long)keys_c[14] << 32 | (unsigned long long)~(unsigned int)ij_284;
+        sel[14] = cj_285 >= tcomp && ij_284 < vocab;
+        nsel = nsel + ((sel[14]) ? 1 : 0);
+        int i_286 = base_t + 6147;
+        int ij_287 = i_286;
+        unsigned long long cj_288 = (unsigned long long)keys_c[15] << 32 | (unsigned long long)~(unsigned int)ij_287;
+        sel[15] = cj_288 >= tcomp && ij_287 < vocab;
+        nsel = nsel + ((sel[15]) ? 1 : 0);
+        int i_289 = base_t + 8192;
+        int ij_290 = i_289;
+        unsigned long long cj_291 = (unsigned long long)keys_c[16] << 32 | (unsigned long long)~(unsigned int)ij_290;
+        sel[16] = cj_291 >= tcomp && ij_290 < vocab;
+        nsel = nsel + ((sel[16]) ? 1 : 0);
+        int i_292 = base_t + 8193;
+        int ij_293 = i_292;
+        unsigned long long cj_294 = (unsigned long long)keys_c[17] << 32 | (unsigned long long)~(unsigned int)ij_293;
+        sel[17] = cj_294 >= tcomp && ij_293 < vocab;
+        nsel = nsel + ((sel[17]) ? 1 : 0);
+        int i_295 = base_t + 8194;
+        int ij_296 = i_295;
+        unsigned long long cj_297 = (unsigned long long)keys_c[18] << 32 | (unsigned long long)~(unsigned int)ij_296;
+        sel[18] = cj_297 >= tcomp && ij_296 < vocab;
+        nsel = nsel + ((sel[18]) ? 1 : 0);
+        int i_298 = base_t + 8195;
+        int ij_299 = i_298;
+        unsigned long long cj_300 = (unsigned long long)keys_c[19] << 32 | (unsigned long long)~(unsigned int)ij_299;
+        sel[19] = cj_300 >= tcomp && ij_299 < vocab;
+        nsel = nsel + ((sel[19]) ? 1 : 0);
+        int i_301 = base_t + 10240;
+        int ij_302 = i_301;
+        unsigned long long cj_303 = (unsigned long long)keys_c[20] << 32 | (unsigned long long)~(unsigned int)ij_302;
+        sel[20] = cj_303 >= tcomp && ij_302 < vocab;
+        nsel = nsel + ((sel[20]) ? 1 : 0);
+        int i_304 = base_t + 10241;
+        int ij_305 = i_304;
+        unsigned long long cj_306 = (unsigned long long)keys_c[21] << 32 | (unsigned long long)~(unsigned int)ij_305;
+        sel[21] = cj_306 >= tcomp && ij_305 < vocab;
+        nsel = nsel + ((sel[21]) ? 1 : 0);
+        int i_307 = base_t + 10242;
+        int ij_308 = i_307;
+        unsigned long long cj_309 = (unsigned long long)keys_c[22] << 32 | (unsigned long long)~(unsigned int)ij_308;
+        sel[22] = cj_309 >= tcomp && ij_308 < vocab;
+        nsel = nsel + ((sel[22]) ? 1 : 0);
+        int i_310 = base_t + 10243;
+        int ij_311 = i_310;
+        unsigned long long cj_312 = (unsigned long long)keys_c[23] << 32 | (unsigned long long)~(unsigned int)ij_311;
+        sel[23] = cj_312 >= tcomp && ij_311 < vocab;
+        nsel = nsel + ((sel[23]) ? 1 : 0);
+        int i_313 = base_t + 12288;
+        int ij_314 = i_313;
+        unsigned long long cj_315 = (unsigned long long)keys_c[24] << 32 | (unsigned long long)~(unsigned int)ij_314;
+        sel[24] = cj_315 >= tcomp && ij_314 < vocab;
+        nsel = nsel + ((sel[24]) ? 1 : 0);
+        int i_316 = base_t + 12289;
+        int ij_317 = i_316;
+        unsigned long long cj_318 = (unsigned long long)keys_c[25] << 32 | (unsigned long long)~(unsigned int)ij_317;
+        sel[25] = cj_318 >= tcomp && ij_317 < vocab;
+        nsel = nsel + ((sel[25]) ? 1 : 0);
+        int i_319 = base_t + 12290;
+        int ij_320 = i_319;
+        unsigned long long cj_321 = (unsigned long long)keys_c[26] << 32 | (unsigned long long)~(unsigned int)ij_320;
+        sel[26] = cj_321 >= tcomp && ij_320 < vocab;
+        nsel = nsel + ((sel[26]) ? 1 : 0);
+        int i_322 = base_t + 12291;
+        int ij_323 = i_322;
+        unsigned long long cj_324 = (unsigned long long)keys_c[27] << 32 | (unsigned long long)~(unsigned int)ij_323;
+        sel[27] = cj_324 >= tcomp && ij_323 < vocab;
+        nsel = nsel + ((sel[27]) ? 1 : 0);
+        int i_325 = base_t + 14336;
+        int ij_326 = i_325;
+        unsigned long long cj_327 = (unsigned long long)keys_c[28] << 32 | (unsigned long long)~(unsigned int)ij_326;
+        sel[28] = cj_327 >= tcomp && ij_326 < vocab;
+        nsel = nsel + ((sel[28]) ? 1 : 0);
+        int i_328 = base_t + 14337;
+        int ij_329 = i_328;
+        unsigned long long cj_330 = (unsigned long long)keys_c[29] << 32 | (unsigned long long)~(unsigned int)ij_329;
+        sel[29] = cj_330 >= tcomp && ij_329 < vocab;
+        nsel = nsel + ((sel[29]) ? 1 : 0);
+        int i_331 = base_t + 14338;
+        int ij_332 = i_331;
+        unsigned long long cj_333 = (unsigned long long)keys_c[30] << 32 | (unsigned long long)~(unsigned int)ij_332;
+        sel[30] = cj_333 >= tcomp && ij_332 < vocab;
+        nsel = nsel + ((sel[30]) ? 1 : 0);
+        int i_334 = base_t + 14339;
+        int ij_335 = i_334;
+        unsigned long long cj_336 = (unsigned long long)keys_c[31] << 32 | (unsigned long long)~(unsigned int)ij_335;
+        sel[31] = cj_336 >= tcomp && ij_335 < vocab;
+        nsel = nsel + ((sel[31]) ? 1 : 0);
+        int i_337 = base_t + 16384;
+        int ij_338 = i_337;
+        unsigned long long cj_339 = (unsigned long long)keys_c[32] << 32 | (unsigned long long)~(unsigned int)ij_338;
+        sel[32] = cj_339 >= tcomp && ij_338 < vocab;
+        nsel = nsel + ((sel[32]) ? 1 : 0);
+        int i_340 = base_t + 16385;
+        int ij_341 = i_340;
+        unsigned long long cj_342 = (unsigned long long)keys_c[33] << 32 | (unsigned long long)~(unsigned int)ij_341;
+        sel[33] = cj_342 >= tcomp && ij_341 < vocab;
+        nsel = nsel + ((sel[33]) ? 1 : 0);
+        int i_343 = base_t + 16386;
+        int ij_344 = i_343;
+        unsigned long long cj_345 = (unsigned long long)keys_c[34] << 32 | (unsigned long long)~(unsigned int)ij_344;
+        sel[34] = cj_345 >= tcomp && ij_344 < vocab;
+        nsel = nsel + ((sel[34]) ? 1 : 0);
+        int i_346 = base_t + 16387;
+        int ij_347 = i_346;
+        unsigned long long cj_348 = (unsigned long long)keys_c[35] << 32 | (unsigned long long)~(unsigned int)ij_347;
+        sel[35] = cj_348 >= tcomp && ij_347 < vocab;
+        nsel = nsel + ((sel[35]) ? 1 : 0);
+        int i_349 = base_t + 18432;
+        int ij_350 = i_349;
+        unsigned long long cj_351 = (unsigned long long)keys_c[36] << 32 | (unsigned long long)~(unsigned int)ij_350;
+        sel[36] = cj_351 >= tcomp && ij_350 < vocab;
+        nsel = nsel + ((sel[36]) ? 1 : 0);
+        int i_352 = base_t + 18433;
+        int ij_353 = i_352;
+        unsigned long long cj_354 = (unsigned long long)keys_c[37] << 32 | (unsigned long long)~(unsigned int)ij_353;
+        sel[37] = cj_354 >= tcomp && ij_353 < vocab;
+        nsel = nsel + ((sel[37]) ? 1 : 0);
+        int i_355 = base_t + 18434;
+        int ij_356 = i_355;
+        unsigned long long cj_357 = (unsigned long long)keys_c[38] << 32 | (unsigned long long)~(unsigned int)ij_356;
+        sel[38] = cj_357 >= tcomp && ij_356 < vocab;
+        nsel = nsel + ((sel[38]) ? 1 : 0);
+        int i_358 = base_t + 18435;
+        int ij_359 = i_358;
+        unsigned long long cj_360 = (unsigned long long)keys_c[39] << 32 | (unsigned long long)~(unsigned int)ij_359;
+        sel[39] = cj_360 >= tcomp && ij_359 < vocab;
+        nsel = nsel + ((sel[39]) ? 1 : 0);
+        unsigned int packed = nsel | lo_above_1 + cand_lo << 12;
+        uint32_t incl_361 = packed;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_361) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl_361;
+        }
+        __syncthreads();
+        unsigned int before_362 = 0;
+        unsigned int total_363 = 0;
+        unsigned int ws_364 = warp_sums[0];
+        total_363 = total_363 + ws_364;
+        if (warp > 0) {
+            before_362 = before_362 + ws_364;
+        }
+        unsigned int ws_365 = warp_sums[1];
+        total_363 = total_363 + ws_365;
+        if (warp > 1) {
+            before_362 = before_362 + ws_365;
+        }
+        unsigned int ws_366 = warp_sums[2];
+        total_363 = total_363 + ws_366;
+        if (warp > 2) {
+            before_362 = before_362 + ws_366;
+        }
+        unsigned int ws_367 = warp_sums[3];
+        total_363 = total_363 + ws_367;
+        if (warp > 3) {
+            before_362 = before_362 + ws_367;
+        }
+        unsigned int ws_368 = warp_sums[4];
+        total_363 = total_363 + ws_368;
+        if (warp > 4) {
+            before_362 = before_362 + ws_368;
+        }
+        unsigned int ws_369 = warp_sums[5];
+        total_363 = total_363 + ws_369;
+        if (warp > 5) {
+            before_362 = before_362 + ws_369;
+        }
+        unsigned int ws_370 = warp_sums[6];
+        total_363 = total_363 + ws_370;
+        if (warp > 6) {
+            before_362 = before_362 + ws_370;
+        }
+        unsigned int ws_371 = warp_sums[7];
+        total_363 = total_363 + ws_371;
+        if (warp > 7) {
+            before_362 = before_362 + ws_371;
+        }
+        unsigned int ws_372 = warp_sums[8];
+        total_363 = total_363 + ws_372;
+        if (warp > 8) {
+            before_362 = before_362 + ws_372;
+        }
+        unsigned int ws_373 = warp_sums[9];
+        total_363 = total_363 + ws_373;
+        if (warp > 9) {
+            before_362 = before_362 + ws_373;
+        }
+        unsigned int ws_374 = warp_sums[10];
+        total_363 = total_363 + ws_374;
+        if (warp > 10) {
+            before_362 = before_362 + ws_374;
+        }
+        unsigned int ws_375 = warp_sums[11];
+        total_363 = total_363 + ws_375;
+        if (warp > 11) {
+            before_362 = before_362 + ws_375;
+        }
+        unsigned int ws_376 = warp_sums[12];
+        total_363 = total_363 + ws_376;
+        if (warp > 12) {
+            before_362 = before_362 + ws_376;
+        }
+        unsigned int ws_377 = warp_sums[13];
+        total_363 = total_363 + ws_377;
+        if (warp > 13) {
+            before_362 = before_362 + ws_377;
+        }
+        unsigned int ws_378 = warp_sums[14];
+        total_363 = total_363 + ws_378;
+        if (warp > 14) {
+            before_362 = before_362 + ws_378;
+        }
+        unsigned int ws_379 = warp_sums[15];
+        total_363 = total_363 + ws_379;
+        if (warp > 15) {
+            before_362 = before_362 + ws_379;
+        }
+        unsigned int excl_380 = before_362 + incl_361 - packed;
+        __syncthreads();
+        unsigned int pos0 = (total_363 >> 12) + (excl_380 & 4095);
+        unsigned int pos_1 = pos0;
+        if (sel[0]) {
+            unsigned long long dst = out_base + (unsigned long long)pos_1;
+            out_vals[dst] = __uint_as_float(keys_c[0]);
+            int i_0_42 = base_t;
+            out_idx[dst] = i_0_42;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[1]) {
+            unsigned long long dst_1 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_1] = __uint_as_float(keys_c[1]);
+            int i_0_43 = base_t + 1;
+            out_idx[dst_1] = i_0_43;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[2]) {
+            unsigned long long dst_2 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_2] = __uint_as_float(keys_c[2]);
+            int i_0_44 = base_t + 2;
+            out_idx[dst_2] = i_0_44;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[3]) {
+            unsigned long long dst_3 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_3] = __uint_as_float(keys_c[3]);
+            int i_0_45 = base_t + 3;
+            out_idx[dst_3] = i_0_45;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[4]) {
+            unsigned long long dst_4 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_4] = __uint_as_float(keys_c[4]);
+            int i_0_46 = base_t + 2048;
+            out_idx[dst_4] = i_0_46;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[5]) {
+            unsigned long long dst_5 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_5] = __uint_as_float(keys_c[5]);
+            int i_0_47 = base_t + 2049;
+            out_idx[dst_5] = i_0_47;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[6]) {
+            unsigned long long dst_6 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_6] = __uint_as_float(keys_c[6]);
+            int i_0_48 = base_t + 2050;
+            out_idx[dst_6] = i_0_48;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[7]) {
+            unsigned long long dst_7 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_7] = __uint_as_float(keys_c[7]);
+            int i_0_49 = base_t + 2051;
+            out_idx[dst_7] = i_0_49;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[8]) {
+            unsigned long long dst_8 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_8] = __uint_as_float(keys_c[8]);
+            int i_0_50 = base_t + 4096;
+            out_idx[dst_8] = i_0_50;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[9]) {
+            unsigned long long dst_9 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_9] = __uint_as_float(keys_c[9]);
+            int i_0_51 = base_t + 4097;
+            out_idx[dst_9] = i_0_51;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[10]) {
+            unsigned long long dst_10 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_10] = __uint_as_float(keys_c[10]);
+            int i_0_52 = base_t + 4098;
+            out_idx[dst_10] = i_0_52;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[11]) {
+            unsigned long long dst_11 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_11] = __uint_as_float(keys_c[11]);
+            int i_0_53 = base_t + 4099;
+            out_idx[dst_11] = i_0_53;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[12]) {
+            unsigned long long dst_12 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_12] = __uint_as_float(keys_c[12]);
+            int i_0_54 = base_t + 6144;
+            out_idx[dst_12] = i_0_54;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[13]) {
+            unsigned long long dst_13 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_13] = __uint_as_float(keys_c[13]);
+            int i_0_55 = base_t + 6145;
+            out_idx[dst_13] = i_0_55;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[14]) {
+            unsigned long long dst_14 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_14] = __uint_as_float(keys_c[14]);
+            int i_0_56 = base_t + 6146;
+            out_idx[dst_14] = i_0_56;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[15]) {
+            unsigned long long dst_15 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_15] = __uint_as_float(keys_c[15]);
+            int i_0_57 = base_t + 6147;
+            out_idx[dst_15] = i_0_57;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[16]) {
+            unsigned long long dst_16 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_16] = __uint_as_float(keys_c[16]);
+            int i_0_58 = base_t + 8192;
+            out_idx[dst_16] = i_0_58;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[17]) {
+            unsigned long long dst_17 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_17] = __uint_as_float(keys_c[17]);
+            int i_0_59 = base_t + 8193;
+            out_idx[dst_17] = i_0_59;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[18]) {
+            unsigned long long dst_18 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_18] = __uint_as_float(keys_c[18]);
+            int i_0_60 = base_t + 8194;
+            out_idx[dst_18] = i_0_60;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[19]) {
+            unsigned long long dst_19 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_19] = __uint_as_float(keys_c[19]);
+            int i_0_61 = base_t + 8195;
+            out_idx[dst_19] = i_0_61;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[20]) {
+            unsigned long long dst_20 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_20] = __uint_as_float(keys_c[20]);
+            int i_0_62 = base_t + 10240;
+            out_idx[dst_20] = i_0_62;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[21]) {
+            unsigned long long dst_21 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_21] = __uint_as_float(keys_c[21]);
+            int i_0_63 = base_t + 10241;
+            out_idx[dst_21] = i_0_63;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[22]) {
+            unsigned long long dst_22 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_22] = __uint_as_float(keys_c[22]);
+            int i_0_64 = base_t + 10242;
+            out_idx[dst_22] = i_0_64;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[23]) {
+            unsigned long long dst_23 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_23] = __uint_as_float(keys_c[23]);
+            int i_0_65 = base_t + 10243;
+            out_idx[dst_23] = i_0_65;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[24]) {
+            unsigned long long dst_24 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_24] = __uint_as_float(keys_c[24]);
+            int i_0_66 = base_t + 12288;
+            out_idx[dst_24] = i_0_66;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[25]) {
+            unsigned long long dst_25 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_25] = __uint_as_float(keys_c[25]);
+            int i_0_67 = base_t + 12289;
+            out_idx[dst_25] = i_0_67;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[26]) {
+            unsigned long long dst_26 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_26] = __uint_as_float(keys_c[26]);
+            int i_0_68 = base_t + 12290;
+            out_idx[dst_26] = i_0_68;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[27]) {
+            unsigned long long dst_27 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_27] = __uint_as_float(keys_c[27]);
+            int i_0_69 = base_t + 12291;
+            out_idx[dst_27] = i_0_69;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[28]) {
+            unsigned long long dst_28 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_28] = __uint_as_float(keys_c[28]);
+            int i_0_70 = base_t + 14336;
+            out_idx[dst_28] = i_0_70;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[29]) {
+            unsigned long long dst_29 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_29] = __uint_as_float(keys_c[29]);
+            int i_0_71 = base_t + 14337;
+            out_idx[dst_29] = i_0_71;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[30]) {
+            unsigned long long dst_30 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_30] = __uint_as_float(keys_c[30]);
+            int i_0_72 = base_t + 14338;
+            out_idx[dst_30] = i_0_72;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[31]) {
+            unsigned long long dst_31 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_31] = __uint_as_float(keys_c[31]);
+            int i_0_73 = base_t + 14339;
+            out_idx[dst_31] = i_0_73;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[32]) {
+            unsigned long long dst_32 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_32] = __uint_as_float(keys_c[32]);
+            int i_0_74 = base_t + 16384;
+            out_idx[dst_32] = i_0_74;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[33]) {
+            unsigned long long dst_33 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_33] = __uint_as_float(keys_c[33]);
+            int i_0_75 = base_t + 16385;
+            out_idx[dst_33] = i_0_75;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[34]) {
+            unsigned long long dst_34 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_34] = __uint_as_float(keys_c[34]);
+            int i_0_76 = base_t + 16386;
+            out_idx[dst_34] = i_0_76;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[35]) {
+            unsigned long long dst_35 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_35] = __uint_as_float(keys_c[35]);
+            int i_0_77 = base_t + 16387;
+            out_idx[dst_35] = i_0_77;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[36]) {
+            unsigned long long dst_36 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_36] = __uint_as_float(keys_c[36]);
+            int i_0_78 = base_t + 18432;
+            out_idx[dst_36] = i_0_78;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[37]) {
+            unsigned long long dst_37 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_37] = __uint_as_float(keys_c[37]);
+            int i_0_79 = base_t + 18433;
+            out_idx[dst_37] = i_0_79;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[38]) {
+            unsigned long long dst_38 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_38] = __uint_as_float(keys_c[38]);
+            int i_0_80 = base_t + 18434;
+            out_idx[dst_38] = i_0_80;
+            pos_1 = pos_1 + 1;
+        }
+        if (sel[39]) {
+            unsigned long long dst_39 = out_base + (unsigned long long)pos_1;
+            out_vals[dst_39] = __uint_as_float(keys_c[39]);
+            int i_0_81 = base_t + 18435;
+            out_idx[dst_39] = i_0_81;
+            pos_1 = pos_1 + 1;
+        }
+        if (rank == 0 && tid == 0) {
+            out_count[row] = k;
+        }
+        if (fuse_on == 0) {
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        }
+    } else {
+        unsigned int prefix = bucket_sel;
+        unsigned int bits_1_1 = __as_u32(vals[0]);
+        unsigned int key_2_1 = ((bits_1_1 <= 2139095040) ? bits_1_1 : 0);
+        unsigned int bucket_3_1 = key_2_1 >> 10 & 2047;
+        if (key_2_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_3_1], 1);
+        }
+        unsigned int bits_4_1 = __as_u32(vals[1]);
+        unsigned int key_5_1 = ((bits_4_1 <= 2139095040) ? bits_4_1 : 0);
+        unsigned int bucket_6_1 = key_5_1 >> 10 & 2047;
+        if (key_5_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_6_1], 1);
+        }
+        unsigned int bits_7 = __as_u32(vals[2]);
+        unsigned int key_8 = ((bits_7 <= 2139095040) ? bits_7 : 0);
+        unsigned int bucket_9_1 = key_8 >> 10 & 2047;
+        if (key_8 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_9_1], 1);
+        }
+        unsigned int bits_10 = __as_u32(vals[3]);
+        unsigned int key_11 = ((bits_10 <= 2139095040) ? bits_10 : 0);
+        unsigned int bucket_12 = key_11 >> 10 & 2047;
+        if (key_11 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_12], 1);
+        }
+        unsigned int bits_13_1 = __as_u32(vals[4]);
+        unsigned int key_14_1 = ((bits_13_1 <= 2139095040) ? bits_13_1 : 0);
+        unsigned int bucket_15 = key_14_1 >> 10 & 2047;
+        if (key_14_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_15], 1);
+        }
+        unsigned int bits_16 = __as_u32(vals[5]);
+        unsigned int key_17 = ((bits_16 <= 2139095040) ? bits_16 : 0);
+        unsigned int bucket_18 = key_17 >> 10 & 2047;
+        if (key_17 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_18], 1);
+        }
+        unsigned int bits_19 = __as_u32(vals[6]);
+        unsigned int key_20 = ((bits_19 <= 2139095040) ? bits_19 : 0);
+        unsigned int bucket_21 = key_20 >> 10 & 2047;
+        if (key_20 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_21], 1);
+        }
+        unsigned int bits_22_1 = __as_u32(vals[7]);
+        unsigned int key_23_1 = ((bits_22_1 <= 2139095040) ? bits_22_1 : 0);
+        unsigned int bucket_24 = key_23_1 >> 10 & 2047;
+        if (key_23_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_24], 1);
+        }
+        unsigned int bits_25 = __as_u32(vals[8]);
+        unsigned int key_26 = ((bits_25 <= 2139095040) ? bits_25 : 0);
+        unsigned int bucket_27 = key_26 >> 10 & 2047;
+        if (key_26 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_27], 1);
+        }
+        unsigned int bits_28 = __as_u32(vals[9]);
+        unsigned int key_29 = ((bits_28 <= 2139095040) ? bits_28 : 0);
+        unsigned int bucket_30_1 = key_29 >> 10 & 2047;
+        if (key_29 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_30_1], 1);
+        }
+        unsigned int bits_31_1 = __as_u32(vals[10]);
+        unsigned int key_32_1 = ((bits_31_1 <= 2139095040) ? bits_31_1 : 0);
+        unsigned int bucket_33_1 = key_32_1 >> 10 & 2047;
+        if (key_32_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_33_1], 1);
+        }
+        unsigned int bits_34 = __as_u32(vals[11]);
+        unsigned int key_35 = ((bits_34 <= 2139095040) ? bits_34 : 0);
+        unsigned int bucket_36_1 = key_35 >> 10 & 2047;
+        if (key_35 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_36_1], 1);
+        }
+        unsigned int bits_37 = __as_u32(vals[12]);
+        unsigned int key_38 = ((bits_37 <= 2139095040) ? bits_37 : 0);
+        unsigned int bucket_39_1 = key_38 >> 10 & 2047;
+        if (key_38 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_39_1], 1);
+        }
+        unsigned int bits_40_1 = __as_u32(vals[13]);
+        unsigned int key_41_1 = ((bits_40_1 <= 2139095040) ? bits_40_1 : 0);
+        unsigned int bucket_42 = key_41_1 >> 10 & 2047;
+        if (key_41_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_42], 1);
+        }
+        unsigned int bits_43 = __as_u32(vals[14]);
+        unsigned int key_44 = ((bits_43 <= 2139095040) ? bits_43 : 0);
+        unsigned int bucket_45 = key_44 >> 10 & 2047;
+        if (key_44 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_45], 1);
+        }
+        unsigned int bits_46 = __as_u32(vals[15]);
+        unsigned int key_47 = ((bits_46 <= 2139095040) ? bits_46 : 0);
+        unsigned int bucket_48 = key_47 >> 10 & 2047;
+        if (key_47 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_48], 1);
+        }
+        unsigned int bits_49_1 = __as_u32(vals[16]);
+        unsigned int key_50_1 = ((bits_49_1 <= 2139095040) ? bits_49_1 : 0);
+        unsigned int bucket_51 = key_50_1 >> 10 & 2047;
+        if (key_50_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_51], 1);
+        }
+        unsigned int bits_52 = __as_u32(vals[17]);
+        unsigned int key_53 = ((bits_52 <= 2139095040) ? bits_52 : 0);
+        unsigned int bucket_54 = key_53 >> 10 & 2047;
+        if (key_53 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_54], 1);
+        }
+        unsigned int bits_55 = __as_u32(vals[18]);
+        unsigned int key_56 = ((bits_55 <= 2139095040) ? bits_55 : 0);
+        unsigned int bucket_57 = key_56 >> 10 & 2047;
+        if (key_56 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_57], 1);
+        }
+        unsigned int bits_58_1 = __as_u32(vals[19]);
+        unsigned int key_59_1 = ((bits_58_1 <= 2139095040) ? bits_58_1 : 0);
+        unsigned int bucket_60 = key_59_1 >> 10 & 2047;
+        if (key_59_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_60], 1);
+        }
+        unsigned int bits_61 = __as_u32(vals[20]);
+        unsigned int key_62 = ((bits_61 <= 2139095040) ? bits_61 : 0);
+        unsigned int bucket_63 = key_62 >> 10 & 2047;
+        if (key_62 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_63], 1);
+        }
+        unsigned int bits_64 = __as_u32(vals[21]);
+        unsigned int key_65 = ((bits_64 <= 2139095040) ? bits_64 : 0);
+        unsigned int bucket_66 = key_65 >> 10 & 2047;
+        if (key_65 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_66], 1);
+        }
+        unsigned int bits_67_1 = __as_u32(vals[22]);
+        unsigned int key_68_1 = ((bits_67_1 <= 2139095040) ? bits_67_1 : 0);
+        unsigned int bucket_69 = key_68_1 >> 10 & 2047;
+        if (key_68_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_69], 1);
+        }
+        unsigned int bits_70 = __as_u32(vals[23]);
+        unsigned int key_71 = ((bits_70 <= 2139095040) ? bits_70 : 0);
+        unsigned int bucket_72 = key_71 >> 10 & 2047;
+        if (key_71 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_72], 1);
+        }
+        unsigned int bits_73 = __as_u32(vals[24]);
+        unsigned int key_74 = ((bits_73 <= 2139095040) ? bits_73 : 0);
+        unsigned int bucket_75 = key_74 >> 10 & 2047;
+        if (key_74 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_75], 1);
+        }
+        unsigned int bits_76_1 = __as_u32(vals[25]);
+        unsigned int key_77_1 = ((bits_76_1 <= 2139095040) ? bits_76_1 : 0);
+        unsigned int bucket_78 = key_77_1 >> 10 & 2047;
+        if (key_77_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_78], 1);
+        }
+        unsigned int bits_79 = __as_u32(vals[26]);
+        unsigned int key_80 = ((bits_79 <= 2139095040) ? bits_79 : 0);
+        unsigned int bucket_81 = key_80 >> 10 & 2047;
+        if (key_80 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_81], 1);
+        }
+        unsigned int bits_82 = __as_u32(vals[27]);
+        unsigned int key_83 = ((bits_82 <= 2139095040) ? bits_82 : 0);
+        unsigned int bucket_84 = key_83 >> 10 & 2047;
+        if (key_83 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_84], 1);
+        }
+        unsigned int bits_85_1 = __as_u32(vals[28]);
+        unsigned int key_86_1 = ((bits_85_1 <= 2139095040) ? bits_85_1 : 0);
+        unsigned int bucket_87 = key_86_1 >> 10 & 2047;
+        if (key_86_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_87], 1);
+        }
+        unsigned int bits_88 = __as_u32(vals[29]);
+        unsigned int key_89 = ((bits_88 <= 2139095040) ? bits_88 : 0);
+        unsigned int bucket_90 = key_89 >> 10 & 2047;
+        if (key_89 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_90], 1);
+        }
+        unsigned int bits_91 = __as_u32(vals[30]);
+        unsigned int key_92 = ((bits_91 <= 2139095040) ? bits_91 : 0);
+        unsigned int bucket_93 = key_92 >> 10 & 2047;
+        if (key_92 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_93], 1);
+        }
+        unsigned int bits_94_1 = __as_u32(vals[31]);
+        unsigned int key_95_1 = ((bits_94_1 <= 2139095040) ? bits_94_1 : 0);
+        unsigned int bucket_96 = key_95_1 >> 10 & 2047;
+        if (key_95_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_96], 1);
+        }
+        unsigned int bits_97 = __as_u32(vals[32]);
+        unsigned int key_98 = ((bits_97 <= 2139095040) ? bits_97 : 0);
+        unsigned int bucket_99 = key_98 >> 10 & 2047;
+        if (key_98 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_99], 1);
+        }
+        unsigned int bits_100 = __as_u32(vals[33]);
+        unsigned int key_101 = ((bits_100 <= 2139095040) ? bits_100 : 0);
+        unsigned int bucket_102 = key_101 >> 10 & 2047;
+        if (key_101 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_102], 1);
+        }
+        unsigned int bits_103_1 = __as_u32(vals[34]);
+        unsigned int key_104_1 = ((bits_103_1 <= 2139095040) ? bits_103_1 : 0);
+        unsigned int bucket_105 = key_104_1 >> 10 & 2047;
+        if (key_104_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_105], 1);
+        }
+        unsigned int bits_106 = __as_u32(vals[35]);
+        unsigned int key_107 = ((bits_106 <= 2139095040) ? bits_106 : 0);
+        unsigned int bucket_108 = key_107 >> 10 & 2047;
+        if (key_107 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_108], 1);
+        }
+        unsigned int bits_109 = __as_u32(vals[36]);
+        unsigned int key_110 = ((bits_109 <= 2139095040) ? bits_109 : 0);
+        unsigned int bucket_111 = key_110 >> 10 & 2047;
+        if (key_110 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_111], 1);
+        }
+        unsigned int bits_112_1 = __as_u32(vals[37]);
+        unsigned int key_113_1 = ((bits_112_1 <= 2139095040) ? bits_112_1 : 0);
+        unsigned int bucket_114 = key_113_1 >> 10 & 2047;
+        if (key_113_1 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_114], 1);
+        }
+        unsigned int bits_115 = __as_u32(vals[38]);
+        unsigned int key_116 = ((bits_115 <= 2139095040) ? bits_115 : 0);
+        unsigned int bucket_117 = key_116 >> 10 & 2047;
+        if (key_116 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_117], 1);
+        }
+        unsigned int bits_118 = __as_u32(vals[39]);
+        unsigned int key_119 = ((bits_118 <= 2139095040) ? bits_118 : 0);
+        unsigned int bucket_120 = key_119 >> 10 & 2047;
+        if (key_119 >> 21 == prefix) {
+            atomicAdd(&hist1[bucket_120], 1);
+        }
+        __syncthreads();
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int c0_1 = 0;
+        unsigned int c1_1 = 0;
+        unsigned int c2_1 = 0;
+        unsigned int c3_1 = 0;
+        unsigned int words_8[4];
+        uint32_t _cluster_mapa_87;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_87) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_8[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_8[(0) + 3]))
+            : "r"(_cluster_mapa_87));
+        c0_1 = c0_1 + words_8[0];
+        c1_1 = c1_1 + words_8[1];
+        c2_1 = c2_1 + words_8[2];
+        c3_1 = c3_1 + words_8[3];
+        unsigned int words_121[4];
+        uint32_t _cluster_mapa_88;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_88) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_121[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_121[(0) + 3]))
+            : "r"(_cluster_mapa_88));
+        c0_1 = c0_1 + words_121[0];
+        c1_1 = c1_1 + words_121[1];
+        c2_1 = c2_1 + words_121[2];
+        c3_1 = c3_1 + words_121[3];
+        unsigned int words_122[4];
+        uint32_t _cluster_mapa_89;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_89) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_122[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_122[(0) + 3]))
+            : "r"(_cluster_mapa_89));
+        c0_1 = c0_1 + words_122[0];
+        c1_1 = c1_1 + words_122[1];
+        c2_1 = c2_1 + words_122[2];
+        c3_1 = c3_1 + words_122[3];
+        unsigned int words_123[4];
+        uint32_t _cluster_mapa_90;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_90) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_123[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_123[(0) + 3]))
+            : "r"(_cluster_mapa_90));
+        c0_1 = c0_1 + words_123[0];
+        c1_1 = c1_1 + words_123[1];
+        c2_1 = c2_1 + words_123[2];
+        c3_1 = c3_1 + words_123[3];
+        unsigned int words_124[4];
+        uint32_t _cluster_mapa_91;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_91) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_124[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_124[(0) + 3]))
+            : "r"(_cluster_mapa_91));
+        c0_1 = c0_1 + words_124[0];
+        c1_1 = c1_1 + words_124[1];
+        c2_1 = c2_1 + words_124[2];
+        c3_1 = c3_1 + words_124[3];
+        unsigned int words_125[4];
+        uint32_t _cluster_mapa_92;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_92) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_125[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_125[(0) + 3]))
+            : "r"(_cluster_mapa_92));
+        c0_1 = c0_1 + words_125[0];
+        c1_1 = c1_1 + words_125[1];
+        c2_1 = c2_1 + words_125[2];
+        c3_1 = c3_1 + words_125[3];
+        unsigned int words_126[4];
+        uint32_t _cluster_mapa_93;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_93) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_126[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_126[(0) + 3]))
+            : "r"(_cluster_mapa_93));
+        c0_1 = c0_1 + words_126[0];
+        c1_1 = c1_1 + words_126[1];
+        c2_1 = c2_1 + words_126[2];
+        c3_1 = c3_1 + words_126[3];
+        unsigned int words_127[4];
+        uint32_t _cluster_mapa_94;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_94) : "r"(hist1_addr + (unsigned int)(tid * 4 * 4)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_127[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_127[(0) + 3]))
+            : "r"(_cluster_mapa_94));
+        c0_1 = c0_1 + words_127[0];
+        c1_1 = c1_1 + words_127[1];
+        c2_1 = c2_1 + words_127[2];
+        c3_1 = c3_1 + words_127[3];
+        unsigned int local_128 = c0_1 + c1_1 + c2_1 + c3_1;
+        uint32_t _warp_scan_sum_95 = local_128;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_95) : "r"(16));
+        unsigned int lane_suffix_1 = _warp_scan_sum_95 - local_128;
+        unsigned int warp_total_1;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_1) : "r"(local_128));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_1;
+        }
+        __syncthreads();
+        unsigned int peer_1 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_2 = ((lane > warp) ? peer_1 : 0);
+        unsigned int warps_above_1;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_1) : "r"(above_2));
+        unsigned int suffix_1 = lane_suffix_1 + warps_above_1;
+        bool hit_1 = 0;
+        unsigned int bucket_129 = 0;
+        unsigned int rest_1 = 0;
+        if (suffix_1 < remaining && remaining <= suffix_1 + local_128) {
+            hit_1 = 1;
+            unsigned int s3_6 = suffix_1 + c3_1;
+            unsigned int s2_6 = s3_6 + c2_1;
+            unsigned int s1_6 = s2_6 + c1_1;
+            if (remaining <= s3_6) {
+                bucket_129 = (unsigned int)(tid * 4 + 3);
+                rest_1 = remaining - suffix_1;
+            } else if (remaining <= s2_6) {
+                bucket_129 = (unsigned int)(tid * 4 + 2);
+                rest_1 = remaining - s3_6;
+            } else {
+                if (remaining <= s1_6) {
+                    bucket_129 = (unsigned int)(tid * 4 + 1);
+                    rest_1 = remaining - s2_6;
+                } else {
+                    bucket_129 = (unsigned int)(tid * 4);
+                    rest_1 = remaining - s1_6;
+                }
+            }
+        }
+        if (hit_1) {
+            scal[0] = bucket_129;
+            scal[1] = rest_1;
+        }
+        __syncthreads();
+        unsigned int bsel = scal[0];
+        remaining = scal[1];
+        prefix = prefix << 11 | bsel;
+        for (int i_12 = tid; i_12 < 2048; i_12 += 512) {
+            hist0[i_12] = 0;
+        }
+        __syncthreads();
+        unsigned int bits_130 = __as_u32(vals[0]);
+        unsigned int key_131 = ((bits_130 <= 2139095040) ? bits_130 : 0);
+        unsigned int bucket_132 = key_131 & 1023;
+        if (key_131 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_132], 1);
+        }
+        unsigned int bits_133 = __as_u32(vals[1]);
+        unsigned int key_134 = ((bits_133 <= 2139095040) ? bits_133 : 0);
+        unsigned int bucket_135 = key_134 & 1023;
+        if (key_134 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_135], 1);
+        }
+        unsigned int bits_136_1 = __as_u32(vals[2]);
+        unsigned int key_137_1 = ((bits_136_1 <= 2139095040) ? bits_136_1 : 0);
+        unsigned int bucket_138 = key_137_1 & 1023;
+        if (key_137_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_138], 1);
+        }
+        unsigned int bits_139 = __as_u32(vals[3]);
+        unsigned int key_140 = ((bits_139 <= 2139095040) ? bits_139 : 0);
+        unsigned int bucket_141 = key_140 & 1023;
+        if (key_140 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_141], 1);
+        }
+        unsigned int bits_142 = __as_u32(vals[4]);
+        unsigned int key_143 = ((bits_142 <= 2139095040) ? bits_142 : 0);
+        unsigned int bucket_144 = key_143 & 1023;
+        if (key_143 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_144], 1);
+        }
+        unsigned int bits_145 = __as_u32(vals[5]);
+        unsigned int key_146 = ((bits_145 <= 2139095040) ? bits_145 : 0);
+        unsigned int bucket_147 = key_146 & 1023;
+        if (key_146 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_147], 1);
+        }
+        unsigned int bits_148_1 = __as_u32(vals[6]);
+        unsigned int key_149_1 = ((bits_148_1 <= 2139095040) ? bits_148_1 : 0);
+        unsigned int bucket_150 = key_149_1 & 1023;
+        if (key_149_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_150], 1);
+        }
+        unsigned int bits_151 = __as_u32(vals[7]);
+        unsigned int key_152 = ((bits_151 <= 2139095040) ? bits_151 : 0);
+        unsigned int bucket_153 = key_152 & 1023;
+        if (key_152 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_153], 1);
+        }
+        unsigned int bits_154 = __as_u32(vals[8]);
+        unsigned int key_155 = ((bits_154 <= 2139095040) ? bits_154 : 0);
+        unsigned int bucket_156 = key_155 & 1023;
+        if (key_155 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_156], 1);
+        }
+        unsigned int bits_157 = __as_u32(vals[9]);
+        unsigned int key_158 = ((bits_157 <= 2139095040) ? bits_157 : 0);
+        unsigned int bucket_159 = key_158 & 1023;
+        if (key_158 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_159], 1);
+        }
+        unsigned int bits_160_1 = __as_u32(vals[10]);
+        unsigned int key_161_1 = ((bits_160_1 <= 2139095040) ? bits_160_1 : 0);
+        unsigned int bucket_162 = key_161_1 & 1023;
+        if (key_161_1 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_162], 1);
+        }
+        unsigned int bits_163 = __as_u32(vals[11]);
+        unsigned int key_164 = ((bits_163 <= 2139095040) ? bits_163 : 0);
+        unsigned int bucket_165 = key_164 & 1023;
+        if (key_164 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_165], 1);
+        }
+        unsigned int bits_166 = __as_u32(vals[12]);
+        unsigned int key_167 = ((bits_166 <= 2139095040) ? bits_166 : 0);
+        unsigned int bucket_168 = key_167 & 1023;
+        if (key_167 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_168], 1);
+        }
+        unsigned int bits_169 = __as_u32(vals[13]);
+        unsigned int key_170 = ((bits_169 <= 2139095040) ? bits_169 : 0);
+        unsigned int bucket_171 = key_170 & 1023;
+        if (key_170 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_171], 1);
+        }
+        unsigned int bits_172 = __as_u32(vals[14]);
+        unsigned int key_173 = ((bits_172 <= 2139095040) ? bits_172 : 0);
+        unsigned int bucket_174 = key_173 & 1023;
+        if (key_173 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_174], 1);
+        }
+        unsigned int bits_175 = __as_u32(vals[15]);
+        unsigned int key_176 = ((bits_175 <= 2139095040) ? bits_175 : 0);
+        unsigned int bucket_177 = key_176 & 1023;
+        if (key_176 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_177], 1);
+        }
+        unsigned int bits_178 = __as_u32(vals[16]);
+        unsigned int key_179 = ((bits_178 <= 2139095040) ? bits_178 : 0);
+        unsigned int bucket_180 = key_179 & 1023;
+        if (key_179 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_180], 1);
+        }
+        unsigned int bits_181 = __as_u32(vals[17]);
+        unsigned int key_182 = ((bits_181 <= 2139095040) ? bits_181 : 0);
+        unsigned int bucket_183 = key_182 & 1023;
+        if (key_182 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_183], 1);
+        }
+        unsigned int bits_184 = __as_u32(vals[18]);
+        unsigned int key_185 = ((bits_184 <= 2139095040) ? bits_184 : 0);
+        unsigned int bucket_186 = key_185 & 1023;
+        if (key_185 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_186], 1);
+        }
+        unsigned int bits_187 = __as_u32(vals[19]);
+        unsigned int key_188 = ((bits_187 <= 2139095040) ? bits_187 : 0);
+        unsigned int bucket_189 = key_188 & 1023;
+        if (key_188 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_189], 1);
+        }
+        unsigned int bits_190 = __as_u32(vals[20]);
+        unsigned int key_191 = ((bits_190 <= 2139095040) ? bits_190 : 0);
+        unsigned int bucket_192 = key_191 & 1023;
+        if (key_191 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_192], 1);
+        }
+        unsigned int bits_193 = __as_u32(vals[21]);
+        unsigned int key_194 = ((bits_193 <= 2139095040) ? bits_193 : 0);
+        unsigned int bucket_195 = key_194 & 1023;
+        if (key_194 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_195], 1);
+        }
+        unsigned int bits_196 = __as_u32(vals[22]);
+        unsigned int key_197 = ((bits_196 <= 2139095040) ? bits_196 : 0);
+        unsigned int bucket_198 = key_197 & 1023;
+        if (key_197 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_198], 1);
+        }
+        unsigned int bits_199 = __as_u32(vals[23]);
+        unsigned int key_200 = ((bits_199 <= 2139095040) ? bits_199 : 0);
+        unsigned int bucket_201_1 = key_200 & 1023;
+        if (key_200 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_201_1], 1);
+        }
+        unsigned int bits_202 = __as_u32(vals[24]);
+        unsigned int key_203 = ((bits_202 <= 2139095040) ? bits_202 : 0);
+        unsigned int bucket_204 = key_203 & 1023;
+        if (key_203 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_204], 1);
+        }
+        unsigned int bits_205 = __as_u32(vals[25]);
+        unsigned int key_206 = ((bits_205 <= 2139095040) ? bits_205 : 0);
+        unsigned int bucket_207_1 = key_206 & 1023;
+        if (key_206 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_207_1], 1);
+        }
+        unsigned int bits_208 = __as_u32(vals[26]);
+        unsigned int key_209 = ((bits_208 <= 2139095040) ? bits_208 : 0);
+        unsigned int bucket_210 = key_209 & 1023;
+        if (key_209 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_210], 1);
+        }
+        unsigned int bits_211 = __as_u32(vals[27]);
+        unsigned int key_212 = ((bits_211 <= 2139095040) ? bits_211 : 0);
+        unsigned int bucket_213_1 = key_212 & 1023;
+        if (key_212 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_213_1], 1);
+        }
+        unsigned int bits_214 = __as_u32(vals[28]);
+        unsigned int key_215 = ((bits_214 <= 2139095040) ? bits_214 : 0);
+        unsigned int bucket_216 = key_215 & 1023;
+        if (key_215 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_216], 1);
+        }
+        unsigned int bits_217 = __as_u32(vals[29]);
+        unsigned int key_218 = ((bits_217 <= 2139095040) ? bits_217 : 0);
+        unsigned int bucket_219 = key_218 & 1023;
+        if (key_218 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_219], 1);
+        }
+        unsigned int bits_220 = __as_u32(vals[30]);
+        unsigned int key_221 = ((bits_220 <= 2139095040) ? bits_220 : 0);
+        unsigned int bucket_222 = key_221 & 1023;
+        if (key_221 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_222], 1);
+        }
+        unsigned int bits_223 = __as_u32(vals[31]);
+        unsigned int key_224 = ((bits_223 <= 2139095040) ? bits_223 : 0);
+        unsigned int bucket_225 = key_224 & 1023;
+        if (key_224 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_225], 1);
+        }
+        unsigned int bits_226 = __as_u32(vals[32]);
+        unsigned int key_227 = ((bits_226 <= 2139095040) ? bits_226 : 0);
+        unsigned int bucket_228 = key_227 & 1023;
+        if (key_227 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_228], 1);
+        }
+        unsigned int bits_229 = __as_u32(vals[33]);
+        unsigned int key_230 = ((bits_229 <= 2139095040) ? bits_229 : 0);
+        unsigned int bucket_231 = key_230 & 1023;
+        if (key_230 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_231], 1);
+        }
+        unsigned int bits_232 = __as_u32(vals[34]);
+        unsigned int key_233 = ((bits_232 <= 2139095040) ? bits_232 : 0);
+        unsigned int bucket_234 = key_233 & 1023;
+        if (key_233 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_234], 1);
+        }
+        unsigned int bits_235 = __as_u32(vals[35]);
+        unsigned int key_236 = ((bits_235 <= 2139095040) ? bits_235 : 0);
+        unsigned int bucket_237 = key_236 & 1023;
+        if (key_236 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_237], 1);
+        }
+        unsigned int bits_238 = __as_u32(vals[36]);
+        unsigned int key_239 = ((bits_238 <= 2139095040) ? bits_238 : 0);
+        unsigned int bucket_240 = key_239 & 1023;
+        if (key_239 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_240], 1);
+        }
+        unsigned int bits_241 = __as_u32(vals[37]);
+        unsigned int key_242 = ((bits_241 <= 2139095040) ? bits_241 : 0);
+        unsigned int bucket_243 = key_242 & 1023;
+        if (key_242 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_243], 1);
+        }
+        unsigned int bits_244 = __as_u32(vals[38]);
+        unsigned int key_245 = ((bits_244 <= 2139095040) ? bits_244 : 0);
+        unsigned int bucket_246 = key_245 & 1023;
+        if (key_245 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_246], 1);
+        }
+        unsigned int bits_247 = __as_u32(vals[39]);
+        unsigned int key_248 = ((bits_247 <= 2139095040) ? bits_247 : 0);
+        unsigned int bucket_249 = key_248 & 1023;
+        if (key_248 >> 10 == prefix) {
+            atomicAdd(&hist0[bucket_249], 1);
+        }
+        __syncthreads();
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int c0_250 = 0;
+        unsigned int c1_251 = 0;
+        unsigned int c2_252 = 0;
+        unsigned int c3_253 = 0;
+        unsigned int words_254[4];
+        uint32_t _cluster_mapa_96;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_96) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(0));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_254[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_254[(0) + 3]))
+            : "r"(_cluster_mapa_96));
+        c0_250 = c0_250 + words_254[0];
+        c1_251 = c1_251 + words_254[1];
+        c2_252 = c2_252 + words_254[2];
+        c3_253 = c3_253 + words_254[3];
+        unsigned int words_255[4];
+        uint32_t _cluster_mapa_97;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_97) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(1));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_255[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_255[(0) + 3]))
+            : "r"(_cluster_mapa_97));
+        c0_250 = c0_250 + words_255[0];
+        c1_251 = c1_251 + words_255[1];
+        c2_252 = c2_252 + words_255[2];
+        c3_253 = c3_253 + words_255[3];
+        unsigned int words_256[4];
+        uint32_t _cluster_mapa_98;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_98) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(2));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_256[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_256[(0) + 3]))
+            : "r"(_cluster_mapa_98));
+        c0_250 = c0_250 + words_256[0];
+        c1_251 = c1_251 + words_256[1];
+        c2_252 = c2_252 + words_256[2];
+        c3_253 = c3_253 + words_256[3];
+        unsigned int words_257[4];
+        uint32_t _cluster_mapa_99;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_99) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(3));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_257[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_257[(0) + 3]))
+            : "r"(_cluster_mapa_99));
+        c0_250 = c0_250 + words_257[0];
+        c1_251 = c1_251 + words_257[1];
+        c2_252 = c2_252 + words_257[2];
+        c3_253 = c3_253 + words_257[3];
+        unsigned int words_258[4];
+        uint32_t _cluster_mapa_100;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_100) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(4));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_258[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_258[(0) + 3]))
+            : "r"(_cluster_mapa_100));
+        c0_250 = c0_250 + words_258[0];
+        c1_251 = c1_251 + words_258[1];
+        c2_252 = c2_252 + words_258[2];
+        c3_253 = c3_253 + words_258[3];
+        unsigned int words_259[4];
+        uint32_t _cluster_mapa_101;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_101) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(5));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_259[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_259[(0) + 3]))
+            : "r"(_cluster_mapa_101));
+        c0_250 = c0_250 + words_259[0];
+        c1_251 = c1_251 + words_259[1];
+        c2_252 = c2_252 + words_259[2];
+        c3_253 = c3_253 + words_259[3];
+        unsigned int words_260[4];
+        uint32_t _cluster_mapa_102;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_102) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(6));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_260[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_260[(0) + 3]))
+            : "r"(_cluster_mapa_102));
+        c0_250 = c0_250 + words_260[0];
+        c1_251 = c1_251 + words_260[1];
+        c2_252 = c2_252 + words_260[2];
+        c3_253 = c3_253 + words_260[3];
+        unsigned int words_261[4];
+        uint32_t _cluster_mapa_103;
+        asm volatile(
+            "mapa.shared::cluster.u32 %0, %1, %2;"
+            : "=r"(_cluster_mapa_103) : "r"(hist0_addr + (unsigned int)(tid * 4 * 4)), "r"(7));
+        asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&words_261[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_261[(0) + 3]))
+            : "r"(_cluster_mapa_103));
+        c0_250 = c0_250 + words_261[0];
+        c1_251 = c1_251 + words_261[1];
+        c2_252 = c2_252 + words_261[2];
+        c3_253 = c3_253 + words_261[3];
+        unsigned int local_262 = c0_250 + c1_251 + c2_252 + c3_253;
+        uint32_t _warp_scan_sum_104 = local_262;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_104) : "r"(16));
+        unsigned int lane_suffix_263 = _warp_scan_sum_104 - local_262;
+        unsigned int warp_total_264;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warp_total_264) : "r"(local_262));
+        if (lane == 0) {
+            warp_sums[warp] = warp_total_264;
+        }
+        __syncthreads();
+        unsigned int peer_265 = ((lane < 16) ? warp_sums[lane] : 0);
+        unsigned int above_266 = ((lane > warp) ? peer_265 : 0);
+        unsigned int warps_above_267;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(warps_above_267) : "r"(above_266));
+        unsigned int suffix_268 = lane_suffix_263 + warps_above_267;
+        bool hit_269 = 0;
+        unsigned int bucket_270 = 0;
+        unsigned int rest_271 = 0;
+        if (suffix_268 < remaining && remaining <= suffix_268 + local_262) {
+            hit_269 = 1;
+            unsigned int s3_7 = suffix_268 + c3_253;
+            unsigned int s2_7 = s3_7 + c2_252;
+            unsigned int s1_7 = s2_7 + c1_251;
+            if (remaining <= s3_7) {
+                bucket_270 = (unsigned int)(tid * 4 + 3);
+                rest_271 = remaining - suffix_268;
+            } else if (remaining <= s2_7) {
+                bucket_270 = (unsigned int)(tid * 4 + 2);
+                rest_271 = remaining - s3_7;
+            } else {
+                if (remaining <= s1_7) {
+                    bucket_270 = (unsigned int)(tid * 4 + 1);
+                    rest_271 = remaining - s2_7;
+                } else {
+                    bucket_270 = (unsigned int)(tid * 4);
+                    rest_271 = remaining - s1_7;
+                }
+            }
+        }
+        if (hit_269) {
+            scal[0] = bucket_270;
+            scal[1] = rest_271;
+        }
+        __syncthreads();
+        unsigned int bsel_272 = scal[0];
+        remaining = scal[1];
+        prefix = prefix << 10 | bsel_272;
+        unsigned int threshold_f = prefix;
+        unsigned int gt = 0;
+        unsigned int bits_273 = __as_u32(vals[0]);
+        unsigned int key_274 = ((bits_273 <= 2139095040) ? bits_273 : 0);
+        int i_vec = start + tid * 4;
+        int i_str = start + tid;
+        int i_13 = i_vec;
+        int i_275 = i_13;
+        bool tie = key_274 == threshold_f && i_275 < vocab;
+        unsigned int m = __ballot_sync(0xFFFFFFFF, tie);
+        if (lane == 0) {
+            cnt[warp] = (unsigned int)__popc(m);
+        }
+        if (key_274 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_276 = __as_u32(vals[1]);
+        unsigned int key_277 = ((bits_276 <= 2139095040) ? bits_276 : 0);
+        int i_vec_278 = start + tid * 4 + 1;
+        int i_str_279 = start + 512 + tid;
+        int i_280_1 = i_vec_278;
+        int i_281 = i_280_1;
+        bool tie_282 = key_277 == threshold_f && i_281 < vocab;
+        unsigned int m_283 = __ballot_sync(0xFFFFFFFF, tie_282);
+        if (lane == 0) {
+            cnt[16 + warp] = (unsigned int)__popc(m_283);
+        }
+        if (key_277 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_284 = __as_u32(vals[2]);
+        unsigned int key_285 = ((bits_284 <= 2139095040) ? bits_284 : 0);
+        int i_vec_286 = start + tid * 4 + 2;
+        int i_str_287 = start + 1024 + tid;
+        int i_288 = i_vec_286;
+        int i_289_1 = i_288;
+        bool tie_290 = key_285 == threshold_f && i_289_1 < vocab;
+        unsigned int m_291 = __ballot_sync(0xFFFFFFFF, tie_290);
+        if (lane == 0) {
+            cnt[32 + warp] = (unsigned int)__popc(m_291);
+        }
+        if (key_285 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_292 = __as_u32(vals[3]);
+        unsigned int key_293 = ((bits_292 <= 2139095040) ? bits_292 : 0);
+        int i_vec_294 = start + tid * 4 + 3;
+        int i_str_295 = start + 1536 + tid;
+        int i_296 = i_vec_294;
+        int i_297 = i_296;
+        bool tie_298 = key_293 == threshold_f && i_297 < vocab;
+        unsigned int m_299 = __ballot_sync(0xFFFFFFFF, tie_298);
+        if (lane == 0) {
+            cnt[48 + warp] = (unsigned int)__popc(m_299);
+        }
+        if (key_293 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_300 = __as_u32(vals[4]);
+        unsigned int key_301 = ((bits_300 <= 2139095040) ? bits_300 : 0);
+        int i_vec_302 = start + 2048 + tid * 4;
+        int i_str_303 = start + 2048 + tid;
+        int i_304_1 = i_vec_302;
+        int i_305 = i_304_1;
+        bool tie_306 = key_301 == threshold_f && i_305 < vocab;
+        unsigned int m_307 = __ballot_sync(0xFFFFFFFF, tie_306);
+        if (lane == 0) {
+            cnt[64 + warp] = (unsigned int)__popc(m_307);
+        }
+        if (key_301 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_308 = __as_u32(vals[5]);
+        unsigned int key_309 = ((bits_308 <= 2139095040) ? bits_308 : 0);
+        int i_vec_310 = start + 2048 + tid * 4 + 1;
+        int i_str_311 = start + 2560 + tid;
+        int i_312 = i_vec_310;
+        int i_313_1 = i_312;
+        bool tie_314 = key_309 == threshold_f && i_313_1 < vocab;
+        unsigned int m_315 = __ballot_sync(0xFFFFFFFF, tie_314);
+        if (lane == 0) {
+            cnt[80 + warp] = (unsigned int)__popc(m_315);
+        }
+        if (key_309 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_316 = __as_u32(vals[6]);
+        unsigned int key_317 = ((bits_316 <= 2139095040) ? bits_316 : 0);
+        int i_vec_318 = start + 2048 + tid * 4 + 2;
+        int i_str_319 = start + 3072 + tid;
+        int i_320 = i_vec_318;
+        int i_321 = i_320;
+        bool tie_322 = key_317 == threshold_f && i_321 < vocab;
+        unsigned int m_323 = __ballot_sync(0xFFFFFFFF, tie_322);
+        if (lane == 0) {
+            cnt[96 + warp] = (unsigned int)__popc(m_323);
+        }
+        if (key_317 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_324 = __as_u32(vals[7]);
+        unsigned int key_325 = ((bits_324 <= 2139095040) ? bits_324 : 0);
+        int i_vec_326 = start + 2048 + tid * 4 + 3;
+        int i_str_327 = start + 3584 + tid;
+        int i_328_1 = i_vec_326;
+        int i_329 = i_328_1;
+        bool tie_330 = key_325 == threshold_f && i_329 < vocab;
+        unsigned int m_331 = __ballot_sync(0xFFFFFFFF, tie_330);
+        if (lane == 0) {
+            cnt[112 + warp] = (unsigned int)__popc(m_331);
+        }
+        if (key_325 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_332 = __as_u32(vals[8]);
+        unsigned int key_333 = ((bits_332 <= 2139095040) ? bits_332 : 0);
+        int i_vec_334 = start + 4096 + tid * 4;
+        int i_str_335 = start + 4096 + tid;
+        int i_336 = i_vec_334;
+        int i_337_1 = i_336;
+        bool tie_338 = key_333 == threshold_f && i_337_1 < vocab;
+        unsigned int m_339 = __ballot_sync(0xFFFFFFFF, tie_338);
+        if (lane == 0) {
+            cnt[128 + warp] = (unsigned int)__popc(m_339);
+        }
+        if (key_333 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_340 = __as_u32(vals[9]);
+        unsigned int key_341 = ((bits_340 <= 2139095040) ? bits_340 : 0);
+        int i_vec_342 = start + 4096 + tid * 4 + 1;
+        int i_str_343 = start + 4608 + tid;
+        int i_344 = i_vec_342;
+        int i_345 = i_344;
+        bool tie_346 = key_341 == threshold_f && i_345 < vocab;
+        unsigned int m_347 = __ballot_sync(0xFFFFFFFF, tie_346);
+        if (lane == 0) {
+            cnt[144 + warp] = (unsigned int)__popc(m_347);
+        }
+        if (key_341 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_348 = __as_u32(vals[10]);
+        unsigned int key_349 = ((bits_348 <= 2139095040) ? bits_348 : 0);
+        int i_vec_350 = start + 4096 + tid * 4 + 2;
+        int i_str_351 = start + 5120 + tid;
+        int i_352_1 = i_vec_350;
+        int i_353 = i_352_1;
+        bool tie_354 = key_349 == threshold_f && i_353 < vocab;
+        unsigned int m_355 = __ballot_sync(0xFFFFFFFF, tie_354);
+        if (lane == 0) {
+            cnt[160 + warp] = (unsigned int)__popc(m_355);
+        }
+        if (key_349 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_356 = __as_u32(vals[11]);
+        unsigned int key_357 = ((bits_356 <= 2139095040) ? bits_356 : 0);
+        int i_vec_358 = start + 4096 + tid * 4 + 3;
+        int i_str_359 = start + 5632 + tid;
+        int i_360 = i_vec_358;
+        int i_361 = i_360;
+        bool tie_362 = key_357 == threshold_f && i_361 < vocab;
+        unsigned int m_363 = __ballot_sync(0xFFFFFFFF, tie_362);
+        if (lane == 0) {
+            cnt[176 + warp] = (unsigned int)__popc(m_363);
+        }
+        if (key_357 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_364 = __as_u32(vals[12]);
+        unsigned int key_365 = ((bits_364 <= 2139095040) ? bits_364 : 0);
+        int i_vec_366 = start + 6144 + tid * 4;
+        int i_str_367 = start + 6144 + tid;
+        int i_368 = i_vec_366;
+        int i_369 = i_368;
+        bool tie_370 = key_365 == threshold_f && i_369 < vocab;
+        unsigned int m_371 = __ballot_sync(0xFFFFFFFF, tie_370);
+        if (lane == 0) {
+            cnt[192 + warp] = (unsigned int)__popc(m_371);
+        }
+        if (key_365 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_372 = __as_u32(vals[13]);
+        unsigned int key_373 = ((bits_372 <= 2139095040) ? bits_372 : 0);
+        int i_vec_374 = start + 6144 + tid * 4 + 1;
+        int i_str_375 = start + 6656 + tid;
+        int i_376 = i_vec_374;
+        int i_377 = i_376;
+        bool tie_378 = key_373 == threshold_f && i_377 < vocab;
+        unsigned int m_379 = __ballot_sync(0xFFFFFFFF, tie_378);
+        if (lane == 0) {
+            cnt[208 + warp] = (unsigned int)__popc(m_379);
+        }
+        if (key_373 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_380 = __as_u32(vals[14]);
+        unsigned int key_381 = ((bits_380 <= 2139095040) ? bits_380 : 0);
+        int i_vec_382 = start + 6144 + tid * 4 + 2;
+        int i_str_383 = start + 7168 + tid;
+        int i_384 = i_vec_382;
+        int i_385 = i_384;
+        bool tie_386 = key_381 == threshold_f && i_385 < vocab;
+        unsigned int m_387 = __ballot_sync(0xFFFFFFFF, tie_386);
+        if (lane == 0) {
+            cnt[224 + warp] = (unsigned int)__popc(m_387);
+        }
+        if (key_381 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_388 = __as_u32(vals[15]);
+        unsigned int key_389 = ((bits_388 <= 2139095040) ? bits_388 : 0);
+        int i_vec_390 = start + 6144 + tid * 4 + 3;
+        int i_str_391 = start + 7680 + tid;
+        int i_392 = i_vec_390;
+        int i_393 = i_392;
+        bool tie_394 = key_389 == threshold_f && i_393 < vocab;
+        unsigned int m_395 = __ballot_sync(0xFFFFFFFF, tie_394);
+        if (lane == 0) {
+            cnt[240 + warp] = (unsigned int)__popc(m_395);
+        }
+        if (key_389 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_396 = __as_u32(vals[16]);
+        unsigned int key_397 = ((bits_396 <= 2139095040) ? bits_396 : 0);
+        int i_vec_398 = start + 8192 + tid * 4;
+        int i_str_399 = start + 8192 + tid;
+        int i_400 = i_vec_398;
+        int i_401 = i_400;
+        bool tie_402 = key_397 == threshold_f && i_401 < vocab;
+        unsigned int m_403 = __ballot_sync(0xFFFFFFFF, tie_402);
+        if (lane == 0) {
+            cnt[256 + warp] = (unsigned int)__popc(m_403);
+        }
+        if (key_397 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_404 = __as_u32(vals[17]);
+        unsigned int key_405 = ((bits_404 <= 2139095040) ? bits_404 : 0);
+        int i_vec_406 = start + 8192 + tid * 4 + 1;
+        int i_str_407 = start + 8704 + tid;
+        int i_408 = i_vec_406;
+        int i_409 = i_408;
+        bool tie_410 = key_405 == threshold_f && i_409 < vocab;
+        unsigned int m_411 = __ballot_sync(0xFFFFFFFF, tie_410);
+        if (lane == 0) {
+            cnt[272 + warp] = (unsigned int)__popc(m_411);
+        }
+        if (key_405 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_412 = __as_u32(vals[18]);
+        unsigned int key_413 = ((bits_412 <= 2139095040) ? bits_412 : 0);
+        int i_vec_414 = start + 8192 + tid * 4 + 2;
+        int i_str_415 = start + 9216 + tid;
+        int i_416 = i_vec_414;
+        int i_417 = i_416;
+        bool tie_418 = key_413 == threshold_f && i_417 < vocab;
+        unsigned int m_419 = __ballot_sync(0xFFFFFFFF, tie_418);
+        if (lane == 0) {
+            cnt[288 + warp] = (unsigned int)__popc(m_419);
+        }
+        if (key_413 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_420 = __as_u32(vals[19]);
+        unsigned int key_421 = ((bits_420 <= 2139095040) ? bits_420 : 0);
+        int i_vec_422 = start + 8192 + tid * 4 + 3;
+        int i_str_423 = start + 9728 + tid;
+        int i_424 = i_vec_422;
+        int i_425 = i_424;
+        bool tie_426 = key_421 == threshold_f && i_425 < vocab;
+        unsigned int m_427 = __ballot_sync(0xFFFFFFFF, tie_426);
+        if (lane == 0) {
+            cnt[304 + warp] = (unsigned int)__popc(m_427);
+        }
+        if (key_421 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_428 = __as_u32(vals[20]);
+        unsigned int key_429 = ((bits_428 <= 2139095040) ? bits_428 : 0);
+        int i_vec_430 = start + 10240 + tid * 4;
+        int i_str_431 = start + 10240 + tid;
+        int i_432 = i_vec_430;
+        int i_433 = i_432;
+        bool tie_434 = key_429 == threshold_f && i_433 < vocab;
+        unsigned int m_435 = __ballot_sync(0xFFFFFFFF, tie_434);
+        if (lane == 0) {
+            cnt[320 + warp] = (unsigned int)__popc(m_435);
+        }
+        if (key_429 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_436 = __as_u32(vals[21]);
+        unsigned int key_437 = ((bits_436 <= 2139095040) ? bits_436 : 0);
+        int i_vec_438 = start + 10240 + tid * 4 + 1;
+        int i_str_439 = start + 10752 + tid;
+        int i_440 = i_vec_438;
+        int i_441 = i_440;
+        bool tie_442 = key_437 == threshold_f && i_441 < vocab;
+        unsigned int m_443 = __ballot_sync(0xFFFFFFFF, tie_442);
+        if (lane == 0) {
+            cnt[336 + warp] = (unsigned int)__popc(m_443);
+        }
+        if (key_437 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_444 = __as_u32(vals[22]);
+        unsigned int key_445 = ((bits_444 <= 2139095040) ? bits_444 : 0);
+        int i_vec_446 = start + 10240 + tid * 4 + 2;
+        int i_str_447 = start + 11264 + tid;
+        int i_448 = i_vec_446;
+        int i_449 = i_448;
+        bool tie_450 = key_445 == threshold_f && i_449 < vocab;
+        unsigned int m_451 = __ballot_sync(0xFFFFFFFF, tie_450);
+        if (lane == 0) {
+            cnt[352 + warp] = (unsigned int)__popc(m_451);
+        }
+        if (key_445 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_452 = __as_u32(vals[23]);
+        unsigned int key_453 = ((bits_452 <= 2139095040) ? bits_452 : 0);
+        int i_vec_454 = start + 10240 + tid * 4 + 3;
+        int i_str_455 = start + 11776 + tid;
+        int i_456 = i_vec_454;
+        int i_457 = i_456;
+        bool tie_458 = key_453 == threshold_f && i_457 < vocab;
+        unsigned int m_459 = __ballot_sync(0xFFFFFFFF, tie_458);
+        if (lane == 0) {
+            cnt[368 + warp] = (unsigned int)__popc(m_459);
+        }
+        if (key_453 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_460 = __as_u32(vals[24]);
+        unsigned int key_461 = ((bits_460 <= 2139095040) ? bits_460 : 0);
+        int i_vec_462 = start + 12288 + tid * 4;
+        int i_str_463 = start + 12288 + tid;
+        int i_464 = i_vec_462;
+        int i_465 = i_464;
+        bool tie_466 = key_461 == threshold_f && i_465 < vocab;
+        unsigned int m_467 = __ballot_sync(0xFFFFFFFF, tie_466);
+        if (lane == 0) {
+            cnt[384 + warp] = (unsigned int)__popc(m_467);
+        }
+        if (key_461 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_468 = __as_u32(vals[25]);
+        unsigned int key_469 = ((bits_468 <= 2139095040) ? bits_468 : 0);
+        int i_vec_470 = start + 12288 + tid * 4 + 1;
+        int i_str_471 = start + 12800 + tid;
+        int i_472 = i_vec_470;
+        int i_473 = i_472;
+        bool tie_474 = key_469 == threshold_f && i_473 < vocab;
+        unsigned int m_475 = __ballot_sync(0xFFFFFFFF, tie_474);
+        if (lane == 0) {
+            cnt[400 + warp] = (unsigned int)__popc(m_475);
+        }
+        if (key_469 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_476 = __as_u32(vals[26]);
+        unsigned int key_477 = ((bits_476 <= 2139095040) ? bits_476 : 0);
+        int i_vec_478 = start + 12288 + tid * 4 + 2;
+        int i_str_479 = start + 13312 + tid;
+        int i_480 = i_vec_478;
+        int i_481 = i_480;
+        bool tie_482 = key_477 == threshold_f && i_481 < vocab;
+        unsigned int m_483 = __ballot_sync(0xFFFFFFFF, tie_482);
+        if (lane == 0) {
+            cnt[416 + warp] = (unsigned int)__popc(m_483);
+        }
+        if (key_477 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_484 = __as_u32(vals[27]);
+        unsigned int key_485 = ((bits_484 <= 2139095040) ? bits_484 : 0);
+        int i_vec_486 = start + 12288 + tid * 4 + 3;
+        int i_str_487 = start + 13824 + tid;
+        int i_488 = i_vec_486;
+        int i_489 = i_488;
+        bool tie_490 = key_485 == threshold_f && i_489 < vocab;
+        unsigned int m_491 = __ballot_sync(0xFFFFFFFF, tie_490);
+        if (lane == 0) {
+            cnt[432 + warp] = (unsigned int)__popc(m_491);
+        }
+        if (key_485 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_492 = __as_u32(vals[28]);
+        unsigned int key_493 = ((bits_492 <= 2139095040) ? bits_492 : 0);
+        int i_vec_494 = start + 14336 + tid * 4;
+        int i_str_495 = start + 14336 + tid;
+        int i_496 = i_vec_494;
+        int i_497 = i_496;
+        bool tie_498 = key_493 == threshold_f && i_497 < vocab;
+        unsigned int m_499 = __ballot_sync(0xFFFFFFFF, tie_498);
+        if (lane == 0) {
+            cnt[448 + warp] = (unsigned int)__popc(m_499);
+        }
+        if (key_493 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_500 = __as_u32(vals[29]);
+        unsigned int key_501 = ((bits_500 <= 2139095040) ? bits_500 : 0);
+        int i_vec_502 = start + 14336 + tid * 4 + 1;
+        int i_str_503 = start + 14848 + tid;
+        int i_504 = i_vec_502;
+        int i_505 = i_504;
+        bool tie_506 = key_501 == threshold_f && i_505 < vocab;
+        unsigned int m_507 = __ballot_sync(0xFFFFFFFF, tie_506);
+        if (lane == 0) {
+            cnt[464 + warp] = (unsigned int)__popc(m_507);
+        }
+        if (key_501 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_508 = __as_u32(vals[30]);
+        unsigned int key_509 = ((bits_508 <= 2139095040) ? bits_508 : 0);
+        int i_vec_510 = start + 14336 + tid * 4 + 2;
+        int i_str_511 = start + 15360 + tid;
+        int i_512 = i_vec_510;
+        int i_513 = i_512;
+        bool tie_514 = key_509 == threshold_f && i_513 < vocab;
+        unsigned int m_515 = __ballot_sync(0xFFFFFFFF, tie_514);
+        if (lane == 0) {
+            cnt[480 + warp] = (unsigned int)__popc(m_515);
+        }
+        if (key_509 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_516 = __as_u32(vals[31]);
+        unsigned int key_517 = ((bits_516 <= 2139095040) ? bits_516 : 0);
+        int i_vec_518 = start + 14336 + tid * 4 + 3;
+        int i_str_519 = start + 15872 + tid;
+        int i_520 = i_vec_518;
+        int i_521 = i_520;
+        bool tie_522 = key_517 == threshold_f && i_521 < vocab;
+        unsigned int m_523 = __ballot_sync(0xFFFFFFFF, tie_522);
+        if (lane == 0) {
+            cnt[496 + warp] = (unsigned int)__popc(m_523);
+        }
+        if (key_517 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_524 = __as_u32(vals[32]);
+        unsigned int key_525 = ((bits_524 <= 2139095040) ? bits_524 : 0);
+        int i_vec_526 = start + 16384 + tid * 4;
+        int i_str_527 = start + 16384 + tid;
+        int i_528 = i_vec_526;
+        int i_529 = i_528;
+        bool tie_530 = key_525 == threshold_f && i_529 < vocab;
+        unsigned int m_531 = __ballot_sync(0xFFFFFFFF, tie_530);
+        if (lane == 0) {
+            cnt[512 + warp] = (unsigned int)__popc(m_531);
+        }
+        if (key_525 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_532 = __as_u32(vals[33]);
+        unsigned int key_533 = ((bits_532 <= 2139095040) ? bits_532 : 0);
+        int i_vec_534 = start + 16384 + tid * 4 + 1;
+        int i_str_535 = start + 16896 + tid;
+        int i_536 = i_vec_534;
+        int i_537 = i_536;
+        bool tie_538 = key_533 == threshold_f && i_537 < vocab;
+        unsigned int m_539 = __ballot_sync(0xFFFFFFFF, tie_538);
+        if (lane == 0) {
+            cnt[528 + warp] = (unsigned int)__popc(m_539);
+        }
+        if (key_533 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_540 = __as_u32(vals[34]);
+        unsigned int key_541 = ((bits_540 <= 2139095040) ? bits_540 : 0);
+        int i_vec_542 = start + 16384 + tid * 4 + 2;
+        int i_str_543 = start + 17408 + tid;
+        int i_544 = i_vec_542;
+        int i_545 = i_544;
+        bool tie_546 = key_541 == threshold_f && i_545 < vocab;
+        unsigned int m_547 = __ballot_sync(0xFFFFFFFF, tie_546);
+        if (lane == 0) {
+            cnt[544 + warp] = (unsigned int)__popc(m_547);
+        }
+        if (key_541 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_548 = __as_u32(vals[35]);
+        unsigned int key_549 = ((bits_548 <= 2139095040) ? bits_548 : 0);
+        int i_vec_550 = start + 16384 + tid * 4 + 3;
+        int i_str_551 = start + 17920 + tid;
+        int i_552 = i_vec_550;
+        int i_553 = i_552;
+        bool tie_554 = key_549 == threshold_f && i_553 < vocab;
+        unsigned int m_555 = __ballot_sync(0xFFFFFFFF, tie_554);
+        if (lane == 0) {
+            cnt[560 + warp] = (unsigned int)__popc(m_555);
+        }
+        if (key_549 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_556 = __as_u32(vals[36]);
+        unsigned int key_557 = ((bits_556 <= 2139095040) ? bits_556 : 0);
+        int i_vec_558 = start + 18432 + tid * 4;
+        int i_str_559 = start + 18432 + tid;
+        int i_560 = i_vec_558;
+        int i_561 = i_560;
+        bool tie_562 = key_557 == threshold_f && i_561 < vocab;
+        unsigned int m_563 = __ballot_sync(0xFFFFFFFF, tie_562);
+        if (lane == 0) {
+            cnt[576 + warp] = (unsigned int)__popc(m_563);
+        }
+        if (key_557 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_564 = __as_u32(vals[37]);
+        unsigned int key_565 = ((bits_564 <= 2139095040) ? bits_564 : 0);
+        int i_vec_566 = start + 18432 + tid * 4 + 1;
+        int i_str_567 = start + 18944 + tid;
+        int i_568 = i_vec_566;
+        int i_569 = i_568;
+        bool tie_570 = key_565 == threshold_f && i_569 < vocab;
+        unsigned int m_571 = __ballot_sync(0xFFFFFFFF, tie_570);
+        if (lane == 0) {
+            cnt[592 + warp] = (unsigned int)__popc(m_571);
+        }
+        if (key_565 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_572 = __as_u32(vals[38]);
+        unsigned int key_573 = ((bits_572 <= 2139095040) ? bits_572 : 0);
+        int i_vec_574 = start + 18432 + tid * 4 + 2;
+        int i_str_575 = start + 19456 + tid;
+        int i_576 = i_vec_574;
+        int i_577 = i_576;
+        bool tie_578 = key_573 == threshold_f && i_577 < vocab;
+        unsigned int m_579 = __ballot_sync(0xFFFFFFFF, tie_578);
+        if (lane == 0) {
+            cnt[608 + warp] = (unsigned int)__popc(m_579);
+        }
+        if (key_573 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int bits_580 = __as_u32(vals[39]);
+        unsigned int key_581 = ((bits_580 <= 2139095040) ? bits_580 : 0);
+        int i_vec_582 = start + 18432 + tid * 4 + 3;
+        int i_str_583 = start + 19968 + tid;
+        int i_584 = i_vec_582;
+        int i_585 = i_584;
+        bool tie_586 = key_581 == threshold_f && i_585 < vocab;
+        unsigned int m_587 = __ballot_sync(0xFFFFFFFF, tie_586);
+        if (lane == 0) {
+            cnt[624 + warp] = (unsigned int)__popc(m_587);
+        }
+        if (key_581 > threshold_f) {
+            gt = gt + 1;
+        }
+        unsigned int gt_cnt = gt;
+        __syncthreads();
+        unsigned int local_588 = 0;
+        int f = tid * 2;
+        if (f < 640) {
+            local_588 = local_588 + cnt[f];
+        }
+        int f_589 = tid * 2 + 1;
+        if (f_589 < 640) {
+            local_588 = local_588 + cnt[f_589];
+        }
+        unsigned int packed_1 = gt_cnt | local_588 << 12;
+        uint32_t incl_1 = packed_1;
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(1));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(2));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(4));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(8));
+        asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl_1) : "r"(16));
+        if (lane == 31) {
+            warp_sums[warp] = incl_1;
+        }
+        __syncthreads();
+        unsigned int before_1 = 0;
+        unsigned int total_1 = 0;
+        unsigned int ws_1 = warp_sums[0];
+        total_1 = total_1 + ws_1;
+        if (warp > 0) {
+            before_1 = before_1 + ws_1;
+        }
+        unsigned int ws_590 = warp_sums[1];
+        total_1 = total_1 + ws_590;
+        if (warp > 1) {
+            before_1 = before_1 + ws_590;
+        }
+        unsigned int ws_591 = warp_sums[2];
+        total_1 = total_1 + ws_591;
+        if (warp > 2) {
+            before_1 = before_1 + ws_591;
+        }
+        unsigned int ws_592 = warp_sums[3];
+        total_1 = total_1 + ws_592;
+        if (warp > 3) {
+            before_1 = before_1 + ws_592;
+        }
+        unsigned int ws_593 = warp_sums[4];
+        total_1 = total_1 + ws_593;
+        if (warp > 4) {
+            before_1 = before_1 + ws_593;
+        }
+        unsigned int ws_594 = warp_sums[5];
+        total_1 = total_1 + ws_594;
+        if (warp > 5) {
+            before_1 = before_1 + ws_594;
+        }
+        unsigned int ws_595 = warp_sums[6];
+        total_1 = total_1 + ws_595;
+        if (warp > 6) {
+            before_1 = before_1 + ws_595;
+        }
+        unsigned int ws_596 = warp_sums[7];
+        total_1 = total_1 + ws_596;
+        if (warp > 7) {
+            before_1 = before_1 + ws_596;
+        }
+        unsigned int ws_597 = warp_sums[8];
+        total_1 = total_1 + ws_597;
+        if (warp > 8) {
+            before_1 = before_1 + ws_597;
+        }
+        unsigned int ws_598 = warp_sums[9];
+        total_1 = total_1 + ws_598;
+        if (warp > 9) {
+            before_1 = before_1 + ws_598;
+        }
+        unsigned int ws_599 = warp_sums[10];
+        total_1 = total_1 + ws_599;
+        if (warp > 10) {
+            before_1 = before_1 + ws_599;
+        }
+        unsigned int ws_600 = warp_sums[11];
+        total_1 = total_1 + ws_600;
+        if (warp > 11) {
+            before_1 = before_1 + ws_600;
+        }
+        unsigned int ws_601 = warp_sums[12];
+        total_1 = total_1 + ws_601;
+        if (warp > 12) {
+            before_1 = before_1 + ws_601;
+        }
+        unsigned int ws_602 = warp_sums[13];
+        total_1 = total_1 + ws_602;
+        if (warp > 13) {
+            before_1 = before_1 + ws_602;
+        }
+        unsigned int ws_603 = warp_sums[14];
+        total_1 = total_1 + ws_603;
+        if (warp > 14) {
+            before_1 = before_1 + ws_603;
+        }
+        unsigned int ws_604 = warp_sums[15];
+        total_1 = total_1 + ws_604;
+        if (warp > 15) {
+            before_1 = before_1 + ws_604;
+        }
+        unsigned int excl_1 = before_1 + incl_1 - packed_1;
+        __syncthreads();
+        unsigned int running = excl_1 >> 12;
+        int f2 = tid * 2;
+        if (f2 < 640) {
+            unsigned int c_1 = cnt[f2];
+            cnt[f2] = running;
+            running = running + c_1;
+        }
+        int f2_605 = tid * 2 + 1;
+        if (f2_605 < 640) {
+            unsigned int c_3 = cnt[f2_605];
+            cnt[f2_605] = running;
+            running = running + c_3;
+        }
+        __syncthreads();
+        unsigned int gt_slot = excl_1 & 4095;
+        unsigned int gt_total = total_1 & 4095;
+        unsigned int eq_total = total_1 >> 12;
+        if (tid == 0) {
+            scal[2] = gt_total;
+            scal[3] = eq_total;
+        }
+        __syncthreads();
+        unsigned int gt_prefix = 0;
+        unsigned int eq_prefix = 0;
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        for (int r_1 = 0; r_1 < 8; r_1++) {
+            if (rank > r_1) {
+                uint32_t _mapa_8;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_8) : "r"(scal_addr + 8), "r"(r_1));
+                unsigned int cluster_value_1[1];
+                asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_1[0])) : "r"(_mapa_8) : "memory");
+                unsigned int gt_peer = cluster_value_1[0];
+                uint32_t _mapa_9;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_9) : "r"(scal_addr + 12), "r"(r_1));
+                unsigned int cluster_value_0[1];
+                asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&cluster_value_0[0])) : "r"(_mapa_9) : "memory");
+                unsigned int eq_peer = cluster_value_0[0];
+                gt_prefix = gt_prefix + gt_peer;
+                eq_prefix = eq_prefix + eq_peer;
+            }
+        }
+        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        unsigned int gt_total_606 = k_u - remaining;
+        unsigned int _min_105 = ((eq_total) < (remaining - eq_prefix) ? (eq_total) : (remaining - eq_prefix));
+        unsigned int eq_take = ((eq_prefix < remaining) ? _min_105 : 0);
+        unsigned long long gt_base = out_base + (unsigned long long)gt_prefix;
+        unsigned long long eq_base = out_base + (unsigned long long)(gt_total_606 + eq_prefix);
+        unsigned int lt_mask = (1 << (unsigned int)lane) - 1;
+        unsigned int g_1 = gt_slot;
+        unsigned int keys[4];
+        int idxs[4];
+        bool ties[4];
+        unsigned int strided[4];
+        unsigned int grp_warp = 0;
+        unsigned int grp_lane = 0;
+        unsigned int bits_607 = __as_u32(vals[0]);
+        unsigned int key_608 = ((bits_607 <= 2139095040) ? bits_607 : 0);
+        keys[0] = key_608;
+        int i_vec_609 = start + tid * 4;
+        int i_str_610 = start + tid;
+        int i_611 = i_vec_609;
+        idxs[0] = i_611;
+        ties[0] = keys[0] == threshold_f && idxs[0] < vocab;
+        unsigned int m_612 = __ballot_sync(0xFFFFFFFF, ties[0]);
+        unsigned int lane_before = (unsigned int)__popc(m_612 & lt_mask);
+        unsigned int warp_off = cnt[warp];
+        strided[0] = warp_off + lane_before;
+        grp_warp = grp_warp + (warp_off - cnt[0]);
+        grp_lane = grp_lane + lane_before;
+        unsigned int bits_613 = __as_u32(vals[1]);
+        unsigned int key_614 = ((bits_613 <= 2139095040) ? bits_613 : 0);
+        keys[1] = key_614;
+        int i_vec_615 = start + tid * 4 + 1;
+        int i_str_616 = start + 512 + tid;
+        int i_617 = i_vec_615;
+        idxs[1] = i_617;
+        ties[1] = keys[1] == threshold_f && idxs[1] < vocab;
+        unsigned int m_618 = __ballot_sync(0xFFFFFFFF, ties[1]);
+        unsigned int lane_before_619 = (unsigned int)__popc(m_618 & lt_mask);
+        unsigned int warp_off_620 = cnt[16 + warp];
+        strided[1] = warp_off_620 + lane_before_619;
+        grp_warp = grp_warp + (warp_off_620 - cnt[16]);
+        grp_lane = grp_lane + lane_before_619;
+        unsigned int bits_621 = __as_u32(vals[2]);
+        unsigned int key_622 = ((bits_621 <= 2139095040) ? bits_621 : 0);
+        keys[2] = key_622;
+        int i_vec_623 = start + tid * 4 + 2;
+        int i_str_624 = start + 1024 + tid;
+        int i_625 = i_vec_623;
+        idxs[2] = i_625;
+        ties[2] = keys[2] == threshold_f && idxs[2] < vocab;
+        unsigned int m_626 = __ballot_sync(0xFFFFFFFF, ties[2]);
+        unsigned int lane_before_627 = (unsigned int)__popc(m_626 & lt_mask);
+        unsigned int warp_off_628 = cnt[32 + warp];
+        strided[2] = warp_off_628 + lane_before_627;
+        grp_warp = grp_warp + (warp_off_628 - cnt[32]);
+        grp_lane = grp_lane + lane_before_627;
+        unsigned int bits_629 = __as_u32(vals[3]);
+        unsigned int key_630 = ((bits_629 <= 2139095040) ? bits_629 : 0);
+        keys[3] = key_630;
+        int i_vec_631 = start + tid * 4 + 3;
+        int i_str_632 = start + 1536 + tid;
+        int i_633 = i_vec_631;
+        idxs[3] = i_633;
+        ties[3] = keys[3] == threshold_f && idxs[3] < vocab;
+        unsigned int m_634 = __ballot_sync(0xFFFFFFFF, ties[3]);
+        unsigned int lane_before_635 = (unsigned int)__popc(m_634 & lt_mask);
+        unsigned int warp_off_636 = cnt[48 + warp];
+        strided[3] = warp_off_636 + lane_before_635;
+        grp_warp = grp_warp + (warp_off_636 - cnt[48]);
+        grp_lane = grp_lane + lane_before_635;
+        unsigned int grp_base = cnt[0];
+        unsigned int own = 0;
+        unsigned int vec_rank = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_637 = vec_rank;
+        if (keys[0] > threshold_f) {
+            unsigned long long dst_40 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_40] = __uint_as_float(keys[0]);
+            out_idx[dst_40] = idxs[0];
+            g_1 = g_1 + 1;
+        } else if (ties[0] && rank_637 < eq_take) {
+            unsigned long long dst2 = eq_base + (unsigned long long)rank_637;
+            out_vals[dst2] = __uint_as_float(keys[0]);
+            out_idx[dst2] = idxs[0];
+        }
+        if (ties[0]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_638 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_639 = vec_rank_638;
+        if (keys[1] > threshold_f) {
+            unsigned long long dst_41 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_41] = __uint_as_float(keys[1]);
+            out_idx[dst_41] = idxs[1];
+            g_1 = g_1 + 1;
+        } else if (ties[1] && rank_639 < eq_take) {
+            unsigned long long dst2_1 = eq_base + (unsigned long long)rank_639;
+            out_vals[dst2_1] = __uint_as_float(keys[1]);
+            out_idx[dst2_1] = idxs[1];
+        }
+        if (ties[1]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_640 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_641 = vec_rank_640;
+        if (keys[2] > threshold_f) {
+            unsigned long long dst_42 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_42] = __uint_as_float(keys[2]);
+            out_idx[dst_42] = idxs[2];
+            g_1 = g_1 + 1;
+        } else if (ties[2] && rank_641 < eq_take) {
+            unsigned long long dst2_2 = eq_base + (unsigned long long)rank_641;
+            out_vals[dst2_2] = __uint_as_float(keys[2]);
+            out_idx[dst2_2] = idxs[2];
+        }
+        if (ties[2]) {
+            own = own + 1;
+        }
+        unsigned int vec_rank_642 = grp_base + grp_warp + grp_lane + own;
+        unsigned int rank_643 = vec_rank_642;
+        if (keys[3] > threshold_f) {
+            unsigned long long dst_43 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_43] = __uint_as_float(keys[3]);
+            out_idx[dst_43] = idxs[3];
+            g_1 = g_1 + 1;
+        } else if (ties[3] && rank_643 < eq_take) {
+            unsigned long long dst2_3 = eq_base + (unsigned long long)rank_643;
+            out_vals[dst2_3] = __uint_as_float(keys[3]);
+            out_idx[dst2_3] = idxs[3];
+        }
+        if (ties[3]) {
+            own = own + 1;
+        }
+        unsigned int keys_644[4];
+        int idxs_645[4];
+        bool ties_646[4];
+        unsigned int strided_647[4];
+        unsigned int grp_warp_648 = 0;
+        unsigned int grp_lane_649 = 0;
+        unsigned int bits_650 = __as_u32(vals[4]);
+        unsigned int key_651 = ((bits_650 <= 2139095040) ? bits_650 : 0);
+        keys_644[0] = key_651;
+        int i_vec_652 = start + 2048 + tid * 4;
+        int i_str_653 = start + 2048 + tid;
+        int i_654 = i_vec_652;
+        idxs_645[0] = i_654;
+        ties_646[0] = keys_644[0] == threshold_f && idxs_645[0] < vocab;
+        unsigned int m_655 = __ballot_sync(0xFFFFFFFF, ties_646[0]);
+        unsigned int lane_before_656 = (unsigned int)__popc(m_655 & lt_mask);
+        unsigned int warp_off_657 = cnt[64 + warp];
+        strided_647[0] = warp_off_657 + lane_before_656;
+        grp_warp_648 = grp_warp_648 + (warp_off_657 - cnt[64]);
+        grp_lane_649 = grp_lane_649 + lane_before_656;
+        unsigned int bits_658 = __as_u32(vals[5]);
+        unsigned int key_659 = ((bits_658 <= 2139095040) ? bits_658 : 0);
+        keys_644[1] = key_659;
+        int i_vec_660 = start + 2048 + tid * 4 + 1;
+        int i_str_661 = start + 2560 + tid;
+        int i_662 = i_vec_660;
+        idxs_645[1] = i_662;
+        ties_646[1] = keys_644[1] == threshold_f && idxs_645[1] < vocab;
+        unsigned int m_663 = __ballot_sync(0xFFFFFFFF, ties_646[1]);
+        unsigned int lane_before_664 = (unsigned int)__popc(m_663 & lt_mask);
+        unsigned int warp_off_665 = cnt[80 + warp];
+        strided_647[1] = warp_off_665 + lane_before_664;
+        grp_warp_648 = grp_warp_648 + (warp_off_665 - cnt[80]);
+        grp_lane_649 = grp_lane_649 + lane_before_664;
+        unsigned int bits_666 = __as_u32(vals[6]);
+        unsigned int key_667 = ((bits_666 <= 2139095040) ? bits_666 : 0);
+        keys_644[2] = key_667;
+        int i_vec_668 = start + 2048 + tid * 4 + 2;
+        int i_str_669 = start + 3072 + tid;
+        int i_670 = i_vec_668;
+        idxs_645[2] = i_670;
+        ties_646[2] = keys_644[2] == threshold_f && idxs_645[2] < vocab;
+        unsigned int m_671 = __ballot_sync(0xFFFFFFFF, ties_646[2]);
+        unsigned int lane_before_672 = (unsigned int)__popc(m_671 & lt_mask);
+        unsigned int warp_off_673 = cnt[96 + warp];
+        strided_647[2] = warp_off_673 + lane_before_672;
+        grp_warp_648 = grp_warp_648 + (warp_off_673 - cnt[96]);
+        grp_lane_649 = grp_lane_649 + lane_before_672;
+        unsigned int bits_674 = __as_u32(vals[7]);
+        unsigned int key_675 = ((bits_674 <= 2139095040) ? bits_674 : 0);
+        keys_644[3] = key_675;
+        int i_vec_676 = start + 2048 + tid * 4 + 3;
+        int i_str_677 = start + 3584 + tid;
+        int i_678 = i_vec_676;
+        idxs_645[3] = i_678;
+        ties_646[3] = keys_644[3] == threshold_f && idxs_645[3] < vocab;
+        unsigned int m_679 = __ballot_sync(0xFFFFFFFF, ties_646[3]);
+        unsigned int lane_before_680 = (unsigned int)__popc(m_679 & lt_mask);
+        unsigned int warp_off_681 = cnt[112 + warp];
+        strided_647[3] = warp_off_681 + lane_before_680;
+        grp_warp_648 = grp_warp_648 + (warp_off_681 - cnt[112]);
+        grp_lane_649 = grp_lane_649 + lane_before_680;
+        unsigned int grp_base_682 = cnt[64];
+        unsigned int own_683 = 0;
+        unsigned int vec_rank_684 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_685 = vec_rank_684;
+        if (keys_644[0] > threshold_f) {
+            unsigned long long dst_44 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_44] = __uint_as_float(keys_644[0]);
+            out_idx[dst_44] = idxs_645[0];
+            g_1 = g_1 + 1;
+        } else if (ties_646[0] && rank_685 < eq_take) {
+            unsigned long long dst2_4 = eq_base + (unsigned long long)rank_685;
+            out_vals[dst2_4] = __uint_as_float(keys_644[0]);
+            out_idx[dst2_4] = idxs_645[0];
+        }
+        if (ties_646[0]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_686 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_687 = vec_rank_686;
+        if (keys_644[1] > threshold_f) {
+            unsigned long long dst_45 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_45] = __uint_as_float(keys_644[1]);
+            out_idx[dst_45] = idxs_645[1];
+            g_1 = g_1 + 1;
+        } else if (ties_646[1] && rank_687 < eq_take) {
+            unsigned long long dst2_5 = eq_base + (unsigned long long)rank_687;
+            out_vals[dst2_5] = __uint_as_float(keys_644[1]);
+            out_idx[dst2_5] = idxs_645[1];
+        }
+        if (ties_646[1]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_688 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_689 = vec_rank_688;
+        if (keys_644[2] > threshold_f) {
+            unsigned long long dst_46 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_46] = __uint_as_float(keys_644[2]);
+            out_idx[dst_46] = idxs_645[2];
+            g_1 = g_1 + 1;
+        } else if (ties_646[2] && rank_689 < eq_take) {
+            unsigned long long dst2_6 = eq_base + (unsigned long long)rank_689;
+            out_vals[dst2_6] = __uint_as_float(keys_644[2]);
+            out_idx[dst2_6] = idxs_645[2];
+        }
+        if (ties_646[2]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int vec_rank_690 = grp_base_682 + grp_warp_648 + grp_lane_649 + own_683;
+        unsigned int rank_691 = vec_rank_690;
+        if (keys_644[3] > threshold_f) {
+            unsigned long long dst_47 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_47] = __uint_as_float(keys_644[3]);
+            out_idx[dst_47] = idxs_645[3];
+            g_1 = g_1 + 1;
+        } else if (ties_646[3] && rank_691 < eq_take) {
+            unsigned long long dst2_7 = eq_base + (unsigned long long)rank_691;
+            out_vals[dst2_7] = __uint_as_float(keys_644[3]);
+            out_idx[dst2_7] = idxs_645[3];
+        }
+        if (ties_646[3]) {
+            own_683 = own_683 + 1;
+        }
+        unsigned int keys_692[4];
+        int idxs_693[4];
+        bool ties_694[4];
+        unsigned int strided_695[4];
+        unsigned int grp_warp_696 = 0;
+        unsigned int grp_lane_697 = 0;
+        unsigned int bits_698 = __as_u32(vals[8]);
+        unsigned int key_699 = ((bits_698 <= 2139095040) ? bits_698 : 0);
+        keys_692[0] = key_699;
+        int i_vec_700 = start + 4096 + tid * 4;
+        int i_str_701 = start + 4096 + tid;
+        int i_702 = i_vec_700;
+        idxs_693[0] = i_702;
+        ties_694[0] = keys_692[0] == threshold_f && idxs_693[0] < vocab;
+        unsigned int m_703 = __ballot_sync(0xFFFFFFFF, ties_694[0]);
+        unsigned int lane_before_704 = (unsigned int)__popc(m_703 & lt_mask);
+        unsigned int warp_off_705 = cnt[128 + warp];
+        strided_695[0] = warp_off_705 + lane_before_704;
+        grp_warp_696 = grp_warp_696 + (warp_off_705 - cnt[128]);
+        grp_lane_697 = grp_lane_697 + lane_before_704;
+        unsigned int bits_706 = __as_u32(vals[9]);
+        unsigned int key_707 = ((bits_706 <= 2139095040) ? bits_706 : 0);
+        keys_692[1] = key_707;
+        int i_vec_708 = start + 4096 + tid * 4 + 1;
+        int i_str_709 = start + 4608 + tid;
+        int i_710 = i_vec_708;
+        idxs_693[1] = i_710;
+        ties_694[1] = keys_692[1] == threshold_f && idxs_693[1] < vocab;
+        unsigned int m_711 = __ballot_sync(0xFFFFFFFF, ties_694[1]);
+        unsigned int lane_before_712 = (unsigned int)__popc(m_711 & lt_mask);
+        unsigned int warp_off_713 = cnt[144 + warp];
+        strided_695[1] = warp_off_713 + lane_before_712;
+        grp_warp_696 = grp_warp_696 + (warp_off_713 - cnt[144]);
+        grp_lane_697 = grp_lane_697 + lane_before_712;
+        unsigned int bits_714 = __as_u32(vals[10]);
+        unsigned int key_715 = ((bits_714 <= 2139095040) ? bits_714 : 0);
+        keys_692[2] = key_715;
+        int i_vec_716 = start + 4096 + tid * 4 + 2;
+        int i_str_717 = start + 5120 + tid;
+        int i_718 = i_vec_716;
+        idxs_693[2] = i_718;
+        ties_694[2] = keys_692[2] == threshold_f && idxs_693[2] < vocab;
+        unsigned int m_719 = __ballot_sync(0xFFFFFFFF, ties_694[2]);
+        unsigned int lane_before_720 = (unsigned int)__popc(m_719 & lt_mask);
+        unsigned int warp_off_721 = cnt[160 + warp];
+        strided_695[2] = warp_off_721 + lane_before_720;
+        grp_warp_696 = grp_warp_696 + (warp_off_721 - cnt[160]);
+        grp_lane_697 = grp_lane_697 + lane_before_720;
+        unsigned int bits_722 = __as_u32(vals[11]);
+        unsigned int key_723 = ((bits_722 <= 2139095040) ? bits_722 : 0);
+        keys_692[3] = key_723;
+        int i_vec_724 = start + 4096 + tid * 4 + 3;
+        int i_str_725 = start + 5632 + tid;
+        int i_726 = i_vec_724;
+        idxs_693[3] = i_726;
+        ties_694[3] = keys_692[3] == threshold_f && idxs_693[3] < vocab;
+        unsigned int m_727 = __ballot_sync(0xFFFFFFFF, ties_694[3]);
+        unsigned int lane_before_728 = (unsigned int)__popc(m_727 & lt_mask);
+        unsigned int warp_off_729 = cnt[176 + warp];
+        strided_695[3] = warp_off_729 + lane_before_728;
+        grp_warp_696 = grp_warp_696 + (warp_off_729 - cnt[176]);
+        grp_lane_697 = grp_lane_697 + lane_before_728;
+        unsigned int grp_base_730 = cnt[128];
+        unsigned int own_731 = 0;
+        unsigned int vec_rank_732 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_733 = vec_rank_732;
+        if (keys_692[0] > threshold_f) {
+            unsigned long long dst_48 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_48] = __uint_as_float(keys_692[0]);
+            out_idx[dst_48] = idxs_693[0];
+            g_1 = g_1 + 1;
+        } else if (ties_694[0] && rank_733 < eq_take) {
+            unsigned long long dst2_8 = eq_base + (unsigned long long)rank_733;
+            out_vals[dst2_8] = __uint_as_float(keys_692[0]);
+            out_idx[dst2_8] = idxs_693[0];
+        }
+        if (ties_694[0]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_734 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_735 = vec_rank_734;
+        if (keys_692[1] > threshold_f) {
+            unsigned long long dst_49 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_49] = __uint_as_float(keys_692[1]);
+            out_idx[dst_49] = idxs_693[1];
+            g_1 = g_1 + 1;
+        } else if (ties_694[1] && rank_735 < eq_take) {
+            unsigned long long dst2_9 = eq_base + (unsigned long long)rank_735;
+            out_vals[dst2_9] = __uint_as_float(keys_692[1]);
+            out_idx[dst2_9] = idxs_693[1];
+        }
+        if (ties_694[1]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_736 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_737 = vec_rank_736;
+        if (keys_692[2] > threshold_f) {
+            unsigned long long dst_50 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_50] = __uint_as_float(keys_692[2]);
+            out_idx[dst_50] = idxs_693[2];
+            g_1 = g_1 + 1;
+        } else if (ties_694[2] && rank_737 < eq_take) {
+            unsigned long long dst2_10 = eq_base + (unsigned long long)rank_737;
+            out_vals[dst2_10] = __uint_as_float(keys_692[2]);
+            out_idx[dst2_10] = idxs_693[2];
+        }
+        if (ties_694[2]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int vec_rank_738 = grp_base_730 + grp_warp_696 + grp_lane_697 + own_731;
+        unsigned int rank_739 = vec_rank_738;
+        if (keys_692[3] > threshold_f) {
+            unsigned long long dst_51 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_51] = __uint_as_float(keys_692[3]);
+            out_idx[dst_51] = idxs_693[3];
+            g_1 = g_1 + 1;
+        } else if (ties_694[3] && rank_739 < eq_take) {
+            unsigned long long dst2_11 = eq_base + (unsigned long long)rank_739;
+            out_vals[dst2_11] = __uint_as_float(keys_692[3]);
+            out_idx[dst2_11] = idxs_693[3];
+        }
+        if (ties_694[3]) {
+            own_731 = own_731 + 1;
+        }
+        unsigned int keys_740[4];
+        int idxs_741[4];
+        bool ties_742[4];
+        unsigned int strided_743[4];
+        unsigned int grp_warp_744 = 0;
+        unsigned int grp_lane_745 = 0;
+        unsigned int bits_746 = __as_u32(vals[12]);
+        unsigned int key_747 = ((bits_746 <= 2139095040) ? bits_746 : 0);
+        keys_740[0] = key_747;
+        int i_vec_748 = start + 6144 + tid * 4;
+        int i_str_749 = start + 6144 + tid;
+        int i_750 = i_vec_748;
+        idxs_741[0] = i_750;
+        ties_742[0] = keys_740[0] == threshold_f && idxs_741[0] < vocab;
+        unsigned int m_751 = __ballot_sync(0xFFFFFFFF, ties_742[0]);
+        unsigned int lane_before_752 = (unsigned int)__popc(m_751 & lt_mask);
+        unsigned int warp_off_753 = cnt[192 + warp];
+        strided_743[0] = warp_off_753 + lane_before_752;
+        grp_warp_744 = grp_warp_744 + (warp_off_753 - cnt[192]);
+        grp_lane_745 = grp_lane_745 + lane_before_752;
+        unsigned int bits_754 = __as_u32(vals[13]);
+        unsigned int key_755 = ((bits_754 <= 2139095040) ? bits_754 : 0);
+        keys_740[1] = key_755;
+        int i_vec_756 = start + 6144 + tid * 4 + 1;
+        int i_str_757 = start + 6656 + tid;
+        int i_758 = i_vec_756;
+        idxs_741[1] = i_758;
+        ties_742[1] = keys_740[1] == threshold_f && idxs_741[1] < vocab;
+        unsigned int m_759 = __ballot_sync(0xFFFFFFFF, ties_742[1]);
+        unsigned int lane_before_760 = (unsigned int)__popc(m_759 & lt_mask);
+        unsigned int warp_off_761 = cnt[208 + warp];
+        strided_743[1] = warp_off_761 + lane_before_760;
+        grp_warp_744 = grp_warp_744 + (warp_off_761 - cnt[208]);
+        grp_lane_745 = grp_lane_745 + lane_before_760;
+        unsigned int bits_762 = __as_u32(vals[14]);
+        unsigned int key_763 = ((bits_762 <= 2139095040) ? bits_762 : 0);
+        keys_740[2] = key_763;
+        int i_vec_764 = start + 6144 + tid * 4 + 2;
+        int i_str_765 = start + 7168 + tid;
+        int i_766 = i_vec_764;
+        idxs_741[2] = i_766;
+        ties_742[2] = keys_740[2] == threshold_f && idxs_741[2] < vocab;
+        unsigned int m_767 = __ballot_sync(0xFFFFFFFF, ties_742[2]);
+        unsigned int lane_before_768 = (unsigned int)__popc(m_767 & lt_mask);
+        unsigned int warp_off_769 = cnt[224 + warp];
+        strided_743[2] = warp_off_769 + lane_before_768;
+        grp_warp_744 = grp_warp_744 + (warp_off_769 - cnt[224]);
+        grp_lane_745 = grp_lane_745 + lane_before_768;
+        unsigned int bits_770 = __as_u32(vals[15]);
+        unsigned int key_771 = ((bits_770 <= 2139095040) ? bits_770 : 0);
+        keys_740[3] = key_771;
+        int i_vec_772 = start + 6144 + tid * 4 + 3;
+        int i_str_773 = start + 7680 + tid;
+        int i_774 = i_vec_772;
+        idxs_741[3] = i_774;
+        ties_742[3] = keys_740[3] == threshold_f && idxs_741[3] < vocab;
+        unsigned int m_775 = __ballot_sync(0xFFFFFFFF, ties_742[3]);
+        unsigned int lane_before_776 = (unsigned int)__popc(m_775 & lt_mask);
+        unsigned int warp_off_777 = cnt[240 + warp];
+        strided_743[3] = warp_off_777 + lane_before_776;
+        grp_warp_744 = grp_warp_744 + (warp_off_777 - cnt[240]);
+        grp_lane_745 = grp_lane_745 + lane_before_776;
+        unsigned int grp_base_778 = cnt[192];
+        unsigned int own_779 = 0;
+        unsigned int vec_rank_780 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_781 = vec_rank_780;
+        if (keys_740[0] > threshold_f) {
+            unsigned long long dst_52 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_52] = __uint_as_float(keys_740[0]);
+            out_idx[dst_52] = idxs_741[0];
+            g_1 = g_1 + 1;
+        } else if (ties_742[0] && rank_781 < eq_take) {
+            unsigned long long dst2_12 = eq_base + (unsigned long long)rank_781;
+            out_vals[dst2_12] = __uint_as_float(keys_740[0]);
+            out_idx[dst2_12] = idxs_741[0];
+        }
+        if (ties_742[0]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_782 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_783 = vec_rank_782;
+        if (keys_740[1] > threshold_f) {
+            unsigned long long dst_53 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_53] = __uint_as_float(keys_740[1]);
+            out_idx[dst_53] = idxs_741[1];
+            g_1 = g_1 + 1;
+        } else if (ties_742[1] && rank_783 < eq_take) {
+            unsigned long long dst2_13 = eq_base + (unsigned long long)rank_783;
+            out_vals[dst2_13] = __uint_as_float(keys_740[1]);
+            out_idx[dst2_13] = idxs_741[1];
+        }
+        if (ties_742[1]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_784 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_785 = vec_rank_784;
+        if (keys_740[2] > threshold_f) {
+            unsigned long long dst_54 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_54] = __uint_as_float(keys_740[2]);
+            out_idx[dst_54] = idxs_741[2];
+            g_1 = g_1 + 1;
+        } else if (ties_742[2] && rank_785 < eq_take) {
+            unsigned long long dst2_14 = eq_base + (unsigned long long)rank_785;
+            out_vals[dst2_14] = __uint_as_float(keys_740[2]);
+            out_idx[dst2_14] = idxs_741[2];
+        }
+        if (ties_742[2]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int vec_rank_786 = grp_base_778 + grp_warp_744 + grp_lane_745 + own_779;
+        unsigned int rank_787 = vec_rank_786;
+        if (keys_740[3] > threshold_f) {
+            unsigned long long dst_55 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_55] = __uint_as_float(keys_740[3]);
+            out_idx[dst_55] = idxs_741[3];
+            g_1 = g_1 + 1;
+        } else if (ties_742[3] && rank_787 < eq_take) {
+            unsigned long long dst2_15 = eq_base + (unsigned long long)rank_787;
+            out_vals[dst2_15] = __uint_as_float(keys_740[3]);
+            out_idx[dst2_15] = idxs_741[3];
+        }
+        if (ties_742[3]) {
+            own_779 = own_779 + 1;
+        }
+        unsigned int keys_788[4];
+        int idxs_789[4];
+        bool ties_790[4];
+        unsigned int strided_791[4];
+        unsigned int grp_warp_792 = 0;
+        unsigned int grp_lane_793 = 0;
+        unsigned int bits_794 = __as_u32(vals[16]);
+        unsigned int key_795 = ((bits_794 <= 2139095040) ? bits_794 : 0);
+        keys_788[0] = key_795;
+        int i_vec_796 = start + 8192 + tid * 4;
+        int i_str_797 = start + 8192 + tid;
+        int i_798 = i_vec_796;
+        idxs_789[0] = i_798;
+        ties_790[0] = keys_788[0] == threshold_f && idxs_789[0] < vocab;
+        unsigned int m_799 = __ballot_sync(0xFFFFFFFF, ties_790[0]);
+        unsigned int lane_before_800 = (unsigned int)__popc(m_799 & lt_mask);
+        unsigned int warp_off_801 = cnt[256 + warp];
+        strided_791[0] = warp_off_801 + lane_before_800;
+        grp_warp_792 = grp_warp_792 + (warp_off_801 - cnt[256]);
+        grp_lane_793 = grp_lane_793 + lane_before_800;
+        unsigned int bits_802 = __as_u32(vals[17]);
+        unsigned int key_803 = ((bits_802 <= 2139095040) ? bits_802 : 0);
+        keys_788[1] = key_803;
+        int i_vec_804 = start + 8192 + tid * 4 + 1;
+        int i_str_805 = start + 8704 + tid;
+        int i_806 = i_vec_804;
+        idxs_789[1] = i_806;
+        ties_790[1] = keys_788[1] == threshold_f && idxs_789[1] < vocab;
+        unsigned int m_807 = __ballot_sync(0xFFFFFFFF, ties_790[1]);
+        unsigned int lane_before_808 = (unsigned int)__popc(m_807 & lt_mask);
+        unsigned int warp_off_809 = cnt[272 + warp];
+        strided_791[1] = warp_off_809 + lane_before_808;
+        grp_warp_792 = grp_warp_792 + (warp_off_809 - cnt[272]);
+        grp_lane_793 = grp_lane_793 + lane_before_808;
+        unsigned int bits_810 = __as_u32(vals[18]);
+        unsigned int key_811 = ((bits_810 <= 2139095040) ? bits_810 : 0);
+        keys_788[2] = key_811;
+        int i_vec_812 = start + 8192 + tid * 4 + 2;
+        int i_str_813 = start + 9216 + tid;
+        int i_814 = i_vec_812;
+        idxs_789[2] = i_814;
+        ties_790[2] = keys_788[2] == threshold_f && idxs_789[2] < vocab;
+        unsigned int m_815 = __ballot_sync(0xFFFFFFFF, ties_790[2]);
+        unsigned int lane_before_816 = (unsigned int)__popc(m_815 & lt_mask);
+        unsigned int warp_off_817 = cnt[288 + warp];
+        strided_791[2] = warp_off_817 + lane_before_816;
+        grp_warp_792 = grp_warp_792 + (warp_off_817 - cnt[288]);
+        grp_lane_793 = grp_lane_793 + lane_before_816;
+        unsigned int bits_818 = __as_u32(vals[19]);
+        unsigned int key_819 = ((bits_818 <= 2139095040) ? bits_818 : 0);
+        keys_788[3] = key_819;
+        int i_vec_820 = start + 8192 + tid * 4 + 3;
+        int i_str_821 = start + 9728 + tid;
+        int i_822 = i_vec_820;
+        idxs_789[3] = i_822;
+        ties_790[3] = keys_788[3] == threshold_f && idxs_789[3] < vocab;
+        unsigned int m_823 = __ballot_sync(0xFFFFFFFF, ties_790[3]);
+        unsigned int lane_before_824 = (unsigned int)__popc(m_823 & lt_mask);
+        unsigned int warp_off_825 = cnt[304 + warp];
+        strided_791[3] = warp_off_825 + lane_before_824;
+        grp_warp_792 = grp_warp_792 + (warp_off_825 - cnt[304]);
+        grp_lane_793 = grp_lane_793 + lane_before_824;
+        unsigned int grp_base_826 = cnt[256];
+        unsigned int own_827 = 0;
+        unsigned int vec_rank_828 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_829 = vec_rank_828;
+        if (keys_788[0] > threshold_f) {
+            unsigned long long dst_56 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_56] = __uint_as_float(keys_788[0]);
+            out_idx[dst_56] = idxs_789[0];
+            g_1 = g_1 + 1;
+        } else if (ties_790[0] && rank_829 < eq_take) {
+            unsigned long long dst2_16 = eq_base + (unsigned long long)rank_829;
+            out_vals[dst2_16] = __uint_as_float(keys_788[0]);
+            out_idx[dst2_16] = idxs_789[0];
+        }
+        if (ties_790[0]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_830 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_831 = vec_rank_830;
+        if (keys_788[1] > threshold_f) {
+            unsigned long long dst_57 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_57] = __uint_as_float(keys_788[1]);
+            out_idx[dst_57] = idxs_789[1];
+            g_1 = g_1 + 1;
+        } else if (ties_790[1] && rank_831 < eq_take) {
+            unsigned long long dst2_17 = eq_base + (unsigned long long)rank_831;
+            out_vals[dst2_17] = __uint_as_float(keys_788[1]);
+            out_idx[dst2_17] = idxs_789[1];
+        }
+        if (ties_790[1]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_832 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_833 = vec_rank_832;
+        if (keys_788[2] > threshold_f) {
+            unsigned long long dst_58 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_58] = __uint_as_float(keys_788[2]);
+            out_idx[dst_58] = idxs_789[2];
+            g_1 = g_1 + 1;
+        } else if (ties_790[2] && rank_833 < eq_take) {
+            unsigned long long dst2_18 = eq_base + (unsigned long long)rank_833;
+            out_vals[dst2_18] = __uint_as_float(keys_788[2]);
+            out_idx[dst2_18] = idxs_789[2];
+        }
+        if (ties_790[2]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int vec_rank_834 = grp_base_826 + grp_warp_792 + grp_lane_793 + own_827;
+        unsigned int rank_835 = vec_rank_834;
+        if (keys_788[3] > threshold_f) {
+            unsigned long long dst_59 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_59] = __uint_as_float(keys_788[3]);
+            out_idx[dst_59] = idxs_789[3];
+            g_1 = g_1 + 1;
+        } else if (ties_790[3] && rank_835 < eq_take) {
+            unsigned long long dst2_19 = eq_base + (unsigned long long)rank_835;
+            out_vals[dst2_19] = __uint_as_float(keys_788[3]);
+            out_idx[dst2_19] = idxs_789[3];
+        }
+        if (ties_790[3]) {
+            own_827 = own_827 + 1;
+        }
+        unsigned int keys_836[4];
+        int idxs_837[4];
+        bool ties_838[4];
+        unsigned int strided_839[4];
+        unsigned int grp_warp_840 = 0;
+        unsigned int grp_lane_841 = 0;
+        unsigned int bits_842 = __as_u32(vals[20]);
+        unsigned int key_843 = ((bits_842 <= 2139095040) ? bits_842 : 0);
+        keys_836[0] = key_843;
+        int i_vec_844 = start + 10240 + tid * 4;
+        int i_str_845 = start + 10240 + tid;
+        int i_846 = i_vec_844;
+        idxs_837[0] = i_846;
+        ties_838[0] = keys_836[0] == threshold_f && idxs_837[0] < vocab;
+        unsigned int m_847 = __ballot_sync(0xFFFFFFFF, ties_838[0]);
+        unsigned int lane_before_848 = (unsigned int)__popc(m_847 & lt_mask);
+        unsigned int warp_off_849 = cnt[320 + warp];
+        strided_839[0] = warp_off_849 + lane_before_848;
+        grp_warp_840 = grp_warp_840 + (warp_off_849 - cnt[320]);
+        grp_lane_841 = grp_lane_841 + lane_before_848;
+        unsigned int bits_850 = __as_u32(vals[21]);
+        unsigned int key_851 = ((bits_850 <= 2139095040) ? bits_850 : 0);
+        keys_836[1] = key_851;
+        int i_vec_852 = start + 10240 + tid * 4 + 1;
+        int i_str_853 = start + 10752 + tid;
+        int i_854 = i_vec_852;
+        idxs_837[1] = i_854;
+        ties_838[1] = keys_836[1] == threshold_f && idxs_837[1] < vocab;
+        unsigned int m_855 = __ballot_sync(0xFFFFFFFF, ties_838[1]);
+        unsigned int lane_before_856 = (unsigned int)__popc(m_855 & lt_mask);
+        unsigned int warp_off_857 = cnt[336 + warp];
+        strided_839[1] = warp_off_857 + lane_before_856;
+        grp_warp_840 = grp_warp_840 + (warp_off_857 - cnt[336]);
+        grp_lane_841 = grp_lane_841 + lane_before_856;
+        unsigned int bits_858 = __as_u32(vals[22]);
+        unsigned int key_859 = ((bits_858 <= 2139095040) ? bits_858 : 0);
+        keys_836[2] = key_859;
+        int i_vec_860 = start + 10240 + tid * 4 + 2;
+        int i_str_861 = start + 11264 + tid;
+        int i_862 = i_vec_860;
+        idxs_837[2] = i_862;
+        ties_838[2] = keys_836[2] == threshold_f && idxs_837[2] < vocab;
+        unsigned int m_863 = __ballot_sync(0xFFFFFFFF, ties_838[2]);
+        unsigned int lane_before_864 = (unsigned int)__popc(m_863 & lt_mask);
+        unsigned int warp_off_865 = cnt[352 + warp];
+        strided_839[2] = warp_off_865 + lane_before_864;
+        grp_warp_840 = grp_warp_840 + (warp_off_865 - cnt[352]);
+        grp_lane_841 = grp_lane_841 + lane_before_864;
+        unsigned int bits_866 = __as_u32(vals[23]);
+        unsigned int key_867 = ((bits_866 <= 2139095040) ? bits_866 : 0);
+        keys_836[3] = key_867;
+        int i_vec_868 = start + 10240 + tid * 4 + 3;
+        int i_str_869 = start + 11776 + tid;
+        int i_870 = i_vec_868;
+        idxs_837[3] = i_870;
+        ties_838[3] = keys_836[3] == threshold_f && idxs_837[3] < vocab;
+        unsigned int m_871 = __ballot_sync(0xFFFFFFFF, ties_838[3]);
+        unsigned int lane_before_872 = (unsigned int)__popc(m_871 & lt_mask);
+        unsigned int warp_off_873 = cnt[368 + warp];
+        strided_839[3] = warp_off_873 + lane_before_872;
+        grp_warp_840 = grp_warp_840 + (warp_off_873 - cnt[368]);
+        grp_lane_841 = grp_lane_841 + lane_before_872;
+        unsigned int grp_base_874 = cnt[320];
+        unsigned int own_875 = 0;
+        unsigned int vec_rank_876 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_877 = vec_rank_876;
+        if (keys_836[0] > threshold_f) {
+            unsigned long long dst_60 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_60] = __uint_as_float(keys_836[0]);
+            out_idx[dst_60] = idxs_837[0];
+            g_1 = g_1 + 1;
+        } else if (ties_838[0] && rank_877 < eq_take) {
+            unsigned long long dst2_20 = eq_base + (unsigned long long)rank_877;
+            out_vals[dst2_20] = __uint_as_float(keys_836[0]);
+            out_idx[dst2_20] = idxs_837[0];
+        }
+        if (ties_838[0]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_878 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_879 = vec_rank_878;
+        if (keys_836[1] > threshold_f) {
+            unsigned long long dst_61 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_61] = __uint_as_float(keys_836[1]);
+            out_idx[dst_61] = idxs_837[1];
+            g_1 = g_1 + 1;
+        } else if (ties_838[1] && rank_879 < eq_take) {
+            unsigned long long dst2_21 = eq_base + (unsigned long long)rank_879;
+            out_vals[dst2_21] = __uint_as_float(keys_836[1]);
+            out_idx[dst2_21] = idxs_837[1];
+        }
+        if (ties_838[1]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_880 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_881 = vec_rank_880;
+        if (keys_836[2] > threshold_f) {
+            unsigned long long dst_62 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_62] = __uint_as_float(keys_836[2]);
+            out_idx[dst_62] = idxs_837[2];
+            g_1 = g_1 + 1;
+        } else if (ties_838[2] && rank_881 < eq_take) {
+            unsigned long long dst2_22 = eq_base + (unsigned long long)rank_881;
+            out_vals[dst2_22] = __uint_as_float(keys_836[2]);
+            out_idx[dst2_22] = idxs_837[2];
+        }
+        if (ties_838[2]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int vec_rank_882 = grp_base_874 + grp_warp_840 + grp_lane_841 + own_875;
+        unsigned int rank_883 = vec_rank_882;
+        if (keys_836[3] > threshold_f) {
+            unsigned long long dst_63 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_63] = __uint_as_float(keys_836[3]);
+            out_idx[dst_63] = idxs_837[3];
+            g_1 = g_1 + 1;
+        } else if (ties_838[3] && rank_883 < eq_take) {
+            unsigned long long dst2_23 = eq_base + (unsigned long long)rank_883;
+            out_vals[dst2_23] = __uint_as_float(keys_836[3]);
+            out_idx[dst2_23] = idxs_837[3];
+        }
+        if (ties_838[3]) {
+            own_875 = own_875 + 1;
+        }
+        unsigned int keys_884[4];
+        int idxs_885[4];
+        bool ties_886[4];
+        unsigned int strided_887[4];
+        unsigned int grp_warp_888 = 0;
+        unsigned int grp_lane_889 = 0;
+        unsigned int bits_890 = __as_u32(vals[24]);
+        unsigned int key_891 = ((bits_890 <= 2139095040) ? bits_890 : 0);
+        keys_884[0] = key_891;
+        int i_vec_892 = start + 12288 + tid * 4;
+        int i_str_893 = start + 12288 + tid;
+        int i_894 = i_vec_892;
+        idxs_885[0] = i_894;
+        ties_886[0] = keys_884[0] == threshold_f && idxs_885[0] < vocab;
+        unsigned int m_895 = __ballot_sync(0xFFFFFFFF, ties_886[0]);
+        unsigned int lane_before_896 = (unsigned int)__popc(m_895 & lt_mask);
+        unsigned int warp_off_897 = cnt[384 + warp];
+        strided_887[0] = warp_off_897 + lane_before_896;
+        grp_warp_888 = grp_warp_888 + (warp_off_897 - cnt[384]);
+        grp_lane_889 = grp_lane_889 + lane_before_896;
+        unsigned int bits_898 = __as_u32(vals[25]);
+        unsigned int key_899 = ((bits_898 <= 2139095040) ? bits_898 : 0);
+        keys_884[1] = key_899;
+        int i_vec_900 = start + 12288 + tid * 4 + 1;
+        int i_str_901 = start + 12800 + tid;
+        int i_902 = i_vec_900;
+        idxs_885[1] = i_902;
+        ties_886[1] = keys_884[1] == threshold_f && idxs_885[1] < vocab;
+        unsigned int m_903 = __ballot_sync(0xFFFFFFFF, ties_886[1]);
+        unsigned int lane_before_904 = (unsigned int)__popc(m_903 & lt_mask);
+        unsigned int warp_off_905 = cnt[400 + warp];
+        strided_887[1] = warp_off_905 + lane_before_904;
+        grp_warp_888 = grp_warp_888 + (warp_off_905 - cnt[400]);
+        grp_lane_889 = grp_lane_889 + lane_before_904;
+        unsigned int bits_906 = __as_u32(vals[26]);
+        unsigned int key_907 = ((bits_906 <= 2139095040) ? bits_906 : 0);
+        keys_884[2] = key_907;
+        int i_vec_908 = start + 12288 + tid * 4 + 2;
+        int i_str_909 = start + 13312 + tid;
+        int i_910 = i_vec_908;
+        idxs_885[2] = i_910;
+        ties_886[2] = keys_884[2] == threshold_f && idxs_885[2] < vocab;
+        unsigned int m_911 = __ballot_sync(0xFFFFFFFF, ties_886[2]);
+        unsigned int lane_before_912 = (unsigned int)__popc(m_911 & lt_mask);
+        unsigned int warp_off_913 = cnt[416 + warp];
+        strided_887[2] = warp_off_913 + lane_before_912;
+        grp_warp_888 = grp_warp_888 + (warp_off_913 - cnt[416]);
+        grp_lane_889 = grp_lane_889 + lane_before_912;
+        unsigned int bits_914 = __as_u32(vals[27]);
+        unsigned int key_915 = ((bits_914 <= 2139095040) ? bits_914 : 0);
+        keys_884[3] = key_915;
+        int i_vec_916 = start + 12288 + tid * 4 + 3;
+        int i_str_917 = start + 13824 + tid;
+        int i_918 = i_vec_916;
+        idxs_885[3] = i_918;
+        ties_886[3] = keys_884[3] == threshold_f && idxs_885[3] < vocab;
+        unsigned int m_919 = __ballot_sync(0xFFFFFFFF, ties_886[3]);
+        unsigned int lane_before_920 = (unsigned int)__popc(m_919 & lt_mask);
+        unsigned int warp_off_921 = cnt[432 + warp];
+        strided_887[3] = warp_off_921 + lane_before_920;
+        grp_warp_888 = grp_warp_888 + (warp_off_921 - cnt[432]);
+        grp_lane_889 = grp_lane_889 + lane_before_920;
+        unsigned int grp_base_922 = cnt[384];
+        unsigned int own_923 = 0;
+        unsigned int vec_rank_924 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_925 = vec_rank_924;
+        if (keys_884[0] > threshold_f) {
+            unsigned long long dst_64 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_64] = __uint_as_float(keys_884[0]);
+            out_idx[dst_64] = idxs_885[0];
+            g_1 = g_1 + 1;
+        } else if (ties_886[0] && rank_925 < eq_take) {
+            unsigned long long dst2_24 = eq_base + (unsigned long long)rank_925;
+            out_vals[dst2_24] = __uint_as_float(keys_884[0]);
+            out_idx[dst2_24] = idxs_885[0];
+        }
+        if (ties_886[0]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_926 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_927 = vec_rank_926;
+        if (keys_884[1] > threshold_f) {
+            unsigned long long dst_65 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_65] = __uint_as_float(keys_884[1]);
+            out_idx[dst_65] = idxs_885[1];
+            g_1 = g_1 + 1;
+        } else if (ties_886[1] && rank_927 < eq_take) {
+            unsigned long long dst2_25 = eq_base + (unsigned long long)rank_927;
+            out_vals[dst2_25] = __uint_as_float(keys_884[1]);
+            out_idx[dst2_25] = idxs_885[1];
+        }
+        if (ties_886[1]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_928 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_929 = vec_rank_928;
+        if (keys_884[2] > threshold_f) {
+            unsigned long long dst_66 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_66] = __uint_as_float(keys_884[2]);
+            out_idx[dst_66] = idxs_885[2];
+            g_1 = g_1 + 1;
+        } else if (ties_886[2] && rank_929 < eq_take) {
+            unsigned long long dst2_26 = eq_base + (unsigned long long)rank_929;
+            out_vals[dst2_26] = __uint_as_float(keys_884[2]);
+            out_idx[dst2_26] = idxs_885[2];
+        }
+        if (ties_886[2]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int vec_rank_930 = grp_base_922 + grp_warp_888 + grp_lane_889 + own_923;
+        unsigned int rank_931 = vec_rank_930;
+        if (keys_884[3] > threshold_f) {
+            unsigned long long dst_67 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_67] = __uint_as_float(keys_884[3]);
+            out_idx[dst_67] = idxs_885[3];
+            g_1 = g_1 + 1;
+        } else if (ties_886[3] && rank_931 < eq_take) {
+            unsigned long long dst2_27 = eq_base + (unsigned long long)rank_931;
+            out_vals[dst2_27] = __uint_as_float(keys_884[3]);
+            out_idx[dst2_27] = idxs_885[3];
+        }
+        if (ties_886[3]) {
+            own_923 = own_923 + 1;
+        }
+        unsigned int keys_932[4];
+        int idxs_933[4];
+        bool ties_934[4];
+        unsigned int strided_935[4];
+        unsigned int grp_warp_936 = 0;
+        unsigned int grp_lane_937 = 0;
+        unsigned int bits_938 = __as_u32(vals[28]);
+        unsigned int key_939 = ((bits_938 <= 2139095040) ? bits_938 : 0);
+        keys_932[0] = key_939;
+        int i_vec_940 = start + 14336 + tid * 4;
+        int i_str_941 = start + 14336 + tid;
+        int i_942 = i_vec_940;
+        idxs_933[0] = i_942;
+        ties_934[0] = keys_932[0] == threshold_f && idxs_933[0] < vocab;
+        unsigned int m_943 = __ballot_sync(0xFFFFFFFF, ties_934[0]);
+        unsigned int lane_before_944 = (unsigned int)__popc(m_943 & lt_mask);
+        unsigned int warp_off_945 = cnt[448 + warp];
+        strided_935[0] = warp_off_945 + lane_before_944;
+        grp_warp_936 = grp_warp_936 + (warp_off_945 - cnt[448]);
+        grp_lane_937 = grp_lane_937 + lane_before_944;
+        unsigned int bits_946 = __as_u32(vals[29]);
+        unsigned int key_947 = ((bits_946 <= 2139095040) ? bits_946 : 0);
+        keys_932[1] = key_947;
+        int i_vec_948 = start + 14336 + tid * 4 + 1;
+        int i_str_949 = start + 14848 + tid;
+        int i_950 = i_vec_948;
+        idxs_933[1] = i_950;
+        ties_934[1] = keys_932[1] == threshold_f && idxs_933[1] < vocab;
+        unsigned int m_951 = __ballot_sync(0xFFFFFFFF, ties_934[1]);
+        unsigned int lane_before_952 = (unsigned int)__popc(m_951 & lt_mask);
+        unsigned int warp_off_953 = cnt[464 + warp];
+        strided_935[1] = warp_off_953 + lane_before_952;
+        grp_warp_936 = grp_warp_936 + (warp_off_953 - cnt[464]);
+        grp_lane_937 = grp_lane_937 + lane_before_952;
+        unsigned int bits_954 = __as_u32(vals[30]);
+        unsigned int key_955 = ((bits_954 <= 2139095040) ? bits_954 : 0);
+        keys_932[2] = key_955;
+        int i_vec_956 = start + 14336 + tid * 4 + 2;
+        int i_str_957 = start + 15360 + tid;
+        int i_958 = i_vec_956;
+        idxs_933[2] = i_958;
+        ties_934[2] = keys_932[2] == threshold_f && idxs_933[2] < vocab;
+        unsigned int m_959 = __ballot_sync(0xFFFFFFFF, ties_934[2]);
+        unsigned int lane_before_960 = (unsigned int)__popc(m_959 & lt_mask);
+        unsigned int warp_off_961 = cnt[480 + warp];
+        strided_935[2] = warp_off_961 + lane_before_960;
+        grp_warp_936 = grp_warp_936 + (warp_off_961 - cnt[480]);
+        grp_lane_937 = grp_lane_937 + lane_before_960;
+        unsigned int bits_962 = __as_u32(vals[31]);
+        unsigned int key_963 = ((bits_962 <= 2139095040) ? bits_962 : 0);
+        keys_932[3] = key_963;
+        int i_vec_964 = start + 14336 + tid * 4 + 3;
+        int i_str_965 = start + 15872 + tid;
+        int i_966 = i_vec_964;
+        idxs_933[3] = i_966;
+        ties_934[3] = keys_932[3] == threshold_f && idxs_933[3] < vocab;
+        unsigned int m_967 = __ballot_sync(0xFFFFFFFF, ties_934[3]);
+        unsigned int lane_before_968 = (unsigned int)__popc(m_967 & lt_mask);
+        unsigned int warp_off_969 = cnt[496 + warp];
+        strided_935[3] = warp_off_969 + lane_before_968;
+        grp_warp_936 = grp_warp_936 + (warp_off_969 - cnt[496]);
+        grp_lane_937 = grp_lane_937 + lane_before_968;
+        unsigned int grp_base_970 = cnt[448];
+        unsigned int own_971 = 0;
+        unsigned int vec_rank_972 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_973 = vec_rank_972;
+        if (keys_932[0] > threshold_f) {
+            unsigned long long dst_68 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_68] = __uint_as_float(keys_932[0]);
+            out_idx[dst_68] = idxs_933[0];
+            g_1 = g_1 + 1;
+        } else if (ties_934[0] && rank_973 < eq_take) {
+            unsigned long long dst2_28 = eq_base + (unsigned long long)rank_973;
+            out_vals[dst2_28] = __uint_as_float(keys_932[0]);
+            out_idx[dst2_28] = idxs_933[0];
+        }
+        if (ties_934[0]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_974 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_975 = vec_rank_974;
+        if (keys_932[1] > threshold_f) {
+            unsigned long long dst_69 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_69] = __uint_as_float(keys_932[1]);
+            out_idx[dst_69] = idxs_933[1];
+            g_1 = g_1 + 1;
+        } else if (ties_934[1] && rank_975 < eq_take) {
+            unsigned long long dst2_29 = eq_base + (unsigned long long)rank_975;
+            out_vals[dst2_29] = __uint_as_float(keys_932[1]);
+            out_idx[dst2_29] = idxs_933[1];
+        }
+        if (ties_934[1]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_976 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_977 = vec_rank_976;
+        if (keys_932[2] > threshold_f) {
+            unsigned long long dst_70 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_70] = __uint_as_float(keys_932[2]);
+            out_idx[dst_70] = idxs_933[2];
+            g_1 = g_1 + 1;
+        } else if (ties_934[2] && rank_977 < eq_take) {
+            unsigned long long dst2_30 = eq_base + (unsigned long long)rank_977;
+            out_vals[dst2_30] = __uint_as_float(keys_932[2]);
+            out_idx[dst2_30] = idxs_933[2];
+        }
+        if (ties_934[2]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int vec_rank_978 = grp_base_970 + grp_warp_936 + grp_lane_937 + own_971;
+        unsigned int rank_979 = vec_rank_978;
+        if (keys_932[3] > threshold_f) {
+            unsigned long long dst_71 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_71] = __uint_as_float(keys_932[3]);
+            out_idx[dst_71] = idxs_933[3];
+            g_1 = g_1 + 1;
+        } else if (ties_934[3] && rank_979 < eq_take) {
+            unsigned long long dst2_31 = eq_base + (unsigned long long)rank_979;
+            out_vals[dst2_31] = __uint_as_float(keys_932[3]);
+            out_idx[dst2_31] = idxs_933[3];
+        }
+        if (ties_934[3]) {
+            own_971 = own_971 + 1;
+        }
+        unsigned int keys_980[4];
+        int idxs_981[4];
+        bool ties_982[4];
+        unsigned int strided_983[4];
+        unsigned int grp_warp_984 = 0;
+        unsigned int grp_lane_985 = 0;
+        unsigned int bits_986 = __as_u32(vals[32]);
+        unsigned int key_987 = ((bits_986 <= 2139095040) ? bits_986 : 0);
+        keys_980[0] = key_987;
+        int i_vec_988 = start + 16384 + tid * 4;
+        int i_str_989 = start + 16384 + tid;
+        int i_990 = i_vec_988;
+        idxs_981[0] = i_990;
+        ties_982[0] = keys_980[0] == threshold_f && idxs_981[0] < vocab;
+        unsigned int m_991 = __ballot_sync(0xFFFFFFFF, ties_982[0]);
+        unsigned int lane_before_992 = (unsigned int)__popc(m_991 & lt_mask);
+        unsigned int warp_off_993 = cnt[512 + warp];
+        strided_983[0] = warp_off_993 + lane_before_992;
+        grp_warp_984 = grp_warp_984 + (warp_off_993 - cnt[512]);
+        grp_lane_985 = grp_lane_985 + lane_before_992;
+        unsigned int bits_994 = __as_u32(vals[33]);
+        unsigned int key_995 = ((bits_994 <= 2139095040) ? bits_994 : 0);
+        keys_980[1] = key_995;
+        int i_vec_996 = start + 16384 + tid * 4 + 1;
+        int i_str_997 = start + 16896 + tid;
+        int i_998 = i_vec_996;
+        idxs_981[1] = i_998;
+        ties_982[1] = keys_980[1] == threshold_f && idxs_981[1] < vocab;
+        unsigned int m_999 = __ballot_sync(0xFFFFFFFF, ties_982[1]);
+        unsigned int lane_before_1000 = (unsigned int)__popc(m_999 & lt_mask);
+        unsigned int warp_off_1001 = cnt[528 + warp];
+        strided_983[1] = warp_off_1001 + lane_before_1000;
+        grp_warp_984 = grp_warp_984 + (warp_off_1001 - cnt[528]);
+        grp_lane_985 = grp_lane_985 + lane_before_1000;
+        unsigned int bits_1002 = __as_u32(vals[34]);
+        unsigned int key_1003 = ((bits_1002 <= 2139095040) ? bits_1002 : 0);
+        keys_980[2] = key_1003;
+        int i_vec_1004 = start + 16384 + tid * 4 + 2;
+        int i_str_1005 = start + 17408 + tid;
+        int i_1006 = i_vec_1004;
+        idxs_981[2] = i_1006;
+        ties_982[2] = keys_980[2] == threshold_f && idxs_981[2] < vocab;
+        unsigned int m_1007 = __ballot_sync(0xFFFFFFFF, ties_982[2]);
+        unsigned int lane_before_1008 = (unsigned int)__popc(m_1007 & lt_mask);
+        unsigned int warp_off_1009 = cnt[544 + warp];
+        strided_983[2] = warp_off_1009 + lane_before_1008;
+        grp_warp_984 = grp_warp_984 + (warp_off_1009 - cnt[544]);
+        grp_lane_985 = grp_lane_985 + lane_before_1008;
+        unsigned int bits_1010 = __as_u32(vals[35]);
+        unsigned int key_1011 = ((bits_1010 <= 2139095040) ? bits_1010 : 0);
+        keys_980[3] = key_1011;
+        int i_vec_1012 = start + 16384 + tid * 4 + 3;
+        int i_str_1013 = start + 17920 + tid;
+        int i_1014 = i_vec_1012;
+        idxs_981[3] = i_1014;
+        ties_982[3] = keys_980[3] == threshold_f && idxs_981[3] < vocab;
+        unsigned int m_1015 = __ballot_sync(0xFFFFFFFF, ties_982[3]);
+        unsigned int lane_before_1016 = (unsigned int)__popc(m_1015 & lt_mask);
+        unsigned int warp_off_1017 = cnt[560 + warp];
+        strided_983[3] = warp_off_1017 + lane_before_1016;
+        grp_warp_984 = grp_warp_984 + (warp_off_1017 - cnt[560]);
+        grp_lane_985 = grp_lane_985 + lane_before_1016;
+        unsigned int grp_base_1018 = cnt[512];
+        unsigned int own_1019 = 0;
+        unsigned int vec_rank_1020 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1021 = vec_rank_1020;
+        if (keys_980[0] > threshold_f) {
+            unsigned long long dst_72 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_72] = __uint_as_float(keys_980[0]);
+            out_idx[dst_72] = idxs_981[0];
+            g_1 = g_1 + 1;
+        } else if (ties_982[0] && rank_1021 < eq_take) {
+            unsigned long long dst2_32 = eq_base + (unsigned long long)rank_1021;
+            out_vals[dst2_32] = __uint_as_float(keys_980[0]);
+            out_idx[dst2_32] = idxs_981[0];
+        }
+        if (ties_982[0]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1022 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1023 = vec_rank_1022;
+        if (keys_980[1] > threshold_f) {
+            unsigned long long dst_73 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_73] = __uint_as_float(keys_980[1]);
+            out_idx[dst_73] = idxs_981[1];
+            g_1 = g_1 + 1;
+        } else if (ties_982[1] && rank_1023 < eq_take) {
+            unsigned long long dst2_33 = eq_base + (unsigned long long)rank_1023;
+            out_vals[dst2_33] = __uint_as_float(keys_980[1]);
+            out_idx[dst2_33] = idxs_981[1];
+        }
+        if (ties_982[1]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1024 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1025 = vec_rank_1024;
+        if (keys_980[2] > threshold_f) {
+            unsigned long long dst_74 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_74] = __uint_as_float(keys_980[2]);
+            out_idx[dst_74] = idxs_981[2];
+            g_1 = g_1 + 1;
+        } else if (ties_982[2] && rank_1025 < eq_take) {
+            unsigned long long dst2_34 = eq_base + (unsigned long long)rank_1025;
+            out_vals[dst2_34] = __uint_as_float(keys_980[2]);
+            out_idx[dst2_34] = idxs_981[2];
+        }
+        if (ties_982[2]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int vec_rank_1026 = grp_base_1018 + grp_warp_984 + grp_lane_985 + own_1019;
+        unsigned int rank_1027 = vec_rank_1026;
+        if (keys_980[3] > threshold_f) {
+            unsigned long long dst_75 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_75] = __uint_as_float(keys_980[3]);
+            out_idx[dst_75] = idxs_981[3];
+            g_1 = g_1 + 1;
+        } else if (ties_982[3] && rank_1027 < eq_take) {
+            unsigned long long dst2_35 = eq_base + (unsigned long long)rank_1027;
+            out_vals[dst2_35] = __uint_as_float(keys_980[3]);
+            out_idx[dst2_35] = idxs_981[3];
+        }
+        if (ties_982[3]) {
+            own_1019 = own_1019 + 1;
+        }
+        unsigned int keys_1028[4];
+        int idxs_1029[4];
+        bool ties_1030[4];
+        unsigned int strided_1031[4];
+        unsigned int grp_warp_1032 = 0;
+        unsigned int grp_lane_1033 = 0;
+        unsigned int bits_1034 = __as_u32(vals[36]);
+        unsigned int key_1035 = ((bits_1034 <= 2139095040) ? bits_1034 : 0);
+        keys_1028[0] = key_1035;
+        int i_vec_1036 = start + 18432 + tid * 4;
+        int i_str_1037 = start + 18432 + tid;
+        int i_1038 = i_vec_1036;
+        idxs_1029[0] = i_1038;
+        ties_1030[0] = keys_1028[0] == threshold_f && idxs_1029[0] < vocab;
+        unsigned int m_1039 = __ballot_sync(0xFFFFFFFF, ties_1030[0]);
+        unsigned int lane_before_1040 = (unsigned int)__popc(m_1039 & lt_mask);
+        unsigned int warp_off_1041 = cnt[576 + warp];
+        strided_1031[0] = warp_off_1041 + lane_before_1040;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1041 - cnt[576]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1040;
+        unsigned int bits_1042 = __as_u32(vals[37]);
+        unsigned int key_1043 = ((bits_1042 <= 2139095040) ? bits_1042 : 0);
+        keys_1028[1] = key_1043;
+        int i_vec_1044 = start + 18432 + tid * 4 + 1;
+        int i_str_1045 = start + 18944 + tid;
+        int i_1046 = i_vec_1044;
+        idxs_1029[1] = i_1046;
+        ties_1030[1] = keys_1028[1] == threshold_f && idxs_1029[1] < vocab;
+        unsigned int m_1047 = __ballot_sync(0xFFFFFFFF, ties_1030[1]);
+        unsigned int lane_before_1048 = (unsigned int)__popc(m_1047 & lt_mask);
+        unsigned int warp_off_1049 = cnt[592 + warp];
+        strided_1031[1] = warp_off_1049 + lane_before_1048;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1049 - cnt[592]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1048;
+        unsigned int bits_1050 = __as_u32(vals[38]);
+        unsigned int key_1051 = ((bits_1050 <= 2139095040) ? bits_1050 : 0);
+        keys_1028[2] = key_1051;
+        int i_vec_1052 = start + 18432 + tid * 4 + 2;
+        int i_str_1053 = start + 19456 + tid;
+        int i_1054 = i_vec_1052;
+        idxs_1029[2] = i_1054;
+        ties_1030[2] = keys_1028[2] == threshold_f && idxs_1029[2] < vocab;
+        unsigned int m_1055 = __ballot_sync(0xFFFFFFFF, ties_1030[2]);
+        unsigned int lane_before_1056 = (unsigned int)__popc(m_1055 & lt_mask);
+        unsigned int warp_off_1057 = cnt[608 + warp];
+        strided_1031[2] = warp_off_1057 + lane_before_1056;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1057 - cnt[608]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1056;
+        unsigned int bits_1058 = __as_u32(vals[39]);
+        unsigned int key_1059 = ((bits_1058 <= 2139095040) ? bits_1058 : 0);
+        keys_1028[3] = key_1059;
+        int i_vec_1060 = start + 18432 + tid * 4 + 3;
+        int i_str_1061 = start + 19968 + tid;
+        int i_1062 = i_vec_1060;
+        idxs_1029[3] = i_1062;
+        ties_1030[3] = keys_1028[3] == threshold_f && idxs_1029[3] < vocab;
+        unsigned int m_1063 = __ballot_sync(0xFFFFFFFF, ties_1030[3]);
+        unsigned int lane_before_1064 = (unsigned int)__popc(m_1063 & lt_mask);
+        unsigned int warp_off_1065 = cnt[624 + warp];
+        strided_1031[3] = warp_off_1065 + lane_before_1064;
+        grp_warp_1032 = grp_warp_1032 + (warp_off_1065 - cnt[624]);
+        grp_lane_1033 = grp_lane_1033 + lane_before_1064;
+        unsigned int grp_base_1066 = cnt[576];
+        unsigned int own_1067 = 0;
+        unsigned int vec_rank_1068 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1069 = vec_rank_1068;
+        if (keys_1028[0] > threshold_f) {
+            unsigned long long dst_76 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_76] = __uint_as_float(keys_1028[0]);
+            out_idx[dst_76] = idxs_1029[0];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[0] && rank_1069 < eq_take) {
+            unsigned long long dst2_36 = eq_base + (unsigned long long)rank_1069;
+            out_vals[dst2_36] = __uint_as_float(keys_1028[0]);
+            out_idx[dst2_36] = idxs_1029[0];
+        }
+        if (ties_1030[0]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1070 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1071 = vec_rank_1070;
+        if (keys_1028[1] > threshold_f) {
+            unsigned long long dst_77 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_77] = __uint_as_float(keys_1028[1]);
+            out_idx[dst_77] = idxs_1029[1];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[1] && rank_1071 < eq_take) {
+            unsigned long long dst2_37 = eq_base + (unsigned long long)rank_1071;
+            out_vals[dst2_37] = __uint_as_float(keys_1028[1]);
+            out_idx[dst2_37] = idxs_1029[1];
+        }
+        if (ties_1030[1]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1072 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1073 = vec_rank_1072;
+        if (keys_1028[2] > threshold_f) {
+            unsigned long long dst_78 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_78] = __uint_as_float(keys_1028[2]);
+            out_idx[dst_78] = idxs_1029[2];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[2] && rank_1073 < eq_take) {
+            unsigned long long dst2_38 = eq_base + (unsigned long long)rank_1073;
+            out_vals[dst2_38] = __uint_as_float(keys_1028[2]);
+            out_idx[dst2_38] = idxs_1029[2];
+        }
+        if (ties_1030[2]) {
+            own_1067 = own_1067 + 1;
+        }
+        unsigned int vec_rank_1074 = grp_base_1066 + grp_warp_1032 + grp_lane_1033 + own_1067;
+        unsigned int rank_1075 = vec_rank_1074;
+        if (keys_1028[3] > threshold_f) {
+            unsigned long long dst_79 = gt_base + (unsigned long long)g_1;
+            out_vals[dst_79] = __uint_as_float(keys_1028[3]);
+            out_idx[dst_79] = idxs_1029[3];
+            g_1 = g_1 + 1;
+        } else if (ties_1030[3] && rank_1075 < eq_take) {
+            unsigned long long dst2_39 = eq_base + (unsigned long long)rank_1075;
+            out_vals[dst2_39] = __uint_as_float(keys_1028[3]);
+            out_idx[dst2_39] = idxs_1029[3];
+        }
+        if (ties_1030[3]) {
+            own_1067 = own_1067 + 1;
+        }
+        if (rank == 0 && tid == 0) {
+            out_count[row] = k;
+        }
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_CLIST_OFF
+#undef SMEM_CLIST_STAGE_BYTES
+#undef SMEM_CLIST_STRIDE
+#undef SMEM_CNT_OFF
+#undef SMEM_CNT_STAGE_BYTES
+#undef SMEM_CNT_STRIDE
+#undef SMEM_COARSE_OFF
+#undef SMEM_COARSE_STAGE_BYTES
+#undef SMEM_COARSE_STRIDE
+#undef SMEM_HIST0_OFF
+#undef SMEM_HIST0_STAGE_BYTES
+#undef SMEM_HIST0_STRIDE
+#undef SMEM_HIST1_OFF
+#undef SMEM_HIST1_STAGE_BYTES
+#undef SMEM_HIST1_STRIDE
+#undef SMEM_SCAL32_OFF
+#undef SMEM_SCAL32_STAGE_BYTES
+#undef SMEM_SCAL32_STRIDE
+#undef SMEM_SCAL_BU64_OFF
+#undef SMEM_SCAL_BU64_STAGE_BYTES
+#undef SMEM_SCAL_BU64_STRIDE
+#undef SMEM_SCAL_BU_OFF
+#undef SMEM_SCAL_BU_STAGE_BYTES
+#undef SMEM_SCAL_BU_STRIDE
+#undef SMEM_SCAL_OFF
+#undef SMEM_SCAL_STAGE_BYTES
+#undef SMEM_SCAL_STRIDE
+#undef SMEM_TOT64_OFF
+#undef SMEM_TOT64_STAGE_BYTES
+#undef SMEM_TOT64_STRIDE
+#undef SMEM_TOTAL
+#undef SMEM_WARP_SUMS_OFF
+#undef SMEM_WARP_SUMS_STAGE_BYTES
+#undef SMEM_WARP_SUMS_STRIDE
+#undef SMEM_WSUM64_OFF
+#undef SMEM_WSUM64_STAGE_BYTES
+#undef SMEM_WSUM64_STRIDE
+#undef SMEM_XBUF0B_OFF
+#undef SMEM_XBUF0B_STAGE_BYTES
+#undef SMEM_XBUF0B_STRIDE
+#undef SMEM_XBUF1B_OFF
+#undef SMEM_XBUF1B_STAGE_BYTES
+#undef SMEM_XBUF1B_STRIDE
+#undef SMEM_XBUF64_OFF
+#undef SMEM_XBUF64_STAGE_BYTES
+#undef SMEM_XBUF64_STRIDE
+#undef THREADS
+#undef clist_addr
+#undef cnt_addr
+#undef coarse_addr
+#undef hist0_addr
+#undef hist1_addr
+#undef scal32_addr
+#undef scal_addr
+#undef scal_bu64_addr
+#undef scal_bu_addr
+#undef tot64_addr
+#undef warp_sums_addr
+#undef wsum64_addr
+#undef xbuf0b_addr
+#undef xbuf1b_addr
+#undef xbuf64_addr
+
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
