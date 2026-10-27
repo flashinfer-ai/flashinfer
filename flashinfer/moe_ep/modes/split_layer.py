@@ -57,6 +57,7 @@ from ..core.validation.common import (
 )
 from ..weights import MoEWeightPack
 from .config import SplitConfig
+from ..backends.split.comm.nvlink_one_sided.config import NVLinkOneSidedConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
 if TYPE_CHECKING:
@@ -303,11 +304,13 @@ def _communication_backend(backend, kernel: SplitKernelBackend):
     """The communication config for this kernel. A kernel that packs its
     dispatch rows keeps NVLink one-sided's Lamport transport off: it rewrites
     payload words equal to its sentinel, which preserves BF16 values but not
-    other bytes."""
-    if (
-        kernel.packs_dispatch_payload
-        and getattr(backend, "lamport", False) is not False
-    ):
+    other bytes. The backend's name stands for its default config, which has
+    the transport on."""
+    if not kernel.packs_dispatch_payload:
+        return backend
+    if isinstance(backend, str) and backend == NVLinkOneSidedConfig.backend_name:
+        backend = NVLinkOneSidedConfig()
+    if getattr(backend, "lamport", False) is not False:
         return dataclasses.replace(backend, lamport=False)
     return backend
 

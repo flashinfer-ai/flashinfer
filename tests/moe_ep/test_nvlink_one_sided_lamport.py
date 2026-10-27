@@ -1547,7 +1547,7 @@ def test_lamport_carries():
 
 def test_split_layer_keeps_packed_rows_off_lamport():
     """A split-layer kernel that packs its dispatch rows into other bytes
-    turns the Lamport transport off."""
+    turns the Lamport transport off, also when the comm backend is a name."""
     from flashinfer.moe_ep import NVLinkOneSidedConfig
     from flashinfer.moe_ep.modes.split_layer import _communication_backend
 
@@ -1555,7 +1555,11 @@ def test_split_layer_keeps_packed_rows_off_lamport():
     packing = SimpleNamespace(packs_dispatch_payload=True)
     assert _communication_backend(config, packing).lamport is False
     assert config.lamport is None
+    named = _communication_backend("nvlink_one_sided", packing)
+    assert named == NVLinkOneSidedConfig(lamport=False)
     plain = SimpleNamespace(packs_dispatch_payload=False)
     assert _communication_backend(config, plain) is config
+    assert _communication_backend("nvlink_one_sided", plain) == "nvlink_one_sided"
     other = SimpleNamespace(backend_name="cake")
     assert _communication_backend(other, packing) is other
+    assert _communication_backend("cake", packing) == "cake"
