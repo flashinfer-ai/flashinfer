@@ -11,10 +11,12 @@ The index is organized by CUDA version for jit-cache, and flat for others.
 """
 
 import hashlib
+import json
 import pathlib
 import re
 import argparse
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -134,6 +136,7 @@ def update_parent_indices(leaf_dir: pathlib.Path, root_dir: pathlib.Path):
 
 
 def update_index(
+    release_assets: str,
     dist_dir: str = "dist",
     output_dir: str = "whl",
     base_url: str = "https://github.com/flashinfer-ai/flashinfer/releases/download",
@@ -144,6 +147,7 @@ def update_index(
     Update wheel index from dist directory.
 
     Args:
+        release_assets: JSON file with GitHub release assets (name and created_at)
         dist_dir: Directory containing wheel files
         output_dir: Output directory for index files
         base_url: Base URL for wheel downloads
@@ -159,6 +163,19 @@ def update_index(
     if not wheels:
         print(f"No wheel files found in '{dist_dir}'")
         sys.exit(1)
+
+    upload_times = {}
+    for asset in json.loads(pathlib.Path(release_assets).read_text()):
+        uploaded_at = datetime.fromisoformat(asset["created_at"].replace("Z", "+00:00"))
+        if uploaded_at.tzinfo is None:
+            raise ValueError(f"Upload time for {asset['name']} must include a timezone")
+        upload_times[asset["name"]] = (
+            uploaded_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+
+    for wheel_path in wheels:
+        if get_package_info(wheel_path) and wheel_path.name not in upload_times:
+            raise ValueError(f"Missing release asset upload time for {wheel_path.name}")
 
     print(f"Found {len(wheels)} wheel file(s)")
 
@@ -198,7 +215,8 @@ def update_index(
 
         # Construct download URL
         tag = release_tag or f"v{info['version'].split('+')[0].split('.dev')[0]}"
-        download_url = f"{base_url}/{tag}/{wheel_path.name}#sha256={sha256}"
+        wheel_url = f"{base_url}/{tag}/{wheel_path.name}"
+        download_url = f"{wheel_url}#sha256={sha256}"
 
         # Update index.html
         index_file = index_dir / "index.html"
@@ -211,12 +229,16 @@ def update_index(
                 # Simple regex to extract the <a> tags
                 links.update(re.findall(r'<a href=".*?">.*?</a><br>\n', content))
 
-        # Create and add new link
-        new_link = f'<a href="{download_url}">{wheel_path.name}</a><br>\n'
-        is_new = new_link not in links
-        if is_new:
-            links.add(new_link)
-
+        # uv reads this HTML extension for --exclude-newer (PEP 700 specifies JSON only).
+        new_link = (
+            f'<a href="{download_url}" data-upload-time="{upload_times[wheel_path.name]}">'
+            f"{wheel_path.name}</a><br>\n"
+        )
+        updated_links = {
+            link for link in links if not link.startswith(f'<a href="{wheel_url}#')
+        }
+        updated_links.add(new_link)
+        if updated_links != links:
             # Write the complete, valid HTML file
             with index_file.open("w") as f:
                 f.write("<!DOCTYPE html>\n")
@@ -224,7 +246,7 @@ def update_index(
                 f.write(f"<head><title>Links for {package}</title></head>\n")
                 f.write("<body>\n")
                 f.write(f"<h1>Links for {package}</h1>\n")
-                for link in sorted(list(links)):
+                for link in sorted(updated_links):
                     f.write(link)
                 f.write("</body>\n")
                 f.write("</html>\n")
@@ -249,6 +271,11 @@ def update_index(
 def main():
     parser = argparse.ArgumentParser(
         description="Update wheel index for flashinfer packages"
+    )
+    parser.add_argument(
+        "--release-assets",
+        required=True,
+        help="JSON array of GitHub release assets with name and created_at fields",
     )
     parser.add_argument(
         "--dist-dir",
@@ -278,6 +305,7 @@ def main():
     args = parser.parse_args()
 
     update_index(
+        release_assets=args.release_assets,
         dist_dir=args.dist_dir,
         output_dir=args.output_dir,
         base_url=args.base_url,
