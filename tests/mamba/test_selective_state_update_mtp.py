@@ -32,6 +32,10 @@ _BASE_PARAMS = (
     (   4,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=4
     (  64,     8,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # nheads=8
     (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
+    (  64,    64,     80,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=80
+    (  64,    64,     96,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=96
+    (   1,    64,     96,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=1, dim=96: 48 rows per CTA
+    (  64,    64,    288,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=288
     (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
     (  64,    64,     64,   96,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=96
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
@@ -41,6 +45,16 @@ _BASE_PARAMS = (
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
 )
 # fmt: on
+
+
+def _skip_unsupported_dim(algorithm, dim):
+    """Skip head dims that the vertical and horizontal MTP kernels do not support."""
+    # Vertical needs dim divisible by warpSize (32); horizontal by TMA_STATE_ROWS (32).
+    if algorithm in ("vertical", "horizontal") and dim % 32 != 0:
+        pytest.skip(f"{algorithm} kernel requires dim divisible by 32, got {dim}")
+    # Both load a whole head as one TMA box, which holds at most 256 elements per dimension.
+    if algorithm in ("vertical", "horizontal") and dim > 256:
+        pytest.skip(f"{algorithm} kernel requires dim <= 256, got {dim}")
 
 
 class TestSelectiveStateUpdateMTP:
@@ -203,6 +217,7 @@ class TestSelectiveStateUpdateMTP:
         use_out_tensor,
     ):
         """Test that kernel output matches reference within tolerance."""
+        _skip_unsupported_dim(self._algo, dim)
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
@@ -210,7 +225,8 @@ class TestSelectiveStateUpdateMTP:
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            out = torch.empty_like(inputs["x"])
+            # Start from NaN, so an element that the kernel does not write fails the check.
+            out = torch.full_like(inputs["x"], float("nan"))
         else:
             out = None
 
@@ -316,7 +332,11 @@ class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
 
     @pytest.mark.parametrize(
         "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
-        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+        [
+            (64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True),
+            # dim=80 runs the strided epilogue with z gating
+            (64, 64, 80, 128, 4, torch.bfloat16, torch.float32, True),
+        ],
     )
     def test_output_correctness(
         self,
@@ -1191,7 +1211,9 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    @pytest.fixture(autouse=True)
+    def _rand_seed(self):
+        self.rand_seed = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1220,7 +1242,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.rand_seed if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -1255,7 +1277,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            rand_seed=self.RAND_SEED,
+            rand_seed=self.rand_seed,
             algorithm=self._algo,
         )
 
@@ -1327,7 +1349,9 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    @pytest.fixture(autouse=True)
+    def _rand_seed(self):
+        self.rand_seed = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1357,7 +1381,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.rand_seed if is_cvt_rs_supported() else None
 
         y_ref = selective_state_update_triton(
             state_ref,
@@ -1400,7 +1424,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
-            rand_seed=self.RAND_SEED,
+            rand_seed=self.rand_seed,
             algorithm=self._algo,
         )
 

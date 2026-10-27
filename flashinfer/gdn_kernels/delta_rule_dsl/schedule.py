@@ -19,6 +19,13 @@ class WorkDesc:
     # update by mainloop
     tile_idx: cutlass.Int32
 
+    # V slice this block owns; nonzero only in the sm_80 kernel, which splits V.
+    v_slice_idx: cutlass.Int32 = 0
+
+    def v_row_offset(self, d_v: cutlass.Constexpr):
+        """First V row this block owns, in elements."""
+        return self.v_slice_idx * cutlass.Int32(d_v)
+
     def is_valid(self, num_seqs: cutlass.Int32):
         return self.seq_idx >= cutlass.Int32(0) and self.seq_idx < num_seqs
 

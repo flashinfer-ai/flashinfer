@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
 
 cuda_13_required = pytest.mark.skipif(
@@ -18,14 +20,14 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_config import (
     Sm100_Bf16_Cutedsl_MegaMoeConfigBase,
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import MegaMoEBf16Mxfp8Config
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import MegaMoEBf16Mxfp8Config
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
     bf16_mxfp8_candidates,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16_mxfp8 import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16_mxfp8 import (
     MegaMoEBf16Mxfp8Frontend,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
     default_knobs,
     is_valid_bf16_mxfp8,
 )
@@ -142,7 +144,7 @@ def test_mixed_frontend_rejects_unsupported_knobs():
 def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -174,7 +176,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
     """An ikr + dispatch-warp session must still accept pinned perf knobs."""
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -202,10 +204,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
         assert config.in_kernel_fc2_reduce is True
         assert config.token_back_mode == "reuse_dispatch_warps"
         assert config.flag_batch == 4
-        # Both destinations exist either way, so the knob can flip later.
-        assert buf.combine_output.shape == (8, 2, 128)
-        assert buf.reduced_output.shape == (8, 1, 128)
-        assert buf.kernel_combine_output is buf.reduced_output
+        assert buf.output_activation.shape == (8, 128)
     finally:
         buf.destroy()
 
@@ -214,7 +213,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
 def test_mixed_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
 
     monkeypatch.setattr(
         bf16_mxfp8, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
@@ -247,7 +246,7 @@ def test_mixed_frontend_rejects_unpermitted_ikr_knobs():
 
 @cuda_13_required
 def test_mixed_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     valid = default_knobs(8, dtype="bf16_mxfp8")
@@ -291,12 +290,45 @@ def test_mixed_backend_is_registered():
 
 @cuda_13_required
 def test_mixed_config_inherits_bf16_options():
+    import torch
+
     config = Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         gate_up_clamp=1.5,
         enable_in_kernel_fc2_reduce=True,
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
     assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
     assert config.enable_in_kernel_fc2_reduce
+    assert config.finalize_mode is FinalizeMode.PERSISTENT
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.PERSISTENT,
+        )
+
+
+@cuda_13_required
+def test_mixed_config_none_finalize_constraints():
+    config = Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128, top_k=2, finalize_mode=FinalizeMode.NONE
+    )
+    assert config.finalize_mode is FinalizeMode.NONE
+    with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce=False"):
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.NONE,
+            enable_in_kernel_fc2_reduce=True,
+        )
+    with pytest.raises(ValueError, match="fixed/offline-tuned knobs"):
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.NONE,
+            knobs="auto",
+        )

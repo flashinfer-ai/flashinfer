@@ -1,0 +1,4075 @@
+{
+  "arches": [
+    "sm_120a"
+  ],
+  "policy": {
+    "atom_rule": {
+      "batch_class_min": [
+        1,
+        2,
+        9,
+        128
+      ],
+      "long_context_min_kv": 16384,
+      "num_atoms": {
+        "n1:a1": 1,
+        "n2:a2": 1,
+        "n3:a2": 2,
+        "n3:a3": 1,
+        "n4:a2": 2,
+        "n4:a4": 1,
+        "n5:a2": 3,
+        "n5:a3": 2,
+        "n5:a5": 1,
+        "n6:a2": 3,
+        "n6:a3": 2,
+        "n6:a6": 1
+      },
+      "selection": {
+        "h32:n1": [
+          "a1",
+          "a1",
+          "a1",
+          "a1"
+        ],
+        "h32:n2": [
+          "a2",
+          "a2",
+          "a2",
+          "a2"
+        ],
+        "h32:n3": [
+          "a3",
+          "a2",
+          "a3",
+          "a3"
+        ],
+        "h32:n4": [
+          "a2",
+          "a2",
+          "a4",
+          "a4"
+        ],
+        "h32:n5": [
+          "a2",
+          "a2",
+          "a5",
+          "a5"
+        ],
+        "h32:n6": [
+          "a2",
+          "a2",
+          "a6",
+          "a6"
+        ],
+        "h64:n1": [
+          "a1",
+          "a1",
+          "a1",
+          "a1"
+        ],
+        "h64:n2": [
+          "a2",
+          "a2",
+          "a2",
+          "a2"
+        ],
+        "h64:n3": [
+          "a3",
+          "a2",
+          "a3",
+          "a3"
+        ],
+        "h64:n4": [
+          "a2",
+          "a2",
+          "a4",
+          "a4"
+        ],
+        "h64:n5": [
+          "a2",
+          "a2",
+          "a2",
+          "a3"
+        ],
+        "h64:n6": [
+          "a2",
+          "a2",
+          "a2",
+          "a3"
+        ]
+      },
+      "selection_long": {
+        "h32:n1": [
+          "a1",
+          "a1",
+          "a1",
+          "a1"
+        ],
+        "h32:n2": [
+          "a2",
+          "a2",
+          "a2",
+          "a2"
+        ],
+        "h32:n3": [
+          "a3",
+          "a3",
+          "a3",
+          "a3"
+        ],
+        "h32:n4": [
+          "a2",
+          "a4",
+          "a4",
+          "a4"
+        ],
+        "h32:n5": [
+          "a2",
+          "a5",
+          "a5",
+          "a5"
+        ],
+        "h32:n6": [
+          "a2",
+          "a6",
+          "a6",
+          "a6"
+        ],
+        "h64:n1": [
+          "a1",
+          "a1",
+          "a1",
+          "a1"
+        ],
+        "h64:n2": [
+          "a2",
+          "a2",
+          "a2",
+          "a2"
+        ],
+        "h64:n3": [
+          "a3",
+          "a3",
+          "a3",
+          "a3"
+        ],
+        "h64:n4": [
+          "a2",
+          "a4",
+          "a4",
+          "a4"
+        ],
+        "h64:n5": [
+          "a2",
+          "a2",
+          "a2",
+          "a3"
+        ],
+        "h64:n6": [
+          "a2",
+          "a2",
+          "a2",
+          "a3"
+        ]
+      }
+    },
+    "clean_logits": "raw",
+    "fused_row_bytes": 132,
+    "head_dim": 128,
+    "heads": [
+      32,
+      64
+    ],
+    "logits_stride_alignment": [
+      128,
+      256
+    ],
+    "max_batch": 4096,
+    "metadata_route": "sm120:metadata",
+    "next_n": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "page_kv": [
+      64,
+      128
+    ],
+    "split_kv": 128,
+    "threads": {
+      "logits": 384,
+      "metadata": 32
+    }
+  },
+  "programs": {
+    "cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "context_lens"
+        ],
+        [
+          "buffer",
+          "schedule_meta"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "next_n"
+        ],
+        [
+          "parameter",
+          "num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "split_kv"
+        ],
+        [
+          "parameter",
+          "num_sms"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_e7d6f4b1aa3768885743_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_1898b94a8466fd77e45c": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=4"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_255f1462006e65d5bc73": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_8855d5e0ab804616a3d0_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_2c3bb30322305948abc8": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_2c3bb30322305948abc8",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_154addce123e91040878_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_2c3bb30322305948abc8_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_36a1938625d68329ab91": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=3"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_3b0b9cb3d990043cf58e": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_e7d6f4b1aa3768885743_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_3c3c9d5d200214010b02": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=6"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_499b8f66bab82c047c43": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=5"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_5d0b4c0e859bbf7b7261": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=6"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_601c3e046a836742eea7": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=5"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_aac105fc5eb587e97c96_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_6f9829ec75257d994654": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_aac105fc5eb587e97c96_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_74b4b7d772169678d3a2": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_74b4b7d772169678d3a2",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_3527502a0d6951f1d104_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_74b4b7d772169678d3a2_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_7690df62a6e1d64458eb": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=4"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_9228798cfefc7d3002ef": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=5"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_a0583be4cd06f2395bbb": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_52522722d895ca31177d_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_a0d49fe972c682195134": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=3"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_ac4af50cebcd5a7b807c": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=4"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_b4d4bfaeee5c4ea75166": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=6"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_ba36b370436793a6b094": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=3"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=2"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_da417b52416eff7c48b5": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64",
+        "-DNEXT_N=5"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=3"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_0fa3aec07a51ed2e94d5_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_e1ce7daca2c2dbbea0e3": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128",
+        "-DNEXT_N=2"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_e73160f1f8e0e3079f7e": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=6"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DNEXT_N=2"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_41927e019e70d9eab863_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_52522722d895ca31177d_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_fd408a78059d20662c22": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=128"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_2057763b3c5c4a104d1a_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c": {
+      "arches": [
+        "sm_120a"
+      ],
+      "arg_plan": [
+        [
+          "buffer",
+          "metadata.context_lens"
+        ],
+        [
+          "buffer",
+          "metadata.schedule_meta"
+        ],
+        [
+          "parameter",
+          "metadata.batch_size"
+        ],
+        [
+          "parameter",
+          "metadata.next_n"
+        ],
+        [
+          "parameter",
+          "metadata.num_next_n_atoms"
+        ],
+        [
+          "parameter",
+          "metadata.split_kv"
+        ],
+        [
+          "parameter",
+          "metadata.num_sms"
+        ],
+        [
+          "grid",
+          "metadata.grid_x"
+        ],
+        [
+          "grid",
+          "metadata.grid_y"
+        ],
+        [
+          "grid",
+          "metadata.grid_z"
+        ],
+        [
+          "tma_buffer",
+          "logits.Q"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV"
+        ],
+        [
+          "tma_buffer",
+          "logits.KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "logits.Weights"
+        ],
+        [
+          "buffer",
+          "logits.Logits"
+        ],
+        [
+          "buffer",
+          "logits.context_lens"
+        ],
+        [
+          "buffer",
+          "logits.block_table"
+        ],
+        [
+          "buffer",
+          "logits.schedule_meta"
+        ],
+        [
+          "parameter",
+          "logits.logits_stride"
+        ],
+        [
+          "parameter",
+          "logits.block_table_stride"
+        ],
+        [
+          "grid",
+          "logits.grid_x"
+        ],
+        [
+          "grid",
+          "logits.grid_y"
+        ],
+        [
+          "grid",
+          "logits.grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "-DPAGE_KV=64"
+      ],
+      "ffi_entry": "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c",
+      "kind": "sequence",
+      "role": "sequence",
+      "sources": [
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_8855d5e0ab804616a3d0_kernel.cu",
+        "csrc/experimental/deepgemm_sm120_paged_mqa_logits/generated/cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c_binding.cu"
+      ],
+      "stages": [
+        "metadata",
+        "logits"
+      ],
+      "standalone": true
+    }
+  },
+  "routes": {
+    "sm120:fp8:h32:p128:n1:a1": {
+      "atom_variant": "a1",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 1,
+      "next_n_atom": 1,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_fd408a78059d20662c22"
+    },
+    "sm120:fp8:h32:p128:n2:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 2,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_e1ce7daca2c2dbbea0e3"
+    },
+    "sm120:fp8:h32:p128:n3:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_36a1938625d68329ab91"
+    },
+    "sm120:fp8:h32:p128:n3:a3": {
+      "atom_variant": "a3",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 3,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_6f9829ec75257d994654"
+    },
+    "sm120:fp8:h32:p128:n4:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_7690df62a6e1d64458eb"
+    },
+    "sm120:fp8:h32:p128:n4:a4": {
+      "atom_variant": "a4",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 4,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_3b0b9cb3d990043cf58e"
+    },
+    "sm120:fp8:h32:p128:n5:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_9228798cfefc7d3002ef"
+    },
+    "sm120:fp8:h32:p128:n5:a5": {
+      "atom_variant": "a5",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 5,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_a0583be4cd06f2395bbb"
+    },
+    "sm120:fp8:h32:p128:n6:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_5d0b4c0e859bbf7b7261"
+    },
+    "sm120:fp8:h32:p128:n6:a6": {
+      "atom_variant": "a6",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 6,
+      "num_heads": 32,
+      "page_kv": 128,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_255f1462006e65d5bc73"
+    },
+    "sm120:fp8:h32:p64:n1:a1": {
+      "atom_variant": "a1",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 1,
+      "next_n_atom": 1,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_dbbf426bbb6ef34ec5ca"
+    },
+    "sm120:fp8:h32:p64:n2:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 2,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_ce9972dce15c32afd34f"
+    },
+    "sm120:fp8:h32:p64:n3:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_ba36b370436793a6b094"
+    },
+    "sm120:fp8:h32:p64:n3:a3": {
+      "atom_variant": "a3",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 3,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_6ae122e0b8b7f76cf001"
+    },
+    "sm120:fp8:h32:p64:n4:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_ac4af50cebcd5a7b807c"
+    },
+    "sm120:fp8:h32:p64:n4:a4": {
+      "atom_variant": "a4",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 4,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_0c8d63e17a90adcc76b0"
+    },
+    "sm120:fp8:h32:p64:n5:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_da417b52416eff7c48b5"
+    },
+    "sm120:fp8:h32:p64:n5:a5": {
+      "atom_variant": "a5",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 5,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_f75a888f2aaf87f7765f"
+    },
+    "sm120:fp8:h32:p64:n6:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 2,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_3c3c9d5d200214010b02"
+    },
+    "sm120:fp8:h32:p64:n6:a6": {
+      "atom_variant": "a6",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 6,
+      "num_heads": 32,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_feb78761d08d6286577c"
+    },
+    "sm120:fp8:h64:p64:n1:a1": {
+      "atom_variant": "a1",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 1,
+      "next_n_atom": 1,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_2c3bb30322305948abc8"
+    },
+    "sm120:fp8:h64:p64:n2:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 2,
+      "next_n_atom": 2,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_f6e3861f40cc2117ee1b"
+    },
+    "sm120:fp8:h64:p64:n3:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 2,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_a0d49fe972c682195134"
+    },
+    "sm120:fp8:h64:p64:n3:a3": {
+      "atom_variant": "a3",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 3,
+      "next_n_atom": 3,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_dc13848e361d0fc9d191"
+    },
+    "sm120:fp8:h64:p64:n4:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 2,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_1898b94a8466fd77e45c"
+    },
+    "sm120:fp8:h64:p64:n4:a4": {
+      "atom_variant": "a4",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 4,
+      "next_n_atom": 4,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_74b4b7d772169678d3a2"
+    },
+    "sm120:fp8:h64:p64:n5:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 2,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_601c3e046a836742eea7"
+    },
+    "sm120:fp8:h64:p64:n5:a3": {
+      "atom_variant": "a3",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 5,
+      "next_n_atom": 3,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_499b8f66bab82c047c43"
+    },
+    "sm120:fp8:h64:p64:n6:a2": {
+      "atom_variant": "a2",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 2,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_e73160f1f8e0e3079f7e"
+    },
+    "sm120:fp8:h64:p64:n6:a3": {
+      "atom_variant": "a3",
+      "clean_logits": "raw",
+      "kernel_launches": 2,
+      "next_n": 6,
+      "next_n_atom": 3,
+      "num_heads": 64,
+      "page_kv": 64,
+      "sequence": "cake_deepgemm_sm120_paged_mqa_logits_seq_b4d4bfaeee5c4ea75166"
+    },
+    "sm120:metadata": {
+      "atom_variant": null,
+      "clean_logits": null,
+      "kernel_launches": 1,
+      "next_n": null,
+      "next_n_atom": null,
+      "num_heads": null,
+      "page_kv": null,
+      "sequence": null,
+      "stages": [
+        [
+          "metadata",
+          "cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7"
+        ]
+      ]
+    }
+  },
+  "schema": "sm120_paged_mqa.v1"
+}

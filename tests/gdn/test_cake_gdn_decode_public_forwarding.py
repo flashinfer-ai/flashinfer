@@ -36,12 +36,12 @@ _PROMOTED_BF16_ROWS = [
 ]
 
 
-@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_q_heads,num_v_heads,strided,disable,cache,cache_steps",
     _PROMOTED_BF16_ROWS,
 )
-def test_all_promoted_bf16_rows_resolve_on_both_architectures(
+def test_all_promoted_bf16_rows_resolve_on_every_architecture(
     arch,
     batch_size,
     seq_len,

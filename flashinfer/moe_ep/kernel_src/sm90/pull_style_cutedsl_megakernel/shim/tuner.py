@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Kernel tuning knobs for the SM90 Hopper FP8 MegaMoE frontend.
 
-Sibling-fork mirror of ``kernel_src/cutedsl_megamoe/shim/tuner.py``,
+Sibling-fork mirror of ``kernel_src/sm100/cutedsl_megamoe/shim/tuner.py``,
 retargeted at ``Sm90MegaMoE(SwapAB)Fp8Kernel``.  Exposes the SM90 tuning
 surface so callers -- or an autotuner -- can enumerate valid tactics and
 apply them to a :class:`.hopper_fp8.MegaMoEHopperFp8Config`.
@@ -32,6 +32,8 @@ import dataclasses
 import itertools
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 # --- knob value-sets (geometry domains mirror the kernel ctor validation;
 # see kernel_fp8_glu_fc12{,_swapab}.py _validate_mma_tiler_and_cluster_shape).
 
@@ -39,6 +41,11 @@ CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "in_kernel_fc2_reduce": (False, True),
     "token_back_mode": ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
     "load_balance_mode": ("static", "atomic_counter"),
+    # Combine dedup + wire format change the combine numerics (fp32 group
+    # pre-reduce ordering; quantized wire), so an autotuner must keep the
+    # values it validated against.  Both are COLLECTIVE (wire format).
+    "grouped_token_back": (False, True),
+    "combine_format": ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"),
 }
 
 _NONSWAP_TILES = ((64, 128, 128), (64, 256, 128))
@@ -49,6 +56,11 @@ _CLUSTER_SHAPES = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
 PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "swap_ab": (False, True),
     "pingpong": (False, True),
+    # Wire-level top-k dedup on dispatch; bit-exact with the non-dedup path
+    # (the duplicate pool rows receive the same payload bytes either way).
+    # COLLECTIVE: changes the route-word wire format -- all EP ranks must
+    # agree (a mixed on/off pair mis-decodes the flag bits).
+    "dedup_dispatch": (False, True),
     # How many of the 4 dispatch warps do token-comm work (the rest idle);
     # output-invariant partitioning (rank-local, no wire-format coupling).
     "active_dispatch_warps": (1, 2, 4),
@@ -125,7 +137,10 @@ def default_knobs(
     }
 
 
-def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def is_valid(
+    knobs: Dict[str, Any], *, apply_routing_weights_before_fc2: bool = True
+) -> bool:
     """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
 
     Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
@@ -168,10 +183,23 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
         return False
     # Kernel invariant: the in-kernel reduce collapses topk before a separate
     # reducer could apply routing weights.
-    if in_kernel and not apply_topk_in_fc1:
+    if in_kernel and not apply_routing_weights_before_fc2:
         return False
     if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
         return False
+    grouped = bool(knobs.get("grouped_token_back", False))
+    combine_format = knobs.get("combine_format", "bf16")
+    if combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
+        return False
+    if combine_format != "bf16" and not grouped:
+        return False
+    if grouped:
+        if knobs.get("token_back_mode", "reuse_dispatch_warps") != (
+            "reuse_dispatch_warps"
+        ):
+            return False
+        if in_kernel or not apply_routing_weights_before_fc2:
+            return False
     return True
 
 

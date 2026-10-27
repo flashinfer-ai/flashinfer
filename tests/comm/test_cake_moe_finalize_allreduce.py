@@ -11,10 +11,12 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.jit.cake_moe_finalize_comm import SMALL_TOKEN_MAX
 
 
 HIDDEN_SIZE = 7168
-WORKSPACE_TOKEN_CAPACITY = 16
+WORKSPACE_TOKEN_CAPACITY = 128
+BACKENDS = ("trtllm", "cake")
 ATOL = 1e-2
 RTOL = 1e-2
 FP4_ATOL = 1.0
@@ -143,6 +145,20 @@ def _reference(
     return residual, norm
 
 
+def _cases() -> list[tuple[int, int, bool, str, float]]:
+    """Token counts on both sides of the small-token threshold, each crossed with
+    top_k, shared expert, output profile and weight_bias."""
+    threshold = SMALL_TOKEN_MAX
+    return [
+        (tokens, top_k, use_shared, output_profile, weight_bias)
+        for tokens in (1, threshold, threshold + 1, WORKSPACE_TOKEN_CAPACITY)
+        for top_k in (4, 8)
+        for use_shared in (False, True)
+        for output_profile in ("110", "111")
+        for weight_bias in (0.0, 1.0)
+    ]
+
+
 def _workspace(
     rank: int, world_size: int, group: dist.ProcessGroup
 ) -> tuple[list[list[int]], torch.Tensor]:
@@ -179,16 +195,15 @@ def _run_backend(
     quant_out = None
     scale_out = None
     if output_profile == "111":
+        # Packed E2M1 pairs and E4M3 scales (SWIZZLED_128x4) are byte buffers.
         quant_out = torch.zeros(
-            residual_in.numel() // 4,
-            dtype=residual_in.dtype,
-            device=residual_in.device,
+            residual_in.numel() // 2, dtype=torch.uint8, device=residual_in.device
         )
         padded_rows = ((residual_in.shape[0] + 127) // 128) * 128
         padded_columns = ((HIDDEN_SIZE // 16 + 3) // 4) * 4
         scale_out = torch.zeros(
             padded_rows * padded_columns,
-            dtype=residual_in.dtype,
+            dtype=torch.float8_e4m3fn,
             device=residual_in.device,
         )
     comm.trtllm_moe_finalize_allreduce_fusion(
@@ -225,19 +240,21 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
         world_size=world_size,
     )
     group = dist.group.WORLD
-    cases = (
-        (1, 4, False, "110", 0.0),
-        (16, 8, True, "110", 1.0),
-        (16, 8, True, "111", 0.0),
-    )
+    cases = _cases()
+    # One workspace per backend for the whole run: consecutive cases switch between
+    # the small-token and the persistent program on the same workspace.
+    workspaces: dict[str, tuple[list[list[int]], torch.Tensor]] = {}
     try:
+        for backend in BACKENDS:
+            workspaces[backend] = _workspace(rank, world_size, group)
         for launch_with_pdl in (False, True):
-            for tokens, top_k, use_shared, output_profile, weight_bias in cases:
+            for case_index, case in enumerate(cases):
+                tokens, top_k, use_shared, output_profile, weight_bias = case
                 generator = torch.Generator(device=device).manual_seed(
                     0xCA4E0000
-                    + world_size * 10000
-                    + rank * 100
-                    + tokens
+                    + world_size * 100000
+                    + rank * 1000
+                    + case_index * 2
                     + int(launch_with_pdl)
                 )
                 allreduce_in = _bounded_rand(
@@ -297,50 +314,47 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
                 )
 
                 outputs: dict[str, tuple[torch.Tensor, ...]] = {}
-                for backend in ("trtllm", "cake"):
-                    dist.barrier(group=group)
-                    handles, workspace_ptrs = _workspace(rank, world_size, group)
-                    try:
-                        result = _run_backend(
-                            backend=backend,
-                            workspace_ptrs=workspace_ptrs,
-                            allreduce_in=allreduce_in,
-                            residual_in=residual_in,
-                            norm_weight=norm_weight,
-                            inverse_indices=inverse_indices,
-                            expert_scales=expert_scales,
-                            shared_expert_output=shared_expert_output,
-                            launch_with_pdl=launch_with_pdl,
-                            world_rank=rank,
-                            world_size=world_size,
-                            output_profile=output_profile,
-                            routed_scaling_factor=routed_scaling_factor,
-                            weight_bias=weight_bias,
-                        )
-                        outputs[backend] = tuple(
-                            tensor.clone() for tensor in result if tensor is not None
-                        )
-                    finally:
-                        dist.barrier(group=group)
-                        comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
-                            handles, group=group
-                        )
+                for backend in BACKENDS:
+                    result = _run_backend(
+                        backend=backend,
+                        workspace_ptrs=workspaces[backend][1],
+                        allreduce_in=allreduce_in,
+                        residual_in=residual_in,
+                        norm_weight=norm_weight,
+                        inverse_indices=inverse_indices,
+                        expert_scales=expert_scales,
+                        shared_expert_output=shared_expert_output,
+                        launch_with_pdl=launch_with_pdl,
+                        world_rank=rank,
+                        world_size=world_size,
+                        output_profile=output_profile,
+                        routed_scaling_factor=routed_scaling_factor,
+                        weight_bias=weight_bias,
+                    )
+                    outputs[backend] = tuple(
+                        tensor.clone() for tensor in result if tensor is not None
+                    )
 
                 trtllm_result = outputs["trtllm"]
+                label = f"pdl={launch_with_pdl} case={case}"
                 for backend, result in outputs.items():
                     torch.testing.assert_close(
                         result[0].float(),
                         residual_ref.float(),
                         atol=ATOL,
                         rtol=RTOL,
-                        msg=lambda text, backend=backend: f"{backend} residual: {text}",
+                        msg=lambda text, backend=backend, label=label: (
+                            f"{backend} residual {label}: {text}"
+                        ),
                     )
                     torch.testing.assert_close(
                         result[1].float(),
                         norm_ref.float(),
                         atol=ATOL,
                         rtol=RTOL,
-                        msg=lambda text, backend=backend: f"{backend} norm: {text}",
+                        msg=lambda text, backend=backend, label=label: (
+                            f"{backend} norm {label}: {text}"
+                        ),
                     )
                     if output_profile == "111":
                         assert len(result) == len(trtllm_result) == 4
@@ -356,10 +370,16 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
                                 norm_ref.float(),
                                 atol=FP4_ATOL,
                                 rtol=FP4_RTOL,
-                                msg=lambda text: f"cake decoded FP4: {text}",
+                                msg=lambda text, label=label: (
+                                    f"cake decoded FP4 {label}: {text}"
+                                ),
                             )
     finally:
         dist.barrier(group=group)
+        for handles, _ in workspaces.values():
+            comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                handles, group=group
+            )
         dist.destroy_process_group(group=group)
 
 

@@ -1,0 +1,6 @@
+This implementation develops the FlashMLA-style MLA attention framework for
+Hopper sliding-window decode. FlashMLA is Copyright (c) 2025 DeepSeek and
+licensed under MIT; its notice is retained in FLASHMLA_LICENSE.txt.
+
+CUTLASS/CuTe utilities are supplied by the existing FlashInfer CUTLASS
+submodule and retain their upstream license and copyright notices.

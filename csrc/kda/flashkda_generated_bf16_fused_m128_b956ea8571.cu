@@ -701,9 +701,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     #define prep_inv16_ready_addr (mbar_base + 648)
     #define work_item_ready_addr (mbar_base + 688)
     #define aux_pairwise_inputs_ready_addr (mbar_base + 696)
-    #define aux_pairwise_consumed_addr (mbar_base + 736)
-    #define aux_inverse_ready_addr (mbar_base + 776)
-    #define short_beta_ready_addr (mbar_base + 816)
+    #define aux_pairwise_consumed_addr (mbar_base + 776)
+    #define aux_inverse_ready_addr (mbar_base + 856)
+    #define short_beta_ready_addr (mbar_base + 936)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -804,8 +804,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 116756);
     const int smem_work_item_resolved_addr = smem + 116756;
 
-    // Mbarrier init (25 groups, 107 barriers)
-    // Mbarriers at smem_raw[0..856)
+    // Mbarrier init (25 groups, 122 barriers)
+    // Mbarriers at smem_raw[0..976)
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -832,9 +832,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
         // prep_diag_ready: 5 barriers, init_count=2
         // prep_inv16_ready: 5 barriers, init_count=2
         // work_item_ready: 1 barriers, init_count=1
-        // aux_pairwise_inputs_ready: 5 barriers, init_count=1
-        // aux_pairwise_consumed: 5 barriers, init_count=1
-        // aux_inverse_ready: 5 barriers, init_count=1
+        // --- pipeline 'aux_handoff_pipe' ---
+        // aux_pairwise_inputs_ready: 10 barriers, init_count=1
+        // aux_pairwise_consumed: 10 barriers, init_count=1
+        // aux_inverse_ready: 10 barriers, init_count=1
+        // --- pipeline 'chunk_pipe' ---
         // short_beta_ready: 5 barriers, init_count=1
         // Warp-cooperative initialization, grouped by equal arrival count.
         for (int _bar = lane; _bar < 20; _bar += 32) {
@@ -876,7 +878,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
         for (int _bar = lane; _bar < 10; _bar += 32) {
             mbarrier_init(smem + 608 + _bar * 8, 2);
         }
-        for (int _bar = lane; _bar < 21; _bar += 32) {
+        for (int _bar = lane; _bar < 36; _bar += 32) {
             mbarrier_init(smem + 688 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -885,9 +887,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     __syncwarp();
 
     // TMEM alloc (256 columns, 240 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 856);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 976);
     if (warp == 0) {
-        int _tmem_hold = smem + 856;
+        int _tmem_hold = smem + 976;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -1563,7 +1565,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     // ---- Role: aux_mma ----
     } else if (warp >= 10 && warp <= 11) {
         { // aux_mma_main
-            unsigned int _phase_aux_pairwise_inputs_ready = 0;
             {
                 int task_idx_2 = blockIdx.x;
                 int seq_idx_2 = seq_order[task_idx_2 / num_heads];
@@ -1579,7 +1580,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 for (int aux_iter = 0; aux_iter < num_aux_iters; aux_iter++) {
                     int chunk_idx_2 = aux_iter * 2 + aux_instance;
                     int stage_f32 = aux_stage * 5376;
-                    mbarrier_wait(aux_pairwise_inputs_ready_addr + (aux_stage) * 8, _phase_aux_pairwise_inputs_ready);
+                    mbarrier_wait(aux_pairwise_inputs_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8, (unsigned int)chunk_idx_2 / 10 % 2);
                     unsigned int a_frag[4];
                     unsigned int b_frag[4];
                     float acc[8];
@@ -1944,6 +1945,24 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     for (int value_idx_1 = 0; value_idx_1 < 8; value_idx_1++) {
                         n_values[value_idx_1] = n_values[value_idx_1] + product[value_idx_1];
                     }
+                    unsigned int repack_low_word[1];
+                    unsigned int repack_high_word[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 0], n_values[_lp*2+1 + 0]));
+                        repack_low_word[_lp] = *(uint32_t*)&_h2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 6], n_values[_lp*2+1 + 6]));
+                        repack_high_word[_lp] = *(uint32_t*)&_h2;
+                    }
+                    n_frag[0] = 0;
+                    n_frag[1] = 0;
+                    n_frag[2] = 0;
+                    n_frag[3] = 0;
+                    n_frag[0] = repack_low_word[0];
+                    n_frag[3] = repack_high_word[0];
                     unsigned int binv_frag[4];
                     binv_frag[0] = 0;
                     binv_frag[1] = 0;
@@ -2185,7 +2204,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     __syncwarp();
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive(aux_pairwise_consumed_addr + (aux_stage) * 8);
+                        mbarrier_arrive(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
                     }
                     int lane_row = lane % 16;
                     int lane_col = lane / 16 * 8;
@@ -2206,12 +2225,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(qk_full_addr + (aux_stage) * 8);
-                        mbarrier_arrive(aux_inverse_ready_addr + (aux_stage) * 8);
+                        mbarrier_arrive(aux_inverse_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
                     }
                     aux_stage += 1;
-                    if (aux_stage == 5) { aux_stage = 0; _phase_aux_pairwise_inputs_ready ^= 1; }
+                    if (aux_stage == 5) { aux_stage = 0; }
                     aux_stage += 1;
-                    if (aux_stage == 5) { aux_stage = 0; _phase_aux_pairwise_inputs_ready ^= 1; }
+                    if (aux_stage == 5) { aux_stage = 0; }
                 }
             }
             unsigned int _phase_work_item_ready_0_1 = 0;
@@ -2415,10 +2434,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             unsigned int _phase_v_free = 1;
             unsigned int _phase_qk_raw_full = 0;
             unsigned int _phase_short_beta_ready = 0;
-            unsigned int _phase_aux_pairwise_consumed = 0;
             unsigned int _phase_prep_diag_ready = 0;
             unsigned int _phase_prep_inv16_ready = 0;
-            unsigned int _phase_aux_inverse_ready = 0;
             #pragma unroll 1
             for (int prep_iter = 0; prep_iter < num_prep_iters; prep_iter++) {
                 int chunk_idx_3 = prep_iter * 5 + prep_instance;
@@ -2897,7 +2914,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            mbarrier_arrive(aux_pairwise_inputs_ready_addr + (prep_stage) * 8);
+                            mbarrier_arrive(aux_pairwise_inputs_ready_addr + ((unsigned int)chunk_idx_3 % 10) * 8);
                         }
                     }
                 }
@@ -2906,7 +2923,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 float acc_1[8];
                 long long tape_scaled_base = 0;
                 {
-                    mbarrier_wait(aux_pairwise_consumed_addr + (prep_stage) * 8, _phase_aux_pairwise_consumed);
+                    mbarrier_wait(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_3 % 10) * 8, (unsigned int)chunk_idx_3 / 10 % 2);
                 }
                 {
                     int stage_f32_0 = prep_stage * 5376;
@@ -2962,7 +2979,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     }
                 }
                 {
-                    mbarrier_wait(aux_inverse_ready_addr + (prep_stage) * 8, _phase_aux_inverse_ready);
+                    mbarrier_wait(aux_inverse_ready_addr + ((unsigned int)chunk_idx_3 % 10) * 8, (unsigned int)chunk_idx_3 / 10 % 2);
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
@@ -3012,7 +3029,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 }
                 for (int _advance = 0; _advance < 5; _advance++) {
                     prep_stage += 1;
-                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_v_free ^= 1; _phase_qk_raw_full ^= 1; _phase_short_beta_ready ^= 1; _phase_aux_pairwise_consumed ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; _phase_aux_inverse_ready ^= 1; }
+                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_v_free ^= 1; _phase_qk_raw_full ^= 1; _phase_short_beta_ready ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; }
                 }
             }
         }

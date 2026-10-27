@@ -149,6 +149,9 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
 
     The mixed finalize kernel also supports N tiles 64 and 192. Keep its
     tactic space distinct so W4A8 does not change W4A4 tuning results.
+    GEMM1 N=192 is valid for non-gated activations whose intermediate size is a
+    multiple of 192 (GEMM1 has no partial-N-tile store); ``get_valid_tactics``
+    filters other configs out through ``can_implement``.
     """
     return [
         (
@@ -157,7 +160,7 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
             ((tile, gemm2_n), (tile // 128, cluster_n), False),
         )
         for tile, gemm1_n, gemm2_n, cluster_n in itertools.product(
-            VALID_TILE_SIZES, (128, 256), (64, 128, 192, 256), (1, 2)
+            VALID_TILE_SIZES, (128, 192, 256), (64, 128, 192, 256), (1, 2)
         )
     ]
 
@@ -480,6 +483,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        use_cuda_graph: Whether autotuning profiles CUDA Graph replay.
+        localized_weights: Optional per-locality-domain weight shards.
+        localized_streams: One green-context stream per localized shard.
+        localized_sm_count: SM count assigned to each localized shard.
+        localized_memset_stream: Optional stream used to overlap output zeroing.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
 
@@ -505,14 +513,23 @@ class CuteDslFusedMoERunner(TunableRunner):
         situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
         quant_mode: str = "w4a4",
+        use_cuda_graph: bool = False,
+        localized_weights: Optional[list] = None,
+        localized_streams: Optional[list] = None,
+        localized_sm_count: Optional[int] = None,
+        localized_memset_stream: Optional[torch.cuda.Stream] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
-        if quant_mode not in ("w4a4", "w4a8"):
+        if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
             raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
-        if quant_mode == "w4a8" and use_per_token_activation:
-            raise ValueError("per-token activation scaling is not supported for W4A8")
+        if quant_mode in ("w4a8", "mxfp8") and use_per_token_activation:
+            raise ValueError(
+                f"per-token activation scaling is not supported for {quant_mode}"
+            )
+        if localized_weights is not None and quant_mode != "w4a4":
+            raise ValueError("localized runner supports quant_mode='w4a4' only")
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -530,6 +547,22 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
+        self.use_cuda_graph = use_cuda_graph
+        self.localized_weights = localized_weights
+        self.localized_streams = localized_streams
+        self.localized_sm_count = localized_sm_count
+        self.localized_memset_stream = localized_memset_stream
+
+        if localized_weights is not None and (
+            len(localized_weights) != 2
+            or localized_streams is None
+            or len(localized_streams) != len(localized_weights)
+            or localized_sm_count is None
+        ):
+            raise ValueError(
+                "localized runner requires exactly two weight shards, one stream "
+                "per shard, and localized_sm_count"
+            )
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -641,6 +674,24 @@ class CuteDslFusedMoERunner(TunableRunner):
             # between profile iterations yields autotune timings
             # representative of production cold-cache conditions.
             use_cold_l2_cache=True,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    def _localization_signature(self) -> tuple:
+        if self.localized_weights is None:
+            return ()
+        shard_shapes = tuple(
+            (
+                tuple(shard["w1_weight"].shape),
+                tuple(shard["w2_weight"].shape),
+            )
+            for shard in self.localized_weights
+        )
+        return (
+            "localized",
+            self.localized_sm_count,
+            shard_shapes,
+            self.localized_memset_stream is not None,
         )
 
     def __hash__(self):
@@ -660,11 +711,13 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.situ_linear_beta,
                 self.use_per_token_activation,
                 self.quant_mode,
+                self.use_cuda_graph,
+                self._localization_signature(),
             )
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (
+        extras: tuple[Any, ...] = (
             self.quant_mode,
             int(self.activation_type),
             self.swiglu_alpha,
@@ -678,6 +731,17 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.output_dtype,
             self.enable_pdl,
         )
+        if self.use_cuda_graph:
+            extras += ("cuda_graph",)
+        return extras + self._localization_signature()
+
+    def _weights_for_tuning(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.localized_weights is None:
+            return inputs[4], inputs[8]
+        shard = self.localized_weights[0]
+        return shard["w1_weight"], shard["w2_weight"]
 
     def get_valid_tactics(  # type: ignore[override]
         self,
@@ -691,23 +755,30 @@ class CuteDslFusedMoERunner(TunableRunner):
         Supports both Blackwell and Rubin architectures.
         """
         import cutlass
+        from ...cute_dsl.utils import torch_to_cutlass_dtype
         from .moe_utils import get_max_num_permuted_tokens
 
         x = inputs[0]
-        w1_weight = inputs[4]
+        w1_weight, w2_weight = self._weights_for_tuning(inputs)
 
         gated = self.gated
         num_tokens = x.shape[0]
-        is_mxfp8 = self.quant_mode == "w4a8"
+        # MXFP8 activations (E4M3 + E8M0, block 32) in both the W4A8 and MXFP8 modes.
+        is_mxfp8 = self.quant_mode in ("w4a8", "mxfp8")
         hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
         # has a single intermediate-row projection.
         gemm1_n = w1_weight.shape[1]
         intermediate_size = gemm1_n // 2 if gated else gemm1_n
+        gemm2_n = w2_weight.shape[1]
+        # Packed FP4 weights hold two elements per byte; MXFP8 weights one.
+        gemm2_k = w2_weight.shape[2] * (1 if self.quant_mode == "mxfp8" else 2)
 
         a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
-        b_dtype = cutlass.Float4E2M1FN
+        b_dtype = (
+            cutlass.Float8E4M3FN if self.quant_mode == "mxfp8" else cutlass.Float4E2M1FN
+        )
         sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
         sf_vec_size = 32 if is_mxfp8 else 16
 
@@ -720,7 +791,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 return []
         else:
             gemm1_c_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
-        gemm2_out_dtype = cutlass.BFloat16
+        gemm2_out_dtype = torch_to_cutlass_dtype(self.output_dtype)
 
         all_tactics = ALL_W4A8_MOE_TACTICS if is_mxfp8 else _get_arch_tactics()
 
@@ -739,9 +810,13 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
 
             if _is_rubin_tactic(tactic):
-                # The Rubin (SM107) kernels only implement the gated (SwiGLU)
-                # activation path; skip Rubin tactics for non-gated activations.
-                if not gated:
+                # The Rubin (SM107) gather kernel implements SwiGLU (and its
+                # SiTU variant) plus Relu2, but not GeGLU-tanh; skip Rubin
+                # tactics for the unimplemented activation.
+                if (
+                    ActivationType(int(self.activation_type))
+                    == ActivationType.GegluTanh
+                ):
                     return False
 
                 # The SM107 kernels need cutlass.utils.rubin_helpers, which only
@@ -798,8 +873,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                     mma_tiler=gemm2_mma_tiler,
                     cluster_shape_mn=gemm2_cluster_shape_mn,
                     m=permuted_m,
-                    n=hidden_size,
-                    k=intermediate_size,
+                    n=gemm2_n,
+                    k=gemm2_k,
                     l=num_local_experts,
                     a_major="k",
                     b_major="k",
@@ -829,6 +904,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     a_major="k",
                     b_major="k",
                     c_major="n",
+                    gated=gated,
                 )
                 gemm2_ok = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
                     a_dtype=a_dtype,
@@ -840,8 +916,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                     mma_tiler_mn=gemm2_mma_tiler_mn,
                     cluster_shape_mn=gemm2_cluster_shape_mn,
                     m=permuted_m,
-                    n=hidden_size,
-                    k=intermediate_size,
+                    n=gemm2_n,
+                    k=gemm2_k,
                     l=num_local_experts,
                     a_major="k",
                     b_major="k",
@@ -897,10 +973,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         if tactic is None or tactic == -1:
             tactic = (
                 DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode == "w4a8"
+                if self.quant_mode in ("w4a8", "mxfp8")
                 else _get_default_tactic()
             )
-        elif self.quant_mode == "w4a8":
+        elif self.quant_mode in ("w4a8", "mxfp8"):
             tactic = canonicalize_w4a8_tactic(tactic)
 
         params = _extract_tactic_params(tactic)
@@ -930,6 +1006,14 @@ class CuteDslFusedMoERunner(TunableRunner):
         else:
             per_token_scale = None
             moe_output = optional_inputs[0] if optional_inputs else None
+
+        if self.localized_weights is not None:
+            kwargs.update(
+                localized_weights=self.localized_weights,
+                localized_streams=self.localized_streams,
+                localized_memset_stream=self.localized_memset_stream,
+                sm_count=self.localized_sm_count,
+            )
 
         return self.forward_impl(
             x=x,

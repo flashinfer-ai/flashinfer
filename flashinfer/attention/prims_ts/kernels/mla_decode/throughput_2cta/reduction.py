@@ -135,6 +135,8 @@ def run_reduction_kernel(
     # Producer splits are sized from the group's largest K domain, while each
     # logical row consumes only the prefix containing its visible K tiles.
     tile_k = cache_seqs[batch_idx]
+    query_is_valid = query_is_valid & (tile_k > Int32(0))
+    tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
         cfg.mask_type == MaskType.CAUSAL.value and kernel.seq_len_q > 1
