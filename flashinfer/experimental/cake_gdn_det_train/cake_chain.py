@@ -16,20 +16,35 @@ limitations under the License.
 Host plan and autograd chain of the deterministic GDN chunked training
 (head dimension 128, chunk 64): the chunk and segment tables, the scan
 configuration and segment planner, the workspace pool, the forward and backward
-launch order, the finalize selection and the autograd wrapper with FLA's
-``chunk_gated_delta_rule`` signature (no context parallelism).
+launch order, the adjoint-scan and finalize selection and the autograd wrapper
+with FLA's ``chunk_gated_delta_rule`` signature (no context parallelism).
+
+The forward runs the prep (``prep_tma``, the q / k tiles staged by TMA and one
+CTA per (chunk, key head), unless its dispatch rule :func:`use_prep_tma` keeps
+the plain prep; both give the same bits), the tcgen05 WY stage and the fused
+tcgen05 scan and output (``fwd_ho``; a split plan first runs the pre-scan and
+the stitch for the segment start states).  The backward runs ``dv_local`` and
+the register scan of the adjoint state (with the pre-scan and the stitch on a
+split plan), or on a serial plan the tcgen05 adjoint scan with ``dv_local``
+fused (``dhu_tc2``) when its selection rule (:func:`dhu_tc_pricing`) prices it
+at most ``DHU_TC_GAIN`` of the register path; then, for a value-head group of
+two, the fused tcgen05 tail (``tail_g2``), else ``dqkwg``, the WY pullback and
+the finalize.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
 may use are the ones the registry delivers for that architecture.  The
 planner's per-configuration facts (the register scans' shared-memory figure,
-the chunks one pre-scan CTA covers) are the records' ``scan`` constants.
+the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
+``dhu_tc2`` selection constants and the ``prep_tma`` dispatch window are those
+records' ``select`` tables.
 
 The chain is deterministic: no atomics, no data-dependent ordering, so the
 outputs and gradients are bitwise run to run for one layout and one plan.
 The plan pins that tests and tuning use are explicit keyword arguments of
 :func:`chunk_gated_delta_rule` (``scan_config``, ``segment_chunks``,
-``finalize``, ``warmup_log2``); nothing here reads an environment variable.
+``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``); nothing here reads an
+environment variable.
 """
 
 from __future__ import annotations
@@ -61,12 +76,14 @@ __all__ = [
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
     "chunk_gated_delta_rule",
+    "dhu_tc_pricing",
     "finalize_stage",
     "gdn_chunk_backward",
     "gdn_chunk_forward",
     "make_options",
     "scan_plans",
     "stage_set",
+    "use_prep_tma",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
@@ -83,6 +100,8 @@ STITCH_VSPLIT = 4  # CTAs per (sequence, value head) of the stitch launch
 # another order is launched with the values reordered.
 _PREP_ARGS = ("q", "k", "g", "beta", "beta32_out", "qn", "kn", "rstd_q", "rstd_k", "g_cs", "chunk_start", "chunk_len",
               "num_heads", "num_v_heads", "normalize_qk")  # fmt: skip
+# prep_tma takes q / k (dhu_tc2 qn / kn / w / do) as the tensors its binding encodes the tensor maps from
+_PREP_TMA_ARGS = ("q_tma", "k_tma") + _PREP_ARGS[2:]
 _WY_ARGS = ("kn", "v", "g_cs", "beta", "A_out", "w_out", "u_out", "chunk_start", "chunk_len", "num_heads",
             "num_v_heads", "recompute")  # fmt: skip
 _FWD_H_ARGS = ("kn", "w", "u", "g_cs", "h0", "h_out", "v_new", "final_state", "seg_state", "chunk_start",
@@ -92,20 +111,28 @@ _FWD_H_SPLIT_ARGS = _FWD_H_ARGS + ("seg_flag",)
 _FWD_H_PRE_ARGS = _FWD_H_SPLIT_ARGS + ("warmup_thresh_log2",)
 _STITCH_ARGS = ("seg_state", "init_state", "state_out", "seq_seg_start", "seg_flag", "num_v_heads", "use_init",
                 "reverse")  # fmt: skip
-_FWD_O_ARGS = ("qn", "kn", "v_new", "h", "g_cs", "o_out", "chunk_start", "chunk_len", "num_heads", "num_v_heads",
-               "scale")  # fmt: skip
+_FWD_HO_ARGS = ("qn_tma", "kn_tma", "w_tma", "u_tma", "g_cs", "h0", "seg_start", "h_tma", "v_new_tma", "v_new",
+                "o_tma", "o_out", "final_state", "chunk_start", "chunk_len", "seg_chunk_start", "seg_seq",
+                "seq_chunk_start", "walk", "num_heads", "num_v_heads", "use_initial_state", "store_final_state",
+                "use_seg_start", "scale")  # fmt: skip
 _DV_LOCAL_ARGS = ("qn", "kn", "do", "g_cs", "dv_local", "chunk_start", "chunk_len", "num_heads", "num_v_heads",
                   "scale")  # fmt: skip
 _DHU_ARGS = ("qn", "kn", "w", "do", "dv_local", "g_cs", "dht", "dh_out", "dv2", "dh0", "seg_state", "chunk_start",
              "chunk_len", "seg_chunk_start", "seg_seq", "seq_chunk_start", "num_heads", "num_v_heads",
              "use_final_state_grad", "store_initial_state_grad", "scale")  # fmt: skip
 _DHU_PRE_ARGS = _DHU_ARGS + ("seg_flag", "warmup_thresh_log2")
+_DHU_TC2_ARGS = ("qn_tma", "kn_tma", "w_tma", "do_tma") + tuple(
+    a for a in _DHU_ARGS[4:] if a != "dv_local"
+)
 _DQKWG_ARGS = ("qn", "kn", "v_new", "do", "dv2", "h", "dh", "g_cs", "dq_out", "dk_out", "dw_out", "dg_out",
                "chunk_start", "chunk_len", "num_heads", "num_v_heads", "scale")  # fmt: skip
 _WY_BWD_ARGS = ("kn", "v", "A", "dw", "du", "g_cs", "beta", "dk2_out", "dv_out", "dbeta_out", "dg2_out",
                 "chunk_start", "chunk_len", "num_heads", "num_v_heads")  # fmt: skip
 _FINALIZE_ARGS = ("qn", "kn", "rstd_q", "rstd_k", "dq_hv", "dk_hv", "dk2", "dg1", "dg2", "dq_out", "dk_out", "dg_out",
                   "chunk_start", "chunk_len", "num_heads", "num_v_heads", "normalize_qk")  # fmt: skip
+_TAIL_ARGS = ("qn", "kn", "rstd_q", "rstd_k", "v_new", "do", "dv2", "h", "dh", "g_cs", "v", "A", "beta", "dq_out",
+              "dk_out", "dg_out", "dv_out", "dbeta_out", "chunk_start", "chunk_len", "num_heads", "num_v_heads", "scale",
+              "normalize_qk")  # fmt: skip
 _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_seg_chunk_start", "fwd_seg_seq",
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
@@ -114,17 +141,22 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "meta": _META_ARGS,
     "prep": _PREP_ARGS,
     "prep_bf16beta": _PREP_ARGS,
-    "wy": _WY_ARGS,
-    "fwd_o": _FWD_O_ARGS,
+    "prep_tma": _PREP_TMA_ARGS,
+    "prep_tma_bf16beta": _PREP_TMA_ARGS,
+    "wy_tc": _WY_ARGS,
+    "fwd_ho": _FWD_HO_ARGS,
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
+    "dhu_tc2": _DHU_TC2_ARGS,
     "dqkwg": _DQKWG_ARGS,
     "wy_bwd": _WY_BWD_ARGS,
     "wy_bwd_bf16": _WY_BWD_ARGS,
     "finalize": _FINALIZE_ARGS,
     "finalize_mlp": _FINALIZE_ARGS,
+    "tail_g2": _TAIL_ARGS,
+    "tail_g2_bf16": _TAIL_ARGS,
     **{f"fwd_h_r{vb}k{ks}": _FWD_H_ARGS for vb, ks in REG_SCAN_CONFIGS},
-    **{f"fwd_h_r{vb}k{ks}_split": _FWD_H_SPLIT_ARGS for vb, ks in REG_SCAN_CONFIGS},
+    **{f"fwd_h_r{vb}k{ks}_split": _FWD_H_SPLIT_ARGS for vb, ks in PRESCAN_CONFIGS},
     **{f"fwd_h_pre_r{vb}k{ks}": _FWD_H_PRE_ARGS for vb, ks in PRESCAN_CONFIGS},
     **{f"dhu_r{vb}k{ks}": _DHU_ARGS for vb, ks in REG_SCAN_CONFIGS},
     **{f"dhu_pre_r{vb}k{ks}": _DHU_PRE_ARGS for vb, ks in PRESCAN_CONFIGS},
@@ -186,6 +218,8 @@ REG_SCAN_SMEM, PRESCAN_BLOCK_THREADS = _scan_facts()
 FINALIZE_MLP_GROUP = 3
 FINALIZE_MLP_MIN_BLOCKS = 4
 FINALIZE_STAGES = ("finalize", "finalize_mlp")
+DHU_SCANS = ("reg", "tc")
+PREP_FORMS = ("plain", "tma")
 
 
 @dataclass(frozen=True)
@@ -193,10 +227,14 @@ class ChainOptions:
     """The explicit plan pins of one call.
 
     ``scan_config`` forces the register-scan configuration ``(value block, key split)`` of both scans;
-    ``segment_chunks`` forces the segment length in chunks (0: the serial scan); ``finalize`` forces the
-    finalize stage; ``warmup_log2`` overrides the pre-scans' warm-up threshold; ``save_state`` keeps the forward's
-    ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the chunk
-    tables and the per-stream workspaces between calls.
+    ``segment_chunks`` forces the segment length in chunks (0: the serial scan; above the chunks one pre-scan
+    CTA covers, 128, a plan that splits a sequence raises); ``finalize`` forces the finalize stage of the unfused tail
+    (value-head groups other than two); ``warmup_log2`` overrides the pre-scans' warm-up threshold; ``dhu_scan``
+    forces the adjoint scan of a serial plan (``"reg"``: ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2``;
+    ``None``: the selection rule); ``prep`` forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
+    grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule); ``save_state`` keeps the
+    forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
+    chunk tables, the selection results and the per-stream workspaces between calls.
     """
 
     scan_config: tuple[int, int] | None = None
@@ -205,6 +243,8 @@ class ChainOptions:
     warmup_log2: float | None = None
     save_state: bool = True
     host_cache: bool = True
+    dhu_scan: str | None = None
+    prep: str | None = None
 
     @property
     def pins(self) -> tuple:
@@ -219,6 +259,8 @@ def make_options(
     warmup_log2: float | None = None,
     save_state: bool = True,
     host_cache: bool = True,
+    dhu_scan: str | None = None,
+    prep: str | None = None,
 ) -> ChainOptions:
     """Validated :class:`ChainOptions`."""
     if scan_config is not None:
@@ -249,6 +291,12 @@ def make_options(
         warmup_log2 = float(warmup_log2)
         if not math.isfinite(warmup_log2):
             raise ValueError(f"warmup_log2 must be finite; got {warmup_log2!r}")
+    if dhu_scan is not None and dhu_scan not in DHU_SCANS:
+        raise ValueError(
+            f"dhu_scan must be one of {DHU_SCANS} or None; got {dhu_scan!r}"
+        )
+    if prep is not None and prep not in PREP_FORMS:
+        raise ValueError(f"prep must be one of {PREP_FORMS} or None; got {prep!r}")
     return ChainOptions(
         scan_config,
         segment_chunks,
@@ -256,6 +304,8 @@ def make_options(
         warmup_log2,
         bool(save_state),
         bool(host_cache),
+        dhu_scan,
+        prep,
     )
 
 
@@ -909,6 +959,141 @@ def _scan_stages(kind: str, config: tuple[int, int], arch: str):
 
 
 # --------------------------------------------------------------------------- #
+# adjoint-scan selection: dhu_tc2 (dv_local fused) or dv_local + the register scan
+# --------------------------------------------------------------------------- #
+# The rule: T_tc = makespan steps x t(n), t(n) = t_lat + (t_full - t_lat) x clamp((n - 48) / (SMs - 48), 0, 1) with n
+# the resident CTAs (one per (sequence, value head)); T_reg = the planner's serial cost of the register scan at the
+# bound-layout plan's configuration x t_unit + tiles x c_dvl / SMs.  dhu_tc2 is selected iff T_tc <= DHU_TC_GAIN T_reg.
+DHU_TC_GAIN = 0.95
+DHU_TC_LOW_RESIDENT = 48  # resident CTAs up to which a tcgen05 scan step takes t_lat
+DHU_TC_CONSTANTS = ("t_lat", "t_full", "t_unit", "c_dvl")
+_DHU_AUTO: dict = {}
+_DHU_AUTO_LIMIT = 256
+
+
+@cache
+def _dhu_tc_constants(arch: str) -> tuple[tuple[str, float], ...] | None:
+    """The ``dhu_tc2`` record's ``select`` constants for ``arch`` (``None`` when the record carries none)."""
+    for found in cake_jit.MODULES.values():
+        if found["stage"] == "dhu_tc2" and arch in found["arches"]:
+            const = (found.get("select") or {}).get(arch)
+            if const is None or any(key not in const for key in DHU_TC_CONSTANTS):
+                return None
+            return tuple((key, float(const[key])) for key in DHU_TC_CONSTANTS)
+    return None
+
+
+def dhu_tc_pricing(chunks, num_v_heads, device_index, sset: StageSet | None = None, *,
+                   scan_config: tuple[int, int] | None = None, segment_chunks: int | None = None) -> dict:  # fmt: skip
+    """The selection rule's two sides for a serial layout of ``chunks`` (chunks per sequence); ``select`` is the
+    answer.  The register path is priced at the configuration of the bound layout's adjoint plan, under the same
+    pins as the call."""
+    arch = cake_backend.device_arch(int(device_index))
+    found = _dhu_tc_constants(arch)
+    sm_count, _smem, _major = _device_props(device_index)
+    n = min(len(chunks) * num_v_heads, sm_count)
+    steps_tc = _scan_makespan(chunks, (1,) * len(chunks), num_v_heads, sm_count, 1)
+    rec: dict[str, Any] = {"arch": arch, "steps_tc": steps_tc, "resident": n}
+    if found is None:
+        rec["missing_constants"] = True
+        return rec
+    const = dict(found)
+    low = DHU_TC_LOW_RESIDENT
+    t_n = const["t_lat"] + (const["t_full"] - const["t_lat"]) * min(
+        max((n - low) / (sm_count - low), 0.0), 1.0
+    )
+    total = sum(chunks) * CHUNK
+    plan, _pricing = choose_scan_plan("dhu", total, len(chunks), num_v_heads, device_index, None,
+                                      sset or stage_set(arch), True, scan_config=scan_config,
+                                      segment_chunks=segment_chunks)  # fmt: skip
+    cfg = tuple(plan.config)
+    cost_units = SCAN_STEP_FACTOR[cfg] * _scan_makespan(
+        chunks,
+        (1,) * len(chunks),
+        num_v_heads * (HEAD_DIM // cfg[0]),
+        sm_count,
+        _scan_residency("dhu", *cfg, device_index),
+    )
+    tiles = sum(chunks) * num_v_heads
+    rec.update(t_n=t_n, T_tc=steps_tc * t_n, reg_config=list(cfg), reg_cost_units=cost_units,
+               T_reg=cost_units * const["t_unit"] + tiles * const["c_dvl"] / sm_count)  # fmt: skip
+    rec["select"] = rec["T_tc"] <= DHU_TC_GAIN * rec["T_reg"]
+    return rec
+
+
+def _dhu_tc_selected(
+    meta: ChunkMeta, num_v_heads: int, device_index: int, options: ChainOptions
+) -> bool:
+    """Whether a serial plan's adjoint scan is ``dhu_tc2``: the ``dhu_scan`` pin, else the rule on a host-built table
+    (a device-built table has no layout on the host: the register path)."""
+    if options.dhu_scan is not None:
+        return options.dhu_scan == "tc"
+    if meta.seq_lens is None:
+        return False
+    key = (meta.seq_lens, int(num_v_heads), int(device_index), options.pins)
+    hit = _DHU_AUTO.get(key) if options.host_cache else None
+    if hit is None:
+        chunks = tuple(-(-int(x) // CHUNK) for x in meta.seq_lens)
+        hit = bool(dhu_tc_pricing(chunks, num_v_heads, device_index, scan_config=options.scan_config,
+                                  segment_chunks=options.segment_chunks).get("select", False))  # fmt: skip
+        if options.host_cache:
+            if len(_DHU_AUTO) >= _DHU_AUTO_LIMIT:
+                del _DHU_AUTO[next(iter(_DHU_AUTO))]
+            _DHU_AUTO[key] = hit
+    return hit
+
+
+# --------------------------------------------------------------------------- #
+# prep selection: prep_tma (TMA-staged q / k, one CTA per (chunk, key head)) or the plain prep
+# --------------------------------------------------------------------------- #
+# The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
+# grid needs a second, short wave, slots < CTAs <= window x slots, prep_tma elsewhere.  Both give the same bits.  The
+# tensor maps need q and k 16-byte aligned; an unaligned q or k takes the plain prep.
+PREP_TMA_CONSTANTS = ("ctas_per_sm", "window")
+TMA_ALIGN_BYTES = 16
+
+
+@cache
+def _prep_tma_constants(arch: str) -> tuple[int, float] | None:
+    """The ``prep_tma`` record's ``select`` window for ``arch`` (``None`` when the record carries none)."""
+    for found in cake_jit.MODULES.values():
+        if found["stage"] == "prep_tma" and arch in found["arches"]:
+            const = (found.get("select") or {}).get(arch)
+            if const is None or any(key not in const for key in PREP_TMA_CONSTANTS):
+                return None
+            return int(const["ctas_per_sm"]), float(const["window"])
+    return None
+
+
+def use_prep_tma(num_chunks: int, num_heads: int, device_index: int) -> bool:
+    """The dispatch rule: ``prep_tma`` for ``num_chunks`` x ``num_heads`` CTAs unless slots < CTAs <= window x slots
+    (``False`` when the architecture's record carries no window)."""
+    found = _prep_tma_constants(cake_backend.device_arch(int(device_index)))
+    if found is None:
+        return False
+    ctas_per_sm, window = found
+    sm_count, _smem, _major = _device_props(device_index)
+    ctas, slots = int(num_chunks) * int(num_heads), ctas_per_sm * int(sm_count)
+    return not (slots < ctas <= window * slots)
+
+
+def _prep_stage(
+    q, k, num_chunks: int, num_heads: int, arch: str, options: ChainOptions
+) -> str:
+    """``prep_tma`` or ``prep`` for one call: the ``prep`` pin, else the rule; the plain prep when q or k is not
+    16-byte aligned or the architecture has no ``prep_tma`` record."""
+    if options.prep == "plain" or not _available("prep_tma", arch):
+        return "prep"
+    if any(t.data_ptr() % TMA_ALIGN_BYTES for t in (q, k)):
+        return "prep"
+    if options.prep == "tma" or use_prep_tma(
+        num_chunks, num_heads, _device_index(q.device)
+    ):
+        return "prep_tma"
+    return "prep"
+
+
+# --------------------------------------------------------------------------- #
 # forward
 # --------------------------------------------------------------------------- #
 def _launch_wy(
@@ -929,7 +1114,7 @@ def _launch_wy(
         (total_tokens, num_v_heads, HEAD_DIM), dtype=kn.dtype, device=kn.device
     )
     u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-    _launch("wy", meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
+    _launch("wy_tc", meta.num_chunks, num_v_heads, 1, kn, v, g_cs, beta32, A, w, u, meta.chunk_start, meta.chunk_len,
             num_heads, num_v_heads, 1 if recompute else 0)  # fmt: skip
     return w, u
 
@@ -989,6 +1174,80 @@ def _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_he
     return h, v_new, final_state
 
 
+_WALKS: dict = {}
+
+
+def _walk(device, num_segments: int, options: ChainOptions) -> torch.Tensor:
+    """The identity walk of ``fwd_ho`` (CTA group ``b // HV`` runs segment ``b``): a constant table per (device,
+    segment count), kept between calls under ``host_cache``."""
+    key = (_device_index(device), int(num_segments))
+    walk = _WALKS.get(key) if options.host_cache else None
+    if walk is None:
+        walk = torch.arange(int(num_segments), dtype=torch.int32, device=device)
+        if options.host_cache:
+            _WALKS[key] = walk
+    return walk
+
+
+def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads, *, store_final_state, table,
+                   workspaces, options, scale):  # fmt: skip
+    """The fused forward scan and output on the plan's forward segment table: a split plan first runs the pre-scan
+    and the stitch (``reverse = 0``) for the segments' start states."""
+    device = kn.device
+    h = torch.empty(
+        (meta.num_chunks, num_v_heads, HEAD_DIM, HEAD_DIM),
+        dtype=kn.dtype,
+        device=device,
+    )
+    v_new = torch.empty(u.shape, dtype=u.dtype, device=device)
+    o = torch.empty(u.shape, dtype=u.dtype, device=device)
+    if store_final_state:
+        final_state = torch.empty(
+            (meta.num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        final_state = workspaces.take(table, "f_zero_state", (0, num_v_heads, HEAD_DIM, HEAD_DIM), torch.float32,
+                                      device)  # fmt: skip
+    if initial_state is not None:
+        h0 = initial_state.contiguous()
+        if h0.dtype != torch.float32:
+            h0 = h0.float()
+        use_init = 1
+    else:
+        h0, use_init = final_state, 0
+    segs = meta.fwd_segments
+    seg_start, use_seg = final_state, 0
+    if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
+        stage, vb, pre, pre_threads = _scan_stages("fwd_h", segs.scan_config, arch)
+        if pre is None or not _available("stitch", arch):
+            raise NotImplementedError(f"the segmented fwd_ho path needs {stage.replace('fwd_h_r', 'fwd_h_pre_r')} and "
+                                      f"stitch for {arch}")  # fmt: skip
+        if segs.segment_len > pre_threads:
+            raise ValueError(
+                f"segment_len {segs.segment_len} exceeds the {pre_threads} chunks of {pre}"
+            )
+        seg_state = workspaces.take(table, "f_seg_state", (segs.num_segments, num_v_heads, HEAD_DIM, 2 * HEAD_DIM),
+                                    torch.float32, device)  # fmt: skip
+        seg_flag = workspaces.take(
+            table, "f_seg_flag", (segs.num_segments, num_v_heads), torch.int32, device
+        )
+        _launch(pre, segs.num_segments, num_v_heads, 2 * HEAD_DIM // vb, kn, w, u, g_cs, h0, h, v_new, final_state,
+                seg_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
+                num_heads, num_v_heads, use_init, 0, seg_flag, warmup_thresh_log2(options))  # fmt: skip
+        seg_start = workspaces.take(table, "f_seg_start", (segs.num_segments, num_v_heads, HEAD_DIM, HEAD_DIM),
+                                    torch.float32, device)  # fmt: skip
+        _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, h0, seg_start, segs.seq_seg_start,
+                seg_flag, num_v_heads, use_init, 0)  # fmt: skip
+        use_seg = 1
+    walk = _walk(device, segs.num_segments, options)
+    _launch("fwd_ho", segs.num_segments * num_v_heads, 1, 1, qn, kn, w, u, g_cs, h0, seg_start, h, v_new, v_new, o, o,
+            final_state, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
+            walk, num_heads, num_v_heads, use_init, 1 if store_final_state else 0, use_seg, float(scale))  # fmt: skip
+    return h, v_new, final_state, o
+
+
 def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
                       normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
@@ -1021,9 +1280,10 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
     rstd_q = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     rstd_k = torch.empty((total_tokens, num_heads), dtype=torch.float32, device=device)
     g_cs = torch.empty((total_tokens, num_v_heads), dtype=torch.float32, device=device)
-    _launch("prep_bf16beta" if beta_bf16 else "prep", meta.num_chunks, num_v_heads, 1, q, k, g32, beta, beta32, qn, kn,
-            rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads, num_v_heads,
-            1 if normalize_qk else 0)  # fmt: skip
+    prep = _prep_stage(q, k, meta.num_chunks, num_heads, arch, options)
+    _launch(prep + ("_bf16beta" if beta_bf16 else ""), meta.num_chunks, num_heads if prep == "prep_tma" else num_v_heads,
+            1, q, k, g32, beta, beta32, qn, kn, rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads,
+            num_v_heads, 1 if normalize_qk else 0)  # fmt: skip
     A = torch.empty((total_tokens, num_v_heads, CHUNK), dtype=q.dtype, device=device)
     w, u = _launch_wy(
         arch,
@@ -1040,12 +1300,9 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
     )
     workspaces = _workspaces(options)
     table = workspaces.table(_device_index(kn.device))
-    h, v_new, final_state = _launch_fwd_h(arch, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads,
-                                          store_final_state=output_final_state, table=table, workspaces=workspaces,
-                                          options=options)  # fmt: skip
-    o = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-    _launch("fwd_o", meta.num_chunks, num_v_heads, 1, qn, kn, v_new, h, g_cs, o, meta.chunk_start, meta.chunk_len,
-            num_heads, num_v_heads, float(scale))  # fmt: skip
+    h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num_v_heads,
+                                              store_final_state=output_final_state, table=table,
+                                              workspaces=workspaces, options=options, scale=scale)  # fmt: skip
     return {
         "arch": arch, "normalize_qk": normalize_qk, "num_heads": num_heads, "num_v_heads": num_v_heads,
         "total_tokens": total_tokens, "qn": qn, "kn": kn, "rstd_q": rstd_q, "rstd_k": rstd_k, "g_cs": g_cs, "A": A,
@@ -1101,9 +1358,15 @@ def gdn_chunk_backward(
     else:
         h, v_new = forward["h"], forward["v_new"]
     token_hv = (total_tokens, num_v_heads, HEAD_DIM)
-    dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
-    _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start, meta.chunk_len,
-            num_heads, num_v_heads, scale)  # fmt: skip
+    segs = meta.bwd_segments
+    serial = not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs)
+    use_tc = serial and _dhu_tc_selected(
+        meta, num_v_heads, _device_index(device), options
+    )
+    if not use_tc:
+        dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
+        _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,
+                meta.chunk_len, num_heads, num_v_heads, scale)  # fmt: skip
     dh = workspaces.take(table, "b_dh", h.shape, h.dtype, device)
     dv2 = workspaces.take(table, "b_dv2", token_hv, v.dtype, device)
     if has_initial_state:
@@ -1127,9 +1390,13 @@ def gdn_chunk_backward(
         use_dht = 1
     else:
         dht32, use_dht = dh0, 0
-    segs = meta.bwd_segments
     scan_stage, vb, pre, pre_threads = _scan_stages("dhu", segs.scan_config, arch)
-    if segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
+    if use_tc:
+        # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
+        _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
+                meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
+                num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
+    elif segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
         if pre is None or not _available("stitch", arch):
             raise NotImplementedError(f"the segmented dhu scan needs {scan_stage.replace('dhu_r', 'dhu_pre_r')} and "
                                       f"stitch for {arch}")  # fmt: skip
@@ -1151,9 +1418,29 @@ def gdn_chunk_backward(
         _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                 seg_flag, num_v_heads, use_dht, 1)  # fmt: skip
         dht32, use_dht = dh_end, 1
-    _launch(scan_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32, dh, dv2,
-            dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
-            num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
+    if not use_tc:
+        _launch(scan_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32, dh,
+                dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
+                meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
+    dbeta_bf16 = dbeta_dtype == torch.bfloat16
+    if num_v_heads == 2 * num_heads:
+        # a value-head group of two: dqkwg, the WY pullback and the finalize as one cluster kernel
+        dv = torch.empty(v.shape, dtype=v.dtype, device=device)
+        dbeta = torch.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
+                            dtype=torch.bfloat16 if dbeta_bf16 else torch.float32, device=device)  # fmt: skip
+        dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
+        dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
+        dg = torch.empty(
+            forward.get("g_shape") or (total_tokens, num_v_heads),
+            dtype=torch.float32,
+            device=device,
+        )
+        _launch("tail_g2_bf16" if dbeta_bf16 else "tail_g2", meta.num_chunks * num_v_heads, 1, 1, qn, kn,
+                forward["rstd_q"], forward["rstd_k"], v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta,
+                meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, scale,
+                1 if forward.get("normalize_qk", True) else 0)  # fmt: skip
+        return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
+                "dinitial_state": dh0 if has_initial_state else None}  # fmt: skip
     dq_hv = workspaces.take(table, "b_dq_hv", token_hv, qn.dtype, device)
     dk_hv = workspaces.take(table, "b_dk_hv", token_hv, qn.dtype, device)
     dw = workspaces.take(table, "b_dw", w.shape, w.dtype, device)
@@ -1164,7 +1451,6 @@ def gdn_chunk_backward(
             meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, scale)  # fmt: skip
     dk2 = workspaces.take(table, "b_dk2", token_hv, qn.dtype, device)
     dv = torch.empty(v.shape, dtype=v.dtype, device=device)
-    dbeta_bf16 = dbeta_dtype == torch.bfloat16
     dbeta = torch.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
                         dtype=torch.bfloat16 if dbeta_bf16 else torch.float32, device=device)  # fmt: skip
     dg2 = workspaces.take(
@@ -1330,6 +1616,8 @@ def chunk_gated_delta_rule(
     warmup_log2: float | None = None,
     save_state: bool = True,
     host_cache: bool = True,
+    dhu_scan: str | None = None,
+    prep: str | None = None,
 ):
     """Deterministic chunked gated delta rule with FLA's signature (head dimension 128, ``HV`` a multiple of ``H``).
 
@@ -1347,7 +1635,8 @@ def chunk_gated_delta_rule(
     ):
         raise NotImplementedError("q/k/v must be bfloat16")
     options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
-                           warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache)  # fmt: skip
+                           warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
+                           dhu_scan=dhu_scan, prep=prep)  # fmt: skip
     if g.dtype != torch.float32:
         g = g.float()
     if scale is None:

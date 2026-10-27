@@ -40,12 +40,14 @@ from .cake_chain import (
     build_chunk_meta_from_cu_seqlens,
     choose_scan_plan,
     chunk_gated_delta_rule,
+    dhu_tc_pricing,
     finalize_stage,
     gdn_chunk_backward,
     gdn_chunk_forward,
     make_options,
     scan_plans,
     stage_set,
+    use_prep_tma,
 )
 
 __all__ = [
@@ -65,10 +67,12 @@ __all__ = [
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
     "chunk_gated_delta_rule",
+    "dhu_tc_pricing",
     "finalize_stage",
     "gdn_chunk_backward",
     "gdn_chunk_forward",
     "make_options",
     "scan_plans",
     "stage_set",
+    "use_prep_tma",
 ]

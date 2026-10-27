@@ -17,12 +17,15 @@ Backend suite of the Cake deterministic GDN chunked-training package
 (``flashinfer.experimental.cake_gdn_det_train``).
 
 Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
-scan constants), the build manifest (every record's library, the recorded source digests), the plan pins, the
-finalize rule and the host chunk / segment tables.  On SM100 / SM103: the six outputs ``o, dq, dk, dv, dg, dbeta``
-against an FP64 token recurrence on packed layouts (host and device table routes, FP32 and BF16 ``beta``, every
-register-scan configuration, the serial and segment-parallel scans, both finalize stages, the recompute and
-uncached forms, the un-normalized ``q`` / ``k`` form), the initial / final state with its gradients, and the bitwise
-contracts: two runs, the two table routes on one plan, and an equal-length batch against the same sequences packed.
+scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
+library, the recorded source digests), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule on the
+campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
+packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
+and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
+unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
+initial / final state with its gradients, the pre-scan capacity, and the bitwise contracts: two runs, the two table
+routes on one plan, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte alignment (the plain prep), and an
+equal-length batch against the same sequences packed.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer: a build
 that vendors the package under another import path runs it unchanged after pointing the ``PACKAGES`` entry at its
@@ -125,12 +128,15 @@ def _inputs(
 
 
 def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_state=False, dht=None,
-         use_qk_l2norm_in_kernel=True, **pins):  # fmt: skip
+         use_qk_l2norm_in_kernel=True, leaves=None, **pins):  # fmt: skip
     """Forward and backward through the package; returns the outputs and gradients (and the final state / its
-    initial-state gradient when asked)."""
+    initial-state gradient when asked).  ``leaves`` replaces the fresh leaf copies of the inputs it names."""
     leaves = {
-        name: inputs[name].detach().clone().requires_grad_(True)
-        for name in ("q", "k", "v", "g", "beta")
+        **{
+            name: inputs[name].detach().clone().requires_grad_(True)
+            for name in ("q", "k", "v", "g", "beta")
+        },
+        **(leaves or {}),
     }
     h0 = None
     if initial_state is not None:
@@ -273,11 +279,34 @@ def _assert_bitwise(a: dict, b: dict, names) -> None:
     assert not differing, f"not bitwise equal: {differing}"
 
 
+def _record_launches(monkeypatch) -> list[str]:
+    """The stages the package launches from here on, in order."""
+    stages: list[str] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, *args, **kwargs):
+        stages.append(stage)
+        return launch(stage, *args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return stages
+
+
+def _preps(stages) -> set[str]:
+    return {stage for stage in stages if stage.startswith("prep")}
+
+
 # --------------------------------------------------------------------------- registry and manifest (no device)
 
 
+FUSED_TAIL_STAGES = (
+    "tail_g2",
+    "tail_g2_bf16",
+)  # two-CTA clusters: the two value heads of a key head
+
+
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 25 and len(set(cake_jit.STAGES)) == 25
+    assert len(cake_jit.STAGES) == 29 and len(set(cake_jit.STAGES)) == 29
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -295,7 +324,9 @@ def test_registry_records_are_well_formed() -> None:
         assert rec["kernel_symbol"] == "kernel_" + rec["library"], name
         launch = rec["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False, name
-        assert launch["cluster"] == (1, 1, 1), name
+        assert launch["cluster"] == (
+            (2, 1, 1) if rec["stage"] in FUSED_TAIL_STAGES else (1, 1, 1)
+        ), name
         assert len(launch["block"]) == 3 and launch["block"][0] % 32 == 0, name
         assert launch["dynamic_smem_bytes"] >= 0, name
         # the record's kernel parameters are the call site's, possibly reordered (the chain reorders them)
@@ -321,6 +352,15 @@ def test_scan_records_carry_the_planner_constants() -> None:
         for kind in cake_chain.SCAN_KINDS:
             assert sset.reg_of(kind) == cake_chain.REG_SCAN_CONFIGS, (arch, kind)
             assert sset.split_of(kind) == cake_chain.PRESCAN_CONFIGS, (arch, kind)
+        const = dict(cake_chain._dhu_tc_constants(arch))
+        assert set(const) == set(cake_chain.DHU_TC_CONSTANTS), arch
+        assert (
+            0 < const["t_lat"] <= const["t_full"]
+            and const["t_unit"] > 0
+            and const["c_dvl"] > 0
+        ), arch
+        ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
+        assert ctas_per_sm > 0 and window > 1, arch
 
 
 def test_manifest_covers_every_record_and_its_sources() -> None:
@@ -350,7 +390,10 @@ def test_options_validate_their_pins() -> None:
         scan_config=[64, 1], segment_chunks=0, finalize="finalize"
     )
     assert opts.scan_config == (64, 1) and opts.segment_chunks == 0
-    assert opts.save_state is True and opts.host_cache is True
+    assert opts.save_state is True and opts.host_cache is True and opts.dhu_scan is None
+    assert opts.prep is None
+    assert cake_chain.make_options(dhu_scan="tc").dhu_scan == "tc"
+    assert cake_chain.make_options(prep="tma").prep == "tma"
     for bad in (
         {"scan_config": (32,)},
         {"scan_config": (32, 0)},
@@ -359,6 +402,8 @@ def test_options_validate_their_pins() -> None:
         {"segment_chunks": True},
         {"finalize": "finalize_g2"},
         {"warmup_log2": float("nan")},
+        {"dhu_scan": "auto"},
+        {"prep": "auto"},
     ):
         with pytest.raises(ValueError):
             cake_chain.make_options(**bad)
@@ -376,6 +421,72 @@ def test_finalize_rule() -> None:
         rule(10, 4, 8, 148, forced="finalize_mlp")
     with pytest.raises(ValueError):
         rule(10, 4, 10, 148)
+
+
+# The campaign rows the selection rule decides on (serial adjoint plans on both architectures), and the decision
+# recorded with the rule's constants: dhu_tc2 on r01, r03, r05, r06, r08, r09 (r01: T_tc = 64 steps x t(64 CTAs),
+# B200 154.9 us, GB300 141.9 us).
+_REAL_15 = (
+    2756,
+    4479,
+    4053,
+    4052,
+    5896,
+    4229,
+    5238,
+    3013,
+    4429,
+    4175,
+    3743,
+    4029,
+    5404,
+    3129,
+    5875,
+)
+RULE_ROWS = (
+    ("r01", (4096,) * 4, 16, True),
+    ("r03", (4096,) * 8, 16, True),
+    ("r05", (4096,) * 16, 16, True),
+    ("r06", _REAL_15, 16, True),
+    ("r08", (4096,) * 4, 32, True),
+    ("r09", (4096,) * 16, 32, True),
+)
+RULE_DEVICES = {
+    "sm_100a": ((148, 232448, 10), 154.9),
+    "sm_103a": ((152, 232448, 10), 141.9),
+}
+
+
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_dhu_tc_rule_on_the_campaign_rows(arch, monkeypatch) -> None:
+    props, r01_tc = RULE_DEVICES[arch]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    for row, seq_lens, num_v_heads, selected in RULE_ROWS:
+        _fwd, bwd = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        assert bwd.segment_len == 0 or max(chunks) <= bwd.segment_len, (row, bwd)
+        rec = cake_chain.dhu_tc_pricing(chunks, num_v_heads, 0)
+        assert rec["select"] is selected, (row, rec)
+        if row == "r01":
+            assert abs(rec["T_tc"] - r01_tc) < 0.1, rec
+
+
+# The prep dispatch window on the two architectures' SM counts (slots = 6 x SMs): the plain prep inside
+# (slots, 2.5 x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs) lie inside on both.
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_prep_rule(arch, monkeypatch) -> None:
+    props, _r01 = RULE_DEVICES[arch]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    rule = cake_chain.use_prep_tma
+    slots = 6 * props[0]
+    assert rule(slots, 1, 0) and not rule(slots + 1, 1, 0)
+    assert not rule(int(2.5 * slots), 1, 0) and rule(int(2.5 * slots) + 1, 1, 0)
+    assert not rule(4 * 4096 // 64, 8, 0)
+    assert rule(16 * 4096 // 64, 8, 0) and rule(2, 2, 0)
 
 
 def test_host_tables_follow_the_layout() -> None:
@@ -417,6 +528,13 @@ CASES = (
     ("recompute", (100, 640, 77, 300), (2, 6), torch.bfloat16, "host", {"save_state": False}, True),
     ("uncached", (100, 640, 77, 300), (2, 6), torch.float32, "device", {"host_cache": False}, True),
     ("no-l2norm", (200, 513), (2, 6), torch.bfloat16, "host", {}, False),
+    ("recompute-split", (2000, 300), (1, 2), torch.bfloat16, "host", {"save_state": False, "scan_config": (32, 2), "segment_chunks": 4}, True),
+    ("dhu-tc-g2-host", (100, 640, 77, 300), (2, 4), torch.bfloat16, "host", {"dhu_scan": "tc"}, True),
+    ("dhu-tc-g3-device", (100, 640, 77, 300), (2, 6), torch.float32, "device", {"dhu_scan": "tc"}, True),
+    ("dhu-tc-g1-recompute", (300, 1000), (2, 2), torch.bfloat16, "host", {"dhu_scan": "tc", "save_state": False}, True),
+    ("dhu-reg-g2", (300, 1000), (4, 8), torch.float32, "host", {"dhu_scan": "reg", "scan_config": (64, 1)}, True),
+    ("prep-tma-g3-device", (100, 640, 77, 300), (2, 6), torch.bfloat16, "device", {"prep": "tma"}, True),
+    ("prep-plain-g2-host", (63, 64, 65, 500), (4, 8), torch.float32, "host", {"prep": "plain"}, True),
 )  # fmt: skip
 
 
@@ -431,7 +549,12 @@ def test_matches_the_fp64_recurrence(case, device) -> None:
     _assert_close_to_reference(got, ref, OUTPUT_NAMES)
 
 
-def test_initial_and_final_state(device) -> None:
+@pytest.mark.parametrize(
+    "pins",
+    [{}, {"dhu_scan": "tc"}, {"scan_config": (32, 2), "segment_chunks": 4}],
+    ids=["rule", "dhu-tc", "split"],
+)
+def test_initial_and_final_state(pins, device) -> None:
     seq_lens, heads = (200, 333), (2, 4)
     inputs = _inputs(seq_lens, heads, torch.float32, device, seed=3)
     gen = torch.Generator().manual_seed(7)
@@ -441,7 +564,9 @@ def test_initial_and_final_state(device) -> None:
     dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
         device
     )
-    got = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht)
+    got = _run(
+        inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, **pins
+    )
     ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
@@ -453,7 +578,7 @@ def test_initial_and_final_state(device) -> None:
 # are compared with tolerance; each one carries the error of its own plan (twice the FP64 gate's max-abs bound).
 LONG_LAYOUTS = (
     ("16x4096-h8", (4096,) * 16, (8, 16)),
-    ("15-real-h8", (2756, 4479, 4053, 4052, 5896, 4229, 5238, 3013, 4429, 4175, 3743, 4029, 5404, 3129, 5875), (8, 16)),
+    ("15-real-h8", _REAL_15, (8, 16)),
     ("1x16384-h16", (16384,), (16, 32)),
 )  # fmt: skip
 
@@ -500,17 +625,27 @@ def test_long_device_route_runs_and_is_deterministic(layout, device) -> None:
     assert not bad, f"device vs host route outside the cross-plan gate: {bad}; {report}"
 
 
+def test_segments_beyond_the_prescan_capacity_raise(device) -> None:
+    seq_lens = (
+        140 * 64,
+    )  # one sequence of 140 chunks: a forced 129-chunk segment length splits it
+    inputs = _inputs(seq_lens, (1, 2), torch.bfloat16, device, seed=17)
+    with pytest.raises(ValueError, match="exceeds"):
+        _run(inputs, seq_lens, scan_config=(64, 1), segment_chunks=129)
+
+
 # --------------------------------------------------------------------------- bitwise contracts
 
 
 @pytest.mark.parametrize(
     "pins",
     [
-        {"scan_config": (32, 2), "segment_chunks": 0},
-        {"scan_config": (32, 2), "segment_chunks": 4},
-        {"scan_config": (64, 1), "segment_chunks": 6},
+        {"scan_config": (32, 2), "segment_chunks": 0, "dhu_scan": "reg"},
+        {"scan_config": (64, 1), "segment_chunks": 0, "dhu_scan": "tc"},
+        {"scan_config": (32, 2), "segment_chunks": 4, "dhu_scan": "reg"},
+        {"scan_config": (64, 1), "segment_chunks": 6, "dhu_scan": "reg"},
     ],
-    ids=["serial-32x2", "split-32x2", "split-64x1"],
+    ids=["serial-32x2", "serial-dhu-tc", "split-32x2", "split-64x1"],
 )
 def test_table_routes_agree_bitwise(pins, device) -> None:
     seq_lens = (1500, 77, 640)
@@ -531,15 +666,53 @@ def test_run_to_run_bitwise(route, device) -> None:
     _assert_bitwise(first, uncached, OUTPUT_NAMES)
 
 
-def test_equal_length_batch_matches_the_packed_layout(device) -> None:
+@pytest.mark.parametrize("route", ["host", "device"])
+@pytest.mark.parametrize(
+    "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
+)
+def test_prep_forms_agree_bitwise(route, beta_dtype, device, monkeypatch) -> None:
+    seq_lens = (1500, 77, 640)
+    inputs = _inputs(seq_lens, (2, 6), beta_dtype, device, seed=19)
+    stages = _record_launches(monkeypatch)
+    tma = _run(inputs, seq_lens, route=route, prep="tma")
+    tma_preps = _preps(stages)
+    stages.clear()
+    plain = _run(inputs, seq_lens, route=route, prep="plain")
+    suffix = "_bf16beta" if beta_dtype == torch.bfloat16 else ""
+    assert tma_preps == {"prep_tma" + suffix} and _preps(stages) == {"prep" + suffix}
+    _assert_bitwise(tma, plain, OUTPUT_NAMES)
+
+
+def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
+    # q / k as contiguous views 8 bytes past a 16-byte boundary: the tensor maps of prep_tma need 16-byte aligned
+    # addresses, the plain prep's 4-element loads 8; a prep_tma pin still runs the plain prep, with the same bits.
+    seq_lens = (300, 77)
+    inputs = _inputs(seq_lens, (2, 4), torch.float32, device, seed=23)
+    leaves = {}
+    for name in ("q", "k"):
+        t = inputs[name]
+        buf = torch.empty(t.numel() + 4, dtype=t.dtype, device=device)
+        leaves[name] = buf[4:].view(t.shape).copy_(t).requires_grad_(True)
+        assert leaves[name].is_contiguous() and leaves[name].data_ptr() % 16 == 8
+    stages = _record_launches(monkeypatch)
+    shifted = _run(inputs, seq_lens, leaves=leaves, prep="tma")
+    assert _preps(stages) == {"prep"}
+    aligned = _run(inputs, seq_lens, prep="plain")
+    _assert_bitwise(shifted, aligned, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize(
+    "preps", [(None, None), ("tma", "plain")], ids=["rule", "tma-vs-plain"]
+)
+def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:
     batch, seq_len, heads = 3, 150, (2, 6)
     inputs = _inputs((seq_len,), heads, torch.float32, device, seed=9, batch=batch)
-    batched = _run(inputs, None)
+    batched = _run(inputs, None, prep=preps[0])
     packed_inputs = {
         name: t.reshape(1, batch * seq_len, *t.shape[2:]).contiguous()
         for name, t in inputs.items()
     }
-    packed = _run(packed_inputs, (seq_len,) * batch, route="host")
+    packed = _run(packed_inputs, (seq_len,) * batch, route="host", prep=preps[1])
     for name in OUTPUT_NAMES:
         packed[name] = packed[name].reshape(batched[name].shape)
     _assert_bitwise(batched, packed, OUTPUT_NAMES)
