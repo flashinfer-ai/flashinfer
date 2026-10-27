@@ -2967,6 +2967,63 @@ def run_mtp_decode(
 
     per_token_pool_scatter = ssm_state_indices is not None
 
+    # SM120 frozen-state ReplaySSM fast path.  SM120 has no tcgen05, so the
+    # state/K, state/Q and Gram products use TF32 warp MMA (mma.sync).  It is
+    # selected where it beats the FMA path: always when B * HV <= 128 (few
+    # CTAs, where splitting V rows across CTAs helps most), and for larger
+    # batches only when T >= 7.  At T <= 6 the FMA path is as fast or faster
+    # (up to ~15% at T=4) once B * HV > 128.
+    use_replayssm_hmma = (
+        (target.major, target.minor) == (12, 0)
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and 4 <= T <= 8
+        and K == 128
+        and V == 128
+        and 1 <= B <= 256
+        and use_qk_l2norm
+        and (use_inline_kernel or T >= 7)
+    )
+    if use_replayssm_hmma:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_hmma import (
+            run_gdn_verify_kernel_mtp_replayssm_hmma,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_hmma(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+            # Split each head's V rows across CTAs so enough state loads are
+            # in flight: four ways when there are few heads, two otherwise.
+            v_split=4 if use_inline_kernel else 2,
+        )
+        return
+
     # SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
     # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
     # checkpoints with TMA, and uses tcgen05 for every state/K and state/Q dot.

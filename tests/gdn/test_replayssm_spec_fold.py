@@ -23,10 +23,15 @@ from flashinfer.gdn_decode import (
 )
 
 
+_CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+_IS_SM100 = _CAPABILITY is not None and _CAPABILITY[0] == 10
+_IS_SM120 = _CAPABILITY == (12, 0)
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="ReplaySSM requires SM100/SM103",
+    not (_IS_SM100 or _IS_SM120), reason="ReplaySSM requires SM100/SM103 or SM120"
 )
+requires_sm100 = pytest.mark.skipif(not _IS_SM100, reason="tcgen05 requires SM100")
+requires_sm120 = pytest.mark.skipif(not _IS_SM120, reason="requires SM120")
 
 
 def _inputs(batch=4, steps=8, heads=2, value_heads=8, dtype=torch.bfloat16):
@@ -130,6 +135,10 @@ def _offset_copy(tensor, offset):
         (17, 6, 2, 8, "inner_strided"),
         (17, 7, 2, 8, "strided_bias"),
         (2, 16, 2, 8, "default"),
+        (1, 6, 8, 24, "default"),
+        (8, 7, 8, 24, "default"),
+        (8, 8, 8, 32, "default"),
+        (16, 5, 8, 32, "default"),
         (2, 8, 2, 8, "unnormalized"),
         (17, 4, 2, 8, "unnormalized"),
         (2, 4, 2, 8, "int64"),
@@ -251,6 +260,8 @@ def test_replayssm_verify(batch, steps, heads, hv, variant):
 )
 @pytest.mark.parametrize("tcgen", [False, True])
 def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
+    if tcgen and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     if tcgen and (steps < 4 or not normalize or track):
         pytest.skip("tcgen commit requires normalized T=4..8 without tracking")
     # The extra full-accept row preserves final-step tracking coverage at T=3,
@@ -345,6 +356,8 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
 )
 @pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
 def test_replayssm_single_request_commit(steps, accept, backend):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     if steps < 4 and backend == "tcgen05":
         pytest.skip("tcgen commit requires T=4..8")
     args, cache = _inputs(batch=1, steps=steps)
@@ -574,9 +587,11 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
     args, cache = _inputs()
     target = device_target.gdn_device_target(args["q"].device)
     monkeypatch.setattr(
-        device_target, "gdn_device_target", lambda device: target._replace(major=12)
+        device_target,
+        "gdn_device_target",
+        lambda device: target._replace(major=12, minor=1),
     )
-    with pytest.raises(ValueError, match="SM100/SM103"):
+    with pytest.raises(ValueError, match="SM100/SM103 or SM120"):
         gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
 
 
@@ -599,6 +614,7 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
         (9, 4, 8, 32, "auto", "simt"),
     ],
 )
+@requires_sm100
 def test_replayssm_commit_dispatch(
     steps, layers, batch, hv, backend, expected, monkeypatch
 ):
@@ -628,3 +644,73 @@ def test_replayssm_commit_dispatch(
     )
     gated_delta_rule_replayssm_commit(**args, backend=backend)
     assert selected == [expected]
+
+
+@requires_sm120
+@pytest.mark.parametrize("backend", ["auto", "simt"])
+def test_replayssm_commit_dispatch_sm120(backend, monkeypatch):
+    from flashinfer.gdn_kernels import gdn_replayssm_spec_fold as simt
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    # T=8 and a large grid would select tcgen05 on SM100.
+    args = gdn_replayssm_commit_trace.init(
+        batch_size=8, pool_size=8, num_layers=4, num_v_heads=32, seq_len=8
+    )
+    selected = []
+    monkeypatch.setattr(simt, "_CACHE", {})
+    monkeypatch.setattr(
+        simt,
+        "build_and_load_cute_dsl_kernel",
+        lambda *args, **kwargs: lambda *args: selected.append("simt"),
+    )
+    gated_delta_rule_replayssm_commit(**args, backend=backend)
+    assert selected == ["simt"]
+
+
+@requires_sm120
+def test_replayssm_commit_rejects_tcgen05_on_sm120():
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(seq_len=8)
+    with pytest.raises(ValueError, match="SM100/SM103"):
+        gated_delta_rule_replayssm_commit(**args, backend="tcgen05")
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "batch,steps,hv,variant,expected",
+    [
+        (1, 4, 8, "default", 4),
+        (16, 8, 8, "default", 4),
+        (17, 6, 8, "default", None),
+        (17, 7, 8, "default", 2),
+        (8, 4, 32, "default", None),
+        (8, 8, 32, "default", 2),
+        (256, 8, 2, "default", 2),
+        (1, 3, 8, "default", None),
+        (1, 8, 8, "unnormalized", None),
+        (1, 8, 8, "int64", None),
+        (1, 8, 8, "fp32_output", None),
+    ],
+)
+def test_replayssm_verify_dispatch_sm120(
+    batch, steps, hv, variant, expected, monkeypatch
+):
+    """The SM120 warp-MMA verify is selected, with its V split, per shape."""
+    from flashinfer.gdn_kernels import gdn_decode_mtp_replayssm_hmma as hmma
+
+    args, cache = _inputs(batch, steps, 2, hv)
+    if variant == "unnormalized":
+        args["use_qk_l2norm"] = False
+    if variant == "int64":
+        args["initial_state_indices"] = args["initial_state_indices"].long()
+    if variant == "fp32_output":
+        args["output"] = torch.empty_like(args["v"], dtype=torch.float32)
+    selected = []
+    monkeypatch.setattr(
+        hmma,
+        "run_gdn_verify_kernel_mtp_replayssm_hmma",
+        lambda *args, v_split: selected.append(v_split),
+    )
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    assert selected == ([] if expected is None else [expected])
