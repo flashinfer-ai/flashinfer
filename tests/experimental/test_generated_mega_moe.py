@@ -852,7 +852,7 @@ def test_tp_ep_routing_change_on_one_workspace(case, rank, num_tokens):
     entries_b = [torch.empty_like(permuted) for _ in range(3)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        for output, entries in zip(outputs_b, entries_b):
+        for output, entries in zip(outputs_b, entries_b, strict=True):
             bound_ids.copy_(ids_b)
             bound_weights.copy_(weights_b)
             plan.run()
