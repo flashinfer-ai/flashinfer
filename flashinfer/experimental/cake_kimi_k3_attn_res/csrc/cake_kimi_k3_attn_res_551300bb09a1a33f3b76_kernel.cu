@@ -50,7 +50,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_VALUES_TMEM_OFFSET 0
-#define NUM_PIPE_STAGES 2
+#define NUM_MAIN_STAGES 1
 #define SMEM_SOURCE_BUF_OFF 0
 #define SMEM_SOURCE_BUF_STAGE_BYTES 28672
 #define SMEM_SOURCE_BUF_STRIDE 28672
@@ -67,13 +67,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
 #define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
 #define SMEM_STATS_OFF 157696
-#define SMEM_STATS_STAGE_BYTES 1024
-#define SMEM_STATS_STRIDE 1024
-#define SMEM_OUTPUT_STATS_OFF 158720
+#define SMEM_STATS_STAGE_BYTES 768
+#define SMEM_STATS_STRIDE 768
+#define SMEM_OUTPUT_STATS_OFF 158464
 #define SMEM_OUTPUT_STATS_STAGE_BYTES 64
 #define SMEM_OUTPUT_STATS_STRIDE 64
-#define SMEM_TOTAL 158976
-#define THREADS 320
+#define SMEM_TOTAL 158720
+#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -216,8 +216,8 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(320, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+kernel_cake_kimi_k3_attn_res_551300bb09a1a33f3b76(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -227,7 +227,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
-    const int mbar_base = smem + 158784;
+    const int mbar_base = smem + 158528;
     #define ready_addr (mbar_base + 0)
     #define consumed_addr (mbar_base + 32)
     #define norm_ready_addr (mbar_base + 64)
@@ -250,27 +250,27 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
     const int output_norm_buf_addr = smem + 143360;
     float* stats = reinterpret_cast<float*>(smem_raw + 157696);
     const int stats_addr = smem + 157696;
-    float* output_stats = reinterpret_cast<float*>(smem_raw + 158720);
-    const int output_stats_addr = smem + 158720;
+    float* output_stats = reinterpret_cast<float*>(smem_raw + 158464);
+    const int output_stats_addr = smem + 158464;
 
     // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 9 barriers)
-    // Mbarriers at smem_raw[158784..158856)
+    // Mbarriers at smem_raw[158528..158600)
 
-    if (warp == 0) {
+    if (warp == 8) {
         uint32_t leader = elect_sync();
         if (leader) {
             // ready: 4 barriers, init_count=1
-            mbarrier_init(smem + 158784, 1);
-            mbarrier_init(smem + 158792, 1);
-            mbarrier_init(smem + 158800, 1);
-            mbarrier_init(smem + 158808, 1);
+            mbarrier_init(smem + 158528, 1);
+            mbarrier_init(smem + 158536, 1);
+            mbarrier_init(smem + 158544, 1);
+            mbarrier_init(smem + 158552, 1);
             // consumed: 4 barriers, init_count=128
-            mbarrier_init(smem + 158816, 128);
-            mbarrier_init(smem + 158824, 128);
-            mbarrier_init(smem + 158832, 128);
-            mbarrier_init(smem + 158840, 128);
+            mbarrier_init(smem + 158560, 128);
+            mbarrier_init(smem + 158568, 128);
+            mbarrier_init(smem + 158576, 128);
+            mbarrier_init(smem + 158584, 128);
             // norm_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 158848, 1);
+            mbarrier_init(smem + 158592, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -278,9 +278,9 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 158856);
-    if (warp == 2) {
-        int _tmem_hold = smem + 158856;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 158600);
+    if (warp == 0) {
+        int _tmem_hold = smem + 158600;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
     }
@@ -292,12 +292,16 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
 
     // Kernel post-init ops
     const int tmem_values_tmem = taddr;
+    if (warp >= 8 && warp <= 11) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+    }
 
     // ---- Role: producers ----
-    if (warp <= 1) {
+    if (warp >= 8 && warp <= 9) {
         { // producers_main
+            unsigned int _phase_consumed = 1;
             if (elect_sync()) {
-                int warp_id_in_role = warp - 0;
+                int warp_id_in_role = warp - 8;
                 int stream = warp_id_in_role;
                 unsigned int stream_u = (unsigned int)stream;
                 asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -310,11 +314,9 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         : "memory");
                 }
                 unsigned int stage = 0;
-                unsigned int phase = 0;
-                unsigned int phase_flipped = 1;
                 #pragma unroll 1
                 for (int token = bid + stream * num_bids; token < M; token += 2 * num_bids) {
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -328,8 +330,8 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -343,10 +345,10 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 3 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
+                    mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 43008);
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
@@ -355,17 +357,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                         "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 5 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
-                        : "memory");
-                    stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
-                    asm volatile(
-                        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
-                        "[%0], [%1], %2, [%3];"
-                        :: "r"(source_buf_addr + (stream_u * 2 + stage) * 2 * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
+                        :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     asm volatile(
                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -373,16 +365,17 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         :: "r"(delta_buf_addr + stream_u * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
                 }
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             }
             asm volatile("barrier.sync 0, 320;" ::: "memory");
         }
     // ---- Role: consumers ----
-    } else if (warp >= 2 && warp <= 9) {
+    } else if (warp <= 7) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;");
         { // consumers_main
-            int warp_id_in_role_1 = warp - 2;
+            int warp_id_in_role_1 = warp - 0;
             int consumer_warp = warp_id_in_role_1;
             int stream_1 = consumer_warp / 4;
             unsigned int stream_u_1 = (unsigned int)stream_1;
@@ -390,7 +383,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
             int thread_in_group = warp_in_group * 32 + lane;
             int tmem_base = taddr + (unsigned int)(stream_1 * 128) + (unsigned int)(warp % 4 * 32 << 16);
             int first_token = bid + stream_1 * num_bids;
-            unsigned int stats_stream_base = stream_u_1 * 128;
+            unsigned int stats_stream_base = stream_u_1 * 96;
             unsigned int output_stats_base = stream_u_1 * 8;
             float q_cache[56];
             int hidden_base = thread_in_group * 8;
@@ -874,7 +867,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
             q_cache[54] = q_pair_33.x;
             q_cache[55] = q_pair_33.y;
             unsigned int consumer_stage = 0;
-            unsigned int consumer_phase = 0;
+            unsigned int _phase_ready = 0;
             #pragma unroll 1
             for (int token_1 = bid + stream_1 * num_bids; token_1 < M; token_1 += 2 * num_bids) {
                 float acc32[56];
@@ -937,7 +930,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                 float m_running = -3.4028235e+38f;
                 float s_running = 0.0f;
                 unsigned int ring_stage = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq[4];
@@ -2250,9 +2243,9 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction, weight_sum);
                 m_running = new_max;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_420 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_420) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_420) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_421[4];
@@ -3565,9 +3558,9 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction_600, weight_sum_601);
                 m_running = new_max_599;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_851 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_851) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_851) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_852[4];
@@ -3629,6 +3622,77 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     smem_regs_865[_lr_33] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_854 / 2) + (unsigned int)_lr_33];
                 }
                 float values_866[8];
+                unsigned int smem_regs_867[4];
+                #pragma unroll
+                for (int _lr_34 = 0; _lr_34 < 4; _lr_34++) {
+                    smem_regs_867[_lr_34] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_854 / 2) + (unsigned int)_lr_34];
+                }
+                __nv_bfloat162 prefix_pair = __as_bf16x2(smem_regs_865[0]);
+                __nv_bfloat162 delta_pair = __as_bf16x2(smem_regs_867[0]);
+                __nv_bfloat162 updated_bf16_pair = prefix_pair + delta_pair;
+                values_866[0] = (float)updated_bf16_pair.x;
+                values_866[1] = (float)updated_bf16_pair.y;
+                __nv_bfloat162 prefix_pair_868 = __as_bf16x2(smem_regs_865[1]);
+                __nv_bfloat162 delta_pair_869 = __as_bf16x2(smem_regs_867[1]);
+                __nv_bfloat162 updated_bf16_pair_870 = prefix_pair_868 + delta_pair_869;
+                values_866[2] = (float)updated_bf16_pair_870.x;
+                values_866[3] = (float)updated_bf16_pair_870.y;
+                __nv_bfloat162 prefix_pair_871 = __as_bf16x2(smem_regs_865[2]);
+                __nv_bfloat162 delta_pair_872 = __as_bf16x2(smem_regs_867[2]);
+                __nv_bfloat162 updated_bf16_pair_873 = prefix_pair_871 + delta_pair_872;
+                values_866[4] = (float)updated_bf16_pair_873.x;
+                values_866[5] = (float)updated_bf16_pair_873.y;
+                __nv_bfloat162 prefix_pair_874 = __as_bf16x2(smem_regs_865[3]);
+                __nv_bfloat162 delta_pair_875 = __as_bf16x2(smem_regs_867[3]);
+                __nv_bfloat162 updated_bf16_pair_876 = prefix_pair_874 + delta_pair_875;
+                values_866[6] = (float)updated_bf16_pair_876.x;
+                values_866[7] = (float)updated_bf16_pair_876.y;
+                unsigned int _packed_0[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_866[_lp*2 + 0], values_866[_lp*2+1 + 0]));
+                    _packed_0[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_866[_lp*2 + 2], values_866[_lp*2+1 + 2]));
+                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_866[_lp*2 + 4], values_866[_lp*2+1 + 4]));
+                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_866[_lp*2 + 6], values_866[_lp*2+1 + 6]));
+                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_854))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                tmem_st_x8_f32(tmem_base + 64, values_866);
+                float2 value_pair_877 = make_float2(values_866[0], values_866[1]);
+                float2 q_pair_878 = make_float2(q_cache[0], q_cache[1]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_877, value_pair_877, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_877, q_pair_878, local_dot_853[1]);
+                float2 value_pair_879 = make_float2(values_866[2], values_866[3]);
+                float2 q_pair_880 = make_float2(q_cache[2], q_cache[3]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_879, value_pair_879, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_879, q_pair_880, local_dot_853[1]);
+                float2 value_pair_881 = make_float2(values_866[4], values_866[5]);
+                float2 q_pair_882 = make_float2(q_cache[4], q_cache[5]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_881, value_pair_881, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_881, q_pair_882, local_dot_853[1]);
+                float2 value_pair_883 = make_float2(values_866[6], values_866[7]);
+                float2 q_pair_884 = make_float2(q_cache[6], q_cache[7]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_883, value_pair_883, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_883, q_pair_884, local_dot_853[1]);
+                int hidden_base_885 = 2048 + thread_in_group * 8;
+                unsigned int smem_regs_886[4];
+                #pragma unroll
+                for (int _lr_35 = 0; _lr_35 < 4; _lr_35++) {
+                    smem_regs_886[_lr_35] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_885 / 2) + (unsigned int)_lr_35];
+                }
+                float values_887[8];
                 float _unpack_bf16_33[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -3638,40 +3702,110 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_33[_pair * 2])[0]), "=f"((&_unpack_bf16_33[_pair * 2])[1])
-                        : "r"(smem_regs_865[_pair]));
+                        : "r"(smem_regs_886[_pair]));
                 }
-                values_866[0] = _unpack_bf16_33[0];
-                values_866[1] = _unpack_bf16_33[1];
-                values_866[2] = _unpack_bf16_33[2];
-                values_866[3] = _unpack_bf16_33[3];
-                values_866[4] = _unpack_bf16_33[4];
-                values_866[5] = _unpack_bf16_33[5];
-                values_866[6] = _unpack_bf16_33[6];
-                values_866[7] = _unpack_bf16_33[7];
-                tmem_st_x8_f32(tmem_base + 64, values_866);
-                float2 value_pair_867 = make_float2(values_866[0], values_866[1]);
-                float2 q_pair_868 = make_float2(q_cache[0], q_cache[1]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_867, value_pair_867, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_867, q_pair_868, local_dot_853[1]);
-                float2 value_pair_869 = make_float2(values_866[2], values_866[3]);
-                float2 q_pair_870 = make_float2(q_cache[2], q_cache[3]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_869, value_pair_869, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_869, q_pair_870, local_dot_853[1]);
-                float2 value_pair_871 = make_float2(values_866[4], values_866[5]);
-                float2 q_pair_872 = make_float2(q_cache[4], q_cache[5]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_871, value_pair_871, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_871, q_pair_872, local_dot_853[1]);
-                float2 value_pair_873 = make_float2(values_866[6], values_866[7]);
-                float2 q_pair_874 = make_float2(q_cache[6], q_cache[7]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_873, value_pair_873, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_873, q_pair_874, local_dot_853[1]);
-                int hidden_base_875 = 2048 + thread_in_group * 8;
-                unsigned int smem_regs_876[4];
+                values_887[0] = _unpack_bf16_33[0];
+                values_887[1] = _unpack_bf16_33[1];
+                values_887[2] = _unpack_bf16_33[2];
+                values_887[3] = _unpack_bf16_33[3];
+                values_887[4] = _unpack_bf16_33[4];
+                values_887[5] = _unpack_bf16_33[5];
+                values_887[6] = _unpack_bf16_33[6];
+                values_887[7] = _unpack_bf16_33[7];
+                tmem_st_x8_f32(tmem_base + 8, values_887);
+                float2 value_pair_888 = make_float2(values_887[0], values_887[1]);
+                float2 q_pair_889 = make_float2(q_cache[8], q_cache[9]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_888, value_pair_888, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_888, q_pair_889, local_dot_853[0]);
+                float2 value_pair_890 = make_float2(values_887[2], values_887[3]);
+                float2 q_pair_891 = make_float2(q_cache[10], q_cache[11]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_890, value_pair_890, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_890, q_pair_891, local_dot_853[0]);
+                float2 value_pair_892 = make_float2(values_887[4], values_887[5]);
+                float2 q_pair_893 = make_float2(q_cache[12], q_cache[13]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_892, value_pair_892, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_892, q_pair_893, local_dot_853[0]);
+                float2 value_pair_894 = make_float2(values_887[6], values_887[7]);
+                float2 q_pair_895 = make_float2(q_cache[14], q_cache[15]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_894, value_pair_894, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_894, q_pair_895, local_dot_853[0]);
+                unsigned int smem_regs_896[4];
                 #pragma unroll
-                for (int _lr_34 = 0; _lr_34 < 4; _lr_34++) {
-                    smem_regs_876[_lr_34] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_875 / 2) + (unsigned int)_lr_34];
+                for (int _lr_36 = 0; _lr_36 < 4; _lr_36++) {
+                    smem_regs_896[_lr_36] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_885 / 2) + (unsigned int)_lr_36];
                 }
-                float values_877[8];
+                float values_897[8];
+                unsigned int smem_regs_898[4];
+                #pragma unroll
+                for (int _lr_37 = 0; _lr_37 < 4; _lr_37++) {
+                    smem_regs_898[_lr_37] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_885 / 2) + (unsigned int)_lr_37];
+                }
+                __nv_bfloat162 prefix_pair_899 = __as_bf16x2(smem_regs_896[0]);
+                __nv_bfloat162 delta_pair_900 = __as_bf16x2(smem_regs_898[0]);
+                __nv_bfloat162 updated_bf16_pair_901 = prefix_pair_899 + delta_pair_900;
+                values_897[0] = (float)updated_bf16_pair_901.x;
+                values_897[1] = (float)updated_bf16_pair_901.y;
+                __nv_bfloat162 prefix_pair_902 = __as_bf16x2(smem_regs_896[1]);
+                __nv_bfloat162 delta_pair_903 = __as_bf16x2(smem_regs_898[1]);
+                __nv_bfloat162 updated_bf16_pair_904 = prefix_pair_902 + delta_pair_903;
+                values_897[2] = (float)updated_bf16_pair_904.x;
+                values_897[3] = (float)updated_bf16_pair_904.y;
+                __nv_bfloat162 prefix_pair_905 = __as_bf16x2(smem_regs_896[2]);
+                __nv_bfloat162 delta_pair_906 = __as_bf16x2(smem_regs_898[2]);
+                __nv_bfloat162 updated_bf16_pair_907 = prefix_pair_905 + delta_pair_906;
+                values_897[4] = (float)updated_bf16_pair_907.x;
+                values_897[5] = (float)updated_bf16_pair_907.y;
+                __nv_bfloat162 prefix_pair_908 = __as_bf16x2(smem_regs_896[3]);
+                __nv_bfloat162 delta_pair_909 = __as_bf16x2(smem_regs_898[3]);
+                __nv_bfloat162 updated_bf16_pair_910 = prefix_pair_908 + delta_pair_909;
+                values_897[6] = (float)updated_bf16_pair_910.x;
+                values_897[7] = (float)updated_bf16_pair_910.y;
+                unsigned int _packed_1[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_897[_lp*2 + 0], values_897[_lp*2+1 + 0]));
+                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_897[_lp*2 + 2], values_897[_lp*2+1 + 2]));
+                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_897[_lp*2 + 4], values_897[_lp*2+1 + 4]));
+                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_897[_lp*2 + 6], values_897[_lp*2+1 + 6]));
+                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_885))[0] = reinterpret_cast<int4*>(_packed_1)[0];
+                tmem_st_x8_f32(tmem_base + 64 + 8, values_897);
+                float2 value_pair_911 = make_float2(values_897[0], values_897[1]);
+                float2 q_pair_912 = make_float2(q_cache[8], q_cache[9]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_911, value_pair_911, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_911, q_pair_912, local_dot_853[1]);
+                float2 value_pair_913 = make_float2(values_897[2], values_897[3]);
+                float2 q_pair_914 = make_float2(q_cache[10], q_cache[11]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_913, value_pair_913, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_913, q_pair_914, local_dot_853[1]);
+                float2 value_pair_915 = make_float2(values_897[4], values_897[5]);
+                float2 q_pair_916 = make_float2(q_cache[12], q_cache[13]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_915, value_pair_915, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_915, q_pair_916, local_dot_853[1]);
+                float2 value_pair_917 = make_float2(values_897[6], values_897[7]);
+                float2 q_pair_918 = make_float2(q_cache[14], q_cache[15]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_917, value_pair_917, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_917, q_pair_918, local_dot_853[1]);
+                int hidden_base_919 = 4096 + thread_in_group * 8;
+                unsigned int smem_regs_920[4];
+                #pragma unroll
+                for (int _lr_38 = 0; _lr_38 < 4; _lr_38++) {
+                    smem_regs_920[_lr_38] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_919 / 2) + (unsigned int)_lr_38];
+                }
+                float values_921[8];
                 float _unpack_bf16_34[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -3681,82 +3815,183 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_34[_pair * 2])[0]), "=f"((&_unpack_bf16_34[_pair * 2])[1])
-                        : "r"(smem_regs_876[_pair]));
+                        : "r"(smem_regs_920[_pair]));
                 }
-                values_877[0] = _unpack_bf16_34[0];
-                values_877[1] = _unpack_bf16_34[1];
-                values_877[2] = _unpack_bf16_34[2];
-                values_877[3] = _unpack_bf16_34[3];
-                values_877[4] = _unpack_bf16_34[4];
-                values_877[5] = _unpack_bf16_34[5];
-                values_877[6] = _unpack_bf16_34[6];
-                values_877[7] = _unpack_bf16_34[7];
-                tmem_st_x8_f32(tmem_base + 8, values_877);
-                float2 value_pair_878 = make_float2(values_877[0], values_877[1]);
-                float2 q_pair_879 = make_float2(q_cache[8], q_cache[9]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_878, value_pair_878, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_878, q_pair_879, local_dot_853[0]);
-                float2 value_pair_880 = make_float2(values_877[2], values_877[3]);
-                float2 q_pair_881 = make_float2(q_cache[10], q_cache[11]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_880, value_pair_880, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_880, q_pair_881, local_dot_853[0]);
-                float2 value_pair_882 = make_float2(values_877[4], values_877[5]);
-                float2 q_pair_883 = make_float2(q_cache[12], q_cache[13]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_882, value_pair_882, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_882, q_pair_883, local_dot_853[0]);
-                float2 value_pair_884 = make_float2(values_877[6], values_877[7]);
-                float2 q_pair_885 = make_float2(q_cache[14], q_cache[15]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_884, value_pair_884, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_884, q_pair_885, local_dot_853[0]);
-                unsigned int smem_regs_886[4];
+                values_921[0] = _unpack_bf16_34[0];
+                values_921[1] = _unpack_bf16_34[1];
+                values_921[2] = _unpack_bf16_34[2];
+                values_921[3] = _unpack_bf16_34[3];
+                values_921[4] = _unpack_bf16_34[4];
+                values_921[5] = _unpack_bf16_34[5];
+                values_921[6] = _unpack_bf16_34[6];
+                values_921[7] = _unpack_bf16_34[7];
+                tmem_st_x8_f32(tmem_base + 16, values_921);
+                float2 value_pair_922 = make_float2(values_921[0], values_921[1]);
+                float2 q_pair_923 = make_float2(q_cache[16], q_cache[17]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_922, value_pair_922, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_922, q_pair_923, local_dot_853[0]);
+                float2 value_pair_924 = make_float2(values_921[2], values_921[3]);
+                float2 q_pair_925 = make_float2(q_cache[18], q_cache[19]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_924, value_pair_924, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_924, q_pair_925, local_dot_853[0]);
+                float2 value_pair_926 = make_float2(values_921[4], values_921[5]);
+                float2 q_pair_927 = make_float2(q_cache[20], q_cache[21]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_926, value_pair_926, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_926, q_pair_927, local_dot_853[0]);
+                float2 value_pair_928 = make_float2(values_921[6], values_921[7]);
+                float2 q_pair_929 = make_float2(q_cache[22], q_cache[23]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_928, value_pair_928, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_928, q_pair_929, local_dot_853[0]);
+                unsigned int smem_regs_930[4];
                 #pragma unroll
-                for (int _lr_35 = 0; _lr_35 < 4; _lr_35++) {
-                    smem_regs_886[_lr_35] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_875 / 2) + (unsigned int)_lr_35];
+                for (int _lr_39 = 0; _lr_39 < 4; _lr_39++) {
+                    smem_regs_930[_lr_39] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_919 / 2) + (unsigned int)_lr_39];
                 }
-                float values_887[8];
-                float _unpack_bf16_35[8];
+                float values_931[8];
+                unsigned int smem_regs_932[4];
                 #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
+                for (int _lr_40 = 0; _lr_40 < 4; _lr_40++) {
+                    smem_regs_932[_lr_40] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_919 / 2) + (unsigned int)_lr_40];
+                }
+                __nv_bfloat162 prefix_pair_933 = __as_bf16x2(smem_regs_930[0]);
+                __nv_bfloat162 delta_pair_934 = __as_bf16x2(smem_regs_932[0]);
+                __nv_bfloat162 updated_bf16_pair_935 = prefix_pair_933 + delta_pair_934;
+                values_931[0] = (float)updated_bf16_pair_935.x;
+                values_931[1] = (float)updated_bf16_pair_935.y;
+                __nv_bfloat162 prefix_pair_936 = __as_bf16x2(smem_regs_930[1]);
+                __nv_bfloat162 delta_pair_937 = __as_bf16x2(smem_regs_932[1]);
+                __nv_bfloat162 updated_bf16_pair_938 = prefix_pair_936 + delta_pair_937;
+                values_931[2] = (float)updated_bf16_pair_938.x;
+                values_931[3] = (float)updated_bf16_pair_938.y;
+                __nv_bfloat162 prefix_pair_939 = __as_bf16x2(smem_regs_930[2]);
+                __nv_bfloat162 delta_pair_940 = __as_bf16x2(smem_regs_932[2]);
+                __nv_bfloat162 updated_bf16_pair_941 = prefix_pair_939 + delta_pair_940;
+                values_931[4] = (float)updated_bf16_pair_941.x;
+                values_931[5] = (float)updated_bf16_pair_941.y;
+                __nv_bfloat162 prefix_pair_942 = __as_bf16x2(smem_regs_930[3]);
+                __nv_bfloat162 delta_pair_943 = __as_bf16x2(smem_regs_932[3]);
+                __nv_bfloat162 updated_bf16_pair_944 = prefix_pair_942 + delta_pair_943;
+                values_931[6] = (float)updated_bf16_pair_944.x;
+                values_931[7] = (float)updated_bf16_pair_944.y;
+                unsigned int _packed_2[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_931[_lp*2 + 0], values_931[_lp*2+1 + 0]));
+                    _packed_2[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_931[_lp*2 + 2], values_931[_lp*2+1 + 2]));
+                    _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_931[_lp*2 + 4], values_931[_lp*2+1 + 4]));
+                    _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_931[_lp*2 + 6], values_931[_lp*2+1 + 6]));
+                    _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_919))[0] = reinterpret_cast<int4*>(_packed_2)[0];
+                tmem_st_x8_f32(tmem_base + 64 + 16, values_931);
+                float2 value_pair_945 = make_float2(values_931[0], values_931[1]);
+                float2 q_pair_946 = make_float2(q_cache[16], q_cache[17]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_945, value_pair_945, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_945, q_pair_946, local_dot_853[1]);
+                float2 value_pair_947 = make_float2(values_931[2], values_931[3]);
+                float2 q_pair_948 = make_float2(q_cache[18], q_cache[19]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_947, value_pair_947, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_947, q_pair_948, local_dot_853[1]);
+                float2 value_pair_949 = make_float2(values_931[4], values_931[5]);
+                float2 q_pair_950 = make_float2(q_cache[20], q_cache[21]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_949, value_pair_949, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_949, q_pair_950, local_dot_853[1]);
+                float2 value_pair_951 = make_float2(values_931[6], values_931[7]);
+                float2 q_pair_952 = make_float2(q_cache[22], q_cache[23]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_951, value_pair_951, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_951, q_pair_952, local_dot_853[1]);
+                int hidden_base_953 = 6144 + thread_in_group * 4;
+                unsigned int smem_regs_954[2];
+                #pragma unroll
+                for (int _lr_41 = 0; _lr_41 < 2; _lr_41++) {
+                    smem_regs_954[_lr_41] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_953 / 2) + (unsigned int)_lr_41];
+                }
+                float values_955[4];
+                float _unpack_bf16_35[4];
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
                     asm volatile(
                         "{\n\t"
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_35[_pair * 2])[0]), "=f"((&_unpack_bf16_35[_pair * 2])[1])
-                        : "r"(smem_regs_886[_pair]));
+                        : "r"(smem_regs_954[_pair]));
                 }
-                values_887[0] = _unpack_bf16_35[0];
-                values_887[1] = _unpack_bf16_35[1];
-                values_887[2] = _unpack_bf16_35[2];
-                values_887[3] = _unpack_bf16_35[3];
-                values_887[4] = _unpack_bf16_35[4];
-                values_887[5] = _unpack_bf16_35[5];
-                values_887[6] = _unpack_bf16_35[6];
-                values_887[7] = _unpack_bf16_35[7];
-                tmem_st_x8_f32(tmem_base + 64 + 8, values_887);
-                float2 value_pair_888 = make_float2(values_887[0], values_887[1]);
-                float2 q_pair_889 = make_float2(q_cache[8], q_cache[9]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_888, value_pair_888, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_888, q_pair_889, local_dot_853[1]);
-                float2 value_pair_890 = make_float2(values_887[2], values_887[3]);
-                float2 q_pair_891 = make_float2(q_cache[10], q_cache[11]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_890, value_pair_890, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_890, q_pair_891, local_dot_853[1]);
-                float2 value_pair_892 = make_float2(values_887[4], values_887[5]);
-                float2 q_pair_893 = make_float2(q_cache[12], q_cache[13]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_892, value_pair_892, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_892, q_pair_893, local_dot_853[1]);
-                float2 value_pair_894 = make_float2(values_887[6], values_887[7]);
-                float2 q_pair_895 = make_float2(q_cache[14], q_cache[15]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_894, value_pair_894, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_894, q_pair_895, local_dot_853[1]);
-                int hidden_base_896 = 4096 + thread_in_group * 8;
-                unsigned int smem_regs_897[4];
+                values_955[0] = _unpack_bf16_35[0];
+                values_955[1] = _unpack_bf16_35[1];
+                values_955[2] = _unpack_bf16_35[2];
+                values_955[3] = _unpack_bf16_35[3];
+                tmem_st_x4_f32(tmem_base + 24, values_955);
+                float2 value_pair_956 = make_float2(values_955[0], values_955[1]);
+                float2 q_pair_957 = make_float2(q_cache[24], q_cache[25]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_956, value_pair_956, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_956, q_pair_957, local_dot_853[0]);
+                float2 value_pair_958 = make_float2(values_955[2], values_955[3]);
+                float2 q_pair_959 = make_float2(q_cache[26], q_cache[27]);
+                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_958, value_pair_958, local_sum_sq_852[0]);
+                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_958, q_pair_959, local_dot_853[0]);
+                unsigned int smem_regs_960[2];
                 #pragma unroll
-                for (int _lr_36 = 0; _lr_36 < 4; _lr_36++) {
-                    smem_regs_897[_lr_36] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_896 / 2) + (unsigned int)_lr_36];
+                for (int _lr_42 = 0; _lr_42 < 2; _lr_42++) {
+                    smem_regs_960[_lr_42] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_953 / 2) + (unsigned int)_lr_42];
                 }
-                float values_898[8];
+                float values_961[4];
+                unsigned int smem_regs_962[2];
+                #pragma unroll
+                for (int _lr_43 = 0; _lr_43 < 2; _lr_43++) {
+                    smem_regs_962[_lr_43] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_953 / 2) + (unsigned int)_lr_43];
+                }
+                __nv_bfloat162 prefix_pair_963 = __as_bf16x2(smem_regs_960[0]);
+                __nv_bfloat162 delta_pair_964 = __as_bf16x2(smem_regs_962[0]);
+                __nv_bfloat162 updated_bf16_pair_965 = prefix_pair_963 + delta_pair_964;
+                values_961[0] = (float)updated_bf16_pair_965.x;
+                values_961[1] = (float)updated_bf16_pair_965.y;
+                __nv_bfloat162 prefix_pair_966 = __as_bf16x2(smem_regs_960[1]);
+                __nv_bfloat162 delta_pair_967 = __as_bf16x2(smem_regs_962[1]);
+                __nv_bfloat162 updated_bf16_pair_968 = prefix_pair_966 + delta_pair_967;
+                values_961[2] = (float)updated_bf16_pair_968.x;
+                values_961[3] = (float)updated_bf16_pair_968.y;
+                unsigned int _packed_3[2];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_961[_lp*2 + 0], values_961[_lp*2+1 + 0]));
+                    _packed_3[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_961[_lp*2 + 2], values_961[_lp*2+1 + 2]));
+                    _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_953))[0] = reinterpret_cast<int2*>(_packed_3)[0];
+                tmem_st_x4_f32(tmem_base + 64 + 24, values_961);
+                float2 value_pair_969 = make_float2(values_961[0], values_961[1]);
+                float2 q_pair_970 = make_float2(q_cache[24], q_cache[25]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_969, value_pair_969, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_969, q_pair_970, local_dot_853[1]);
+                float2 value_pair_971 = make_float2(values_961[2], values_961[3]);
+                float2 q_pair_972 = make_float2(q_cache[26], q_cache[27]);
+                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_971, value_pair_971, local_sum_sq_852[1]);
+                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_971, q_pair_972, local_dot_853[1]);
+                int hidden_base_973 = 1024 + thread_in_group * 8;
+                unsigned int smem_regs_974[4];
+                #pragma unroll
+                for (int _lr_44 = 0; _lr_44 < 4; _lr_44++) {
+                    smem_regs_974[_lr_44] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_973 / 2) + (unsigned int)_lr_44];
+                }
+                float values_975[8];
                 float _unpack_bf16_36[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -3766,39 +4001,110 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_36[_pair * 2])[0]), "=f"((&_unpack_bf16_36[_pair * 2])[1])
-                        : "r"(smem_regs_897[_pair]));
+                        : "r"(smem_regs_974[_pair]));
                 }
-                values_898[0] = _unpack_bf16_36[0];
-                values_898[1] = _unpack_bf16_36[1];
-                values_898[2] = _unpack_bf16_36[2];
-                values_898[3] = _unpack_bf16_36[3];
-                values_898[4] = _unpack_bf16_36[4];
-                values_898[5] = _unpack_bf16_36[5];
-                values_898[6] = _unpack_bf16_36[6];
-                values_898[7] = _unpack_bf16_36[7];
-                tmem_st_x8_f32(tmem_base + 16, values_898);
-                float2 value_pair_899 = make_float2(values_898[0], values_898[1]);
-                float2 q_pair_900 = make_float2(q_cache[16], q_cache[17]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_899, value_pair_899, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_899, q_pair_900, local_dot_853[0]);
-                float2 value_pair_901 = make_float2(values_898[2], values_898[3]);
-                float2 q_pair_902 = make_float2(q_cache[18], q_cache[19]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_901, value_pair_901, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_901, q_pair_902, local_dot_853[0]);
-                float2 value_pair_903 = make_float2(values_898[4], values_898[5]);
-                float2 q_pair_904 = make_float2(q_cache[20], q_cache[21]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_903, value_pair_903, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_903, q_pair_904, local_dot_853[0]);
-                float2 value_pair_905 = make_float2(values_898[6], values_898[7]);
-                float2 q_pair_906 = make_float2(q_cache[22], q_cache[23]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_905, value_pair_905, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_905, q_pair_906, local_dot_853[0]);
-                unsigned int smem_regs_907[4];
+                values_975[0] = _unpack_bf16_36[0];
+                values_975[1] = _unpack_bf16_36[1];
+                values_975[2] = _unpack_bf16_36[2];
+                values_975[3] = _unpack_bf16_36[3];
+                values_975[4] = _unpack_bf16_36[4];
+                values_975[5] = _unpack_bf16_36[5];
+                values_975[6] = _unpack_bf16_36[6];
+                values_975[7] = _unpack_bf16_36[7];
+                tmem_st_x8_f32(tmem_base + 32, values_975);
+                float2 value_pair_976 = make_float2(values_975[0], values_975[1]);
+                float2 q_pair_977 = make_float2(q_cache[28], q_cache[29]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_976, value_pair_976, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_976, q_pair_977, local_dot_853[2]);
+                float2 value_pair_978 = make_float2(values_975[2], values_975[3]);
+                float2 q_pair_979 = make_float2(q_cache[30], q_cache[31]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_978, value_pair_978, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_978, q_pair_979, local_dot_853[2]);
+                float2 value_pair_980 = make_float2(values_975[4], values_975[5]);
+                float2 q_pair_981 = make_float2(q_cache[32], q_cache[33]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_980, value_pair_980, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_980, q_pair_981, local_dot_853[2]);
+                float2 value_pair_982 = make_float2(values_975[6], values_975[7]);
+                float2 q_pair_983 = make_float2(q_cache[34], q_cache[35]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_982, value_pair_982, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_982, q_pair_983, local_dot_853[2]);
+                unsigned int smem_regs_984[4];
                 #pragma unroll
-                for (int _lr_37 = 0; _lr_37 < 4; _lr_37++) {
-                    smem_regs_907[_lr_37] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_896 / 2) + (unsigned int)_lr_37];
+                for (int _lr_45 = 0; _lr_45 < 4; _lr_45++) {
+                    smem_regs_984[_lr_45] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_973 / 2) + (unsigned int)_lr_45];
                 }
-                float values_908[8];
+                float values_985[8];
+                unsigned int smem_regs_986[4];
+                #pragma unroll
+                for (int _lr_46 = 0; _lr_46 < 4; _lr_46++) {
+                    smem_regs_986[_lr_46] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_973 / 2) + (unsigned int)_lr_46];
+                }
+                __nv_bfloat162 prefix_pair_987 = __as_bf16x2(smem_regs_984[0]);
+                __nv_bfloat162 delta_pair_988 = __as_bf16x2(smem_regs_986[0]);
+                __nv_bfloat162 updated_bf16_pair_989 = prefix_pair_987 + delta_pair_988;
+                values_985[0] = (float)updated_bf16_pair_989.x;
+                values_985[1] = (float)updated_bf16_pair_989.y;
+                __nv_bfloat162 prefix_pair_990 = __as_bf16x2(smem_regs_984[1]);
+                __nv_bfloat162 delta_pair_991 = __as_bf16x2(smem_regs_986[1]);
+                __nv_bfloat162 updated_bf16_pair_992 = prefix_pair_990 + delta_pair_991;
+                values_985[2] = (float)updated_bf16_pair_992.x;
+                values_985[3] = (float)updated_bf16_pair_992.y;
+                __nv_bfloat162 prefix_pair_993 = __as_bf16x2(smem_regs_984[2]);
+                __nv_bfloat162 delta_pair_994 = __as_bf16x2(smem_regs_986[2]);
+                __nv_bfloat162 updated_bf16_pair_995 = prefix_pair_993 + delta_pair_994;
+                values_985[4] = (float)updated_bf16_pair_995.x;
+                values_985[5] = (float)updated_bf16_pair_995.y;
+                __nv_bfloat162 prefix_pair_996 = __as_bf16x2(smem_regs_984[3]);
+                __nv_bfloat162 delta_pair_997 = __as_bf16x2(smem_regs_986[3]);
+                __nv_bfloat162 updated_bf16_pair_998 = prefix_pair_996 + delta_pair_997;
+                values_985[6] = (float)updated_bf16_pair_998.x;
+                values_985[7] = (float)updated_bf16_pair_998.y;
+                unsigned int _packed_4[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_985[_lp*2 + 0], values_985[_lp*2+1 + 0]));
+                    _packed_4[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_985[_lp*2 + 2], values_985[_lp*2+1 + 2]));
+                    _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_985[_lp*2 + 4], values_985[_lp*2+1 + 4]));
+                    _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_985[_lp*2 + 6], values_985[_lp*2+1 + 6]));
+                    _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_973))[0] = reinterpret_cast<int4*>(_packed_4)[0];
+                tmem_st_x8_f32(tmem_base + 64 + 32, values_985);
+                float2 value_pair_999 = make_float2(values_985[0], values_985[1]);
+                float2 q_pair_1000 = make_float2(q_cache[28], q_cache[29]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_999, value_pair_999, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_999, q_pair_1000, local_dot_853[3]);
+                float2 value_pair_1001 = make_float2(values_985[2], values_985[3]);
+                float2 q_pair_1002 = make_float2(q_cache[30], q_cache[31]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1001, value_pair_1001, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1001, q_pair_1002, local_dot_853[3]);
+                float2 value_pair_1003 = make_float2(values_985[4], values_985[5]);
+                float2 q_pair_1004 = make_float2(q_cache[32], q_cache[33]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1003, value_pair_1003, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1003, q_pair_1004, local_dot_853[3]);
+                float2 value_pair_1005 = make_float2(values_985[6], values_985[7]);
+                float2 q_pair_1006 = make_float2(q_cache[34], q_cache[35]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1005, value_pair_1005, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1005, q_pair_1006, local_dot_853[3]);
+                int hidden_base_1007 = 3072 + thread_in_group * 8;
+                unsigned int smem_regs_1008[4];
+                #pragma unroll
+                for (int _lr_47 = 0; _lr_47 < 4; _lr_47++) {
+                    smem_regs_1008[_lr_47] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_1007 / 2) + (unsigned int)_lr_47];
+                }
+                float values_1009[8];
                 float _unpack_bf16_37[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -3808,70 +4114,223 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_37[_pair * 2])[0]), "=f"((&_unpack_bf16_37[_pair * 2])[1])
-                        : "r"(smem_regs_907[_pair]));
+                        : "r"(smem_regs_1008[_pair]));
                 }
-                values_908[0] = _unpack_bf16_37[0];
-                values_908[1] = _unpack_bf16_37[1];
-                values_908[2] = _unpack_bf16_37[2];
-                values_908[3] = _unpack_bf16_37[3];
-                values_908[4] = _unpack_bf16_37[4];
-                values_908[5] = _unpack_bf16_37[5];
-                values_908[6] = _unpack_bf16_37[6];
-                values_908[7] = _unpack_bf16_37[7];
-                tmem_st_x8_f32(tmem_base + 64 + 16, values_908);
-                float2 value_pair_909 = make_float2(values_908[0], values_908[1]);
-                float2 q_pair_910 = make_float2(q_cache[16], q_cache[17]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_909, value_pair_909, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_909, q_pair_910, local_dot_853[1]);
-                float2 value_pair_911 = make_float2(values_908[2], values_908[3]);
-                float2 q_pair_912 = make_float2(q_cache[18], q_cache[19]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_911, value_pair_911, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_911, q_pair_912, local_dot_853[1]);
-                float2 value_pair_913 = make_float2(values_908[4], values_908[5]);
-                float2 q_pair_914 = make_float2(q_cache[20], q_cache[21]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_913, value_pair_913, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_913, q_pair_914, local_dot_853[1]);
-                float2 value_pair_915 = make_float2(values_908[6], values_908[7]);
-                float2 q_pair_916 = make_float2(q_cache[22], q_cache[23]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_915, value_pair_915, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_915, q_pair_916, local_dot_853[1]);
-                int hidden_base_917 = 6144 + thread_in_group * 4;
-                unsigned int smem_regs_918[2];
+                values_1009[0] = _unpack_bf16_37[0];
+                values_1009[1] = _unpack_bf16_37[1];
+                values_1009[2] = _unpack_bf16_37[2];
+                values_1009[3] = _unpack_bf16_37[3];
+                values_1009[4] = _unpack_bf16_37[4];
+                values_1009[5] = _unpack_bf16_37[5];
+                values_1009[6] = _unpack_bf16_37[6];
+                values_1009[7] = _unpack_bf16_37[7];
+                tmem_st_x8_f32(tmem_base + 40, values_1009);
+                float2 value_pair_1010 = make_float2(values_1009[0], values_1009[1]);
+                float2 q_pair_1011 = make_float2(q_cache[36], q_cache[37]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1010, value_pair_1010, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1010, q_pair_1011, local_dot_853[2]);
+                float2 value_pair_1012 = make_float2(values_1009[2], values_1009[3]);
+                float2 q_pair_1013 = make_float2(q_cache[38], q_cache[39]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1012, value_pair_1012, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1012, q_pair_1013, local_dot_853[2]);
+                float2 value_pair_1014 = make_float2(values_1009[4], values_1009[5]);
+                float2 q_pair_1015 = make_float2(q_cache[40], q_cache[41]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1014, value_pair_1014, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1014, q_pair_1015, local_dot_853[2]);
+                float2 value_pair_1016 = make_float2(values_1009[6], values_1009[7]);
+                float2 q_pair_1017 = make_float2(q_cache[42], q_cache[43]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1016, value_pair_1016, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1016, q_pair_1017, local_dot_853[2]);
+                unsigned int smem_regs_1018[4];
                 #pragma unroll
-                for (int _lr_38 = 0; _lr_38 < 2; _lr_38++) {
-                    smem_regs_918[_lr_38] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_917 / 2) + (unsigned int)_lr_38];
+                for (int _lr_48 = 0; _lr_48 < 4; _lr_48++) {
+                    smem_regs_1018[_lr_48] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_1007 / 2) + (unsigned int)_lr_48];
                 }
-                float values_919[4];
-                float _unpack_bf16_38[4];
+                float values_1019[8];
+                unsigned int smem_regs_1020[4];
                 #pragma unroll
-                for (int _pair = 0; _pair < 2; _pair++) {
+                for (int _lr_49 = 0; _lr_49 < 4; _lr_49++) {
+                    smem_regs_1020[_lr_49] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1007 / 2) + (unsigned int)_lr_49];
+                }
+                __nv_bfloat162 prefix_pair_1021 = __as_bf16x2(smem_regs_1018[0]);
+                __nv_bfloat162 delta_pair_1022 = __as_bf16x2(smem_regs_1020[0]);
+                __nv_bfloat162 updated_bf16_pair_1023 = prefix_pair_1021 + delta_pair_1022;
+                values_1019[0] = (float)updated_bf16_pair_1023.x;
+                values_1019[1] = (float)updated_bf16_pair_1023.y;
+                __nv_bfloat162 prefix_pair_1024 = __as_bf16x2(smem_regs_1018[1]);
+                __nv_bfloat162 delta_pair_1025 = __as_bf16x2(smem_regs_1020[1]);
+                __nv_bfloat162 updated_bf16_pair_1026 = prefix_pair_1024 + delta_pair_1025;
+                values_1019[2] = (float)updated_bf16_pair_1026.x;
+                values_1019[3] = (float)updated_bf16_pair_1026.y;
+                __nv_bfloat162 prefix_pair_1027 = __as_bf16x2(smem_regs_1018[2]);
+                __nv_bfloat162 delta_pair_1028 = __as_bf16x2(smem_regs_1020[2]);
+                __nv_bfloat162 updated_bf16_pair_1029 = prefix_pair_1027 + delta_pair_1028;
+                values_1019[4] = (float)updated_bf16_pair_1029.x;
+                values_1019[5] = (float)updated_bf16_pair_1029.y;
+                __nv_bfloat162 prefix_pair_1030 = __as_bf16x2(smem_regs_1018[3]);
+                __nv_bfloat162 delta_pair_1031 = __as_bf16x2(smem_regs_1020[3]);
+                __nv_bfloat162 updated_bf16_pair_1032 = prefix_pair_1030 + delta_pair_1031;
+                values_1019[6] = (float)updated_bf16_pair_1032.x;
+                values_1019[7] = (float)updated_bf16_pair_1032.y;
+                unsigned int _packed_5[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1019[_lp*2 + 0], values_1019[_lp*2+1 + 0]));
+                    _packed_5[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1019[_lp*2 + 2], values_1019[_lp*2+1 + 2]));
+                    _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1019[_lp*2 + 4], values_1019[_lp*2+1 + 4]));
+                    _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1019[_lp*2 + 6], values_1019[_lp*2+1 + 6]));
+                    _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1007))[0] = reinterpret_cast<int4*>(_packed_5)[0];
+                tmem_st_x8_f32(tmem_base + 64 + 40, values_1019);
+                float2 value_pair_1033 = make_float2(values_1019[0], values_1019[1]);
+                float2 q_pair_1034 = make_float2(q_cache[36], q_cache[37]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1033, value_pair_1033, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1033, q_pair_1034, local_dot_853[3]);
+                float2 value_pair_1035 = make_float2(values_1019[2], values_1019[3]);
+                float2 q_pair_1036 = make_float2(q_cache[38], q_cache[39]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1035, value_pair_1035, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1035, q_pair_1036, local_dot_853[3]);
+                float2 value_pair_1037 = make_float2(values_1019[4], values_1019[5]);
+                float2 q_pair_1038 = make_float2(q_cache[40], q_cache[41]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1037, value_pair_1037, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1037, q_pair_1038, local_dot_853[3]);
+                float2 value_pair_1039 = make_float2(values_1019[6], values_1019[7]);
+                float2 q_pair_1040 = make_float2(q_cache[42], q_cache[43]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1039, value_pair_1039, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1039, q_pair_1040, local_dot_853[3]);
+                int hidden_base_1041 = 5120 + thread_in_group * 8;
+                unsigned int smem_regs_1042[4];
+                #pragma unroll
+                for (int _lr_50 = 0; _lr_50 < 4; _lr_50++) {
+                    smem_regs_1042[_lr_50] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_1041 / 2) + (unsigned int)_lr_50];
+                }
+                float values_1043[8];
+                float _unpack_bf16_38[8];
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
                         "{\n\t"
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_38[_pair * 2])[0]), "=f"((&_unpack_bf16_38[_pair * 2])[1])
-                        : "r"(smem_regs_918[_pair]));
+                        : "r"(smem_regs_1042[_pair]));
                 }
-                values_919[0] = _unpack_bf16_38[0];
-                values_919[1] = _unpack_bf16_38[1];
-                values_919[2] = _unpack_bf16_38[2];
-                values_919[3] = _unpack_bf16_38[3];
-                tmem_st_x4_f32(tmem_base + 24, values_919);
-                float2 value_pair_920 = make_float2(values_919[0], values_919[1]);
-                float2 q_pair_921 = make_float2(q_cache[24], q_cache[25]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_920, value_pair_920, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_920, q_pair_921, local_dot_853[0]);
-                float2 value_pair_922 = make_float2(values_919[2], values_919[3]);
-                float2 q_pair_923 = make_float2(q_cache[26], q_cache[27]);
-                local_sum_sq_852[0] = fma_f32x2_rn_ftz(value_pair_922, value_pair_922, local_sum_sq_852[0]);
-                local_dot_853[0] = fma_f32x2_rn_ftz(value_pair_922, q_pair_923, local_dot_853[0]);
-                unsigned int smem_regs_924[2];
+                values_1043[0] = _unpack_bf16_38[0];
+                values_1043[1] = _unpack_bf16_38[1];
+                values_1043[2] = _unpack_bf16_38[2];
+                values_1043[3] = _unpack_bf16_38[3];
+                values_1043[4] = _unpack_bf16_38[4];
+                values_1043[5] = _unpack_bf16_38[5];
+                values_1043[6] = _unpack_bf16_38[6];
+                values_1043[7] = _unpack_bf16_38[7];
+                tmem_st_x8_f32(tmem_base + 48, values_1043);
+                float2 value_pair_1044 = make_float2(values_1043[0], values_1043[1]);
+                float2 q_pair_1045 = make_float2(q_cache[44], q_cache[45]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1044, value_pair_1044, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1044, q_pair_1045, local_dot_853[2]);
+                float2 value_pair_1046 = make_float2(values_1043[2], values_1043[3]);
+                float2 q_pair_1047 = make_float2(q_cache[46], q_cache[47]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1046, value_pair_1046, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1046, q_pair_1047, local_dot_853[2]);
+                float2 value_pair_1048 = make_float2(values_1043[4], values_1043[5]);
+                float2 q_pair_1049 = make_float2(q_cache[48], q_cache[49]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1048, value_pair_1048, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1048, q_pair_1049, local_dot_853[2]);
+                float2 value_pair_1050 = make_float2(values_1043[6], values_1043[7]);
+                float2 q_pair_1051 = make_float2(q_cache[50], q_cache[51]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1050, value_pair_1050, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1050, q_pair_1051, local_dot_853[2]);
+                unsigned int smem_regs_1052[4];
                 #pragma unroll
-                for (int _lr_39 = 0; _lr_39 < 2; _lr_39++) {
-                    smem_regs_924[_lr_39] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_917 / 2) + (unsigned int)_lr_39];
+                for (int _lr_51 = 0; _lr_51 < 4; _lr_51++) {
+                    smem_regs_1052[_lr_51] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_1041 / 2) + (unsigned int)_lr_51];
                 }
-                float values_925[4];
+                float values_1053[8];
+                unsigned int smem_regs_1054[4];
+                #pragma unroll
+                for (int _lr_52 = 0; _lr_52 < 4; _lr_52++) {
+                    smem_regs_1054[_lr_52] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1041 / 2) + (unsigned int)_lr_52];
+                }
+                __nv_bfloat162 prefix_pair_1055 = __as_bf16x2(smem_regs_1052[0]);
+                __nv_bfloat162 delta_pair_1056 = __as_bf16x2(smem_regs_1054[0]);
+                __nv_bfloat162 updated_bf16_pair_1057 = prefix_pair_1055 + delta_pair_1056;
+                values_1053[0] = (float)updated_bf16_pair_1057.x;
+                values_1053[1] = (float)updated_bf16_pair_1057.y;
+                __nv_bfloat162 prefix_pair_1058 = __as_bf16x2(smem_regs_1052[1]);
+                __nv_bfloat162 delta_pair_1059 = __as_bf16x2(smem_regs_1054[1]);
+                __nv_bfloat162 updated_bf16_pair_1060 = prefix_pair_1058 + delta_pair_1059;
+                values_1053[2] = (float)updated_bf16_pair_1060.x;
+                values_1053[3] = (float)updated_bf16_pair_1060.y;
+                __nv_bfloat162 prefix_pair_1061 = __as_bf16x2(smem_regs_1052[2]);
+                __nv_bfloat162 delta_pair_1062 = __as_bf16x2(smem_regs_1054[2]);
+                __nv_bfloat162 updated_bf16_pair_1063 = prefix_pair_1061 + delta_pair_1062;
+                values_1053[4] = (float)updated_bf16_pair_1063.x;
+                values_1053[5] = (float)updated_bf16_pair_1063.y;
+                __nv_bfloat162 prefix_pair_1064 = __as_bf16x2(smem_regs_1052[3]);
+                __nv_bfloat162 delta_pair_1065 = __as_bf16x2(smem_regs_1054[3]);
+                __nv_bfloat162 updated_bf16_pair_1066 = prefix_pair_1064 + delta_pair_1065;
+                values_1053[6] = (float)updated_bf16_pair_1066.x;
+                values_1053[7] = (float)updated_bf16_pair_1066.y;
+                unsigned int _packed_6[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1053[_lp*2 + 0], values_1053[_lp*2+1 + 0]));
+                    _packed_6[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1053[_lp*2 + 2], values_1053[_lp*2+1 + 2]));
+                    _packed_6[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1053[_lp*2 + 4], values_1053[_lp*2+1 + 4]));
+                    _packed_6[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1053[_lp*2 + 6], values_1053[_lp*2+1 + 6]));
+                    _packed_6[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1041))[0] = reinterpret_cast<int4*>(_packed_6)[0];
+                tmem_st_x8_f32(tmem_base + 64 + 48, values_1053);
+                float2 value_pair_1067 = make_float2(values_1053[0], values_1053[1]);
+                float2 q_pair_1068 = make_float2(q_cache[44], q_cache[45]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1067, value_pair_1067, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1067, q_pair_1068, local_dot_853[3]);
+                float2 value_pair_1069 = make_float2(values_1053[2], values_1053[3]);
+                float2 q_pair_1070 = make_float2(q_cache[46], q_cache[47]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1069, value_pair_1069, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1069, q_pair_1070, local_dot_853[3]);
+                float2 value_pair_1071 = make_float2(values_1053[4], values_1053[5]);
+                float2 q_pair_1072 = make_float2(q_cache[48], q_cache[49]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1071, value_pair_1071, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1071, q_pair_1072, local_dot_853[3]);
+                float2 value_pair_1073 = make_float2(values_1053[6], values_1053[7]);
+                float2 q_pair_1074 = make_float2(q_cache[50], q_cache[51]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1073, value_pair_1073, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1073, q_pair_1074, local_dot_853[3]);
+                int hidden_base_1075 = 6656 + thread_in_group * 4;
+                unsigned int smem_regs_1076[2];
+                #pragma unroll
+                for (int _lr_53 = 0; _lr_53 < 2; _lr_53++) {
+                    smem_regs_1076[_lr_53] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_1075 / 2) + (unsigned int)_lr_53];
+                }
+                float values_1077[4];
                 float _unpack_bf16_39[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -3881,28 +4340,833 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_39[_pair * 2])[0]), "=f"((&_unpack_bf16_39[_pair * 2])[1])
-                        : "r"(smem_regs_924[_pair]));
+                        : "r"(smem_regs_1076[_pair]));
                 }
-                values_925[0] = _unpack_bf16_39[0];
-                values_925[1] = _unpack_bf16_39[1];
-                values_925[2] = _unpack_bf16_39[2];
-                values_925[3] = _unpack_bf16_39[3];
-                tmem_st_x4_f32(tmem_base + 64 + 24, values_925);
-                float2 value_pair_926 = make_float2(values_925[0], values_925[1]);
-                float2 q_pair_927 = make_float2(q_cache[24], q_cache[25]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_926, value_pair_926, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_926, q_pair_927, local_dot_853[1]);
-                float2 value_pair_928 = make_float2(values_925[2], values_925[3]);
-                float2 q_pair_929 = make_float2(q_cache[26], q_cache[27]);
-                local_sum_sq_852[1] = fma_f32x2_rn_ftz(value_pair_928, value_pair_928, local_sum_sq_852[1]);
-                local_dot_853[1] = fma_f32x2_rn_ftz(value_pair_928, q_pair_929, local_dot_853[1]);
-                int hidden_base_930 = 1024 + thread_in_group * 8;
-                unsigned int smem_regs_931[4];
+                values_1077[0] = _unpack_bf16_39[0];
+                values_1077[1] = _unpack_bf16_39[1];
+                values_1077[2] = _unpack_bf16_39[2];
+                values_1077[3] = _unpack_bf16_39[3];
+                tmem_st_x4_f32(tmem_base + 56, values_1077);
+                float2 value_pair_1078 = make_float2(values_1077[0], values_1077[1]);
+                float2 q_pair_1079 = make_float2(q_cache[52], q_cache[53]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1078, value_pair_1078, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1078, q_pair_1079, local_dot_853[2]);
+                float2 value_pair_1080 = make_float2(values_1077[2], values_1077[3]);
+                float2 q_pair_1081 = make_float2(q_cache[54], q_cache[55]);
+                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_1080, value_pair_1080, local_sum_sq_852[2]);
+                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_1080, q_pair_1081, local_dot_853[2]);
+                unsigned int smem_regs_1082[2];
                 #pragma unroll
-                for (int _lr_40 = 0; _lr_40 < 4; _lr_40++) {
-                    smem_regs_931[_lr_40] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_930 / 2) + (unsigned int)_lr_40];
+                for (int _lr_54 = 0; _lr_54 < 2; _lr_54++) {
+                    smem_regs_1082[_lr_54] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_1075 / 2) + (unsigned int)_lr_54];
                 }
-                float values_932[8];
+                float values_1083[4];
+                unsigned int smem_regs_1084[2];
+                #pragma unroll
+                for (int _lr_55 = 0; _lr_55 < 2; _lr_55++) {
+                    smem_regs_1084[_lr_55] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1075 / 2) + (unsigned int)_lr_55];
+                }
+                __nv_bfloat162 prefix_pair_1085 = __as_bf16x2(smem_regs_1082[0]);
+                __nv_bfloat162 delta_pair_1086 = __as_bf16x2(smem_regs_1084[0]);
+                __nv_bfloat162 updated_bf16_pair_1087 = prefix_pair_1085 + delta_pair_1086;
+                values_1083[0] = (float)updated_bf16_pair_1087.x;
+                values_1083[1] = (float)updated_bf16_pair_1087.y;
+                __nv_bfloat162 prefix_pair_1088 = __as_bf16x2(smem_regs_1082[1]);
+                __nv_bfloat162 delta_pair_1089 = __as_bf16x2(smem_regs_1084[1]);
+                __nv_bfloat162 updated_bf16_pair_1090 = prefix_pair_1088 + delta_pair_1089;
+                values_1083[2] = (float)updated_bf16_pair_1090.x;
+                values_1083[3] = (float)updated_bf16_pair_1090.y;
+                unsigned int _packed_7[2];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1083[_lp*2 + 0], values_1083[_lp*2+1 + 0]));
+                    _packed_7[_lp] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1083[_lp*2 + 2], values_1083[_lp*2+1 + 2]));
+                    _packed_7[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_1075))[0] = reinterpret_cast<int2*>(_packed_7)[0];
+                tmem_st_x4_f32(tmem_base + 64 + 56, values_1083);
+                float2 value_pair_1091 = make_float2(values_1083[0], values_1083[1]);
+                float2 q_pair_1092 = make_float2(q_cache[52], q_cache[53]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1091, value_pair_1091, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1091, q_pair_1092, local_dot_853[3]);
+                float2 value_pair_1093 = make_float2(values_1083[2], values_1083[3]);
+                float2 q_pair_1094 = make_float2(q_cache[54], q_cache[55]);
+                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1093, value_pair_1093, local_sum_sq_852[3]);
+                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1093, q_pair_1094, local_dot_853[3]);
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                mbarrier_arrive(consumed_addr + (ring_stage_851) * 8);
+                asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                unsigned int slot_base_1095 = stats_stream_base + 64;
+                float2 reduce_pair_1096 = make_float2(local_sum_sq_852[0].x + local_sum_sq_852[0].y, local_dot_853[0].x + local_dot_853[0].y);
+                unsigned long long packed_pair_1097 = 0;
+                unsigned long long peer_packed_1098 = 0;
+                float2 peer_pair_1099 = make_float2(0.0f, 0.0f);
+                packed_pair_1097 = reinterpret_cast<unsigned long long*>(&reduce_pair_1096)[0];
+                unsigned long long _shfl_xor_sync_136 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1097, 16);
+                peer_packed_1098 = _shfl_xor_sync_136;
+                peer_pair_1099 = reinterpret_cast<float2*>(&peer_packed_1098)[0];
+                reduce_pair_1096 = add_f32x2(reduce_pair_1096, peer_pair_1099);
+                packed_pair_1097 = reinterpret_cast<unsigned long long*>(&reduce_pair_1096)[0];
+                unsigned long long _shfl_xor_sync_137 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1097, 8);
+                peer_packed_1098 = _shfl_xor_sync_137;
+                peer_pair_1099 = reinterpret_cast<float2*>(&peer_packed_1098)[0];
+                reduce_pair_1096 = add_f32x2(reduce_pair_1096, peer_pair_1099);
+                packed_pair_1097 = reinterpret_cast<unsigned long long*>(&reduce_pair_1096)[0];
+                unsigned long long _shfl_xor_sync_138 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1097, 4);
+                peer_packed_1098 = _shfl_xor_sync_138;
+                peer_pair_1099 = reinterpret_cast<float2*>(&peer_packed_1098)[0];
+                reduce_pair_1096 = add_f32x2(reduce_pair_1096, peer_pair_1099);
+                packed_pair_1097 = reinterpret_cast<unsigned long long*>(&reduce_pair_1096)[0];
+                unsigned long long _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1097, 2);
+                peer_packed_1098 = _shfl_xor_sync_139;
+                peer_pair_1099 = reinterpret_cast<float2*>(&peer_packed_1098)[0];
+                reduce_pair_1096 = add_f32x2(reduce_pair_1096, peer_pair_1099);
+                packed_pair_1097 = reinterpret_cast<unsigned long long*>(&reduce_pair_1096)[0];
+                unsigned long long _shfl_xor_sync_140 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1097, 1);
+                peer_packed_1098 = _shfl_xor_sync_140;
+                peer_pair_1099 = reinterpret_cast<float2*>(&peer_packed_1098)[0];
+                reduce_pair_1096 = add_f32x2(reduce_pair_1096, peer_pair_1099);
+                if (lane == 0) {
+                    stats[slot_base_1095 + (unsigned int)(warp_in_group * 2 * 2)] = reduce_pair_1096.x;
+                    stats[slot_base_1095 + (unsigned int)(warp_in_group * 2 * 2) + 1] = reduce_pair_1096.y;
+                }
+                float2 reduce_pair_1100 = make_float2(local_sum_sq_852[1].x + local_sum_sq_852[1].y, local_dot_853[1].x + local_dot_853[1].y);
+                unsigned long long packed_pair_1101 = 0;
+                unsigned long long peer_packed_1102 = 0;
+                float2 peer_pair_1103 = make_float2(0.0f, 0.0f);
+                packed_pair_1101 = reinterpret_cast<unsigned long long*>(&reduce_pair_1100)[0];
+                unsigned long long _shfl_xor_sync_141 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1101, 16);
+                peer_packed_1102 = _shfl_xor_sync_141;
+                peer_pair_1103 = reinterpret_cast<float2*>(&peer_packed_1102)[0];
+                reduce_pair_1100 = add_f32x2(reduce_pair_1100, peer_pair_1103);
+                packed_pair_1101 = reinterpret_cast<unsigned long long*>(&reduce_pair_1100)[0];
+                unsigned long long _shfl_xor_sync_142 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1101, 8);
+                peer_packed_1102 = _shfl_xor_sync_142;
+                peer_pair_1103 = reinterpret_cast<float2*>(&peer_packed_1102)[0];
+                reduce_pair_1100 = add_f32x2(reduce_pair_1100, peer_pair_1103);
+                packed_pair_1101 = reinterpret_cast<unsigned long long*>(&reduce_pair_1100)[0];
+                unsigned long long _shfl_xor_sync_143 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1101, 4);
+                peer_packed_1102 = _shfl_xor_sync_143;
+                peer_pair_1103 = reinterpret_cast<float2*>(&peer_packed_1102)[0];
+                reduce_pair_1100 = add_f32x2(reduce_pair_1100, peer_pair_1103);
+                packed_pair_1101 = reinterpret_cast<unsigned long long*>(&reduce_pair_1100)[0];
+                unsigned long long _shfl_xor_sync_144 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1101, 2);
+                peer_packed_1102 = _shfl_xor_sync_144;
+                peer_pair_1103 = reinterpret_cast<float2*>(&peer_packed_1102)[0];
+                reduce_pair_1100 = add_f32x2(reduce_pair_1100, peer_pair_1103);
+                packed_pair_1101 = reinterpret_cast<unsigned long long*>(&reduce_pair_1100)[0];
+                unsigned long long _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1101, 1);
+                peer_packed_1102 = _shfl_xor_sync_145;
+                peer_pair_1103 = reinterpret_cast<float2*>(&peer_packed_1102)[0];
+                reduce_pair_1100 = add_f32x2(reduce_pair_1100, peer_pair_1103);
+                if (lane == 0) {
+                    stats[slot_base_1095 + (unsigned int)((warp_in_group * 2 + 1) * 2)] = reduce_pair_1100.x;
+                    stats[slot_base_1095 + (unsigned int)((warp_in_group * 2 + 1) * 2) + 1] = reduce_pair_1100.y;
+                }
+                float2 reduce_pair_1104 = make_float2(local_sum_sq_852[2].x + local_sum_sq_852[2].y, local_dot_853[2].x + local_dot_853[2].y);
+                unsigned long long packed_pair_1105 = 0;
+                unsigned long long peer_packed_1106 = 0;
+                float2 peer_pair_1107 = make_float2(0.0f, 0.0f);
+                packed_pair_1105 = reinterpret_cast<unsigned long long*>(&reduce_pair_1104)[0];
+                unsigned long long _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1105, 16);
+                peer_packed_1106 = _shfl_xor_sync_146;
+                peer_pair_1107 = reinterpret_cast<float2*>(&peer_packed_1106)[0];
+                reduce_pair_1104 = add_f32x2(reduce_pair_1104, peer_pair_1107);
+                packed_pair_1105 = reinterpret_cast<unsigned long long*>(&reduce_pair_1104)[0];
+                unsigned long long _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1105, 8);
+                peer_packed_1106 = _shfl_xor_sync_147;
+                peer_pair_1107 = reinterpret_cast<float2*>(&peer_packed_1106)[0];
+                reduce_pair_1104 = add_f32x2(reduce_pair_1104, peer_pair_1107);
+                packed_pair_1105 = reinterpret_cast<unsigned long long*>(&reduce_pair_1104)[0];
+                unsigned long long _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1105, 4);
+                peer_packed_1106 = _shfl_xor_sync_148;
+                peer_pair_1107 = reinterpret_cast<float2*>(&peer_packed_1106)[0];
+                reduce_pair_1104 = add_f32x2(reduce_pair_1104, peer_pair_1107);
+                packed_pair_1105 = reinterpret_cast<unsigned long long*>(&reduce_pair_1104)[0];
+                unsigned long long _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1105, 2);
+                peer_packed_1106 = _shfl_xor_sync_149;
+                peer_pair_1107 = reinterpret_cast<float2*>(&peer_packed_1106)[0];
+                reduce_pair_1104 = add_f32x2(reduce_pair_1104, peer_pair_1107);
+                packed_pair_1105 = reinterpret_cast<unsigned long long*>(&reduce_pair_1104)[0];
+                unsigned long long _shfl_xor_sync_150 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1105, 1);
+                peer_packed_1106 = _shfl_xor_sync_150;
+                peer_pair_1107 = reinterpret_cast<float2*>(&peer_packed_1106)[0];
+                reduce_pair_1104 = add_f32x2(reduce_pair_1104, peer_pair_1107);
+                if (lane == 0) {
+                    stats[slot_base_1095 + (unsigned int)((4 + warp_in_group) * 2 * 2)] = reduce_pair_1104.x;
+                    stats[slot_base_1095 + (unsigned int)((4 + warp_in_group) * 2 * 2) + 1] = reduce_pair_1104.y;
+                }
+                float2 reduce_pair_1108 = make_float2(local_sum_sq_852[3].x + local_sum_sq_852[3].y, local_dot_853[3].x + local_dot_853[3].y);
+                unsigned long long packed_pair_1109 = 0;
+                unsigned long long peer_packed_1110 = 0;
+                float2 peer_pair_1111 = make_float2(0.0f, 0.0f);
+                packed_pair_1109 = reinterpret_cast<unsigned long long*>(&reduce_pair_1108)[0];
+                unsigned long long _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1109, 16);
+                peer_packed_1110 = _shfl_xor_sync_151;
+                peer_pair_1111 = reinterpret_cast<float2*>(&peer_packed_1110)[0];
+                reduce_pair_1108 = add_f32x2(reduce_pair_1108, peer_pair_1111);
+                packed_pair_1109 = reinterpret_cast<unsigned long long*>(&reduce_pair_1108)[0];
+                unsigned long long _shfl_xor_sync_152 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1109, 8);
+                peer_packed_1110 = _shfl_xor_sync_152;
+                peer_pair_1111 = reinterpret_cast<float2*>(&peer_packed_1110)[0];
+                reduce_pair_1108 = add_f32x2(reduce_pair_1108, peer_pair_1111);
+                packed_pair_1109 = reinterpret_cast<unsigned long long*>(&reduce_pair_1108)[0];
+                unsigned long long _shfl_xor_sync_153 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1109, 4);
+                peer_packed_1110 = _shfl_xor_sync_153;
+                peer_pair_1111 = reinterpret_cast<float2*>(&peer_packed_1110)[0];
+                reduce_pair_1108 = add_f32x2(reduce_pair_1108, peer_pair_1111);
+                packed_pair_1109 = reinterpret_cast<unsigned long long*>(&reduce_pair_1108)[0];
+                unsigned long long _shfl_xor_sync_154 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1109, 2);
+                peer_packed_1110 = _shfl_xor_sync_154;
+                peer_pair_1111 = reinterpret_cast<float2*>(&peer_packed_1110)[0];
+                reduce_pair_1108 = add_f32x2(reduce_pair_1108, peer_pair_1111);
+                packed_pair_1109 = reinterpret_cast<unsigned long long*>(&reduce_pair_1108)[0];
+                unsigned long long _shfl_xor_sync_155 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1109, 1);
+                peer_packed_1110 = _shfl_xor_sync_155;
+                peer_pair_1111 = reinterpret_cast<float2*>(&peer_packed_1110)[0];
+                reduce_pair_1108 = add_f32x2(reduce_pair_1108, peer_pair_1111);
+                if (lane == 0) {
+                    stats[slot_base_1095 + (unsigned int)(((4 + warp_in_group) * 2 + 1) * 2)] = reduce_pair_1108.x;
+                    stats[slot_base_1095 + (unsigned int)(((4 + warp_in_group) * 2 + 1) * 2) + 1] = reduce_pair_1108.y;
+                }
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                asm volatile("barrier.sync %0, 128;" :: "r"(8 + stream_1) : "memory");
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                int stat_source_1112 = lane / 8;
+                int stat_warp_1113 = lane % 8;
+                float total_sum_sq_1114 = 0.0f;
+                float total_dot_1115 = 0.0f;
+                if (stat_source_1112 < 2) {
+                    total_sum_sq_1114 = stats[slot_base_1095 + (unsigned int)((stat_warp_1113 * 2 + stat_source_1112) * 2)];
+                    total_dot_1115 = stats[slot_base_1095 + (unsigned int)((stat_warp_1113 * 2 + stat_source_1112) * 2) + 1];
+                }
+                float _shfl_down_sync_156 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1114, 4, 8);
+                total_sum_sq_1114 += _shfl_down_sync_156;
+                float _shfl_down_sync_157 = __shfl_down_sync(0xFFFFFFFF, total_dot_1115, 4, 8);
+                total_dot_1115 += _shfl_down_sync_157;
+                float _shfl_down_sync_158 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1114, 2, 8);
+                total_sum_sq_1114 += _shfl_down_sync_158;
+                float _shfl_down_sync_159 = __shfl_down_sync(0xFFFFFFFF, total_dot_1115, 2, 8);
+                total_dot_1115 += _shfl_down_sync_159;
+                float _shfl_down_sync_160 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1114, 1, 8);
+                total_sum_sq_1114 += _shfl_down_sync_160;
+                float _shfl_down_sync_161 = __shfl_down_sync(0xFFFFFFFF, total_dot_1115, 1, 8);
+                total_dot_1115 += _shfl_down_sync_161;
+                float local_logit_1116 = 0.0f;
+                if (stat_source_1112 < 2 && stat_warp_1113 == 0) {
+                    float _rsqrt_162 = rsqrtf(total_sum_sq_1114 / 7168.0f + eps);
+                    local_logit_1116 = total_dot_1115 * _rsqrt_162;
+                }
+                float logits_1117[2];
+                logits_1117[0] = 0.0f;
+                float _shfl_sync_163 = __shfl_sync(0xFFFFFFFF, local_logit_1116, 0);
+                logits_1117[0] = _shfl_sync_163;
+                logits_1117[1] = 0.0f;
+                float _shfl_sync_164 = __shfl_sync(0xFFFFFFFF, local_logit_1116, 8);
+                logits_1117[1] = _shfl_sync_164;
+                float weights_1118[2];
+                float new_max_1119 = 0.0f;
+                float correction_1120 = 0.0f;
+                float weight_sum_1121 = 0.0f;
+                weights_1118[0] = 0.0f;
+                weights_1118[1] = 0.0f;
+                float chunk_max_1122 = -3.4028235e+38f;
+                chunk_max_1122 = max_noftz(chunk_max_1122, logits_1117[0]);
+                chunk_max_1122 = max_noftz(chunk_max_1122, logits_1117[1]);
+                new_max_1119 = max_noftz(m_running, chunk_max_1122);
+                float _exp2_165 = approx_exp2((m_running - new_max_1119) * 1.442695f);
+                correction_1120 = _exp2_165;
+                float _exp2_166 = approx_exp2((logits_1117[0] - new_max_1119) * 1.442695f);
+                weights_1118[0] = _exp2_166;
+                weight_sum_1121 += weights_1118[0];
+                float _exp2_167 = approx_exp2((logits_1117[1] - new_max_1119) * 1.442695f);
+                weights_1118[1] = _exp2_167;
+                weight_sum_1121 += weights_1118[1];
+                float2 correction_pair_1123 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1124 = make_float2(acc32[0], acc32[1]);
+                float2 scaled_pair_1125;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1125) : "l"(*(const unsigned long long*)&acc_pair_1124), "l"(*(const unsigned long long*)&correction_pair_1123));
+                acc32[0] = scaled_pair_1125.x;
+                acc32[1] = scaled_pair_1125.y;
+                float2 acc_pair_1126 = make_float2(acc32[2], acc32[3]);
+                float2 scaled_pair_1127;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1127) : "l"(*(const unsigned long long*)&acc_pair_1126), "l"(*(const unsigned long long*)&correction_pair_1123));
+                acc32[2] = scaled_pair_1127.x;
+                acc32[3] = scaled_pair_1127.y;
+                float2 acc_pair_1128 = make_float2(acc32[4], acc32[5]);
+                float2 scaled_pair_1129;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1129) : "l"(*(const unsigned long long*)&acc_pair_1128), "l"(*(const unsigned long long*)&correction_pair_1123));
+                acc32[4] = scaled_pair_1129.x;
+                acc32[5] = scaled_pair_1129.y;
+                float2 acc_pair_1130 = make_float2(acc32[6], acc32[7]);
+                float2 scaled_pair_1131;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1131) : "l"(*(const unsigned long long*)&acc_pair_1130), "l"(*(const unsigned long long*)&correction_pair_1123));
+                acc32[6] = scaled_pair_1131.x;
+                acc32[7] = scaled_pair_1131.y;
+                float _tmem_load_32[8];
+                tmem_ld_x8(&_tmem_load_32[0], tmem_base);
+                float2 weight_pair_1132 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1133 = make_float2(_tmem_load_32[0], _tmem_load_32[1]);
+                float2 acc_pair_1134 = make_float2(acc32[0], acc32[1]);
+                float2 updated_pair_1135 = fma_f32x2_rn_ftz(weight_pair_1132, cached_pair_1133, acc_pair_1134);
+                acc32[0] = updated_pair_1135.x;
+                acc32[1] = updated_pair_1135.y;
+                float2 cached_pair_1136 = make_float2(_tmem_load_32[2], _tmem_load_32[3]);
+                float2 acc_pair_1137 = make_float2(acc32[2], acc32[3]);
+                float2 updated_pair_1138 = fma_f32x2_rn_ftz(weight_pair_1132, cached_pair_1136, acc_pair_1137);
+                acc32[2] = updated_pair_1138.x;
+                acc32[3] = updated_pair_1138.y;
+                float2 cached_pair_1139 = make_float2(_tmem_load_32[4], _tmem_load_32[5]);
+                float2 acc_pair_1140 = make_float2(acc32[4], acc32[5]);
+                float2 updated_pair_1141 = fma_f32x2_rn_ftz(weight_pair_1132, cached_pair_1139, acc_pair_1140);
+                acc32[4] = updated_pair_1141.x;
+                acc32[5] = updated_pair_1141.y;
+                float2 cached_pair_1142 = make_float2(_tmem_load_32[6], _tmem_load_32[7]);
+                float2 acc_pair_1143 = make_float2(acc32[6], acc32[7]);
+                float2 updated_pair_1144 = fma_f32x2_rn_ftz(weight_pair_1132, cached_pair_1142, acc_pair_1143);
+                acc32[6] = updated_pair_1144.x;
+                acc32[7] = updated_pair_1144.y;
+                float _tmem_load_33[8];
+                tmem_ld_x8(&_tmem_load_33[0], tmem_base + 64);
+                float2 weight_pair_1145 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1146 = make_float2(_tmem_load_33[0], _tmem_load_33[1]);
+                float2 acc_pair_1147 = make_float2(acc32[0], acc32[1]);
+                float2 updated_pair_1148 = fma_f32x2_rn_ftz(weight_pair_1145, cached_pair_1146, acc_pair_1147);
+                acc32[0] = updated_pair_1148.x;
+                acc32[1] = updated_pair_1148.y;
+                float2 cached_pair_1149 = make_float2(_tmem_load_33[2], _tmem_load_33[3]);
+                float2 acc_pair_1150 = make_float2(acc32[2], acc32[3]);
+                float2 updated_pair_1151 = fma_f32x2_rn_ftz(weight_pair_1145, cached_pair_1149, acc_pair_1150);
+                acc32[2] = updated_pair_1151.x;
+                acc32[3] = updated_pair_1151.y;
+                float2 cached_pair_1152 = make_float2(_tmem_load_33[4], _tmem_load_33[5]);
+                float2 acc_pair_1153 = make_float2(acc32[4], acc32[5]);
+                float2 updated_pair_1154 = fma_f32x2_rn_ftz(weight_pair_1145, cached_pair_1152, acc_pair_1153);
+                acc32[4] = updated_pair_1154.x;
+                acc32[5] = updated_pair_1154.y;
+                float2 cached_pair_1155 = make_float2(_tmem_load_33[6], _tmem_load_33[7]);
+                float2 acc_pair_1156 = make_float2(acc32[6], acc32[7]);
+                float2 updated_pair_1157 = fma_f32x2_rn_ftz(weight_pair_1145, cached_pair_1155, acc_pair_1156);
+                acc32[6] = updated_pair_1157.x;
+                acc32[7] = updated_pair_1157.y;
+                float2 correction_pair_1158 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1159 = make_float2(acc32[8], acc32[9]);
+                float2 scaled_pair_1160;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1160) : "l"(*(const unsigned long long*)&acc_pair_1159), "l"(*(const unsigned long long*)&correction_pair_1158));
+                acc32[8] = scaled_pair_1160.x;
+                acc32[9] = scaled_pair_1160.y;
+                float2 acc_pair_1161 = make_float2(acc32[10], acc32[11]);
+                float2 scaled_pair_1162;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1162) : "l"(*(const unsigned long long*)&acc_pair_1161), "l"(*(const unsigned long long*)&correction_pair_1158));
+                acc32[10] = scaled_pair_1162.x;
+                acc32[11] = scaled_pair_1162.y;
+                float2 acc_pair_1163 = make_float2(acc32[12], acc32[13]);
+                float2 scaled_pair_1164;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1164) : "l"(*(const unsigned long long*)&acc_pair_1163), "l"(*(const unsigned long long*)&correction_pair_1158));
+                acc32[12] = scaled_pair_1164.x;
+                acc32[13] = scaled_pair_1164.y;
+                float2 acc_pair_1165 = make_float2(acc32[14], acc32[15]);
+                float2 scaled_pair_1166;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1166) : "l"(*(const unsigned long long*)&acc_pair_1165), "l"(*(const unsigned long long*)&correction_pair_1158));
+                acc32[14] = scaled_pair_1166.x;
+                acc32[15] = scaled_pair_1166.y;
+                float _tmem_load_34[8];
+                tmem_ld_x8(&_tmem_load_34[0], tmem_base + 8);
+                float2 weight_pair_1167 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1168 = make_float2(_tmem_load_34[0], _tmem_load_34[1]);
+                float2 acc_pair_1169 = make_float2(acc32[8], acc32[9]);
+                float2 updated_pair_1170 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1168, acc_pair_1169);
+                acc32[8] = updated_pair_1170.x;
+                acc32[9] = updated_pair_1170.y;
+                float2 cached_pair_1171 = make_float2(_tmem_load_34[2], _tmem_load_34[3]);
+                float2 acc_pair_1172 = make_float2(acc32[10], acc32[11]);
+                float2 updated_pair_1173 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1171, acc_pair_1172);
+                acc32[10] = updated_pair_1173.x;
+                acc32[11] = updated_pair_1173.y;
+                float2 cached_pair_1174 = make_float2(_tmem_load_34[4], _tmem_load_34[5]);
+                float2 acc_pair_1175 = make_float2(acc32[12], acc32[13]);
+                float2 updated_pair_1176 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1174, acc_pair_1175);
+                acc32[12] = updated_pair_1176.x;
+                acc32[13] = updated_pair_1176.y;
+                float2 cached_pair_1177 = make_float2(_tmem_load_34[6], _tmem_load_34[7]);
+                float2 acc_pair_1178 = make_float2(acc32[14], acc32[15]);
+                float2 updated_pair_1179 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1177, acc_pair_1178);
+                acc32[14] = updated_pair_1179.x;
+                acc32[15] = updated_pair_1179.y;
+                float _tmem_load_35[8];
+                tmem_ld_x8(&_tmem_load_35[0], tmem_base + 64 + 8);
+                float2 weight_pair_1180 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1181 = make_float2(_tmem_load_35[0], _tmem_load_35[1]);
+                float2 acc_pair_1182 = make_float2(acc32[8], acc32[9]);
+                float2 updated_pair_1183 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1181, acc_pair_1182);
+                acc32[8] = updated_pair_1183.x;
+                acc32[9] = updated_pair_1183.y;
+                float2 cached_pair_1184 = make_float2(_tmem_load_35[2], _tmem_load_35[3]);
+                float2 acc_pair_1185 = make_float2(acc32[10], acc32[11]);
+                float2 updated_pair_1186 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1184, acc_pair_1185);
+                acc32[10] = updated_pair_1186.x;
+                acc32[11] = updated_pair_1186.y;
+                float2 cached_pair_1187 = make_float2(_tmem_load_35[4], _tmem_load_35[5]);
+                float2 acc_pair_1188 = make_float2(acc32[12], acc32[13]);
+                float2 updated_pair_1189 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1187, acc_pair_1188);
+                acc32[12] = updated_pair_1189.x;
+                acc32[13] = updated_pair_1189.y;
+                float2 cached_pair_1190 = make_float2(_tmem_load_35[6], _tmem_load_35[7]);
+                float2 acc_pair_1191 = make_float2(acc32[14], acc32[15]);
+                float2 updated_pair_1192 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1190, acc_pair_1191);
+                acc32[14] = updated_pair_1192.x;
+                acc32[15] = updated_pair_1192.y;
+                float2 correction_pair_1193 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1194 = make_float2(acc32[16], acc32[17]);
+                float2 scaled_pair_1195;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1195) : "l"(*(const unsigned long long*)&acc_pair_1194), "l"(*(const unsigned long long*)&correction_pair_1193));
+                acc32[16] = scaled_pair_1195.x;
+                acc32[17] = scaled_pair_1195.y;
+                float2 acc_pair_1196 = make_float2(acc32[18], acc32[19]);
+                float2 scaled_pair_1197;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1197) : "l"(*(const unsigned long long*)&acc_pair_1196), "l"(*(const unsigned long long*)&correction_pair_1193));
+                acc32[18] = scaled_pair_1197.x;
+                acc32[19] = scaled_pair_1197.y;
+                float2 acc_pair_1198 = make_float2(acc32[20], acc32[21]);
+                float2 scaled_pair_1199;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1199) : "l"(*(const unsigned long long*)&acc_pair_1198), "l"(*(const unsigned long long*)&correction_pair_1193));
+                acc32[20] = scaled_pair_1199.x;
+                acc32[21] = scaled_pair_1199.y;
+                float2 acc_pair_1200 = make_float2(acc32[22], acc32[23]);
+                float2 scaled_pair_1201;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1201) : "l"(*(const unsigned long long*)&acc_pair_1200), "l"(*(const unsigned long long*)&correction_pair_1193));
+                acc32[22] = scaled_pair_1201.x;
+                acc32[23] = scaled_pair_1201.y;
+                float _tmem_load_36[8];
+                tmem_ld_x8(&_tmem_load_36[0], tmem_base + 16);
+                float2 weight_pair_1202 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1203 = make_float2(_tmem_load_36[0], _tmem_load_36[1]);
+                float2 acc_pair_1204 = make_float2(acc32[16], acc32[17]);
+                float2 updated_pair_1205 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1203, acc_pair_1204);
+                acc32[16] = updated_pair_1205.x;
+                acc32[17] = updated_pair_1205.y;
+                float2 cached_pair_1206 = make_float2(_tmem_load_36[2], _tmem_load_36[3]);
+                float2 acc_pair_1207 = make_float2(acc32[18], acc32[19]);
+                float2 updated_pair_1208 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1206, acc_pair_1207);
+                acc32[18] = updated_pair_1208.x;
+                acc32[19] = updated_pair_1208.y;
+                float2 cached_pair_1209 = make_float2(_tmem_load_36[4], _tmem_load_36[5]);
+                float2 acc_pair_1210 = make_float2(acc32[20], acc32[21]);
+                float2 updated_pair_1211 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1209, acc_pair_1210);
+                acc32[20] = updated_pair_1211.x;
+                acc32[21] = updated_pair_1211.y;
+                float2 cached_pair_1212 = make_float2(_tmem_load_36[6], _tmem_load_36[7]);
+                float2 acc_pair_1213 = make_float2(acc32[22], acc32[23]);
+                float2 updated_pair_1214 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1212, acc_pair_1213);
+                acc32[22] = updated_pair_1214.x;
+                acc32[23] = updated_pair_1214.y;
+                float _tmem_load_37[8];
+                tmem_ld_x8(&_tmem_load_37[0], tmem_base + 64 + 16);
+                float2 weight_pair_1215 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1216 = make_float2(_tmem_load_37[0], _tmem_load_37[1]);
+                float2 acc_pair_1217 = make_float2(acc32[16], acc32[17]);
+                float2 updated_pair_1218 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1216, acc_pair_1217);
+                acc32[16] = updated_pair_1218.x;
+                acc32[17] = updated_pair_1218.y;
+                float2 cached_pair_1219 = make_float2(_tmem_load_37[2], _tmem_load_37[3]);
+                float2 acc_pair_1220 = make_float2(acc32[18], acc32[19]);
+                float2 updated_pair_1221 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1219, acc_pair_1220);
+                acc32[18] = updated_pair_1221.x;
+                acc32[19] = updated_pair_1221.y;
+                float2 cached_pair_1222 = make_float2(_tmem_load_37[4], _tmem_load_37[5]);
+                float2 acc_pair_1223 = make_float2(acc32[20], acc32[21]);
+                float2 updated_pair_1224 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1222, acc_pair_1223);
+                acc32[20] = updated_pair_1224.x;
+                acc32[21] = updated_pair_1224.y;
+                float2 cached_pair_1225 = make_float2(_tmem_load_37[6], _tmem_load_37[7]);
+                float2 acc_pair_1226 = make_float2(acc32[22], acc32[23]);
+                float2 updated_pair_1227 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1225, acc_pair_1226);
+                acc32[22] = updated_pair_1227.x;
+                acc32[23] = updated_pair_1227.y;
+                float2 correction_pair_1228 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1229 = make_float2(acc32[24], acc32[25]);
+                float2 scaled_pair_1230;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1230) : "l"(*(const unsigned long long*)&acc_pair_1229), "l"(*(const unsigned long long*)&correction_pair_1228));
+                acc32[24] = scaled_pair_1230.x;
+                acc32[25] = scaled_pair_1230.y;
+                float2 acc_pair_1231 = make_float2(acc32[26], acc32[27]);
+                float2 scaled_pair_1232;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1232) : "l"(*(const unsigned long long*)&acc_pair_1231), "l"(*(const unsigned long long*)&correction_pair_1228));
+                acc32[26] = scaled_pair_1232.x;
+                acc32[27] = scaled_pair_1232.y;
+                float _tmem_load_38[4];
+                tmem_ld_x4(&_tmem_load_38[0], tmem_base + 24);
+                float2 weight_pair_1233 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1234 = make_float2(_tmem_load_38[0], _tmem_load_38[1]);
+                float2 acc_pair_1235 = make_float2(acc32[24], acc32[25]);
+                float2 updated_pair_1236 = fma_f32x2_rn_ftz(weight_pair_1233, cached_pair_1234, acc_pair_1235);
+                acc32[24] = updated_pair_1236.x;
+                acc32[25] = updated_pair_1236.y;
+                float2 cached_pair_1237 = make_float2(_tmem_load_38[2], _tmem_load_38[3]);
+                float2 acc_pair_1238 = make_float2(acc32[26], acc32[27]);
+                float2 updated_pair_1239 = fma_f32x2_rn_ftz(weight_pair_1233, cached_pair_1237, acc_pair_1238);
+                acc32[26] = updated_pair_1239.x;
+                acc32[27] = updated_pair_1239.y;
+                float _tmem_load_39[4];
+                tmem_ld_x4(&_tmem_load_39[0], tmem_base + 64 + 24);
+                float2 weight_pair_1240 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1241 = make_float2(_tmem_load_39[0], _tmem_load_39[1]);
+                float2 acc_pair_1242 = make_float2(acc32[24], acc32[25]);
+                float2 updated_pair_1243 = fma_f32x2_rn_ftz(weight_pair_1240, cached_pair_1241, acc_pair_1242);
+                acc32[24] = updated_pair_1243.x;
+                acc32[25] = updated_pair_1243.y;
+                float2 cached_pair_1244 = make_float2(_tmem_load_39[2], _tmem_load_39[3]);
+                float2 acc_pair_1245 = make_float2(acc32[26], acc32[27]);
+                float2 updated_pair_1246 = fma_f32x2_rn_ftz(weight_pair_1240, cached_pair_1244, acc_pair_1245);
+                acc32[26] = updated_pair_1246.x;
+                acc32[27] = updated_pair_1246.y;
+                float2 correction_pair_1247 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1248 = make_float2(acc32[28], acc32[29]);
+                float2 scaled_pair_1249;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1249) : "l"(*(const unsigned long long*)&acc_pair_1248), "l"(*(const unsigned long long*)&correction_pair_1247));
+                acc32[28] = scaled_pair_1249.x;
+                acc32[29] = scaled_pair_1249.y;
+                float2 acc_pair_1250 = make_float2(acc32[30], acc32[31]);
+                float2 scaled_pair_1251;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1251) : "l"(*(const unsigned long long*)&acc_pair_1250), "l"(*(const unsigned long long*)&correction_pair_1247));
+                acc32[30] = scaled_pair_1251.x;
+                acc32[31] = scaled_pair_1251.y;
+                float2 acc_pair_1252 = make_float2(acc32[32], acc32[33]);
+                float2 scaled_pair_1253;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1253) : "l"(*(const unsigned long long*)&acc_pair_1252), "l"(*(const unsigned long long*)&correction_pair_1247));
+                acc32[32] = scaled_pair_1253.x;
+                acc32[33] = scaled_pair_1253.y;
+                float2 acc_pair_1254 = make_float2(acc32[34], acc32[35]);
+                float2 scaled_pair_1255;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1255) : "l"(*(const unsigned long long*)&acc_pair_1254), "l"(*(const unsigned long long*)&correction_pair_1247));
+                acc32[34] = scaled_pair_1255.x;
+                acc32[35] = scaled_pair_1255.y;
+                float _tmem_load_40[8];
+                tmem_ld_x8(&_tmem_load_40[0], tmem_base + 32);
+                float2 weight_pair_1256 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1257 = make_float2(_tmem_load_40[0], _tmem_load_40[1]);
+                float2 acc_pair_1258 = make_float2(acc32[28], acc32[29]);
+                float2 updated_pair_1259 = fma_f32x2_rn_ftz(weight_pair_1256, cached_pair_1257, acc_pair_1258);
+                acc32[28] = updated_pair_1259.x;
+                acc32[29] = updated_pair_1259.y;
+                float2 cached_pair_1260 = make_float2(_tmem_load_40[2], _tmem_load_40[3]);
+                float2 acc_pair_1261 = make_float2(acc32[30], acc32[31]);
+                float2 updated_pair_1262 = fma_f32x2_rn_ftz(weight_pair_1256, cached_pair_1260, acc_pair_1261);
+                acc32[30] = updated_pair_1262.x;
+                acc32[31] = updated_pair_1262.y;
+                float2 cached_pair_1263 = make_float2(_tmem_load_40[4], _tmem_load_40[5]);
+                float2 acc_pair_1264 = make_float2(acc32[32], acc32[33]);
+                float2 updated_pair_1265 = fma_f32x2_rn_ftz(weight_pair_1256, cached_pair_1263, acc_pair_1264);
+                acc32[32] = updated_pair_1265.x;
+                acc32[33] = updated_pair_1265.y;
+                float2 cached_pair_1266 = make_float2(_tmem_load_40[6], _tmem_load_40[7]);
+                float2 acc_pair_1267 = make_float2(acc32[34], acc32[35]);
+                float2 updated_pair_1268 = fma_f32x2_rn_ftz(weight_pair_1256, cached_pair_1266, acc_pair_1267);
+                acc32[34] = updated_pair_1268.x;
+                acc32[35] = updated_pair_1268.y;
+                float _tmem_load_41[8];
+                tmem_ld_x8(&_tmem_load_41[0], tmem_base + 64 + 32);
+                float2 weight_pair_1269 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1270 = make_float2(_tmem_load_41[0], _tmem_load_41[1]);
+                float2 acc_pair_1271 = make_float2(acc32[28], acc32[29]);
+                float2 updated_pair_1272 = fma_f32x2_rn_ftz(weight_pair_1269, cached_pair_1270, acc_pair_1271);
+                acc32[28] = updated_pair_1272.x;
+                acc32[29] = updated_pair_1272.y;
+                float2 cached_pair_1273 = make_float2(_tmem_load_41[2], _tmem_load_41[3]);
+                float2 acc_pair_1274 = make_float2(acc32[30], acc32[31]);
+                float2 updated_pair_1275 = fma_f32x2_rn_ftz(weight_pair_1269, cached_pair_1273, acc_pair_1274);
+                acc32[30] = updated_pair_1275.x;
+                acc32[31] = updated_pair_1275.y;
+                float2 cached_pair_1276 = make_float2(_tmem_load_41[4], _tmem_load_41[5]);
+                float2 acc_pair_1277 = make_float2(acc32[32], acc32[33]);
+                float2 updated_pair_1278 = fma_f32x2_rn_ftz(weight_pair_1269, cached_pair_1276, acc_pair_1277);
+                acc32[32] = updated_pair_1278.x;
+                acc32[33] = updated_pair_1278.y;
+                float2 cached_pair_1279 = make_float2(_tmem_load_41[6], _tmem_load_41[7]);
+                float2 acc_pair_1280 = make_float2(acc32[34], acc32[35]);
+                float2 updated_pair_1281 = fma_f32x2_rn_ftz(weight_pair_1269, cached_pair_1279, acc_pair_1280);
+                acc32[34] = updated_pair_1281.x;
+                acc32[35] = updated_pair_1281.y;
+                float2 correction_pair_1282 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1283 = make_float2(acc32[36], acc32[37]);
+                float2 scaled_pair_1284;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1284) : "l"(*(const unsigned long long*)&acc_pair_1283), "l"(*(const unsigned long long*)&correction_pair_1282));
+                acc32[36] = scaled_pair_1284.x;
+                acc32[37] = scaled_pair_1284.y;
+                float2 acc_pair_1285 = make_float2(acc32[38], acc32[39]);
+                float2 scaled_pair_1286;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1286) : "l"(*(const unsigned long long*)&acc_pair_1285), "l"(*(const unsigned long long*)&correction_pair_1282));
+                acc32[38] = scaled_pair_1286.x;
+                acc32[39] = scaled_pair_1286.y;
+                float2 acc_pair_1287 = make_float2(acc32[40], acc32[41]);
+                float2 scaled_pair_1288;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1288) : "l"(*(const unsigned long long*)&acc_pair_1287), "l"(*(const unsigned long long*)&correction_pair_1282));
+                acc32[40] = scaled_pair_1288.x;
+                acc32[41] = scaled_pair_1288.y;
+                float2 acc_pair_1289 = make_float2(acc32[42], acc32[43]);
+                float2 scaled_pair_1290;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1290) : "l"(*(const unsigned long long*)&acc_pair_1289), "l"(*(const unsigned long long*)&correction_pair_1282));
+                acc32[42] = scaled_pair_1290.x;
+                acc32[43] = scaled_pair_1290.y;
+                float _tmem_load_42[8];
+                tmem_ld_x8(&_tmem_load_42[0], tmem_base + 40);
+                float2 weight_pair_1291 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1292 = make_float2(_tmem_load_42[0], _tmem_load_42[1]);
+                float2 acc_pair_1293 = make_float2(acc32[36], acc32[37]);
+                float2 updated_pair_1294 = fma_f32x2_rn_ftz(weight_pair_1291, cached_pair_1292, acc_pair_1293);
+                acc32[36] = updated_pair_1294.x;
+                acc32[37] = updated_pair_1294.y;
+                float2 cached_pair_1295 = make_float2(_tmem_load_42[2], _tmem_load_42[3]);
+                float2 acc_pair_1296 = make_float2(acc32[38], acc32[39]);
+                float2 updated_pair_1297 = fma_f32x2_rn_ftz(weight_pair_1291, cached_pair_1295, acc_pair_1296);
+                acc32[38] = updated_pair_1297.x;
+                acc32[39] = updated_pair_1297.y;
+                float2 cached_pair_1298 = make_float2(_tmem_load_42[4], _tmem_load_42[5]);
+                float2 acc_pair_1299 = make_float2(acc32[40], acc32[41]);
+                float2 updated_pair_1300 = fma_f32x2_rn_ftz(weight_pair_1291, cached_pair_1298, acc_pair_1299);
+                acc32[40] = updated_pair_1300.x;
+                acc32[41] = updated_pair_1300.y;
+                float2 cached_pair_1301 = make_float2(_tmem_load_42[6], _tmem_load_42[7]);
+                float2 acc_pair_1302 = make_float2(acc32[42], acc32[43]);
+                float2 updated_pair_1303 = fma_f32x2_rn_ftz(weight_pair_1291, cached_pair_1301, acc_pair_1302);
+                acc32[42] = updated_pair_1303.x;
+                acc32[43] = updated_pair_1303.y;
+                float _tmem_load_43[8];
+                tmem_ld_x8(&_tmem_load_43[0], tmem_base + 64 + 40);
+                float2 weight_pair_1304 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1305 = make_float2(_tmem_load_43[0], _tmem_load_43[1]);
+                float2 acc_pair_1306 = make_float2(acc32[36], acc32[37]);
+                float2 updated_pair_1307 = fma_f32x2_rn_ftz(weight_pair_1304, cached_pair_1305, acc_pair_1306);
+                acc32[36] = updated_pair_1307.x;
+                acc32[37] = updated_pair_1307.y;
+                float2 cached_pair_1308 = make_float2(_tmem_load_43[2], _tmem_load_43[3]);
+                float2 acc_pair_1309 = make_float2(acc32[38], acc32[39]);
+                float2 updated_pair_1310 = fma_f32x2_rn_ftz(weight_pair_1304, cached_pair_1308, acc_pair_1309);
+                acc32[38] = updated_pair_1310.x;
+                acc32[39] = updated_pair_1310.y;
+                float2 cached_pair_1311 = make_float2(_tmem_load_43[4], _tmem_load_43[5]);
+                float2 acc_pair_1312 = make_float2(acc32[40], acc32[41]);
+                float2 updated_pair_1313 = fma_f32x2_rn_ftz(weight_pair_1304, cached_pair_1311, acc_pair_1312);
+                acc32[40] = updated_pair_1313.x;
+                acc32[41] = updated_pair_1313.y;
+                float2 cached_pair_1314 = make_float2(_tmem_load_43[6], _tmem_load_43[7]);
+                float2 acc_pair_1315 = make_float2(acc32[42], acc32[43]);
+                float2 updated_pair_1316 = fma_f32x2_rn_ftz(weight_pair_1304, cached_pair_1314, acc_pair_1315);
+                acc32[42] = updated_pair_1316.x;
+                acc32[43] = updated_pair_1316.y;
+                float2 correction_pair_1317 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1318 = make_float2(acc32[44], acc32[45]);
+                float2 scaled_pair_1319;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1319) : "l"(*(const unsigned long long*)&acc_pair_1318), "l"(*(const unsigned long long*)&correction_pair_1317));
+                acc32[44] = scaled_pair_1319.x;
+                acc32[45] = scaled_pair_1319.y;
+                float2 acc_pair_1320 = make_float2(acc32[46], acc32[47]);
+                float2 scaled_pair_1321;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1321) : "l"(*(const unsigned long long*)&acc_pair_1320), "l"(*(const unsigned long long*)&correction_pair_1317));
+                acc32[46] = scaled_pair_1321.x;
+                acc32[47] = scaled_pair_1321.y;
+                float2 acc_pair_1322 = make_float2(acc32[48], acc32[49]);
+                float2 scaled_pair_1323;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1323) : "l"(*(const unsigned long long*)&acc_pair_1322), "l"(*(const unsigned long long*)&correction_pair_1317));
+                acc32[48] = scaled_pair_1323.x;
+                acc32[49] = scaled_pair_1323.y;
+                float2 acc_pair_1324 = make_float2(acc32[50], acc32[51]);
+                float2 scaled_pair_1325;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1325) : "l"(*(const unsigned long long*)&acc_pair_1324), "l"(*(const unsigned long long*)&correction_pair_1317));
+                acc32[50] = scaled_pair_1325.x;
+                acc32[51] = scaled_pair_1325.y;
+                float _tmem_load_44[8];
+                tmem_ld_x8(&_tmem_load_44[0], tmem_base + 48);
+                float2 weight_pair_1326 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1327 = make_float2(_tmem_load_44[0], _tmem_load_44[1]);
+                float2 acc_pair_1328 = make_float2(acc32[44], acc32[45]);
+                float2 updated_pair_1329 = fma_f32x2_rn_ftz(weight_pair_1326, cached_pair_1327, acc_pair_1328);
+                acc32[44] = updated_pair_1329.x;
+                acc32[45] = updated_pair_1329.y;
+                float2 cached_pair_1330 = make_float2(_tmem_load_44[2], _tmem_load_44[3]);
+                float2 acc_pair_1331 = make_float2(acc32[46], acc32[47]);
+                float2 updated_pair_1332 = fma_f32x2_rn_ftz(weight_pair_1326, cached_pair_1330, acc_pair_1331);
+                acc32[46] = updated_pair_1332.x;
+                acc32[47] = updated_pair_1332.y;
+                float2 cached_pair_1333 = make_float2(_tmem_load_44[4], _tmem_load_44[5]);
+                float2 acc_pair_1334 = make_float2(acc32[48], acc32[49]);
+                float2 updated_pair_1335 = fma_f32x2_rn_ftz(weight_pair_1326, cached_pair_1333, acc_pair_1334);
+                acc32[48] = updated_pair_1335.x;
+                acc32[49] = updated_pair_1335.y;
+                float2 cached_pair_1336 = make_float2(_tmem_load_44[6], _tmem_load_44[7]);
+                float2 acc_pair_1337 = make_float2(acc32[50], acc32[51]);
+                float2 updated_pair_1338 = fma_f32x2_rn_ftz(weight_pair_1326, cached_pair_1336, acc_pair_1337);
+                acc32[50] = updated_pair_1338.x;
+                acc32[51] = updated_pair_1338.y;
+                float _tmem_load_45[8];
+                tmem_ld_x8(&_tmem_load_45[0], tmem_base + 64 + 48);
+                float2 weight_pair_1339 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1340 = make_float2(_tmem_load_45[0], _tmem_load_45[1]);
+                float2 acc_pair_1341 = make_float2(acc32[44], acc32[45]);
+                float2 updated_pair_1342 = fma_f32x2_rn_ftz(weight_pair_1339, cached_pair_1340, acc_pair_1341);
+                acc32[44] = updated_pair_1342.x;
+                acc32[45] = updated_pair_1342.y;
+                float2 cached_pair_1343 = make_float2(_tmem_load_45[2], _tmem_load_45[3]);
+                float2 acc_pair_1344 = make_float2(acc32[46], acc32[47]);
+                float2 updated_pair_1345 = fma_f32x2_rn_ftz(weight_pair_1339, cached_pair_1343, acc_pair_1344);
+                acc32[46] = updated_pair_1345.x;
+                acc32[47] = updated_pair_1345.y;
+                float2 cached_pair_1346 = make_float2(_tmem_load_45[4], _tmem_load_45[5]);
+                float2 acc_pair_1347 = make_float2(acc32[48], acc32[49]);
+                float2 updated_pair_1348 = fma_f32x2_rn_ftz(weight_pair_1339, cached_pair_1346, acc_pair_1347);
+                acc32[48] = updated_pair_1348.x;
+                acc32[49] = updated_pair_1348.y;
+                float2 cached_pair_1349 = make_float2(_tmem_load_45[6], _tmem_load_45[7]);
+                float2 acc_pair_1350 = make_float2(acc32[50], acc32[51]);
+                float2 updated_pair_1351 = fma_f32x2_rn_ftz(weight_pair_1339, cached_pair_1349, acc_pair_1350);
+                acc32[50] = updated_pair_1351.x;
+                acc32[51] = updated_pair_1351.y;
+                float2 correction_pair_1352 = make_float2(correction_1120, correction_1120);
+                float2 acc_pair_1353 = make_float2(acc32[52], acc32[53]);
+                float2 scaled_pair_1354;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1354) : "l"(*(const unsigned long long*)&acc_pair_1353), "l"(*(const unsigned long long*)&correction_pair_1352));
+                acc32[52] = scaled_pair_1354.x;
+                acc32[53] = scaled_pair_1354.y;
+                float2 acc_pair_1355 = make_float2(acc32[54], acc32[55]);
+                float2 scaled_pair_1356;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1356) : "l"(*(const unsigned long long*)&acc_pair_1355), "l"(*(const unsigned long long*)&correction_pair_1352));
+                acc32[54] = scaled_pair_1356.x;
+                acc32[55] = scaled_pair_1356.y;
+                float _tmem_load_46[4];
+                tmem_ld_x4(&_tmem_load_46[0], tmem_base + 56);
+                float2 weight_pair_1357 = make_float2(weights_1118[0], weights_1118[0]);
+                float2 cached_pair_1358 = make_float2(_tmem_load_46[0], _tmem_load_46[1]);
+                float2 acc_pair_1359 = make_float2(acc32[52], acc32[53]);
+                float2 updated_pair_1360 = fma_f32x2_rn_ftz(weight_pair_1357, cached_pair_1358, acc_pair_1359);
+                acc32[52] = updated_pair_1360.x;
+                acc32[53] = updated_pair_1360.y;
+                float2 cached_pair_1361 = make_float2(_tmem_load_46[2], _tmem_load_46[3]);
+                float2 acc_pair_1362 = make_float2(acc32[54], acc32[55]);
+                float2 updated_pair_1363 = fma_f32x2_rn_ftz(weight_pair_1357, cached_pair_1361, acc_pair_1362);
+                acc32[54] = updated_pair_1363.x;
+                acc32[55] = updated_pair_1363.y;
+                float _tmem_load_47[4];
+                tmem_ld_x4(&_tmem_load_47[0], tmem_base + 64 + 56);
+                float2 weight_pair_1364 = make_float2(weights_1118[1], weights_1118[1]);
+                float2 cached_pair_1365 = make_float2(_tmem_load_47[0], _tmem_load_47[1]);
+                float2 acc_pair_1366 = make_float2(acc32[52], acc32[53]);
+                float2 updated_pair_1367 = fma_f32x2_rn_ftz(weight_pair_1364, cached_pair_1365, acc_pair_1366);
+                acc32[52] = updated_pair_1367.x;
+                acc32[53] = updated_pair_1367.y;
+                float2 cached_pair_1368 = make_float2(_tmem_load_47[2], _tmem_load_47[3]);
+                float2 acc_pair_1369 = make_float2(acc32[54], acc32[55]);
+                float2 updated_pair_1370 = fma_f32x2_rn_ftz(weight_pair_1364, cached_pair_1368, acc_pair_1369);
+                acc32[54] = updated_pair_1370.x;
+                acc32[55] = updated_pair_1370.y;
+                s_running = __fmaf_rn(s_running, correction_1120, weight_sum_1121);
+                m_running = new_max_1119;
+                consumer_stage += 1;
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
+                if (token_1 == first_token) {
+                    mbarrier_wait(norm_ready_addr, 0);
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                }
+                float2 local_output_sum_pair = make_float2(0.0f, 0.0f);
+                float2 acc_pair_1371 = make_float2(acc32[0], acc32[1]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1371, acc_pair_1371, local_output_sum_pair);
+                float2 acc_pair_1372 = make_float2(acc32[2], acc32[3]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1372, acc_pair_1372, local_output_sum_pair);
+                float2 acc_pair_1373 = make_float2(acc32[4], acc32[5]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1373, acc_pair_1373, local_output_sum_pair);
+                float2 acc_pair_1374 = make_float2(acc32[6], acc32[7]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1374, acc_pair_1374, local_output_sum_pair);
+                float2 acc_pair_1375 = make_float2(acc32[8], acc32[9]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1375, acc_pair_1375, local_output_sum_pair);
+                float2 acc_pair_1376 = make_float2(acc32[10], acc32[11]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1376, acc_pair_1376, local_output_sum_pair);
+                float2 acc_pair_1377 = make_float2(acc32[12], acc32[13]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1377, acc_pair_1377, local_output_sum_pair);
+                float2 acc_pair_1378 = make_float2(acc32[14], acc32[15]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1378, acc_pair_1378, local_output_sum_pair);
+                float2 acc_pair_1379 = make_float2(acc32[16], acc32[17]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1379, acc_pair_1379, local_output_sum_pair);
+                float2 acc_pair_1380 = make_float2(acc32[18], acc32[19]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1380, acc_pair_1380, local_output_sum_pair);
+                float2 acc_pair_1381 = make_float2(acc32[20], acc32[21]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1381, acc_pair_1381, local_output_sum_pair);
+                float2 acc_pair_1382 = make_float2(acc32[22], acc32[23]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1382, acc_pair_1382, local_output_sum_pair);
+                float2 acc_pair_1383 = make_float2(acc32[24], acc32[25]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1383, acc_pair_1383, local_output_sum_pair);
+                float2 acc_pair_1384 = make_float2(acc32[26], acc32[27]);
+                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1384, acc_pair_1384, local_output_sum_pair);
+                float local_output_sum_sq = local_output_sum_pair.x + local_output_sum_pair.y;
+                float _warp_reduce_168 = local_output_sum_sq;
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    _warp_reduce_168 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_168, offset);
+                local_output_sum_sq = _warp_reduce_168;
+                if (lane == 0) {
+                    output_stats[output_stats_base + (unsigned int)warp_in_group] = local_output_sum_sq;
+                }
+                float2 local_output_sum_pair_1385 = make_float2(0.0f, 0.0f);
+                float2 acc_pair_1386 = make_float2(acc32[28], acc32[29]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1386, acc_pair_1386, local_output_sum_pair_1385);
+                float2 acc_pair_1387 = make_float2(acc32[30], acc32[31]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1387, acc_pair_1387, local_output_sum_pair_1385);
+                float2 acc_pair_1388 = make_float2(acc32[32], acc32[33]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1388, acc_pair_1388, local_output_sum_pair_1385);
+                float2 acc_pair_1389 = make_float2(acc32[34], acc32[35]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1389, acc_pair_1389, local_output_sum_pair_1385);
+                float2 acc_pair_1390 = make_float2(acc32[36], acc32[37]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1390, acc_pair_1390, local_output_sum_pair_1385);
+                float2 acc_pair_1391 = make_float2(acc32[38], acc32[39]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1391, acc_pair_1391, local_output_sum_pair_1385);
+                float2 acc_pair_1392 = make_float2(acc32[40], acc32[41]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1392, acc_pair_1392, local_output_sum_pair_1385);
+                float2 acc_pair_1393 = make_float2(acc32[42], acc32[43]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1393, acc_pair_1393, local_output_sum_pair_1385);
+                float2 acc_pair_1394 = make_float2(acc32[44], acc32[45]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1394, acc_pair_1394, local_output_sum_pair_1385);
+                float2 acc_pair_1395 = make_float2(acc32[46], acc32[47]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1395, acc_pair_1395, local_output_sum_pair_1385);
+                float2 acc_pair_1396 = make_float2(acc32[48], acc32[49]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1396, acc_pair_1396, local_output_sum_pair_1385);
+                float2 acc_pair_1397 = make_float2(acc32[50], acc32[51]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1397, acc_pair_1397, local_output_sum_pair_1385);
+                float2 acc_pair_1398 = make_float2(acc32[52], acc32[53]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1398, acc_pair_1398, local_output_sum_pair_1385);
+                float2 acc_pair_1399 = make_float2(acc32[54], acc32[55]);
+                local_output_sum_pair_1385 = fma_f32x2_rn_ftz(acc_pair_1399, acc_pair_1399, local_output_sum_pair_1385);
+                float local_output_sum_sq_1400 = local_output_sum_pair_1385.x + local_output_sum_pair_1385.y;
+                float _warp_reduce_169 = local_output_sum_sq_1400;
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    _warp_reduce_169 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_169, offset);
+                local_output_sum_sq_1400 = _warp_reduce_169;
+                if (lane == 0) {
+                    output_stats[output_stats_base + (unsigned int)(4 + warp_in_group)] = local_output_sum_sq_1400;
+                }
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                asm volatile("barrier.sync %0, 128;" :: "r"(8 + stream_1) : "memory");
+                float total_output_sum_sq = ((lane < 8) ? output_stats[output_stats_base + (unsigned int)lane] : 0.0f);
+                float _shfl_down_sync_170 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 4, 8);
+                total_output_sum_sq += _shfl_down_sync_170;
+                float _shfl_down_sync_171 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 2, 8);
+                total_output_sum_sq += _shfl_down_sync_171;
+                float _shfl_down_sync_172 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 1, 8);
+                total_output_sum_sq += _shfl_down_sync_172;
+                float output_rsigma = 0.0f;
+                if (lane == 0) {
+                    float _rsqrt_173 = rsqrtf(__fmaf_rn(output_norm_eps * s_running, s_running, total_output_sum_sq / 7168.0f));
+                    output_rsigma = _rsqrt_173;
+                }
+                float _shfl_sync_174 = __shfl_sync(0xFFFFFFFF, output_rsigma, 0);
+                output_rsigma = _shfl_sync_174;
+                int hidden_base_1401 = thread_in_group * 8;
+                unsigned int smem_bf16x2[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1401 * 2)) : "memory");
                 float _unpack_bf16_40[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -3912,2081 +5176,41 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&_unpack_bf16_40[_pair * 2])[0]), "=f"((&_unpack_bf16_40[_pair * 2])[1])
-                        : "r"(smem_regs_931[_pair]));
-                }
-                values_932[0] = _unpack_bf16_40[0];
-                values_932[1] = _unpack_bf16_40[1];
-                values_932[2] = _unpack_bf16_40[2];
-                values_932[3] = _unpack_bf16_40[3];
-                values_932[4] = _unpack_bf16_40[4];
-                values_932[5] = _unpack_bf16_40[5];
-                values_932[6] = _unpack_bf16_40[6];
-                values_932[7] = _unpack_bf16_40[7];
-                tmem_st_x8_f32(tmem_base + 32, values_932);
-                float2 value_pair_933 = make_float2(values_932[0], values_932[1]);
-                float2 q_pair_934 = make_float2(q_cache[28], q_cache[29]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_933, value_pair_933, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_933, q_pair_934, local_dot_853[2]);
-                float2 value_pair_935 = make_float2(values_932[2], values_932[3]);
-                float2 q_pair_936 = make_float2(q_cache[30], q_cache[31]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_935, value_pair_935, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_935, q_pair_936, local_dot_853[2]);
-                float2 value_pair_937 = make_float2(values_932[4], values_932[5]);
-                float2 q_pair_938 = make_float2(q_cache[32], q_cache[33]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_937, value_pair_937, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_937, q_pair_938, local_dot_853[2]);
-                float2 value_pair_939 = make_float2(values_932[6], values_932[7]);
-                float2 q_pair_940 = make_float2(q_cache[34], q_cache[35]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_939, value_pair_939, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_939, q_pair_940, local_dot_853[2]);
-                unsigned int smem_regs_941[4];
-                #pragma unroll
-                for (int _lr_41 = 0; _lr_41 < 4; _lr_41++) {
-                    smem_regs_941[_lr_41] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_930 / 2) + (unsigned int)_lr_41];
-                }
-                float values_942[8];
-                float _unpack_bf16_41[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_41[_pair * 2])[0]), "=f"((&_unpack_bf16_41[_pair * 2])[1])
-                        : "r"(smem_regs_941[_pair]));
-                }
-                values_942[0] = _unpack_bf16_41[0];
-                values_942[1] = _unpack_bf16_41[1];
-                values_942[2] = _unpack_bf16_41[2];
-                values_942[3] = _unpack_bf16_41[3];
-                values_942[4] = _unpack_bf16_41[4];
-                values_942[5] = _unpack_bf16_41[5];
-                values_942[6] = _unpack_bf16_41[6];
-                values_942[7] = _unpack_bf16_41[7];
-                tmem_st_x8_f32(tmem_base + 64 + 32, values_942);
-                float2 value_pair_943 = make_float2(values_942[0], values_942[1]);
-                float2 q_pair_944 = make_float2(q_cache[28], q_cache[29]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_943, value_pair_943, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_943, q_pair_944, local_dot_853[3]);
-                float2 value_pair_945 = make_float2(values_942[2], values_942[3]);
-                float2 q_pair_946 = make_float2(q_cache[30], q_cache[31]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_945, value_pair_945, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_945, q_pair_946, local_dot_853[3]);
-                float2 value_pair_947 = make_float2(values_942[4], values_942[5]);
-                float2 q_pair_948 = make_float2(q_cache[32], q_cache[33]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_947, value_pair_947, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_947, q_pair_948, local_dot_853[3]);
-                float2 value_pair_949 = make_float2(values_942[6], values_942[7]);
-                float2 q_pair_950 = make_float2(q_cache[34], q_cache[35]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_949, value_pair_949, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_949, q_pair_950, local_dot_853[3]);
-                int hidden_base_951 = 3072 + thread_in_group * 8;
-                unsigned int smem_regs_952[4];
-                #pragma unroll
-                for (int _lr_42 = 0; _lr_42 < 4; _lr_42++) {
-                    smem_regs_952[_lr_42] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_951 / 2) + (unsigned int)_lr_42];
-                }
-                float values_953[8];
-                float _unpack_bf16_42[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_42[_pair * 2])[0]), "=f"((&_unpack_bf16_42[_pair * 2])[1])
-                        : "r"(smem_regs_952[_pair]));
-                }
-                values_953[0] = _unpack_bf16_42[0];
-                values_953[1] = _unpack_bf16_42[1];
-                values_953[2] = _unpack_bf16_42[2];
-                values_953[3] = _unpack_bf16_42[3];
-                values_953[4] = _unpack_bf16_42[4];
-                values_953[5] = _unpack_bf16_42[5];
-                values_953[6] = _unpack_bf16_42[6];
-                values_953[7] = _unpack_bf16_42[7];
-                tmem_st_x8_f32(tmem_base + 40, values_953);
-                float2 value_pair_954 = make_float2(values_953[0], values_953[1]);
-                float2 q_pair_955 = make_float2(q_cache[36], q_cache[37]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_954, value_pair_954, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_954, q_pair_955, local_dot_853[2]);
-                float2 value_pair_956 = make_float2(values_953[2], values_953[3]);
-                float2 q_pair_957 = make_float2(q_cache[38], q_cache[39]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_956, value_pair_956, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_956, q_pair_957, local_dot_853[2]);
-                float2 value_pair_958 = make_float2(values_953[4], values_953[5]);
-                float2 q_pair_959 = make_float2(q_cache[40], q_cache[41]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_958, value_pair_958, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_958, q_pair_959, local_dot_853[2]);
-                float2 value_pair_960 = make_float2(values_953[6], values_953[7]);
-                float2 q_pair_961 = make_float2(q_cache[42], q_cache[43]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_960, value_pair_960, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_960, q_pair_961, local_dot_853[2]);
-                unsigned int smem_regs_962[4];
-                #pragma unroll
-                for (int _lr_43 = 0; _lr_43 < 4; _lr_43++) {
-                    smem_regs_962[_lr_43] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_951 / 2) + (unsigned int)_lr_43];
-                }
-                float values_963[8];
-                float _unpack_bf16_43[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_43[_pair * 2])[0]), "=f"((&_unpack_bf16_43[_pair * 2])[1])
-                        : "r"(smem_regs_962[_pair]));
-                }
-                values_963[0] = _unpack_bf16_43[0];
-                values_963[1] = _unpack_bf16_43[1];
-                values_963[2] = _unpack_bf16_43[2];
-                values_963[3] = _unpack_bf16_43[3];
-                values_963[4] = _unpack_bf16_43[4];
-                values_963[5] = _unpack_bf16_43[5];
-                values_963[6] = _unpack_bf16_43[6];
-                values_963[7] = _unpack_bf16_43[7];
-                tmem_st_x8_f32(tmem_base + 64 + 40, values_963);
-                float2 value_pair_964 = make_float2(values_963[0], values_963[1]);
-                float2 q_pair_965 = make_float2(q_cache[36], q_cache[37]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_964, value_pair_964, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_964, q_pair_965, local_dot_853[3]);
-                float2 value_pair_966 = make_float2(values_963[2], values_963[3]);
-                float2 q_pair_967 = make_float2(q_cache[38], q_cache[39]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_966, value_pair_966, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_966, q_pair_967, local_dot_853[3]);
-                float2 value_pair_968 = make_float2(values_963[4], values_963[5]);
-                float2 q_pair_969 = make_float2(q_cache[40], q_cache[41]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_968, value_pair_968, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_968, q_pair_969, local_dot_853[3]);
-                float2 value_pair_970 = make_float2(values_963[6], values_963[7]);
-                float2 q_pair_971 = make_float2(q_cache[42], q_cache[43]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_970, value_pair_970, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_970, q_pair_971, local_dot_853[3]);
-                int hidden_base_972 = 5120 + thread_in_group * 8;
-                unsigned int smem_regs_973[4];
-                #pragma unroll
-                for (int _lr_44 = 0; _lr_44 < 4; _lr_44++) {
-                    smem_regs_973[_lr_44] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_972 / 2) + (unsigned int)_lr_44];
-                }
-                float values_974[8];
-                float _unpack_bf16_44[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_44[_pair * 2])[0]), "=f"((&_unpack_bf16_44[_pair * 2])[1])
-                        : "r"(smem_regs_973[_pair]));
-                }
-                values_974[0] = _unpack_bf16_44[0];
-                values_974[1] = _unpack_bf16_44[1];
-                values_974[2] = _unpack_bf16_44[2];
-                values_974[3] = _unpack_bf16_44[3];
-                values_974[4] = _unpack_bf16_44[4];
-                values_974[5] = _unpack_bf16_44[5];
-                values_974[6] = _unpack_bf16_44[6];
-                values_974[7] = _unpack_bf16_44[7];
-                tmem_st_x8_f32(tmem_base + 48, values_974);
-                float2 value_pair_975 = make_float2(values_974[0], values_974[1]);
-                float2 q_pair_976 = make_float2(q_cache[44], q_cache[45]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_975, value_pair_975, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_975, q_pair_976, local_dot_853[2]);
-                float2 value_pair_977 = make_float2(values_974[2], values_974[3]);
-                float2 q_pair_978 = make_float2(q_cache[46], q_cache[47]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_977, value_pair_977, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_977, q_pair_978, local_dot_853[2]);
-                float2 value_pair_979 = make_float2(values_974[4], values_974[5]);
-                float2 q_pair_980 = make_float2(q_cache[48], q_cache[49]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_979, value_pair_979, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_979, q_pair_980, local_dot_853[2]);
-                float2 value_pair_981 = make_float2(values_974[6], values_974[7]);
-                float2 q_pair_982 = make_float2(q_cache[50], q_cache[51]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_981, value_pair_981, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_981, q_pair_982, local_dot_853[2]);
-                unsigned int smem_regs_983[4];
-                #pragma unroll
-                for (int _lr_45 = 0; _lr_45 < 4; _lr_45++) {
-                    smem_regs_983[_lr_45] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_972 / 2) + (unsigned int)_lr_45];
-                }
-                float values_984[8];
-                float _unpack_bf16_45[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_45[_pair * 2])[0]), "=f"((&_unpack_bf16_45[_pair * 2])[1])
-                        : "r"(smem_regs_983[_pair]));
-                }
-                values_984[0] = _unpack_bf16_45[0];
-                values_984[1] = _unpack_bf16_45[1];
-                values_984[2] = _unpack_bf16_45[2];
-                values_984[3] = _unpack_bf16_45[3];
-                values_984[4] = _unpack_bf16_45[4];
-                values_984[5] = _unpack_bf16_45[5];
-                values_984[6] = _unpack_bf16_45[6];
-                values_984[7] = _unpack_bf16_45[7];
-                tmem_st_x8_f32(tmem_base + 64 + 48, values_984);
-                float2 value_pair_985 = make_float2(values_984[0], values_984[1]);
-                float2 q_pair_986 = make_float2(q_cache[44], q_cache[45]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_985, value_pair_985, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_985, q_pair_986, local_dot_853[3]);
-                float2 value_pair_987 = make_float2(values_984[2], values_984[3]);
-                float2 q_pair_988 = make_float2(q_cache[46], q_cache[47]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_987, value_pair_987, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_987, q_pair_988, local_dot_853[3]);
-                float2 value_pair_989 = make_float2(values_984[4], values_984[5]);
-                float2 q_pair_990 = make_float2(q_cache[48], q_cache[49]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_989, value_pair_989, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_989, q_pair_990, local_dot_853[3]);
-                float2 value_pair_991 = make_float2(values_984[6], values_984[7]);
-                float2 q_pair_992 = make_float2(q_cache[50], q_cache[51]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_991, value_pair_991, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_991, q_pair_992, local_dot_853[3]);
-                int hidden_base_993 = 6656 + thread_in_group * 4;
-                unsigned int smem_regs_994[2];
-                #pragma unroll
-                for (int _lr_46 = 0; _lr_46 < 2; _lr_46++) {
-                    smem_regs_994[_lr_46] = source_words[ring_stage_851 * 2 * 3584 + (unsigned int)(hidden_base_993 / 2) + (unsigned int)_lr_46];
-                }
-                float values_995[4];
-                float _unpack_bf16_46[4];
-                #pragma unroll
-                for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_46[_pair * 2])[0]), "=f"((&_unpack_bf16_46[_pair * 2])[1])
-                        : "r"(smem_regs_994[_pair]));
-                }
-                values_995[0] = _unpack_bf16_46[0];
-                values_995[1] = _unpack_bf16_46[1];
-                values_995[2] = _unpack_bf16_46[2];
-                values_995[3] = _unpack_bf16_46[3];
-                tmem_st_x4_f32(tmem_base + 56, values_995);
-                float2 value_pair_996 = make_float2(values_995[0], values_995[1]);
-                float2 q_pair_997 = make_float2(q_cache[52], q_cache[53]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_996, value_pair_996, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_996, q_pair_997, local_dot_853[2]);
-                float2 value_pair_998 = make_float2(values_995[2], values_995[3]);
-                float2 q_pair_999 = make_float2(q_cache[54], q_cache[55]);
-                local_sum_sq_852[2] = fma_f32x2_rn_ftz(value_pair_998, value_pair_998, local_sum_sq_852[2]);
-                local_dot_853[2] = fma_f32x2_rn_ftz(value_pair_998, q_pair_999, local_dot_853[2]);
-                unsigned int smem_regs_1000[2];
-                #pragma unroll
-                for (int _lr_47 = 0; _lr_47 < 2; _lr_47++) {
-                    smem_regs_1000[_lr_47] = source_words[(ring_stage_851 * 2 + 1) * 3584 + (unsigned int)(hidden_base_993 / 2) + (unsigned int)_lr_47];
-                }
-                float values_1001[4];
-                float _unpack_bf16_47[4];
-                #pragma unroll
-                for (int _pair = 0; _pair < 2; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_47[_pair * 2])[0]), "=f"((&_unpack_bf16_47[_pair * 2])[1])
-                        : "r"(smem_regs_1000[_pair]));
-                }
-                values_1001[0] = _unpack_bf16_47[0];
-                values_1001[1] = _unpack_bf16_47[1];
-                values_1001[2] = _unpack_bf16_47[2];
-                values_1001[3] = _unpack_bf16_47[3];
-                tmem_st_x4_f32(tmem_base + 64 + 56, values_1001);
-                float2 value_pair_1002 = make_float2(values_1001[0], values_1001[1]);
-                float2 q_pair_1003 = make_float2(q_cache[52], q_cache[53]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1002, value_pair_1002, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1002, q_pair_1003, local_dot_853[3]);
-                float2 value_pair_1004 = make_float2(values_1001[2], values_1001[3]);
-                float2 q_pair_1005 = make_float2(q_cache[54], q_cache[55]);
-                local_sum_sq_852[3] = fma_f32x2_rn_ftz(value_pair_1004, value_pair_1004, local_sum_sq_852[3]);
-                local_dot_853[3] = fma_f32x2_rn_ftz(value_pair_1004, q_pair_1005, local_dot_853[3]);
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(consumed_addr + (ring_stage_851) * 8);
-                asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                unsigned int slot_base_1006 = stats_stream_base + 64;
-                float2 reduce_pair_1007 = make_float2(local_sum_sq_852[0].x + local_sum_sq_852[0].y, local_dot_853[0].x + local_dot_853[0].y);
-                unsigned long long packed_pair_1008 = 0;
-                unsigned long long peer_packed_1009 = 0;
-                float2 peer_pair_1010 = make_float2(0.0f, 0.0f);
-                packed_pair_1008 = reinterpret_cast<unsigned long long*>(&reduce_pair_1007)[0];
-                unsigned long long _shfl_xor_sync_136 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1008, 16);
-                peer_packed_1009 = _shfl_xor_sync_136;
-                peer_pair_1010 = reinterpret_cast<float2*>(&peer_packed_1009)[0];
-                reduce_pair_1007 = add_f32x2(reduce_pair_1007, peer_pair_1010);
-                packed_pair_1008 = reinterpret_cast<unsigned long long*>(&reduce_pair_1007)[0];
-                unsigned long long _shfl_xor_sync_137 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1008, 8);
-                peer_packed_1009 = _shfl_xor_sync_137;
-                peer_pair_1010 = reinterpret_cast<float2*>(&peer_packed_1009)[0];
-                reduce_pair_1007 = add_f32x2(reduce_pair_1007, peer_pair_1010);
-                packed_pair_1008 = reinterpret_cast<unsigned long long*>(&reduce_pair_1007)[0];
-                unsigned long long _shfl_xor_sync_138 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1008, 4);
-                peer_packed_1009 = _shfl_xor_sync_138;
-                peer_pair_1010 = reinterpret_cast<float2*>(&peer_packed_1009)[0];
-                reduce_pair_1007 = add_f32x2(reduce_pair_1007, peer_pair_1010);
-                packed_pair_1008 = reinterpret_cast<unsigned long long*>(&reduce_pair_1007)[0];
-                unsigned long long _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1008, 2);
-                peer_packed_1009 = _shfl_xor_sync_139;
-                peer_pair_1010 = reinterpret_cast<float2*>(&peer_packed_1009)[0];
-                reduce_pair_1007 = add_f32x2(reduce_pair_1007, peer_pair_1010);
-                packed_pair_1008 = reinterpret_cast<unsigned long long*>(&reduce_pair_1007)[0];
-                unsigned long long _shfl_xor_sync_140 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1008, 1);
-                peer_packed_1009 = _shfl_xor_sync_140;
-                peer_pair_1010 = reinterpret_cast<float2*>(&peer_packed_1009)[0];
-                reduce_pair_1007 = add_f32x2(reduce_pair_1007, peer_pair_1010);
-                if (lane == 0) {
-                    stats[slot_base_1006 + (unsigned int)(warp_in_group * 2 * 2)] = reduce_pair_1007.x;
-                    stats[slot_base_1006 + (unsigned int)(warp_in_group * 2 * 2) + 1] = reduce_pair_1007.y;
-                }
-                float2 reduce_pair_1011 = make_float2(local_sum_sq_852[1].x + local_sum_sq_852[1].y, local_dot_853[1].x + local_dot_853[1].y);
-                unsigned long long packed_pair_1012 = 0;
-                unsigned long long peer_packed_1013 = 0;
-                float2 peer_pair_1014 = make_float2(0.0f, 0.0f);
-                packed_pair_1012 = reinterpret_cast<unsigned long long*>(&reduce_pair_1011)[0];
-                unsigned long long _shfl_xor_sync_141 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1012, 16);
-                peer_packed_1013 = _shfl_xor_sync_141;
-                peer_pair_1014 = reinterpret_cast<float2*>(&peer_packed_1013)[0];
-                reduce_pair_1011 = add_f32x2(reduce_pair_1011, peer_pair_1014);
-                packed_pair_1012 = reinterpret_cast<unsigned long long*>(&reduce_pair_1011)[0];
-                unsigned long long _shfl_xor_sync_142 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1012, 8);
-                peer_packed_1013 = _shfl_xor_sync_142;
-                peer_pair_1014 = reinterpret_cast<float2*>(&peer_packed_1013)[0];
-                reduce_pair_1011 = add_f32x2(reduce_pair_1011, peer_pair_1014);
-                packed_pair_1012 = reinterpret_cast<unsigned long long*>(&reduce_pair_1011)[0];
-                unsigned long long _shfl_xor_sync_143 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1012, 4);
-                peer_packed_1013 = _shfl_xor_sync_143;
-                peer_pair_1014 = reinterpret_cast<float2*>(&peer_packed_1013)[0];
-                reduce_pair_1011 = add_f32x2(reduce_pair_1011, peer_pair_1014);
-                packed_pair_1012 = reinterpret_cast<unsigned long long*>(&reduce_pair_1011)[0];
-                unsigned long long _shfl_xor_sync_144 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1012, 2);
-                peer_packed_1013 = _shfl_xor_sync_144;
-                peer_pair_1014 = reinterpret_cast<float2*>(&peer_packed_1013)[0];
-                reduce_pair_1011 = add_f32x2(reduce_pair_1011, peer_pair_1014);
-                packed_pair_1012 = reinterpret_cast<unsigned long long*>(&reduce_pair_1011)[0];
-                unsigned long long _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1012, 1);
-                peer_packed_1013 = _shfl_xor_sync_145;
-                peer_pair_1014 = reinterpret_cast<float2*>(&peer_packed_1013)[0];
-                reduce_pair_1011 = add_f32x2(reduce_pair_1011, peer_pair_1014);
-                if (lane == 0) {
-                    stats[slot_base_1006 + (unsigned int)((warp_in_group * 2 + 1) * 2)] = reduce_pair_1011.x;
-                    stats[slot_base_1006 + (unsigned int)((warp_in_group * 2 + 1) * 2) + 1] = reduce_pair_1011.y;
-                }
-                float2 reduce_pair_1015 = make_float2(local_sum_sq_852[2].x + local_sum_sq_852[2].y, local_dot_853[2].x + local_dot_853[2].y);
-                unsigned long long packed_pair_1016 = 0;
-                unsigned long long peer_packed_1017 = 0;
-                float2 peer_pair_1018 = make_float2(0.0f, 0.0f);
-                packed_pair_1016 = reinterpret_cast<unsigned long long*>(&reduce_pair_1015)[0];
-                unsigned long long _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1016, 16);
-                peer_packed_1017 = _shfl_xor_sync_146;
-                peer_pair_1018 = reinterpret_cast<float2*>(&peer_packed_1017)[0];
-                reduce_pair_1015 = add_f32x2(reduce_pair_1015, peer_pair_1018);
-                packed_pair_1016 = reinterpret_cast<unsigned long long*>(&reduce_pair_1015)[0];
-                unsigned long long _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1016, 8);
-                peer_packed_1017 = _shfl_xor_sync_147;
-                peer_pair_1018 = reinterpret_cast<float2*>(&peer_packed_1017)[0];
-                reduce_pair_1015 = add_f32x2(reduce_pair_1015, peer_pair_1018);
-                packed_pair_1016 = reinterpret_cast<unsigned long long*>(&reduce_pair_1015)[0];
-                unsigned long long _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1016, 4);
-                peer_packed_1017 = _shfl_xor_sync_148;
-                peer_pair_1018 = reinterpret_cast<float2*>(&peer_packed_1017)[0];
-                reduce_pair_1015 = add_f32x2(reduce_pair_1015, peer_pair_1018);
-                packed_pair_1016 = reinterpret_cast<unsigned long long*>(&reduce_pair_1015)[0];
-                unsigned long long _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1016, 2);
-                peer_packed_1017 = _shfl_xor_sync_149;
-                peer_pair_1018 = reinterpret_cast<float2*>(&peer_packed_1017)[0];
-                reduce_pair_1015 = add_f32x2(reduce_pair_1015, peer_pair_1018);
-                packed_pair_1016 = reinterpret_cast<unsigned long long*>(&reduce_pair_1015)[0];
-                unsigned long long _shfl_xor_sync_150 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1016, 1);
-                peer_packed_1017 = _shfl_xor_sync_150;
-                peer_pair_1018 = reinterpret_cast<float2*>(&peer_packed_1017)[0];
-                reduce_pair_1015 = add_f32x2(reduce_pair_1015, peer_pair_1018);
-                if (lane == 0) {
-                    stats[slot_base_1006 + (unsigned int)((4 + warp_in_group) * 2 * 2)] = reduce_pair_1015.x;
-                    stats[slot_base_1006 + (unsigned int)((4 + warp_in_group) * 2 * 2) + 1] = reduce_pair_1015.y;
-                }
-                float2 reduce_pair_1019 = make_float2(local_sum_sq_852[3].x + local_sum_sq_852[3].y, local_dot_853[3].x + local_dot_853[3].y);
-                unsigned long long packed_pair_1020 = 0;
-                unsigned long long peer_packed_1021 = 0;
-                float2 peer_pair_1022 = make_float2(0.0f, 0.0f);
-                packed_pair_1020 = reinterpret_cast<unsigned long long*>(&reduce_pair_1019)[0];
-                unsigned long long _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1020, 16);
-                peer_packed_1021 = _shfl_xor_sync_151;
-                peer_pair_1022 = reinterpret_cast<float2*>(&peer_packed_1021)[0];
-                reduce_pair_1019 = add_f32x2(reduce_pair_1019, peer_pair_1022);
-                packed_pair_1020 = reinterpret_cast<unsigned long long*>(&reduce_pair_1019)[0];
-                unsigned long long _shfl_xor_sync_152 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1020, 8);
-                peer_packed_1021 = _shfl_xor_sync_152;
-                peer_pair_1022 = reinterpret_cast<float2*>(&peer_packed_1021)[0];
-                reduce_pair_1019 = add_f32x2(reduce_pair_1019, peer_pair_1022);
-                packed_pair_1020 = reinterpret_cast<unsigned long long*>(&reduce_pair_1019)[0];
-                unsigned long long _shfl_xor_sync_153 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1020, 4);
-                peer_packed_1021 = _shfl_xor_sync_153;
-                peer_pair_1022 = reinterpret_cast<float2*>(&peer_packed_1021)[0];
-                reduce_pair_1019 = add_f32x2(reduce_pair_1019, peer_pair_1022);
-                packed_pair_1020 = reinterpret_cast<unsigned long long*>(&reduce_pair_1019)[0];
-                unsigned long long _shfl_xor_sync_154 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1020, 2);
-                peer_packed_1021 = _shfl_xor_sync_154;
-                peer_pair_1022 = reinterpret_cast<float2*>(&peer_packed_1021)[0];
-                reduce_pair_1019 = add_f32x2(reduce_pair_1019, peer_pair_1022);
-                packed_pair_1020 = reinterpret_cast<unsigned long long*>(&reduce_pair_1019)[0];
-                unsigned long long _shfl_xor_sync_155 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1020, 1);
-                peer_packed_1021 = _shfl_xor_sync_155;
-                peer_pair_1022 = reinterpret_cast<float2*>(&peer_packed_1021)[0];
-                reduce_pair_1019 = add_f32x2(reduce_pair_1019, peer_pair_1022);
-                if (lane == 0) {
-                    stats[slot_base_1006 + (unsigned int)(((4 + warp_in_group) * 2 + 1) * 2)] = reduce_pair_1019.x;
-                    stats[slot_base_1006 + (unsigned int)(((4 + warp_in_group) * 2 + 1) * 2) + 1] = reduce_pair_1019.y;
-                }
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                asm volatile("barrier.sync %0, 128;" :: "r"(8 + stream_1) : "memory");
-                asm volatile("tcgen05.fence::after_thread_sync;");
-                int stat_source_1023 = lane / 8;
-                int stat_warp_1024 = lane % 8;
-                float total_sum_sq_1025 = 0.0f;
-                float total_dot_1026 = 0.0f;
-                if (stat_source_1023 < 2) {
-                    total_sum_sq_1025 = stats[slot_base_1006 + (unsigned int)((stat_warp_1024 * 2 + stat_source_1023) * 2)];
-                    total_dot_1026 = stats[slot_base_1006 + (unsigned int)((stat_warp_1024 * 2 + stat_source_1023) * 2) + 1];
-                }
-                float _shfl_down_sync_156 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1025, 4, 8);
-                total_sum_sq_1025 += _shfl_down_sync_156;
-                float _shfl_down_sync_157 = __shfl_down_sync(0xFFFFFFFF, total_dot_1026, 4, 8);
-                total_dot_1026 += _shfl_down_sync_157;
-                float _shfl_down_sync_158 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1025, 2, 8);
-                total_sum_sq_1025 += _shfl_down_sync_158;
-                float _shfl_down_sync_159 = __shfl_down_sync(0xFFFFFFFF, total_dot_1026, 2, 8);
-                total_dot_1026 += _shfl_down_sync_159;
-                float _shfl_down_sync_160 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1025, 1, 8);
-                total_sum_sq_1025 += _shfl_down_sync_160;
-                float _shfl_down_sync_161 = __shfl_down_sync(0xFFFFFFFF, total_dot_1026, 1, 8);
-                total_dot_1026 += _shfl_down_sync_161;
-                float local_logit_1027 = 0.0f;
-                if (stat_source_1023 < 2 && stat_warp_1024 == 0) {
-                    float _rsqrt_162 = rsqrtf(total_sum_sq_1025 / 7168.0f + eps);
-                    local_logit_1027 = total_dot_1026 * _rsqrt_162;
-                }
-                float logits_1028[2];
-                logits_1028[0] = 0.0f;
-                float _shfl_sync_163 = __shfl_sync(0xFFFFFFFF, local_logit_1027, 0);
-                logits_1028[0] = _shfl_sync_163;
-                logits_1028[1] = 0.0f;
-                float _shfl_sync_164 = __shfl_sync(0xFFFFFFFF, local_logit_1027, 8);
-                logits_1028[1] = _shfl_sync_164;
-                float weights_1029[2];
-                float new_max_1030 = 0.0f;
-                float correction_1031 = 0.0f;
-                float weight_sum_1032 = 0.0f;
-                weights_1029[0] = 0.0f;
-                weights_1029[1] = 0.0f;
-                float chunk_max_1033 = -3.4028235e+38f;
-                chunk_max_1033 = max_noftz(chunk_max_1033, logits_1028[0]);
-                chunk_max_1033 = max_noftz(chunk_max_1033, logits_1028[1]);
-                new_max_1030 = max_noftz(m_running, chunk_max_1033);
-                float _exp2_165 = approx_exp2((m_running - new_max_1030) * 1.442695f);
-                correction_1031 = _exp2_165;
-                float _exp2_166 = approx_exp2((logits_1028[0] - new_max_1030) * 1.442695f);
-                weights_1029[0] = _exp2_166;
-                weight_sum_1032 += weights_1029[0];
-                float _exp2_167 = approx_exp2((logits_1028[1] - new_max_1030) * 1.442695f);
-                weights_1029[1] = _exp2_167;
-                weight_sum_1032 += weights_1029[1];
-                float2 correction_pair_1034 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1035 = make_float2(acc32[0], acc32[1]);
-                float2 scaled_pair_1036;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1036) : "l"(*(const unsigned long long*)&acc_pair_1035), "l"(*(const unsigned long long*)&correction_pair_1034));
-                acc32[0] = scaled_pair_1036.x;
-                acc32[1] = scaled_pair_1036.y;
-                float2 acc_pair_1037 = make_float2(acc32[2], acc32[3]);
-                float2 scaled_pair_1038;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1038) : "l"(*(const unsigned long long*)&acc_pair_1037), "l"(*(const unsigned long long*)&correction_pair_1034));
-                acc32[2] = scaled_pair_1038.x;
-                acc32[3] = scaled_pair_1038.y;
-                float2 acc_pair_1039 = make_float2(acc32[4], acc32[5]);
-                float2 scaled_pair_1040;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1040) : "l"(*(const unsigned long long*)&acc_pair_1039), "l"(*(const unsigned long long*)&correction_pair_1034));
-                acc32[4] = scaled_pair_1040.x;
-                acc32[5] = scaled_pair_1040.y;
-                float2 acc_pair_1041 = make_float2(acc32[6], acc32[7]);
-                float2 scaled_pair_1042;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1042) : "l"(*(const unsigned long long*)&acc_pair_1041), "l"(*(const unsigned long long*)&correction_pair_1034));
-                acc32[6] = scaled_pair_1042.x;
-                acc32[7] = scaled_pair_1042.y;
-                float _tmem_load_32[8];
-                tmem_ld_x8(&_tmem_load_32[0], tmem_base);
-                float2 weight_pair_1043 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1044 = make_float2(_tmem_load_32[0], _tmem_load_32[1]);
-                float2 acc_pair_1045 = make_float2(acc32[0], acc32[1]);
-                float2 updated_pair_1046 = fma_f32x2_rn_ftz(weight_pair_1043, cached_pair_1044, acc_pair_1045);
-                acc32[0] = updated_pair_1046.x;
-                acc32[1] = updated_pair_1046.y;
-                float2 cached_pair_1047 = make_float2(_tmem_load_32[2], _tmem_load_32[3]);
-                float2 acc_pair_1048 = make_float2(acc32[2], acc32[3]);
-                float2 updated_pair_1049 = fma_f32x2_rn_ftz(weight_pair_1043, cached_pair_1047, acc_pair_1048);
-                acc32[2] = updated_pair_1049.x;
-                acc32[3] = updated_pair_1049.y;
-                float2 cached_pair_1050 = make_float2(_tmem_load_32[4], _tmem_load_32[5]);
-                float2 acc_pair_1051 = make_float2(acc32[4], acc32[5]);
-                float2 updated_pair_1052 = fma_f32x2_rn_ftz(weight_pair_1043, cached_pair_1050, acc_pair_1051);
-                acc32[4] = updated_pair_1052.x;
-                acc32[5] = updated_pair_1052.y;
-                float2 cached_pair_1053 = make_float2(_tmem_load_32[6], _tmem_load_32[7]);
-                float2 acc_pair_1054 = make_float2(acc32[6], acc32[7]);
-                float2 updated_pair_1055 = fma_f32x2_rn_ftz(weight_pair_1043, cached_pair_1053, acc_pair_1054);
-                acc32[6] = updated_pair_1055.x;
-                acc32[7] = updated_pair_1055.y;
-                float _tmem_load_33[8];
-                tmem_ld_x8(&_tmem_load_33[0], tmem_base + 64);
-                float2 weight_pair_1056 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1057 = make_float2(_tmem_load_33[0], _tmem_load_33[1]);
-                float2 acc_pair_1058 = make_float2(acc32[0], acc32[1]);
-                float2 updated_pair_1059 = fma_f32x2_rn_ftz(weight_pair_1056, cached_pair_1057, acc_pair_1058);
-                acc32[0] = updated_pair_1059.x;
-                acc32[1] = updated_pair_1059.y;
-                float2 cached_pair_1060 = make_float2(_tmem_load_33[2], _tmem_load_33[3]);
-                float2 acc_pair_1061 = make_float2(acc32[2], acc32[3]);
-                float2 updated_pair_1062 = fma_f32x2_rn_ftz(weight_pair_1056, cached_pair_1060, acc_pair_1061);
-                acc32[2] = updated_pair_1062.x;
-                acc32[3] = updated_pair_1062.y;
-                float2 cached_pair_1063 = make_float2(_tmem_load_33[4], _tmem_load_33[5]);
-                float2 acc_pair_1064 = make_float2(acc32[4], acc32[5]);
-                float2 updated_pair_1065 = fma_f32x2_rn_ftz(weight_pair_1056, cached_pair_1063, acc_pair_1064);
-                acc32[4] = updated_pair_1065.x;
-                acc32[5] = updated_pair_1065.y;
-                float2 cached_pair_1066 = make_float2(_tmem_load_33[6], _tmem_load_33[7]);
-                float2 acc_pair_1067 = make_float2(acc32[6], acc32[7]);
-                float2 updated_pair_1068 = fma_f32x2_rn_ftz(weight_pair_1056, cached_pair_1066, acc_pair_1067);
-                acc32[6] = updated_pair_1068.x;
-                acc32[7] = updated_pair_1068.y;
-                float2 correction_pair_1069 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1070 = make_float2(acc32[8], acc32[9]);
-                float2 scaled_pair_1071;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1071) : "l"(*(const unsigned long long*)&acc_pair_1070), "l"(*(const unsigned long long*)&correction_pair_1069));
-                acc32[8] = scaled_pair_1071.x;
-                acc32[9] = scaled_pair_1071.y;
-                float2 acc_pair_1072 = make_float2(acc32[10], acc32[11]);
-                float2 scaled_pair_1073;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1073) : "l"(*(const unsigned long long*)&acc_pair_1072), "l"(*(const unsigned long long*)&correction_pair_1069));
-                acc32[10] = scaled_pair_1073.x;
-                acc32[11] = scaled_pair_1073.y;
-                float2 acc_pair_1074 = make_float2(acc32[12], acc32[13]);
-                float2 scaled_pair_1075;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1075) : "l"(*(const unsigned long long*)&acc_pair_1074), "l"(*(const unsigned long long*)&correction_pair_1069));
-                acc32[12] = scaled_pair_1075.x;
-                acc32[13] = scaled_pair_1075.y;
-                float2 acc_pair_1076 = make_float2(acc32[14], acc32[15]);
-                float2 scaled_pair_1077;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1077) : "l"(*(const unsigned long long*)&acc_pair_1076), "l"(*(const unsigned long long*)&correction_pair_1069));
-                acc32[14] = scaled_pair_1077.x;
-                acc32[15] = scaled_pair_1077.y;
-                float _tmem_load_34[8];
-                tmem_ld_x8(&_tmem_load_34[0], tmem_base + 8);
-                float2 weight_pair_1078 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1079 = make_float2(_tmem_load_34[0], _tmem_load_34[1]);
-                float2 acc_pair_1080 = make_float2(acc32[8], acc32[9]);
-                float2 updated_pair_1081 = fma_f32x2_rn_ftz(weight_pair_1078, cached_pair_1079, acc_pair_1080);
-                acc32[8] = updated_pair_1081.x;
-                acc32[9] = updated_pair_1081.y;
-                float2 cached_pair_1082 = make_float2(_tmem_load_34[2], _tmem_load_34[3]);
-                float2 acc_pair_1083 = make_float2(acc32[10], acc32[11]);
-                float2 updated_pair_1084 = fma_f32x2_rn_ftz(weight_pair_1078, cached_pair_1082, acc_pair_1083);
-                acc32[10] = updated_pair_1084.x;
-                acc32[11] = updated_pair_1084.y;
-                float2 cached_pair_1085 = make_float2(_tmem_load_34[4], _tmem_load_34[5]);
-                float2 acc_pair_1086 = make_float2(acc32[12], acc32[13]);
-                float2 updated_pair_1087 = fma_f32x2_rn_ftz(weight_pair_1078, cached_pair_1085, acc_pair_1086);
-                acc32[12] = updated_pair_1087.x;
-                acc32[13] = updated_pair_1087.y;
-                float2 cached_pair_1088 = make_float2(_tmem_load_34[6], _tmem_load_34[7]);
-                float2 acc_pair_1089 = make_float2(acc32[14], acc32[15]);
-                float2 updated_pair_1090 = fma_f32x2_rn_ftz(weight_pair_1078, cached_pair_1088, acc_pair_1089);
-                acc32[14] = updated_pair_1090.x;
-                acc32[15] = updated_pair_1090.y;
-                float _tmem_load_35[8];
-                tmem_ld_x8(&_tmem_load_35[0], tmem_base + 64 + 8);
-                float2 weight_pair_1091 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1092 = make_float2(_tmem_load_35[0], _tmem_load_35[1]);
-                float2 acc_pair_1093 = make_float2(acc32[8], acc32[9]);
-                float2 updated_pair_1094 = fma_f32x2_rn_ftz(weight_pair_1091, cached_pair_1092, acc_pair_1093);
-                acc32[8] = updated_pair_1094.x;
-                acc32[9] = updated_pair_1094.y;
-                float2 cached_pair_1095 = make_float2(_tmem_load_35[2], _tmem_load_35[3]);
-                float2 acc_pair_1096 = make_float2(acc32[10], acc32[11]);
-                float2 updated_pair_1097 = fma_f32x2_rn_ftz(weight_pair_1091, cached_pair_1095, acc_pair_1096);
-                acc32[10] = updated_pair_1097.x;
-                acc32[11] = updated_pair_1097.y;
-                float2 cached_pair_1098 = make_float2(_tmem_load_35[4], _tmem_load_35[5]);
-                float2 acc_pair_1099 = make_float2(acc32[12], acc32[13]);
-                float2 updated_pair_1100 = fma_f32x2_rn_ftz(weight_pair_1091, cached_pair_1098, acc_pair_1099);
-                acc32[12] = updated_pair_1100.x;
-                acc32[13] = updated_pair_1100.y;
-                float2 cached_pair_1101 = make_float2(_tmem_load_35[6], _tmem_load_35[7]);
-                float2 acc_pair_1102 = make_float2(acc32[14], acc32[15]);
-                float2 updated_pair_1103 = fma_f32x2_rn_ftz(weight_pair_1091, cached_pair_1101, acc_pair_1102);
-                acc32[14] = updated_pair_1103.x;
-                acc32[15] = updated_pair_1103.y;
-                float2 correction_pair_1104 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1105 = make_float2(acc32[16], acc32[17]);
-                float2 scaled_pair_1106;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1106) : "l"(*(const unsigned long long*)&acc_pair_1105), "l"(*(const unsigned long long*)&correction_pair_1104));
-                acc32[16] = scaled_pair_1106.x;
-                acc32[17] = scaled_pair_1106.y;
-                float2 acc_pair_1107 = make_float2(acc32[18], acc32[19]);
-                float2 scaled_pair_1108;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1108) : "l"(*(const unsigned long long*)&acc_pair_1107), "l"(*(const unsigned long long*)&correction_pair_1104));
-                acc32[18] = scaled_pair_1108.x;
-                acc32[19] = scaled_pair_1108.y;
-                float2 acc_pair_1109 = make_float2(acc32[20], acc32[21]);
-                float2 scaled_pair_1110;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1110) : "l"(*(const unsigned long long*)&acc_pair_1109), "l"(*(const unsigned long long*)&correction_pair_1104));
-                acc32[20] = scaled_pair_1110.x;
-                acc32[21] = scaled_pair_1110.y;
-                float2 acc_pair_1111 = make_float2(acc32[22], acc32[23]);
-                float2 scaled_pair_1112;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1112) : "l"(*(const unsigned long long*)&acc_pair_1111), "l"(*(const unsigned long long*)&correction_pair_1104));
-                acc32[22] = scaled_pair_1112.x;
-                acc32[23] = scaled_pair_1112.y;
-                float _tmem_load_36[8];
-                tmem_ld_x8(&_tmem_load_36[0], tmem_base + 16);
-                float2 weight_pair_1113 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1114 = make_float2(_tmem_load_36[0], _tmem_load_36[1]);
-                float2 acc_pair_1115 = make_float2(acc32[16], acc32[17]);
-                float2 updated_pair_1116 = fma_f32x2_rn_ftz(weight_pair_1113, cached_pair_1114, acc_pair_1115);
-                acc32[16] = updated_pair_1116.x;
-                acc32[17] = updated_pair_1116.y;
-                float2 cached_pair_1117 = make_float2(_tmem_load_36[2], _tmem_load_36[3]);
-                float2 acc_pair_1118 = make_float2(acc32[18], acc32[19]);
-                float2 updated_pair_1119 = fma_f32x2_rn_ftz(weight_pair_1113, cached_pair_1117, acc_pair_1118);
-                acc32[18] = updated_pair_1119.x;
-                acc32[19] = updated_pair_1119.y;
-                float2 cached_pair_1120 = make_float2(_tmem_load_36[4], _tmem_load_36[5]);
-                float2 acc_pair_1121 = make_float2(acc32[20], acc32[21]);
-                float2 updated_pair_1122 = fma_f32x2_rn_ftz(weight_pair_1113, cached_pair_1120, acc_pair_1121);
-                acc32[20] = updated_pair_1122.x;
-                acc32[21] = updated_pair_1122.y;
-                float2 cached_pair_1123 = make_float2(_tmem_load_36[6], _tmem_load_36[7]);
-                float2 acc_pair_1124 = make_float2(acc32[22], acc32[23]);
-                float2 updated_pair_1125 = fma_f32x2_rn_ftz(weight_pair_1113, cached_pair_1123, acc_pair_1124);
-                acc32[22] = updated_pair_1125.x;
-                acc32[23] = updated_pair_1125.y;
-                float _tmem_load_37[8];
-                tmem_ld_x8(&_tmem_load_37[0], tmem_base + 64 + 16);
-                float2 weight_pair_1126 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1127 = make_float2(_tmem_load_37[0], _tmem_load_37[1]);
-                float2 acc_pair_1128 = make_float2(acc32[16], acc32[17]);
-                float2 updated_pair_1129 = fma_f32x2_rn_ftz(weight_pair_1126, cached_pair_1127, acc_pair_1128);
-                acc32[16] = updated_pair_1129.x;
-                acc32[17] = updated_pair_1129.y;
-                float2 cached_pair_1130 = make_float2(_tmem_load_37[2], _tmem_load_37[3]);
-                float2 acc_pair_1131 = make_float2(acc32[18], acc32[19]);
-                float2 updated_pair_1132 = fma_f32x2_rn_ftz(weight_pair_1126, cached_pair_1130, acc_pair_1131);
-                acc32[18] = updated_pair_1132.x;
-                acc32[19] = updated_pair_1132.y;
-                float2 cached_pair_1133 = make_float2(_tmem_load_37[4], _tmem_load_37[5]);
-                float2 acc_pair_1134 = make_float2(acc32[20], acc32[21]);
-                float2 updated_pair_1135 = fma_f32x2_rn_ftz(weight_pair_1126, cached_pair_1133, acc_pair_1134);
-                acc32[20] = updated_pair_1135.x;
-                acc32[21] = updated_pair_1135.y;
-                float2 cached_pair_1136 = make_float2(_tmem_load_37[6], _tmem_load_37[7]);
-                float2 acc_pair_1137 = make_float2(acc32[22], acc32[23]);
-                float2 updated_pair_1138 = fma_f32x2_rn_ftz(weight_pair_1126, cached_pair_1136, acc_pair_1137);
-                acc32[22] = updated_pair_1138.x;
-                acc32[23] = updated_pair_1138.y;
-                float2 correction_pair_1139 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1140 = make_float2(acc32[24], acc32[25]);
-                float2 scaled_pair_1141;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1141) : "l"(*(const unsigned long long*)&acc_pair_1140), "l"(*(const unsigned long long*)&correction_pair_1139));
-                acc32[24] = scaled_pair_1141.x;
-                acc32[25] = scaled_pair_1141.y;
-                float2 acc_pair_1142 = make_float2(acc32[26], acc32[27]);
-                float2 scaled_pair_1143;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1143) : "l"(*(const unsigned long long*)&acc_pair_1142), "l"(*(const unsigned long long*)&correction_pair_1139));
-                acc32[26] = scaled_pair_1143.x;
-                acc32[27] = scaled_pair_1143.y;
-                float _tmem_load_38[4];
-                tmem_ld_x4(&_tmem_load_38[0], tmem_base + 24);
-                float2 weight_pair_1144 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1145 = make_float2(_tmem_load_38[0], _tmem_load_38[1]);
-                float2 acc_pair_1146 = make_float2(acc32[24], acc32[25]);
-                float2 updated_pair_1147 = fma_f32x2_rn_ftz(weight_pair_1144, cached_pair_1145, acc_pair_1146);
-                acc32[24] = updated_pair_1147.x;
-                acc32[25] = updated_pair_1147.y;
-                float2 cached_pair_1148 = make_float2(_tmem_load_38[2], _tmem_load_38[3]);
-                float2 acc_pair_1149 = make_float2(acc32[26], acc32[27]);
-                float2 updated_pair_1150 = fma_f32x2_rn_ftz(weight_pair_1144, cached_pair_1148, acc_pair_1149);
-                acc32[26] = updated_pair_1150.x;
-                acc32[27] = updated_pair_1150.y;
-                float _tmem_load_39[4];
-                tmem_ld_x4(&_tmem_load_39[0], tmem_base + 64 + 24);
-                float2 weight_pair_1151 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1152 = make_float2(_tmem_load_39[0], _tmem_load_39[1]);
-                float2 acc_pair_1153 = make_float2(acc32[24], acc32[25]);
-                float2 updated_pair_1154 = fma_f32x2_rn_ftz(weight_pair_1151, cached_pair_1152, acc_pair_1153);
-                acc32[24] = updated_pair_1154.x;
-                acc32[25] = updated_pair_1154.y;
-                float2 cached_pair_1155 = make_float2(_tmem_load_39[2], _tmem_load_39[3]);
-                float2 acc_pair_1156 = make_float2(acc32[26], acc32[27]);
-                float2 updated_pair_1157 = fma_f32x2_rn_ftz(weight_pair_1151, cached_pair_1155, acc_pair_1156);
-                acc32[26] = updated_pair_1157.x;
-                acc32[27] = updated_pair_1157.y;
-                float2 correction_pair_1158 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1159 = make_float2(acc32[28], acc32[29]);
-                float2 scaled_pair_1160;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1160) : "l"(*(const unsigned long long*)&acc_pair_1159), "l"(*(const unsigned long long*)&correction_pair_1158));
-                acc32[28] = scaled_pair_1160.x;
-                acc32[29] = scaled_pair_1160.y;
-                float2 acc_pair_1161 = make_float2(acc32[30], acc32[31]);
-                float2 scaled_pair_1162;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1162) : "l"(*(const unsigned long long*)&acc_pair_1161), "l"(*(const unsigned long long*)&correction_pair_1158));
-                acc32[30] = scaled_pair_1162.x;
-                acc32[31] = scaled_pair_1162.y;
-                float2 acc_pair_1163 = make_float2(acc32[32], acc32[33]);
-                float2 scaled_pair_1164;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1164) : "l"(*(const unsigned long long*)&acc_pair_1163), "l"(*(const unsigned long long*)&correction_pair_1158));
-                acc32[32] = scaled_pair_1164.x;
-                acc32[33] = scaled_pair_1164.y;
-                float2 acc_pair_1165 = make_float2(acc32[34], acc32[35]);
-                float2 scaled_pair_1166;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1166) : "l"(*(const unsigned long long*)&acc_pair_1165), "l"(*(const unsigned long long*)&correction_pair_1158));
-                acc32[34] = scaled_pair_1166.x;
-                acc32[35] = scaled_pair_1166.y;
-                float _tmem_load_40[8];
-                tmem_ld_x8(&_tmem_load_40[0], tmem_base + 32);
-                float2 weight_pair_1167 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1168 = make_float2(_tmem_load_40[0], _tmem_load_40[1]);
-                float2 acc_pair_1169 = make_float2(acc32[28], acc32[29]);
-                float2 updated_pair_1170 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1168, acc_pair_1169);
-                acc32[28] = updated_pair_1170.x;
-                acc32[29] = updated_pair_1170.y;
-                float2 cached_pair_1171 = make_float2(_tmem_load_40[2], _tmem_load_40[3]);
-                float2 acc_pair_1172 = make_float2(acc32[30], acc32[31]);
-                float2 updated_pair_1173 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1171, acc_pair_1172);
-                acc32[30] = updated_pair_1173.x;
-                acc32[31] = updated_pair_1173.y;
-                float2 cached_pair_1174 = make_float2(_tmem_load_40[4], _tmem_load_40[5]);
-                float2 acc_pair_1175 = make_float2(acc32[32], acc32[33]);
-                float2 updated_pair_1176 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1174, acc_pair_1175);
-                acc32[32] = updated_pair_1176.x;
-                acc32[33] = updated_pair_1176.y;
-                float2 cached_pair_1177 = make_float2(_tmem_load_40[6], _tmem_load_40[7]);
-                float2 acc_pair_1178 = make_float2(acc32[34], acc32[35]);
-                float2 updated_pair_1179 = fma_f32x2_rn_ftz(weight_pair_1167, cached_pair_1177, acc_pair_1178);
-                acc32[34] = updated_pair_1179.x;
-                acc32[35] = updated_pair_1179.y;
-                float _tmem_load_41[8];
-                tmem_ld_x8(&_tmem_load_41[0], tmem_base + 64 + 32);
-                float2 weight_pair_1180 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1181 = make_float2(_tmem_load_41[0], _tmem_load_41[1]);
-                float2 acc_pair_1182 = make_float2(acc32[28], acc32[29]);
-                float2 updated_pair_1183 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1181, acc_pair_1182);
-                acc32[28] = updated_pair_1183.x;
-                acc32[29] = updated_pair_1183.y;
-                float2 cached_pair_1184 = make_float2(_tmem_load_41[2], _tmem_load_41[3]);
-                float2 acc_pair_1185 = make_float2(acc32[30], acc32[31]);
-                float2 updated_pair_1186 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1184, acc_pair_1185);
-                acc32[30] = updated_pair_1186.x;
-                acc32[31] = updated_pair_1186.y;
-                float2 cached_pair_1187 = make_float2(_tmem_load_41[4], _tmem_load_41[5]);
-                float2 acc_pair_1188 = make_float2(acc32[32], acc32[33]);
-                float2 updated_pair_1189 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1187, acc_pair_1188);
-                acc32[32] = updated_pair_1189.x;
-                acc32[33] = updated_pair_1189.y;
-                float2 cached_pair_1190 = make_float2(_tmem_load_41[6], _tmem_load_41[7]);
-                float2 acc_pair_1191 = make_float2(acc32[34], acc32[35]);
-                float2 updated_pair_1192 = fma_f32x2_rn_ftz(weight_pair_1180, cached_pair_1190, acc_pair_1191);
-                acc32[34] = updated_pair_1192.x;
-                acc32[35] = updated_pair_1192.y;
-                float2 correction_pair_1193 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1194 = make_float2(acc32[36], acc32[37]);
-                float2 scaled_pair_1195;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1195) : "l"(*(const unsigned long long*)&acc_pair_1194), "l"(*(const unsigned long long*)&correction_pair_1193));
-                acc32[36] = scaled_pair_1195.x;
-                acc32[37] = scaled_pair_1195.y;
-                float2 acc_pair_1196 = make_float2(acc32[38], acc32[39]);
-                float2 scaled_pair_1197;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1197) : "l"(*(const unsigned long long*)&acc_pair_1196), "l"(*(const unsigned long long*)&correction_pair_1193));
-                acc32[38] = scaled_pair_1197.x;
-                acc32[39] = scaled_pair_1197.y;
-                float2 acc_pair_1198 = make_float2(acc32[40], acc32[41]);
-                float2 scaled_pair_1199;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1199) : "l"(*(const unsigned long long*)&acc_pair_1198), "l"(*(const unsigned long long*)&correction_pair_1193));
-                acc32[40] = scaled_pair_1199.x;
-                acc32[41] = scaled_pair_1199.y;
-                float2 acc_pair_1200 = make_float2(acc32[42], acc32[43]);
-                float2 scaled_pair_1201;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1201) : "l"(*(const unsigned long long*)&acc_pair_1200), "l"(*(const unsigned long long*)&correction_pair_1193));
-                acc32[42] = scaled_pair_1201.x;
-                acc32[43] = scaled_pair_1201.y;
-                float _tmem_load_42[8];
-                tmem_ld_x8(&_tmem_load_42[0], tmem_base + 40);
-                float2 weight_pair_1202 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1203 = make_float2(_tmem_load_42[0], _tmem_load_42[1]);
-                float2 acc_pair_1204 = make_float2(acc32[36], acc32[37]);
-                float2 updated_pair_1205 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1203, acc_pair_1204);
-                acc32[36] = updated_pair_1205.x;
-                acc32[37] = updated_pair_1205.y;
-                float2 cached_pair_1206 = make_float2(_tmem_load_42[2], _tmem_load_42[3]);
-                float2 acc_pair_1207 = make_float2(acc32[38], acc32[39]);
-                float2 updated_pair_1208 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1206, acc_pair_1207);
-                acc32[38] = updated_pair_1208.x;
-                acc32[39] = updated_pair_1208.y;
-                float2 cached_pair_1209 = make_float2(_tmem_load_42[4], _tmem_load_42[5]);
-                float2 acc_pair_1210 = make_float2(acc32[40], acc32[41]);
-                float2 updated_pair_1211 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1209, acc_pair_1210);
-                acc32[40] = updated_pair_1211.x;
-                acc32[41] = updated_pair_1211.y;
-                float2 cached_pair_1212 = make_float2(_tmem_load_42[6], _tmem_load_42[7]);
-                float2 acc_pair_1213 = make_float2(acc32[42], acc32[43]);
-                float2 updated_pair_1214 = fma_f32x2_rn_ftz(weight_pair_1202, cached_pair_1212, acc_pair_1213);
-                acc32[42] = updated_pair_1214.x;
-                acc32[43] = updated_pair_1214.y;
-                float _tmem_load_43[8];
-                tmem_ld_x8(&_tmem_load_43[0], tmem_base + 64 + 40);
-                float2 weight_pair_1215 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1216 = make_float2(_tmem_load_43[0], _tmem_load_43[1]);
-                float2 acc_pair_1217 = make_float2(acc32[36], acc32[37]);
-                float2 updated_pair_1218 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1216, acc_pair_1217);
-                acc32[36] = updated_pair_1218.x;
-                acc32[37] = updated_pair_1218.y;
-                float2 cached_pair_1219 = make_float2(_tmem_load_43[2], _tmem_load_43[3]);
-                float2 acc_pair_1220 = make_float2(acc32[38], acc32[39]);
-                float2 updated_pair_1221 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1219, acc_pair_1220);
-                acc32[38] = updated_pair_1221.x;
-                acc32[39] = updated_pair_1221.y;
-                float2 cached_pair_1222 = make_float2(_tmem_load_43[4], _tmem_load_43[5]);
-                float2 acc_pair_1223 = make_float2(acc32[40], acc32[41]);
-                float2 updated_pair_1224 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1222, acc_pair_1223);
-                acc32[40] = updated_pair_1224.x;
-                acc32[41] = updated_pair_1224.y;
-                float2 cached_pair_1225 = make_float2(_tmem_load_43[6], _tmem_load_43[7]);
-                float2 acc_pair_1226 = make_float2(acc32[42], acc32[43]);
-                float2 updated_pair_1227 = fma_f32x2_rn_ftz(weight_pair_1215, cached_pair_1225, acc_pair_1226);
-                acc32[42] = updated_pair_1227.x;
-                acc32[43] = updated_pair_1227.y;
-                float2 correction_pair_1228 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1229 = make_float2(acc32[44], acc32[45]);
-                float2 scaled_pair_1230;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1230) : "l"(*(const unsigned long long*)&acc_pair_1229), "l"(*(const unsigned long long*)&correction_pair_1228));
-                acc32[44] = scaled_pair_1230.x;
-                acc32[45] = scaled_pair_1230.y;
-                float2 acc_pair_1231 = make_float2(acc32[46], acc32[47]);
-                float2 scaled_pair_1232;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1232) : "l"(*(const unsigned long long*)&acc_pair_1231), "l"(*(const unsigned long long*)&correction_pair_1228));
-                acc32[46] = scaled_pair_1232.x;
-                acc32[47] = scaled_pair_1232.y;
-                float2 acc_pair_1233 = make_float2(acc32[48], acc32[49]);
-                float2 scaled_pair_1234;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1234) : "l"(*(const unsigned long long*)&acc_pair_1233), "l"(*(const unsigned long long*)&correction_pair_1228));
-                acc32[48] = scaled_pair_1234.x;
-                acc32[49] = scaled_pair_1234.y;
-                float2 acc_pair_1235 = make_float2(acc32[50], acc32[51]);
-                float2 scaled_pair_1236;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1236) : "l"(*(const unsigned long long*)&acc_pair_1235), "l"(*(const unsigned long long*)&correction_pair_1228));
-                acc32[50] = scaled_pair_1236.x;
-                acc32[51] = scaled_pair_1236.y;
-                float _tmem_load_44[8];
-                tmem_ld_x8(&_tmem_load_44[0], tmem_base + 48);
-                float2 weight_pair_1237 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1238 = make_float2(_tmem_load_44[0], _tmem_load_44[1]);
-                float2 acc_pair_1239 = make_float2(acc32[44], acc32[45]);
-                float2 updated_pair_1240 = fma_f32x2_rn_ftz(weight_pair_1237, cached_pair_1238, acc_pair_1239);
-                acc32[44] = updated_pair_1240.x;
-                acc32[45] = updated_pair_1240.y;
-                float2 cached_pair_1241 = make_float2(_tmem_load_44[2], _tmem_load_44[3]);
-                float2 acc_pair_1242 = make_float2(acc32[46], acc32[47]);
-                float2 updated_pair_1243 = fma_f32x2_rn_ftz(weight_pair_1237, cached_pair_1241, acc_pair_1242);
-                acc32[46] = updated_pair_1243.x;
-                acc32[47] = updated_pair_1243.y;
-                float2 cached_pair_1244 = make_float2(_tmem_load_44[4], _tmem_load_44[5]);
-                float2 acc_pair_1245 = make_float2(acc32[48], acc32[49]);
-                float2 updated_pair_1246 = fma_f32x2_rn_ftz(weight_pair_1237, cached_pair_1244, acc_pair_1245);
-                acc32[48] = updated_pair_1246.x;
-                acc32[49] = updated_pair_1246.y;
-                float2 cached_pair_1247 = make_float2(_tmem_load_44[6], _tmem_load_44[7]);
-                float2 acc_pair_1248 = make_float2(acc32[50], acc32[51]);
-                float2 updated_pair_1249 = fma_f32x2_rn_ftz(weight_pair_1237, cached_pair_1247, acc_pair_1248);
-                acc32[50] = updated_pair_1249.x;
-                acc32[51] = updated_pair_1249.y;
-                float _tmem_load_45[8];
-                tmem_ld_x8(&_tmem_load_45[0], tmem_base + 64 + 48);
-                float2 weight_pair_1250 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1251 = make_float2(_tmem_load_45[0], _tmem_load_45[1]);
-                float2 acc_pair_1252 = make_float2(acc32[44], acc32[45]);
-                float2 updated_pair_1253 = fma_f32x2_rn_ftz(weight_pair_1250, cached_pair_1251, acc_pair_1252);
-                acc32[44] = updated_pair_1253.x;
-                acc32[45] = updated_pair_1253.y;
-                float2 cached_pair_1254 = make_float2(_tmem_load_45[2], _tmem_load_45[3]);
-                float2 acc_pair_1255 = make_float2(acc32[46], acc32[47]);
-                float2 updated_pair_1256 = fma_f32x2_rn_ftz(weight_pair_1250, cached_pair_1254, acc_pair_1255);
-                acc32[46] = updated_pair_1256.x;
-                acc32[47] = updated_pair_1256.y;
-                float2 cached_pair_1257 = make_float2(_tmem_load_45[4], _tmem_load_45[5]);
-                float2 acc_pair_1258 = make_float2(acc32[48], acc32[49]);
-                float2 updated_pair_1259 = fma_f32x2_rn_ftz(weight_pair_1250, cached_pair_1257, acc_pair_1258);
-                acc32[48] = updated_pair_1259.x;
-                acc32[49] = updated_pair_1259.y;
-                float2 cached_pair_1260 = make_float2(_tmem_load_45[6], _tmem_load_45[7]);
-                float2 acc_pair_1261 = make_float2(acc32[50], acc32[51]);
-                float2 updated_pair_1262 = fma_f32x2_rn_ftz(weight_pair_1250, cached_pair_1260, acc_pair_1261);
-                acc32[50] = updated_pair_1262.x;
-                acc32[51] = updated_pair_1262.y;
-                float2 correction_pair_1263 = make_float2(correction_1031, correction_1031);
-                float2 acc_pair_1264 = make_float2(acc32[52], acc32[53]);
-                float2 scaled_pair_1265;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1265) : "l"(*(const unsigned long long*)&acc_pair_1264), "l"(*(const unsigned long long*)&correction_pair_1263));
-                acc32[52] = scaled_pair_1265.x;
-                acc32[53] = scaled_pair_1265.y;
-                float2 acc_pair_1266 = make_float2(acc32[54], acc32[55]);
-                float2 scaled_pair_1267;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1267) : "l"(*(const unsigned long long*)&acc_pair_1266), "l"(*(const unsigned long long*)&correction_pair_1263));
-                acc32[54] = scaled_pair_1267.x;
-                acc32[55] = scaled_pair_1267.y;
-                float _tmem_load_46[4];
-                tmem_ld_x4(&_tmem_load_46[0], tmem_base + 56);
-                float2 weight_pair_1268 = make_float2(weights_1029[0], weights_1029[0]);
-                float2 cached_pair_1269 = make_float2(_tmem_load_46[0], _tmem_load_46[1]);
-                float2 acc_pair_1270 = make_float2(acc32[52], acc32[53]);
-                float2 updated_pair_1271 = fma_f32x2_rn_ftz(weight_pair_1268, cached_pair_1269, acc_pair_1270);
-                acc32[52] = updated_pair_1271.x;
-                acc32[53] = updated_pair_1271.y;
-                float2 cached_pair_1272 = make_float2(_tmem_load_46[2], _tmem_load_46[3]);
-                float2 acc_pair_1273 = make_float2(acc32[54], acc32[55]);
-                float2 updated_pair_1274 = fma_f32x2_rn_ftz(weight_pair_1268, cached_pair_1272, acc_pair_1273);
-                acc32[54] = updated_pair_1274.x;
-                acc32[55] = updated_pair_1274.y;
-                float _tmem_load_47[4];
-                tmem_ld_x4(&_tmem_load_47[0], tmem_base + 64 + 56);
-                float2 weight_pair_1275 = make_float2(weights_1029[1], weights_1029[1]);
-                float2 cached_pair_1276 = make_float2(_tmem_load_47[0], _tmem_load_47[1]);
-                float2 acc_pair_1277 = make_float2(acc32[52], acc32[53]);
-                float2 updated_pair_1278 = fma_f32x2_rn_ftz(weight_pair_1275, cached_pair_1276, acc_pair_1277);
-                acc32[52] = updated_pair_1278.x;
-                acc32[53] = updated_pair_1278.y;
-                float2 cached_pair_1279 = make_float2(_tmem_load_47[2], _tmem_load_47[3]);
-                float2 acc_pair_1280 = make_float2(acc32[54], acc32[55]);
-                float2 updated_pair_1281 = fma_f32x2_rn_ftz(weight_pair_1275, cached_pair_1279, acc_pair_1280);
-                acc32[54] = updated_pair_1281.x;
-                acc32[55] = updated_pair_1281.y;
-                s_running = __fmaf_rn(s_running, correction_1031, weight_sum_1032);
-                m_running = new_max_1030;
-                consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
-                unsigned int ring_stage_1282 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_1282) * 8, consumer_phase);
-                asm volatile("tcgen05.fence::after_thread_sync;");
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                float2 local_sum_sq_1283[4];
-                float2 local_dot_1284[4];
-                local_sum_sq_1283[0] = make_float2(0.0f, 0.0f);
-                local_dot_1284[0] = make_float2(0.0f, 0.0f);
-                local_sum_sq_1283[1] = make_float2(0.0f, 0.0f);
-                local_dot_1284[1] = make_float2(0.0f, 0.0f);
-                local_sum_sq_1283[2] = make_float2(0.0f, 0.0f);
-                local_dot_1284[2] = make_float2(0.0f, 0.0f);
-                local_sum_sq_1283[3] = make_float2(0.0f, 0.0f);
-                local_dot_1284[3] = make_float2(0.0f, 0.0f);
-                int hidden_base_1285 = thread_in_group * 8;
-                unsigned int smem_regs_1286[4];
-                #pragma unroll
-                for (int _lr_48 = 0; _lr_48 < 4; _lr_48++) {
-                    smem_regs_1286[_lr_48] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1285 / 2) + (unsigned int)_lr_48];
-                }
-                float values_1287[8];
-                unsigned int smem_regs_1288[4];
-                #pragma unroll
-                for (int _lr_49 = 0; _lr_49 < 4; _lr_49++) {
-                    smem_regs_1288[_lr_49] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1285 / 2) + (unsigned int)_lr_49];
-                }
-                __nv_bfloat162 prefix_pair = __as_bf16x2(smem_regs_1286[0]);
-                __nv_bfloat162 delta_pair = __as_bf16x2(smem_regs_1288[0]);
-                __nv_bfloat162 updated_bf16_pair = prefix_pair + delta_pair;
-                values_1287[0] = (float)updated_bf16_pair.x;
-                values_1287[1] = (float)updated_bf16_pair.y;
-                __nv_bfloat162 prefix_pair_1289 = __as_bf16x2(smem_regs_1286[1]);
-                __nv_bfloat162 delta_pair_1290 = __as_bf16x2(smem_regs_1288[1]);
-                __nv_bfloat162 updated_bf16_pair_1291 = prefix_pair_1289 + delta_pair_1290;
-                values_1287[2] = (float)updated_bf16_pair_1291.x;
-                values_1287[3] = (float)updated_bf16_pair_1291.y;
-                __nv_bfloat162 prefix_pair_1292 = __as_bf16x2(smem_regs_1286[2]);
-                __nv_bfloat162 delta_pair_1293 = __as_bf16x2(smem_regs_1288[2]);
-                __nv_bfloat162 updated_bf16_pair_1294 = prefix_pair_1292 + delta_pair_1293;
-                values_1287[4] = (float)updated_bf16_pair_1294.x;
-                values_1287[5] = (float)updated_bf16_pair_1294.y;
-                __nv_bfloat162 prefix_pair_1295 = __as_bf16x2(smem_regs_1286[3]);
-                __nv_bfloat162 delta_pair_1296 = __as_bf16x2(smem_regs_1288[3]);
-                __nv_bfloat162 updated_bf16_pair_1297 = prefix_pair_1295 + delta_pair_1296;
-                values_1287[6] = (float)updated_bf16_pair_1297.x;
-                values_1287[7] = (float)updated_bf16_pair_1297.y;
-                unsigned int _packed_0[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1287[_lp*2 + 0], values_1287[_lp*2+1 + 0]));
-                    _packed_0[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1287[_lp*2 + 2], values_1287[_lp*2+1 + 2]));
-                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1287[_lp*2 + 4], values_1287[_lp*2+1 + 4]));
-                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1287[_lp*2 + 6], values_1287[_lp*2+1 + 6]));
-                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1285))[0] = reinterpret_cast<int4*>(_packed_0)[0];
-                tmem_st_x8_f32(tmem_base, values_1287);
-                float2 value_pair_1298 = make_float2(values_1287[0], values_1287[1]);
-                float2 q_pair_1299 = make_float2(q_cache[0], q_cache[1]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1298, value_pair_1298, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1298, q_pair_1299, local_dot_1284[0]);
-                float2 value_pair_1300 = make_float2(values_1287[2], values_1287[3]);
-                float2 q_pair_1301 = make_float2(q_cache[2], q_cache[3]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1300, value_pair_1300, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1300, q_pair_1301, local_dot_1284[0]);
-                float2 value_pair_1302 = make_float2(values_1287[4], values_1287[5]);
-                float2 q_pair_1303 = make_float2(q_cache[4], q_cache[5]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1302, value_pair_1302, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1302, q_pair_1303, local_dot_1284[0]);
-                float2 value_pair_1304 = make_float2(values_1287[6], values_1287[7]);
-                float2 q_pair_1305 = make_float2(q_cache[6], q_cache[7]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1304, value_pair_1304, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1304, q_pair_1305, local_dot_1284[0]);
-                int hidden_base_1306 = 2048 + thread_in_group * 8;
-                unsigned int smem_regs_1307[4];
-                #pragma unroll
-                for (int _lr_50 = 0; _lr_50 < 4; _lr_50++) {
-                    smem_regs_1307[_lr_50] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1306 / 2) + (unsigned int)_lr_50];
-                }
-                float values_1308[8];
-                unsigned int smem_regs_1309[4];
-                #pragma unroll
-                for (int _lr_51 = 0; _lr_51 < 4; _lr_51++) {
-                    smem_regs_1309[_lr_51] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1306 / 2) + (unsigned int)_lr_51];
-                }
-                __nv_bfloat162 prefix_pair_1310 = __as_bf16x2(smem_regs_1307[0]);
-                __nv_bfloat162 delta_pair_1311 = __as_bf16x2(smem_regs_1309[0]);
-                __nv_bfloat162 updated_bf16_pair_1312 = prefix_pair_1310 + delta_pair_1311;
-                values_1308[0] = (float)updated_bf16_pair_1312.x;
-                values_1308[1] = (float)updated_bf16_pair_1312.y;
-                __nv_bfloat162 prefix_pair_1313 = __as_bf16x2(smem_regs_1307[1]);
-                __nv_bfloat162 delta_pair_1314 = __as_bf16x2(smem_regs_1309[1]);
-                __nv_bfloat162 updated_bf16_pair_1315 = prefix_pair_1313 + delta_pair_1314;
-                values_1308[2] = (float)updated_bf16_pair_1315.x;
-                values_1308[3] = (float)updated_bf16_pair_1315.y;
-                __nv_bfloat162 prefix_pair_1316 = __as_bf16x2(smem_regs_1307[2]);
-                __nv_bfloat162 delta_pair_1317 = __as_bf16x2(smem_regs_1309[2]);
-                __nv_bfloat162 updated_bf16_pair_1318 = prefix_pair_1316 + delta_pair_1317;
-                values_1308[4] = (float)updated_bf16_pair_1318.x;
-                values_1308[5] = (float)updated_bf16_pair_1318.y;
-                __nv_bfloat162 prefix_pair_1319 = __as_bf16x2(smem_regs_1307[3]);
-                __nv_bfloat162 delta_pair_1320 = __as_bf16x2(smem_regs_1309[3]);
-                __nv_bfloat162 updated_bf16_pair_1321 = prefix_pair_1319 + delta_pair_1320;
-                values_1308[6] = (float)updated_bf16_pair_1321.x;
-                values_1308[7] = (float)updated_bf16_pair_1321.y;
-                unsigned int _packed_1[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1308[_lp*2 + 0], values_1308[_lp*2+1 + 0]));
-                    _packed_1[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1308[_lp*2 + 2], values_1308[_lp*2+1 + 2]));
-                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1308[_lp*2 + 4], values_1308[_lp*2+1 + 4]));
-                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1308[_lp*2 + 6], values_1308[_lp*2+1 + 6]));
-                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1306))[0] = reinterpret_cast<int4*>(_packed_1)[0];
-                tmem_st_x8_f32(tmem_base + 8, values_1308);
-                float2 value_pair_1322 = make_float2(values_1308[0], values_1308[1]);
-                float2 q_pair_1323 = make_float2(q_cache[8], q_cache[9]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1322, value_pair_1322, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1322, q_pair_1323, local_dot_1284[0]);
-                float2 value_pair_1324 = make_float2(values_1308[2], values_1308[3]);
-                float2 q_pair_1325 = make_float2(q_cache[10], q_cache[11]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1324, value_pair_1324, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1324, q_pair_1325, local_dot_1284[0]);
-                float2 value_pair_1326 = make_float2(values_1308[4], values_1308[5]);
-                float2 q_pair_1327 = make_float2(q_cache[12], q_cache[13]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1326, value_pair_1326, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1326, q_pair_1327, local_dot_1284[0]);
-                float2 value_pair_1328 = make_float2(values_1308[6], values_1308[7]);
-                float2 q_pair_1329 = make_float2(q_cache[14], q_cache[15]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1328, value_pair_1328, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1328, q_pair_1329, local_dot_1284[0]);
-                int hidden_base_1330 = 4096 + thread_in_group * 8;
-                unsigned int smem_regs_1331[4];
-                #pragma unroll
-                for (int _lr_52 = 0; _lr_52 < 4; _lr_52++) {
-                    smem_regs_1331[_lr_52] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1330 / 2) + (unsigned int)_lr_52];
-                }
-                float values_1332[8];
-                unsigned int smem_regs_1333[4];
-                #pragma unroll
-                for (int _lr_53 = 0; _lr_53 < 4; _lr_53++) {
-                    smem_regs_1333[_lr_53] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1330 / 2) + (unsigned int)_lr_53];
-                }
-                __nv_bfloat162 prefix_pair_1334 = __as_bf16x2(smem_regs_1331[0]);
-                __nv_bfloat162 delta_pair_1335 = __as_bf16x2(smem_regs_1333[0]);
-                __nv_bfloat162 updated_bf16_pair_1336 = prefix_pair_1334 + delta_pair_1335;
-                values_1332[0] = (float)updated_bf16_pair_1336.x;
-                values_1332[1] = (float)updated_bf16_pair_1336.y;
-                __nv_bfloat162 prefix_pair_1337 = __as_bf16x2(smem_regs_1331[1]);
-                __nv_bfloat162 delta_pair_1338 = __as_bf16x2(smem_regs_1333[1]);
-                __nv_bfloat162 updated_bf16_pair_1339 = prefix_pair_1337 + delta_pair_1338;
-                values_1332[2] = (float)updated_bf16_pair_1339.x;
-                values_1332[3] = (float)updated_bf16_pair_1339.y;
-                __nv_bfloat162 prefix_pair_1340 = __as_bf16x2(smem_regs_1331[2]);
-                __nv_bfloat162 delta_pair_1341 = __as_bf16x2(smem_regs_1333[2]);
-                __nv_bfloat162 updated_bf16_pair_1342 = prefix_pair_1340 + delta_pair_1341;
-                values_1332[4] = (float)updated_bf16_pair_1342.x;
-                values_1332[5] = (float)updated_bf16_pair_1342.y;
-                __nv_bfloat162 prefix_pair_1343 = __as_bf16x2(smem_regs_1331[3]);
-                __nv_bfloat162 delta_pair_1344 = __as_bf16x2(smem_regs_1333[3]);
-                __nv_bfloat162 updated_bf16_pair_1345 = prefix_pair_1343 + delta_pair_1344;
-                values_1332[6] = (float)updated_bf16_pair_1345.x;
-                values_1332[7] = (float)updated_bf16_pair_1345.y;
-                unsigned int _packed_2[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1332[_lp*2 + 0], values_1332[_lp*2+1 + 0]));
-                    _packed_2[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1332[_lp*2 + 2], values_1332[_lp*2+1 + 2]));
-                    _packed_2[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1332[_lp*2 + 4], values_1332[_lp*2+1 + 4]));
-                    _packed_2[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1332[_lp*2 + 6], values_1332[_lp*2+1 + 6]));
-                    _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1330))[0] = reinterpret_cast<int4*>(_packed_2)[0];
-                tmem_st_x8_f32(tmem_base + 16, values_1332);
-                float2 value_pair_1346 = make_float2(values_1332[0], values_1332[1]);
-                float2 q_pair_1347 = make_float2(q_cache[16], q_cache[17]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1346, value_pair_1346, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1346, q_pair_1347, local_dot_1284[0]);
-                float2 value_pair_1348 = make_float2(values_1332[2], values_1332[3]);
-                float2 q_pair_1349 = make_float2(q_cache[18], q_cache[19]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1348, value_pair_1348, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1348, q_pair_1349, local_dot_1284[0]);
-                float2 value_pair_1350 = make_float2(values_1332[4], values_1332[5]);
-                float2 q_pair_1351 = make_float2(q_cache[20], q_cache[21]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1350, value_pair_1350, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1350, q_pair_1351, local_dot_1284[0]);
-                float2 value_pair_1352 = make_float2(values_1332[6], values_1332[7]);
-                float2 q_pair_1353 = make_float2(q_cache[22], q_cache[23]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1352, value_pair_1352, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1352, q_pair_1353, local_dot_1284[0]);
-                int hidden_base_1354 = 6144 + thread_in_group * 4;
-                unsigned int smem_regs_1355[2];
-                #pragma unroll
-                for (int _lr_54 = 0; _lr_54 < 2; _lr_54++) {
-                    smem_regs_1355[_lr_54] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1354 / 2) + (unsigned int)_lr_54];
-                }
-                float values_1356[4];
-                unsigned int smem_regs_1357[2];
-                #pragma unroll
-                for (int _lr_55 = 0; _lr_55 < 2; _lr_55++) {
-                    smem_regs_1357[_lr_55] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1354 / 2) + (unsigned int)_lr_55];
-                }
-                __nv_bfloat162 prefix_pair_1358 = __as_bf16x2(smem_regs_1355[0]);
-                __nv_bfloat162 delta_pair_1359 = __as_bf16x2(smem_regs_1357[0]);
-                __nv_bfloat162 updated_bf16_pair_1360 = prefix_pair_1358 + delta_pair_1359;
-                values_1356[0] = (float)updated_bf16_pair_1360.x;
-                values_1356[1] = (float)updated_bf16_pair_1360.y;
-                __nv_bfloat162 prefix_pair_1361 = __as_bf16x2(smem_regs_1355[1]);
-                __nv_bfloat162 delta_pair_1362 = __as_bf16x2(smem_regs_1357[1]);
-                __nv_bfloat162 updated_bf16_pair_1363 = prefix_pair_1361 + delta_pair_1362;
-                values_1356[2] = (float)updated_bf16_pair_1363.x;
-                values_1356[3] = (float)updated_bf16_pair_1363.y;
-                unsigned int _packed_3[2];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1356[_lp*2 + 0], values_1356[_lp*2+1 + 0]));
-                    _packed_3[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1356[_lp*2 + 2], values_1356[_lp*2+1 + 2]));
-                    _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_1354))[0] = reinterpret_cast<int2*>(_packed_3)[0];
-                tmem_st_x4_f32(tmem_base + 24, values_1356);
-                float2 value_pair_1364 = make_float2(values_1356[0], values_1356[1]);
-                float2 q_pair_1365 = make_float2(q_cache[24], q_cache[25]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1364, value_pair_1364, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1364, q_pair_1365, local_dot_1284[0]);
-                float2 value_pair_1366 = make_float2(values_1356[2], values_1356[3]);
-                float2 q_pair_1367 = make_float2(q_cache[26], q_cache[27]);
-                local_sum_sq_1283[0] = fma_f32x2_rn_ftz(value_pair_1366, value_pair_1366, local_sum_sq_1283[0]);
-                local_dot_1284[0] = fma_f32x2_rn_ftz(value_pair_1366, q_pair_1367, local_dot_1284[0]);
-                int hidden_base_1368 = 1024 + thread_in_group * 8;
-                unsigned int smem_regs_1369[4];
-                #pragma unroll
-                for (int _lr_56 = 0; _lr_56 < 4; _lr_56++) {
-                    smem_regs_1369[_lr_56] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1368 / 2) + (unsigned int)_lr_56];
-                }
-                float values_1370[8];
-                unsigned int smem_regs_1371[4];
-                #pragma unroll
-                for (int _lr_57 = 0; _lr_57 < 4; _lr_57++) {
-                    smem_regs_1371[_lr_57] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1368 / 2) + (unsigned int)_lr_57];
-                }
-                __nv_bfloat162 prefix_pair_1372 = __as_bf16x2(smem_regs_1369[0]);
-                __nv_bfloat162 delta_pair_1373 = __as_bf16x2(smem_regs_1371[0]);
-                __nv_bfloat162 updated_bf16_pair_1374 = prefix_pair_1372 + delta_pair_1373;
-                values_1370[0] = (float)updated_bf16_pair_1374.x;
-                values_1370[1] = (float)updated_bf16_pair_1374.y;
-                __nv_bfloat162 prefix_pair_1375 = __as_bf16x2(smem_regs_1369[1]);
-                __nv_bfloat162 delta_pair_1376 = __as_bf16x2(smem_regs_1371[1]);
-                __nv_bfloat162 updated_bf16_pair_1377 = prefix_pair_1375 + delta_pair_1376;
-                values_1370[2] = (float)updated_bf16_pair_1377.x;
-                values_1370[3] = (float)updated_bf16_pair_1377.y;
-                __nv_bfloat162 prefix_pair_1378 = __as_bf16x2(smem_regs_1369[2]);
-                __nv_bfloat162 delta_pair_1379 = __as_bf16x2(smem_regs_1371[2]);
-                __nv_bfloat162 updated_bf16_pair_1380 = prefix_pair_1378 + delta_pair_1379;
-                values_1370[4] = (float)updated_bf16_pair_1380.x;
-                values_1370[5] = (float)updated_bf16_pair_1380.y;
-                __nv_bfloat162 prefix_pair_1381 = __as_bf16x2(smem_regs_1369[3]);
-                __nv_bfloat162 delta_pair_1382 = __as_bf16x2(smem_regs_1371[3]);
-                __nv_bfloat162 updated_bf16_pair_1383 = prefix_pair_1381 + delta_pair_1382;
-                values_1370[6] = (float)updated_bf16_pair_1383.x;
-                values_1370[7] = (float)updated_bf16_pair_1383.y;
-                unsigned int _packed_4[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1370[_lp*2 + 0], values_1370[_lp*2+1 + 0]));
-                    _packed_4[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1370[_lp*2 + 2], values_1370[_lp*2+1 + 2]));
-                    _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1370[_lp*2 + 4], values_1370[_lp*2+1 + 4]));
-                    _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1370[_lp*2 + 6], values_1370[_lp*2+1 + 6]));
-                    _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1368))[0] = reinterpret_cast<int4*>(_packed_4)[0];
-                tmem_st_x8_f32(tmem_base + 32, values_1370);
-                float2 value_pair_1384 = make_float2(values_1370[0], values_1370[1]);
-                float2 q_pair_1385 = make_float2(q_cache[28], q_cache[29]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1384, value_pair_1384, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1384, q_pair_1385, local_dot_1284[2]);
-                float2 value_pair_1386 = make_float2(values_1370[2], values_1370[3]);
-                float2 q_pair_1387 = make_float2(q_cache[30], q_cache[31]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1386, value_pair_1386, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1386, q_pair_1387, local_dot_1284[2]);
-                float2 value_pair_1388 = make_float2(values_1370[4], values_1370[5]);
-                float2 q_pair_1389 = make_float2(q_cache[32], q_cache[33]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1388, value_pair_1388, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1388, q_pair_1389, local_dot_1284[2]);
-                float2 value_pair_1390 = make_float2(values_1370[6], values_1370[7]);
-                float2 q_pair_1391 = make_float2(q_cache[34], q_cache[35]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1390, value_pair_1390, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1390, q_pair_1391, local_dot_1284[2]);
-                int hidden_base_1392 = 3072 + thread_in_group * 8;
-                unsigned int smem_regs_1393[4];
-                #pragma unroll
-                for (int _lr_58 = 0; _lr_58 < 4; _lr_58++) {
-                    smem_regs_1393[_lr_58] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1392 / 2) + (unsigned int)_lr_58];
-                }
-                float values_1394[8];
-                unsigned int smem_regs_1395[4];
-                #pragma unroll
-                for (int _lr_59 = 0; _lr_59 < 4; _lr_59++) {
-                    smem_regs_1395[_lr_59] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1392 / 2) + (unsigned int)_lr_59];
-                }
-                __nv_bfloat162 prefix_pair_1396 = __as_bf16x2(smem_regs_1393[0]);
-                __nv_bfloat162 delta_pair_1397 = __as_bf16x2(smem_regs_1395[0]);
-                __nv_bfloat162 updated_bf16_pair_1398 = prefix_pair_1396 + delta_pair_1397;
-                values_1394[0] = (float)updated_bf16_pair_1398.x;
-                values_1394[1] = (float)updated_bf16_pair_1398.y;
-                __nv_bfloat162 prefix_pair_1399 = __as_bf16x2(smem_regs_1393[1]);
-                __nv_bfloat162 delta_pair_1400 = __as_bf16x2(smem_regs_1395[1]);
-                __nv_bfloat162 updated_bf16_pair_1401 = prefix_pair_1399 + delta_pair_1400;
-                values_1394[2] = (float)updated_bf16_pair_1401.x;
-                values_1394[3] = (float)updated_bf16_pair_1401.y;
-                __nv_bfloat162 prefix_pair_1402 = __as_bf16x2(smem_regs_1393[2]);
-                __nv_bfloat162 delta_pair_1403 = __as_bf16x2(smem_regs_1395[2]);
-                __nv_bfloat162 updated_bf16_pair_1404 = prefix_pair_1402 + delta_pair_1403;
-                values_1394[4] = (float)updated_bf16_pair_1404.x;
-                values_1394[5] = (float)updated_bf16_pair_1404.y;
-                __nv_bfloat162 prefix_pair_1405 = __as_bf16x2(smem_regs_1393[3]);
-                __nv_bfloat162 delta_pair_1406 = __as_bf16x2(smem_regs_1395[3]);
-                __nv_bfloat162 updated_bf16_pair_1407 = prefix_pair_1405 + delta_pair_1406;
-                values_1394[6] = (float)updated_bf16_pair_1407.x;
-                values_1394[7] = (float)updated_bf16_pair_1407.y;
-                unsigned int _packed_5[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1394[_lp*2 + 0], values_1394[_lp*2+1 + 0]));
-                    _packed_5[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1394[_lp*2 + 2], values_1394[_lp*2+1 + 2]));
-                    _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1394[_lp*2 + 4], values_1394[_lp*2+1 + 4]));
-                    _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1394[_lp*2 + 6], values_1394[_lp*2+1 + 6]));
-                    _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1392))[0] = reinterpret_cast<int4*>(_packed_5)[0];
-                tmem_st_x8_f32(tmem_base + 40, values_1394);
-                float2 value_pair_1408 = make_float2(values_1394[0], values_1394[1]);
-                float2 q_pair_1409 = make_float2(q_cache[36], q_cache[37]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1408, value_pair_1408, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1408, q_pair_1409, local_dot_1284[2]);
-                float2 value_pair_1410 = make_float2(values_1394[2], values_1394[3]);
-                float2 q_pair_1411 = make_float2(q_cache[38], q_cache[39]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1410, value_pair_1410, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1410, q_pair_1411, local_dot_1284[2]);
-                float2 value_pair_1412 = make_float2(values_1394[4], values_1394[5]);
-                float2 q_pair_1413 = make_float2(q_cache[40], q_cache[41]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1412, value_pair_1412, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1412, q_pair_1413, local_dot_1284[2]);
-                float2 value_pair_1414 = make_float2(values_1394[6], values_1394[7]);
-                float2 q_pair_1415 = make_float2(q_cache[42], q_cache[43]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1414, value_pair_1414, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1414, q_pair_1415, local_dot_1284[2]);
-                int hidden_base_1416 = 5120 + thread_in_group * 8;
-                unsigned int smem_regs_1417[4];
-                #pragma unroll
-                for (int _lr_60 = 0; _lr_60 < 4; _lr_60++) {
-                    smem_regs_1417[_lr_60] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1416 / 2) + (unsigned int)_lr_60];
-                }
-                float values_1418[8];
-                unsigned int smem_regs_1419[4];
-                #pragma unroll
-                for (int _lr_61 = 0; _lr_61 < 4; _lr_61++) {
-                    smem_regs_1419[_lr_61] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1416 / 2) + (unsigned int)_lr_61];
-                }
-                __nv_bfloat162 prefix_pair_1420 = __as_bf16x2(smem_regs_1417[0]);
-                __nv_bfloat162 delta_pair_1421 = __as_bf16x2(smem_regs_1419[0]);
-                __nv_bfloat162 updated_bf16_pair_1422 = prefix_pair_1420 + delta_pair_1421;
-                values_1418[0] = (float)updated_bf16_pair_1422.x;
-                values_1418[1] = (float)updated_bf16_pair_1422.y;
-                __nv_bfloat162 prefix_pair_1423 = __as_bf16x2(smem_regs_1417[1]);
-                __nv_bfloat162 delta_pair_1424 = __as_bf16x2(smem_regs_1419[1]);
-                __nv_bfloat162 updated_bf16_pair_1425 = prefix_pair_1423 + delta_pair_1424;
-                values_1418[2] = (float)updated_bf16_pair_1425.x;
-                values_1418[3] = (float)updated_bf16_pair_1425.y;
-                __nv_bfloat162 prefix_pair_1426 = __as_bf16x2(smem_regs_1417[2]);
-                __nv_bfloat162 delta_pair_1427 = __as_bf16x2(smem_regs_1419[2]);
-                __nv_bfloat162 updated_bf16_pair_1428 = prefix_pair_1426 + delta_pair_1427;
-                values_1418[4] = (float)updated_bf16_pair_1428.x;
-                values_1418[5] = (float)updated_bf16_pair_1428.y;
-                __nv_bfloat162 prefix_pair_1429 = __as_bf16x2(smem_regs_1417[3]);
-                __nv_bfloat162 delta_pair_1430 = __as_bf16x2(smem_regs_1419[3]);
-                __nv_bfloat162 updated_bf16_pair_1431 = prefix_pair_1429 + delta_pair_1430;
-                values_1418[6] = (float)updated_bf16_pair_1431.x;
-                values_1418[7] = (float)updated_bf16_pair_1431.y;
-                unsigned int _packed_6[4];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1418[_lp*2 + 0], values_1418[_lp*2+1 + 0]));
-                    _packed_6[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1418[_lp*2 + 2], values_1418[_lp*2+1 + 2]));
-                    _packed_6[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1418[_lp*2 + 4], values_1418[_lp*2+1 + 4]));
-                    _packed_6[_lp + 2] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1418[_lp*2 + 6], values_1418[_lp*2+1 + 6]));
-                    _packed_6[_lp + 3] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int4*>(prefix + (token_1 * 7168 + hidden_base_1416))[0] = reinterpret_cast<int4*>(_packed_6)[0];
-                tmem_st_x8_f32(tmem_base + 48, values_1418);
-                float2 value_pair_1432 = make_float2(values_1418[0], values_1418[1]);
-                float2 q_pair_1433 = make_float2(q_cache[44], q_cache[45]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1432, value_pair_1432, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1432, q_pair_1433, local_dot_1284[2]);
-                float2 value_pair_1434 = make_float2(values_1418[2], values_1418[3]);
-                float2 q_pair_1435 = make_float2(q_cache[46], q_cache[47]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1434, value_pair_1434, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1434, q_pair_1435, local_dot_1284[2]);
-                float2 value_pair_1436 = make_float2(values_1418[4], values_1418[5]);
-                float2 q_pair_1437 = make_float2(q_cache[48], q_cache[49]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1436, value_pair_1436, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1436, q_pair_1437, local_dot_1284[2]);
-                float2 value_pair_1438 = make_float2(values_1418[6], values_1418[7]);
-                float2 q_pair_1439 = make_float2(q_cache[50], q_cache[51]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1438, value_pair_1438, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1438, q_pair_1439, local_dot_1284[2]);
-                int hidden_base_1440 = 6656 + thread_in_group * 4;
-                unsigned int smem_regs_1441[2];
-                #pragma unroll
-                for (int _lr_62 = 0; _lr_62 < 2; _lr_62++) {
-                    smem_regs_1441[_lr_62] = source_words[ring_stage_1282 * 2 * 3584 + (unsigned int)(hidden_base_1440 / 2) + (unsigned int)_lr_62];
-                }
-                float values_1442[4];
-                unsigned int smem_regs_1443[2];
-                #pragma unroll
-                for (int _lr_63 = 0; _lr_63 < 2; _lr_63++) {
-                    smem_regs_1443[_lr_63] = delta_words[stream_u_1 * 3584 + (unsigned int)(hidden_base_1440 / 2) + (unsigned int)_lr_63];
-                }
-                __nv_bfloat162 prefix_pair_1444 = __as_bf16x2(smem_regs_1441[0]);
-                __nv_bfloat162 delta_pair_1445 = __as_bf16x2(smem_regs_1443[0]);
-                __nv_bfloat162 updated_bf16_pair_1446 = prefix_pair_1444 + delta_pair_1445;
-                values_1442[0] = (float)updated_bf16_pair_1446.x;
-                values_1442[1] = (float)updated_bf16_pair_1446.y;
-                __nv_bfloat162 prefix_pair_1447 = __as_bf16x2(smem_regs_1441[1]);
-                __nv_bfloat162 delta_pair_1448 = __as_bf16x2(smem_regs_1443[1]);
-                __nv_bfloat162 updated_bf16_pair_1449 = prefix_pair_1447 + delta_pair_1448;
-                values_1442[2] = (float)updated_bf16_pair_1449.x;
-                values_1442[3] = (float)updated_bf16_pair_1449.y;
-                unsigned int _packed_7[2];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1442[_lp*2 + 0], values_1442[_lp*2+1 + 0]));
-                    _packed_7[_lp] = *(uint32_t*)&_bf2;
-                }
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1442[_lp*2 + 2], values_1442[_lp*2+1 + 2]));
-                    _packed_7[_lp + 1] = *(uint32_t*)&_bf2;
-                }
-                reinterpret_cast<int2*>(prefix + (token_1 * 7168 + hidden_base_1440))[0] = reinterpret_cast<int2*>(_packed_7)[0];
-                tmem_st_x4_f32(tmem_base + 56, values_1442);
-                float2 value_pair_1450 = make_float2(values_1442[0], values_1442[1]);
-                float2 q_pair_1451 = make_float2(q_cache[52], q_cache[53]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1450, value_pair_1450, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1450, q_pair_1451, local_dot_1284[2]);
-                float2 value_pair_1452 = make_float2(values_1442[2], values_1442[3]);
-                float2 q_pair_1453 = make_float2(q_cache[54], q_cache[55]);
-                local_sum_sq_1283[2] = fma_f32x2_rn_ftz(value_pair_1452, value_pair_1452, local_sum_sq_1283[2]);
-                local_dot_1284[2] = fma_f32x2_rn_ftz(value_pair_1452, q_pair_1453, local_dot_1284[2]);
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(consumed_addr + (ring_stage_1282) * 8);
-                asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                unsigned int slot_base_1454 = stats_stream_base + 96;
-                float2 reduce_pair_1455 = make_float2(local_sum_sq_1283[0].x + local_sum_sq_1283[0].y, local_dot_1284[0].x + local_dot_1284[0].y);
-                unsigned long long packed_pair_1456 = 0;
-                unsigned long long peer_packed_1457 = 0;
-                float2 peer_pair_1458 = make_float2(0.0f, 0.0f);
-                packed_pair_1456 = reinterpret_cast<unsigned long long*>(&reduce_pair_1455)[0];
-                unsigned long long _shfl_xor_sync_168 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1456, 16);
-                peer_packed_1457 = _shfl_xor_sync_168;
-                peer_pair_1458 = reinterpret_cast<float2*>(&peer_packed_1457)[0];
-                reduce_pair_1455 = add_f32x2(reduce_pair_1455, peer_pair_1458);
-                packed_pair_1456 = reinterpret_cast<unsigned long long*>(&reduce_pair_1455)[0];
-                unsigned long long _shfl_xor_sync_169 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1456, 8);
-                peer_packed_1457 = _shfl_xor_sync_169;
-                peer_pair_1458 = reinterpret_cast<float2*>(&peer_packed_1457)[0];
-                reduce_pair_1455 = add_f32x2(reduce_pair_1455, peer_pair_1458);
-                packed_pair_1456 = reinterpret_cast<unsigned long long*>(&reduce_pair_1455)[0];
-                unsigned long long _shfl_xor_sync_170 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1456, 4);
-                peer_packed_1457 = _shfl_xor_sync_170;
-                peer_pair_1458 = reinterpret_cast<float2*>(&peer_packed_1457)[0];
-                reduce_pair_1455 = add_f32x2(reduce_pair_1455, peer_pair_1458);
-                packed_pair_1456 = reinterpret_cast<unsigned long long*>(&reduce_pair_1455)[0];
-                unsigned long long _shfl_xor_sync_171 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1456, 2);
-                peer_packed_1457 = _shfl_xor_sync_171;
-                peer_pair_1458 = reinterpret_cast<float2*>(&peer_packed_1457)[0];
-                reduce_pair_1455 = add_f32x2(reduce_pair_1455, peer_pair_1458);
-                packed_pair_1456 = reinterpret_cast<unsigned long long*>(&reduce_pair_1455)[0];
-                unsigned long long _shfl_xor_sync_172 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1456, 1);
-                peer_packed_1457 = _shfl_xor_sync_172;
-                peer_pair_1458 = reinterpret_cast<float2*>(&peer_packed_1457)[0];
-                reduce_pair_1455 = add_f32x2(reduce_pair_1455, peer_pair_1458);
-                if (lane == 0) {
-                    stats[slot_base_1454 + (unsigned int)(warp_in_group * 2 * 2)] = reduce_pair_1455.x;
-                    stats[slot_base_1454 + (unsigned int)(warp_in_group * 2 * 2) + 1] = reduce_pair_1455.y;
-                }
-                float2 reduce_pair_1459 = make_float2(local_sum_sq_1283[2].x + local_sum_sq_1283[2].y, local_dot_1284[2].x + local_dot_1284[2].y);
-                unsigned long long packed_pair_1460 = 0;
-                unsigned long long peer_packed_1461 = 0;
-                float2 peer_pair_1462 = make_float2(0.0f, 0.0f);
-                packed_pair_1460 = reinterpret_cast<unsigned long long*>(&reduce_pair_1459)[0];
-                unsigned long long _shfl_xor_sync_173 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1460, 16);
-                peer_packed_1461 = _shfl_xor_sync_173;
-                peer_pair_1462 = reinterpret_cast<float2*>(&peer_packed_1461)[0];
-                reduce_pair_1459 = add_f32x2(reduce_pair_1459, peer_pair_1462);
-                packed_pair_1460 = reinterpret_cast<unsigned long long*>(&reduce_pair_1459)[0];
-                unsigned long long _shfl_xor_sync_174 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1460, 8);
-                peer_packed_1461 = _shfl_xor_sync_174;
-                peer_pair_1462 = reinterpret_cast<float2*>(&peer_packed_1461)[0];
-                reduce_pair_1459 = add_f32x2(reduce_pair_1459, peer_pair_1462);
-                packed_pair_1460 = reinterpret_cast<unsigned long long*>(&reduce_pair_1459)[0];
-                unsigned long long _shfl_xor_sync_175 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1460, 4);
-                peer_packed_1461 = _shfl_xor_sync_175;
-                peer_pair_1462 = reinterpret_cast<float2*>(&peer_packed_1461)[0];
-                reduce_pair_1459 = add_f32x2(reduce_pair_1459, peer_pair_1462);
-                packed_pair_1460 = reinterpret_cast<unsigned long long*>(&reduce_pair_1459)[0];
-                unsigned long long _shfl_xor_sync_176 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1460, 2);
-                peer_packed_1461 = _shfl_xor_sync_176;
-                peer_pair_1462 = reinterpret_cast<float2*>(&peer_packed_1461)[0];
-                reduce_pair_1459 = add_f32x2(reduce_pair_1459, peer_pair_1462);
-                packed_pair_1460 = reinterpret_cast<unsigned long long*>(&reduce_pair_1459)[0];
-                unsigned long long _shfl_xor_sync_177 = __shfl_xor_sync(0xFFFFFFFF, packed_pair_1460, 1);
-                peer_packed_1461 = _shfl_xor_sync_177;
-                peer_pair_1462 = reinterpret_cast<float2*>(&peer_packed_1461)[0];
-                reduce_pair_1459 = add_f32x2(reduce_pair_1459, peer_pair_1462);
-                if (lane == 0) {
-                    stats[slot_base_1454 + (unsigned int)((4 + warp_in_group) * 2 * 2)] = reduce_pair_1459.x;
-                    stats[slot_base_1454 + (unsigned int)((4 + warp_in_group) * 2 * 2) + 1] = reduce_pair_1459.y;
-                }
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                asm volatile("barrier.sync %0, 128;" :: "r"(8 + stream_1) : "memory");
-                asm volatile("tcgen05.fence::after_thread_sync;");
-                int stat_source_1463 = lane / 8;
-                int stat_warp_1464 = lane % 8;
-                float total_sum_sq_1465 = 0.0f;
-                float total_dot_1466 = 0.0f;
-                if (stat_source_1463 < 1) {
-                    total_sum_sq_1465 = stats[slot_base_1454 + (unsigned int)((stat_warp_1464 * 2 + stat_source_1463) * 2)];
-                    total_dot_1466 = stats[slot_base_1454 + (unsigned int)((stat_warp_1464 * 2 + stat_source_1463) * 2) + 1];
-                }
-                float _shfl_down_sync_178 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1465, 4, 8);
-                total_sum_sq_1465 += _shfl_down_sync_178;
-                float _shfl_down_sync_179 = __shfl_down_sync(0xFFFFFFFF, total_dot_1466, 4, 8);
-                total_dot_1466 += _shfl_down_sync_179;
-                float _shfl_down_sync_180 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1465, 2, 8);
-                total_sum_sq_1465 += _shfl_down_sync_180;
-                float _shfl_down_sync_181 = __shfl_down_sync(0xFFFFFFFF, total_dot_1466, 2, 8);
-                total_dot_1466 += _shfl_down_sync_181;
-                float _shfl_down_sync_182 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq_1465, 1, 8);
-                total_sum_sq_1465 += _shfl_down_sync_182;
-                float _shfl_down_sync_183 = __shfl_down_sync(0xFFFFFFFF, total_dot_1466, 1, 8);
-                total_dot_1466 += _shfl_down_sync_183;
-                float local_logit_1467 = 0.0f;
-                if (stat_source_1463 < 1 && stat_warp_1464 == 0) {
-                    float _rsqrt_184 = rsqrtf(total_sum_sq_1465 / 7168.0f + eps);
-                    local_logit_1467 = total_dot_1466 * _rsqrt_184;
-                }
-                float logits_1468[2];
-                logits_1468[0] = 0.0f;
-                float _shfl_sync_185 = __shfl_sync(0xFFFFFFFF, local_logit_1467, 0);
-                logits_1468[0] = _shfl_sync_185;
-                logits_1468[1] = 0.0f;
-                float _shfl_sync_186 = __shfl_sync(0xFFFFFFFF, local_logit_1467, 8);
-                logits_1468[1] = _shfl_sync_186;
-                float weights_1469[2];
-                float new_max_1470 = 0.0f;
-                float correction_1471 = 0.0f;
-                float weight_sum_1472 = 0.0f;
-                weights_1469[0] = 0.0f;
-                weights_1469[1] = 0.0f;
-                float chunk_max_1473 = -3.4028235e+38f;
-                chunk_max_1473 = max_noftz(chunk_max_1473, logits_1468[0]);
-                new_max_1470 = max_noftz(m_running, chunk_max_1473);
-                float _exp2_187 = approx_exp2((m_running - new_max_1470) * 1.442695f);
-                correction_1471 = _exp2_187;
-                float _exp2_188 = approx_exp2((logits_1468[0] - new_max_1470) * 1.442695f);
-                weights_1469[0] = _exp2_188;
-                weight_sum_1472 += weights_1469[0];
-                float2 correction_pair_1474 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1475 = make_float2(acc32[0], acc32[1]);
-                float2 scaled_pair_1476;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1476) : "l"(*(const unsigned long long*)&acc_pair_1475), "l"(*(const unsigned long long*)&correction_pair_1474));
-                acc32[0] = scaled_pair_1476.x;
-                acc32[1] = scaled_pair_1476.y;
-                float2 acc_pair_1477 = make_float2(acc32[2], acc32[3]);
-                float2 scaled_pair_1478;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1478) : "l"(*(const unsigned long long*)&acc_pair_1477), "l"(*(const unsigned long long*)&correction_pair_1474));
-                acc32[2] = scaled_pair_1478.x;
-                acc32[3] = scaled_pair_1478.y;
-                float2 acc_pair_1479 = make_float2(acc32[4], acc32[5]);
-                float2 scaled_pair_1480;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1480) : "l"(*(const unsigned long long*)&acc_pair_1479), "l"(*(const unsigned long long*)&correction_pair_1474));
-                acc32[4] = scaled_pair_1480.x;
-                acc32[5] = scaled_pair_1480.y;
-                float2 acc_pair_1481 = make_float2(acc32[6], acc32[7]);
-                float2 scaled_pair_1482;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1482) : "l"(*(const unsigned long long*)&acc_pair_1481), "l"(*(const unsigned long long*)&correction_pair_1474));
-                acc32[6] = scaled_pair_1482.x;
-                acc32[7] = scaled_pair_1482.y;
-                float _tmem_load_48[8];
-                tmem_ld_x8(&_tmem_load_48[0], tmem_base);
-                float2 weight_pair_1483 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1484 = make_float2(_tmem_load_48[0], _tmem_load_48[1]);
-                float2 acc_pair_1485 = make_float2(acc32[0], acc32[1]);
-                float2 updated_pair_1486 = fma_f32x2_rn_ftz(weight_pair_1483, cached_pair_1484, acc_pair_1485);
-                acc32[0] = updated_pair_1486.x;
-                acc32[1] = updated_pair_1486.y;
-                float2 cached_pair_1487 = make_float2(_tmem_load_48[2], _tmem_load_48[3]);
-                float2 acc_pair_1488 = make_float2(acc32[2], acc32[3]);
-                float2 updated_pair_1489 = fma_f32x2_rn_ftz(weight_pair_1483, cached_pair_1487, acc_pair_1488);
-                acc32[2] = updated_pair_1489.x;
-                acc32[3] = updated_pair_1489.y;
-                float2 cached_pair_1490 = make_float2(_tmem_load_48[4], _tmem_load_48[5]);
-                float2 acc_pair_1491 = make_float2(acc32[4], acc32[5]);
-                float2 updated_pair_1492 = fma_f32x2_rn_ftz(weight_pair_1483, cached_pair_1490, acc_pair_1491);
-                acc32[4] = updated_pair_1492.x;
-                acc32[5] = updated_pair_1492.y;
-                float2 cached_pair_1493 = make_float2(_tmem_load_48[6], _tmem_load_48[7]);
-                float2 acc_pair_1494 = make_float2(acc32[6], acc32[7]);
-                float2 updated_pair_1495 = fma_f32x2_rn_ftz(weight_pair_1483, cached_pair_1493, acc_pair_1494);
-                acc32[6] = updated_pair_1495.x;
-                acc32[7] = updated_pair_1495.y;
-                float2 correction_pair_1496 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1497 = make_float2(acc32[8], acc32[9]);
-                float2 scaled_pair_1498;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1498) : "l"(*(const unsigned long long*)&acc_pair_1497), "l"(*(const unsigned long long*)&correction_pair_1496));
-                acc32[8] = scaled_pair_1498.x;
-                acc32[9] = scaled_pair_1498.y;
-                float2 acc_pair_1499 = make_float2(acc32[10], acc32[11]);
-                float2 scaled_pair_1500;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1500) : "l"(*(const unsigned long long*)&acc_pair_1499), "l"(*(const unsigned long long*)&correction_pair_1496));
-                acc32[10] = scaled_pair_1500.x;
-                acc32[11] = scaled_pair_1500.y;
-                float2 acc_pair_1501 = make_float2(acc32[12], acc32[13]);
-                float2 scaled_pair_1502;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1502) : "l"(*(const unsigned long long*)&acc_pair_1501), "l"(*(const unsigned long long*)&correction_pair_1496));
-                acc32[12] = scaled_pair_1502.x;
-                acc32[13] = scaled_pair_1502.y;
-                float2 acc_pair_1503 = make_float2(acc32[14], acc32[15]);
-                float2 scaled_pair_1504;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1504) : "l"(*(const unsigned long long*)&acc_pair_1503), "l"(*(const unsigned long long*)&correction_pair_1496));
-                acc32[14] = scaled_pair_1504.x;
-                acc32[15] = scaled_pair_1504.y;
-                float _tmem_load_49[8];
-                tmem_ld_x8(&_tmem_load_49[0], tmem_base + 8);
-                float2 weight_pair_1505 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1506 = make_float2(_tmem_load_49[0], _tmem_load_49[1]);
-                float2 acc_pair_1507 = make_float2(acc32[8], acc32[9]);
-                float2 updated_pair_1508 = fma_f32x2_rn_ftz(weight_pair_1505, cached_pair_1506, acc_pair_1507);
-                acc32[8] = updated_pair_1508.x;
-                acc32[9] = updated_pair_1508.y;
-                float2 cached_pair_1509 = make_float2(_tmem_load_49[2], _tmem_load_49[3]);
-                float2 acc_pair_1510 = make_float2(acc32[10], acc32[11]);
-                float2 updated_pair_1511 = fma_f32x2_rn_ftz(weight_pair_1505, cached_pair_1509, acc_pair_1510);
-                acc32[10] = updated_pair_1511.x;
-                acc32[11] = updated_pair_1511.y;
-                float2 cached_pair_1512 = make_float2(_tmem_load_49[4], _tmem_load_49[5]);
-                float2 acc_pair_1513 = make_float2(acc32[12], acc32[13]);
-                float2 updated_pair_1514 = fma_f32x2_rn_ftz(weight_pair_1505, cached_pair_1512, acc_pair_1513);
-                acc32[12] = updated_pair_1514.x;
-                acc32[13] = updated_pair_1514.y;
-                float2 cached_pair_1515 = make_float2(_tmem_load_49[6], _tmem_load_49[7]);
-                float2 acc_pair_1516 = make_float2(acc32[14], acc32[15]);
-                float2 updated_pair_1517 = fma_f32x2_rn_ftz(weight_pair_1505, cached_pair_1515, acc_pair_1516);
-                acc32[14] = updated_pair_1517.x;
-                acc32[15] = updated_pair_1517.y;
-                float2 correction_pair_1518 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1519 = make_float2(acc32[16], acc32[17]);
-                float2 scaled_pair_1520;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1520) : "l"(*(const unsigned long long*)&acc_pair_1519), "l"(*(const unsigned long long*)&correction_pair_1518));
-                acc32[16] = scaled_pair_1520.x;
-                acc32[17] = scaled_pair_1520.y;
-                float2 acc_pair_1521 = make_float2(acc32[18], acc32[19]);
-                float2 scaled_pair_1522;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1522) : "l"(*(const unsigned long long*)&acc_pair_1521), "l"(*(const unsigned long long*)&correction_pair_1518));
-                acc32[18] = scaled_pair_1522.x;
-                acc32[19] = scaled_pair_1522.y;
-                float2 acc_pair_1523 = make_float2(acc32[20], acc32[21]);
-                float2 scaled_pair_1524;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1524) : "l"(*(const unsigned long long*)&acc_pair_1523), "l"(*(const unsigned long long*)&correction_pair_1518));
-                acc32[20] = scaled_pair_1524.x;
-                acc32[21] = scaled_pair_1524.y;
-                float2 acc_pair_1525 = make_float2(acc32[22], acc32[23]);
-                float2 scaled_pair_1526;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1526) : "l"(*(const unsigned long long*)&acc_pair_1525), "l"(*(const unsigned long long*)&correction_pair_1518));
-                acc32[22] = scaled_pair_1526.x;
-                acc32[23] = scaled_pair_1526.y;
-                float _tmem_load_50[8];
-                tmem_ld_x8(&_tmem_load_50[0], tmem_base + 16);
-                float2 weight_pair_1527 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1528 = make_float2(_tmem_load_50[0], _tmem_load_50[1]);
-                float2 acc_pair_1529 = make_float2(acc32[16], acc32[17]);
-                float2 updated_pair_1530 = fma_f32x2_rn_ftz(weight_pair_1527, cached_pair_1528, acc_pair_1529);
-                acc32[16] = updated_pair_1530.x;
-                acc32[17] = updated_pair_1530.y;
-                float2 cached_pair_1531 = make_float2(_tmem_load_50[2], _tmem_load_50[3]);
-                float2 acc_pair_1532 = make_float2(acc32[18], acc32[19]);
-                float2 updated_pair_1533 = fma_f32x2_rn_ftz(weight_pair_1527, cached_pair_1531, acc_pair_1532);
-                acc32[18] = updated_pair_1533.x;
-                acc32[19] = updated_pair_1533.y;
-                float2 cached_pair_1534 = make_float2(_tmem_load_50[4], _tmem_load_50[5]);
-                float2 acc_pair_1535 = make_float2(acc32[20], acc32[21]);
-                float2 updated_pair_1536 = fma_f32x2_rn_ftz(weight_pair_1527, cached_pair_1534, acc_pair_1535);
-                acc32[20] = updated_pair_1536.x;
-                acc32[21] = updated_pair_1536.y;
-                float2 cached_pair_1537 = make_float2(_tmem_load_50[6], _tmem_load_50[7]);
-                float2 acc_pair_1538 = make_float2(acc32[22], acc32[23]);
-                float2 updated_pair_1539 = fma_f32x2_rn_ftz(weight_pair_1527, cached_pair_1537, acc_pair_1538);
-                acc32[22] = updated_pair_1539.x;
-                acc32[23] = updated_pair_1539.y;
-                float2 correction_pair_1540 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1541 = make_float2(acc32[24], acc32[25]);
-                float2 scaled_pair_1542;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1542) : "l"(*(const unsigned long long*)&acc_pair_1541), "l"(*(const unsigned long long*)&correction_pair_1540));
-                acc32[24] = scaled_pair_1542.x;
-                acc32[25] = scaled_pair_1542.y;
-                float2 acc_pair_1543 = make_float2(acc32[26], acc32[27]);
-                float2 scaled_pair_1544;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1544) : "l"(*(const unsigned long long*)&acc_pair_1543), "l"(*(const unsigned long long*)&correction_pair_1540));
-                acc32[26] = scaled_pair_1544.x;
-                acc32[27] = scaled_pair_1544.y;
-                float _tmem_load_51[4];
-                tmem_ld_x4(&_tmem_load_51[0], tmem_base + 24);
-                float2 weight_pair_1545 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1546 = make_float2(_tmem_load_51[0], _tmem_load_51[1]);
-                float2 acc_pair_1547 = make_float2(acc32[24], acc32[25]);
-                float2 updated_pair_1548 = fma_f32x2_rn_ftz(weight_pair_1545, cached_pair_1546, acc_pair_1547);
-                acc32[24] = updated_pair_1548.x;
-                acc32[25] = updated_pair_1548.y;
-                float2 cached_pair_1549 = make_float2(_tmem_load_51[2], _tmem_load_51[3]);
-                float2 acc_pair_1550 = make_float2(acc32[26], acc32[27]);
-                float2 updated_pair_1551 = fma_f32x2_rn_ftz(weight_pair_1545, cached_pair_1549, acc_pair_1550);
-                acc32[26] = updated_pair_1551.x;
-                acc32[27] = updated_pair_1551.y;
-                float2 correction_pair_1552 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1553 = make_float2(acc32[28], acc32[29]);
-                float2 scaled_pair_1554;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1554) : "l"(*(const unsigned long long*)&acc_pair_1553), "l"(*(const unsigned long long*)&correction_pair_1552));
-                acc32[28] = scaled_pair_1554.x;
-                acc32[29] = scaled_pair_1554.y;
-                float2 acc_pair_1555 = make_float2(acc32[30], acc32[31]);
-                float2 scaled_pair_1556;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1556) : "l"(*(const unsigned long long*)&acc_pair_1555), "l"(*(const unsigned long long*)&correction_pair_1552));
-                acc32[30] = scaled_pair_1556.x;
-                acc32[31] = scaled_pair_1556.y;
-                float2 acc_pair_1557 = make_float2(acc32[32], acc32[33]);
-                float2 scaled_pair_1558;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1558) : "l"(*(const unsigned long long*)&acc_pair_1557), "l"(*(const unsigned long long*)&correction_pair_1552));
-                acc32[32] = scaled_pair_1558.x;
-                acc32[33] = scaled_pair_1558.y;
-                float2 acc_pair_1559 = make_float2(acc32[34], acc32[35]);
-                float2 scaled_pair_1560;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1560) : "l"(*(const unsigned long long*)&acc_pair_1559), "l"(*(const unsigned long long*)&correction_pair_1552));
-                acc32[34] = scaled_pair_1560.x;
-                acc32[35] = scaled_pair_1560.y;
-                float _tmem_load_52[8];
-                tmem_ld_x8(&_tmem_load_52[0], tmem_base + 32);
-                float2 weight_pair_1561 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1562 = make_float2(_tmem_load_52[0], _tmem_load_52[1]);
-                float2 acc_pair_1563 = make_float2(acc32[28], acc32[29]);
-                float2 updated_pair_1564 = fma_f32x2_rn_ftz(weight_pair_1561, cached_pair_1562, acc_pair_1563);
-                acc32[28] = updated_pair_1564.x;
-                acc32[29] = updated_pair_1564.y;
-                float2 cached_pair_1565 = make_float2(_tmem_load_52[2], _tmem_load_52[3]);
-                float2 acc_pair_1566 = make_float2(acc32[30], acc32[31]);
-                float2 updated_pair_1567 = fma_f32x2_rn_ftz(weight_pair_1561, cached_pair_1565, acc_pair_1566);
-                acc32[30] = updated_pair_1567.x;
-                acc32[31] = updated_pair_1567.y;
-                float2 cached_pair_1568 = make_float2(_tmem_load_52[4], _tmem_load_52[5]);
-                float2 acc_pair_1569 = make_float2(acc32[32], acc32[33]);
-                float2 updated_pair_1570 = fma_f32x2_rn_ftz(weight_pair_1561, cached_pair_1568, acc_pair_1569);
-                acc32[32] = updated_pair_1570.x;
-                acc32[33] = updated_pair_1570.y;
-                float2 cached_pair_1571 = make_float2(_tmem_load_52[6], _tmem_load_52[7]);
-                float2 acc_pair_1572 = make_float2(acc32[34], acc32[35]);
-                float2 updated_pair_1573 = fma_f32x2_rn_ftz(weight_pair_1561, cached_pair_1571, acc_pair_1572);
-                acc32[34] = updated_pair_1573.x;
-                acc32[35] = updated_pair_1573.y;
-                float2 correction_pair_1574 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1575 = make_float2(acc32[36], acc32[37]);
-                float2 scaled_pair_1576;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1576) : "l"(*(const unsigned long long*)&acc_pair_1575), "l"(*(const unsigned long long*)&correction_pair_1574));
-                acc32[36] = scaled_pair_1576.x;
-                acc32[37] = scaled_pair_1576.y;
-                float2 acc_pair_1577 = make_float2(acc32[38], acc32[39]);
-                float2 scaled_pair_1578;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1578) : "l"(*(const unsigned long long*)&acc_pair_1577), "l"(*(const unsigned long long*)&correction_pair_1574));
-                acc32[38] = scaled_pair_1578.x;
-                acc32[39] = scaled_pair_1578.y;
-                float2 acc_pair_1579 = make_float2(acc32[40], acc32[41]);
-                float2 scaled_pair_1580;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1580) : "l"(*(const unsigned long long*)&acc_pair_1579), "l"(*(const unsigned long long*)&correction_pair_1574));
-                acc32[40] = scaled_pair_1580.x;
-                acc32[41] = scaled_pair_1580.y;
-                float2 acc_pair_1581 = make_float2(acc32[42], acc32[43]);
-                float2 scaled_pair_1582;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1582) : "l"(*(const unsigned long long*)&acc_pair_1581), "l"(*(const unsigned long long*)&correction_pair_1574));
-                acc32[42] = scaled_pair_1582.x;
-                acc32[43] = scaled_pair_1582.y;
-                float _tmem_load_53[8];
-                tmem_ld_x8(&_tmem_load_53[0], tmem_base + 40);
-                float2 weight_pair_1583 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1584 = make_float2(_tmem_load_53[0], _tmem_load_53[1]);
-                float2 acc_pair_1585 = make_float2(acc32[36], acc32[37]);
-                float2 updated_pair_1586 = fma_f32x2_rn_ftz(weight_pair_1583, cached_pair_1584, acc_pair_1585);
-                acc32[36] = updated_pair_1586.x;
-                acc32[37] = updated_pair_1586.y;
-                float2 cached_pair_1587 = make_float2(_tmem_load_53[2], _tmem_load_53[3]);
-                float2 acc_pair_1588 = make_float2(acc32[38], acc32[39]);
-                float2 updated_pair_1589 = fma_f32x2_rn_ftz(weight_pair_1583, cached_pair_1587, acc_pair_1588);
-                acc32[38] = updated_pair_1589.x;
-                acc32[39] = updated_pair_1589.y;
-                float2 cached_pair_1590 = make_float2(_tmem_load_53[4], _tmem_load_53[5]);
-                float2 acc_pair_1591 = make_float2(acc32[40], acc32[41]);
-                float2 updated_pair_1592 = fma_f32x2_rn_ftz(weight_pair_1583, cached_pair_1590, acc_pair_1591);
-                acc32[40] = updated_pair_1592.x;
-                acc32[41] = updated_pair_1592.y;
-                float2 cached_pair_1593 = make_float2(_tmem_load_53[6], _tmem_load_53[7]);
-                float2 acc_pair_1594 = make_float2(acc32[42], acc32[43]);
-                float2 updated_pair_1595 = fma_f32x2_rn_ftz(weight_pair_1583, cached_pair_1593, acc_pair_1594);
-                acc32[42] = updated_pair_1595.x;
-                acc32[43] = updated_pair_1595.y;
-                float2 correction_pair_1596 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1597 = make_float2(acc32[44], acc32[45]);
-                float2 scaled_pair_1598;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1598) : "l"(*(const unsigned long long*)&acc_pair_1597), "l"(*(const unsigned long long*)&correction_pair_1596));
-                acc32[44] = scaled_pair_1598.x;
-                acc32[45] = scaled_pair_1598.y;
-                float2 acc_pair_1599 = make_float2(acc32[46], acc32[47]);
-                float2 scaled_pair_1600;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1600) : "l"(*(const unsigned long long*)&acc_pair_1599), "l"(*(const unsigned long long*)&correction_pair_1596));
-                acc32[46] = scaled_pair_1600.x;
-                acc32[47] = scaled_pair_1600.y;
-                float2 acc_pair_1601 = make_float2(acc32[48], acc32[49]);
-                float2 scaled_pair_1602;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1602) : "l"(*(const unsigned long long*)&acc_pair_1601), "l"(*(const unsigned long long*)&correction_pair_1596));
-                acc32[48] = scaled_pair_1602.x;
-                acc32[49] = scaled_pair_1602.y;
-                float2 acc_pair_1603 = make_float2(acc32[50], acc32[51]);
-                float2 scaled_pair_1604;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1604) : "l"(*(const unsigned long long*)&acc_pair_1603), "l"(*(const unsigned long long*)&correction_pair_1596));
-                acc32[50] = scaled_pair_1604.x;
-                acc32[51] = scaled_pair_1604.y;
-                float _tmem_load_54[8];
-                tmem_ld_x8(&_tmem_load_54[0], tmem_base + 48);
-                float2 weight_pair_1605 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1606 = make_float2(_tmem_load_54[0], _tmem_load_54[1]);
-                float2 acc_pair_1607 = make_float2(acc32[44], acc32[45]);
-                float2 updated_pair_1608 = fma_f32x2_rn_ftz(weight_pair_1605, cached_pair_1606, acc_pair_1607);
-                acc32[44] = updated_pair_1608.x;
-                acc32[45] = updated_pair_1608.y;
-                float2 cached_pair_1609 = make_float2(_tmem_load_54[2], _tmem_load_54[3]);
-                float2 acc_pair_1610 = make_float2(acc32[46], acc32[47]);
-                float2 updated_pair_1611 = fma_f32x2_rn_ftz(weight_pair_1605, cached_pair_1609, acc_pair_1610);
-                acc32[46] = updated_pair_1611.x;
-                acc32[47] = updated_pair_1611.y;
-                float2 cached_pair_1612 = make_float2(_tmem_load_54[4], _tmem_load_54[5]);
-                float2 acc_pair_1613 = make_float2(acc32[48], acc32[49]);
-                float2 updated_pair_1614 = fma_f32x2_rn_ftz(weight_pair_1605, cached_pair_1612, acc_pair_1613);
-                acc32[48] = updated_pair_1614.x;
-                acc32[49] = updated_pair_1614.y;
-                float2 cached_pair_1615 = make_float2(_tmem_load_54[6], _tmem_load_54[7]);
-                float2 acc_pair_1616 = make_float2(acc32[50], acc32[51]);
-                float2 updated_pair_1617 = fma_f32x2_rn_ftz(weight_pair_1605, cached_pair_1615, acc_pair_1616);
-                acc32[50] = updated_pair_1617.x;
-                acc32[51] = updated_pair_1617.y;
-                float2 correction_pair_1618 = make_float2(correction_1471, correction_1471);
-                float2 acc_pair_1619 = make_float2(acc32[52], acc32[53]);
-                float2 scaled_pair_1620;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1620) : "l"(*(const unsigned long long*)&acc_pair_1619), "l"(*(const unsigned long long*)&correction_pair_1618));
-                acc32[52] = scaled_pair_1620.x;
-                acc32[53] = scaled_pair_1620.y;
-                float2 acc_pair_1621 = make_float2(acc32[54], acc32[55]);
-                float2 scaled_pair_1622;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1622) : "l"(*(const unsigned long long*)&acc_pair_1621), "l"(*(const unsigned long long*)&correction_pair_1618));
-                acc32[54] = scaled_pair_1622.x;
-                acc32[55] = scaled_pair_1622.y;
-                float _tmem_load_55[4];
-                tmem_ld_x4(&_tmem_load_55[0], tmem_base + 56);
-                float2 weight_pair_1623 = make_float2(weights_1469[0], weights_1469[0]);
-                float2 cached_pair_1624 = make_float2(_tmem_load_55[0], _tmem_load_55[1]);
-                float2 acc_pair_1625 = make_float2(acc32[52], acc32[53]);
-                float2 updated_pair_1626 = fma_f32x2_rn_ftz(weight_pair_1623, cached_pair_1624, acc_pair_1625);
-                acc32[52] = updated_pair_1626.x;
-                acc32[53] = updated_pair_1626.y;
-                float2 cached_pair_1627 = make_float2(_tmem_load_55[2], _tmem_load_55[3]);
-                float2 acc_pair_1628 = make_float2(acc32[54], acc32[55]);
-                float2 updated_pair_1629 = fma_f32x2_rn_ftz(weight_pair_1623, cached_pair_1627, acc_pair_1628);
-                acc32[54] = updated_pair_1629.x;
-                acc32[55] = updated_pair_1629.y;
-                s_running = __fmaf_rn(s_running, correction_1471, weight_sum_1472);
-                m_running = new_max_1470;
-                consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
-                if (token_1 == first_token) {
-                    mbarrier_wait(norm_ready_addr, 0);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                }
-                float2 local_output_sum_pair = make_float2(0.0f, 0.0f);
-                float2 acc_pair_1630 = make_float2(acc32[0], acc32[1]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1630, acc_pair_1630, local_output_sum_pair);
-                float2 acc_pair_1631 = make_float2(acc32[2], acc32[3]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1631, acc_pair_1631, local_output_sum_pair);
-                float2 acc_pair_1632 = make_float2(acc32[4], acc32[5]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1632, acc_pair_1632, local_output_sum_pair);
-                float2 acc_pair_1633 = make_float2(acc32[6], acc32[7]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1633, acc_pair_1633, local_output_sum_pair);
-                float2 acc_pair_1634 = make_float2(acc32[8], acc32[9]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1634, acc_pair_1634, local_output_sum_pair);
-                float2 acc_pair_1635 = make_float2(acc32[10], acc32[11]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1635, acc_pair_1635, local_output_sum_pair);
-                float2 acc_pair_1636 = make_float2(acc32[12], acc32[13]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1636, acc_pair_1636, local_output_sum_pair);
-                float2 acc_pair_1637 = make_float2(acc32[14], acc32[15]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1637, acc_pair_1637, local_output_sum_pair);
-                float2 acc_pair_1638 = make_float2(acc32[16], acc32[17]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1638, acc_pair_1638, local_output_sum_pair);
-                float2 acc_pair_1639 = make_float2(acc32[18], acc32[19]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1639, acc_pair_1639, local_output_sum_pair);
-                float2 acc_pair_1640 = make_float2(acc32[20], acc32[21]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1640, acc_pair_1640, local_output_sum_pair);
-                float2 acc_pair_1641 = make_float2(acc32[22], acc32[23]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1641, acc_pair_1641, local_output_sum_pair);
-                float2 acc_pair_1642 = make_float2(acc32[24], acc32[25]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1642, acc_pair_1642, local_output_sum_pair);
-                float2 acc_pair_1643 = make_float2(acc32[26], acc32[27]);
-                local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_1643, acc_pair_1643, local_output_sum_pair);
-                float local_output_sum_sq = local_output_sum_pair.x + local_output_sum_pair.y;
-                float _warp_reduce_189 = local_output_sum_sq;
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    _warp_reduce_189 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_189, offset);
-                local_output_sum_sq = _warp_reduce_189;
-                if (lane == 0) {
-                    output_stats[output_stats_base + (unsigned int)warp_in_group] = local_output_sum_sq;
-                }
-                float2 local_output_sum_pair_1644 = make_float2(0.0f, 0.0f);
-                float2 acc_pair_1645 = make_float2(acc32[28], acc32[29]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1645, acc_pair_1645, local_output_sum_pair_1644);
-                float2 acc_pair_1646 = make_float2(acc32[30], acc32[31]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1646, acc_pair_1646, local_output_sum_pair_1644);
-                float2 acc_pair_1647 = make_float2(acc32[32], acc32[33]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1647, acc_pair_1647, local_output_sum_pair_1644);
-                float2 acc_pair_1648 = make_float2(acc32[34], acc32[35]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1648, acc_pair_1648, local_output_sum_pair_1644);
-                float2 acc_pair_1649 = make_float2(acc32[36], acc32[37]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1649, acc_pair_1649, local_output_sum_pair_1644);
-                float2 acc_pair_1650 = make_float2(acc32[38], acc32[39]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1650, acc_pair_1650, local_output_sum_pair_1644);
-                float2 acc_pair_1651 = make_float2(acc32[40], acc32[41]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1651, acc_pair_1651, local_output_sum_pair_1644);
-                float2 acc_pair_1652 = make_float2(acc32[42], acc32[43]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1652, acc_pair_1652, local_output_sum_pair_1644);
-                float2 acc_pair_1653 = make_float2(acc32[44], acc32[45]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1653, acc_pair_1653, local_output_sum_pair_1644);
-                float2 acc_pair_1654 = make_float2(acc32[46], acc32[47]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1654, acc_pair_1654, local_output_sum_pair_1644);
-                float2 acc_pair_1655 = make_float2(acc32[48], acc32[49]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1655, acc_pair_1655, local_output_sum_pair_1644);
-                float2 acc_pair_1656 = make_float2(acc32[50], acc32[51]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1656, acc_pair_1656, local_output_sum_pair_1644);
-                float2 acc_pair_1657 = make_float2(acc32[52], acc32[53]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1657, acc_pair_1657, local_output_sum_pair_1644);
-                float2 acc_pair_1658 = make_float2(acc32[54], acc32[55]);
-                local_output_sum_pair_1644 = fma_f32x2_rn_ftz(acc_pair_1658, acc_pair_1658, local_output_sum_pair_1644);
-                float local_output_sum_sq_1659 = local_output_sum_pair_1644.x + local_output_sum_pair_1644.y;
-                float _warp_reduce_190 = local_output_sum_sq_1659;
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    _warp_reduce_190 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_190, offset);
-                local_output_sum_sq_1659 = _warp_reduce_190;
-                if (lane == 0) {
-                    output_stats[output_stats_base + (unsigned int)(4 + warp_in_group)] = local_output_sum_sq_1659;
-                }
-                asm volatile("tcgen05.fence::before_thread_sync;");
-                asm volatile("barrier.sync %0, 128;" :: "r"(8 + stream_1) : "memory");
-                float total_output_sum_sq = ((lane < 8) ? output_stats[output_stats_base + (unsigned int)lane] : 0.0f);
-                float _shfl_down_sync_191 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 4, 8);
-                total_output_sum_sq += _shfl_down_sync_191;
-                float _shfl_down_sync_192 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 2, 8);
-                total_output_sum_sq += _shfl_down_sync_192;
-                float _shfl_down_sync_193 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 1, 8);
-                total_output_sum_sq += _shfl_down_sync_193;
-                float output_rsigma = 0.0f;
-                if (lane == 0) {
-                    float _rsqrt_194 = rsqrtf(__fmaf_rn(output_norm_eps * s_running, s_running, total_output_sum_sq / 7168.0f));
-                    output_rsigma = _rsqrt_194;
-                }
-                float _shfl_sync_195 = __shfl_sync(0xFFFFFFFF, output_rsigma, 0);
-                output_rsigma = _shfl_sync_195;
-                int hidden_base_1660 = thread_in_group * 8;
-                unsigned int smem_bf16x2[4];
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1660 * 2)) : "memory");
-                float _unpack_bf16_48[8];
-                #pragma unroll
-                for (int _pair = 0; _pair < 4; _pair++) {
-                    asm volatile(
-                        "{\n\t"
-                        "shl.b32 %0, %2, 16;\n\t"
-                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                        "}\n"
-                        : "=f"((&_unpack_bf16_48[_pair * 2])[0]), "=f"((&_unpack_bf16_48[_pair * 2])[1])
                         : "r"(smem_bf16x2[_pair]));
                 }
                 float2 output_rsigma_pair = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_196 = make_float2(acc32[0], acc32[1]);
-                float2 scaled_pair_1661;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1661) : "l"(*(const unsigned long long*)&_f32x2_mul_a_196), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                float2 _f32x2_mul_b_197 = make_float2(_unpack_bf16_48[0], _unpack_bf16_48[1]);
+                float2 _f32x2_mul_a_175 = make_float2(acc32[0], acc32[1]);
+                float2 scaled_pair_1402;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1402) : "l"(*(const unsigned long long*)&_f32x2_mul_a_175), "l"(*(const unsigned long long*)&output_rsigma_pair));
+                float2 _f32x2_mul_b_176 = make_float2(_unpack_bf16_40[0], _unpack_bf16_40[1]);
                 float2 normalized_pair;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair) : "l"(*(const unsigned long long*)&scaled_pair_1661), "l"(*(const unsigned long long*)&_f32x2_mul_b_197));
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair) : "l"(*(const unsigned long long*)&scaled_pair_1402), "l"(*(const unsigned long long*)&_f32x2_mul_b_176));
                 acc32[0] = normalized_pair.x;
                 acc32[1] = normalized_pair.y;
-                float2 _f32x2_mul_a_198 = make_float2(acc32[2], acc32[3]);
-                float2 scaled_pair_1662;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1662) : "l"(*(const unsigned long long*)&_f32x2_mul_a_198), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                float2 _f32x2_mul_b_199 = make_float2(_unpack_bf16_48[2], _unpack_bf16_48[3]);
-                float2 normalized_pair_1663;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1663) : "l"(*(const unsigned long long*)&scaled_pair_1662), "l"(*(const unsigned long long*)&_f32x2_mul_b_199));
-                acc32[2] = normalized_pair_1663.x;
-                acc32[3] = normalized_pair_1663.y;
-                float2 _f32x2_mul_a_200 = make_float2(acc32[4], acc32[5]);
-                float2 scaled_pair_1664;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1664) : "l"(*(const unsigned long long*)&_f32x2_mul_a_200), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                float2 _f32x2_mul_b_201 = make_float2(_unpack_bf16_48[4], _unpack_bf16_48[5]);
-                float2 normalized_pair_1665;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1665) : "l"(*(const unsigned long long*)&scaled_pair_1664), "l"(*(const unsigned long long*)&_f32x2_mul_b_201));
-                acc32[4] = normalized_pair_1665.x;
-                acc32[5] = normalized_pair_1665.y;
-                float2 _f32x2_mul_a_202 = make_float2(acc32[6], acc32[7]);
-                float2 scaled_pair_1666;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1666) : "l"(*(const unsigned long long*)&_f32x2_mul_a_202), "l"(*(const unsigned long long*)&output_rsigma_pair));
-                float2 _f32x2_mul_b_203 = make_float2(_unpack_bf16_48[6], _unpack_bf16_48[7]);
-                float2 normalized_pair_1667;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1667) : "l"(*(const unsigned long long*)&scaled_pair_1666), "l"(*(const unsigned long long*)&_f32x2_mul_b_203));
-                acc32[6] = normalized_pair_1667.x;
-                acc32[7] = normalized_pair_1667.y;
+                float2 _f32x2_mul_a_177 = make_float2(acc32[2], acc32[3]);
+                float2 scaled_pair_1403;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1403) : "l"(*(const unsigned long long*)&_f32x2_mul_a_177), "l"(*(const unsigned long long*)&output_rsigma_pair));
+                float2 _f32x2_mul_b_178 = make_float2(_unpack_bf16_40[2], _unpack_bf16_40[3]);
+                float2 normalized_pair_1404;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1404) : "l"(*(const unsigned long long*)&scaled_pair_1403), "l"(*(const unsigned long long*)&_f32x2_mul_b_178));
+                acc32[2] = normalized_pair_1404.x;
+                acc32[3] = normalized_pair_1404.y;
+                float2 _f32x2_mul_a_179 = make_float2(acc32[4], acc32[5]);
+                float2 scaled_pair_1405;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1405) : "l"(*(const unsigned long long*)&_f32x2_mul_a_179), "l"(*(const unsigned long long*)&output_rsigma_pair));
+                float2 _f32x2_mul_b_180 = make_float2(_unpack_bf16_40[4], _unpack_bf16_40[5]);
+                float2 normalized_pair_1406;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1406) : "l"(*(const unsigned long long*)&scaled_pair_1405), "l"(*(const unsigned long long*)&_f32x2_mul_b_180));
+                acc32[4] = normalized_pair_1406.x;
+                acc32[5] = normalized_pair_1406.y;
+                float2 _f32x2_mul_a_181 = make_float2(acc32[6], acc32[7]);
+                float2 scaled_pair_1407;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1407) : "l"(*(const unsigned long long*)&_f32x2_mul_a_181), "l"(*(const unsigned long long*)&output_rsigma_pair));
+                float2 _f32x2_mul_b_182 = make_float2(_unpack_bf16_40[6], _unpack_bf16_40[7]);
+                float2 normalized_pair_1408;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1408) : "l"(*(const unsigned long long*)&scaled_pair_1407), "l"(*(const unsigned long long*)&_f32x2_mul_b_182));
+                acc32[6] = normalized_pair_1408.x;
+                acc32[7] = normalized_pair_1408.y;
                 unsigned int _packed_8[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6008,13 +5232,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 6], acc32[_lp*2+1 + 6]));
                     _packed_8[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1660))[0] = reinterpret_cast<int4*>(_packed_8)[0];
-                int hidden_base_1668 = 2048 + thread_in_group * 8;
-                unsigned int smem_bf16x2_1669[4];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1401))[0] = reinterpret_cast<int4*>(_packed_8)[0];
+                int hidden_base_1409 = 2048 + thread_in_group * 8;
+                unsigned int smem_bf16x2_1410[4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1669[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1669[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1669[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1669[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1668 * 2)) : "memory");
-                float _unpack_bf16_49[8];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1410[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1410[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1410[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1410[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1409 * 2)) : "memory");
+                float _unpack_bf16_41[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -6022,42 +5246,42 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_49[_pair * 2])[0]), "=f"((&_unpack_bf16_49[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1669[_pair]));
+                        : "=f"((&_unpack_bf16_41[_pair * 2])[0]), "=f"((&_unpack_bf16_41[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1410[_pair]));
                 }
-                float2 output_rsigma_pair_1670 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_204 = make_float2(acc32[8], acc32[9]);
-                float2 scaled_pair_1671;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1671) : "l"(*(const unsigned long long*)&_f32x2_mul_a_204), "l"(*(const unsigned long long*)&output_rsigma_pair_1670));
-                float2 _f32x2_mul_b_205 = make_float2(_unpack_bf16_49[0], _unpack_bf16_49[1]);
-                float2 normalized_pair_1672;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1672) : "l"(*(const unsigned long long*)&scaled_pair_1671), "l"(*(const unsigned long long*)&_f32x2_mul_b_205));
-                acc32[8] = normalized_pair_1672.x;
-                acc32[9] = normalized_pair_1672.y;
-                float2 _f32x2_mul_a_206 = make_float2(acc32[10], acc32[11]);
-                float2 scaled_pair_1673;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1673) : "l"(*(const unsigned long long*)&_f32x2_mul_a_206), "l"(*(const unsigned long long*)&output_rsigma_pair_1670));
-                float2 _f32x2_mul_b_207 = make_float2(_unpack_bf16_49[2], _unpack_bf16_49[3]);
-                float2 normalized_pair_1674;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1674) : "l"(*(const unsigned long long*)&scaled_pair_1673), "l"(*(const unsigned long long*)&_f32x2_mul_b_207));
-                acc32[10] = normalized_pair_1674.x;
-                acc32[11] = normalized_pair_1674.y;
-                float2 _f32x2_mul_a_208 = make_float2(acc32[12], acc32[13]);
-                float2 scaled_pair_1675;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1675) : "l"(*(const unsigned long long*)&_f32x2_mul_a_208), "l"(*(const unsigned long long*)&output_rsigma_pair_1670));
-                float2 _f32x2_mul_b_209 = make_float2(_unpack_bf16_49[4], _unpack_bf16_49[5]);
-                float2 normalized_pair_1676;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1676) : "l"(*(const unsigned long long*)&scaled_pair_1675), "l"(*(const unsigned long long*)&_f32x2_mul_b_209));
-                acc32[12] = normalized_pair_1676.x;
-                acc32[13] = normalized_pair_1676.y;
-                float2 _f32x2_mul_a_210 = make_float2(acc32[14], acc32[15]);
-                float2 scaled_pair_1677;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1677) : "l"(*(const unsigned long long*)&_f32x2_mul_a_210), "l"(*(const unsigned long long*)&output_rsigma_pair_1670));
-                float2 _f32x2_mul_b_211 = make_float2(_unpack_bf16_49[6], _unpack_bf16_49[7]);
-                float2 normalized_pair_1678;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1678) : "l"(*(const unsigned long long*)&scaled_pair_1677), "l"(*(const unsigned long long*)&_f32x2_mul_b_211));
-                acc32[14] = normalized_pair_1678.x;
-                acc32[15] = normalized_pair_1678.y;
+                float2 output_rsigma_pair_1411 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_183 = make_float2(acc32[8], acc32[9]);
+                float2 scaled_pair_1412;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1412) : "l"(*(const unsigned long long*)&_f32x2_mul_a_183), "l"(*(const unsigned long long*)&output_rsigma_pair_1411));
+                float2 _f32x2_mul_b_184 = make_float2(_unpack_bf16_41[0], _unpack_bf16_41[1]);
+                float2 normalized_pair_1413;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1413) : "l"(*(const unsigned long long*)&scaled_pair_1412), "l"(*(const unsigned long long*)&_f32x2_mul_b_184));
+                acc32[8] = normalized_pair_1413.x;
+                acc32[9] = normalized_pair_1413.y;
+                float2 _f32x2_mul_a_185 = make_float2(acc32[10], acc32[11]);
+                float2 scaled_pair_1414;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1414) : "l"(*(const unsigned long long*)&_f32x2_mul_a_185), "l"(*(const unsigned long long*)&output_rsigma_pair_1411));
+                float2 _f32x2_mul_b_186 = make_float2(_unpack_bf16_41[2], _unpack_bf16_41[3]);
+                float2 normalized_pair_1415;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1415) : "l"(*(const unsigned long long*)&scaled_pair_1414), "l"(*(const unsigned long long*)&_f32x2_mul_b_186));
+                acc32[10] = normalized_pair_1415.x;
+                acc32[11] = normalized_pair_1415.y;
+                float2 _f32x2_mul_a_187 = make_float2(acc32[12], acc32[13]);
+                float2 scaled_pair_1416;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1416) : "l"(*(const unsigned long long*)&_f32x2_mul_a_187), "l"(*(const unsigned long long*)&output_rsigma_pair_1411));
+                float2 _f32x2_mul_b_188 = make_float2(_unpack_bf16_41[4], _unpack_bf16_41[5]);
+                float2 normalized_pair_1417;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1417) : "l"(*(const unsigned long long*)&scaled_pair_1416), "l"(*(const unsigned long long*)&_f32x2_mul_b_188));
+                acc32[12] = normalized_pair_1417.x;
+                acc32[13] = normalized_pair_1417.y;
+                float2 _f32x2_mul_a_189 = make_float2(acc32[14], acc32[15]);
+                float2 scaled_pair_1418;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1418) : "l"(*(const unsigned long long*)&_f32x2_mul_a_189), "l"(*(const unsigned long long*)&output_rsigma_pair_1411));
+                float2 _f32x2_mul_b_190 = make_float2(_unpack_bf16_41[6], _unpack_bf16_41[7]);
+                float2 normalized_pair_1419;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1419) : "l"(*(const unsigned long long*)&scaled_pair_1418), "l"(*(const unsigned long long*)&_f32x2_mul_b_190));
+                acc32[14] = normalized_pair_1419.x;
+                acc32[15] = normalized_pair_1419.y;
                 unsigned int _packed_9[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6079,13 +5303,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 14], acc32[_lp*2+1 + 14]));
                     _packed_9[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1668))[0] = reinterpret_cast<int4*>(_packed_9)[0];
-                int hidden_base_1679 = 4096 + thread_in_group * 8;
-                unsigned int smem_bf16x2_1680[4];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1409))[0] = reinterpret_cast<int4*>(_packed_9)[0];
+                int hidden_base_1420 = 4096 + thread_in_group * 8;
+                unsigned int smem_bf16x2_1421[4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1680[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1680[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1680[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1680[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1679 * 2)) : "memory");
-                float _unpack_bf16_50[8];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1421[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1421[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1421[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1421[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1420 * 2)) : "memory");
+                float _unpack_bf16_42[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -6093,42 +5317,42 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_50[_pair * 2])[0]), "=f"((&_unpack_bf16_50[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1680[_pair]));
+                        : "=f"((&_unpack_bf16_42[_pair * 2])[0]), "=f"((&_unpack_bf16_42[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1421[_pair]));
                 }
-                float2 output_rsigma_pair_1681 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_212 = make_float2(acc32[16], acc32[17]);
-                float2 scaled_pair_1682;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1682) : "l"(*(const unsigned long long*)&_f32x2_mul_a_212), "l"(*(const unsigned long long*)&output_rsigma_pair_1681));
-                float2 _f32x2_mul_b_213 = make_float2(_unpack_bf16_50[0], _unpack_bf16_50[1]);
-                float2 normalized_pair_1683;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1683) : "l"(*(const unsigned long long*)&scaled_pair_1682), "l"(*(const unsigned long long*)&_f32x2_mul_b_213));
-                acc32[16] = normalized_pair_1683.x;
-                acc32[17] = normalized_pair_1683.y;
-                float2 _f32x2_mul_a_214 = make_float2(acc32[18], acc32[19]);
-                float2 scaled_pair_1684;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1684) : "l"(*(const unsigned long long*)&_f32x2_mul_a_214), "l"(*(const unsigned long long*)&output_rsigma_pair_1681));
-                float2 _f32x2_mul_b_215 = make_float2(_unpack_bf16_50[2], _unpack_bf16_50[3]);
-                float2 normalized_pair_1685;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1685) : "l"(*(const unsigned long long*)&scaled_pair_1684), "l"(*(const unsigned long long*)&_f32x2_mul_b_215));
-                acc32[18] = normalized_pair_1685.x;
-                acc32[19] = normalized_pair_1685.y;
-                float2 _f32x2_mul_a_216 = make_float2(acc32[20], acc32[21]);
-                float2 scaled_pair_1686;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1686) : "l"(*(const unsigned long long*)&_f32x2_mul_a_216), "l"(*(const unsigned long long*)&output_rsigma_pair_1681));
-                float2 _f32x2_mul_b_217 = make_float2(_unpack_bf16_50[4], _unpack_bf16_50[5]);
-                float2 normalized_pair_1687;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1687) : "l"(*(const unsigned long long*)&scaled_pair_1686), "l"(*(const unsigned long long*)&_f32x2_mul_b_217));
-                acc32[20] = normalized_pair_1687.x;
-                acc32[21] = normalized_pair_1687.y;
-                float2 _f32x2_mul_a_218 = make_float2(acc32[22], acc32[23]);
-                float2 scaled_pair_1688;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1688) : "l"(*(const unsigned long long*)&_f32x2_mul_a_218), "l"(*(const unsigned long long*)&output_rsigma_pair_1681));
-                float2 _f32x2_mul_b_219 = make_float2(_unpack_bf16_50[6], _unpack_bf16_50[7]);
-                float2 normalized_pair_1689;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1689) : "l"(*(const unsigned long long*)&scaled_pair_1688), "l"(*(const unsigned long long*)&_f32x2_mul_b_219));
-                acc32[22] = normalized_pair_1689.x;
-                acc32[23] = normalized_pair_1689.y;
+                float2 output_rsigma_pair_1422 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_191 = make_float2(acc32[16], acc32[17]);
+                float2 scaled_pair_1423;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1423) : "l"(*(const unsigned long long*)&_f32x2_mul_a_191), "l"(*(const unsigned long long*)&output_rsigma_pair_1422));
+                float2 _f32x2_mul_b_192 = make_float2(_unpack_bf16_42[0], _unpack_bf16_42[1]);
+                float2 normalized_pair_1424;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1424) : "l"(*(const unsigned long long*)&scaled_pair_1423), "l"(*(const unsigned long long*)&_f32x2_mul_b_192));
+                acc32[16] = normalized_pair_1424.x;
+                acc32[17] = normalized_pair_1424.y;
+                float2 _f32x2_mul_a_193 = make_float2(acc32[18], acc32[19]);
+                float2 scaled_pair_1425;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1425) : "l"(*(const unsigned long long*)&_f32x2_mul_a_193), "l"(*(const unsigned long long*)&output_rsigma_pair_1422));
+                float2 _f32x2_mul_b_194 = make_float2(_unpack_bf16_42[2], _unpack_bf16_42[3]);
+                float2 normalized_pair_1426;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1426) : "l"(*(const unsigned long long*)&scaled_pair_1425), "l"(*(const unsigned long long*)&_f32x2_mul_b_194));
+                acc32[18] = normalized_pair_1426.x;
+                acc32[19] = normalized_pair_1426.y;
+                float2 _f32x2_mul_a_195 = make_float2(acc32[20], acc32[21]);
+                float2 scaled_pair_1427;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1427) : "l"(*(const unsigned long long*)&_f32x2_mul_a_195), "l"(*(const unsigned long long*)&output_rsigma_pair_1422));
+                float2 _f32x2_mul_b_196 = make_float2(_unpack_bf16_42[4], _unpack_bf16_42[5]);
+                float2 normalized_pair_1428;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1428) : "l"(*(const unsigned long long*)&scaled_pair_1427), "l"(*(const unsigned long long*)&_f32x2_mul_b_196));
+                acc32[20] = normalized_pair_1428.x;
+                acc32[21] = normalized_pair_1428.y;
+                float2 _f32x2_mul_a_197 = make_float2(acc32[22], acc32[23]);
+                float2 scaled_pair_1429;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1429) : "l"(*(const unsigned long long*)&_f32x2_mul_a_197), "l"(*(const unsigned long long*)&output_rsigma_pair_1422));
+                float2 _f32x2_mul_b_198 = make_float2(_unpack_bf16_42[6], _unpack_bf16_42[7]);
+                float2 normalized_pair_1430;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1430) : "l"(*(const unsigned long long*)&scaled_pair_1429), "l"(*(const unsigned long long*)&_f32x2_mul_b_198));
+                acc32[22] = normalized_pair_1430.x;
+                acc32[23] = normalized_pair_1430.y;
                 unsigned int _packed_10[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6150,13 +5374,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 22], acc32[_lp*2+1 + 22]));
                     _packed_10[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1679))[0] = reinterpret_cast<int4*>(_packed_10)[0];
-                int hidden_base_1690 = 6144 + thread_in_group * 4;
-                unsigned int smem_bf16x2_1691[2];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1420))[0] = reinterpret_cast<int4*>(_packed_10)[0];
+                int hidden_base_1431 = 6144 + thread_in_group * 4;
+                unsigned int smem_bf16x2_1432[2];
                 asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1691[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1691[(0) + 1]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1690 * 2)) : "memory");
-                float _unpack_bf16_51[4];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1432[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1432[(0) + 1]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1431 * 2)) : "memory");
+                float _unpack_bf16_43[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
                     asm volatile(
@@ -6164,26 +5388,26 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_51[_pair * 2])[0]), "=f"((&_unpack_bf16_51[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1691[_pair]));
+                        : "=f"((&_unpack_bf16_43[_pair * 2])[0]), "=f"((&_unpack_bf16_43[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1432[_pair]));
                 }
-                float2 output_rsigma_pair_1692 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_220 = make_float2(acc32[24], acc32[25]);
-                float2 scaled_pair_1693;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1693) : "l"(*(const unsigned long long*)&_f32x2_mul_a_220), "l"(*(const unsigned long long*)&output_rsigma_pair_1692));
-                float2 _f32x2_mul_b_221 = make_float2(_unpack_bf16_51[0], _unpack_bf16_51[1]);
-                float2 normalized_pair_1694;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1694) : "l"(*(const unsigned long long*)&scaled_pair_1693), "l"(*(const unsigned long long*)&_f32x2_mul_b_221));
-                acc32[24] = normalized_pair_1694.x;
-                acc32[25] = normalized_pair_1694.y;
-                float2 _f32x2_mul_a_222 = make_float2(acc32[26], acc32[27]);
-                float2 scaled_pair_1695;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1695) : "l"(*(const unsigned long long*)&_f32x2_mul_a_222), "l"(*(const unsigned long long*)&output_rsigma_pair_1692));
-                float2 _f32x2_mul_b_223 = make_float2(_unpack_bf16_51[2], _unpack_bf16_51[3]);
-                float2 normalized_pair_1696;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1696) : "l"(*(const unsigned long long*)&scaled_pair_1695), "l"(*(const unsigned long long*)&_f32x2_mul_b_223));
-                acc32[26] = normalized_pair_1696.x;
-                acc32[27] = normalized_pair_1696.y;
+                float2 output_rsigma_pair_1433 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_199 = make_float2(acc32[24], acc32[25]);
+                float2 scaled_pair_1434;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1434) : "l"(*(const unsigned long long*)&_f32x2_mul_a_199), "l"(*(const unsigned long long*)&output_rsigma_pair_1433));
+                float2 _f32x2_mul_b_200 = make_float2(_unpack_bf16_43[0], _unpack_bf16_43[1]);
+                float2 normalized_pair_1435;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1435) : "l"(*(const unsigned long long*)&scaled_pair_1434), "l"(*(const unsigned long long*)&_f32x2_mul_b_200));
+                acc32[24] = normalized_pair_1435.x;
+                acc32[25] = normalized_pair_1435.y;
+                float2 _f32x2_mul_a_201 = make_float2(acc32[26], acc32[27]);
+                float2 scaled_pair_1436;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1436) : "l"(*(const unsigned long long*)&_f32x2_mul_a_201), "l"(*(const unsigned long long*)&output_rsigma_pair_1433));
+                float2 _f32x2_mul_b_202 = make_float2(_unpack_bf16_43[2], _unpack_bf16_43[3]);
+                float2 normalized_pair_1437;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1437) : "l"(*(const unsigned long long*)&scaled_pair_1436), "l"(*(const unsigned long long*)&_f32x2_mul_b_202));
+                acc32[26] = normalized_pair_1437.x;
+                acc32[27] = normalized_pair_1437.y;
                 unsigned int _packed_11[2];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6195,13 +5419,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 26], acc32[_lp*2+1 + 26]));
                     _packed_11[_lp + 1] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_1690))[0] = reinterpret_cast<int2*>(_packed_11)[0];
-                int hidden_base_1697 = 1024 + thread_in_group * 8;
-                unsigned int smem_bf16x2_1698[4];
+                reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_1431))[0] = reinterpret_cast<int2*>(_packed_11)[0];
+                int hidden_base_1438 = 1024 + thread_in_group * 8;
+                unsigned int smem_bf16x2_1439[4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1698[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1698[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1698[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1698[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1697 * 2)) : "memory");
-                float _unpack_bf16_52[8];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1439[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1439[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1439[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1439[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1438 * 2)) : "memory");
+                float _unpack_bf16_44[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -6209,42 +5433,42 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_52[_pair * 2])[0]), "=f"((&_unpack_bf16_52[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1698[_pair]));
+                        : "=f"((&_unpack_bf16_44[_pair * 2])[0]), "=f"((&_unpack_bf16_44[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1439[_pair]));
                 }
-                float2 output_rsigma_pair_1699 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_224 = make_float2(acc32[28], acc32[29]);
-                float2 scaled_pair_1700;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1700) : "l"(*(const unsigned long long*)&_f32x2_mul_a_224), "l"(*(const unsigned long long*)&output_rsigma_pair_1699));
-                float2 _f32x2_mul_b_225 = make_float2(_unpack_bf16_52[0], _unpack_bf16_52[1]);
-                float2 normalized_pair_1701;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1701) : "l"(*(const unsigned long long*)&scaled_pair_1700), "l"(*(const unsigned long long*)&_f32x2_mul_b_225));
-                acc32[28] = normalized_pair_1701.x;
-                acc32[29] = normalized_pair_1701.y;
-                float2 _f32x2_mul_a_226 = make_float2(acc32[30], acc32[31]);
-                float2 scaled_pair_1702;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1702) : "l"(*(const unsigned long long*)&_f32x2_mul_a_226), "l"(*(const unsigned long long*)&output_rsigma_pair_1699));
-                float2 _f32x2_mul_b_227 = make_float2(_unpack_bf16_52[2], _unpack_bf16_52[3]);
-                float2 normalized_pair_1703;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1703) : "l"(*(const unsigned long long*)&scaled_pair_1702), "l"(*(const unsigned long long*)&_f32x2_mul_b_227));
-                acc32[30] = normalized_pair_1703.x;
-                acc32[31] = normalized_pair_1703.y;
-                float2 _f32x2_mul_a_228 = make_float2(acc32[32], acc32[33]);
-                float2 scaled_pair_1704;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1704) : "l"(*(const unsigned long long*)&_f32x2_mul_a_228), "l"(*(const unsigned long long*)&output_rsigma_pair_1699));
-                float2 _f32x2_mul_b_229 = make_float2(_unpack_bf16_52[4], _unpack_bf16_52[5]);
-                float2 normalized_pair_1705;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1705) : "l"(*(const unsigned long long*)&scaled_pair_1704), "l"(*(const unsigned long long*)&_f32x2_mul_b_229));
-                acc32[32] = normalized_pair_1705.x;
-                acc32[33] = normalized_pair_1705.y;
-                float2 _f32x2_mul_a_230 = make_float2(acc32[34], acc32[35]);
-                float2 scaled_pair_1706;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1706) : "l"(*(const unsigned long long*)&_f32x2_mul_a_230), "l"(*(const unsigned long long*)&output_rsigma_pair_1699));
-                float2 _f32x2_mul_b_231 = make_float2(_unpack_bf16_52[6], _unpack_bf16_52[7]);
-                float2 normalized_pair_1707;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1707) : "l"(*(const unsigned long long*)&scaled_pair_1706), "l"(*(const unsigned long long*)&_f32x2_mul_b_231));
-                acc32[34] = normalized_pair_1707.x;
-                acc32[35] = normalized_pair_1707.y;
+                float2 output_rsigma_pair_1440 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_203 = make_float2(acc32[28], acc32[29]);
+                float2 scaled_pair_1441;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1441) : "l"(*(const unsigned long long*)&_f32x2_mul_a_203), "l"(*(const unsigned long long*)&output_rsigma_pair_1440));
+                float2 _f32x2_mul_b_204 = make_float2(_unpack_bf16_44[0], _unpack_bf16_44[1]);
+                float2 normalized_pair_1442;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1442) : "l"(*(const unsigned long long*)&scaled_pair_1441), "l"(*(const unsigned long long*)&_f32x2_mul_b_204));
+                acc32[28] = normalized_pair_1442.x;
+                acc32[29] = normalized_pair_1442.y;
+                float2 _f32x2_mul_a_205 = make_float2(acc32[30], acc32[31]);
+                float2 scaled_pair_1443;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1443) : "l"(*(const unsigned long long*)&_f32x2_mul_a_205), "l"(*(const unsigned long long*)&output_rsigma_pair_1440));
+                float2 _f32x2_mul_b_206 = make_float2(_unpack_bf16_44[2], _unpack_bf16_44[3]);
+                float2 normalized_pair_1444;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1444) : "l"(*(const unsigned long long*)&scaled_pair_1443), "l"(*(const unsigned long long*)&_f32x2_mul_b_206));
+                acc32[30] = normalized_pair_1444.x;
+                acc32[31] = normalized_pair_1444.y;
+                float2 _f32x2_mul_a_207 = make_float2(acc32[32], acc32[33]);
+                float2 scaled_pair_1445;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1445) : "l"(*(const unsigned long long*)&_f32x2_mul_a_207), "l"(*(const unsigned long long*)&output_rsigma_pair_1440));
+                float2 _f32x2_mul_b_208 = make_float2(_unpack_bf16_44[4], _unpack_bf16_44[5]);
+                float2 normalized_pair_1446;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1446) : "l"(*(const unsigned long long*)&scaled_pair_1445), "l"(*(const unsigned long long*)&_f32x2_mul_b_208));
+                acc32[32] = normalized_pair_1446.x;
+                acc32[33] = normalized_pair_1446.y;
+                float2 _f32x2_mul_a_209 = make_float2(acc32[34], acc32[35]);
+                float2 scaled_pair_1447;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1447) : "l"(*(const unsigned long long*)&_f32x2_mul_a_209), "l"(*(const unsigned long long*)&output_rsigma_pair_1440));
+                float2 _f32x2_mul_b_210 = make_float2(_unpack_bf16_44[6], _unpack_bf16_44[7]);
+                float2 normalized_pair_1448;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1448) : "l"(*(const unsigned long long*)&scaled_pair_1447), "l"(*(const unsigned long long*)&_f32x2_mul_b_210));
+                acc32[34] = normalized_pair_1448.x;
+                acc32[35] = normalized_pair_1448.y;
                 unsigned int _packed_12[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6266,13 +5490,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 34], acc32[_lp*2+1 + 34]));
                     _packed_12[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1697))[0] = reinterpret_cast<int4*>(_packed_12)[0];
-                int hidden_base_1708 = 3072 + thread_in_group * 8;
-                unsigned int smem_bf16x2_1709[4];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1438))[0] = reinterpret_cast<int4*>(_packed_12)[0];
+                int hidden_base_1449 = 3072 + thread_in_group * 8;
+                unsigned int smem_bf16x2_1450[4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1709[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1709[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1709[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1709[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1708 * 2)) : "memory");
-                float _unpack_bf16_53[8];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1450[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1450[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1450[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1450[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1449 * 2)) : "memory");
+                float _unpack_bf16_45[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -6280,42 +5504,42 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_53[_pair * 2])[0]), "=f"((&_unpack_bf16_53[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1709[_pair]));
+                        : "=f"((&_unpack_bf16_45[_pair * 2])[0]), "=f"((&_unpack_bf16_45[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1450[_pair]));
                 }
-                float2 output_rsigma_pair_1710 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_232 = make_float2(acc32[36], acc32[37]);
-                float2 scaled_pair_1711;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1711) : "l"(*(const unsigned long long*)&_f32x2_mul_a_232), "l"(*(const unsigned long long*)&output_rsigma_pair_1710));
-                float2 _f32x2_mul_b_233 = make_float2(_unpack_bf16_53[0], _unpack_bf16_53[1]);
-                float2 normalized_pair_1712;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1712) : "l"(*(const unsigned long long*)&scaled_pair_1711), "l"(*(const unsigned long long*)&_f32x2_mul_b_233));
-                acc32[36] = normalized_pair_1712.x;
-                acc32[37] = normalized_pair_1712.y;
-                float2 _f32x2_mul_a_234 = make_float2(acc32[38], acc32[39]);
-                float2 scaled_pair_1713;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1713) : "l"(*(const unsigned long long*)&_f32x2_mul_a_234), "l"(*(const unsigned long long*)&output_rsigma_pair_1710));
-                float2 _f32x2_mul_b_235 = make_float2(_unpack_bf16_53[2], _unpack_bf16_53[3]);
-                float2 normalized_pair_1714;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1714) : "l"(*(const unsigned long long*)&scaled_pair_1713), "l"(*(const unsigned long long*)&_f32x2_mul_b_235));
-                acc32[38] = normalized_pair_1714.x;
-                acc32[39] = normalized_pair_1714.y;
-                float2 _f32x2_mul_a_236 = make_float2(acc32[40], acc32[41]);
-                float2 scaled_pair_1715;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1715) : "l"(*(const unsigned long long*)&_f32x2_mul_a_236), "l"(*(const unsigned long long*)&output_rsigma_pair_1710));
-                float2 _f32x2_mul_b_237 = make_float2(_unpack_bf16_53[4], _unpack_bf16_53[5]);
-                float2 normalized_pair_1716;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1716) : "l"(*(const unsigned long long*)&scaled_pair_1715), "l"(*(const unsigned long long*)&_f32x2_mul_b_237));
-                acc32[40] = normalized_pair_1716.x;
-                acc32[41] = normalized_pair_1716.y;
-                float2 _f32x2_mul_a_238 = make_float2(acc32[42], acc32[43]);
-                float2 scaled_pair_1717;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1717) : "l"(*(const unsigned long long*)&_f32x2_mul_a_238), "l"(*(const unsigned long long*)&output_rsigma_pair_1710));
-                float2 _f32x2_mul_b_239 = make_float2(_unpack_bf16_53[6], _unpack_bf16_53[7]);
-                float2 normalized_pair_1718;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1718) : "l"(*(const unsigned long long*)&scaled_pair_1717), "l"(*(const unsigned long long*)&_f32x2_mul_b_239));
-                acc32[42] = normalized_pair_1718.x;
-                acc32[43] = normalized_pair_1718.y;
+                float2 output_rsigma_pair_1451 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_211 = make_float2(acc32[36], acc32[37]);
+                float2 scaled_pair_1452;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1452) : "l"(*(const unsigned long long*)&_f32x2_mul_a_211), "l"(*(const unsigned long long*)&output_rsigma_pair_1451));
+                float2 _f32x2_mul_b_212 = make_float2(_unpack_bf16_45[0], _unpack_bf16_45[1]);
+                float2 normalized_pair_1453;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1453) : "l"(*(const unsigned long long*)&scaled_pair_1452), "l"(*(const unsigned long long*)&_f32x2_mul_b_212));
+                acc32[36] = normalized_pair_1453.x;
+                acc32[37] = normalized_pair_1453.y;
+                float2 _f32x2_mul_a_213 = make_float2(acc32[38], acc32[39]);
+                float2 scaled_pair_1454;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1454) : "l"(*(const unsigned long long*)&_f32x2_mul_a_213), "l"(*(const unsigned long long*)&output_rsigma_pair_1451));
+                float2 _f32x2_mul_b_214 = make_float2(_unpack_bf16_45[2], _unpack_bf16_45[3]);
+                float2 normalized_pair_1455;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1455) : "l"(*(const unsigned long long*)&scaled_pair_1454), "l"(*(const unsigned long long*)&_f32x2_mul_b_214));
+                acc32[38] = normalized_pair_1455.x;
+                acc32[39] = normalized_pair_1455.y;
+                float2 _f32x2_mul_a_215 = make_float2(acc32[40], acc32[41]);
+                float2 scaled_pair_1456;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1456) : "l"(*(const unsigned long long*)&_f32x2_mul_a_215), "l"(*(const unsigned long long*)&output_rsigma_pair_1451));
+                float2 _f32x2_mul_b_216 = make_float2(_unpack_bf16_45[4], _unpack_bf16_45[5]);
+                float2 normalized_pair_1457;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1457) : "l"(*(const unsigned long long*)&scaled_pair_1456), "l"(*(const unsigned long long*)&_f32x2_mul_b_216));
+                acc32[40] = normalized_pair_1457.x;
+                acc32[41] = normalized_pair_1457.y;
+                float2 _f32x2_mul_a_217 = make_float2(acc32[42], acc32[43]);
+                float2 scaled_pair_1458;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1458) : "l"(*(const unsigned long long*)&_f32x2_mul_a_217), "l"(*(const unsigned long long*)&output_rsigma_pair_1451));
+                float2 _f32x2_mul_b_218 = make_float2(_unpack_bf16_45[6], _unpack_bf16_45[7]);
+                float2 normalized_pair_1459;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1459) : "l"(*(const unsigned long long*)&scaled_pair_1458), "l"(*(const unsigned long long*)&_f32x2_mul_b_218));
+                acc32[42] = normalized_pair_1459.x;
+                acc32[43] = normalized_pair_1459.y;
                 unsigned int _packed_13[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6337,13 +5561,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 42], acc32[_lp*2+1 + 42]));
                     _packed_13[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1708))[0] = reinterpret_cast<int4*>(_packed_13)[0];
-                int hidden_base_1719 = 5120 + thread_in_group * 8;
-                unsigned int smem_bf16x2_1720[4];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1449))[0] = reinterpret_cast<int4*>(_packed_13)[0];
+                int hidden_base_1460 = 5120 + thread_in_group * 8;
+                unsigned int smem_bf16x2_1461[4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1720[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1720[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1720[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1720[(0) + 3]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1719 * 2)) : "memory");
-                float _unpack_bf16_54[8];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1461[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1461[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1461[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1461[(0) + 3]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1460 * 2)) : "memory");
+                float _unpack_bf16_46[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -6351,42 +5575,42 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_54[_pair * 2])[0]), "=f"((&_unpack_bf16_54[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1720[_pair]));
+                        : "=f"((&_unpack_bf16_46[_pair * 2])[0]), "=f"((&_unpack_bf16_46[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1461[_pair]));
                 }
-                float2 output_rsigma_pair_1721 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_240 = make_float2(acc32[44], acc32[45]);
-                float2 scaled_pair_1722;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1722) : "l"(*(const unsigned long long*)&_f32x2_mul_a_240), "l"(*(const unsigned long long*)&output_rsigma_pair_1721));
-                float2 _f32x2_mul_b_241 = make_float2(_unpack_bf16_54[0], _unpack_bf16_54[1]);
-                float2 normalized_pair_1723;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1723) : "l"(*(const unsigned long long*)&scaled_pair_1722), "l"(*(const unsigned long long*)&_f32x2_mul_b_241));
-                acc32[44] = normalized_pair_1723.x;
-                acc32[45] = normalized_pair_1723.y;
-                float2 _f32x2_mul_a_242 = make_float2(acc32[46], acc32[47]);
-                float2 scaled_pair_1724;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1724) : "l"(*(const unsigned long long*)&_f32x2_mul_a_242), "l"(*(const unsigned long long*)&output_rsigma_pair_1721));
-                float2 _f32x2_mul_b_243 = make_float2(_unpack_bf16_54[2], _unpack_bf16_54[3]);
-                float2 normalized_pair_1725;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1725) : "l"(*(const unsigned long long*)&scaled_pair_1724), "l"(*(const unsigned long long*)&_f32x2_mul_b_243));
-                acc32[46] = normalized_pair_1725.x;
-                acc32[47] = normalized_pair_1725.y;
-                float2 _f32x2_mul_a_244 = make_float2(acc32[48], acc32[49]);
-                float2 scaled_pair_1726;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1726) : "l"(*(const unsigned long long*)&_f32x2_mul_a_244), "l"(*(const unsigned long long*)&output_rsigma_pair_1721));
-                float2 _f32x2_mul_b_245 = make_float2(_unpack_bf16_54[4], _unpack_bf16_54[5]);
-                float2 normalized_pair_1727;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1727) : "l"(*(const unsigned long long*)&scaled_pair_1726), "l"(*(const unsigned long long*)&_f32x2_mul_b_245));
-                acc32[48] = normalized_pair_1727.x;
-                acc32[49] = normalized_pair_1727.y;
-                float2 _f32x2_mul_a_246 = make_float2(acc32[50], acc32[51]);
-                float2 scaled_pair_1728;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1728) : "l"(*(const unsigned long long*)&_f32x2_mul_a_246), "l"(*(const unsigned long long*)&output_rsigma_pair_1721));
-                float2 _f32x2_mul_b_247 = make_float2(_unpack_bf16_54[6], _unpack_bf16_54[7]);
-                float2 normalized_pair_1729;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1729) : "l"(*(const unsigned long long*)&scaled_pair_1728), "l"(*(const unsigned long long*)&_f32x2_mul_b_247));
-                acc32[50] = normalized_pair_1729.x;
-                acc32[51] = normalized_pair_1729.y;
+                float2 output_rsigma_pair_1462 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_219 = make_float2(acc32[44], acc32[45]);
+                float2 scaled_pair_1463;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1463) : "l"(*(const unsigned long long*)&_f32x2_mul_a_219), "l"(*(const unsigned long long*)&output_rsigma_pair_1462));
+                float2 _f32x2_mul_b_220 = make_float2(_unpack_bf16_46[0], _unpack_bf16_46[1]);
+                float2 normalized_pair_1464;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1464) : "l"(*(const unsigned long long*)&scaled_pair_1463), "l"(*(const unsigned long long*)&_f32x2_mul_b_220));
+                acc32[44] = normalized_pair_1464.x;
+                acc32[45] = normalized_pair_1464.y;
+                float2 _f32x2_mul_a_221 = make_float2(acc32[46], acc32[47]);
+                float2 scaled_pair_1465;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1465) : "l"(*(const unsigned long long*)&_f32x2_mul_a_221), "l"(*(const unsigned long long*)&output_rsigma_pair_1462));
+                float2 _f32x2_mul_b_222 = make_float2(_unpack_bf16_46[2], _unpack_bf16_46[3]);
+                float2 normalized_pair_1466;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1466) : "l"(*(const unsigned long long*)&scaled_pair_1465), "l"(*(const unsigned long long*)&_f32x2_mul_b_222));
+                acc32[46] = normalized_pair_1466.x;
+                acc32[47] = normalized_pair_1466.y;
+                float2 _f32x2_mul_a_223 = make_float2(acc32[48], acc32[49]);
+                float2 scaled_pair_1467;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1467) : "l"(*(const unsigned long long*)&_f32x2_mul_a_223), "l"(*(const unsigned long long*)&output_rsigma_pair_1462));
+                float2 _f32x2_mul_b_224 = make_float2(_unpack_bf16_46[4], _unpack_bf16_46[5]);
+                float2 normalized_pair_1468;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1468) : "l"(*(const unsigned long long*)&scaled_pair_1467), "l"(*(const unsigned long long*)&_f32x2_mul_b_224));
+                acc32[48] = normalized_pair_1468.x;
+                acc32[49] = normalized_pair_1468.y;
+                float2 _f32x2_mul_a_225 = make_float2(acc32[50], acc32[51]);
+                float2 scaled_pair_1469;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1469) : "l"(*(const unsigned long long*)&_f32x2_mul_a_225), "l"(*(const unsigned long long*)&output_rsigma_pair_1462));
+                float2 _f32x2_mul_b_226 = make_float2(_unpack_bf16_46[6], _unpack_bf16_46[7]);
+                float2 normalized_pair_1470;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1470) : "l"(*(const unsigned long long*)&scaled_pair_1469), "l"(*(const unsigned long long*)&_f32x2_mul_b_226));
+                acc32[50] = normalized_pair_1470.x;
+                acc32[51] = normalized_pair_1470.y;
                 unsigned int _packed_14[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6408,13 +5632,13 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 50], acc32[_lp*2+1 + 50]));
                     _packed_14[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1719))[0] = reinterpret_cast<int4*>(_packed_14)[0];
-                int hidden_base_1730 = 6656 + thread_in_group * 4;
-                unsigned int smem_bf16x2_1731[2];
+                reinterpret_cast<int4*>(out + (token_1 * 7168 + hidden_base_1460))[0] = reinterpret_cast<int4*>(_packed_14)[0];
+                int hidden_base_1471 = 6656 + thread_in_group * 4;
+                unsigned int smem_bf16x2_1472[2];
                 asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1731[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1731[(0) + 1]))
-                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1730 * 2)) : "memory");
-                float _unpack_bf16_55[4];
+                    : "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1472[0])), "=r"(*reinterpret_cast<uint32_t*>(&smem_bf16x2_1472[(0) + 1]))
+                    : "r"(output_norm_buf_addr + (unsigned int)(hidden_base_1471 * 2)) : "memory");
+                float _unpack_bf16_47[4];
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
                     asm volatile(
@@ -6422,26 +5646,26 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_55[_pair * 2])[0]), "=f"((&_unpack_bf16_55[_pair * 2])[1])
-                        : "r"(smem_bf16x2_1731[_pair]));
+                        : "=f"((&_unpack_bf16_47[_pair * 2])[0]), "=f"((&_unpack_bf16_47[_pair * 2])[1])
+                        : "r"(smem_bf16x2_1472[_pair]));
                 }
-                float2 output_rsigma_pair_1732 = make_float2(output_rsigma, output_rsigma);
-                float2 _f32x2_mul_a_248 = make_float2(acc32[52], acc32[53]);
-                float2 scaled_pair_1733;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1733) : "l"(*(const unsigned long long*)&_f32x2_mul_a_248), "l"(*(const unsigned long long*)&output_rsigma_pair_1732));
-                float2 _f32x2_mul_b_249 = make_float2(_unpack_bf16_55[0], _unpack_bf16_55[1]);
-                float2 normalized_pair_1734;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1734) : "l"(*(const unsigned long long*)&scaled_pair_1733), "l"(*(const unsigned long long*)&_f32x2_mul_b_249));
-                acc32[52] = normalized_pair_1734.x;
-                acc32[53] = normalized_pair_1734.y;
-                float2 _f32x2_mul_a_250 = make_float2(acc32[54], acc32[55]);
-                float2 scaled_pair_1735;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1735) : "l"(*(const unsigned long long*)&_f32x2_mul_a_250), "l"(*(const unsigned long long*)&output_rsigma_pair_1732));
-                float2 _f32x2_mul_b_251 = make_float2(_unpack_bf16_55[2], _unpack_bf16_55[3]);
-                float2 normalized_pair_1736;
-                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1736) : "l"(*(const unsigned long long*)&scaled_pair_1735), "l"(*(const unsigned long long*)&_f32x2_mul_b_251));
-                acc32[54] = normalized_pair_1736.x;
-                acc32[55] = normalized_pair_1736.y;
+                float2 output_rsigma_pair_1473 = make_float2(output_rsigma, output_rsigma);
+                float2 _f32x2_mul_a_227 = make_float2(acc32[52], acc32[53]);
+                float2 scaled_pair_1474;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1474) : "l"(*(const unsigned long long*)&_f32x2_mul_a_227), "l"(*(const unsigned long long*)&output_rsigma_pair_1473));
+                float2 _f32x2_mul_b_228 = make_float2(_unpack_bf16_47[0], _unpack_bf16_47[1]);
+                float2 normalized_pair_1475;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1475) : "l"(*(const unsigned long long*)&scaled_pair_1474), "l"(*(const unsigned long long*)&_f32x2_mul_b_228));
+                acc32[52] = normalized_pair_1475.x;
+                acc32[53] = normalized_pair_1475.y;
+                float2 _f32x2_mul_a_229 = make_float2(acc32[54], acc32[55]);
+                float2 scaled_pair_1476;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_pair_1476) : "l"(*(const unsigned long long*)&_f32x2_mul_a_229), "l"(*(const unsigned long long*)&output_rsigma_pair_1473));
+                float2 _f32x2_mul_b_230 = make_float2(_unpack_bf16_47[2], _unpack_bf16_47[3]);
+                float2 normalized_pair_1477;
+                asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&normalized_pair_1477) : "l"(*(const unsigned long long*)&scaled_pair_1476), "l"(*(const unsigned long long*)&_f32x2_mul_b_230));
+                acc32[54] = normalized_pair_1477.x;
+                acc32[55] = normalized_pair_1477.y;
                 unsigned int _packed_15[2];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -6453,7 +5677,7 @@ kernel_cake_kimi_k3_attn_res_273f8297b094e2da044a(__nv_bfloat16* __restrict__ ou
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc32[_lp*2 + 54], acc32[_lp*2+1 + 54]));
                     _packed_15[_lp + 1] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_1730))[0] = reinterpret_cast<int2*>(_packed_15)[0];
+                reinterpret_cast<int2*>(out + (token_1 * 7168 + hidden_base_1471))[0] = reinterpret_cast<int2*>(_packed_15)[0];
             }
             mbarrier_wait(norm_ready_addr, 0);
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
