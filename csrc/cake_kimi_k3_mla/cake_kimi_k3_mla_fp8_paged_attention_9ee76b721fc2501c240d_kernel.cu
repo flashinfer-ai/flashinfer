@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_9ee76b721fc2501c240d(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -114,8 +114,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
     float* smem_acc = reinterpret_cast<float*>(smem_raw + 1088);
     const int smem_acc_addr = smem + 1088;
 
-    // === Task calls (dependency order) ===
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    // === Task calls (declaration order) ===
     int chunk = blockIdx.y;
     int sr_idx = blockIdx.x;
     int row = sr_idx;
@@ -138,6 +137,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
         row_ok = ((sr_b < batch) ? sr_in_rows : 0);
     }
     if (row_ok != 0) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
         int stat_base = row * num_split;
         int last_split = num_split - 1;
         int half = lane >> 4;
@@ -161,38 +161,35 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
         int s_ld = ((s_idx > last_split) ? last_split : s_idx);
         float m_raw = partial_max[stat_base + s_ld];
         float sum_raw = partial_sum[stat_base + s_ld];
-        float m_s = ((s_idx > last_split) ? -CAKE_INF : m_raw);
-        float _warp_reduce_0 = m_s;
+        float m_s = ((s_idx > last_split) ? -CUDART_INF_F : m_raw);
+        float m_warp = m_s;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-        float m_warp = _warp_reduce_0;
+            m_warp = max_noftz(m_warp, __shfl_xor_sync(0xFFFFFFFF, m_warp, offset));
         if (lane == 0) {
             smem_red[warp] = m_warp;
         }
-        asm volatile("barrier.sync 8, 256;" ::: "memory");
+        asm volatile("barrier.sync 1, 256;" ::: "memory");
         float max_m = smem_red[0];
         #pragma unroll
         for (int w = 1; w < 8; w++) {
             float m_w = smem_red[w];
-            float _max_0 = max_noftz(max_m, m_w);
-            max_m = _max_0;
+            max_m = max_noftz(max_m, m_w);
         }
         float w_s = 0.0f;
-        if (m_s > -CAKE_INF) {
-            float _exp2_0 = approx_exp2(m_s - max_m);
-            w_s = _exp2_0 * sum_raw;
+        if (m_s > -CUDART_INF_F) {
+            float _exp2_1 = approx_exp2(m_s - max_m);
+            w_s = _exp2_1 * sum_raw;
         }
         smem_w[s_idx] = w_s;
-        float _warp_reduce_1 = w_s;
+        float sum_warp = w_s;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-        float sum_warp = _warp_reduce_1;
+            sum_warp += __shfl_xor_sync(0xFFFFFFFF, sum_warp, offset);
         if (lane == 0) {
             smem_red[8 + warp] = sum_warp;
         }
-        asm volatile("barrier.sync 8, 256;" ::: "memory");
+        asm volatile("barrier.sync 1, 256;" ::: "memory");
         float sum_w = 0.0f;
         #pragma unroll
         for (int w_1 = 0; w_1 < 8; w_1++) {
@@ -201,8 +198,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
         }
         float inv_sum = 0.0f;
         if (sum_w > 0.0f) {
-            float _rcp_0 = approx_rcp(sum_w);
-            inv_sum = _rcp_0 * bmm2_scale;
+            float _rcp_2 = approx_rcp(sum_w);
+            inv_sum = _rcp_2 * bmm2_scale;
         }
         float acc[8];
         #pragma unroll
@@ -237,16 +234,16 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
             float w_k = ((s_raw > last_split) ? 0.0f : w_raw);
             float _vec_load_0[8];
             {
-                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(partial_O + (stat_base + s_w_idx) * 512 + d0);
-                uint4 _vld_1[1];
+                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(partial_O + (stat_base + s_w_idx) * 512 + d0);
+                uint4 _vld_3[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_1[_blk] = _vptr_1[_blk];
-                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+                    _vld_3[_blk] = _vptr_3[_blk];
+                    uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
-                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
                     }
                 }
             }
@@ -259,8 +256,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
         }
         #pragma unroll
         for (int e_2 = 0; e_2 < 8; e_2++) {
-            float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, acc[e_2], 16);
-            float other = _shfl_xor_0;
+            float other = __shfl_xor_sync(0xFFFFFFFF, acc[e_2], 16);
             acc[e_2] = acc[e_2] + other;
         }
         if (lane < 16) {
@@ -269,7 +265,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
                 smem_acc[warp * 128 + lane * 8 + e_3] = acc[e_3];
             }
         }
-        asm volatile("barrier.sync 8, 256;" ::: "memory");
+        asm volatile("barrier.sync 1, 256;" ::: "memory");
         if (warp == 0) {
             int d_out = chunk * 128 + lane * 4;
             float out[4];
@@ -285,7 +281,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* 
             }
             #pragma unroll
             for (int e_5 = 0; e_5 < 4; e_5++) {
-                *(reinterpret_cast<__nv_bfloat16*>(O + (row * 512 + d_out + e_5)) + (0)) = __float2bfloat16_rn(out[e_5]);
+                *(reinterpret_cast<__nv_bfloat16*>(O + (row * 512 + d_out + e_5)) + (0)) = (__nv_bfloat16)out[e_5];
             }
         }
     }
