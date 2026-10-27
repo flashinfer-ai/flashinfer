@@ -263,6 +263,23 @@ CLUSTER_SPLIT_ONE_CTA_M_K8192: dict[str, tuple[int, int]] = {
     "sm_100a": (2, 32),
     "sm_103a": (2, 16),
 }
+# The quantizer alone (the public per-token quantize entries; the quantize + GEMM chain keeps
+# :func:`quant_cluster_split`): per architecture and row width, the token-count ranges
+# ``(low, high, C)`` whose bf16 rows run as clusters of ``C`` CTAs instead.  Paired timings on
+# B200 and GB300 at the SM counts of :data:`MEASURED_SM_COUNT`; other SM counts keep the chain's
+# split.
+QUANT_ALONE_CLUSTER_SPLIT: dict[str, dict[int, tuple[tuple[int, int, int], ...]]] = {
+    "sm_100a": {
+        16384: ((1, 1, 8), (130, 130, 2)),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+    "sm_103a": {
+        16384: ((1, 1, 8),),
+        18432: ((1, 8, 8),),
+        28672: ((1, 8, 8), (130, 130, 4)),
+    },
+}
 # 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
 CLUSTER_SPLIT_PAD_CHUNKS = 1024
 
@@ -371,6 +388,19 @@ def quant_cluster_split(m: int, k: int, is_bf16: bool, fold: bool, arch: str) ->
     return QUANT_CLUSTER_SPLIT if int(m) <= limit else 1
 
 
+def quant_alone_cluster_split(
+    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+) -> int:
+    """CTAs per token row of the quantizer alone: the range of
+    :data:`QUANT_ALONE_CLUSTER_SPLIT` holding ``M`` at ``K`` on ``arch`` at its measured SM
+    count, else :func:`quant_cluster_split`."""
+    if is_bf16 and MEASURED_SM_COUNT.get(arch) == int(sm_count):
+        for low, high, split in QUANT_ALONE_CLUSTER_SPLIT.get(arch, {}).get(int(k), ()):
+            if low <= int(m) <= high:
+                return split
+    return quant_cluster_split(m, k, is_bf16, fold, arch)
+
+
 def quant_plan(
     m: int,
     k: int,
@@ -379,13 +409,17 @@ def quant_plan(
     arch: str,
     sm_count: int,
     x_row_stride: Optional[int] = None,
+    *,
+    alone: bool = False,
 ) -> QuantizePlan:
     """Resolve the quantizer instance and grid exactly like the Cake production launcher
     (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, the
     static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
     at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
     the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
-    contiguous) only decides between the static-K and the runtime-geometry instance.
+    contiguous) only decides between the static-K and the runtime-geometry instance;
+    ``alone`` selects the cluster split of the quantizer alone
+    (:func:`quant_alone_cluster_split`) instead of the chain's.
     A row the cluster split serves (:func:`quant_cluster_split`) runs as a cluster of
     ``C`` CTAs, each with the CTA shape of a ``C``-th of the row; the grid is one cluster
     per row, then (``M`` not a multiple of 128) the padding clusters, each CTA zeroing
@@ -406,7 +440,11 @@ def quant_plan(
     k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
     grid = pm
-    split = quant_cluster_split(m, k, is_bf16, fold, arch)
+    split = (
+        quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
+        if alone
+        else quant_cluster_split(m, k, is_bf16, fold, arch)
+    )
     if split > 1:
         share = (k // SF_VEC + split - 1) // split * SF_VEC
         threads, min_blocks = cta_config(share, m)
@@ -574,6 +612,14 @@ CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
         "n8_sk3_l2256b": (17, 17),
         "n8_sk4_l2256b": (1, 8),
     },
+}
+# Chain cells of the entry L2 prefetch on the SM count of :data:`MEASURED_SM_COUNT` only: per
+# architecture, the program family, the token-count range and the ``(K, N)`` shapes (paired
+# timings on B200); the GEMM alone keeps its program there.
+CHAIN_EP_MEASURED_CELLS: dict[
+    str, dict[str, tuple[int, int, tuple[tuple[int, int], ...]]]
+] = {
+    "sm_100a": {"m128_bF_ro": (128, 128, ((8192, 28672),))},
 }
 # The GEMM alone (``mm_fp4``, and :func:`prepare_mm_fp4_per_token` without a tactic) takes
 # the entry L2 prefetch program on these cells too: per architecture, the program families
@@ -1434,13 +1480,29 @@ def prepare_nvfp4_per_token_quantize(
     *,
     out_scale: Optional[torch.Tensor] = None,
 ) -> NVFP4PerTokenQuantizeRunner:
-    """Validate the binding, select the quantizer instance and bind the launch.
+    """Validate the binding, select the quantizer-alone instance
+    (``quant_plan(..., alone=True)``) and bind the launch.
 
     ``global_scale_inv`` is the one-element float32 inverse base scale
     (typically ``1 / (448 * 6)``); ``out_scale`` an optional one-element
     float32 tensor the returned per-token scale is multiplied by (the packed
     data is unchanged).  The JIT module of the instance is built and loaded
     here, so prepare outside CUDA Graph capture."""
+    return _prepare_quantize(
+        x, global_scale_inv, outputs, out_scale=out_scale, alone=True
+    )
+
+
+def _prepare_quantize(
+    x: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    outputs: PerTokenQuantizeOutputs,
+    *,
+    out_scale: Optional[torch.Tensor],
+    alone: bool,
+) -> NVFP4PerTokenQuantizeRunner:
+    """:func:`prepare_nvfp4_per_token_quantize` with the cluster split of the quantizer
+    alone (``alone``) or of the quantize + GEMM chain."""
     m, k = validate_quantize_inputs(x, outputs)
     device = x.device
     arch = _device_arch(device)
@@ -1448,7 +1510,14 @@ def prepare_nvfp4_per_token_quantize(
     fold = out_scale is not None
     scale_arg = _scalar_f32(out_scale, "out_scale", device) if fold else gs_inv
     plan = quant_plan(
-        m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device), row_stride_of(x)
+        m,
+        k,
+        x.dtype == torch.bfloat16,
+        fold,
+        arch,
+        _sm_count(device),
+        row_stride_of(x),
+        alone=alone,
     )
     kwargs = _quant_kwargs(plan, x, outputs, gs_inv, scale_arg)
     with torch.cuda.device(_device_index(device)):
@@ -1485,7 +1554,9 @@ def _quant_prepared(
     (``x_row_stride`` selects the static-K or the runtime-geometry instance)."""
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
-    plan = quant_plan(m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride)
+    plan = quant_plan(
+        m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride, alone=True
+    )
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1812,13 +1883,22 @@ def _entry_prefetch_tactic(
 ) -> Optional[dict[str, Any]]:
     """``plan``'s tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
     when its program family (kernel key without the output dtype) and token count lie in a
-    cell of ``rules`` on its architecture and that program is registered, else ``None``."""
+    cell of ``rules`` on its architecture (for the chain, also of
+    :data:`CHAIN_EP_MEASURED_CELLS`) and that program is registered, else ``None``."""
     family = "_".join(
         part
         for part in plan.kernel_key.removeprefix("gemm:").split("_")
         if part not in ("bf16", "f16")
     )
     cell = rules.get(plan.arch, {}).get(family)
+    if (cell is None or not cell[0] <= plan.M <= cell[1]) and rules is CHAIN_EP_RULES:
+        measured = CHAIN_EP_MEASURED_CELLS.get(plan.arch, {}).get(family)
+        if (
+            measured is not None
+            and MEASURED_SM_COUNT.get(plan.arch) == plan.sm_count
+            and (plan.K, plan.N) in measured[2]
+        ):
+            cell = measured[:2]
     if cell is None or not cell[0] <= plan.M <= cell[1]:
         return None
     tactic = {**plan.tactic, "ep_stages": CHAIN_EP_STAGES}
@@ -1887,8 +1967,8 @@ def prepare_nvfp4_per_token_chain(
     activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``).  The GEMM
     runs the program of :func:`chain_gemm_tactic` (the entry L2 prefetch of the weight
     tiles on the cells of :data:`CHAIN_EP_RULES`), else the one ``mm_fp4`` runs."""
-    quantize = prepare_nvfp4_per_token_quantize(
-        x, global_scale_inv, workspace, out_scale=out_scale
+    quantize = _prepare_quantize(
+        x, global_scale_inv, workspace, out_scale=out_scale, alone=False
     )
     device = workspace.fp4.device
     plan = gemm_plan(
