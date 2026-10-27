@@ -813,7 +813,10 @@
             "fuse_sf_copy_to_mma": true,
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
                 [256, 256, 64, 128, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
-                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56]
+                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 4, 4, 4, 4, 4, 4, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 5, 5, 5, 5, 5, 5, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 128, 6, 6, 6, 6, 6, 6, "128x4", 144, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56]
             ],
             "tile_scheduler": "persistent",
             "num_stages_tmem_acc": 1
