@@ -109,7 +109,8 @@ def _registered_worker(world_size, rank, port):
                 _refresh(case, 0)
                 case.check()
                 # caller-owned outputs on the same communicator take the staged
-                # route; the two routes alternate on the shared signal words
+                # route; the two routes alternate on disjoint words of one
+                # signal allocation
                 staged = PreparedCase(
                     communicator,
                     case.inputs,
