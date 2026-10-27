@@ -1042,10 +1042,10 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
 def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
     if (
-        torch.cuda.get_device_capability() != (10, 0)
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
         or not prefill._cudnn_supports_paged_auto()
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     device = torch.device("cuda")
     q = torch.randn(128, 16, 128, device=device, dtype=torch.bfloat16)
     k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
@@ -1384,10 +1384,10 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 )
 def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
     if (
-        torch.cuda.get_device_capability() != (10, 0)
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
         or not prefill._cudnn_supports_paged_auto()
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     torch.manual_seed(19)
     counts = [length // 16 for length in kv_lengths]
     q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=torch.bfloat16)
@@ -1912,9 +1912,9 @@ def test_paged_auto_fallback_refreshes_retained_capture(
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Override shape admission only after checking the real runtime capability:
     # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
@@ -2021,9 +2021,9 @@ def test_paged_auto_capture_reserves_initialized_page_capacity(
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Check backend viability even when default heuristics prefer FROST.
     if backend_only:
         monkeypatch.setattr(
@@ -2115,9 +2115,9 @@ def test_paged_auto_query_capacity_switch_preserves_capture(
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Exercise capacity changes independently of evolving performance heuristics.
     monkeypatch.setattr(
         flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
