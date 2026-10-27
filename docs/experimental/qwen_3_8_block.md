@@ -244,7 +244,7 @@ raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` de
 chain's programmatic-dependent-launch sites (served on the caller-list form; under the in-block indexer `use_pdl=True` stays a typed
 decline), the e4m3 compressed-key cache arms (served by the tree; this entry declines `index_cache_dtype=torch.float8_e4m3fn` by name until
 its own e4m3 cache surface lands) and, since this pin, the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its
-measured AUTO default on cc 10.7 (the lean tile below 4 units: the batch 1 and 2 decode steps of this entry). `qwen_3_8_block_support(...).source`
+measured AUTO default on cc 10.7 (the lean tile up to 4 units: the batch 1 and 2 decode steps of this entry). `qwen_3_8_block_support(...).source`
 reports the pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the
 cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/` (its README is the recipe; the tracer's `decode_qsa` forms declare this route,
 the batch-1 cells among them: the lean kernel module is loaded by path on that route only, so the closure needs their trace).
