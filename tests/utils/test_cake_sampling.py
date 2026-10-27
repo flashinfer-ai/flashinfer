@@ -1452,8 +1452,9 @@ def test_round16_sm12x_resident_changes_only_its_cells(monkeypatch):
     """The (8, 40) resident (``_SM12X_RESIDENTS_BY_DEVICE``: RTX PRO 6000 (12, 0) with 188 SMs) changes the launch
     plans of the owner cells on H100, B200, GB300, R200 and RTX PRO 6000 exactly on the cells of
     ``_R16_PLAN_CHANGES``, against the plans without it.  On a wide grid it changes only RTX PRO 6000 rows of
-    131072 < V <= 163840, each from the (8, 48) build to the (8, 40) one: a top-k up to fused_tail_kcap in one launch,
-    a larger top-k with launch_flags bit 12 added and every other flag, the slab and its stage-2/3 form kept.  A (12, 0)
+    131072 < V <= 163840, each from the (8, 48) build to the (8, 40) one: a top-k up to fused_tail_kcap in one launch
+    (on a grid ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists for the (8, 40) build, the two-launch chain), a larger top-k with
+    launch_flags bit 12 added and every other flag, the slab and its stage-2/3 form kept.  A (12, 0)
     device with 170 or 84 SMs keeps every plan, its (8, 48) launches included, and the cost model never ranks the
     (8, 40) build.  No plan of a 12.x device depends on whether CUDA is present (it runs no whole-CTA tail), and every
     other device is compared with itself, so no GPU is needed."""
@@ -1499,7 +1500,9 @@ def test_round16_sm12x_resident_changes_only_its_cells(monkeypatch):
             old_plan.stage23_flags,
         )
         assert not old_plan.one_launch
-        if k <= kcap:
+        if k <= kcap and not cs._multi_wave_chain(
+            cell[2], cell[1], 8, 40, False, (12, 0), 188
+        ):
             assert new_plan.one_launch and new_plan.launch_flags == cs._FLAG_FUSE_TAIL
         else:
             assert not new_plan.one_launch
@@ -1581,7 +1584,8 @@ def test_round16_sm12x_resident_samples_bitwise():
     """The (8, 40) resident forced at V = 151936 and at V = 163840 (the top of the range it serves) on a grid of more
     than one wave, with adversarial rows (ties across both k boundaries, +inf entries at the row ends and on a CTA's
     chunk edge, -inf / negative / -0.0 entries around fewer positive entries than any top-k, a fully uniform row, equal
-    maxima on both sides of every CTA's chunk edge; no NaN), scalar and per-row top-k / top-p: its no-tail twin (bit 12)
+    maxima on both sides of every CTA's chunk edge, an all-NaN row, NaN in place of the ten largest entries and on both
+    sides of every CTA's chunk edge), scalar and per-row top-k / top-p: its no-tail twin (bit 12)
     matches the reference, and its fused two-warp tail in one launch (top-k up to fused_tail_kcap), its two-launch form,
     the twin with the early trigger (bit 1) and the (8, 48) build it replaces sample the same tokens and write the same
     sorted slab and renormalized probabilities, bitwise, as does the public route.  On a device that lists the (8, 40)
@@ -1610,7 +1614,9 @@ def test_round16_sm12x_resident_samples_bitwise():
         pn[3, [chunk - 1, 2 * chunk, vocab - 3]] = (0.25, 0.5, 0.25)
         pn[4] = np.float32(2**-18)
         pn[5, np.concatenate([edges - 1, edges, [vocab - 1]])] = np.float32(2**-6)
-        assert not np.isnan(pn).any()
+        pn[6] = np.nan
+        pn[7, np.argsort(-pn[7])[:10]] = np.nan
+        pn[7, np.concatenate([edges - 1, edges, [0, vocab - 1]])] = np.nan
         probs.copy_(torch.tensor(pn, device="cuda"))
         p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
         k_small = torch.tensor(
@@ -1834,7 +1840,7 @@ def test_multi_wave_chain_variants_take_their_no_tail_twins():
     runs the variant's no-tail twin at every such batch.  Every other device, another SM count of the same capability
     included, keeps the fused tail on every grid."""
     assert cs._MULTI_WAVE_CHAIN_BY_DEVICE == {
-        (12, 0, 188): {(8, 32, False): (92544, 32)}
+        (12, 0, 188): {(8, 32, False): (92544, 32), (8, 40, False): (131073, 160)}
     }
     for (major, minor, sms), table in cs._MULTI_WAVE_CHAIN_BY_DEVICE.items():
         cap = (major, minor)
@@ -1923,6 +1929,68 @@ def test_multi_wave_chain_samples_like_the_fused_tail():
                 assert plan.launch_flags & cs._FLAG_NO_TAIL, (*where, plan)
                 routed, _ = _run_and_check(probs, k, p, 0xC0DE, 5)
                 assert np.array_equal(routed.samples, fused.samples), where
+
+
+def test_multi_wave_chain_of_the_e40_resident_changes_only_its_cells(monkeypatch):
+    """The (8, 40) entry of ``_MULTI_WAVE_CHAIN_BY_DEVICE`` (RTX PRO 6000 with 188 SMs) changes no owner cell (at most
+    128 rows) on any emulated device.  On RTX PRO 6000, over vocabularies on both sides of the (8, 40) resident's range
+    (131072 < V <= 163840) and of the listed smallest vocab, batch 1-512 and top-k on both sides of fused_tail_kcap, a
+    plan changes exactly where it is the (8, 40) one-launch fused tail with at least the listed vocab and batch, into
+    the same build's two-launch chain on its no-tail twin: the (8, 48) chain the (8, 40) build replaces
+    (``_SM12X_RESIDENTS_BY_DEVICE``) with launch_flags bit 12 added, the slab and its stage-2/3 form kept.  H100, B200,
+    GB300, R200 and a (12, 0) device with 170 or 84 SMs keep every plan.  No plan of a 12.x device depends on whether
+    CUDA is present (it runs no whole-CTA tail), and every other device is compared with itself, so no GPU is needed."""
+    vocab_least, batch_least = cs._MULTI_WAVE_CHAIN_BY_DEVICE[12, 0, 188][8, 40, False]
+    assert batch_least > 128  # no owner cell
+
+    def plans(cells, emulated=None, entry=True, resident=True):
+        table = {key: dict(t) for key, t in cs._MULTI_WAVE_CHAIN_BY_DEVICE.items()}
+        if not entry:
+            del table[12, 0, 188][8, 40, False]
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_MULTI_WAVE_CHAIN_BY_DEVICE", table)
+            if not resident:
+                m.setattr(cs, "_SM12X_RESIDENTS_BY_DEVICE", {})
+            return _emulated_launch_plans(m, emulated, cells)
+
+    assert plans(_PLAN_CELLS) == plans(_PLAN_CELLS, entry=False)
+    kcap = cs._fused_tail_kcap()
+    vocabs = (131072, 131073, 140000, 151936, 152064, 163840, 163841)
+    top_ks = (1, 10, kcap, kcap + 1, 1000)
+    cells = tuple(itertools.product(vocabs, range(1, 513), top_ks))
+    rtx = {"RTX PRO 6000": _PLAN_DEVICES["RTX PRO 6000"]}
+    new = plans(cells, rtx)
+    old = plans(cells, rtx, entry=False)
+    e48 = plans(cells, rtx, resident=False)
+    moved = 0
+    for cell, plan in new.items():
+        before = old[cell]
+        _, vocab, batch, _ = cell
+        if (
+            before is not None
+            and (before.cluster, before.ept, before.stream) == (8, 40, False)
+            and before.one_launch
+            and vocab >= vocab_least
+            and batch >= batch_least
+        ):
+            chain = e48[cell]
+            assert (chain.cluster, chain.ept, chain.stream) == (8, 48, False), cell
+            assert not chain.one_launch and not plan.one_launch, cell
+            assert plan == chain._replace(
+                ept=40, launch_flags=chain.launch_flags | cs._FLAG_NO_TAIL
+            ), cell
+            moved += 1
+        else:
+            assert plan == before, cell
+    served = sum(max(vocab_least, 131073) <= v <= 163840 for v in vocabs)
+    assert moved == served * (513 - batch_least) * sum(k <= kcap for k in top_ks)
+    smem = _PLAN_DEVICES["RTX PRO 6000"][2]
+    others = {name: d for name, d in _PLAN_DEVICES.items() if name != "RTX PRO 6000"}
+    others.update({f"(12, 0) {n} SMs": ((12, 0), n, smem) for n in (170, 84)})
+    sparse = tuple(
+        itertools.product(vocabs, (1, 64, 128, 129, 144, 192, 256, 384, 512), top_ks)
+    )
+    assert plans(sparse, others) == plans(sparse, others, entry=False)
 
 
 # --------------------------------------------------------------------------- adversarial

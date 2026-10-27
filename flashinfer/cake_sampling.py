@@ -314,9 +314,12 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
 # compiles for sm_120a without stack or spills, where the (8, 48) build spills; it carries the fused two-warp tail (one
 # launch at k <= fused_tail_kcap) and ships a no-tail twin for the two-launch chain.  RTX PRO 6000 (12, 0) with 188
 # SMs, V = 151936, batch 1-128, top-k 10 / 50 / 1000, against the (8, 48) build (two boards, eager and CUDA graph, two
-# input placements, 8 rounds, the same sampled tokens): 0.867-0.962x, -1.0..-7.1 us.  The cost model never ranks these
-# builds (its tables were fitted without them), and a device absent here (another SM count of the same capability
-# too) keeps its plans.
+# input placements, 8 rounds, the same sampled tokens): 0.867-0.962x, -1.0..-7.1 us.  With 144-512 rows at
+# V = 131073-163840 and top-k 10 / 50 its one-launch fused tail took 0.833-0.988x of the (8, 48) chain's time up to 208
+# rows but up to 1.036x from 224 rows, so from 160 rows a top-k up to fused_tail_kcap takes the (8, 40) build's
+# two-launch chain on its no-tail twin instead (``_MULTI_WAVE_CHAIN_BY_DEVICE``): 0.825-0.987x of the (8, 48) chain's
+# time with 160-512 rows.  The cost model never ranks these builds (its tables were fitted without them), and a device
+# absent here (another SM count of the same capability too) keeps its plans.
 _SM12X_RESIDENTS_BY_DEVICE: dict[
     tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, bool]]
 ] = {
@@ -721,7 +724,7 @@ _NO_TAIL_SHARED_BITS = (
 # 2-5 %, R200's cluster-8 ept-16 stream 1.5-8 % at 16 rows while it wins 1-6 % at up to 8 rows.  A build absent here
 # keeps its fused-tail form.  The (12, 0) entry of the (8, 40) resident is its chain form
 # (``_SM12X_RESIDENTS_BY_DEVICE``): a top-k above fused_tail_kcap takes the no-tail build, as the (8, 48) build it
-# replaces there runs without a tail.
+# replaces there runs without a tail, and so does a smaller top-k on the grids ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists.
 _NO_TAIL_MAX_BATCH_BY_CAPABILITY: dict[
     tuple[int, int], dict[tuple[int, int, bool, int], int]
 ] = {
@@ -1063,26 +1066,34 @@ def _no_tail_flag(
 
 # Fused-tail variants whose small-top-k launch takes the two-launch chain (stage 1 on the no-tail twin) on a multi-wave
 # stage-1 grid, per device (capability, SM count): (cluster, ept, stream) -> (smallest vocab, smallest batch) of the
-# launches that take it.  RTX PRO 6000 (12, 0) with 188 SMs, the (8, 32) resident, the chain against the fused tail
-# (two boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same sampled tokens):
-# faster on every measured cell with 32-128 rows at V = 92544-131072, top-k 10 / 50 / 64 (0.950-0.996x; at V = 128256
-# 0.983-0.992x with 32 rows, 0.976-0.988x with 64 and 0.950-0.960x with 128).  Outside that envelope the gain is not
-# consistent: 23 rows at V = 128256 are slower (1.005-1.031x), 24 rows faster eager but up to 1.008x slower under CUDA
-# graph at V = 128256 and up to 1.008x slower at V = 131072, and 32 rows at V = 65537 tie (0.996-1.004x).  Launches
-# with fewer rows or a shorter vocabulary keep the fused tail, including cells where the chain measured faster (24 rows
-# at V = 92544, 26 / 28 rows at V = 128256, 128 rows at V = 65537); top-k below 10 and more than 128 rows were not
-# measured.  The fused tail's own latency steps up by 4.7-5.2 us from 22 to 23 rows at V = 128256, so one cluster-8
-# wave holds 176 CTAs there (the cluster-8 width of the 212-SM table ``_wave_ctas`` uses for this device) and every
-# listed launch spans at least two waves.  An inference, not profiled: as for the whole-CTA tail (``_fuse_block_tail``),
-# rank 0 of every cluster runs the tail after its row, so each later wave presumably starts behind the tails of the
-# wave before it, while the chain's stage-2/3 kernel serves every row in one launch; a second wave of one or two
-# clusters presumably saves too little to pay for the second launch.  A device or variant absent here (another SM
-# count of the same capability too) keeps the fused tail on every grid.
+# launches that take it.  RTX PRO 6000 (12, 0) with 188 SMs, the (8, 32) resident, the chain against the fused tail (two
+# boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same sampled tokens): faster
+# on every measured cell with 32-128 rows at V = 92544-131072, top-k 10 / 50 / 64 (0.950-0.996x; at V = 128256
+# 0.983-0.992x with 32 rows, 0.976-0.988x with 64 and 0.950-0.960x with 128), except 32 rows at V = 131072 under CUDA
+# graph, which tie (0.998-1.001x).  Outside that envelope the gain is not consistent: 23 rows at V = 128256 are slower
+# (1.005-1.031x), 24 rows faster eager but up to 1.008x slower under CUDA graph at V = 128256 and up to 1.008x slower at
+# V = 131072, and 32 rows at V = 65537 tie (0.996-1.004x).  Launches with fewer rows or a shorter vocabulary keep the
+# fused tail, including cells where the chain measured faster (24 rows at V = 92544, 26 / 28 rows at V = 128256,
+# 128 rows at V = 65537); top-k below 10 and more than 128 rows were not measured.  The fused tail's own latency steps
+# up by 4.4-5.8 us from 22 to 23 rows at V = 128256, so one cluster-8 wave holds 176 CTAs there (the cluster-8 width of
+# the 212-SM table ``_wave_ctas`` uses for this device) and every listed launch spans at least two waves.  The (8, 40)
+# resident on the same device (``_SM12X_RESIDENTS_BY_DEVICE``: rows of 131072 < V <= 163840), at V = 131073 /
+# 140000 / 151936 / 163840, top-k 10 / 50 (and 64 with 256 rows at V = 151936), 144-512 rows, same protocol: with
+# 160-512 rows the chain took 0.927-0.999x of the fused tail's time (-27.5..+0.3 us) and 0.825-0.987x of the time of the
+# (8, 48) chain the (8, 40) build replaces, on every measured cell; the fused tail took 0.833-0.988x of the (8, 48)
+# chain's time up to 208 rows but up to 1.036x from 224 rows (up to 1.011x with 256 rows, 1.010-1.036x with 384 and
+# 512 rows at V >= 140000).  With 144 rows it keeps the fused tail: the chain took 1.003-1.008x of its time at
+# V = 131073 (0.971-0.998x at the larger vocabularies); 129-143 and 145-159 rows and more than 512 rows were not
+# measured.  An inference, not profiled: as for the whole-CTA tail (``_fuse_block_tail``), rank 0 of every cluster runs
+# the tail after its row, so each later wave presumably starts behind the tails of the wave before it, while the chain's
+# stage-2/3 kernel serves every row in one launch; a second wave of one or two clusters presumably saves too little to
+# pay for the second launch.  A device or variant absent here (another SM count of the same capability too) keeps the
+# fused tail on every grid.
 _MULTI_WAVE_CHAIN_BY_DEVICE: dict[
     tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int]]
 ] = {
     # RTX PRO 6000 Blackwell Server (188 SMs)
-    (12, 0, 188): {(8, 32, False): (92544, 32)},
+    (12, 0, 188): {(8, 32, False): (92544, 32), (8, 40, False): (131073, 160)},
 }
 
 
