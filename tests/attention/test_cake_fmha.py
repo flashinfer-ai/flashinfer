@@ -1727,6 +1727,10 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
         enable_block_sparse_attention=False,
     )
     route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    # The generated DEC_B128 program serves the 2048 launch; the 1024 launch
+    # (at most nine KV blocks) and the 4096 launch (a tensor bmm1 with a host
+    # bmm2) stay on the JIT member.
+    program = ("decode_bf16", "DEC_B128") if max_seq_len == 2048 else None
     assert route == cake_api.CakeFmhaDecodeRoute(
         target=target,
         batch_size=batch_size,
@@ -1737,6 +1741,7 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
         has_window=False,
         use_scale_ptr=device_scale,
         retain_kv_l2=retain_kv_l2,
+        program=program,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
 
@@ -1744,6 +1749,7 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
     lse_route = cake_api.select_cake_fmha_decode_route(
         query.device, **{**kwargs, "lse": caller_lse}
     )
+    # A caller LSE keeps the route (and so its JIT member, which writes the LSE).
     assert lse_route == dataclasses.replace(route, return_lse=True)
     assert cake_api.cake_fmha_route_is_optimized(lse_route)
 
@@ -1801,6 +1807,7 @@ def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
         enable_block_sparse_attention=False,
     )
     route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    # The generated DEC_SINK program serves the launch without an LSE.
     assert route == cake_api.CakeFmhaDecodeRoute(
         target="sm100a",
         batch_size=batch_size,
@@ -1811,6 +1818,7 @@ def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
         has_window=False,
         use_scale_ptr=False,
         retain_kv_l2=False,
+        program=("decode_bf16", "DEC_SINK"),
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
 
