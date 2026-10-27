@@ -22,9 +22,7 @@ from b12x._lib.intrinsics.atomics import (
     st_shared_bf16_from_f32,
     st_shared_f32,
 )
-from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
-from b12x._lib.intrinsics.conversion import cvt_f32_to_e4m3, fp8_e4m3_to_f32
-from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32
+from b12x._lib.intrinsics.packed import byte_perm
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     get_ptr_as_int64,
@@ -32,8 +30,10 @@ from b12x._lib.intrinsics.memory import (
     ldmatrix_m8n8x4_b16,
     st_shared_u8,
 )
+from b12x._lib.intrinsics.conversion import cvt_f32_to_e4m3, fp8_e4m3_to_f32
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
-from b12x._lib.intrinsics.packed import byte_perm
 
 from ._layout import (
     CANDIDATES_PER_CHUNK,

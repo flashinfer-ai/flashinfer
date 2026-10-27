@@ -39,8 +39,8 @@ from b12x._lib.intrinsics.memory import (
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
-from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.intrinsics.packed import frag_layout_swizzle_16b_to_8b
+from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 from cutlass import Int64
 from b12x._lib.utils.device import current_cuda_stream
 
@@ -114,7 +114,7 @@ class IndexerPagedTiledLogitsKernelBinding:
     index_k_cache: torch.Tensor
     real_page_table: torch.Tensor
     seqlens_per_query: torch.Tensor
-    active_width: torch.Tensor
+    active_width: torch.Tensor | None = None
     tile_logits: torch.Tensor
     page_size: int = _PAGE_SIZE
     tile_block_q: int = _PAGED_TILED_BLOCK_Q
@@ -132,7 +132,7 @@ class IndexerPagedSupertileLogitsKernelBinding:
     index_k_cache: torch.Tensor
     real_page_table: torch.Tensor
     seqlens_per_query: torch.Tensor
-    active_width: torch.Tensor
+    active_width: torch.Tensor | None = None
     tile_logits: torch.Tensor
     source_page_offset: int
     output_width_tokens: int
@@ -186,7 +186,7 @@ def build_indexer_paged_tiled_logits_kernel_binding(
     index_k_cache: torch.Tensor,
     real_page_table: torch.Tensor,
     seqlens_per_query: torch.Tensor,
-    active_width: torch.Tensor,
+    active_width: torch.Tensor | None,
     tile_logits: torch.Tensor,
     page_size: int = _PAGE_SIZE,
     tile_block_q: int = _PAGED_TILED_BLOCK_Q,
@@ -215,7 +215,7 @@ def build_indexer_paged_supertile_logits_kernel_binding(
     index_k_cache: torch.Tensor,
     real_page_table: torch.Tensor,
     seqlens_per_query: torch.Tensor,
-    active_width: torch.Tensor,
+    active_width: torch.Tensor | None,
     tile_logits: torch.Tensor,
     source_page_offset: int,
     output_width_tokens: int,
@@ -830,7 +830,7 @@ class DSAPagedLogitsKernel:
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -881,7 +881,7 @@ class DSAPagedLogitsKernel:
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         source_page_offset: Int32,
         output_width_tokens: Int32,
         logits_out: cute.Tensor,
@@ -911,7 +911,9 @@ class DSAPagedLogitsKernel:
         if valid_width_tokens > remaining_width_tokens:
             valid_width_tokens = remaining_width_tokens
 
-        live_width = Int32(active_width[Int32(0)])
+        live_width = source_width_tokens
+        if cutlass.const_expr(active_width is not None):
+            live_width = Int32(active_width[Int32(0)])
         if live_width > source_width_tokens:
             live_width = source_width_tokens
         live_width = live_width - source_offset_tokens
@@ -1148,7 +1150,7 @@ class DSAPagedSupertileLogitsKernel(DSAPagedLogitsKernel):
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         source_page_offset: Int32,
         output_width_tokens: Int32,
         logits_out: cute.Tensor,
@@ -1270,7 +1272,7 @@ class DSAScheduledSingleRowLogitsKernel:
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
         schedule_metadata: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -1321,7 +1323,7 @@ class DSAScheduledSingleRowLogitsKernel:
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
         schedule_metadata: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         logits_out: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
     ):
@@ -1334,7 +1336,9 @@ class DSAScheduledSingleRowLogitsKernel:
         SharedStorage = self._get_shared_storage_cls()
 
         width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
-        live_width = Int32(active_width[Int32(0)])
+        live_width = width_tokens
+        if cutlass.const_expr(active_width is not None):
+            live_width = Int32(active_width[Int32(0)])
         if live_width > width_tokens:
             live_width = width_tokens
         seq_len = Int32(seqlens_per_query[Int32(0)])
@@ -1640,7 +1644,7 @@ class DSAScheduledMultiRowLogitsKernel:
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
         schedule_metadata: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         logits_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
@@ -1691,7 +1695,7 @@ class DSAScheduledMultiRowLogitsKernel:
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
         schedule_metadata: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         logits_out: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
     ):
@@ -1704,7 +1708,9 @@ class DSAScheduledMultiRowLogitsKernel:
         SharedStorage = self._get_shared_storage_cls()
 
         width_tokens = Int32(real_page_table.shape[1]) * Int32(_PAGE_SIZE)
-        live_width = Int32(active_width[Int32(0)])
+        live_width = width_tokens
+        if cutlass.const_expr(active_width is not None):
+            live_width = Int32(active_width[Int32(0)])
         if live_width > width_tokens:
             live_width = width_tokens
         q_rows = Int32(seqlens_per_query.shape[0])
@@ -2274,22 +2280,19 @@ def run_paged_logits_kernel(
         return torch.empty(
             (rows, width_tokens), dtype=torch.float32, device=q_fp8.device
         )
-    if active_width is None:
-        active_width = torch.tensor(
-            [width_tokens], dtype=torch.int32, device=q_fp8.device
-        )
-    if active_width.shape != (1,):
-        raise ValueError(
-            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
-        )
-    if active_width.dtype != torch.int32:
-        raise ValueError(
-            f"active_width must have dtype torch.int32, got {active_width.dtype}"
-        )
-    if active_width.device != q_fp8.device:
-        raise ValueError(
-            f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
-        )
+    if active_width is not None:
+        if active_width.shape != (1,):
+            raise ValueError(
+                f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+            )
+        if active_width.dtype != torch.int32:
+            raise ValueError(
+                f"active_width must have dtype torch.int32, got {active_width.dtype}"
+            )
+        if active_width.device != q_fp8.device:
+            raise ValueError(
+                f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
+            )
 
     k_quant_bytes, k_scales = _split_index_k_cache_runtime_views(index_k_cache)
     use_scalar_k_load = _needs_paged_index_k_scalar_load(
@@ -2306,7 +2309,7 @@ def run_paged_logits_kernel(
     weights_kernel = weights.contiguous()
     real_page_table_kernel = real_page_table.contiguous()
     seqlens_per_query_kernel = seqlens_per_query.contiguous()
-    active_width_kernel = active_width.contiguous()
+    active_width_kernel = None if active_width is None else active_width.contiguous()
     schedule_metadata_kernel = None
     max_pages = int(real_page_table.shape[1])
     if output_mode == IndexerOutputMode.PAGE_HEAD_MAX:
@@ -2393,7 +2396,7 @@ def run_paged_logits_kernel(
             seqlens_per_query_kernel,
             dynamic_dims=(0,),
         ),
-        _tensor_meta_key(active_width_kernel),
+        None if active_width_kernel is None else _tensor_meta_key(active_width_kernel),
         (
             _tensor_compile_key(
                 "page_scores",
@@ -2428,7 +2431,9 @@ def run_paged_logits_kernel(
         args = (
             *common_args,
             _to_kernel_tensor(schedule_metadata_kernel, cutlass.Int32, assumed_align=4),
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -2456,7 +2461,9 @@ def run_paged_logits_kernel(
         args = (
             *common_args,
             _to_kernel_tensor(schedule_metadata_kernel, cutlass.Int32, assumed_align=4),
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -2486,7 +2493,9 @@ def run_paged_logits_kernel(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -2576,11 +2585,6 @@ def run_paged_tiled_logits_kernel(
         seqlens_per_query,
         api_name="run_paged_tiled_logits_kernel",
         name="seqlens_per_query",
-    )
-    active_width = _require_bound_arg(
-        active_width,
-        api_name="run_paged_tiled_logits_kernel",
-        name="active_width",
     )
     tile_logits = _require_bound_arg(
         tile_logits,
@@ -2700,11 +2704,6 @@ def run_paged_supertile_logits_kernel(
         api_name="run_paged_supertile_logits_kernel",
         name="seqlens_per_query",
     )
-    active_width = _require_bound_arg(
-        active_width,
-        api_name="run_paged_supertile_logits_kernel",
-        name="active_width",
-    )
     tile_logits = _require_bound_arg(
         tile_logits,
         api_name="run_paged_supertile_logits_kernel",
@@ -2760,7 +2759,7 @@ def _run_paged_tiled_logits_kernel_common(
     index_k_cache: torch.Tensor,
     real_page_table: torch.Tensor,
     seqlens_per_query: torch.Tensor,
-    active_width: torch.Tensor,
+    active_width: torch.Tensor | None,
     tile_logits: torch.Tensor,
     page_size: int,
     tile_block_q: int,
@@ -2793,18 +2792,19 @@ def _run_paged_tiled_logits_kernel_common(
         raise ValueError(
             "DSA paged tiled logits kernel only supports the exact CUDA page_size=64 FP8 contract"
         )
-    if active_width.shape != (1,):
-        raise ValueError(
-            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
-        )
-    if active_width.dtype != torch.int32:
-        raise ValueError(
-            f"active_width must have dtype torch.int32, got {active_width.dtype}"
-        )
-    if active_width.device != q_fp8.device:
-        raise ValueError(
-            f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
-        )
+    if active_width is not None:
+        if active_width.shape != (1,):
+            raise ValueError(
+                f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+            )
+        if active_width.dtype != torch.int32:
+            raise ValueError(
+                f"active_width must have dtype torch.int32, got {active_width.dtype}"
+            )
+        if active_width.device != q_fp8.device:
+            raise ValueError(
+                f"active_width device {active_width.device} does not match q_fp8 device {q_fp8.device}"
+            )
     if tile_logits.dtype != torch.float32 or tile_logits.device != q_fp8.device:
         raise ValueError(
             "tile_logits must be a CUDA torch.float32 tensor on the q_fp8 device"
@@ -2877,7 +2877,7 @@ def _run_paged_tiled_logits_kernel_common(
         raise ValueError("paged tiled logits requires contiguous real_page_table")
     if not seqlens_per_query.is_contiguous():
         raise ValueError("paged tiled logits requires contiguous seqlens_per_query")
-    if not active_width.is_contiguous():
+    if active_width is not None and not active_width.is_contiguous():
         raise ValueError("paged tiled logits requires contiguous active_width")
     q_bytes = q_fp8.view(torch.uint8)
     weights_kernel = weights
@@ -2925,7 +2925,7 @@ def _run_paged_tiled_logits_kernel_common(
             seqlens_per_query_kernel,
             dynamic_dims=(0,),
         ),
-        _tensor_meta_key(active_width_kernel),
+        None if active_width_kernel is None else _tensor_meta_key(active_width_kernel),
         _tensor_compile_key(
             "tile_logits",
             logits,
@@ -2953,7 +2953,9 @@ def _run_paged_tiled_logits_kernel_common(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             Int32(source_page_offset),
             Int32(width_tokens),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
@@ -2977,7 +2979,9 @@ def _run_paged_tiled_logits_kernel_common(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             Int32(source_page_offset),
             Int32(width_tokens),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
@@ -2999,7 +3003,9 @@ def _run_paged_tiled_logits_kernel_common(
         )
         args = (
             *common_args,
-            _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
+            None
+            if active_width_kernel is None
+            else _to_kernel_tensor(active_width_kernel, cutlass.Int32, assumed_align=4),
             _to_kernel_tensor(logits, cutlass.Float32, assumed_align=4),
             current_cuda_stream(),
         )
@@ -3374,7 +3380,7 @@ class DSAPagedStreamLogitsKernel:
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         source_page_offset: Int32,
         output_width_tokens: Int32,
         logits_out: cute.Tensor,
@@ -3406,7 +3412,7 @@ class DSAPagedStreamLogitsKernel:
         k_scales: cute.Tensor,
         real_page_table: cute.Tensor,
         seqlens_per_query: cute.Tensor,
-        active_width: cute.Tensor,
+        active_width: cute.Tensor | None,
         source_page_offset: Int32,
         output_width_tokens: Int32,
         logits_out: cute.Tensor,
@@ -3436,7 +3442,9 @@ class DSAPagedStreamLogitsKernel:
         if valid_width_tokens > remaining_width_tokens:
             valid_width_tokens = remaining_width_tokens
 
-        live_width = Int32(active_width[Int32(0)])
+        live_width = source_width_tokens
+        if cutlass.const_expr(active_width is not None):
+            live_width = Int32(active_width[Int32(0)])
         if live_width > source_width_tokens:
             live_width = source_width_tokens
         live_width = live_width - source_offset_tokens

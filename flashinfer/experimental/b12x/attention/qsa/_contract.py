@@ -27,8 +27,14 @@ from ...preparation.types import (
     plan_from_handle,
     require_prepared,
 )
-from ._tuning import QsaConfig, QsaQuery, TUNING
-from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS
+from ._tuning import (
+    QsaConfig,
+    QsaQuery,
+    TUNING,
+    _validate_attention_splits,
+    _validate_score_workspace_bytes,
+)
+from ._sparse_gqa_cute_config import split_row_limit
 
 _ALIGN_BYTES = 256
 _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
@@ -134,9 +140,20 @@ def cache_requirements(
         raise ValueError("max_speculative_tokens must be nonnegative")
 
     ratio = int(compress_ratio)
-    raw_ring_capacity = ratio * math.ceil((ratio + int(max_speculative_tokens)) / ratio)
-    if int(main_page_size) % raw_ring_capacity:
-        raise ValueError("raw_ring_capacity must divide main_page_size")
+    minimum_ring = ratio * math.ceil((ratio + int(max_speculative_tokens)) / ratio)
+    # A rollback horizon cannot alias the next physical page's raw history.
+    raw_ring_capacity = next(
+        (
+            capacity
+            for capacity in range(minimum_ring, int(main_page_size) + 1, ratio)
+            if int(main_page_size) % capacity == 0
+        ),
+        None,
+    )
+    if raw_ring_capacity is None:
+        raise ValueError(
+            "raw_ring_capacity must divide main_page_size and cover speculative history"
+        )
 
     element_nbytes = dtype.itemsize
     kv_element_nbytes = kv_dtype.itemsize
@@ -191,7 +208,19 @@ def cache_requirements(
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
-    """Static model geometry and serving capacities for one QSA plan."""
+    """Static model geometry and serving capacities for one QSA plan.
+
+    ``attention_splits=0`` selects partitions from the attention row count.
+    A fixed power of two from 1 through 64 uses that partition count at every
+    row capacity, with at most 64 attention rows per launch. Selector capacity
+    is unchanged. Fixed partitions use FP32 partial outputs and a merge even
+    for one split; the policy is part of the prepared query identity.
+
+    ``score_workspace_bytes`` bounds the FP32 representative-score workspace
+    (None selects the 128 MiB default). Selection scores a sequence's groups in
+    as many chunks as that bound requires, so a larger bound trades scratch
+    memory for fewer selection passes.
+    """
 
     device: torch.device | str
     max_batch: int
@@ -221,8 +250,12 @@ class Caps:
     dcp_size: int = 1
     dcp_rank: int = 0
     cp_kv_cache_interleave_size: int = 1
+    attention_splits: int = 0
+    score_workspace_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        _validate_attention_splits(self.attention_splits)
+        _validate_score_workspace_bytes(self.score_workspace_bytes)
         object.__setattr__(self, "device", _canonical_device(self.device))
         if self.device.type != "cuda":
             raise ValueError(f"QSA decode requires a CUDA device, got {self.device}")
@@ -478,7 +511,6 @@ class QsaPrograms:
     """
 
     support: Mapping[str, object]
-    score: object
     sparse: Mapping[str, object]
     sparse_draft: Mapping[str, object]
     draft: Mapping[str, object]
@@ -486,7 +518,6 @@ class QsaPrograms:
     def __post_init__(self) -> None:
         objects = (
             *self.support.values(),
-            self.score,
             *self.sparse.values(),
             *self.sparse_draft.values(),
             *self.draft.values(),
@@ -758,6 +789,7 @@ class _KernelCaps:
     dcp_size: int
     dcp_rank: int
     cp_kv_cache_interleave_size: int
+    attention_splits: int = 0
 
     @property
     def group_budget(self) -> int:
@@ -780,10 +812,12 @@ class _KernelCaps:
         )
 
 
-def _qwen_row_splits(rows: int) -> int:
-    return (
-        64 if rows == 1 else 32 if rows <= 4 else 16 if rows <= _MAX_SPLIT_ROWS else 1
-    )
+def _qwen_row_splits(rows: int, kv_heads: int) -> int:
+    if rows == 1:
+        return 64
+    if rows <= 4:
+        return 32
+    return 16 if rows <= split_row_limit(kv_heads) else 1
 
 
 def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
@@ -801,7 +835,9 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
         block_n=QWEN_CUTE_BLOCK_N,
         splits=QWEN_CUTE_NUM_SPLITS,
     ):
-        return QWEN_CUTE_BLOCK_N, _qwen_row_splits(int(rows))
+        return QWEN_CUTE_BLOCK_N, caps.attention_splits or _qwen_row_splits(
+            int(rows), int(caps.kv_heads)
+        )
     raise NotImplementedError(
         "QSA requires the CuTe Qwen sparse-GQA geometry: q_heads divisible by "
         "kv_heads, head_dim=256, selection_width>=2051; "
@@ -817,7 +853,8 @@ def _scratch_layout(
     workspace_q_rows = int(caps.max_q_rows)
     score_width_limit = max(
         1,
-        _SCORE_WORKSPACE_LIMIT_BYTES // (workspace_q_rows * torch.float32.itemsize),
+        int(caps.score_workspace_bytes or _SCORE_WORKSPACE_LIMIT_BYTES)
+        // (workspace_q_rows * torch.float32.itemsize),
     )
     score_width_limit = min(
         score_width_limit,
@@ -841,11 +878,9 @@ def _scratch_layout(
         * torch.bfloat16.itemsize
     )
     score_nbytes = workspace_q_rows * score_workspace_width * torch.float32.itemsize
-    from ._sparse_gqa_cute_config import MAX_SPLIT_ROWS
-
     max_split_row_product = max(
         rows * _target_splits(caps, rows)[1]
-        for rows in range(1, min(workspace_q_rows, MAX_SPLIT_ROWS) + 1)
+        for rows in range(1, min(workspace_q_rows, split_row_limit(caps.kv_heads)) + 1)
     )
     partial_output_nbytes = (
         max_split_row_product
@@ -1202,6 +1237,8 @@ def _query_from_caps(caps: Caps, invocation: FrozenMapping) -> QsaQuery:
         dcp_size=caps.dcp_size,
         dcp_rank=caps.dcp_rank,
         cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
+        attention_splits=caps.attention_splits,
+        score_workspace_bytes=caps.score_workspace_bytes,
         abi=abi,
     )
 
@@ -1269,12 +1306,15 @@ def _caps_from_query(query: QsaQuery, *, ordinal: int) -> Caps:
         dcp_size=query.dcp_size,
         dcp_rank=query.dcp_rank,
         cp_kv_cache_interleave_size=query.cp_kv_cache_interleave_size,
+        attention_splits=query.attention_splits,
+        score_workspace_bytes=query.score_workspace_bytes,
     )
 
 
 def _compile_rows(caps: Caps) -> tuple[int, ...]:
     """Rows whose fixed split/direct native entries can execute at runtime."""
-    candidates = (1, 2, 5, _MAX_SPLIT_ROWS, _MAX_SPLIT_ROWS + 1, caps.max_q_rows)
+    limit = split_row_limit(caps.kv_heads)
+    candidates = (1, 2, 5, limit, limit + 1, caps.max_q_rows)
     return tuple(
         rows for rows in dict.fromkeys(candidates) if 0 < rows <= int(caps.max_q_rows)
     )
@@ -1293,7 +1333,6 @@ def compile_qsa(
     """
     from ._draft_selection import _prepare_kernel, _record_kernel
     from ._kernels import _support_context
-    from ._score_cute import compile_score_representatives
     from ._sparse_gqa import compile_sparse_paged_gqa
     from ..._lib.compile_plan import launch_triton
     import triton
@@ -1430,64 +1469,6 @@ def compile_qsa(
             torch.int64,
             "rope_positions",
         )
-        prepared = _scratch_view(
-            scratch,
-            offset_bytes=layout.prepared_query_offset_bytes,
-            shape=(state.workspace_q_rows, caps.index_heads, caps.index_head_dim),
-            dtype=torch.bfloat16,
-        )
-        scores = _scratch_view(
-            scratch,
-            offset_bytes=layout.score_offset_bytes,
-            shape=(state.workspace_q_rows, state.score_workspace_width),
-            dtype=torch.float32,
-        )
-        eligible = _scratch_view(
-            scratch,
-            offset_bytes=layout.eligible_counts_offset_bytes,
-            shape=(state.workspace_q_rows,),
-            dtype=torch.int32,
-        )
-        merge = _scratch_view(
-            scratch,
-            offset_bytes=layout.merge_lengths_offset_bytes,
-            shape=(state.workspace_q_rows,),
-            dtype=torch.int32,
-        )
-        kernel_caps = _KernelCaps(
-            max_batch=caps.max_batch,
-            max_seq_len=caps.max_seq_len,
-            compressed_page_size=caps.compressed_page_size,
-            q_heads=caps.q_heads,
-            kv_heads=caps.kv_heads,
-            head_dim=caps.head_dim,
-            index_heads=caps.index_heads,
-            index_head_dim=caps.index_head_dim,
-            index_rotary_dim=caps.index_rotary_dim,
-            compress_ratio=caps.compress_ratio,
-            budget=caps.budget,
-            position_axes=caps.position_axes,
-            mrope_sections=caps.mrope_sections,
-            mrope_interleaved=caps.mrope_interleaved,
-            rms_norm_eps=caps.rms_norm_eps,
-            raw_ring_capacity=caps.raw_ring_capacity,
-            max_speculative_tokens=caps.max_speculative_tokens,
-            dcp_size=caps.dcp_size,
-            dcp_rank=caps.dcp_rank,
-            cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
-        )
-        score = compile_score_representatives(
-            prepared_query=prepared,
-            query_positions=positions,
-            request_ids=request_ids,
-            sequence_lengths=sequence_lengths,
-            compressed_cache=compressed,
-            compressed_block_table=compressed_table,
-            scores=scores,
-            eligible_counts=eligible,
-            merge_lengths=merge,
-            caps=kernel_caps,
-        )
         sparse = compile_sparse_paged_gqa(
             query=q,
             key_cache=main_k,
@@ -1579,7 +1560,8 @@ def compile_qsa(
                 dcp_size=caps.dcp_size,
                 dcp_rank=caps.dcp_rank,
                 cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
-                programs=SimpleNamespace(support=support, score=score, sparse=sparse),
+                attention_splits=caps.attention_splits,
+                programs=SimpleNamespace(support=support, sparse=sparse),
             )
         if not support:
             raise RuntimeError("QSA support compilation produced no native programs")
@@ -1627,11 +1609,8 @@ def compile_qsa(
                 ),
                 num_warps=4,
             )
-        else:
-            draft["disabled"] = score
     return QsaPrograms(
         support=support,
-        score=score,
         sparse=sparse,
         sparse_draft=sparse_draft,
         draft=draft,
@@ -2491,7 +2470,9 @@ def _qsa_decode_impl(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     cp_kv_cache_interleave_size: int = 1,
+    attention_splits: int = 0,
     programs: QsaPrograms | None = None,
+    cache_only: bool = False,
 ) -> None:
     """Launch selector state updates, optionally followed by sparse attention."""
     rows = int(index_query.shape[0])
@@ -2526,6 +2507,7 @@ def _qsa_decode_impl(
         dcp_size=int(dcp_size),
         dcp_rank=int(dcp_rank),
         cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
+        attention_splits=attention_splits,
     )
 
     max_q_rows = int(selected_positions.shape[0])
@@ -2648,12 +2630,12 @@ def _qsa_decode_impl(
         launch_expand_global_selected_groups,
         launch_expand_selected_groups,
         launch_prepare_index_query,
+        launch_score_representatives_tiled,
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
         launch_commit_raw_ring,
     )
-    from ._score_cute import launch_score_representatives
 
     # Completion consumes the old ring before the current suffix can wrap it.
     launch_compress_completed_groups(
@@ -2690,6 +2672,9 @@ def _qsa_decode_impl(
         raw_interval_start_positions=raw_interval_start_positions,
         caps=caps,
     )
+
+    if cache_only:
+        return
 
     from ._sparse_gqa import launch_sparse_paged_gqa
 
@@ -2746,7 +2731,7 @@ def _qsa_decode_impl(
                     group_budget=group_budget,
                     _prepared=None if programs is None else programs.support,
                 )
-            launch_score_representatives(
+            launch_score_representatives_tiled(
                 prepared_query=chunk_prepared,
                 query_positions=chunk_positions,
                 request_ids=chunk_request_ids,
@@ -2759,7 +2744,7 @@ def _qsa_decode_impl(
                 group_offset=group_offset,
                 group_count=group_count,
                 caps=caps,
-                _prepared=None if programs is None else programs.score,
+                _prepared=None if programs is None else programs.support,
             )
             launch_topk_groups(
                 scores=chunk_scores,
@@ -2811,39 +2796,50 @@ def _qsa_decode_impl(
                 caps=caps,
                 _prepared=None if programs is None else programs.support,
             )
-        block_n, splits = _target_splits(caps, chunk_rows)
-        split_output = None
-        split_lse = None
-        if splits > 1:
-            split_output = partial_output_storage[: chunk_rows * splits].view(
-                chunk_rows, splits, q_heads, head_dim
-            )
-            split_lse = partial_lse_storage[: chunk_rows * splits].view(
-                chunk_rows, splits, q_heads
-            )
-        active_output = output[row_slice]
-        launch_sparse_paged_gqa(
-            query=query[row_slice],
-            key_cache=main_k_cache,
-            value_cache=main_v_cache,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            block_table=main_block_table,
-            request_ids=chunk_request_ids,
-            selected_positions=selected,
-            query_positions=chunk_positions,
-            output=active_output,
-            output_lse=(
-                output_lse_storage[row_slice] if int(caps.dcp_size) > 1 else None
-            ),
-            partial_output=split_output,
-            partial_lse=split_lse,
-            softmax_scale=1.0 / math.sqrt(head_dim),
-            block_n=block_n,
-            splits=splits,
-            direct_kv_warps=int(sparse_gqa_direct_kv_warps),
-            _prepared=None if programs is None else programs.sparse,
+        attention_rows = (
+            min(chunk_rows, split_row_limit(caps.kv_heads))
+            if caps.attention_splits
+            else chunk_rows
         )
+        for attention_start in range(0, chunk_rows, attention_rows):
+            count = min(attention_rows, chunk_rows - attention_start)
+            attention_slice = slice(
+                row_offset + attention_start, row_offset + attention_start + count
+            )
+            block_n, splits = _target_splits(caps, count)
+            split_output = None
+            split_lse = None
+            if caps.attention_splits or splits > 1:
+                split_output = partial_output_storage[: count * splits].view(
+                    count, splits, q_heads, head_dim
+                )
+                split_lse = partial_lse_storage[: count * splits].view(
+                    count, splits, q_heads
+                )
+            launch_sparse_paged_gqa(
+                query=query[attention_slice],
+                key_cache=main_k_cache,
+                value_cache=main_v_cache,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                block_table=main_block_table,
+                request_ids=request_ids[attention_slice],
+                selected_positions=selected_positions[attention_slice],
+                query_positions=query_positions[attention_slice],
+                output=output[attention_slice],
+                output_lse=(
+                    output_lse_storage[attention_slice]
+                    if int(caps.dcp_size) > 1
+                    else None
+                ),
+                partial_output=split_output,
+                partial_lse=split_lse,
+                softmax_scale=1.0 / math.sqrt(head_dim),
+                block_n=block_n,
+                splits=splits,
+                direct_kv_warps=int(sparse_gqa_direct_kv_warps),
+                _prepared=None if programs is None else programs.sparse,
+            )
 
 
 _QSA_MUTATED_ARGUMENTS = (
@@ -2922,6 +2918,7 @@ def _qsa_decode_op(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     state = require_prepared(
         plan_from_handle(plan_handle), "attention.qsa", query.device
@@ -3037,7 +3034,9 @@ def _qsa_decode_op(
         dcp_size=state.caps.dcp_size,
         dcp_rank=state.caps.dcp_rank,
         cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
+        attention_splits=state.caps.attention_splits,
         programs=state.programs,
+        cache_only=cache_only,
     )
 
 
@@ -3102,6 +3101,7 @@ def _qsa_decode_fake(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     return None
 
@@ -3232,6 +3232,7 @@ def _qsa_decode_shared_op(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     state = require_prepared(
         plan_from_handle(plan_handle), "attention.qsa", query.device
@@ -3355,7 +3356,9 @@ def _qsa_decode_shared_op(
         dcp_size=state.caps.dcp_size,
         dcp_rank=state.caps.dcp_rank,
         cp_kv_cache_interleave_size=state.caps.cp_kv_cache_interleave_size,
+        attention_splits=state.caps.attention_splits,
         programs=state.programs,
+        cache_only=cache_only,
     )
 
 
@@ -3418,6 +3421,7 @@ def _qsa_decode_shared_fake(
     partial_lse_offset_bytes: int,
     output_lse_offset_bytes: int,
     selection_only: bool,
+    cache_only: bool = False,
 ) -> None:
     return None
 
@@ -3437,6 +3441,7 @@ def _run(
     is_prefilling: torch.Tensor,
     selection_only: bool = False,
     programs: QsaPrograms | None = None,
+    cache_only: bool = False,
 ) -> torch.Tensor:
     """Validate a complete transaction and launch its combined or selector stage."""
     if not isinstance(binding, Binding):
@@ -3631,7 +3636,9 @@ def _run(
             dcp_size=caps.dcp_size,
             dcp_rank=caps.dcp_rank,
             cp_kv_cache_interleave_size=caps.cp_kv_cache_interleave_size,
+            attention_splits=caps.attention_splits,
             programs=programs,
+            cache_only=cache_only,
         )
         return binding.output[:rows]
 
@@ -3696,6 +3703,7 @@ def _run(
             int(layout.partial_lse_offset_bytes),
             int(layout.output_lse_offset_bytes),
             selection_only,
+            cache_only,
         )
         return binding.output[:rows]
     _qsa_decode_op(
@@ -3758,6 +3766,7 @@ def _run(
         int(layout.partial_lse_offset_bytes),
         int(layout.output_lse_offset_bytes),
         selection_only,
+        cache_only,
     )
     return binding.output[:rows]
 
@@ -3777,8 +3786,22 @@ def run(
     is_prefilling: torch.Tensor | None = None,
     index_ready: torch.cuda.Event | None = None,
     reuse: DraftSelectionReuse | None = None,
-) -> torch.Tensor:
+    cache_only: bool = False,
+    selection_only: bool = False,
+) -> torch.Tensor | None:
     """Run one packed QSA decode transaction after main K/V writes are enqueued.
+
+    ``cache_only=True`` updates compressed keys and the raw-key ring on the
+    calling stream, then returns ``None``. It skips query preparation, selection
+    and attention, leaving scratch, selected positions, output, and draft anchors
+    unchanged. All input tensors retain the prepared shape/stride contract;
+    query and index-query values are unused. Main K/V writes remain caller-owned.
+    Cache-only execution cannot use selection-stream overlap or draft reuse.
+
+    ``selection_only=True`` updates selector state and writes each row's selected
+    original-token positions to ``binding.selected_positions`` (valid positions
+    first, then ``-1``), then returns ``None`` without attending, so a caller can
+    run its own attention over the selection. It also uses the calling stream.
 
     Main Q/K/V writes precede this call on the calling stream. By default all
     QSA work follows them on that stream. A binding with ``selection_stream``
@@ -3840,6 +3863,17 @@ def run(
         raise TypeError("QSA binding requires a prepared plan")
     if binding.state.caps.dcp_size > 1:
         raise ValueError("DCP QSA requires select() followed by attend()")
+    if cache_only and selection_only:
+        raise ValueError("cache-only QSA performs no selection")
+    if (cache_only or selection_only) and (
+        reuse is not None
+        or binding.selection_stream is not None
+        or index_ready is not None
+    ):
+        raise ValueError(
+            "cache-only and selection-only QSA require the calling stream and no"
+            " draft reuse"
+        )
     if reuse is not None:
         if not isinstance(reuse, DraftSelectionReuse):
             raise TypeError("reuse must be a qsa.DraftSelectionReuse")
@@ -3945,6 +3979,9 @@ def run(
         num_accepted_tokens=num_accepted_tokens,
         is_prefilling=is_prefilling,
     )
+    if cache_only:
+        _run(binding, **inputs, cache_only=True)
+        return None
     if binding.draft_selection is not None:
         from ._draft_selection import validate_buffers
 
@@ -3956,6 +3993,10 @@ def run(
             ],
             list(inputs.values()),
         )
+    if selection_only:
+        _run(binding, **inputs, selection_only=True)
+        _record_draft_anchors(binding, query_positions)
+        return None
     stream = binding.selection_stream
     if stream is None:
         if index_ready is not None:
@@ -4204,7 +4245,6 @@ def _qsa_attention_op(
     ):
         raise RuntimeError("QSA attention custom op requires a retained native plan")
     from ._sparse_gqa import launch_sparse_paged_gqa
-    from ._sparse_gqa_cute_config import BLOCK_N
 
     # Storage addresses exist at the custom-op runtime boundary, not in tracing.
     _require_mutation_alias_contract(
@@ -4248,10 +4288,12 @@ def _qsa_attention_op(
         dtype=torch.float32,
     )
     # Use the same row-chunk and native CuTe split policy as the combined call.
+    if state.caps.attention_splits:
+        work_rows = min(work_rows, split_row_limit(state.caps.kv_heads))
     for start in range(0, rows, work_rows):
         count = min(work_rows, rows - start)
         row_slice = slice(start, start + count)
-        splits = _qwen_row_splits(count)
+        block_n, splits = _target_splits(state.caps, count)
         launch_sparse_paged_gqa(
             query=query[row_slice],
             key_cache=main_k_cache,
@@ -4268,16 +4310,16 @@ def _qsa_attention_op(
             ),
             partial_output=(
                 partial_output[: count * splits].view(count, splits, q_heads, head_dim)
-                if splits > 1
+                if state.caps.attention_splits or splits > 1
                 else None
             ),
             partial_lse=(
                 partial_lse[: count * splits].view(count, splits, q_heads)
-                if splits > 1
+                if state.caps.attention_splits or splits > 1
                 else None
             ),
             softmax_scale=1.0 / math.sqrt(head_dim),
-            block_n=BLOCK_N,
+            block_n=block_n,
             splits=splits,
             direct_kv_warps=direct_kv_warps,
             _prepared=(
@@ -4404,9 +4446,10 @@ def _prime(binding: Binding, *, rows: int | None = None) -> None:
     )
     is_prefilling = torch.ones(int(caps.max_batch), dtype=torch.bool, device=device)
     warm_rows = {requested_rows}
-    if output_capacity > _MAX_SPLIT_ROWS:
-        warm_rows.add(_MAX_SPLIT_ROWS)
-        warm_rows.add(_MAX_SPLIT_ROWS + 1)
+    limit = split_row_limit(caps.kv_heads)
+    if output_capacity > limit:
+        warm_rows.add(limit)
+        warm_rows.add(limit + 1)
     for warm_row_count in sorted(warm_rows):
         query = torch.empty(
             (warm_row_count, int(caps.q_heads), int(caps.head_dim)),

@@ -36,14 +36,7 @@ from b12x._lib.intrinsics.atomics import (
     st_shared_f32_offset,
     st_shared_u32,
 )
-from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
-from b12x._lib.intrinsics.conversion import (
-    cvt_e4m3_to_f32_via_f16,
-    dequant_kv_e4m3_pair_to_bf16x2,
-    f16x2_to_f32x2,
-    fp4_decode_2,
-)
-from b12x._lib.intrinsics.math import fmax_f32, fmin_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.packed import byte_perm, pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.memory import (
     create_l2_evict_first_policy,
     get_ptr_as_int64,
@@ -57,8 +50,15 @@ from b12x._lib.intrinsics.memory import (
     quantize_scaled_store_shared_v2_e4m3,
     shared_ptr_to_u32,
 )
+from b12x._lib.intrinsics.conversion import (
+    cvt_e4m3_to_f32_via_f16,
+    dequant_kv_e4m3_pair_to_bf16x2,
+    f16x2_to_f32x2,
+    fp4_decode_2,
+)
+from b12x._lib.intrinsics.math import fmax_f32, fmin_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
-from b12x._lib.intrinsics.packed import byte_perm, pack_f32x2_to_bfloat2
 
 from .decode_math import (
     EPILOGUE_FINAL_BF16,

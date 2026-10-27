@@ -107,6 +107,21 @@ def test_public_selection_metadata_ignores_pool_size_but_preserves_layout() -> N
     assert interleaved["operands"]["index_k_cache"]["strides"] == (2 * width, 1)
 
 
+def test_public_plan_distinguishes_static_extent_from_device_width() -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4, topk=2
+    )
+    inputs = _public_dsa_inputs()
+    dynamic = dsa_indexer.invocation_from_tensors(caps, **inputs)
+    inputs["active_width"].fill_(128)
+    assert dsa_indexer.invocation_from_tensors(caps, **inputs) == dynamic
+    del inputs["active_width"]
+    static = dsa_indexer.invocation_from_tensors(caps, **inputs)
+    declaration = dsa_indexer.plan(caps, invocation=static)
+    assert declaration.query.operands["active_width"] is None
+    assert static != dynamic
+
+
 @pytest.mark.parametrize(
     ("output_index_space", "output_physical_slots"),
     [("logical", False), ("physical", True)],

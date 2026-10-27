@@ -1700,7 +1700,6 @@ class B12XAttentionWorkspace:
     paged_indexer_real_page_table_runtime: torch.Tensor | None = None
     paged_indexer_seqlens_per_query_runtime: torch.Tensor | None = None
     paged_indexer_active_width_runtime: torch.Tensor | None = None
-    paged_indexer_active_width_cap: torch.Tensor | None = None
     paged_indexer_schedule_metadata_runtime: torch.Tensor | None = None
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
@@ -2059,18 +2058,6 @@ class B12XAttentionWorkspace:
         if self.paged_indexer_active_width_runtime is None:
             self.paged_indexer_active_width_runtime = torch.empty(
                 (1,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-        if self.paged_indexer_active_width_cap is None:
-            width_cap = max(
-                int(self.paged_logits_width_tokens),
-                int(self.max_page_table_width) * int(self.page_size),
-                1,
-            )
-            self.paged_indexer_active_width_cap = torch.full(
-                (1,),
-                int(width_cap),
                 dtype=torch.int32,
                 device=self.device,
             )

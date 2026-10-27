@@ -10,6 +10,10 @@ Planned lifecycle: declare with ``plan(Caps(...))``, prepare it through a
 ``PreparationSession``, then bind and run the prepared ``Plan``.
 Dynamic sequence lengths, page IDs and selected token indices remain binding
 inputs; no runtime route selection or compilation is permitted.
+Prepared attention, GLM latent-cache writes, and pooled physical selection
+expose their tensor mutations as custom operations for fixed-shape
+``torch.compile`` forwards. Attention results are views of caller-owned byte
+scratch; consume or copy them before reusing that storage.
 
 GLM Next uses an explicit recipe identity because its absorbed 512-wide query
 collides with DSV4 by shape. Plan with ``model_type=ModelType.GLM_NEXT`` and

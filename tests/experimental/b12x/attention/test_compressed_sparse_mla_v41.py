@@ -1,6 +1,6 @@
 """Prepared heterogeneous attention numerical and graph boundaries."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 import torch
@@ -71,13 +71,15 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     fp8: bool | str,
     monkeypatch,
     mla_session,
+    arithmetic="auto",
+    rows=19,
 ) -> None:
     from b12x.attention._shared.mla.compressed_reference import (
         pack_deepseek_v41_cache_reference,
     )
 
     device = require_sm120()
-    rows, width, page_size = 19, 128, 64
+    width, page_size = 128, 64
     gen = torch.Generator(device=device).manual_seed(4100 + heads)
     group_scales = torch.linspace(0.03, 0.7, 32, device=device).repeat_interleave(16)
     swa_kv = (
@@ -137,6 +139,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         mode=mode,
         max_chunks_per_row=4,
         use_cuda_graph=True,
+        compute_mode=arithmetic,
     )
     output = torch.empty_like(q)
     invocation = compressed_sparse_mla.invocation_from_tensors(
@@ -148,7 +151,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         lse_scale="natural",
     )
     plan = compressed_sparse_mla.plan(caps, invocation=invocation)
-    if fp8 != "default":
+    if fp8 != "default" and arithmetic == "auto":
         execution = replace(
             TUNING.configure(plan.query, device=mla_session.device.identity).default,
             v41_compute_mode="fp8" if fp8 else "bf16",
@@ -173,6 +176,22 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         lse_scale="natural",
     )
     binding, storage = _prepare_binding(mla_session, plan, bind_args, run_args, output)
+    cache_snapshot = None
+    if arithmetic == "bf16":
+        assert plan.override is None
+        assert plan.query.compute_mode == "bf16"
+        assert plan.selection.config.v41_compute_mode == "bf16"
+        assert plan.selection.source != "override"
+        cache_snapshot = (swa_cache.clone(), indexed_cache.clone())
+        print(
+            {
+                "operation": mode,
+                "rows": rows,
+                "heads": heads,
+                "selection": plan.selection.source,
+                "config": asdict(plan.selection.config),
+            }
+        )
     if heads == 16 and mode == "decode" and not large_pool and fp8 is True:
         offset_storage = torch.empty(q.numel() + 1, dtype=q.dtype, device=device)
         offset_q = offset_storage[1:].view_as(q)
@@ -261,7 +280,8 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     warm_output, warm_lse = run(binding, output)
     check(warm_output, warm_lse, rows)
     # Runtime environment mutations must not change an already-selected plan.
-    monkeypatch.setenv("B12X_MLA_SM120_DSV41_NATIVE", "0" if fp8 else "h8")
+    if arithmetic == "auto":
+        monkeypatch.setenv("B12X_MLA_SM120_DSV41_NATIVE", "0" if fp8 else "h8")
 
     mla_session.freeze()
     graph = torch.cuda.CUDAGraph()
@@ -299,8 +319,30 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
             binding.scratch.final_lse.data_ptr(),
             binding.scratch.mapped_indices.data_ptr(),
         )
+        if cache_snapshot is not None:
+            assert swa_cache.dtype == indexed_cache.dtype == torch.uint8
+            assert torch.equal(swa_cache, cache_snapshot[0])
+            assert torch.equal(indexed_cache, cache_snapshot[1])
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize(
+    "mode,rows", [("decode", 24), ("decode", 32), ("decode", 40), ("extend", 128)]
+)
+def test_v41_bf16_constraint_preserves_packed_cache_and_replay(mode, rows, monkeypatch):
+    device = require_sm120()
+    with PreparationSession(device=device, autotune=True, compile_workers=2) as session:
+        test_v41_heterogeneous_attention_replay_and_live_rows(
+            heads=16,
+            mode=mode,
+            large_pool=False,
+            fp8=False,
+            monkeypatch=monkeypatch,
+            mla_session=session,
+            arithmetic="bf16",
+            rows=rows,
+        )
 
 
 @pytest.mark.parametrize("cache_format", ["deepseek_v4", "deepseek_v41"])

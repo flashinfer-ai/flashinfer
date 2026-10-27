@@ -12,7 +12,9 @@ are planned independently. Supported logical widths are ``(576, 512)`` and
 
 ``window_size=None`` attends to the full causal context. A positive
 ``window_size`` restricts query position ``p`` to the inclusive interval
-``[max(0, p - window_size + 1), p]``. The attention scale is caller-provided.
+``[max(0, p - window_size + 1), p]``. With ``causal=False``, later keys are also
+visible while the left-window bound remains aligned to the query position.
+The attention scale is caller-provided.
 BF16 and E4M3 records are supported. For E4M3 cache with BF16 query input,
 ``q_dtype=torch.bfloat16`` plans fixed query-quantization storage in the same
 caller-owned scratch buffer.

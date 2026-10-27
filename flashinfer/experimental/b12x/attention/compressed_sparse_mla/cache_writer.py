@@ -1,4 +1,4 @@
-"""Prepared native DeepSeek V4.1 compressed-cache writer."""
+"""Prepared native DeepSeek V4 and V4.1 compressed-cache writers."""
 
 from __future__ import annotations
 
@@ -40,10 +40,8 @@ def _validate_query(query: CacheWriterQuery, _device) -> None:
         raise ValueError("page_size must be a positive integer")
     if query.cache_kind not in ("swa", "indexed"):
         raise ValueError("cache_kind must be 'swa' or 'indexed'")
-    if query.cache_format != "deepseek_v41":
-        raise ValueError(
-            "prepared compressed writer requires cache_format='deepseek_v41'"
-        )
+    if query.cache_format not in ("deepseek_v4", "deepseek_v41"):
+        raise ValueError("cache_format must be 'deepseek_v4' or 'deepseek_v41'")
     if query.slot_dtype not in ("int32", "int64"):
         raise ValueError("slot_dtype must be 'int32' or 'int64'")
 
@@ -54,7 +52,7 @@ TUNING = replace(
         query_type=CacheWriterQuery,
         backend="cute",
     ),
-    query_schema_version=22,
+    query_schema_version=23,
     validate_query=_validate_query,
 )
 
@@ -78,13 +76,13 @@ def _representative(query: CacheWriterQuery, ordinal: int):
     from b12x.attention._shared.mla import kv_cache as writer
 
     device = torch.device("cuda", ordinal)
-    record_bytes = 528 if query.cache_kind == "swa" else 288
+    size = page_nbytes(
+        query.page_size, cache_kind=query.cache_kind, cache_format=query.cache_format
+    )
     return (
         writer,
         torch.empty((query.max_rows, 512), dtype=torch.bfloat16, device=device),
-        torch.empty(
-            (1, query.page_size * record_bytes), dtype=torch.uint8, device=device
-        ),
+        torch.empty((1, size), dtype=torch.uint8, device=device),
         torch.empty(
             (query.max_rows,), dtype=_slot_dtype(query.slot_dtype), device=device
         ),
@@ -99,7 +97,7 @@ def compile_cache_writer(query_payload, ordinal):
     with torch.cuda.device(ordinal), FakeTensorMode():
         writer, kv, cache, slots = _representative(query, ordinal)
         kernel, args, spec = writer._compressed_cache_writer_launch(
-            kv, cache, slots, query.page_size, query.cache_kind
+            kv, cache, slots, query.page_size, query.cache_kind, query.cache_format
         )
         return writer.compile_cute(kernel, *args, compile_spec=spec)
 
@@ -160,7 +158,12 @@ class _CacheWriterState:
         if int(slot_mapping.shape[0]) == 0:
             return
         args = writer._compressed_cache_writer_args(
-            kv, cache, slot_mapping, self.query.page_size, self.query.cache_kind
+            kv,
+            cache,
+            slot_mapping,
+            self.query.page_size,
+            self.query.cache_kind,
+            self.query.cache_format,
         )
         writer.run_compiled(self.compiled, args)
 

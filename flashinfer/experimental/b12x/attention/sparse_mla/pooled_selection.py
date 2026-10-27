@@ -11,7 +11,6 @@ import triton.language as tl
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
-from b12x.preparation.types import require_prepared
 
 from ._tuning import SparseMlaConfig, SparseMlaQuery, TUNING
 
@@ -155,20 +154,20 @@ def expand_pooled_topk_to_physical_slots(
         raise ValueError("pool_indices and output must be contiguous")
 
     if plan is not None:
-        state = require_prepared(plan, TUNING.component_id, pool_indices.device)
-        if not isinstance(state, _PooledSelectionState):
-            raise ValueError("pooled selection requires a pooled-selection plan")
-        state.run(
+        from ._ops import pooled_selection
+
+        pooled_selection(
             pool_indices,
             last_token_positions,
             request_ids,
             block_table,
             output,
             active_counts,
-            pool_size=pool_size,
-            block_size=block_size,
-            block_stride_rows=block_stride_rows,
-            num_cache_blocks=num_cache_blocks,
+            pool_size,
+            block_size,
+            block_stride_rows,
+            num_cache_blocks,
+            plan.handle,
         )
     elif rows:
         block_cols = 128

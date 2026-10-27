@@ -32,18 +32,6 @@ from b12x._lib.smem import (
     make_smem_memrange_alias,
     make_tma_aligned_payload_storage,
 )
-from b12x._lib.intrinsics.memory import (
-    ld_shared_v4_u32,
-    ldmatrix_m8n8x4_b16,
-    ldmatrix_m8n8x4_left_half_b16,
-    ldmatrix_m8n8x4_right_half_b16,
-    ldmatrix_m8n8x4_trans_b16,
-    ldmatrix_m8n8x4_trans_left_half_b16,
-    ldmatrix_m8n8x4_trans_right_half_b16,
-    ldmatrix_m16n16x1_trans_b8,
-    st_global_v4_u32,
-    st_shared_v4_u32,
-)
 from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32, mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.intrinsics.packed import (
     bf16_rowsum_m16k16_f32,
@@ -57,6 +45,18 @@ from b12x._lib.intrinsics.packed import (
     pack_f32x2_to_bfloat2,
     frag_layout_swizzle_16b_to_8b,
     frag_layout_swizzle_16b_to_8b_trans,
+)
+from b12x._lib.intrinsics.memory import (
+    ld_shared_v4_u32,
+    ldmatrix_m8n8x4_b16,
+    ldmatrix_m8n8x4_left_half_b16,
+    ldmatrix_m8n8x4_right_half_b16,
+    ldmatrix_m8n8x4_trans_b16,
+    ldmatrix_m8n8x4_trans_left_half_b16,
+    ldmatrix_m8n8x4_trans_right_half_b16,
+    ldmatrix_m16n16x1_trans_b8,
+    st_global_v4_u32,
+    st_shared_v4_u32,
 )
 
 from .traits import PagedForwardTraits
@@ -253,6 +253,9 @@ def _issue_paged_kv_tma_copy_planes_tma(
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
+    # Consumers read a stage with ldmatrix (generic proxy) before releasing it;
+    # order those reads before the TMA refill (async proxy).
+    cute.arch.fence_view_async_shared()
     load_tma0(src_idx=page_id, producer_state=producer_state)
     load_tma1(src_idx=page_id, producer_state=producer_state)
     load_tma2(src_idx=page_id, producer_state=producer_state)
@@ -277,6 +280,8 @@ def _issue_paged_kv_tma_copy_2planes_tma(
         else mPageTable[request_idx, page_idx]
     )
     pipeline_tma.producer_acquire(producer_state)
+    # Generic-proxy stage reads before the TMA refill.
+    cute.arch.fence_view_async_shared()
     load_tma0(src_idx=page_id, producer_state=producer_state)
     load_tma1(src_idx=page_id, producer_state=producer_state)
 
@@ -3783,6 +3788,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3808,6 +3815,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3831,6 +3840,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
         load_tma1(src_idx=src_idx, producer_state=producer_state)
@@ -3852,6 +3863,8 @@ class PagedForwardKernel:
             else mPageTable[request_idx, page_idx]
         )
         pipeline_tma.producer_acquire(producer_state)
+        # Generic-proxy stage reads before the TMA refill.
+        cute.arch.fence_view_async_shared()
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
         load_tma0(src_idx=src_idx, producer_state=producer_state)
 
