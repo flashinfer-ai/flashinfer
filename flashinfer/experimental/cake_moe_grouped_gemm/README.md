@@ -124,13 +124,19 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   `dgrad_evict_first_min_k` columns (`K`), the wide tile is the route's
   `main_wide_ef` stage: the same program with G loaded and `dX` stored under
   the L2 evict-first policy, so a group's weights stay resident in L2 while
-  its row blocks stream past them. Its output is bitwise that of `main_wide`.
+  its row blocks stream past them, and with two head and two tail k steps of
+  an item split around the release of the accumulator's two halves instead of
+  four and three, so fewer of an item's k steps pay the split. Every element
+  still accumulates its k steps in order, so its output is bitwise that of
+  `main_wide`.
 - `fwd` last-wave-halves evict-first twin (`fwd_lwh_ef`): on the architectures
   listed in `fwd_lwh_ef_archs`, when the reduction `K` (the columns of `x`) is
   at most `fwd_lwh_ef_max_k`, as in the down projection, the wide tile is the
   route's `main_wide_ef` stage: the A-collector program that releases the last
-  wave of tiles in two halves and stores Y under the L2 evict-first policy. Its
-  output is bitwise that of `main_wide`.
+  wave of tiles in two halves, stores Y under the L2 evict-first policy and
+  splits two head and two tail k steps of an item around the release of the
+  accumulator's two halves instead of four and three. Its output is bitwise
+  that of `main_wide`.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -197,15 +203,16 @@ names the bound stages in launch order.
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
-`cake_jit.PROGRAMS` lists sixteen libraries, one per kernel and build, each a
+`cake_jit.PROGRAMS` lists nineteen libraries, one per kernel and build, each a
 kernel and a host-binding translation unit under `csrc/cake_moe_grouped_gemm/`
 shared by the architectures it is built for (an architecture-dependent line is
 folded under `__CUDA_ARCH__`):
 
-- `fwd` and `dgrad` in four builds each: the domain-scheduled build for
+- `fwd` and `dgrad` in five builds each: the domain-scheduled build for
   `sm_100a` and `sm_103a` and the static-schedule build for `sm_107a`, each
   with the 256-column output tile (the routes' `main` stage) and with the
-  512-column one (`main_wide`). A route spells the two builds of a stage as
+  512-column one (`main_wide`), and the `sm_107a` evict-first twin of the
+  512-column build (`main_wide_ef`). A route spells the two builds of a stage as
   two stages of one name on disjoint architectures, and
   `cake_jit.stage_binding(name, stage, arch)` returns the one built for the
   architecture.
