@@ -22,7 +22,7 @@ softmax as ``O += rowsum(P_tile) * mean_tile`` (bf16 K=16 UMMA steps), so the
 residual quantization error no longer carries the value DC component. P is
 E4M3 through the ExpCast path in both recipes of the Q/K side:
 
-* VC-Attention keeps Q and K in bf16 (plan ``q_dtype`` bf16/fp16);
+* VC-Attention-QK16 keeps Q and K in bf16 (plan ``q_dtype`` bf16);
 * VC-Attention-QK8 (plan ``q_dtype`` E4M3) centres K by its per-head channel
   mean, rotates Q and K by the normalised 128-point Hadamard matrix and
   quantizes them to E4M3 with one scale per 128-token Q block and per

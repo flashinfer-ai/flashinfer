@@ -550,7 +550,7 @@ restores inside the online softmax, and a direct probability cast (ExpCast). The
 plan selects the recipe at compile time with `vc_config=VCAttentionConfig(...)`;
 the plan's Q/K dtype selects the Q/K side:
 
-* **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16 or fp16): Q and K stay 16-bit.
+* **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16): Q and K stay bf16.
 * **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.float8_e4m3fn`): the paper's
   low-bit Q/K. K is centred by its per-head channel mean, Q and K are rotated by
   the normalised 128-point Hadamard matrix and quantized to E4M3 with one scale
@@ -574,12 +574,15 @@ turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
 inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
-the two preparations (bf16/fp16 inputs with `head_dim=128`). The quantizer
-lives in `flashinfer.quantization`; this module holds the operand contract.
+the two preparations (bf16/fp16 inputs with `head_dim=128`). QK16 plans require
+bf16 Q/K; QK8 preparation accepts bf16 or fp16 inputs and produces E4M3 Q/K.
+The quantizers live in
+`flashinfer.attention.prims_ts.vc_attention.quantization`; the `vc_attention`
+package holds the operand contract.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | `torch.bfloat16`, `torch.float16` (QK16) or `torch.float8_e4m3fn` (QK8) |
+| Q/K dtype | `torch.bfloat16` (QK16) or `torch.float8_e4m3fn` (QK8) |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |

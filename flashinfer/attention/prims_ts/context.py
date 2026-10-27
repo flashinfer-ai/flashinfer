@@ -2853,7 +2853,7 @@ class BatchPrefillTSWrapper:
         """Compile one reusable specialization from explicit static geometry.
 
         ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
-        picks its Q/K side. bf16 or fp16 Q/K runs VC-Attention and E4M3
+        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3
         Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
         and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
         E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
@@ -2912,7 +2912,7 @@ class BatchPrefillTSWrapper:
             Scale applied to the attention output.
         vc_config : VCAttentionConfig, optional
             A VC-Attention recipe. Requires fixed dense tensors, head_dim 128,
-            equal Q and K/V head counts and E4M3 V. bf16 or fp16 Q/K selects
+            equal Q and K/V head counts and E4M3 V. bf16 Q/K selects
             VC-Attention-QK16, E4M3 Q/K selects VC-Attention-QK8.
         sage : SageAttentionConfig, optional
             Sage attention recipe: 8-bit Q/K with per-block scales, E4M3 V with
