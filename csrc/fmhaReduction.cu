@@ -111,6 +111,21 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // The warpGrpThreadIdx.
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
+  // Whether one thread per row computes the attention sink term (see the prologue below).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1030)
+  bool constexpr ComputesSinkTermPerRow{true};
+#else
+  bool constexpr ComputesSinkTermPerRow{false};
+#endif
+  // The prologue ends with a __syncthreads() that every thread must reach, and which threads exit
+  // early depends on the sequence lengths loaded below. So, on that path, wait for the primary
+  // kernel before loading them.
+  if (ComputesSinkTermPerRow && params.ptrAttentionSinks != nullptr) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+  }
+
   // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
   // Fixed-Q batches are packed by mMaxSeqLenQ; grouped CTA coverage can include padded rows.
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
@@ -219,6 +234,37 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // The total number of rows in the partial buffers.
   int32_t numRowsInPartialBuffers{TileSizePerCtaQ};
 
+  // The attention sink term is evaluated in FP64 (M_LOG2E is a double), and all threads of a row
+  // need the same value. Compute capability 10.3 runs FP64 at 1/64 of the FP32 rate, so there one
+  // thread per row computes it here, from the same max (the same fmaxf sequence as the reduction
+  // loop below) and with the same expression, so the result is bit-identical to computing it in
+  // every thread. Where FP64 is fast, this extra pass costs more than it saves. The primary kernel
+  // was waited for at the top of this kernel.
+  __shared__ float attentionSinkVals[ComputesSinkTermPerRow ? TileSizePerCtaQ : 1];
+  // The first row and the number of rows processed by this CTA.
+  int32_t const firstRowIdx{startSliceIdx * NumRowsPerSlice};
+  int32_t const numRowsPerCta{(endSliceIdx - startSliceIdx) * NumRowsPerSlice};
+  if (ComputesSinkTermPerRow && attentionSinksPtr != nullptr && numRowsPerCta > 0) {
+    for (int32_t ii = warpGrpThreadIdx; ii < numRowsPerCta; ii += NumThreadsPerCta) {
+      int32_t const validRowIdx{min(firstRowIdx + ii, numValidRows - 1)};
+      // The local headIdxO (see the mapping of validRowIdx in the reduction loop).
+      int32_t const localHeadIdxO{groupsTokensHeadsQ ? validRowIdx % params.mNumHeadsQPerKv
+                                                     : validRowIdx};
+      float2 const* rowPartialStatsPtr = partialStatsPtr + validRowIdx;
+      float maxVal{-FLT_MAX};
+      for (int32_t jj = 0; jj < numCtasKv; jj += UnrollSize) {
+#pragma unroll
+        for (int32_t kk = 0; kk < UnrollSize; ++kk) {
+          int32_t ctaIdxKv = min(jj + kk, numCtasKv - 1);
+          maxVal = fmaxf(maxVal, rowPartialStatsPtr[ctaIdxKv * numRowsInPartialBuffers].x);
+        }
+      }
+      attentionSinkVals[ii] =
+          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+    }
+    __syncthreads();
+  }
+
   // Iterate over different slices.
   // Split the reduction work across multiple CtasKv to reduce the latency.
   for (int32_t sliceIdx = startSliceIdx; sliceIdx < endSliceIdx; ++sliceIdx) {
@@ -299,7 +345,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     // Update the sums with the attention sink value.
     if (attentionSinksPtr != nullptr) {
       float attentionSinkVal =
-          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+          ComputesSinkTermPerRow
+              ? attentionSinkVals[rowIdx - firstRowIdx]
+              : exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
       // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
       // has also included the 448.f quantization scale.
       sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
