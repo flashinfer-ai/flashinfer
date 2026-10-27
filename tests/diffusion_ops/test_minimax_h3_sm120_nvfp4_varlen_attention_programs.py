@@ -17,8 +17,11 @@ and ``minimax_h3_sm120_varlen_attention_nvfp4_nodelta`` (no CUDA device): each p
 symbol the device unit defines and the binding declares, the binding namespace, the exported ``run`` entry,
 the FFI checks header), its digests follow from the file bytes, its JIT spec carries the target flags,
 ``--fmad=false`` and the recorded options, and the host module's program routing, grid rules (the
-overlapped form's included), head-major unit rows and Q slot count are what the kernels expect."""
+overlapped form's included), head-major unit rows and Q slot count are what the kernels expect; the
+overlapped form launches its producers first, then the lead and the tail attention, and the shared host
+helpers key workspace sets by owner (stream, and capture under CUDA-graph capture) and lock per stream."""
 
+import contextlib
 import hashlib
 import math
 import re
@@ -28,6 +31,9 @@ import pytest
 import torch
 
 from flashinfer.diffusion_ops import cake_minimax_h3_sm120_nvfp4_varlen_attention as ops
+from flashinfer.diffusion_ops import (
+    cake_minimax_h3_sm120_quant_varlen_attention as quant_ops,
+)
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
     MINIMAX_H3_HEAD_DIM,
 )
@@ -65,8 +71,8 @@ NAMED = {
     "ATTENTION_NODELTA_LEAD": ATTENTION_NODELTA_LEAD,
     "ATTENTION_NODELTA_TAIL": ATTENTION_NODELTA_TAIL,
 }
-# The overlapped form's lead attention programs: plain launches (no programmatic dependent launch).
-PLAIN = ("ATTENTION_LEAD", "ATTENTION_NODELTA_LEAD")
+# The overlapped form's producers: its first launch, a plain launch (no programmatic dependent launch).
+PLAIN = ("PREPROCESS_HEAD_MAJOR",)
 DYNAMIC_SMEM = {
     "PREPROCESS": 16512,
     "STATS": 17024,
@@ -76,7 +82,7 @@ DYNAMIC_SMEM = {
     "ATTENTION_NODELTA": 48128,
     "ATTENTION_WS": 80896,
     "ATTENTION_WS_NODELTA": 80896,
-    "PREPROCESS_HEAD_MAJOR": 16512,
+    "PREPROCESS_HEAD_MAJOR": 49536,
     "ATTENTION_LEAD": 66560,
     "ATTENTION_TAIL": 66560,
     "ATTENTION_NODELTA_LEAD": 48128,
@@ -85,6 +91,8 @@ DYNAMIC_SMEM = {
 THREADS = {identifier: 256 for identifier in NAMED} | {
     "ATTENTION_WS": 384,
     "ATTENTION_WS_NODELTA": 384,
+    # three 256-thread producer workers per CTA
+    "PREPROCESS_HEAD_MAJOR": 768,
 }
 PREPROCESS_ARGS = (
     "Q",
@@ -211,10 +219,16 @@ def test_the_loader_publishes_the_thirteen_programs() -> None:
             # the fused pre-processing's grid barrier needs every CTA co-resident
             "cooperative": identifier == "PREPROCESS",
             "dynamic_smem_bytes": DYNAMIC_SMEM[identifier],
-            # the overlapped form's lead attention starts after every earlier launch of the stream
+            # the overlapped form's producers start after every earlier launch of the stream; its lead
+            # and tail attention are programmatic dependents of the producers and of the lead
             "use_pdl": identifier not in PLAIN,
         }
         assert program.needs_device_linking is False
+    assert {
+        identifier
+        for identifier, program in NAMED.items()
+        if not program.launch_record()["use_pdl"]
+    } == {"PREPROCESS_HEAD_MAJOR"}
     # the two quantizer work orders and the four attention programs share their argument lists
     assert QUANTIZE_KV.args == QUANTIZE_KV_HBLK64.args
     assert QUANTIZE_KV.name != QUANTIZE_KV_HBLK64.name
@@ -307,10 +321,11 @@ def _plan(bounds, num_heads=1):
     )
 
 
-OVERLAP = (ATTENTION_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_TAIL)
+# The overlapped form in launch order: producers, lead attention, tail attention.
+OVERLAP = (PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)
 OVERLAP_NODELTA = (
-    ATTENTION_NODELTA_LEAD,
     PREPROCESS_HEAD_MAJOR,
+    ATTENTION_NODELTA_LEAD,
     ATTENTION_NODELTA_TAIL,
 )
 
@@ -439,9 +454,12 @@ def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
 @pytest.mark.parametrize(
     ("num_sms", "num_units", "expected"),
     [
-        (170, 1792, (128, 126, 42)),
-        (188, 1792, (142, 138, 46)),
+        # (lead, producers, tail): the producers take one CTA (three workers) per SM the lead leaves free,
+        # at most 3 * P CTAs
+        (170, 1792, (128, 42, 42)),
+        (188, 1792, (142, 46, 46)),
         (170, 16, (16, 126, 42)),
+        (188, 1, (1, 138, 46)),
         (188, 0, (1, 138, 46)),
         (171, 1792, None),
         (187, 1792, None),
@@ -460,11 +478,11 @@ def test_overlap_grids_follow_the_sm_count(num_sms, num_units, expected) -> None
 @pytest.mark.parametrize(
     ("num_sms", "padded_tokens", "expected"),
     [
-        (170, None, (128, 126, 42)),
-        (170, 16384, (128, 126, 42)),
-        (170, 16512, (106, 192, 64)),
-        (188, 16384, (142, 138, 46)),
-        (188, 16512, (142, 138, 46)),
+        (170, None, (128, 42, 42)),
+        (170, 16384, (128, 42, 42)),
+        (170, 16512, (106, 64, 64)),
+        (188, 16384, (142, 46, 46)),
+        (188, 16512, (142, 46, 46)),
         (171, 16512, None),
     ],
 )
@@ -475,6 +493,146 @@ def test_long_plans_overlap_at_the_long_width(num_sms, padded_tokens, expected) 
         )
         == expected
     )
+
+
+# The custom op's tensor arguments from ``tok_seg`` through ``qm_sf_words``: stand-ins, the launches are
+# recorded.
+IMPL_TENSORS = (
+    "tok_seg",
+    "cu_seqlens",
+    "seg_tile_begin",
+    "tile_table",
+    "unit_table",
+    "q4",
+    "k4",
+    "q_sf",
+    "k_sf",
+    "qm4",
+    "qm_sf",
+    "vt4",
+    "v_sf",
+    "q_mean",
+    "mean_k",
+    "partials",
+    "counters",
+    "barrier",
+    "hctr",
+    "q4_rows",
+    "k4_rows",
+    "k_sf_rows",
+    "vt4_rows",
+    "v_sf_rows",
+    "q_sf_words",
+    "qm_sf_words",
+)
+
+
+@pytest.mark.parametrize("overlap", [OVERLAP, OVERLAP_NODELTA])
+def test_overlapped_form_launches_the_producers_first(overlap, monkeypatch) -> None:
+    """The overlapped form launches the producers, then the lead attention, then the tail attention, with
+    the arguments of their kernels.  Before the first eager call of a form on a device, one no-work
+    instance runs in the same order on the call's own head-control words (one head, one CTA per launch);
+    a call during graph capture runs none."""
+    launches = []
+    monkeypatch.setattr(
+        ops,
+        "_nvfp4_entry",
+        lambda _target, slot: lambda *args: launches.append((slot, args)),
+    )
+    monkeypatch.setattr(
+        ops,
+        "tvm_ffi",
+        types.SimpleNamespace(use_raw_stream=lambda *_args: contextlib.nullcontext()),
+    )
+    monkeypatch.setattr(ops, "_ffi_device", lambda _index: None)
+    monkeypatch.setattr(ops, "_NVFP4_OVERLAP_LOADED", set())
+    capturing = [True]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    producers, lead, tail = (ops._NVFP4_PROGRAMS.index(program) for program in overlap)
+    tokens, heads, scale = 2100, 3, 0.25
+    q = torch.empty(tokens, heads, MINIMAX_H3_HEAD_DIM)
+    # statistics tiles, Q slots, padded tokens, K blocks, units
+    facts = (5, 1, 2176, 17, 51)
+    # producer / second / lead slots, their grids, the tail slot and grid, units per head
+    grids = (producers, -1, lead, 42, 1, 128, tail, 42, 17)
+
+    def call() -> None:
+        ops._minimax_h3_sm120_varlen_attention_nvfp4_impl(
+            q, "k", "v", "out", *IMPL_TENSORS, *facts, *grids, scale, 7, "sm_120a"
+        )
+
+    producer_args = (
+        q,
+        "k",
+        "v",
+        "tile_table",
+        "seg_tile_begin",
+        "tok_seg",
+        "cu_seqlens",
+        "partials",
+        "counters",
+        "mean_k",
+        "q_mean",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+    )
+    attention_args = (
+        "q4_rows",
+        "k4_rows",
+        "k_sf_rows",
+        "vt4_rows",
+        "v_sf_rows",
+        "out",
+        "q_sf_words",
+        "qm4",
+        "qm_sf_words",
+        "seg_tile_begin",
+        "unit_table",
+    )
+    work = [
+        (producers, (*producer_args, "hctr", 5, tokens, 2176, heads, 17, 42, 1, 1)),
+        (lead, (*attention_args, 51, heads, 17, scale, "hctr", 17, 128, 42, 128, 1, 1)),
+        (tail, (*attention_args, 51, heads, 17, scale, "hctr", 17, 128, 42, 42, 1, 1)),
+    ]
+    no_work = [
+        (producers, (*producer_args, "hctr", 0, tokens, 0, 1, 17, 1, 1, 1)),
+        (lead, (*attention_args, 0, 1, 17, scale, "hctr", 1, 1, 1, 1, 1, 1)),
+        (tail, (*attention_args, 0, 1, 17, scale, "hctr", 1, 1, 1, 1, 1, 1)),
+    ]
+    call()  # during graph capture: the call's launches only
+    assert launches == work
+    launches.clear()
+    capturing[0] = False
+    call()  # the first eager call: the no-work instance, then the call
+    assert launches == no_work + work
+    launches.clear()
+    call()
+    assert launches == work
+
+
+def test_workspace_owners_and_stream_locks(monkeypatch) -> None:
+    """An eager call's workspace owner is its (device, stream); a call during graph capture also carries
+    the capture's id, so graphs captured one after another on one stream get separate workspace sets.  The
+    host lock is one per (device, stream), whatever the capture."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert quant_ops._owner(0, 1234) == (0, 1234)
+    capture_ids = iter((7, 8, 0))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(quant_ops, "_capture_id", lambda _stream: next(capture_ids))
+    assert quant_ops._owner(0, 1234) == (0, 1234, 7)
+    assert quant_ops._owner(0, 1234) == (0, 1234, 8)
+    # a stream that takes part in no capture is an eager owner
+    assert quant_ops._owner(0, 1234) == (0, 1234)
+    lock = quant_ops._stream_lock(0, 1234)
+    assert lock is quant_ops._stream_lock(0, 1234)
+    assert lock is not quant_ops._stream_lock(0, 1235)
+    assert lock is not quant_ops._stream_lock(1, 1234)
 
 
 def test_head_major_unit_rows_cover_every_unit_once() -> None:
