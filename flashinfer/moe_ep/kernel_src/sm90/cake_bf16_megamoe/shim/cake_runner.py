@@ -50,6 +50,8 @@ __all__ = [
     "COMBINE_WIRES",
     "COMBINE_WIRE_PER_SHAPE_MAX_TOKENS",
     "COMBINE_WIRE_ENV",
+    "COMPACT_FORM_ENV",
+    "COPY_FORMS",
     "FUSED_BEGIN_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
@@ -65,6 +67,7 @@ __all__ = [
     "PDL_LATE_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
     "GRID_DISPATCH_MIN_TOKENS_ENV",
+    "PUBLISH_FORM_ENV",
     "Sm90CakeBf16MoERunner",
 ]
 
@@ -151,6 +154,14 @@ FUSED_BEGIN_LEVELS = (0, 1, 2)
 _FUSED_PREFIX_MAX_KEYS = (
     1024  # E * ep + 2 * ep bound of the fused prefix (dispatch smem)
 )
+# Kernel forms of the compact (inbox rows -> expert-major activation matrix) and of
+# the pre-reduced combine publish: 0 = the one-block-per-row compact and the
+# route-serial publish, 1 = the latency-pipelined compact (several rows in flight,
+# loads hoisted before stores) and the load-hoisted publish.  Both forms write
+# the same bytes, so ranks may run different forms.
+COMPACT_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM"
+PUBLISH_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM"
+COPY_FORMS = (0, 1)
 
 
 def _env_flag(name: str) -> bool:
@@ -214,6 +225,22 @@ def _fused_begin_default() -> int:
     if raw in ("1", "2"):
         return int(raw)
     raise ValueError(f"{FUSED_BEGIN_ENV} must be one of 0, 1, 2, got {raw!r}")
+
+
+def _form_default(env: str) -> int:
+    raw = os.environ.get(env, "0").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return 0
+    if raw in ("1", "true", "on", "yes"):
+        return 1
+    raise ValueError(f"{env} must be 0 or 1, got {raw!r}")
+
+
+def _form(value: int | None, env: str, name: str) -> int:
+    form = _form_default(env) if value is None else int(value)
+    if form not in COPY_FORMS:
+        raise ValueError(f"{name} must be one of {COPY_FORMS}, got {value!r}")
+    return form
 
 
 def _combine_wire_default(token_capacity: int) -> str:
@@ -297,6 +324,8 @@ class Sm90CakeBf16MoERunner:
         fused_begin: int | None = None,
         fused_dispatch_max_tokens: int | None = None,
         grid_dispatch_min_tokens: int | None = None,
+        compact_form: int | None = None,
+        publish_form: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -377,6 +406,8 @@ class Sm90CakeBf16MoERunner:
         ):
             grid_min = 0  # dedup payload mode only; the key tables must fit in smem
         self._grid_dispatch_min_tokens = grid_min
+        self._compact_form = _form(compact_form, COMPACT_FORM_ENV, "compact_form")
+        self._publish_form = _form(publish_form, PUBLISH_FORM_ENV, "publish_form")
         # the per-route wire publishes through this package's twin under PDL
         self._own_per_route = (
             bool(self._pdl & PDL_EDGE_PUBLISH)
@@ -503,6 +534,16 @@ class Sm90CakeBf16MoERunner:
     def grid_dispatch_min_tokens(self) -> int:
         """Smallest round (tokens) that takes the grid-strided single-launch dispatch (0 = off)."""
         return self._grid_dispatch_min_tokens
+
+    @property
+    def compact_form(self) -> int:
+        """Compact kernel form (0 or 1; see ``COMPACT_FORM_ENV``)."""
+        return self._compact_form
+
+    @property
+    def publish_form(self) -> int:
+        """Pre-reduced publish kernel form (0 or 1; see ``PUBLISH_FORM_ENV``)."""
+        return self._publish_form
 
     @property
     def fused_begin(self) -> int:
@@ -874,6 +915,7 @@ class Sm90CakeBf16MoERunner:
                         pipe._round,
                         1 if self._combine_wire in _PREREDUCED_WIRES else 0,
                         self._pdl_flag(PDL_EDGE_COMPACT),
+                        self._compact_form,
                     )
                 with _record_stage("fc1", nv):
                     self.gemm.fc1(
@@ -911,6 +953,7 @@ class Sm90CakeBf16MoERunner:
                             self._pub_blocks_done,
                             split,
                             self._pdl_flag(PDL_EDGE_PUBLISH),
+                            self._publish_form,
                         )
                     with _record_stage("combine_tail", nv):
                         self.tail_module.sm90_cake_combine_tail_prereduced_bf16(

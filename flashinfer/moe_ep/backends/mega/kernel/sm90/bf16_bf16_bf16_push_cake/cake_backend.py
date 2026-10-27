@@ -260,6 +260,12 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} grid_dispatch_min_tokens must be an int >= 0 or None, got "
                 f"{kcfg.grid_dispatch_min_tokens!r}"
             )
+        for name in ("compact_form", "publish_form"):
+            value = getattr(kcfg, name)
+            if value is not None and (isinstance(value, bool) or value not in (0, 1)):
+                raise MoEEpConfigError(
+                    f"{_NAME} {name} must be 0, 1 or None, got {value!r}"
+                )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -373,6 +379,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 fused_begin=kcfg.fused_begin,
                 fused_dispatch_max_tokens=kcfg.fused_dispatch_max_tokens,
                 grid_dispatch_min_tokens=kcfg.grid_dispatch_min_tokens,
+                compact_form=kcfg.compact_form,
+                publish_form=kcfg.publish_form,
             )
         except Exception:
             pipe.destroy()
@@ -404,6 +412,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.fused_begin,
             kcfg.fused_dispatch_max_tokens,
             kcfg.grid_dispatch_min_tokens,
+            kcfg.compact_form,
+            kcfg.publish_form,
             float(kcfg.init_timeout_s),
         )
 

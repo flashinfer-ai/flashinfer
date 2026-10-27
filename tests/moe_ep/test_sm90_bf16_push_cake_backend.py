@@ -143,6 +143,8 @@ def _build_layer(
     combine_wire: str | None = None,
     token_capacity: int = TOKEN_CAPACITY,
     seed: int = 7,
+    compact_form: int | None = None,
+    publish_form: int | None = None,
     **dispatch_kwargs,
 ):
     from flashinfer.moe_ep import (
@@ -184,6 +186,8 @@ def _build_layer(
                 dedup_dispatch=dedup_dispatch,
                 clamp_limit=clamp_limit,
                 combine_wire=combine_wire,
+                compact_form=compact_form,
+                publish_form=publish_form,
                 **dispatch_kwargs,
             ),
             quantize_input=True,
@@ -272,6 +276,55 @@ def test_ep1_forward_repeated_and_deterministic(
     # bitwise run-to-run determinism (recorded; the kernels have a fixed reduction order)
     for repeat in outputs[1:]:
         assert torch.equal(repeat, outputs[0])
+
+
+# Token counts that take each path of the latency-pipelined compact on a 132-SM part
+# (grid 4 x SMs = 528 blocks; m = TOP_K x tokens rows): one row per block, four rows
+# per block, one warp per row.
+COPY_FORM_TOKENS = (7, TOKEN_CAPACITY, 700, 2048)
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "masked", "hot", "dup_rank"])
+def test_ep1_copy_forms_bitwise(mode: str, wire: str) -> None:
+    """compact_form / publish_form 1 write the same bytes as the forms 0."""
+    device = torch.device("cuda", 0)
+    capacity = max(COPY_FORM_TOKENS)
+    layers = {
+        forms: _build_layer(
+            1,
+            0,
+            device,
+            combine_wire=wire,
+            token_capacity=capacity,
+            compact_form=forms[0],
+            publish_form=forms[1],
+        )
+        for forms in ((0, 0), (1, 1), (1, 0), (0, 1))
+    }
+    _, w13, w2 = layers[(0, 0)]
+    for num_tokens in COPY_FORM_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 31 + num_tokens, device, mode=mode
+        )
+        outputs = {}
+        for forms, (layer, _w13, _w2) in layers.items():
+            outputs[forms] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs[(1, 1)],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep1 {wire} {mode} T={num_tokens} forms=1,1",
+        )
+        for forms, output in outputs.items():
+            assert torch.equal(output, outputs[(0, 0)]), (
+                f"forms {forms} differ at T={num_tokens}"
+            )
 
 
 @requires_sm90
@@ -709,6 +762,65 @@ def test_ep_grid_dispatch_matches_vendored(mode: str) -> None:
         w2,
         label=f" ep{world_size} rank{rank} {mode} grid",
     )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "hot", "dup_remote", "empty_rank"])
+def test_ep_copy_forms_bitwise(mode: str, wire: str) -> None:
+    """The copy forms write the same bytes on every rank, also when ranks mix forms."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = max(COPY_FORM_TOKENS)
+    mixed = rank % 2
+    layers = {
+        name: _build_layer(
+            world_size,
+            rank,
+            device,
+            combine_wire=wire,
+            token_capacity=capacity,
+            compact_form=forms[0],
+            publish_form=forms[1],
+        )
+        for name, forms in (
+            ("f0", (0, 0)),
+            ("f1", (1, 1)),
+            ("mixed", (mixed, 1 - mixed)),
+        )
+    }
+    _, w13, w2 = layers["f0"]
+    for num_tokens in COPY_FORM_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            71 + rank + num_tokens,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs["f1"],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} {wire} {mode} T={num_tokens} forms=1,1",
+        )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["f0"]), (
+                f"{name} differs at T={num_tokens}"
+            )
     dist.barrier()
 
 

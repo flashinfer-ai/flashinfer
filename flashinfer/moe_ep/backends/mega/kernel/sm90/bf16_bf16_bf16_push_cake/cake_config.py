@@ -74,6 +74,14 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     the fused small-round path.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``0`` =
     off).  It changes no stored value.
+
+    ``compact_form`` and ``publish_form`` select kernel forms that write the
+    same bytes: ``1`` runs the latency-pipelined compact (several rows in
+    flight, loads issued before stores) and the load-hoisted pre-reduced
+    publish (a group's route loads issued before its fp32 fma chain), ``0``
+    the one-block-per-row compact and the route-serial publish.  ``None``
+    reads ``FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM`` /
+    ``FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM`` (default ``0``).
     """
 
     intermediate_size: int
@@ -90,3 +98,5 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     fused_begin: int | None = None
     fused_dispatch_max_tokens: int | None = None
     grid_dispatch_min_tokens: int | None = None
+    compact_form: int | None = None
+    publish_form: int | None = None
