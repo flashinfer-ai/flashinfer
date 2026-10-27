@@ -21,7 +21,7 @@ def test_genphase_repeated_launches(monkeypatch, kind, early, ikr):
             kernel_variant="genphase",
             cluster_shape_mn=(4, 1),
             fc2_use_bulk=True,
-            apply_topk_at_fc1=early,
+            apply_routing_weights_before_fc2=early,
             reduce_topk_in_kernel=ikr,
         ),
     )

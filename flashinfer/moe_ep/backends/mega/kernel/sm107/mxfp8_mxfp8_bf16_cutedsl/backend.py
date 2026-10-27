@@ -31,6 +31,9 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
+    from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+        Sm107BlockScaledSymmBuffer,
+    )
     from ..mxfp8_mxfp4_bf16_cutedsl.config import (
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
@@ -51,6 +54,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     # compute(output=None) returns a view into the workspace.
     supports_output_view = True
+    supports_auto_workspaces = True
 
     def __init__(
         self,
@@ -59,6 +63,20 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+
+    def coordinate_workspace_replacement(
+        self, workspace: Sm107BlockScaledSymmBuffer
+    ) -> bool:
+        from ..automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(
+        self, workspace: Sm107BlockScaledSymmBuffer | None = None
+    ) -> dict[str, Any]:
+        from ..automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -140,7 +158,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             allow_nondeterministic=k.in_kernel_fc2_reduce,
-            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             activation=k.activation,
             kernel_variant=k.kernel_variant,
             combine_dtype=k.combine_dtype,
@@ -162,14 +180,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
-        """Resolve the config's ``knobs`` field into shim-kwarg overrides.
-
-        ``None`` -> {} (the explicit config fields stand); a dict ->
-        validated explicit overrides; ``"cache"`` -> knob-cache lookup with
-        the built-in heuristic fallback.  The online ``"auto"`` sweep is not
-        supported on the engine path — the SM107 session bakes knobs at
-        construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
-        """
+        """Resolve fixed overrides or the automatic workspace's initial heuristic."""
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
@@ -183,6 +194,16 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     f"(valid: {sorted(KNOB_KEYS)})"
                 )
             return dict(k.knobs)
+        if k.knobs == "auto":
+            from ......kernel_src.sm107.next_cutedsl_megamoe import default_knobs
+
+            # Cache selection must be collective before it affects allocation.
+            return default_knobs(
+                fleet_params.max_tokens_per_rank,
+                quant_kind=k.kind,
+                kernel_variant=k.kernel_variant,
+                combine_dtype=k.combine_dtype,
+            )
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
             assert knobs is not None
@@ -194,11 +215,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     flush=True,
                 )
             return knobs
-        raise MoEEpConfigError(
-            "knobs='auto' (online sweep) is not supported by the SM107 "
-            "backends; run the offline tuner (python -m flashinfer.moe_ep.tune)"
-            " and use knobs=None, knobs='cache', or an explicit knob dict."
-        )
+        raise MoEEpConfigError("knobs must be None, 'cache', 'auto', or a dictionary")
 
     def validate_forward(
         self,
@@ -253,8 +270,15 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
                 t.scales.view(torch.uint8)
             )
-            workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
+            from ..routing_staging import stage_routes
+
+            stage_routes(
+                t.topk_ids,
+                t.topk_weights,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                workspace=workspace,
+            )
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
@@ -279,6 +303,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                     "compute() called before stage_inputs(); no token count is staged."
                 )
 
+        from ..automatic import prepare_auto_configuration
+
+        prepare_auto_configuration(
+            self, workspace, transformed_weights, output, num_tokens
+        )
         view = sm107_block_scaled_mega_moe(
             output,
             transformed_weights[0],
@@ -290,6 +319,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams):
+        if self._kernel_config.knobs == "auto":
+            return None
         from ......core.kernel.workspace_pool import knobs_pool_key
 
         k = self._kernel_config
@@ -314,7 +345,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             _resolve_gate_up_clamp(k),
             k.in_kernel_fc2_reduce,
             k.token_back_mode,
-            k.apply_topk_in_fc1,
+            k.apply_routing_weights_before_fc2,
             k.schedule_policy,
             k.work_id_mode,
             k.fc2_use_bulk,

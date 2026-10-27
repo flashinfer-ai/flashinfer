@@ -7,7 +7,6 @@ import torch
 
 from flashinfer.moe_ep import tune
 
-
 _GEOMETRY = [
     "--hidden",
     "7168",
@@ -28,7 +27,9 @@ def dispatched(monkeypatch):
     original = tune.importlib.import_module
 
     def load(name, package=None):
-        if name.startswith(".backends.mega.kernel.") and name.endswith(".tuner"):
+        if name.startswith(".backends.mega.kernel.") and name.endswith(
+            (".tuner", ".next_tuning")
+        ):
             calls.append(name)
             return SimpleNamespace(run_tuning=lambda args: 17)
         return original(name, package)
@@ -77,9 +78,14 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-topk-in-fc1"],
+        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
-        ["--arch", "sm100", "--no-apply-topk-in-fc1", "--allow-nondeterministic"],
+        [
+            "--arch",
+            "sm100",
+            "--no-apply-routing-weights-before-fc2",
+            "--allow-nondeterministic",
+        ],
         ["--arch", "sm100", "--no-do-finalize", "--combine-dtype", "nvfp4"],
     ],
 )
@@ -89,12 +95,24 @@ def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsy
     assert capsys.readouterr().err
 
 
+def test_v1_cache_option_is_rejected(dispatched, capsys):
+    with pytest.raises(SystemExit) as exc:
+        tune.main([*_GEOMETRY, "--autotune-cache", "cache.json"])
+    assert exc.value.code == 2
+    assert not dispatched
+    assert "unrecognized arguments: --autotune-cache" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "options,do_finalize",
     [([], True), (["--do-finalize"], True), (["--no-do-finalize"], False)],
 )
+@pytest.mark.parametrize(
+    "routing_option",
+    ["--no-apply-routing-weights-before-fc2", "--no-apply-topk-in-fc1"],
+)
 def test_finalization_and_routing_options_reach_nvfp4_tuner(
-    monkeypatch, options, do_finalize
+    monkeypatch, options, do_finalize, routing_option
 ):
     received = []
     monkeypatch.setattr(
@@ -108,12 +126,12 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
             "--arch",
             "sm100",
             *options,
-            "--no-apply-topk-in-fc1",
+            routing_option,
         ]
     )
     (args,) = received
     assert args.do_finalize == do_finalize
-    assert not args.apply_topk_in_fc1
+    assert not args.apply_routing_weights_before_fc2
 
 
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
@@ -222,3 +240,27 @@ def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched)
         == 17
     )
     assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize(
+    "options",
+    [[], ["--no-do-finalize", "--no-apply-routing-weights-before-fc2"]],
+)
+def test_next_blackwell_dispatch(kind, options, dispatched):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm100",
+                "--dtype",
+                kind,
+                "--implementation",
+                "next",
+                *options,
+            ]
+        )
+        == 17
+    )
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]

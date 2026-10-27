@@ -95,6 +95,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "sm90_fp8_* / sm90_mxfp4 / sm90_bf16 dtypes select sm90",
     )
     parser.add_argument(
+        "--implementation",
+        choices=("default", "next"),
+        default="default",
+        help="SM100 standard kernel implementation; next uses managed autotune v2",
+    )
+    parser.add_argument(
         "--shared-expert",
         action="store_true",
         help="sm120_mxfp4_mxfp8: tune the in-kernel FP8 shared-expert variant",
@@ -181,6 +187,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "after EP communication completes (SM100 NVFP4)",
     )
     parser.add_argument(
+        "--apply-routing-weights-before-fc2",
         "--apply-topk-in-fc1",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -320,6 +327,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if args.dtype == "sm120_mxfp4_mxfp8":
+        if args.implementation != "default":
+            print("--implementation next requires SM100", file=sys.stderr)
+            return 2
         if args.arch != "auto":
             print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
             return 2
@@ -365,10 +375,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if not args.do_finalize or not args.apply_topk_in_fc1:
-        if family != "sm100" or args.dtype != "nvfp4":
+    next_standard = args.implementation == "next"
+    if next_standard and (
+        family != "sm100" or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")
+    ):
+        print("--implementation next requires SM100 NVFP4 or MXFP8", file=sys.stderr)
+        return 2
+
+    if not args.do_finalize or not args.apply_routing_weights_before_fc2:
+        if family != "sm100" or not (
+            args.dtype == "nvfp4"
+            or (next_standard and args.kernel_variant == "inference")
+        ):
             print(
-                "caller finalization and routing-weight placement require SM100 NVFP4",
+                "caller finalization and routing-weight placement require SM100 "
+                "NVFP4 or the next standard implementation",
                 file=sys.stderr,
             )
             return 2
@@ -413,9 +434,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         getattr(args, name) != 1.0
         for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
     )
-    if family != "sm107" and (activation_requested or scaling_requested):
+    if (
+        family != "sm107"
+        and not (next_standard and args.kernel_variant == "inference")
+        and (activation_requested or scaling_requested)
+    ):
         print(
-            "activation and normalization options require --arch sm107", file=sys.stderr
+            "activation and normalization options require SM107 or the next "
+            "standard SM100 implementation",
+            file=sys.stderr,
         )
         return 2
     if scaling_requested and args.dtype != "nvfp4":
@@ -423,7 +450,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     tuner = importlib.import_module(
-        f".backends.mega.kernel.{family}.{backend}.tuner", __package__
+        ".backends.mega.kernel.sm100.next_tuning"
+        if next_standard
+        else f".backends.mega.kernel.{family}.{backend}.tuner",
+        __package__,
     )
     return tuner.run_tuning(args)
 

@@ -468,6 +468,60 @@ def test_rejects_mismatched_context():
         cake_causal_conv1d_kcp_forward(p.x_local[:-1].contiguous(), p.w, p.ctx)
 
 
+def test_kcp_keeps_fp32_taps_and_no_bias():
+    """The KCP path keeps the package's pre-round-6 contract: BF16 taps are refused with the FP32 error text
+    (the training routes accept them), and there is no bias keyword."""
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    with pytest.raises(ValueError, match="weight must be torch.float32"):
+        cake_causal_conv1d_kcp_forward(p.x_local, p.w.to(torch.bfloat16), p.ctx)
+    with pytest.raises(ValueError, match="weight must be torch.float32"):
+        cake_causal_conv1d_kcp_backward(
+            p.x_local,
+            p.w.to(torch.bfloat16),
+            p.ctx,
+            p.dy_local,
+            torch.empty(0, p.C, dtype=torch.bfloat16, device=device),
+        )
+    bias = torch.zeros(p.C, device=device)
+    with pytest.raises(TypeError):
+        cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx, bias=bias)
+    with pytest.raises(TypeError):
+        cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, bias)
+
+
+def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
+    """KCP plans its launches with ``cake_jit.plan(..., legacy=True)``: C = 1280 keeps ``(ct_vec, n_sub,
+    n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)), and the forward's ``y`` stays
+    bitwise the unpartitioned forward's."""
+
+    from flashinfer.cake_causal_conv1d_train_backend import cake_jit
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    geometry = {"threads": 128, "vec": 8}
+    legacy = cake_jit.plan(5000, 1280, 2, geometry=geometry, legacy=True)
+    assert (legacy["ct_vec"], legacy["n_sub"], legacy["n_ch_tiles"]) == (128, 1, 2)
+    routed = cake_jit.plan(5000, 1280, 2, geometry=geometry, role="bwd")
+    assert (routed["ct_vec"], routed["n_sub"], routed["n_ch_tiles"]) == (32, 4, 5)
+    calls = []
+    original = conv_kcp.plan
+
+    def recording_plan(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(conv_kcp, "plan", recording_plan)
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
+    y, hist = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
+    dx, dw = cake_causal_conv1d_kcp_backward(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
+    y_full = cake_causal_conv1d_train_forward(p.x, p.w, p.cu)
+    assert torch.equal(y, y_full[p.l2g])
+    assert torch.isfinite(dw).all() and dx.shape == p.x_local.shape
+
+
 @pytest.mark.parametrize("form", ["knob", "keyword"])
 def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     """The graph-replay option: under ``_set_test_knobs({"graph": "replay"})`` (form ``knob``) or the public keyword

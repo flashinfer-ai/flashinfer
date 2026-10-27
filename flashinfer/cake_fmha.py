@@ -8,6 +8,8 @@ decode entrypoint and does not change ordinary-call behavior.
 from __future__ import annotations
 
 import copy
+import functools
+import heapq
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -49,7 +51,7 @@ from .cake_fmha_request_ordered import (
 from .cake_fmha_request_ordered import (
     _run_cake_fmha_request_ordered_paged_decode as _run_cake_fmha_request_ordered_paged_decode,
 )
-from .utils import get_compute_capability, log2e
+from .utils import get_compute_capability, get_device_sm_count, log2e
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,12 @@ class CakeFmhaContextRoute:
     return_lse: bool
     enable_sink: bool
     exact_profile: Literal["q511", "q257"] | None = None
+    # Both scales are device tensors (FP8 / NVFP4): the program reads them
+    # through device pointers instead of host scalars.
+    device_scales: bool = False
+    # The generated program serving the route (an identifier of
+    # ``_CONTEXT_PROGRAMS``), or ``None`` for the component's JIT module.
+    program: str | None = None
 
 
 # These are the exact optimized routes in the pinned 57,280-cell matrix.  Keep
@@ -260,6 +268,378 @@ _ALIGNED_HOST_PARAMS = (
     "num_kv_heads",
     "batch_size",
 )
+
+
+# The generated paged context programs: the units ``csrc/cake_fmha_context_bf16/``,
+# ``csrc/cake_fmha_context_fp8/`` and ``csrc/cake_fmha_context_nvfp4/`` whose
+# loaders ``flashinfer.jit.cake_fmha_context_{bf16,fp8,nvfp4}`` publish one
+# ``CakeProgram`` constant per program.  Every program is causal, without LSE
+# or sink.  Per target, a route key ``(component, scale form, num_q_heads,
+# num_kv_heads, pack_g, num_m_blocks, page_size, exact class)`` names the
+# program serving it.  The scale form is ``"host"`` (host-scalar scales; the
+# BF16 output scale is 1) or ``"device"`` (both FP8 / NVFP4 scales are device
+# tensors).  The key holds neither the batch size nor the L2 section: a program
+# serves any batch (when the work units do not fill the last L2 section, the
+# program walks that section in another order, which changes the tile order
+# only, not a tile's arithmetic).  The exact class names a one-tile BF16 launch
+# class (``_context_bf16_exact_profile``); ``None`` serves any batch.  A key
+# without a program keeps the component's JIT module.
+_CONTEXT_PROGRAM_ROUTES: dict[
+    str, dict[tuple[str, str, int, int, int, int, int, str | None], str]
+] = {
+    "sm100a": {
+        ("context_bf16", "host", 64, 8, 8, 256, 16, None): "Q8192",
+        ("context_bf16", "host", 32, 4, 8, 2, 16, None): "B128",
+        ("context_bf16", "host", 10, 2, 5, 11, 32, "q511"): "Q511_SM100A",
+        ("context_bf16", "host", 10, 2, 5, 6, 1024, "q257"): "Q257_SM100A",
+        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256",
+        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR",
+        ("context_nvfp4", "host", 32, 4, 8, 16, 16, None): "Q511_SM100A",
+        ("context_nvfp4", "device", 32, 4, 8, 16, 16, None): "Q511_SCALE_PTR_SM100A",
+    },
+    "sm103a": {
+        ("context_bf16", "host", 64, 8, 8, 256, 16, None): "Q8192",
+        ("context_bf16", "host", 32, 4, 8, 2, 16, None): "B128",
+        ("context_bf16", "host", 10, 2, 5, 11, 32, "q511"): "Q511_SM103A",
+        ("context_bf16", "host", 10, 2, 5, 6, 1024, "q257"): "Q257_SM103A",
+        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256",
+        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR",
+        ("context_nvfp4", "host", 32, 4, 8, 16, 16, None): "Q511_SM103A",
+        ("context_nvfp4", "device", 32, 4, 8, 16, 16, None): "Q511_SCALE_PTR_SM103A",
+    },
+}
+# ``(component, identifier)`` -> the delivered record the host pins: the
+# program name, the m-block count of its shape class (``None``: the launch
+# passes it) and whether it launches one CTA per tile (otherwise at most one
+# persistent CTA per SM).  A loader whose record differs fails closed at load.
+_CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
+    ("context_bf16", "Q8192"): (
+        "cake_fmha_context_bf16_eb5b942877557703876d",
+        256,
+        False,
+    ),
+    ("context_bf16", "B128"): ("cake_fmha_context_bf16_31373706c9fcb1a2b1db", 2, False),
+    ("context_bf16", "Q511_SM100A"): (
+        "cake_fmha_context_bf16_fe2dfd2eb24d75a1bccc",
+        11,
+        True,
+    ),
+    ("context_bf16", "Q511_SM103A"): (
+        "cake_fmha_context_bf16_8bd7d679916961178c03",
+        11,
+        True,
+    ),
+    ("context_bf16", "Q257_SM100A"): (
+        "cake_fmha_context_bf16_d400e81a0185922f0097",
+        6,
+        True,
+    ),
+    ("context_bf16", "Q257_SM103A"): (
+        "cake_fmha_context_bf16_5fa928327be121e0c987",
+        6,
+        True,
+    ),
+    ("context_fp8", "B256"): ("cake_fmha_context_fp8_6f7e8b77c2309a9c63a2", 1, False),
+    ("context_fp8", "B256_SCALE_PTR"): (
+        "cake_fmha_context_fp8_a586c83f6eca2799c39e",
+        1,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SM100A"): (
+        "cake_fmha_context_nvfp4_41e0f7b224fcc4acfc54",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SM103A"): (
+        "cake_fmha_context_nvfp4_c916619510183749b162",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SCALE_PTR_SM100A"): (
+        "cake_fmha_context_nvfp4_ab413a0149f11e7a8463",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
+        "cake_fmha_context_nvfp4_1b4750660638d644a971",
+        16,
+        False,
+    ),
+    # The FP8 runtime-size programs: the m-block count is a launch argument.
+    ("context_fp8", "RUNTIME_PACK8"): (
+        "cake_fmha_context_fp8_3fd021cb557d23a90ca8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4"): (
+        "cake_fmha_context_fp8_be3f7f385a3af5fe43b8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2"): (
+        "cake_fmha_context_fp8_caade70bb69e18537405",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1"): (
+        "cake_fmha_context_fp8_ce1b2c2352f741d468e8",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_PAGE64"): (
+        "cake_fmha_context_fp8_1930bf723069ae9f5446",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_PAGE64"): (
+        "cake_fmha_context_fp8_91a83484d11d796aaf30",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_PAGE64"): (
+        "cake_fmha_context_fp8_d427125833943a3251b5",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_PAGE64"): (
+        "cake_fmha_context_fp8_34939d99183a1a6e0baa",
+        None,
+        False,
+    ),
+    # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
+    ("context_fp8", "RUNTIME_SK_PACK8"): (
+        "cake_fmha_context_fp8_ee373474e6d16691cab7",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK4"): (
+        "cake_fmha_context_fp8_074b1da06353ee6d95c6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK2"): (
+        "cake_fmha_context_fp8_2208354a624a713e3455",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK1"): (
+        "cake_fmha_context_fp8_a93f4040f2fe5b5a85bb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK8_PAGE64"): (
+        "cake_fmha_context_fp8_617e3a6b50380cf6e0a5",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK4_PAGE64"): (
+        "cake_fmha_context_fp8_1ea3c441ffa379d0978f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK2_PAGE64"): (
+        "cake_fmha_context_fp8_c76354901ca9c86f4fec",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK1_PAGE64"): (
+        "cake_fmha_context_fp8_9697d1fcd36a1f4a023e",
+        None,
+        False,
+    ),
+}
+# The FP8 runtime-size context programs: every length, head count, m-block
+# count and page size is a launch argument, so one program serves every causal
+# FP8 call without LSE or sink whose GQA group its pack (the query heads one
+# 128-row tile stage holds) divides; pack 1 serves every group.  Per target,
+# ``(pack_g, page_size)`` names the program: a page-64 program folds the page
+# arithmetic into constants, ``None`` serves every page size 16 .. 1024.  The
+# host consults them only for a call no exact route serves, and only where
+# they are not slower than the component's JIT module
+# (:func:`_context_fp8_runtime_serves`).
+_CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (8, 64): "RUNTIME_PACK8_PAGE64",
+        (4, 64): "RUNTIME_PACK4_PAGE64",
+        (2, 64): "RUNTIME_PACK2_PAGE64",
+        (1, 64): "RUNTIME_PACK1_PAGE64",
+        (8, None): "RUNTIME_PACK8",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+    "sm103a": {
+        (8, 64): "RUNTIME_PACK8_PAGE64",
+        (4, 64): "RUNTIME_PACK4_PAGE64",
+        (2, 64): "RUNTIME_PACK2_PAGE64",
+        (1, 64): "RUNTIME_PACK1_PAGE64",
+        (8, None): "RUNTIME_PACK8",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+}
+# The packs the runtime programs ship besides 1: a pack serves every GQA group
+# it divides.
+_CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
+# The FP8 split-KV context programs: the runtime-size schedule and arguments,
+# with the key range of the first ``split_tiles`` tiles split over work units
+# of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
+# partials the tile's last unit merges.  Per target, ``(pack_g, page_size)``
+# names the program as for the runtime-size programs.  The host routes an FP8
+# call to one only where its split plan
+# (:func:`_context_fp8_split_plan`) predicts a gain over the whole-tile
+# program; other calls keep their route.
+_CONTEXT_FP8_SPLIT_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    target: {
+        key: "RUNTIME_SK" + name.removeprefix("RUNTIME") for key, name in routes.items()
+    }
+    for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
+}
+_CONTEXT_FP8_SPLIT_PROGRAMS = frozenset(
+    name for routes in _CONTEXT_FP8_SPLIT_ROUTES.values() for name in routes.values()
+)
+# Units of one split tile at most (the kernel's MAX_SPLITS), and the FP32
+# partial bytes of one split unit: O of both 128-row stages, then the row max
+# and row sum (16 bytes per row and stage).
+_CONTEXT_FP8_SPLIT_MAX = 16
+_CONTEXT_FP8_SPLIT_O_BYTES = 2 * 128 * 128 * 4
+_CONTEXT_FP8_SPLIT_ML_BYTES = 2 * 128 * 4 * 4
+# The binding's host parameters per component, in the kernel's order (then the
+# grid).  The quantized programs take the device-scale parameters in every
+# build; a host-scalar program never reads them.
+_CONTEXT_COMMON_PARAMS = (
+    "LSE_ptr",
+    "sinks",
+    "page_table_k",
+    "page_table_v",
+    "seq_lens_q",
+    "seq_lens_kv",
+    "cu_seq_lens_q",
+    "softmax_scale_log2",
+)
+_CONTEXT_HOST_PARAMS: dict[str, tuple[str, ...]] = {
+    "context_bf16": (
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+    ),
+    "context_fp8": (
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+    ),
+    "context_nvfp4": (
+        "Q",
+        "Kp",
+        "Vp",
+        "Ksf",
+        "Vsf",
+        "O_ptr",
+        *_CONTEXT_COMMON_PARAMS,
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+    ),
+}
+# A runtime-size FP8 program takes the sizes after the FP8 parameters: the
+# scale source (0: the host scalars, 1: the device scalars), the m-block count,
+# the whole 8-unit L2 sections of the tile order (``total_bh // 8``), the work
+# units per request, the query heads, the GQA group and the log2 page size.
+_CONTEXT_FP8_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_fp8"],
+    "scale_source",
+    "num_m_blocks",
+    "full_sections",
+    "num_bh_units",
+    "num_q_heads",
+    "heads_per_group",
+    "page_shift",
+)
+
+
+# A split-KV FP8 program takes the runtime-size parameters, then the split
+# plan, the FP32 partials and the per-tile arrival counters.
+_CONTEXT_FP8_SPLIT_PARAMS = (
+    *_CONTEXT_FP8_RUNTIME_PARAMS,
+    "split_tiles",
+    "split_blocks",
+    "num_splits",
+    "partial_o",
+    "partial_ml",
+    "tile_counters",
+)
+
+
+def _context_program_params(
+    component: str, num_m_blocks: int | None, program: str | None = None
+) -> tuple[str, ...]:
+    """The host parameters of a pinned program's binding, in the kernel's order
+    (then the grid)."""
+
+    if program in _CONTEXT_FP8_SPLIT_PROGRAMS:
+        return _CONTEXT_FP8_SPLIT_PARAMS
+    if num_m_blocks is None:
+        return _CONTEXT_FP8_RUNTIME_PARAMS
+    return _CONTEXT_HOST_PARAMS[component]
+
+
+def _context_program_facts(program_name: str) -> tuple[str, int | None, bool]:
+    for (component, _), (name, num_m_blocks, one_tile) in _CONTEXT_PROGRAMS.items():
+        if name == program_name:
+            return component, num_m_blocks, one_tile
+    raise RuntimeError(f"{program_name} is not a Cake FMHA context program")
+
+
+def cake_fmha_context_launch_grid(
+    program,
+    total_bh: int,
+    sm_count: int,
+    num_m_blocks: int | None = None,
+    split_tiles: int = 0,
+    num_splits: int = 1,
+) -> tuple[int, int, int]:
+    """The launch grid of one generated context program: a one-tile program
+    launches one CTA per tile (``num_m_blocks x total_bh`` tiles, ``total_bh``
+    the work units ``batch_size x num_q_heads / pack_g``), a persistent program
+    ``min(sm_count, tiles)`` CTAs, a split-KV program ``min(sm_count, tiles +
+    (num_splits - 1) x split_tiles)`` (its work units).  ``program`` is the
+    generated loader's ``CakeProgram`` record; ``num_m_blocks`` is the launch's
+    m-block count, required for a runtime-size program and else, when given,
+    its pinned one."""
+
+    _, pinned, one_tile = _context_program_facts(program.name)
+    if pinned is None:
+        if num_m_blocks is None:
+            raise RuntimeError(f"{program.name} takes the m-block count per launch")
+    elif num_m_blocks is None:
+        num_m_blocks = pinned
+    elif int(num_m_blocks) != pinned:
+        raise RuntimeError(f"{program.name} runs {pinned} m-blocks, not {num_m_blocks}")
+    tiles = int(num_m_blocks) * int(total_bh)
+    units = tiles + (int(num_splits) - 1) * int(split_tiles)
+    return (tiles if one_tile else min(int(sm_count), units)), 1, 1
 
 
 def _aligned_program_id(cluster_size: int, dtype: str) -> str:
@@ -1054,9 +1434,16 @@ def _manifest_authenticated_route_accounting() -> tuple[int, int]:
 def _cake_fmha_target(device: torch.device) -> CakeFmhaTarget:
     """Resolve the exact Blackwell cubin target without cross-arch fallback."""
 
+    return _cake_fmha_target_of(get_compute_capability(device))
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_fmha_target_of(capability: tuple[int, int]) -> CakeFmhaTarget:
+    """The target of a compute capability (the CUDA version is fixed per
+    process, so the result is cached; a refusal raises every time)."""
+
     from .jit.cpp_ext import is_cuda_version_at_least
 
-    capability = get_compute_capability(device)
     if capability == (10, 0):
         if not is_cuda_version_at_least("12.8"):
             raise RuntimeError("Cake FMHA on B200 requires CUDA 12.8 or newer")
@@ -2008,10 +2395,13 @@ def _context_tile_mma_work(q_len: int, kv_len: int, tokens_per_tile: int) -> int
     return total
 
 
+@functools.lru_cache(maxsize=1024)
 def _context_pack_g(
     max_q_len: int, max_kv_len: int, num_q_heads: int, num_kv_heads: int
 ) -> int:
-    """Choose the canonical packed-GQA axis from host-visible maxima."""
+    """Choose the canonical packed-GQA axis from host-visible maxima (a pure
+    function of its integers, cached: the tile-work sums walk every query
+    block, which is tens of microseconds at long query lengths)."""
 
     group = num_q_heads // num_kv_heads
     if group <= 1 or group > 128:
@@ -2021,6 +2411,342 @@ def _context_pack_g(
         max_q_len, max_kv_len, 2 * (128 // group)
     )
     return group if packed < unpacked else 1
+
+
+def _context_fp8_runtime_pack(pack_g: int) -> int:
+    """The runtime-size FP8 program's pack for the JIT pack ``pack_g``
+    (:func:`_context_pack_g`): the largest shipped pack dividing it, else 1."""
+
+    for pack in _CONTEXT_FP8_RUNTIME_PACKS:
+        if pack_g % pack == 0:
+            return pack
+    return 1
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_runtime_serves(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+) -> bool:
+    """Whether a runtime-size FP8 program serves a causal call without LSE or
+    sink that no exact route serves (``False`` keeps the JIT module, whose
+    pack is ``pack_g``; a pure function of its arguments, cached like
+    :func:`_context_pack_g`)."""
+
+    pack = _context_fp8_runtime_pack(pack_g)
+    # A shipped pack below the JIT pack holds fewer query heads per tile: it
+    # may run more tile work than the JIT pack.
+    if pack != pack_g and (num_q_heads // pack) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack)
+    ) > (num_q_heads // pack_g) * _context_tile_mma_work(
+        max_q_len, max_kv_len, 2 * (128 // pack_g)
+    ):
+        return False
+    # sm100a: calls this long run back to back at the board power limit, where
+    # the runtime program's SM clock drops below the JIT module's: many
+    # (request, KV head) streams, or many query rows at long query lengths.
+    return not (
+        target == "sm100a"
+        and (
+            batch_size * num_kv_heads >= 2048
+            or (max_q_len >= 128 and batch_size * num_q_heads * max_q_len >= 1 << 20)
+        )
+    )
+
+
+# The split planner's cost model per target, in microseconds: the launch's
+# fixed cost, one KV block of a unit, the fixed cost of a unit, the partial
+# store of a split unit, the merge of a tile of k units (MERGE0 + MERGE1 x k)
+# by its last unit, and each extra work unit's share of the memory system
+# (the per-CTA schedule does not see it).  Fitted to timed split plans of
+# B200 (sm100a) and of GB300 (sm103a).
+_CONTEXT_FP8_SPLIT_COSTS: dict[str, tuple[float, ...]] = {
+    "sm100a": (5.294, 1.529, 3.327, 3.425, 1.383, 1.661, 0.014),
+    "sm103a": (5.703, 1.247, 2.046, 0.256, 3.705, 1.648, 0.023),
+}
+# The share of the partial store and the merge that a split tile holding one
+# 128-row query stage costs, against a tile of two stages (the program stores
+# and merges the rows of the stages its queries reach), per target.  Fitted to
+# timed split launches of the same plan over two packs (B200, GB300).
+_CONTEXT_FP8_SPLIT_ONE_STAGE: dict[str, float] = {
+    "sm100a": 0.750,
+    "sm103a": 0.734,
+}
+# A split must be predicted faster than the whole-tile schedule by both
+# margins (2 % and 0.5 us: the smallest that timed plans of B200 and GB300
+# support; at 1 % some predicted gains measure as losses); a launch of more
+# tiles than this many waves keeps whole tiles (its last partial wave is a
+# small share of it).
+_CONTEXT_FP8_SPLIT_REL_MARGIN = 0.02
+_CONTEXT_FP8_SPLIT_ABS_MARGIN = 0.5
+_CONTEXT_FP8_SPLIT_MAX_WAVES = 4
+
+
+def _context_fp8_tile_blocks(
+    batch_size: int, max_q_len: int, max_kv_len: int, num_q_heads: int, pack: int
+) -> list[int]:
+    """KV blocks of every tile of a runtime-size launch, in the program's tile
+    order (sections of 8 work units x every m-block, the largest m-block
+    first; bottom-right causal), every request at the planned maxima."""
+
+    tok = 128 // pack
+    m_blocks = max((max_q_len + 2 * tok - 1) // (2 * tok), 1)
+    total_bh = batch_size * (num_q_heads // pack)
+    full_n = max((max_kv_len + 127) // 128, 1)
+    shift = max_kv_len - max_q_len
+    per_m = []
+    for m_block in range(m_blocks):
+        top = (m_block * 2 + 2) * tok + shift
+        per_m.append(max((top + 127) // 128 if top < max_kv_len else full_n, 1))
+    full_sections = total_bh // 8
+    blocks = []
+    for tile in range(m_blocks * total_bh):
+        section, m = divmod(tile >> 3, m_blocks)
+        if section >= full_sections:
+            m = (tile - section * 8 * m_blocks) % m_blocks
+        blocks.append(per_m[m_blocks - 1 - m])
+    return blocks
+
+
+def _context_fp8_split_makespan(
+    blocks: list[int],
+    sm_count: int,
+    split_tiles: int,
+    split_blocks: int,
+    num_splits: int,
+    costs: tuple[float, ...],
+    one_stage: float = 1.0,
+) -> float:
+    """The predicted time of a plan: the persistent CTAs draw the work units in
+    ticket order (the split units split-major, then the other tiles whole), a
+    unit costs ``unit + blocks x block`` (plus the partial store when its tile
+    has more than one unit), the tile's last finisher merges, and the launch
+    adds its fixed cost and the extra units' share.  ``one_stage`` scales the
+    partial store and the merge (a launch whose tiles hold one query stage
+    stores and merges the rows of one stage:
+    :data:`_CONTEXT_FP8_SPLIT_ONE_STAGE`)."""
+
+    fixed, block, unit, store, merge0, merge1, extra = costs
+    store, merge0, merge1 = store * one_stage, merge0 * one_stage, merge1 * one_stage
+    tiles = len(blocks)
+    split_tiles = min(split_tiles, tiles) if num_splits > 1 else 0
+    ctas = min(sm_count, tiles + (num_splits - 1) * split_tiles)
+    free = [0.0] * ctas
+    ready = [(0.0, cta) for cta in range(ctas)]
+    finished: dict[int, list[tuple[float, int]]] = {}
+
+    def draw(cost: float) -> tuple[float, int]:
+        # the CTA free first draws the next ticket (entries a merge made stale
+        # are skipped)
+        while True:
+            start, cta = heapq.heappop(ready)
+            if start == free[cta]:
+                break
+        free[cta] = start + cost
+        heapq.heappush(ready, (free[cta], cta))
+        return free[cta], cta
+
+    for split in range(num_splits if split_tiles else 0):
+        for tile in range(split_tiles):
+            n = blocks[tile]
+            count = min((n + split_blocks - 1) // split_blocks, num_splits)
+            if split >= count:
+                continue
+            nb = split_blocks if split + 1 < count else n - split * split_blocks
+            end, cta = draw(unit + nb * block + (store if count > 1 else 0.0))
+            finished.setdefault(tile, []).append((end, cta))
+            if count > 1 and split + 1 == count:
+                merger = max(finished[tile])[1]
+                free[merger] += merge0 + merge1 * count
+                heapq.heappush(ready, (free[merger], merger))
+    for tile in range(split_tiles, tiles):
+        draw(unit + blocks[tile] * block)
+    return fixed + max(free) + extra * (num_splits - 1) * split_tiles
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_split_plan(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, int, int] | None:
+    """``(split_tiles, split_blocks, num_splits)`` of the split-KV launch the
+    cost model predicts fastest, or ``None`` when no split beats the
+    whole-tile schedule by the margins (a pure function of its integers,
+    cached).  The candidates split the tiles the idle CTAs of the last wave
+    can take, ``num_splits`` from 2 up, ``split_blocks`` the even split of the
+    longest tile; at most ``sm_count - 1`` tiles split, so the per-tile
+    counters fit in the counter buffer after its first word."""
+
+    costs = _CONTEXT_FP8_SPLIT_COSTS.get(target)
+    blocks = _context_fp8_tile_blocks(
+        batch_size, max_q_len, max_kv_len, num_q_heads, pack
+    )
+    tiles = len(blocks)
+    if costs is None or not tiles or tiles > _CONTEXT_FP8_SPLIT_MAX_WAVES * sm_count:
+        return None
+    whole = _context_fp8_split_makespan(blocks, sm_count, 0, 1, 1, costs)
+    tail = tiles % sm_count or sm_count
+    idle = sm_count - tail
+    split_counts = {tiles if tiles <= sm_count else tail, tail}
+    split_counts.update(idle // d for d in (1, 2, 3, 4))
+    longest = max(blocks)
+    best, best_time = None, whole
+    for split_tiles in sorted(split_counts):
+        split_tiles = min(split_tiles, tiles, sm_count - 1)
+        if split_tiles <= 0:
+            continue
+        for num_splits in range(2, _CONTEXT_FP8_SPLIT_MAX + 1):
+            split_blocks = (longest + num_splits - 1) // num_splits
+            if (longest + split_blocks - 1) // split_blocks < num_splits:
+                continue
+            time = _context_fp8_split_makespan(
+                blocks, sm_count, split_tiles, split_blocks, num_splits, costs
+            )
+            if time < best_time:
+                best, best_time = (split_tiles, split_blocks, num_splits), time
+    if (
+        best is None
+        or best_time > whole * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
+        or whole - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+    ):
+        return None
+    return best
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_split_choice(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, tuple[int, int, int]] | None:
+    """The pack and the plan of the split-KV launch of a call whose runtime
+    pack is ``pack``, or ``None`` when it does not split (a pure function of
+    its integers, cached).
+
+    The plan is ``pack``'s (:func:`_context_fp8_split_plan`), except for a
+    launch of one m-block of two query stages whose plan splits every tile: a
+    smaller shipped pack whose tiles hold every query token in one stage runs
+    the same split (``split_blocks`` and ``num_splits``) over its tiles, where
+    the cost model predicts it faster by the margins.  Every query row meets
+    the same KV units, merged in the same order, so the output is the same;
+    the launch only has more, cheaper units (one stage stored and merged)."""
+
+    plan = _context_fp8_split_plan(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+    )
+    if plan is None:
+        return None
+    share = _CONTEXT_FP8_SPLIT_ONE_STAGE.get(target, 1.0)
+    tokens = 128 // pack
+    if share >= 1.0 or not tokens < max_q_len <= 2 * tokens:
+        return pack, plan
+    costs = _CONTEXT_FP8_SPLIT_COSTS[target]
+    blocks = _context_fp8_tile_blocks(
+        batch_size, max_q_len, max_kv_len, num_q_heads, pack
+    )
+    if plan[0] < len(blocks):
+        return pack, plan
+    _, split_blocks, num_splits = plan
+    time = _context_fp8_split_makespan(blocks, sm_count, *plan, costs)
+    best, best_time = (pack, plan), time
+    for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1):
+        if smaller >= pack or pack % smaller or max_q_len > 128 // smaller:
+            continue
+        blocks = _context_fp8_tile_blocks(
+            batch_size, max_q_len, max_kv_len, num_q_heads, smaller
+        )
+        if len(blocks) > sm_count - 1:
+            continue
+        candidate = (len(blocks), split_blocks, num_splits)
+        candidate_time = _context_fp8_split_makespan(
+            blocks, sm_count, *candidate, costs, share
+        )
+        if candidate_time < best_time:
+            best, best_time = (smaller, candidate), candidate_time
+    if (
+        best[0] == pack
+        or best_time > time * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
+        or time - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+    ):
+        return pack, plan
+    return best
+
+
+def _context_fp8_launch_split_plan(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, int, int] | None:
+    """The split plan of a launch of the split-KV program of ``pack``: the
+    plan :func:`_context_fp8_split_choice` gives the call where it chose this
+    pack, else ``pack``'s own plan (the route kept ``pack`` where the
+    workspace could not hold the chosen plan's partials)."""
+
+    runtime_pack = _context_fp8_runtime_pack(
+        _context_pack_g(max_q_len, max_kv_len, num_q_heads, num_kv_heads)
+    )
+    choice = _context_fp8_split_choice(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, runtime_pack, sm_count
+    )
+    if choice is not None and choice[0] == pack:
+        return choice[1]
+    return _context_fp8_split_plan(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+    )
+
+
+def _context_split_sm_count(device: torch.device) -> int | None:
+    """The SM count a launch's split plan assumes, or ``None`` off a CUDA
+    device (no split)."""
+
+    return get_device_sm_count(device) if device.type == "cuda" else None
+
+
+def _context_fp8_split_workspace_bytes(split_tiles: int, num_splits: int) -> int:
+    """Workspace bytes of a split plan: the partial O of every split unit, then
+    their row maxima and sums."""
+
+    return (
+        split_tiles
+        * num_splits
+        * (_CONTEXT_FP8_SPLIT_O_BYTES + _CONTEXT_FP8_SPLIT_ML_BYTES)
+    )
+
+
+def _context_fp8_split_workspace_supported(
+    workspace_buffer: torch.Tensor | None,
+    query: torch.Tensor,
+    plan: tuple[int, int, int],
+) -> bool:
+    """Whether the caller's workspace holds the plan's FP32 partials."""
+
+    return (
+        workspace_buffer is not None
+        and workspace_buffer.is_contiguous()
+        and workspace_buffer.device == query.device
+        and workspace_buffer.data_ptr() % 16 == 0
+        and workspace_buffer.numel() * workspace_buffer.element_size()
+        >= _context_fp8_split_workspace_bytes(plan[0], plan[2])
+    )
 
 
 def _context_hd256_workspace_supported(
@@ -2086,6 +2812,17 @@ def _context_nvfp4_workspace_supported(
     return workspace_buffer.numel() * workspace_buffer.element_size() >= required
 
 
+# How the host selects the one-tile BF16 launch classes.  ``False`` (the
+# default): from host-visible facts alone; the programs read every request's KV
+# length and query offsets at run time, so any request lengths up to the
+# planned maxima are served, during CUDA graph capture too.  ``True``: as
+# before the generated programs, the host also reads ``seq_lens`` and
+# ``cum_seq_lens_q`` (a device synchronization, skipped during capture) and
+# selects the class only when every request has the planned maximum lengths;
+# other batches keep the generic JIT route.
+_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS = False
+
+
 def _context_bf16_exact_profile(
     query: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2103,7 +2840,13 @@ def _context_bf16_exact_profile(
     enable_sink: bool,
     kv_layout: str,
 ) -> Literal["q511", "q257"] | None:
-    """Resolve the two measured mask-loop bodies from exact runtime lengths."""
+    """Resolve the two one-tile mask-loop programs.
+
+    ``query`` holds ``batch_size x max_q_len`` rows, which makes every request
+    ``max_q_len`` tokens long; any KV length up to ``max_kv_len`` is served.
+    Unless ``_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS``, no tensor value is
+    read.
+    """
 
     common = (
         batch_size == 4
@@ -2127,8 +2870,6 @@ def _context_bf16_exact_profile(
         and query.shape[0] == 4 * 511
     ):
         profile = "q511"
-        expected_q_len = 511
-        expected_kv_len = 2047
     elif (
         max_q_len == 257
         and max_kv_len == 1024
@@ -2137,10 +2878,10 @@ def _context_bf16_exact_profile(
         and query.shape[0] == 4 * 257
     ):
         profile = "q257"
-        expected_q_len = 257
-        expected_kv_len = 1024
     else:
         return None
+    if not _CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS:
+        return profile
     if query.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return None
     try:
@@ -2148,9 +2889,9 @@ def _context_bf16_exact_profile(
         q_indptr = [int(value) for value in cum_seq_lens_q.detach().cpu().tolist()]
     except RuntimeError:
         return None
-    if kv_lengths != [expected_kv_len] * batch_size:
+    if kv_lengths != [max_kv_len] * batch_size:
         return None
-    if q_indptr != [index * expected_q_len for index in range(batch_size + 1)]:
+    if q_indptr != [index * max_q_len for index in range(batch_size + 1)]:
         return None
     return profile
 
@@ -2402,8 +3143,97 @@ def select_cake_fmha_context_route(
         )
     ):
         return None
+    target = _cake_fmha_target(device)
+    device_scales = component in ("context_fp8", "context_nvfp4") and (
+        isinstance(bmm1_scale, torch.Tensor) and isinstance(bmm2_scale, torch.Tensor)
+    )
+    # The generated program serving the route on ``target`` (its key is the
+    # route's component, scale form, head counts, pack, m-blocks, page size
+    # and exact class), or ``None`` to keep the component's JIT module; the
+    # programs are causal and write no LSE and take no sink.
+    program = None
+    if is_causal and lse is None and sinks is None:
+        program = _CONTEXT_PROGRAM_ROUTES.get(target, {}).get(
+            (
+                component,
+                "device" if device_scales else "host",
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+                num_m_blocks,
+                page_size,
+                exact_profile,
+            )
+        )
+        # An FP8 call no exact route serves: the runtime-size program of its
+        # pack and page size, where it is not slower than the JIT module.
+        runtime = _CONTEXT_FP8_RUNTIME_ROUTES.get(target)
+        if (
+            program is None
+            and component == "context_fp8"
+            and runtime
+            and _context_fp8_runtime_serves(
+                target,
+                batch_size,
+                max_q_len,
+                max_kv_len,
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+            )
+        ):
+            pack = _context_fp8_runtime_pack(pack_g)
+            program = runtime.get((pack, page_size)) or runtime.get((pack, None))
+            if program is not None:
+                pack_g = pack
+                tok_per_stage = 128 // pack
+                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
+                    2 * tok_per_stage
+                )
+                total_bh = batch_size * (num_q_heads // pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # An FP8 call an exact or runtime-size program serves, whose tiles
+        # leave SMs idle: the split-KV program of the pack the split choice
+        # names (:func:`_context_fp8_split_choice`) and the page size, where the
+        # split plan predicts a gain and the workspace holds its partials; the
+        # runtime pack's own plan where the workspace cannot hold the chosen
+        # pack's.
+        split = _CONTEXT_FP8_SPLIT_ROUTES.get(target)
+        sm_count = _context_split_sm_count(device)
+        if program is not None and component == "context_fp8" and split and sm_count:
+            pack = _context_fp8_runtime_pack(pack_g)
+            choice = _context_fp8_split_choice(
+                target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+            )
+            candidates = [] if choice is None else [choice]
+            if choice is not None and choice[0] != pack:
+                own = _context_fp8_split_plan(
+                    target,
+                    batch_size,
+                    max_q_len,
+                    max_kv_len,
+                    num_q_heads,
+                    pack,
+                    sm_count,
+                )
+                candidates.append((pack, own))
+            for pack, plan in candidates:
+                split_program = split.get((pack, page_size)) or split.get((pack, None))
+                if split_program is None or not _context_fp8_split_workspace_supported(
+                    workspace_buffer, query, plan
+                ):
+                    continue
+                program = split_program
+                pack_g = pack
+                tok_per_stage = 128 // pack
+                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
+                    2 * tok_per_stage
+                )
+                total_bh = batch_size * (num_q_heads // pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
+                break
     return CakeFmhaContextRoute(
-        target=_cake_fmha_target(device),
+        target=target,
         component=component,
         num_m_blocks=num_m_blocks,
         num_q_heads=num_q_heads,
@@ -2415,7 +3245,459 @@ def select_cake_fmha_context_route(
         return_lse=lse is not None,
         enable_sink=sinks is not None,
         exact_profile=exact_profile,
+        device_scales=device_scales,
+        program=program,
     )
+
+
+class CakeFmhaContextProgramModule:
+    """One loaded generated context program behind the context FFI ABI
+    (``cake_paged_attention_context``, the arguments ``trtllm_batch_context_
+    with_kv_cache`` passes): the route it serves, the ``CakeProgram`` record,
+    its exact target and the binding's ``run`` entry."""
+
+    def __init__(self, route: CakeFmhaContextRoute, program: Any, target: str):
+        self.route = route
+        self.program = program
+        self.target = target
+        self.entry = program.entry(target)
+        self.units_per_batch = route.num_q_heads // route.pack_g
+        self.quantized = route.component != "context_bf16"
+        _, self.num_m_blocks, self.one_tile = _context_program_facts(program.name)
+        # A runtime-size program serves every head count, page size and query
+        # length of its pack (the route's): the launch reads them off its
+        # tensors and lengths, and the scale form off its scale arguments.
+        self.runtime = self.num_m_blocks is None
+        self.pack_g = route.pack_g
+        self.m_block_tokens = 2 * (128 // route.pack_g)
+        # A split-KV program also takes the split plan of each launch
+        # (:func:`_context_fp8_launch_split_plan`), its partials in the caller's
+        # workspace and its tile counters after the counter buffer's first word.
+        self.split = route.program in _CONTEXT_FP8_SPLIT_PROGRAMS
+
+    def cake_paged_attention_context(
+        self,
+        out: torch.Tensor,
+        out_scale_factor: torch.Tensor | None,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        multi_ctas_kv_counter_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float | torch.Tensor,
+        bmm2_scale: float | torch.Tensor,
+        o_sf_scale: float,
+        o_sf_vec_size: int,
+        o_sf_start_index: int,
+        batch_size: int,
+        window_left: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        sm_count: int,
+        enable_pdl: bool | None,
+        workspace_size: int,
+        attention_sinks: torch.Tensor | None,
+        key_block_scales: torch.Tensor | None,
+        value_block_scales: torch.Tensor | None,
+        skip_softmax_threshold_scale_factor: float | None,
+        uses_shared_paged_kv_idx: bool,
+        use_fp16_softmax: bool,
+        uses_spcompress: bool,
+        is_causal: bool,
+        lse: torch.Tensor | None,
+        lse_stride_tokens: int,
+        lse_stride_heads: int,
+    ) -> None:
+        """Launch the program on the current torch stream.
+
+        The kernel reads every request's KV length (``seq_lens``) and query
+        offsets (``cum_seq_lens_q``) itself; ``total_bh`` is the work-unit
+        count ``batch_size x num_q_heads / pack_g``.  A device-scale program
+        reads the raw bmm1 scale and the bmm2 scale through device
+        pointers; a host-scalar program takes them as scalars and never reads
+        the pointers.  The LSE, sink and Q-length pointers are unread (the
+        programs write no LSE, take no sink and derive the query lengths from
+        ``cum_seq_lens_q``): they point at a small per-device buffer.  A
+        runtime-size program also takes the scale source, the m-block count of
+        ``max_q_len``, the head counts, the GQA group and the log2 page size of
+        this launch.
+        """
+
+        route = self.route
+        if lse is not None or attention_sinks is not None:
+            # route selection keeps such calls on the JIT module: the unread
+            # pointers below never stand in for a caller's LSE or sinks
+            raise RuntimeError(
+                "a Cake FMHA context program writes no LSE and takes no sinks"
+            )
+        if self.runtime:
+            num_q_heads = query.shape[1]
+            units_per_batch = num_q_heads // self.pack_g
+            num_m_blocks = (int(max_q_len) + self.m_block_tokens - 1) // (
+                self.m_block_tokens
+            )
+            # the scale form of this call (one program serves both)
+            device_scales = isinstance(bmm1_scale, torch.Tensor)
+        elif query.shape[1] != route.num_q_heads or key_cache.shape[1] != (
+            route.num_kv_heads
+        ):
+            raise RuntimeError(
+                "Cake FMHA context launch does not match its selected route"
+            )
+        else:
+            units_per_batch = self.units_per_batch
+            num_m_blocks = self.num_m_blocks
+            device_scales = route.device_scales
+        total_bh = int(batch_size) * units_per_batch
+        tiles = num_m_blocks * total_bh
+        num_ctas = tiles if self.one_tile else min(int(sm_count), tiles)
+        device = query.device
+        counter = multi_ctas_kv_counter_buffer
+        if counter.dim() != 1:
+            counter = counter.view(-1)
+        if counter.dtype != torch.uint32:
+            counter = counter.view(torch.uint32)
+        if self.split:
+            # The plan of this launch; one that the workspace or the counter
+            # buffer cannot hold runs as one unit per tile (the whole-tile
+            # schedule, which reads neither).
+            plan = _context_fp8_launch_split_plan(
+                route.target,
+                int(batch_size),
+                int(max_q_len),
+                int(max_kv_len),
+                num_q_heads,
+                int(key_cache.shape[1]),
+                self.pack_g,
+                int(sm_count),
+            )
+            if (
+                plan is None
+                or counter.numel() < 1 + plan[0]
+                or not _context_fp8_split_workspace_supported(
+                    workspace_buffer, query, plan
+                )
+            ):
+                plan = (1, 1, 1)
+            split_tiles, split_blocks, num_splits = plan
+            num_ctas = min(int(sm_count), tiles + (num_splits - 1) * split_tiles)
+            if num_splits > 1:
+                partials = workspace_buffer.view(-1).view(torch.uint8)
+                o_bytes = split_tiles * num_splits * _CONTEXT_FP8_SPLIT_O_BYTES
+                ml_bytes = split_tiles * num_splits * _CONTEXT_FP8_SPLIT_ML_BYTES
+                partial_o = partials[:o_bytes].view(torch.float32)
+                partial_ml = partials[o_bytes : o_bytes + ml_bytes].view(torch.float32)
+                tile_counters = counter[1 : 1 + split_tiles]
+            else:
+                partial_o = partial_ml = _unread_pointers(device)[0]
+                tile_counters = counter[:1]
+        unread_f32, unread_i32 = _unread_pointers(device)
+        # The kernel reads page ``p`` of request ``b`` at ``page_table[b x
+        # page_row_stride + p]``: pass 1-D views over the caller's own table
+        # storage (no copy) that span every row, and its true row stride.
+        tables = (
+            block_tables
+            if block_tables.dtype == torch.int32
+            else block_tables.view(torch.int32)
+        )
+        strides = tables.stride()
+        if strides[-1] != 1:
+            raise RuntimeError(
+                "Cake FMHA context page tables need a unit stride along the pages"
+            )
+        row_stride = strides[0]
+        if uses_shared_paged_kv_idx and tables.is_contiguous():
+            # the binding reads only the table's address: a contiguous table
+            # is its own span
+            page_table_k = page_table_v = tables
+        else:
+            shape = tables.shape
+            span = (shape[0] - 1) * row_stride + shape[-1]
+            offset = tables.storage_offset()
+            page_table_k = tables.as_strided((span,), (1,), offset)
+            page_table_v = (
+                page_table_k
+                if uses_shared_paged_kv_idx
+                else tables.as_strided((span,), (1,), offset + strides[1])
+            )
+        if device_scales:
+            # bmm1 arrives as the caller's device scale (not in log2 form):
+            # with bmm1_is_log2 = 0 the program forms the FP32 product
+            # bmm1 * log2e itself, the value the host multiply gave.
+            if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
+                bmm2_scale, torch.Tensor
+            ):
+                raise RuntimeError(
+                    "a device-scale Cake FMHA context program takes tensor scales"
+                )
+            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 0
+            bmm1_ptr = bmm1_scale if bmm1_scale.dim() == 1 else bmm1_scale.reshape(1)
+            bmm2_ptr = bmm2_scale if bmm2_scale.dim() == 1 else bmm2_scale.reshape(1)
+        else:
+            softmax_scale_log2 = float(bmm1_scale) * log2e
+            output_scale, bmm1_is_log2 = float(bmm2_scale), 0
+            bmm1_ptr = bmm2_ptr = unread_f32
+        # The arguments in the binding's order: ``_CONTEXT_HOST_PARAMS`` of the
+        # component (LSE_ptr, sinks and seq_lens_q unread; a runtime-size
+        # program's sizes after them), then the grid; the order is checked
+        # against the record at load.
+        if not self.quantized:
+            arguments: tuple[Any, ...] = (
+                query,
+                key_cache,
+                value_cache,
+                out,
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                num_ctas,
+                1,
+                1,
+            )
+        elif route.component == "context_nvfp4":
+            arguments = (
+                query.view(torch.uint8),
+                key_cache,
+                value_cache,
+                key_block_scales.view(torch.uint8),
+                value_block_scales.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                num_ctas,
+                1,
+                1,
+            )
+        elif self.runtime:
+            arguments = (
+                query.view(torch.uint8),
+                key_cache.view(torch.uint8),
+                value_cache.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                1 if device_scales else 0,
+                num_m_blocks,
+                total_bh // 8,
+                units_per_batch,
+                num_q_heads,
+                num_q_heads // key_cache.shape[1],
+                key_cache.shape[2].bit_length() - 1,
+            )
+            if self.split:
+                arguments = (
+                    *arguments,
+                    split_tiles,
+                    split_blocks,
+                    num_splits,
+                    partial_o,
+                    partial_ml,
+                    tile_counters,
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
+        else:
+            arguments = (
+                query.view(torch.uint8),
+                key_cache.view(torch.uint8),
+                value_cache.view(torch.uint8),
+                out.view(torch.uint8),
+                unread_f32,
+                unread_f32,
+                page_table_k,
+                page_table_v,
+                unread_i32,
+                seq_lens,
+                cum_seq_lens_q,
+                softmax_scale_log2,
+                output_scale,
+                total_bh,
+                row_stride,
+                num_ctas,
+                counter,
+                bmm1_ptr,
+                bmm2_ptr,
+                bmm1_is_log2,
+                num_ctas,
+                1,
+                1,
+            )
+        if _ffi_call_takes_the_torch_stream():
+            self.entry(*arguments)
+        else:
+            with _torch_stream_context(device):
+                self.entry(*arguments)
+
+
+@functools.cache
+def _ffi_call_takes_the_torch_stream() -> bool:
+    """Whether a tvm-ffi call runs on torch's current stream by itself.
+
+    With the DLPack exchange API on torch tensors (``__dlpack_c_exchange_api__``,
+    native or installed by ``import tvm_ffi``), the call sets the FFI stream of
+    its first CUDA tensor argument's device to torch's current stream there for
+    the call's duration, as for FlashInfer's JIT modules; otherwise the launch
+    sets it itself (:func:`_torch_stream_context`).
+    """
+
+    return getattr(torch.Tensor, "__dlpack_c_exchange_api__", None) is not None
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+_UNREAD_POINTERS: dict[torch.device, tuple[Any, Any, torch.Tensor]] = {}
+
+
+def _unread_pointers(device: torch.device) -> tuple[Any, Any]:
+    """A 16-byte buffer on ``device`` as float32 and int32 FFI tensors, for
+    the binding arguments a context program never reads.
+
+    The buffer is allocated and converted to FFI tensors once per device: an
+    argument that already is an FFI tensor skips the per-call DLPack
+    conversion a torch tensor argument costs (up to five per launch).
+    """
+
+    pointers = _UNREAD_POINTERS.get(device)
+    if pointers is None:
+        buffer = torch.empty(4, dtype=torch.float32, device=device)
+        pointers = _UNREAD_POINTERS[device] = (
+            tvm_ffi.from_dlpack(buffer),
+            tvm_ffi.from_dlpack(buffer.view(torch.int32)),
+            buffer,
+        )
+    return pointers[0], pointers[1]
+
+
+def _torch_stream_context(device: torch.device):
+    """The FFI stream context on the current torch stream of ``device``.
+
+    The binding selects its device from its tensor arguments and launches on
+    the FFI stream of that device; this sets that stream to torch's current
+    one (a CUDA graph's capture stream during capture).  The raw stream handle
+    and a cached FFI device cost a fraction of ``torch.cuda.device`` plus
+    ``tvm_ffi.use_torch_stream()``, which builds a ``torch.cuda.Stream`` and
+    parses a device string on every call.
+    """
+
+    raw_stream_of = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if raw_stream_of is None:
+        return _DeviceTorchStream(index)
+    ffi_device = _FFI_DEVICES.get(index)
+    if ffi_device is None:
+        ffi_device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(ffi_device, raw_stream_of(index))
+
+
+class _DeviceTorchStream:
+    """``torch.cuda.device(index)`` and ``tvm_ffi.use_torch_stream()``."""
+
+    def __init__(self, index: int):
+        self.device = torch.cuda.device(index)
+        self.stream = tvm_ffi.use_torch_stream()
+
+    def __enter__(self) -> None:
+        self.device.__enter__()
+        self.stream.__enter__()
+
+    def __exit__(self, *args: Any) -> None:
+        self.stream.__exit__(*args)
+        self.device.__exit__(*args)
+
+
+_CONTEXT_PROGRAM_MODULES: dict[tuple[str, str, str], CakeFmhaContextProgramModule] = {}
+
+
+def _load_cake_fmha_context_program(
+    route: CakeFmhaContextRoute,
+) -> CakeFmhaContextProgramModule:
+    """Build and load the generated program of ``route`` on the route's target.
+
+    The loaders ``flashinfer.jit.cake_fmha_context_{bf16,fp8,nvfp4}`` are
+    generated by the Cake export beside ``csrc/cake_fmha_context_*/``; they are
+    imported here, lazily, so route selection never needs them.  The record's
+    name, target and argument names are checked against the host once, at
+    load.
+    """
+
+    key = (route.target, route.component, route.program)
+    module = _CONTEXT_PROGRAM_MODULES.get(key)
+    if module is not None:
+        return module
+    import importlib
+
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    pinned = _CONTEXT_PROGRAMS.get((route.component, route.program))
+    if pinned is None:
+        raise RuntimeError(
+            f"Cake FMHA {route.component} names no generated program {route.program!r}"
+        )
+    loader_name = f"cake_fmha_{route.component}"
+    loader = importlib.import_module(f".jit.{loader_name}", __package__)
+    program = getattr(loader, route.program, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name} publishes no CakeProgram {route.program!r}"
+        )
+    if program.name != pinned[0]:
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name}.{route.program} is {program.name}; "
+            f"this module pins {pinned[0]}"
+        )
+    target = _ALIGNED_PROGRAM_TARGET[route.target]
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    params = _context_program_params(route.component, pinned[1], route.program)
+    if tuple(program.args) != (*params, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*params, *GRID_ARGS]}"
+        )
+    module = CakeFmhaContextProgramModule(route, program, target)
+    _CONTEXT_PROGRAM_MODULES[key] = module
+    return module
 
 
 def get_cake_fmha_context_module(
@@ -2427,6 +3709,13 @@ def get_cake_fmha_context_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device))
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
+    if route.program is not None:
+        return _load_cake_fmha_context_program(route)
+    if route.exact_profile is not None:
+        raise RuntimeError(
+            f"Cake FMHA context exact profile {route.exact_profile} has no program "
+            f"on {route.target}"
+        )
     if route.component == "context_fp16_hd256":
         return load_cake_fmha_context_fp16_hd256_module(
             route.target,
@@ -2476,11 +3765,7 @@ def get_cake_fmha_context_module(
         "enable_sink": route.enable_sink,
     }
     if route.component == "context_bf16":
-        return load_cake_fmha_context_bf16_module(
-            *common_args,
-            **common_kwargs,
-            exact_profile=route.exact_profile,
-        )
+        return load_cake_fmha_context_bf16_module(*common_args, **common_kwargs)
     return load_cake_fmha_context_fp8_module(*common_args, **common_kwargs)
 
 

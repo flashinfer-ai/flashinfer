@@ -112,6 +112,22 @@ _UNION_PERSISTENT_ROUTES = (
     "prefill_union:bfloat16:bfloat16:paged:gqa16:any",
     "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64",
 )
+# L2 evict-first decode: the paged BF16 M16 decode program built with its K / V
+# TMA copies under the L2 ``evict_first`` eviction priority (route
+# ``decode_m16:bfloat16:bfloat16:paged:l2ef``) computes the same bytes as the
+# unhinted program.  Measured on compute capability 10.0 and 10.3, it is
+# faster when the batch under-fills the device (at most two work items per SM)
+# and the longest context is at least 40960 tokens, and slower for a short KV
+# or a batch several waves deep; so ``_use_decode_l2ef`` takes it per launch
+# from quantities the launch has.  The decode entry keeps no host copy of the
+# KV lengths (no device-to-host copy, graph capture), so the page-table width
+# stands in for the longest context: 320 pages of 128 tokens.  The program is
+# registered for both targets; ``_DECODE_L2EF_TARGETS`` names the targets
+# whose measurement accepted it.
+_DECODE_L2EF_TARGETS = ("sm100a", "sm103a")
+_DECODE_L2EF_ITEMS_FACTOR = (2, 1)
+_DECODE_L2EF_MIN_KV_LEN = 40960
+_DECODE_L2EF_MIN_PAGES = -(-_DECODE_L2EF_MIN_KV_LEN // _BLOCK_SIZE)
 
 
 def _union_persistent_grid(
@@ -475,7 +491,7 @@ def _device_facts(device_index: int) -> tuple[BlackwellMSATarget, int]:
     compute_capability = get_compute_capability(device)
     if compute_capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
-            "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
+            "the Blackwell MSA backend requires compute capability 10.0, 10.3 or 10.7; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
     if compute_capability == (10, 7):
@@ -1013,9 +1029,49 @@ def _prefill_route(
     )
 
 
-def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) -> str:
+def _decode_route(
+    *, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool, l2ef: bool = False
+) -> str:
     layout = "paged" if paged else "flat"
-    return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
+    form = ":l2ef" if l2ef else ""
+    return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}{form}"
+
+
+def _use_decode_l2ef(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    items: int,
+    num_sms: int,
+    max_pages: int,
+) -> bool:
+    """Whether one M16 decode launch takes the L2 evict-first paged program.
+
+    ``items`` counts the persistent work items (queries x KV heads) and
+    ``max_pages`` is the page-table width, the longest context in 128-token
+    pages.  Every clause is a pure function of the launch: a target of
+    ``_DECODE_L2EF_TARGETS``, the paged BF16 Q / BF16 K-V program,
+    ``items * den <= num * num_sms`` for ``(num, den) =
+    _DECODE_L2EF_ITEMS_FACTOR`` and ``max_pages >= _DECODE_L2EF_MIN_PAGES``.
+    An input the predicate cannot judge is refused.
+    """
+    if items <= 0 or num_sms <= 0:
+        raise ValueError(
+            f"items and num_sms must be positive, got {items} and {num_sms}"
+        )
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    num, den = _DECODE_L2EF_ITEMS_FACTOR
+    return (
+        target in _DECODE_L2EF_TARGETS
+        and bool(paged)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and items * den <= num * num_sms
+        and max_pages >= _DECODE_L2EF_MIN_PAGES
+    )
 
 
 def _long_prefill_route(*, paged: bool, group_size: int) -> str:
@@ -1068,39 +1124,7 @@ def _fp8_q1_schedule(
     return ""
 
 
-# Lever D4b(dynpair) ships with the route off by default: the two-token
-# ticket program costs 6-11 % on per-token random block selections.  Turning the mirror
-# on needs a Cake re-export that registers ``decode_uniform_fp8:paged_dynpair`` again
-# (``exports/blackwell_msa/export.PRODUCTION_ROUTE_KEYS``); this package carries only
-# the single-token program.
-_UNIFORM_FP8_DYNPAIR_ROUTE = (
-    False  # mirror of minimax_sparse_attention_sm100.UNIFORM_FP8_DYNPAIR_ROUTE
-)
 _UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
-_UNIFORM_FP8_DYNPAIR_ROUTE_KEY = "decode_uniform_fp8:paged_dynpair"
-
-
-def _uniform_fp8_dynpair(seqlen_q: int) -> bool:
-    """Even ``seqlen_q`` in [2, 32] takes the two-token ticket program when the route is on.
-
-    Mirror of ``minimax_sparse_attention_sm100.uniform_fp8_dynpair_route`` (lever
-    D4b(dynpair), shipped off): query pairs ``(2 i, 2 i + 1)`` never straddle a
-    request; the kernel pairs the two tokens of a ticket when their selected-block lists
-    are equal and runs them one after the other otherwise; the output is bitwise the
-    single-token program's.  Same kernel ABI, grid rule and launch arguments as the
-    single-token route.
-    """
-    seqlen_q = int(seqlen_q)
-    return _UNIFORM_FP8_DYNPAIR_ROUTE and 2 <= seqlen_q <= 32 and seqlen_q % 2 == 0
-
-
-def _uniform_fp8_route(seqlen_q: int) -> str:
-    """Route key of the uniform FP8 Q/K/V paged decode program for ``seqlen_q``."""
-    return (
-        _UNIFORM_FP8_DYNPAIR_ROUTE_KEY
-        if _uniform_fp8_dynpair(seqlen_q)
-        else _UNIFORM_FP8_SINGLE_ROUTE
-    )
 
 
 def _uniform_fp8_decode_grid(
@@ -2872,7 +2896,8 @@ def _run_decode_m16(
         workspace, "decode_status", (2,), dtype=torch.int32, device=q.device
     )
     total_tasks = total_q * num_kv_heads
-    physical_ctas = min(total_tasks, _num_sms(q.device))
+    num_sms = _num_sms(q.device)
+    physical_ctas = min(total_tasks, num_sms)
     grid = (physical_ctas, 1, 1)
     arguments = {
         "Q": q,
@@ -2923,7 +2948,20 @@ def _run_decode_m16(
         "msa_max_pages": max_pages,
         "msa_split_policy": _SPLIT_ADAPTIVE,
     }
-    route = _decode_route(q_dtype=q.dtype, k_dtype=k.dtype, paged=paged)
+    route = _decode_route(
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        paged=paged,
+        l2ef=_use_decode_l2ef(
+            target=target,
+            paged=paged,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            items=total_tasks,
+            num_sms=num_sms,
+            max_pages=max_pages,
+        ),
+    )
     _launch_route(
         route,
         target=target,
@@ -2958,7 +2996,7 @@ def _run_fp8_direct(
 ) -> None:
     """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
 
-    uniform = route in (_UNIFORM_FP8_SINGLE_ROUTE, _UNIFORM_FP8_DYNPAIR_ROUTE_KEY)
+    uniform = route == _UNIFORM_FP8_SINGLE_ROUTE
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -3698,7 +3736,7 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route=_uniform_fp8_route(int(seqlen_q)),
+                route=_UNIFORM_FP8_SINGLE_ROUTE,
                 output_scale=output_scale,
                 **common,
             )

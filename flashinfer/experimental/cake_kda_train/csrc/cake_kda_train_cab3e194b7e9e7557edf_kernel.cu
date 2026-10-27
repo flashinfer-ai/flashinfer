@@ -316,8 +316,8 @@ kernel_cake_kda_train_cab3e194b7e9e7557edf(const __grid_constant__ CUtensorMap a
             mbarrier_init(smem + 48, 128);
             // dec_done: 1 barriers, init_count=128
             mbarrier_init(smem + 56, 128);
-            // h_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
+            // h_ready: 1 barriers, init_count=2
+            mbarrier_init(smem + 64, 2);
             // h_tape_read: 1 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
             // bv_tape_read: 1 barriers, init_count=1
@@ -562,8 +562,7 @@ kernel_cake_kda_train_cab3e194b7e9e7557edf(const __grid_constant__ CUtensorMap a
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 256;" ::: "memory");
             if (warp == 0) {
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
             }
         }
     }
@@ -1083,6 +1082,8 @@ kernel_cake_kda_train_cab3e194b7e9e7557edf(const __grid_constant__ CUtensorMap a
                     _phase_bv_ready_0_1 ^= 1;
                     mbarrier_wait(dec_done_addr, _phase_dec_done_0);
                     _phase_dec_done_0 ^= 1;
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(h_ready_addr);
                     if (nc_3 > c_3 + 1) {
                         mbarrier_wait(vb_ready_addr, _phase_vb_ready_0);
                         _phase_vb_ready_0 ^= 1;

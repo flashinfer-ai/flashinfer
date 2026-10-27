@@ -73,7 +73,7 @@ void Run(TensorView a_partial, TensorView a_dw, int64_t a_C, int64_t a_main_ctas
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(128, 1, 1);
-  config.dynamicSmemBytes = 0;
+  config.dynamicSmemBytes = 2048;
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

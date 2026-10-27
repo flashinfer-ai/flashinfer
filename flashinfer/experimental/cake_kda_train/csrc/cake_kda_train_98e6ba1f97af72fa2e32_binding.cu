@@ -100,13 +100,13 @@ void Run(TensorView a_g, TensorView a_q, TensorView a_k, TensorView a_beta, Tens
   check_same_device(a_v_new, a_g, "v_new", "g");
   check_contiguous(a_dv2, "dv2");
   check_same_device(a_dv2, a_g, "dv2", "g");
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
-  TVM_FFI_CHECK((a_num_heads <= 262143), ValueError)
+  TVM_FFI_CHECK((a_num_heads <= 262143LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads <= 262143)";
-  TVM_FFI_CHECK((a_num_qk_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_qk_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_qk_heads >= 1)";
-  TVM_FFI_CHECK((a_group >= 1), ValueError)
+  TVM_FFI_CHECK((a_group >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (group >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

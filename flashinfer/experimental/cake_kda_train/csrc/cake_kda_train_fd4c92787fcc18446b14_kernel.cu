@@ -104,7 +104,7 @@ kernel_cake_kda_train_fd4c92787fcc18446b14(int* __restrict__ seq_chunk_start, in
     int* cs_t = reinterpret_cast<int*>(smem_raw + 2144);
     const int cs_t_addr = smem + 2144;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int tid_0 = tid;
     int lane_1 = lane;
     int warp_2 = warp;

@@ -72,6 +72,12 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     return u;
 }
 
+__device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS, LAUNCH_BOUNDS_MIN_BLOCKS) void
@@ -87,7 +93,7 @@ kernel_cake_mhc_train_fwd_collapse(__nv_bfloat16* __restrict__ x, float* __restr
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     int group = tid / 256;
     int gtid = tid - group * 256;
@@ -152,27 +158,22 @@ kernel_cake_mhc_train_fwd_collapse(__nv_bfloat16* __restrict__ x, float* __restr
                 unsigned int uw[4];
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    float _mul_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(pre[0]), "f"(cache[v_1 * 8 + 2 * k]));
-                    float _mul_1;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(pre[0]), "f"(cache[v_1 * 8 + 2 * k + 1]));
-                    float _fma_0;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(pre[1]), "f"(cache[(1 + v_1) * 8 + 2 * k]), "f"(_mul_0));
-                    float _fma_1;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(pre[1]), "f"(cache[(1 + v_1) * 8 + 2 * k + 1]), "f"(_mul_1));
-                    float _fma_2;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(pre[2]), "f"(cache[(2 + v_1) * 8 + 2 * k]), "f"(_fma_0));
-                    float _fma_3;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(pre[2]), "f"(cache[(2 + v_1) * 8 + 2 * k + 1]), "f"(_fma_1));
-                    float _fma_4;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_4) : "f"(pre[3]), "f"(cache[(3 + v_1) * 8 + 2 * k]), "f"(_fma_2));
                     float _fma_5;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(pre[3]), "f"(cache[(3 + v_1) * 8 + 2 * k + 1]), "f"(_fma_3));
-                    __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_fma_4, _fma_5));
-                    unsigned int hword = __as_u32(_bf16x2_0);
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(pre[1]), "f"(cache[(1 + v_1) * 8 + 2 * k]), "f"(mul_f32_rn_noftz(pre[0], cache[v_1 * 8 + 2 * k])));
+                    float _fma_4;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_4) : "f"(pre[2]), "f"(cache[(2 + v_1) * 8 + 2 * k]), "f"(_fma_5));
+                    float _fma_3;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(pre[3]), "f"(cache[(3 + v_1) * 8 + 2 * k]), "f"(_fma_4));
+                    float _fma_8;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_8) : "f"(pre[1]), "f"(cache[(1 + v_1) * 8 + 2 * k + 1]), "f"(mul_f32_rn_noftz(pre[0], cache[v_1 * 8 + 2 * k + 1])));
+                    float _fma_7;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_7) : "f"(pre[2]), "f"(cache[(2 + v_1) * 8 + 2 * k + 1]), "f"(_fma_8));
+                    float _fma_6;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_6) : "f"(pre[3]), "f"(cache[(3 + v_1) * 8 + 2 * k + 1]), "f"(_fma_7));
+                    unsigned int hword = __as_u32(__float22bfloat162_rn(make_float2(_fma_3, _fma_6)));
                     uw[k] = hword;
                 }
-                asm volatile("st.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<unsigned int*>(u + (ubase + (long long)(v_1 * 2048))) + (0)), "r"(uw[(0) + 0]), "r"(uw[(0) + 1]), "r"(uw[(0) + 2]), "r"(uw[(0) + 3]) : "memory");
+                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(u + (ubase + (long long)(v_1 * 2048))))[0] = reinterpret_cast<int4*>(uw)[0];
             }
         }
     }

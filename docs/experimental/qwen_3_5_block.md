@@ -144,8 +144,8 @@ page sizes); the first probe on a served device and the first plan re-read them 
 
 ## Requirements and limits
 
-- SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; the repository-wide
-  floor is unchanged -- the kernels gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
+- SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; also the package minimum;
+  the kernels still gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
 - bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; `rope_dim` 64 (the Qwen3.5 value) or 128
   (`qwen_3_5_block_support(...).rope_dims`: the fused norm + RoPE projection rotates whole 64-column epilogue-subtile pairs below
   the head dim, and the norm + RoPE kernels of the lowered decode chain shuffle 16 x a power-of-two elements -- 32 / 256 fail the
@@ -189,24 +189,32 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(103 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+(114 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
-SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
+SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers, and --
+since the Qwen 3.8 Flash-Next sibling package `../qwen_3_8_block/` shares this tree -- the block-sparse d256 core with its paged
+indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts (the `QSA`
+selection package), ten files the dense forms of this package never run; every file keeps its NVIDIA SPDX header, MIT or
 Apache-2.0), with only the import roots rewritten and six declared patches (P0-P2, exact text, replace the nanobind extension's
-seams, P3 rewords twenty-two comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
+seams, P3 rewords twenty-four comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
 does not carry -- the `gemm` package's lazy exports and the sm120 arch family; P4, which carried the cache-write launcher's
 one-device check ahead of its upstream landing, is retired now that the pinned commit carries it; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
 Pinned revision: cuDNN Frontend
-`d8b0a7ed5` (1.32.0: the Rubin decode levers -- the 64-column decode tile, the decode-grid split combine and its lean group
-walk, the lowered small-M decode chain --, independent K / V paged-pool layouts (HND / NHD per pool, bound and validated per
-operand), the split-prefix scheduling of paged packed attention (long-KV requests first, work-prefix task lookup), the closed
-scheduler-reader and barrier back-edges of the SM100 / SM107 prefill tiles, the shared d128-family configuration tables, and, since
-the previous vendoring, the decode step's measured defaults on cc 10.7 -- programmatic dependent launch on the decode tile's routes
-and the paged write-through folded into the norm + RoPE launch below 128 rows --, the cache-write launcher's one-device check, the
-SM120 templates' split-KV with an attention sink (declared, not served here) and the graph API's serialization and topology
-additions); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
+`f2aa360e5` on its `develop` branch (1.32.0: everything of the previous pins `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
+independent K / V paged-pool layouts, the split-prefix scheduling of paged packed attention, the decode step's measured defaults on cc 10.7
+(programmatic dependent launch on the decode tile's routes, the paged write-through folded into the norm + RoPE launch below 128 rows), the
+in-block QSA indexer's DECODE step over the pools that the Qwen 3.8 sibling binds: the indexer band on the small-M projection route, the
+fused prepare with the paged side-cache arms, the paged scorer, the decode top-k and the decode-grid split combine of the block-sparse
+core --, plus, on `develop`: the block-sparse decode schedule's split rule (the wave rule), the programmatic-dependent-launch sites of
+the block-sparse chain (served under the caller-list form, off by default), the e4m3 compressed-key cache arms of the compress and
+scorer kernels (served by the tree; the sibling entry declines that dtype by name until its own surface lands), the DSL-free front door
+`_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`).
+The dense forms of this package are unchanged by the re-vendor (their files are byte-identical to the previous pin's except the block's
+`api.py` / package roots, the SDPA adapter's configuration and heuristics tables and the shared `tile_dsl` helpers, which carry the
+changes above; the GEMM compiler and its templates are byte-identical).
+`qwen_3_5_block_support(...).source` reports the pin at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The
 kernels keep living in cuDNN Frontend and are re-vendored deliberately: the exporter, the closure list and the tracer live in
@@ -232,8 +240,8 @@ at eviction, a captured one retained and revived, a cold bucket under capture re
 `cudnn` package blocked).
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the
 cudnn-frontend package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests
-(support, weights, RoPE, plan cache, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
-envelope declines by target.
+(support, weights, RoPE, plan cache, isolation) run everywhere. The CI image policy now pins `nvidia-cutlass-dsl` 4.8.0;
+the runtime gate still declines unsupported targets.
 
 No performance number is claimed in this draft. The Rubin decode levers (the 64-column decode tile, the decode-grid split combine
 and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here,

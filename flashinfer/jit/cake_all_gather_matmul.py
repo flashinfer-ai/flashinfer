@@ -21,20 +21,29 @@ architectures (``PROGRAMS`` records its launch block and dynamic shared memory;
 sequence module per (world size, dtype, weight layout, architecture)
 (``SEQUENCES``): the route's device units together with the rendered one-call
 launcher ``run`` (barrier, bridge event, copy-engine pushes with their
-readiness epochs, main kernel with cached tensor maps) and ``run_push`` for
-the calls ``uses_sm_push`` routes through the SM push kernel (the base rule
-plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands; the push launch of a
-call is the architecture's ``PUSH_LAUNCH_ROWS_BY_ARCH`` row of its world size
-and padded rows, else the per-peer payload rule). The main kernels are
+readiness epochs, main kernel with cached tensor maps) and, at world sizes 4
+and 8, ``run_push`` for the calls ``uses_sm_push`` routes through the SM push
+kernel (the base rule plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands;
+the push launch of a call is the architecture's ``PUSH_LAUNCH_ROWS_BY_ARCH``
+row of its world size and padded rows, else the per-peer payload rule; no
+two-rank call takes that route, so a world-size-2 sequence compiles neither
+push program nor ``run_push``). The main kernels are
 tcgen05 code, so a sequence is compiled for its exact architecture
-(``sm_100a`` or ``sm_103a``).
+(``sm_100a`` or ``sm_103a``); a row whose host sequence is another
+architecture's apart from its namespace lists that architecture's sequence
+source and names its own namespace through ``sequence_flags``, compile
+definitions passed to the sequence source alone.
 A route whose (world size, dtype, weight layout) class is listed in
 ``N128_CLASSES`` for the device's architecture also compiles the 128-wide main
 twin (``main_n128``) into its sequence module; ``main_block_n`` selects that
 twin per call from the frozen wave rule (``SM_COUNT_BY_ARCH`` and the
 per-architecture wave cap ``N128_MAX_WAVES_BY_ARCH``) and the table, and the
 launcher receives the chosen ``block_n``. ``N`` stays a positive multiple of
-``BLOCK_N`` (256) either way.
+``BLOCK_N`` (256) either way. On an architecture listed True in
+``CG2_N128_PRECEDENCE_ARCHES`` a call inside a measured ``CG2_REGIONS``
+rectangle of a class listed in ``CG2_CLASSES`` keeps ``block_n = 256`` so that
+``main_form`` selects the CTA-pair twin (the kernel module's default-path rule:
+the pair takes precedence over the wave rule).
 A route whose class is listed in ``CG2_CLASSES`` for the device's architecture
 also compiles the CTA-pair twin of the N256 main (``main_cg2``:
 ``tcgen05.mma.cta_group::2`` over a cluster of two CTAs, each loading its own
@@ -99,6 +108,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_378badfea679e1bc51d7": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_378badfea679e1bc51d7_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_40242e9c64d6e66af6f5": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
@@ -144,6 +161,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_6e81f55424d75f150b3b_kernel.cu",
         ],
         "arches": ["sm_100a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_72ae81d01ed72fe75fe8": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -208,14 +233,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_b4f547b76a4b6c14c87b": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
-        ],
-        "arches": ["sm_100a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -370,6 +387,7 @@ ROUTES: dict[str, str] = {
     "main_bfloat16_ws4_k_major_po": "cake_all_gather_matmul_ea2faa64e8c1ea61c8b8",
     "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_dba24f495a33b1a179e7",
     "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
+    "main_bfloat16_ws8_k_major_cg1s2": "cake_all_gather_matmul_378badfea679e1bc51d7",
     "main_bfloat16_ws8_k_major_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
     "main_bfloat16_ws8_k_major_cg2s2": "cake_all_gather_matmul_9d5d20282a6a1082a079",
     "main_bfloat16_ws8_k_major_ks4": "cake_all_gather_matmul_c4d3d85b74918e225506",
@@ -383,7 +401,7 @@ ROUTES: dict[str, str] = {
     "main_float16_ws2_k_major_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
     "main_float16_ws2_n_major": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
     "main_float16_ws4_k_major": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
-    "main_float16_ws4_k_major_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
+    "main_float16_ws4_k_major_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
     "main_float16_ws4_n_major": "cake_all_gather_matmul_f0cbdce7150397ae0989",
     "main_float16_ws8_k_major": "cake_all_gather_matmul_f85e6d8165a64ac49252",
     "main_float16_ws8_k_major_ks4": "cake_all_gather_matmul_8ec093514b46431df041",
@@ -399,8 +417,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
@@ -412,8 +428,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_bb046ade8e857469f0c6",
             "main_cg2": "cake_all_gather_matmul_d0fc2abec5d93b9a81ec",
         },
@@ -422,12 +436,11 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_e68ff7dc1d24a48a"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
@@ -435,8 +448,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_bb046ade8e857469f0c6",
             "main_cg2": "cake_all_gather_matmul_d0fc2abec5d93b9a81ec",
         },
@@ -445,8 +456,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
@@ -458,8 +467,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
             "main_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
         },
@@ -468,12 +475,11 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_3d4c6b672fccc2e9"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
@@ -481,8 +487,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
             "main_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
         },
@@ -571,8 +575,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_dba24f495a33b1a179e7_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_4dd55b8a57fc515a"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "bfloat16",
@@ -622,6 +627,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_378badfea679e1bc51d7_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a0785a42337a41e57f18_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c4d3d85b74918e225506_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_60cbe405e11489692148_kernel.cu",
@@ -640,6 +646,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
             "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
             "main_cg2s2": "cake_all_gather_matmul_9d5d20282a6a1082a079",
+            "main_cg1s2": "cake_all_gather_matmul_378badfea679e1bc51d7",
             "peer_push_wide_ks4": "cake_all_gather_matmul_a0785a42337a41e57f18",
             "main_ks4": "cake_all_gather_matmul_c4d3d85b74918e225506",
             "main_n128_ks4": "cake_all_gather_matmul_60cbe405e11489692148",
@@ -701,8 +708,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
@@ -714,8 +719,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
             "main_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
         },
@@ -724,12 +727,11 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_65a8f6938e94e471"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
@@ -737,8 +739,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
             "main_cg2": "cake_all_gather_matmul_aa1b0acc28e1e23913d9",
         },
@@ -747,8 +747,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
@@ -759,8 +757,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
         },
     },
@@ -768,11 +764,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_cd42fdd423ee95ad"],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "float16",
@@ -780,8 +775,6 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "programs": {
             "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
             "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
-            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
-            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
         },
     },
@@ -792,7 +785,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
@@ -805,7 +798,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
-            "main_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
+            "main_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
         },
     },
     "float16_ws4_k_major_sm_103a": {
@@ -815,8 +808,10 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_72ae81d01ed72fe75fe8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_126e6d87bacceb57"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
@@ -827,6 +822,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+            "main_cg2": "cake_all_gather_matmul_72ae81d01ed72fe75fe8",
         },
     },
     "float16_ws4_n_major_sm_100a": {
@@ -857,8 +853,9 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f0cbdce7150397ae0989_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
         ],
+        "sequence_flags": ["-DCAKE_SEQ_SHIM=cake_host_shim_seq_2bf1da83f19d9287"],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "float16",
@@ -972,7 +969,6 @@ COMPILE_FLAGS: list[str] = ["--use_fast_math"]
 N128_CLASSES: dict[str, list[list[Any]]] = {
     "sm_100a": [
         [4, "bfloat16", "k_major"],
-        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
         [8, "bfloat16", "n_major"],
         [8, "float16", "k_major"],
@@ -988,11 +984,16 @@ N128_CLASSES: dict[str, list[list[Any]]] = {
 # architecture).
 SM_COUNT_BY_ARCH: dict[str, int] = {"sm_100a": 148, "sm_103a": 148}
 N128_MAX_WAVES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 1}
+# Per-architecture precedence of the CTA pair over the N128 wave rule (copied
+# from the kernel module): where True, ``main_block_n`` keeps a call inside a
+# ``CG2_REGIONS`` rectangle of a ``CG2_CLASSES`` class at 256; an arch outside
+# the table is an error, never a default.
+CG2_N128_PRECEDENCE_ARCHES: dict[str, bool] = {"sm_100a": True, "sm_103a": False}
 # Per-architecture SM push bands ``[world_size, padded_rows, max_cols]`` beyond
 # the base rule of ``uses_sm_push`` (copied from the kernel module; an arch
 # outside the table is an error, never the base rule alone).
 SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
-    "sm_100a": [],
+    "sm_100a": [[8, 1024, 1619]],
     "sm_103a": [[8, 1024, 1619]],
 }
 # Per-architecture SM push launch rows ``[world_size, padded_rows, ctas_per_peer,
@@ -1027,6 +1028,7 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major"],
         [2, "float16", "k_major"],
         [4, "bfloat16", "k_major"],
+        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
     ],
     "sm_103a": [
@@ -1034,6 +1036,7 @@ CG2_CLASSES: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major"],
         [2, "float16", "k_major"],
         [4, "bfloat16", "k_major"],
+        [4, "float16", "k_major"],
         [8, "bfloat16", "k_major"],
     ],
 }
@@ -1058,6 +1061,8 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
         [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
         [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+        [4, "bfloat16", "k_major", 512, 512, 2560, 2560],
+        [4, "float16", "k_major", 512, 512, 2560, 2560],
     ],
     "sm_103a": [
         [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
@@ -1067,6 +1072,8 @@ CG2_REGIONS: dict[str, list[list[Any]]] = {
         [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
         [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
         [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+        [4, "bfloat16", "k_major", 512, 512, 2560, 2560],
+        [4, "float16", "k_major", 512, 512, 2560, 2560],
     ],
 }
 # Classes ``[world_size, dtype, b_layout, form]`` with a delivered spill-wave
@@ -1092,6 +1099,7 @@ CG2_SPILL_POINTS: dict[str, list[list[Any]]] = {
     "sm_100a": [
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
         [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+        [4, "bfloat16", "k_major", 2048, 2560, "cg2s2"],
     ],
     "sm_103a": [
         [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
@@ -1116,6 +1124,25 @@ TILE_ORDER_POINTS: dict[str, list[list[Any]]] = {
     "sm_100a": [],
     "sm_103a": [[4, "bfloat16", "k_major", 128, 14336, "po"]],
 }
+# Classes ``[world_size, dtype, b_layout, form]`` with a delivered one-CTA
+# last-pass N-split main (``form`` ``cg1s2``: the one-CTA N256 main whose last
+# persistent pass runs each output tile as two 128-wide half items on otherwise
+# idle CTAs; the one-CTA launch), per architecture; ``main_form`` selects a
+# point's program only inside this table.
+CG1S_CLASSES: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [[8, "bfloat16", "k_major", "cg1s2"]],
+}
+# Frozen refinement of the one-CTA selection, copied from the kernel module:
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` points per
+# architecture (an architecture without one lists nothing); an N256 call the
+# pair rule leaves on the one-CTA program and no tile-order point names runs
+# the point's last-pass N-split twin iff its class, ``ceil128(rows)`` and exact
+# ``N`` match a point.
+CG1S_POINTS: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [[8, "bfloat16", "k_major", 1152, 1280, "cg1s2"]],
+}
 
 SOURCE_PACKAGE = "cake_all_gather_matmul"
 # The kernels are tcgen05 / TMEM code; one source serves both capabilities,
@@ -1138,14 +1165,16 @@ BLOCK_N = 256
 MAIN_BLOCK_NS: tuple[int, ...] = (256, 128)
 # Forms of the delivered N256 main: the one-CTA program (``cg1``), its CTA-pair
 # twin (``cg2``, ``tcgen05.mma.cta_group::2``), the twin's spill-wave N-split
-# pair twins (``cg2s1`` / ``cg2s2``) and the one-CTA program's tile-order twins
-# (``po`` / ``pi``) ``main_form`` selects per call; the index of a form here is
-# the positional form code the host sequence takes (``main_form_code``). Every
-# pair form launches clusters of ``CG2_CLUSTER_DIMS`` CTAs (the pair); the
-# tile-order forms take the one-CTA launch and grid.
-MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi")
+# pair twins (``cg2s1`` / ``cg2s2``), the one-CTA program's tile-order twins
+# (``po`` / ``pi``) and its last-pass N-split twin (``cg1s2``) ``main_form``
+# selects per call; the index of a form here is the positional form code the
+# host sequence takes (``main_form_code``). Every pair form launches clusters of
+# ``CG2_CLUSTER_DIMS`` CTAs (the pair); the tile-order and last-pass N-split
+# forms take the one-CTA launch and grid.
+MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi", "cg1s2")
 PAIR_FORMS: tuple[str, ...] = ("cg2", "cg2s1", "cg2s2")
 ORDER_FORMS: tuple[str, ...] = ("po", "pi")
+ONE_CTA_SPLIT_FORMS: tuple[str, ...] = ("cg1s2",)
 CG2_CLUSTER_DIMS: tuple[int, int, int] = (2, 1, 1)
 # Rows pushed per peer chunk (19 * BLOCK_M); the main kernel consumes chunk
 # ``c`` of a peer after the matching readiness word reaches the launch epoch.
@@ -1297,6 +1326,20 @@ def _cg2_regions(
     ]
 
 
+def _cg2_rectangle_qualifies(
+    arch: str, world_size: int, dtype_name: str, b_layout: str, padded: int, cols: int
+) -> bool:
+    """Whether some measured rectangle of the class on ``arch`` (``CG2_REGIONS``)
+    contains the call: ``min_padded_rows <= padded <= max_padded_rows`` and
+    ``min_cols <= cols <= max_cols``. Shared by ``main_block_n`` and ``main_form``."""
+
+    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
+    return any(
+        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
+        for min_rows, max_rows, min_cols, max_cols in rectangles
+    )
+
+
 def _cg2s_classes(arch: str) -> frozenset[tuple[int, str, str, str]]:
     """``(world_size, dtype, b_layout, form)`` classes with a delivered spill-wave
     N-split pair main on ``arch`` (the emitted ``CG2S_CLASSES`` table); an
@@ -1354,6 +1397,46 @@ def _tile_order_point(
     return None
 
 
+def _cg1s_classes(arch: str) -> frozenset[tuple[int, str, str, str]]:
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered one-CTA
+    last-pass N-split main on ``arch`` (the emitted ``CG1S_CLASSES`` table); an
+    unknown arch raises."""
+
+    if arch not in CG1S_CLASSES:
+        raise ValueError(
+            f"CG1S_CLASSES has no entry for arch {arch!r} "
+            f"(known: {sorted(CG1S_CLASSES)})"
+        )
+    return frozenset(
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in CG1S_CLASSES[arch]
+    )
+
+
+def _cg1s_point(
+    arch: str,
+    world_size: int,
+    dtype_name: str,
+    b_layout: str,
+    padded: int,
+    cols: int,
+) -> str | None:
+    """Form of the one-CTA last-pass N-split point of ``CG1S_POINTS`` that names
+    the class, padded rows and exact ``N`` on ``arch``, or ``None`` when no point
+    does; an unknown arch raises."""
+
+    if arch not in CG1S_POINTS:
+        raise ValueError(
+            f"CG1S_POINTS has no entry for arch {arch!r} (known: {sorted(CG1S_POINTS)})"
+        )
+    key = (int(world_size), str(dtype_name), str(b_layout), int(padded), int(cols))
+    for entry in CG1S_POINTS[arch]:
+        world, dtype, layout, rows, n, form = entry
+        if (int(world), str(dtype), str(layout), int(rows), int(n)) == key:
+            return str(form)
+    return None
+
+
 def _cg2_spill_point(
     arch: str,
     world_size: int,
@@ -1397,8 +1480,12 @@ def main_block_n(
     ``S = SM_COUNT_BY_ARCH[arch]``), the call spans at most
     ``N128_MAX_WAVES_BY_ARCH[arch]`` N256 waves, and the ``(world_size,
     dtype_name, b_layout)`` class has a delivered ``_n128`` program on ``arch``
-    (``N128_CLASSES``). The rule mirrors the kernel module's ``main_block_n``;
-    the table restricts it to delivered programs."""
+    (``N128_CLASSES``). On an architecture listed True in
+    ``CG2_N128_PRECEDENCE_ARCHES`` a call inside a measured ``CG2_REGIONS``
+    rectangle of a class listed in ``CG2_CLASSES`` keeps 256 (the pair takes
+    precedence over the wave rule). The rule mirrors the kernel module's
+    ``main_block_n`` in its default path; the tables restrict it to delivered
+    programs."""
 
     if arch not in SM_COUNT_BY_ARCH or arch not in N128_MAX_WAVES_BY_ARCH:
         raise ValueError(
@@ -1415,6 +1502,15 @@ def main_block_n(
     w128 = -(-(2 * t256) // sm_count)
     qualify = 2 * w256 > w128
     cap = w256 <= max_waves
+    pair_key = (world_size, str(dtype_name), str(b_layout))
+    if (
+        CG2_N128_PRECEDENCE_ARCHES[arch]
+        and pair_key in _cg2_classes(arch)
+        and _cg2_rectangle_qualifies(
+            arch, world_size, dtype_name, b_layout, padded_rows(rows), int(n)
+        )
+    ):
+        return 256
     delivered = (world_size, str(dtype_name), str(b_layout)) in _n128_classes(arch)
     return 128 if (qualify and cap and max_waves > 0 and delivered) else 256
 
@@ -1429,8 +1525,8 @@ def main_form(
     b_layout: str,
     block_n: int,
 ) -> str:
-    """Form (``"cg1"``, ``"cg2"``, ``"cg2s1"``, ``"cg2s2"``, ``"po"`` or ``"pi"``)
-    of the main program for one call.
+    """Form (``"cg1"``, ``"cg2"``, ``"cg2s1"``, ``"cg2s2"``, ``"po"``, ``"pi"`` or
+    ``"cg1s2"``) of the main program for one call.
 
     The CTA-pair twin (``cg2``) is selected for an N256 call whose
     ``(world_size, dtype_name, b_layout)`` class has a measured rectangle on
@@ -1445,9 +1541,12 @@ def main_form(
     the one-CTA program -- or, when the N256 call's class, ``ceil128(rows)``
     and exact ``n`` name a point of ``TILE_ORDER_POINTS`` on ``arch`` whose
     program is delivered for the class there (``ORDER_CLASSES``), the point's
-    tile-order twin of the one-CTA program (the same launch and grid). The
-    rule mirrors the kernel module's ``main_form`` with its frozen region and
-    point tables; an unknown arch raises, never defaults."""
+    tile-order twin of the one-CTA program (the same launch and grid); else,
+    when they name a point of ``CG1S_POINTS`` on ``arch`` whose program is
+    delivered for the class there (``CG1S_CLASSES``), the one-CTA main's
+    last-pass N-split twin (the same launch and grid). The rule mirrors the
+    kernel module's ``main_form`` with its frozen region and point tables; an
+    unknown arch raises, never defaults."""
 
     if arch not in CG2_REGIONS:
         raise ValueError(
@@ -1460,16 +1559,17 @@ def main_form(
     delivered = (int(world_size), str(dtype_name), str(b_layout)) in _cg2_classes(arch)
     padded = padded_rows(rows)
     cols = int(n)
-    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
-    qualify = any(
-        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
-        for min_rows, max_rows, min_cols, max_cols in rectangles
+    qualify = _cg2_rectangle_qualifies(
+        arch, world_size, dtype_name, b_layout, padded, cols
     )
     key = (int(world_size), str(dtype_name), str(b_layout))
     if not (qualify and delivered):
         order = _tile_order_point(arch, world_size, dtype_name, b_layout, padded, cols)
         if order is not None and (*key, order) in _order_classes(arch):
             return order
+        split = _cg1s_point(arch, world_size, dtype_name, b_layout, padded, cols)
+        if split is not None and (*key, split) in _cg1s_classes(arch):
+            return split
         return "cg1"
     point = _cg2_spill_point(arch, world_size, dtype_name, b_layout, padded, cols)
     if point is not None and (*key, point) in _cg2s_classes(arch):
@@ -1480,7 +1580,8 @@ def main_form(
 def main_form_code(form: str) -> int:
     """The positional form code the host sequence takes after ``block_n``: 0 the
     one-CTA main, 1 the CTA-pair twin, 2 / 3 its spill-wave N-split pair twins,
-    4 / 5 the one-CTA main's tile-order twins (the index into ``MAIN_FORMS``)."""
+    4 / 5 the one-CTA main's tile-order twins, 6 its last-pass N-split twin (the
+    index into ``MAIN_FORMS``)."""
 
     return MAIN_FORMS.index(_check_form(form))
 
@@ -1514,8 +1615,8 @@ def main_grid(
     each CTA striding over the arrival-ordered tile list. Every pair form (the
     CTA-pair twin and its spill-wave N-split twins) launches an even grid of
     ``2 * min(pair_tiles, SMs / 2)`` CTAs, each cluster striding over the
-    pair-tile list. The tile-order twins take the one-CTA grid at the public
-    width."""
+    pair-tile list. The tile-order twins and the last-pass N-split twin take the
+    one-CTA grid at the public width."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
         message = "the persistent main grid needs a positive world_size and sm_count"
@@ -1523,6 +1624,11 @@ def main_grid(
     if _check_form(form) in ORDER_FORMS and _check_block_n(block_n) != 256:
         raise ValueError(
             f"the tile-order mains exist at block_n=256 only, got {block_n}"
+        )
+    if form in ONE_CTA_SPLIT_FORMS and _check_block_n(block_n) != 256:
+        raise ValueError(
+            f"the one-CTA last-pass N-split mains exist at block_n=256 only, "
+            f"got {block_n}"
         )
     if _check_form(form) in PAIR_FORMS:
         if _check_block_n(block_n) != 256:
@@ -1750,7 +1856,8 @@ def _main_route_key(
     """``ROUTES`` key of one main program (``_n128`` suffix for the 128-wide twin,
     ``_cg2`` for the CTA-pair twin of the N256 main, ``_cg2s1`` / ``_cg2s2`` for
     its spill-wave N-split twins, ``_po`` / ``_pi`` for the one-CTA main's
-    tile-order twins, ``_ks<S>`` last for a per-K-slice readiness twin)."""
+    tile-order twins, ``_cg1s2`` for its last-pass N-split twin, ``_ks<S>`` last
+    for a per-K-slice readiness twin)."""
 
     width = "" if _check_block_n(block_n) == 256 else f"_n{block_n}"
     if _check_form(form) in PAIR_FORMS and block_n != 256:
@@ -1758,6 +1865,11 @@ def _main_route_key(
     if form in ORDER_FORMS and block_n != 256:
         raise ValueError(
             f"the tile-order mains exist at block_n=256 only, got {block_n}"
+        )
+    if form in ONE_CTA_SPLIT_FORMS and block_n != 256:
+        raise ValueError(
+            f"the one-CTA last-pass N-split mains exist at block_n=256 only, "
+            f"got {block_n}"
         )
     pair = "" if form == "cg1" else f"_{form}"
     slices = "" if int(k_slices) == 1 else f"_ks{int(k_slices)}"
@@ -1774,7 +1886,8 @@ def main_program(
 ) -> str:
     """The main program of one route at tile width ``block_n`` (256, or the delivered
     ``_n128`` twin), form (``cg1``, the delivered ``_cg2`` CTA-pair twin, a
-    delivered spill-wave N-split twin or a delivered tile-order twin) and readiness slice count (1, or a delivered
+    delivered spill-wave N-split twin, a delivered tile-order twin or the
+    delivered last-pass N-split twin) and readiness slice count (1, or a delivered
     per-K-slice ``_ks<S>`` twin of that program); a class without that program
     raises ``ValueError``."""
 
@@ -1836,23 +1949,26 @@ def sequence_name(world_size: int, dtype_name: str, b_layout: str, arch: str) ->
 
 def sequence_programs(sequence: str) -> tuple[str, ...]:
     """Programs whose device units the sequence module compiles (route order: both
-    barrier phases, both SM push programs, the N256 main, then the ``_n128`` main
-    when the row's ``programs`` carry ``main_n128``, then the ``_cg2`` main when
+    barrier phases, both SM push programs when the row's ``programs`` carry them
+    (the world sizes ``uses_sm_push`` serves, 4 and 8; a world-size-2 row carries
+    neither), the N256 main, then the ``_n128`` main when the row's ``programs``
+    carry ``main_n128``, then the ``_cg2`` main when
     they carry ``main_cg2``, then the spill-wave N-split mains when they carry
     ``main_cg2s1`` / ``main_cg2s2``, then the tile-order mains when they carry
-    ``main_po`` / ``main_pi`` (``ORDER_FORMS`` order), then every per-K-slice
+    ``main_po`` / ``main_pi`` (``ORDER_FORMS`` order), then the last-pass N-split
+    main when they carry ``main_cg1s2``, then every per-K-slice
     readiness twin they carry -- the ``_ks<S>`` push twin of each slice point,
     then the ``_ks<S>`` main twin of every width and form a call at a point can
     resolve to -- in the row's order)."""
 
     row = SEQUENCES[sequence]
-    programs = [
-        ROUTES["barrier_p0"],
-        ROUTES["barrier_p1"],
-        ROUTES["peer_push"],
-        ROUTES["peer_push_wide"],
-        main_program(row["world_size"], row["dtype"], row["b_layout"]),
-    ]
+    programs = [ROUTES["barrier_p0"], ROUTES["barrier_p1"]]
+    # The SM push programs travel with the rows of the world sizes the SM push
+    # route serves (``uses_sm_push``: 4 and 8); a world-size-2 row lists neither.
+    for stage in ("peer_push", "peer_push_wide"):
+        if stage in row["programs"]:
+            programs.append(ROUTES[stage])
+    programs.append(main_program(row["world_size"], row["dtype"], row["b_layout"]))
     if "main_n128" in row["programs"]:
         programs.append(row["programs"]["main_n128"])
     if "main_cg2" in row["programs"]:
@@ -1863,6 +1979,11 @@ def sequence_programs(sequence: str) -> tuple[str, ...]:
     # The tile-order twins of the sequence's (class, form) with a routed point, when it has any: ``main_po`` /
     # ``main_pi`` in ``ORDER_FORMS`` order (none for a class without a point).
     for form in ORDER_FORMS:
+        if f"main_{form}" in row["programs"]:
+            programs.append(row["programs"][f"main_{form}"])
+    # The one-CTA main's last-pass N-split twin of the sequence's (class, form)
+    # with a routed point, when it has one (none for a class without a point).
+    for form in ONE_CTA_SPLIT_FORMS:
         if f"main_{form}" in row["programs"]:
             programs.append(row["programs"][f"main_{form}"])
     # The per-K-slice readiness twins of the sequence's slice points (the push twin of
@@ -1882,14 +2003,33 @@ def spec(sequence: str, arch: str) -> JitSpec:
         raise ValueError(
             f"sequence {sequence!r} is delivered for {row['arches']}, not {arch!r}"
         )
+    sources = [_source_path(relative) for relative in row["sources"]]
+    extra_cuda_cflags = [*ARCH_FLAGS[arch], *COMPILE_FLAGS]
+    # The source build carries every math flag in ``COMPILE_FLAGS``; the
+    # default ``-use_fast_math`` would otherwise be added or dropped.
+    use_fast_math = "--use_fast_math" in COMPILE_FLAGS
+    # A row that builds its host sequence from another architecture's sequence
+    # source names its own host namespace through ``sequence_flags``, compile
+    # definitions of that one source. A per-source list replaces the shared
+    # list and the default fast-math flag for its source, so it is spelled in
+    # full; the device units are absent from it and keep the shared list.
+    # Keyed as ``gen_jit_spec`` declares it (``Mapping[str | Path, ...]``);
+    # ``Mapping`` is invariant in its key type, so a ``dict[Path, ...]`` would not do.
+    by_source: dict[str | Path, list[str]] | None = None
+    if "sequence_flags" in row:
+        sequence_flags = [
+            *(["-use_fast_math"] if use_fast_math else []),
+            *extra_cuda_cflags,
+            *row["sequence_flags"],
+        ]
+        by_source = {sources[-1]: sequence_flags}
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_sequence_{sequence}",
-        sources=[_source_path(relative) for relative in row["sources"]],
-        extra_cuda_cflags=[*ARCH_FLAGS[arch], *COMPILE_FLAGS],
+        sources=sources,
+        extra_cuda_cflags=extra_cuda_cflags,
         extra_include_paths=[_source_dir().parent],
-        # The source build carries every math flag in ``COMPILE_FLAGS``; the
-        # default ``-use_fast_math`` would otherwise be added or dropped.
-        use_fast_math="--use_fast_math" in COMPILE_FLAGS,
+        use_fast_math=use_fast_math,
+        extra_cuda_cflags_by_source=by_source,
     )
 
 
@@ -1915,9 +2055,12 @@ __all__ = [
     "BLOCK_M",
     "BLOCK_N",
     "CAPABILITY_ARCH",
+    "CG1S_CLASSES",
+    "CG1S_POINTS",
     "CG2S_CLASSES",
     "CG2_CLASSES",
     "CG2_CLUSTER_DIMS",
+    "CG2_N128_PRECEDENCE_ARCHES",
     "CG2_REGIONS",
     "CG2_SPILL_POINTS",
     "CHUNK_ROWS",
@@ -1944,6 +2087,7 @@ __all__ = [
     "MAIN_THREADS",
     "N128_CLASSES",
     "N128_MAX_WAVES_BY_ARCH",
+    "ONE_CTA_SPLIT_FORMS",
     "PROGRAMS",
     "ROUTES",
     "SEQUENCES",

@@ -17,13 +17,25 @@ consecutive K-block exponents, activations ``(M, ceil(K/512))`` with any
 strides, weights ``(G, N//128, cols)`` or the row-repeated ``(G, N, cols)``)
 run the block-scaled family: ``tcgen05.mma.kind::mxf8f6f4`` applies both
 scales in the tensor core, ``-1`` entries of ``m_indices`` mark padding rows
-of the compact MoE layout (skipped, output rows untouched) and expert runs
+of the compact MoE layout (skipped, output rows unspecified) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
-schedule, other multiples of 32 the slower multi-run schedule).
+schedule, other multiples of 32 the slower multi-run schedule).  When the
+packed words are DeepGEMM's MN-major activation words and the row-repeated
+weight words and ``N`` is a multiple of 256, the host may route a problem to
+the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
+the 256-row side of a two-CTA MMA and the routed tokens its N side.  With the
+same words, a single-run layout of at most 128 routed rows per group runs the
+store16 programs (:func:`bs_store16`): they write each expert run's routed
+rows rounded up to 16 rows instead of 32.  Every block-scaled route
+accumulates each output in the same K order, so the route never changes the
+bits of a routed row.
 
 The host side selects one kernel route per problem shape and output
 alignment, resolves the launch grid from the device SM count (queried once per
 device), and binds the positional argument plan of the registered program.
+With ``validate_indices`` the expert-run layout read in the same transfer (and,
+for some layouts, the expert starts per tile) may select another route, such
+as the expert-aligned program (a speed choice; results are identical).
 Tensor maps are encoded by the binding and passed to the kernel by value, so a
 prepared launch owns no descriptor storage: every ``launch()`` submits exactly
 one kernel on the current stream and may be captured into a CUDA graph,
@@ -37,7 +49,7 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 import tvm_ffi
@@ -51,6 +63,7 @@ from ..jit.gemm.cake_grouped_fp8_gemm import (
     device_arch,
     generated_program_available,
     load_cake_grouped_fp8_gemm_module,
+    route_program,
     select_module,
 )
 
@@ -64,25 +77,42 @@ DEEPK_C2_ROUTE = "deepk_c2_k_multiple_512"
 DEEPK_C2_AB6_SCALE1_ROUTE = "deepk_c2_ab6_scale1_n256_or_m4096"
 DEEPK_C2_KG1_ROUTE = "deepk_c2_kg1_non_kg4_k_blocks"
 DEEPK_C2_SCALAR_OUTPUT_ROUTE = "deepk_c2_scalar_output"
+DEEPK_C2_KG1_DIRECT_STORE_ROUTE = "deepk_c2_kg1_direct_store_m32"
+DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE = "deepk_c2_ab6_scale1_direct_store_m32"
 DEEPK_N256_ROUTE = "deepk_n256_ab4_three_panel_kg4"
 DEEPK_CG2_RECURRENCE_ROUTE = "deepk_cg2_ab5_x16_pair_wait_kg4"
 DEEPK_CG2_FOUR_LOAD_ROUTE = "deepk_cg2_ab5_x16_four_load_wait_kg4"
 DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE = "deepk_cg2_ab5_x16_four_load_wait_grid128_kg4"
 DEEPK_CG2_RECURRENCE_EARLY4_ROUTE = "deepk_cg2_ab6_early4_output_alias_kg4"
 DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE = "deepk_cg2_ab7_bscale_prefetch_kg4"
+# Expert-aligned K-group 1 schedule: 128-row tiles that never span two experts,
+# cut on the device from m_indices.  Selected only from the layout that
+# ``validate_indices`` reads (see ``prepare_group_gemm_fp8_nt_groupwise_contiguous``).
+DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE = "deepk_c2_kg1_expert_aligned"
+# The expert-aligned program keeps one tile-table entry per expert in shared memory.
+EXPERT_ALIGNED_MAX_GROUPS = 255
 # Block-scaled (packed UE8M0 scale) family.
 BS_N128_ROUTE = "bs_ue8m0_n128"
 BS_N256_ROUTE = "bs_ue8m0_n256"
 BS_N128_RUN32_ROUTE = "bs_ue8m0_n128_run32"
 BS_N256_RUN32_ROUTE = "bs_ue8m0_n256_run32"
+# The store16 programs of the single-run routes (:func:`bs_store16`).
+BS_N128_S16_ROUTE = "bs_ue8m0_n128_s16"
+BS_N256_S16_ROUTE = "bs_ue8m0_n256_s16"
 BS_ROUTES = frozenset(
-    {BS_N128_ROUTE, BS_N256_ROUTE, BS_N128_RUN32_ROUTE, BS_N256_RUN32_ROUTE}
+    {
+        BS_N128_ROUTE,
+        BS_N256_ROUTE,
+        BS_N128_RUN32_ROUTE,
+        BS_N256_RUN32_ROUTE,
+        BS_N128_S16_ROUTE,
+        BS_N256_S16_ROUTE,
+    }
 )
 BS_BLOCK_M = 128
 BS_BLOCK_K = 128
 BS_SUB_ROWS = 32
 
-_CG2_EARLY4_SHAPES = frozenset({(16384, 2048, 4096)})
 _CG2_SELECTED_SHAPES = frozenset(
     {
         (16384, 2048, 4096),
@@ -93,50 +123,245 @@ _CG2_SELECTED_SHAPES = frozenset(
 )
 # Measured CTA cap: these two shapes run their two-CTA routes on 128 CTAs.
 _CG2_GRID128_SHAPES = frozenset({(4096, 2048, 4096), (4096, 4096, 1024)})
+# The two-CTA routes run 256-row tiles.  A tile that holds the start of a
+# non-empty expert runs one main loop per expert segment, so these routes are
+# fast only when every non-empty expert starts on a multiple of 256 rows.
+_CG2_TILE_M = 256
+# (N, K) classes of the two-CTA routes: the route for a routing aligned to
+# 256 rows near the selected M (the 256-row tile count of a selected shape or
+# one more), and the single-CTA route for a known unaligned routing.
+_CG2_ALIGNED_ROUTE = {
+    (2048, 4096): DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE,
+    (4096, 1024): DEEPK_CG2_RECURRENCE_ROUTE,
+}
+_CG2_UNALIGNED_ROUTE = {
+    (2048, 4096): DEEPK_C2_AB6_SCALE1_ROUTE,
+    (4096, 1024): DEEPK_N256_ROUTE,
+}
+_CG2_SELECTED_TILES_M = frozenset(m // _CG2_TILE_M for m, _, _ in _CG2_SELECTED_SHAPES)
+# The two-CTA route each selected shape of those classes ships for an unknown
+# layout.  For a known unaligned layout at these shapes the host keeps it unless
+# the single-CTA route shortens the launch's critical path (:func:`_max_load`).
+_CG2_SHAPE_ROUTE = {
+    (4096, 4096, 1024): DEEPK_CG2_FOUR_LOAD_ROUTE,
+    (16384, 4096, 1024): DEEPK_CG2_RECURRENCE_ROUTE,
+    (4096, 2048, 4096): DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE,
+}
+# M-tile heights whose inner expert starts a validated launch reads for
+# :func:`_max_load` (the single-CTA and the two-CTA routes of those shapes).
+_TILE_START_ROWS = (128, _CG2_TILE_M)
+# A K=384 problem of at most this many 128x128 tiles runs the K-loop route.
+K384_KG1_MAX_TILES = 4
+# At (16384, 4096, 1024) a known unaligned layout leaves the two-CTA pair route
+# only when the single-CTA route's busiest worker runs at least this many fewer
+# expert segments.
+PAIR_N256_MIN_LOAD_GAIN = 2
+# A K=512 problem of at least this many 128x128 tiles keeps the K-multiple-of-512
+# route, except at N=256 or M=4096.
+K512_C2_MIN_TILES = 2
+# A launch whose every tile has at most DIRECT_STORE_MAX_ROWS rows (M <= 32) on at
+# most DIRECT_STORE_MAX_CTAS CTAs runs the direct-store program of its KG1 / AB6
+# route: it stores such a tile with direct row stores instead of the TMA epilogue
+# (same output bytes), which shortens the tail of a launch made of such tiles
+# (measured faster on B200 and GB300).  Every other launch keeps the route's program.
+DIRECT_STORE_MAX_ROWS = 32
+DIRECT_STORE_MAX_CTAS = 16
+_DIRECT_STORE_ROUTE = {
+    DEEPK_C2_KG1_ROUTE: DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
+    DEEPK_C2_AB6_SCALE1_ROUTE: DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
+}
 
 
 def route_for_shape(m: int, n: int, k: int) -> str:
-    """Select the kernel route for a 16-byte-aligned BF16 output."""
-    if (m, n, k) == (4096, 2048, 4096):
-        return DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
-    if (m, n, k) == (4096, 4096, 1024):
-        return DEEPK_CG2_FOUR_LOAD_ROUTE
-    if (m, n, k) in _CG2_EARLY4_SHAPES:
-        return DEEPK_CG2_RECURRENCE_EARLY4_ROUTE
-    if (m, n, k) in _CG2_SELECTED_SHAPES:
-        return DEEPK_CG2_RECURRENCE_ROUTE
+    """Select the kernel route for a 16-byte-aligned BF16 output from the shape.
+
+    :func:`launch_plan` refines it with the device's SM count, and a launch
+    prepared with ``validate_indices`` also with the expert-run layout it reads.
+    """
+    return _route(m, n, k)
+
+
+def _route(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    sm_count: Optional[int] = None,
+    aligned: Optional[bool] = None,
+    tile_starts: Optional[Mapping[int, Sequence[int]]] = None,
+) -> str:
+    """The FP32-scale route of a 16-byte-aligned BF16 output.
+
+    ``aligned`` (whether every expert run starts on a multiple of 256 rows,
+    when the layout is known at preparation) selects the two-CTA routes only
+    for layouts aligned to their 256-row tiles.  At the shapes of
+    ``_CG2_SHAPE_ROUTE`` a known unaligned layout keeps the two-CTA route
+    unless the single-CTA route shortens the launch's critical path, counted
+    from ``tile_starts`` and ``sm_count`` (:func:`_max_load`).  ``sm_count``
+    also lets K=384 problems of at most ``K384_KG1_MAX_TILES`` 128x128 tiles
+    run the K-loop route instead of the static-K route, and K=128 problems of
+    at most ``sm_count`` 128x128 tiles (one wave) run the K-loop K-group 1
+    route, whose accumulator starts from -0.0 at K=128 so that its output
+    has the bits of the static-K route's.  K=512 problems of at
+    least ``K512_C2_MIN_TILES`` 128x128 tiles keep the K-multiple-of-512 route
+    except at N=256 or M=4096.
+    """
+    if k <= 0 or k % K_BLOCK:
+        raise ValueError(
+            f"contiguous grouped FP8 GEMM requires positive K divisible by {K_BLOCK}; got K={k}"
+        )
+    if (n, k) in _CG2_ALIGNED_ROUTE:
+        if aligned is False:
+            return _unaligned_cg2_route(m, n, k, sm_count, tile_starts)
+        if (m, n, k) == (4096, 4096, 1024):
+            return DEEPK_CG2_FOUR_LOAD_ROUTE
+        if (m, n, k) in _CG2_SELECTED_SHAPES:
+            return _CG2_ALIGNED_ROUTE[(n, k)]
+        if aligned and math.ceil(m / _CG2_TILE_M) in {
+            t + d for t in _CG2_SELECTED_TILES_M for d in (0, 1)
+        }:
+            return _CG2_ALIGNED_ROUTE[(n, k)]
     if k == 128:
+        if sm_count is not None and math.ceil(m / 128) * math.ceil(n / 128) <= sm_count:
+            return DEEPK_C2_KG1_ROUTE
         return K128_ROUTE
     if k == 384:
-        return K384_ROUTE
-    if k > 0 and k % K_BLOCK == 0:
-        if (k // K_BLOCK) % 4:
+        if (
+            sm_count is not None
+            and math.ceil(m / 128) * math.ceil(n / 128) <= K384_KG1_MAX_TILES
+        ):
             return DEEPK_C2_KG1_ROUTE
-        if m == 16384 and n in {2048, 4096}:
-            return DEEPK_N256_ROUTE
-        if n == 256 or m == 4096:
-            return DEEPK_C2_AB6_SCALE1_ROUTE
+        return K384_ROUTE
+    if (k // K_BLOCK) % 4:
+        return DEEPK_C2_KG1_ROUTE
+    if m == 16384 and n in {2048, 4096}:
+        return DEEPK_N256_ROUTE
+    if (
+        k == 512
+        and n != 256
+        and m != 4096
+        and math.ceil(m / 128) * math.ceil(n / 128) >= K512_C2_MIN_TILES
+    ):
         return DEEPK_C2_ROUTE
-    raise ValueError(
-        f"contiguous grouped FP8 GEMM requires positive K divisible by {K_BLOCK}; got K={k}"
+    return DEEPK_C2_AB6_SCALE1_ROUTE
+
+
+def _max_load(
+    route: str, m: int, n: int, tile_starts: Mapping[int, Sequence[int]], workers: int
+) -> int:
+    """Most expert segments one worker of a persistent ``route`` launch runs.
+
+    Tiles are numbered M-major (``t = m_tile * n_tiles + n_tile``) and worker
+    ``w`` (a CTA, or a cluster of a two-CTA route) runs tiles ``w, w + workers,
+    ...``.  A tile runs one main loop per expert overlapping its rows: one, plus
+    the non-empty experts that start inside it (``tile_starts[tile_m]`` per M
+    tile).
+    """
+    tile_m, tile_n, _ = route_geometry(route)
+    n_tiles = math.ceil(n / tile_n)
+    total = math.ceil(m / tile_m) * n_tiles
+    load = [total // workers + (w < total % workers) for w in range(workers)]
+    for m_tile, starts in enumerate(tile_starts[tile_m]):
+        if starts:
+            for tile in range(m_tile * n_tiles, (m_tile + 1) * n_tiles):
+                load[tile % workers] += starts
+    return max(load)
+
+
+def _unaligned_cg2_route(
+    m: int,
+    n: int,
+    k: int,
+    sm_count: Optional[int],
+    tile_starts: Optional[Mapping[int, Sequence[int]]],
+) -> str:
+    """Route of a known layout that is not aligned to 256 rows, for ``(n, k)`` in
+    ``_CG2_UNALIGNED_ROUTE``.
+
+    A tile holding an expert start runs one more main loop, which costs a
+    256-row two-CTA tile more than a 128-row tile.  At the shapes of
+    ``_CG2_SHAPE_ROUTE`` the single-CTA route is taken only where its busiest
+    worker runs fewer expert segments than the two-CTA route's (at least
+    ``PAIR_N256_MIN_LOAD_GAIN`` fewer for the pair route; at N=2048, K=4096: at
+    most 1.5 times as many, its segments being shorter); elsewhere those classes
+    ship no two-CTA route for such a layout.
+    """
+    single = _CG2_UNALIGNED_ROUTE[(n, k)]
+    shape_route = _CG2_SHAPE_ROUTE.get((m, n, k))
+    if shape_route is None or sm_count is None or tile_starts is None:
+        return single
+    load_cg2 = _max_load(
+        shape_route, m, n, tile_starts, _route_workers(shape_route, m, n, k, sm_count)
     )
+    load_single = _max_load(
+        single, m, n, tile_starts, _route_workers(single, m, n, k, sm_count)
+    )
+    if shape_route == DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE:
+        return single if 2 * load_single <= 3 * load_cg2 else shape_route
+    if shape_route == DEEPK_CG2_RECURRENCE_ROUTE:
+        return (
+            single if load_single <= load_cg2 - PAIR_N256_MIN_LOAD_GAIN else shape_route
+        )
+    return single if load_single < load_cg2 else shape_route
 
 
-def bs_block_n(m: int, n: int, k: int, sm_count: int) -> int:
-    """``BLOCK_N`` of the block-scaled family (mirror of the source dispatcher's measured rule).
+def bs_block_n(
+    m: int,
+    n: int,
+    k: int,
+    sm_count: int,
+    *,
+    alignment: int = BS_BLOCK_M,
+    num_groups: int | None = None,
+) -> int:
+    """``BLOCK_N`` of the block-scaled family.
 
-    256-column tiles move the fewest bytes per output and win for short K loops or at
-    least three waves of M blocks; long-K problems with fewer M blocks run 128.
+    ``m`` counts every row of the compact layout, including the ``-1`` padding
+    tail, and each CTA steps over the skipped tiles of that tail: 256-column
+    tiles halve that walk and the A traffic, so they are the default.  128
+    columns win where they buy parallelism: when a 256-column grid has fewer
+    tiles than the device has SMs, and for long-K problems (at least 16 K
+    blocks) with fewer than three waves of M blocks.  Two cases of that long-K
+    range still run 256 columns:
+
+    - the single-run schedule below 32 K blocks and two waves of M blocks;
+    - the 32-row multi-run schedule once the routed rows, sized as
+      ``m - num_groups * (alignment - 1) - 127`` (the caller's buffer of routed
+      rows plus each group's alignment padding and the 128-row round-up), would
+      at one row per run fill more 128-column tiles than the device has SMs.
+
+    The choice never changes the output bits: every route accumulates each
+    output in the same K order.
     """
     if n % B_SCALE_BLOCK_N:
         raise ValueError(f"N must be a multiple of {B_SCALE_BLOCK_N}, got {n}")
+    if n % 256:
+        return 128
     m_blocks = (m + BS_BLOCK_M - 1) // BS_BLOCK_M
-    if n % 256 == 0 and not (k // K_BLOCK >= 16 and m_blocks < 3 * sm_count):
+    if m_blocks * (n // 256) < sm_count:
+        return 128
+    k_blocks = k // K_BLOCK
+    if k_blocks < 16 or m_blocks >= 3 * sm_count:
         return 256
+    if alignment % BS_BLOCK_M == 0:
+        return 256 if k_blocks < 32 and m_blocks < 2 * sm_count else 128
+    if num_groups is not None:
+        routed = m - num_groups * (alignment - 1) - (BS_BLOCK_M - 1)
+        run_blocks = (routed * alignment + BS_BLOCK_M - 1) // BS_BLOCK_M
+        if routed > 0 and run_blocks * (n // 128) > sm_count:
+            return 256
     return 128
 
 
-def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int) -> str:
+def bs_route_for_shape(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    alignment: int,
+    sm_count: int,
+    num_groups: int | None = None,
+) -> str:
     """Select the block-scaled route for packed UE8M0 scales."""
     if alignment <= 0 or alignment % BS_SUB_ROWS:
         raise ValueError(
@@ -146,7 +371,7 @@ def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int)
         raise ValueError(
             f"block-scaled grouped FP8 GEMM requires positive K divisible by {BS_BLOCK_K}; got K={k}"
         )
-    block_n = bs_block_n(m, n, k, sm_count)
+    block_n = bs_block_n(m, n, k, sm_count, alignment=alignment, num_groups=num_groups)
     single_run = alignment % BS_BLOCK_M == 0
     return {
         (128, True): BS_N128_ROUTE,
@@ -154,6 +379,150 @@ def bs_route_for_shape(m: int, n: int, k: int, *, alignment: int, sm_count: int)
         (128, False): BS_N128_RUN32_ROUTE,
         (256, False): BS_N256_RUN32_ROUTE,
     }[(block_n, single_run)]
+
+
+# Swap-AB block-scaled programs: the weight rows fill the 256-row side of the
+# two-CTA MMA and the routed tokens its N side.
+BS_SWAP_ROUTE = "bs_ue8m0_swap"
+BS_SWAP_CARRY_ROUTE = "bs_ue8m0_swap_carry"
+BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
+BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
+BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
+BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
+BS_SWAP_ROUTES = frozenset(
+    {
+        BS_SWAP_ROUTE,
+        BS_SWAP_RUN32_ROUTE,
+        BS_SWAP_CARRY_ROUTE,
+        BS_SWAP_S16_ROUTE,
+        BS_SWAP_CARRY_S16_ROUTE,
+        BS_SWAP_RP32_ROUTE,
+    }
+)
+BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
+# sm_100a swaps a long-K problem of at least 100 rows per group when the
+# non-swapped BLOCK_N 128 grid has at most this many tiles (half of 148 SMs).
+BS_SWAP_SM100_MAX_TILES = 74
+# The 32-row-block swap-AB program (each 32-row M block holds one group's
+# rows) serves the 32- and 64-row-aligned layouts of at most 1536 rows on
+# these architectures, in place of BS_SWAP_RUN32_ROUTE, while its launch
+# balances better than the run32 program's: it spreads 32-row blocks over
+# every SM but streams a group's weight tile once per block, so it pays only
+# while a run32 launch would leave SMs idle.  Per architecture
+# ``(rows, factor)`` bounds the tiles, ``factor * ceil(m / rows) * (n / 256)
+# <= sm_count``: sm_100a at most one 32 x 256 tile per SM, sm_103a at most a
+# third of ``sm_count`` 128 x 256 run32 tiles (a run32 launch on at most two
+# thirds of the SMs).  Without ``sm_count`` both keep BS_SWAP_RUN32_ROUTE.
+BS_SWAP_RP32_TILE_BOUND = {"sm_100a": (BS_SUB_ROWS, 1), "sm_103a": (BS_BLOCK_M, 3)}
+BS_SWAP_RP32_ARCHS = frozenset(BS_SWAP_RP32_TILE_BOUND)
+BS_SWAP_RP32_MAX_ALIGNMENT = 64
+BS_SWAP_RP32_MAX_ROWS = 1536
+
+
+def bs_swap_route_for_shape(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    alignment: int,
+    num_groups: int | None,
+    arch: str,
+    sm_count: int | None = None,
+) -> str | None:
+    """Select the swap-AB route for packed UE8M0 scales, or ``None`` for :func:`bs_route_for_shape`.
+
+    The rule reads host-known values only.  ``rows`` estimates the routed rows
+    per group, ``(m - num_groups * (alignment - 1)) / num_groups``: the compact
+    layout less each group's largest alignment padding.
+
+    - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
+      tile height) or the group count is unknown.
+    - Swap every layout whose alignment is not a multiple of 128 (the 32-row
+      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
+      ``BS_SWAP_RP32_ARCHS``, an alignment of at most
+      ``BS_SWAP_RP32_MAX_ALIGNMENT`` with ``m`` at most
+      ``BS_SWAP_RP32_MAX_ROWS`` takes ``BS_SWAP_RP32_ROUTE`` instead when its
+      tiles meet the architecture's ``BS_SWAP_RP32_TILE_BOUND``
+      (``factor * ceil(m / rows) * n / 256 <= sm_count``); with ``sm_count``
+      ``None`` it keeps ``BS_SWAP_RUN32_ROUTE``.
+    - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
+    - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
+      rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
+      128 grid, ``ceil(m / 128) * n / 128`` tiles, is at most
+      ``BS_SWAP_SM100_MAX_TILES``; sm_103a swaps for N < 1024 or at least 400
+      rows.
+
+    Swapped single-run layouts with K <= 256, or K <= 2048 and at least 128
+    rows, take ``BS_SWAP_CARRY_ROUTE``: it loads the next tile's group entries
+    at the head of each tile, so the load overlaps a tile of work.  The other
+    swapped layouts read each tile's entries at its head.
+
+    The choice never changes the output bits: every route accumulates each
+    output in the same K order.
+    """
+    if arch not in BS_SWAP_ARCHS or n % 256 or k % BS_BLOCK_K:
+        return None
+    single_run = alignment % BS_BLOCK_M == 0
+    if not single_run:
+        if (
+            arch in BS_SWAP_RP32_ARCHS
+            and alignment <= BS_SWAP_RP32_MAX_ALIGNMENT
+            and m <= BS_SWAP_RP32_MAX_ROWS
+            and sm_count is not None
+        ):
+            block_rows, factor = BS_SWAP_RP32_TILE_BOUND[arch]
+            if factor * math.ceil(m / block_rows) * (n // 256) <= sm_count:
+                return BS_SWAP_RP32_ROUTE
+        return BS_SWAP_RUN32_ROUTE
+    if not num_groups or num_groups <= 0:
+        return None
+    # rows = routed / num_groups; compared without division.
+    routed = m - num_groups * (alignment - 1)
+    if k <= 512:
+        swap = 2 * num_groups <= routed <= 20 * num_groups or (
+            k <= 256 and num_groups <= routed < 2 * num_groups
+        )
+    elif 4 * routed < 3 * num_groups:
+        swap = False
+    elif routed < 100 * num_groups:
+        swap = True
+    elif arch == "sm_100a":
+        tiles = -(-m // BS_BLOCK_M) * (n // 128)
+        swap = n >= 1024 or (k >= 2048 and tiles <= BS_SWAP_SM100_MAX_TILES)
+    else:
+        swap = n < 1024 or routed >= 400 * num_groups
+    if not swap:
+        return None
+    if k <= 256 or (k <= 2048 and routed >= 128 * num_groups):
+        return BS_SWAP_CARRY_ROUTE
+    return BS_SWAP_ROUTE
+
+
+# The store16 programs: the single-run schedules with 16-row output stores.
+BS_STORE16_ROUTES = {
+    BS_N128_ROUTE: BS_N128_S16_ROUTE,
+    BS_N256_ROUTE: BS_N256_S16_ROUTE,
+    BS_SWAP_ROUTE: BS_SWAP_S16_ROUTE,
+    BS_SWAP_CARRY_ROUTE: BS_SWAP_CARRY_S16_ROUTE,
+}
+BS_STORE16_ARCHS = frozenset({"sm_100a", "sm_103a"})
+
+
+def bs_store16(m: int, *, alignment: int, num_groups: int | None) -> bool:
+    """Whether a single-run block-scaled problem takes the store16 programs.
+
+    The rule reads host-known values only, never the ``m_indices`` contents (a
+    launch may rebind them): ``alignment`` a multiple of 128 and at most 128
+    routed rows per group, estimated as in :func:`bs_swap_route_for_shape` by
+    ``(m - num_groups * (alignment - 1)) / num_groups``.  A store16 program
+    writes each expert run's routed rows rounded up to 16 rows instead of 32;
+    the routed rows keep their bits.  Above 128 rows per group the 32-row
+    stores are kept.
+    """
+    if not num_groups or num_groups <= 0 or alignment <= 0 or alignment % BS_BLOCK_M:
+        return False
+    # rows = routed / num_groups <= 128; compared without division.
+    return m - num_groups * (alignment - 1) <= BS_BLOCK_M * num_groups
 
 
 def resolve_route_for_grid(route: str, n: int, grid: tuple[int, int, int]) -> str:
@@ -195,8 +564,49 @@ def launch_plan(
     scalar_output: bool,
     block_scaled: bool = False,
     alignment: int = 128,
+    num_groups: int | None = None,
+    arch: str | None = None,
 ) -> tuple[str, tuple[int, int, int]]:
-    """Resolve ``(route, grid)`` for a problem shape on a device with ``sm_count`` SMs."""
+    """Resolve ``(route, grid)`` for a problem shape on a device with ``sm_count`` SMs.
+
+    ``arch`` (the device's, e.g. ``"sm_100a"``) admits the swap-AB routes of
+    :func:`bs_swap_route_for_shape` and the store16 programs of
+    :func:`bs_store16` for a block-scaled problem; ``None`` keeps the routes of
+    :func:`bs_route_for_shape`.  An FP32-scale problem takes :func:`_route`
+    with the SM count.  A KG1 / AB6 launch of at most ``DIRECT_STORE_MAX_ROWS``
+    rows on at most ``DIRECT_STORE_MAX_CTAS`` CTAs runs that route's
+    direct-store program.
+    """
+    return _launch_plan(
+        m,
+        n,
+        k,
+        sm_count=sm_count,
+        scalar_output=scalar_output,
+        block_scaled=block_scaled,
+        alignment=alignment,
+        num_groups=num_groups,
+        arch=arch,
+        aligned=None,
+    )
+
+
+def _launch_plan(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    sm_count: int,
+    scalar_output: bool,
+    block_scaled: bool,
+    alignment: int,
+    num_groups: int | None,
+    arch: str | None,
+    aligned: Optional[bool],
+    tile_starts: Optional[Mapping[int, Sequence[int]]] = None,
+) -> tuple[str, tuple[int, int, int]]:
+    """:func:`launch_plan` with the layout a validated launch read (``aligned``
+    and ``tile_starts``, see :func:`_route`)."""
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
     if block_scaled:
@@ -204,21 +614,59 @@ def launch_plan(
             raise ValueError(
                 "block-scaled grouped FP8 GEMM requires a 16-byte-aligned output"
             )
-        route = bs_route_for_shape(m, n, k, alignment=alignment, sm_count=sm_count)
+        route = bs_route_for_shape(
+            m, n, k, alignment=alignment, sm_count=sm_count, num_groups=num_groups
+        )
+        if arch is not None:
+            route = (
+                bs_swap_route_for_shape(
+                    m,
+                    n,
+                    k,
+                    alignment=alignment,
+                    num_groups=num_groups,
+                    arch=arch,
+                    sm_count=sm_count,
+                )
+                or route
+            )
+            if (
+                arch in BS_STORE16_ARCHS
+                and route in BS_STORE16_ROUTES
+                and bs_store16(m, alignment=alignment, num_groups=num_groups)
+            ):
+                route = BS_STORE16_ROUTES[route]
     elif scalar_output:
         route = DEEPK_C2_SCALAR_OUTPUT_ROUTE
     else:
-        route = route_for_shape(m, n, k)
+        route = _route(
+            m, n, k, sm_count=sm_count, aligned=aligned, tile_starts=tile_starts
+        )
+    cluster_ctas = route_geometry(route)[2]
+    grid = (_route_workers(route, m, n, k, sm_count) * cluster_ctas, 1, 1)
+    route = resolve_route_for_grid(route, n, grid)
+    if m <= DIRECT_STORE_MAX_ROWS and grid[0] <= DIRECT_STORE_MAX_CTAS:
+        route = _DIRECT_STORE_ROUTE.get(route, route)
+    return route, grid
+
+
+def _route_workers(route: str, m: int, n: int, k: int, sm_count: int) -> int:
+    """Workers (CTAs, or clusters of a two-CTA route) of a ``route`` launch."""
     tile_m, tile_n, cluster_ctas = route_geometry(route)
     total_tiles = math.ceil(m / tile_m) * math.ceil(n / tile_n)
     cta_limit = sm_count
-    if (m, n, k) in _CG2_GRID128_SHAPES:
+    # The cap keeps every shipped plan; the swap-AB routes and the single-CTA
+    # routes of a known unaligned layout at these shapes run on all SMs.
+    if (
+        (m, n, k) in _CG2_GRID128_SHAPES
+        and route not in BS_SWAP_ROUTES
+        and route not in _CG2_UNALIGNED_ROUTE.values()
+    ):
         cta_limit = min(cta_limit, 128)
     clusters = min(total_tiles, cta_limit // cluster_ctas)
     if clusters <= 0:
         raise ValueError("device cannot schedule one complete kernel cluster")
-    grid = (clusters * cluster_ctas, 1, 1)
-    return resolve_route_for_grid(route, n, grid), grid
+    return clusters
 
 
 @functools.cache
@@ -256,12 +704,28 @@ def _require_tensor(
 
 
 def _validate_indices(
-    m_indices: torch.Tensor, groups: int, *, allow_padding: bool = False
-) -> None:
+    m_indices: torch.Tensor,
+    groups: int,
+    *,
+    allow_padding: bool = False,
+    layout_tile_m: Optional[int] = None,
+    layout_tile_rows: int = 128,
+    read_alignment: bool = False,
+) -> tuple[Optional[tuple[int, int, int, int]], Optional[bool]]:
     """Check the routing contract (in range, sorted) with one device-to-host transfer.
 
     With ``allow_padding`` the value ``-1`` marks padding rows; the remaining
-    entries must still be nondecreasing.
+    entries must still be nondecreasing.  Returns ``(layout, aligned)``, both
+    ``None`` unless asked for; the caller uses them only to choose a route.
+    With ``layout_tile_m`` (no padding) the same transfer also reads
+    ``layout = (inner_starts, run_starts, expert_tiles, max_offset)``: the
+    number of expert runs starting at a row that is not a multiple of
+    ``layout_tile_m`` (so a ``layout_tile_m``-row tile spans two experts), the
+    number of expert runs starting after row 0, the number of
+    ``layout_tile_rows``-row tiles when no tile spans two experts, and the
+    largest offset of such an inner start within its tile (0 without one).
+    With ``read_alignment`` (no padding) it also reads ``aligned``: whether
+    every expert run starts on a multiple of 256 rows (see :func:`_route`).
     """
     indices = m_indices.to(torch.int64)
     routed = indices[indices >= 0] if allow_padding else indices
@@ -270,9 +734,33 @@ def _validate_indices(
         if routed.numel() > 1
         else torch.zeros((), dtype=torch.int64, device=indices.device)
     )
-    lowest, highest, unsorted = torch.stack(
-        (indices.min(), indices.max(), unsorted)
-    ).tolist()
+    stats = [indices.min(), indices.max(), unsorted]
+    if layout_tile_m is not None or read_alignment:
+        if allow_padding:
+            raise ValueError("the index layout is read only without padding rows")
+        rows = torch.arange(
+            1, indices.numel(), dtype=torch.int64, device=indices.device
+        )
+        run_starts = indices[1:] != indices[:-1]
+    if read_alignment:
+        stats.append((run_starts & (rows % _CG2_TILE_M != 0)).sum())
+    if layout_tile_m is not None:
+        zero = torch.zeros((), dtype=torch.int64, device=indices.device)
+        if indices.numel() > 1:
+            offset = rows % layout_tile_m
+            inner = run_starts & (offset != 0)
+            # First row of the run each row belongs to (0 for the leading run).
+            run_first = torch.cummax(
+                torch.where(run_starts, rows, torch.zeros_like(rows)), dim=0
+            ).values
+            stats.append(inner.sum())
+            stats.append(run_starts.sum())
+            stats.append(((rows - run_first) % layout_tile_rows == 0).sum() + 1)
+            stats.append(torch.where(inner, offset, torch.zeros_like(offset)).max())
+        else:
+            stats += [zero, zero, zero + 1, zero]
+    values = torch.stack(stats).tolist()
+    lowest, highest, unsorted = values[:3]
     if lowest < (-1 if allow_padding else 0) or highest >= groups:
         if allow_padding:
             raise ValueError("m_indices must satisfy -1 <= index < num_groups")
@@ -281,6 +769,107 @@ def _validate_indices(
         )
     if unsorted:
         raise ValueError("m_indices must be sorted in nondecreasing order")
+    extra = values[3:]
+    aligned: Optional[bool] = None
+    if read_alignment:
+        aligned, extra = extra[0] == 0, extra[1:]
+    layout: Optional[tuple[int, int, int, int]] = None
+    if layout_tile_m is not None:
+        inner, starts, expert_tiles, max_offset = (int(v) for v in extra[:4])
+        layout = inner, starts, expert_tiles, max_offset
+    return layout, aligned
+
+
+def _tile_starts(m_indices: torch.Tensor) -> dict[int, tuple[int, ...]]:
+    """Per M-tile height in ``_TILE_START_ROWS``: how many non-empty experts start
+    inside each M tile, off its first row (one device-to-host transfer).
+
+    Read only for a validated layout that is not aligned to 256 rows at a shape
+    of ``_CG2_SHAPE_ROUTE`` (see :func:`_unaligned_cg2_route`).
+    """
+    indices = m_indices.to(torch.int64)
+    m = indices.numel()
+    rows = torch.arange(1, m, dtype=torch.int64, device=indices.device)
+    run_starts = indices[1:] != indices[:-1]
+    counts: list[torch.Tensor] = []
+    for tile_m in _TILE_START_ROWS:
+        inner = (run_starts & (rows % tile_m != 0)).to(torch.int64)
+        per_tile = torch.zeros(
+            math.ceil(m / tile_m), dtype=torch.int64, device=indices.device
+        )
+        counts.append(per_tile.index_add_(0, rows // tile_m, inner))
+    values = torch.cat(counts).tolist()
+    out: dict[int, tuple[int, ...]] = {}
+    first = 0
+    for tile_m in _TILE_START_ROWS:
+        tiles = math.ceil(m / tile_m)
+        out[tile_m] = tuple(int(v) for v in values[first : first + tiles])
+        first += tiles
+    return out
+
+
+def _route_registered(arch: str, route: str) -> bool:
+    try:
+        route_program(arch, route)
+    except NotImplementedError:
+        return False
+    return True
+
+
+def _expert_aligned_eligible(
+    arch: str,
+    groups: int,
+    *,
+    block_scaled: bool,
+    fill_padding: bool,
+    scalar_output: bool,
+) -> bool:
+    """True when the expert-aligned program can serve this launch (FP32 scales, no
+    padding rows, a 16-byte-aligned output, at most ``EXPERT_ALIGNED_MAX_GROUPS``
+    experts, a program registered for ``arch``)."""
+    return (
+        not block_scaled
+        and not fill_padding
+        and not scalar_output
+        and groups <= EXPERT_ALIGNED_MAX_GROUPS
+        and _route_registered(arch, DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
+    )
+
+
+def _expert_aligned_preferred(
+    inner_starts: int, run_starts: int, max_offset: int, tile_m: int
+) -> bool:
+    """True when at least 90% of the expert runs after row 0 start inside a tile
+    of the shape's route and one of them starts at least half a tile in.
+
+    The shape's route computes a tile spanning several experts once per expert
+    and finds where each run ends by reading ``m_indices`` row by row; the
+    expert-aligned program does neither, but its own schedule is slower than
+    several shape routes on homogeneous tiles and it needs more tiles when
+    runs start just past a tile boundary.  Measured on B200 and both GB300
+    classes, it wins on such layouts (routed tokens put nearly every run start
+    inside a tile, at any offset); with half the runs inside a tile, or with
+    every inner run starting one row in, it can lose.
+    """
+    return (
+        inner_starts > 0
+        and 10 * inner_starts >= 9 * run_starts
+        and 2 * max_offset >= tile_m
+    )
+
+
+def _expert_aligned_plan(
+    n: int, expert_tiles: int, *, sm_count: int
+) -> tuple[str, tuple[int, int, int]]:
+    """``(route, grid)`` of the expert-aligned program for ``expert_tiles`` M tiles.
+
+    The program loops over its tiles persistently and counts them on the
+    device, so the grid only sizes the launch: a later ``m_indices`` with more
+    or fewer tiles stays correct.
+    """
+    _, tile_n, _ = route_geometry(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
+    ctas = max(1, min(expert_tiles * math.ceil(n / tile_n), sm_count))
+    return DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE, (ctas, 1, 1)
 
 
 def _packed_scale_strides(
@@ -353,6 +942,35 @@ def _packed_weight_scale_strides(
     )
 
 
+def _swap_scale_surfaces(
+    a_scale: torch.Tensor, b_scale: torch.Tensor, *, m: int, n: int, k: int
+) -> Optional[tuple[torch.Tensor, torch.Tensor, int]]:
+    """The packed scale words as the swap-AB programs' tensor-map surfaces, or ``None``.
+
+    The swap-AB programs load the activation words as the uint32 surface
+    ``[cols, M]`` (DeepGEMM's MN-major layout: ``a_scale`` the transpose of a
+    contiguous tensor) and the weight words as ``[G * cols_b, N]`` (the
+    row-repeated ``(G, N, cols_b)`` layout, also the transpose of a contiguous
+    tensor), both read in place; the third value is ``cols_b``, the words per
+    group.  Any other layout, and an ``M`` that is not a multiple of 128 rows,
+    returns ``None``: the non-swapped routes read it as it is.
+    """
+    cols = -(-(k // K_BLOCK) // 4)
+    groups, rows, cols_b = (int(v) for v in b_scale.shape)
+    if m % BS_BLOCK_M or n % 4 or rows != n:
+        return None
+    if not (a_scale.mT.is_contiguous() and b_scale.mT.is_contiguous()):
+        return None
+    sfb = b_scale.as_strided(((groups - 1) * cols_b + cols, n), (n, 1))
+    return _swap_sfa(a_scale, m=m, k=k), sfb.view(torch.uint32), cols_b
+
+
+def _swap_sfa(a_scale: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    """The MN-major activation words as the uint32 surface ``[cols, M]`` with word stride ``M``."""
+    cols = -(-(k // K_BLOCK) // 4)
+    return a_scale.as_strided((cols, m), (m, 1)).view(torch.uint32)
+
+
 def argument_slots(arg_plan: Sequence[Sequence[str]]) -> dict[str, tuple[int, ...]]:
     """Positions of every named binding in a generated program's argument plan."""
     slots: dict[str, list[int]] = {}
@@ -416,7 +1034,7 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
 
     @property
     def block_scaled(self) -> bool:
-        return self.route in BS_ROUTES
+        return self.route in BS_ROUTES or self.route in BS_SWAP_ROUTES
 
     @property
     def out(self) -> torch.Tensor:
@@ -437,7 +1055,16 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
         buffers.  Afterwards every ``launch`` must supply all of them.
         """
         arguments = list(self._arguments)
-        names: tuple[str, ...] = ("A", "A64", "A32", "C", "C_tma", "a_scale", "SFA")
+        names: tuple[str, ...] = (
+            "A",
+            "A64",
+            "A32",
+            "C",
+            "C_tma",
+            "a_scale",
+            "SFA",
+            "SFA_packed",
+        )
         if not self.fill_padding:
             names += ("m_indices",)
         for name in names:
@@ -512,6 +1139,12 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
                             f"a_scale must keep the prepared packed layout {self._a_scale_layout}, got {layout}"
                         )
                     self._rebind(rebound, "SFA", ffi_scale)
+                    if self.route in BS_SWAP_ROUTES:
+                        self._rebind(
+                            rebound,
+                            "SFA_packed",
+                            _swap_sfa(a_scale, m=self.m, k=self.k),
+                        )
                 else:
                     a_scale = _require_tensor(
                         a_scale,
@@ -638,18 +1271,31 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         value ``-1`` marks padding rows (the compact MoE layout): such a row is
         computed with the preceding expert's weights (expert 0 for leading
         padding) and its output row is unspecified.  The block-scaled family
-        reads ``-1`` natively per 32-row sub-block: a sub-block whose leading
-        entry is ``-1`` is skipped and its output rows are left untouched;
-        ``-1`` rows sharing a sub-block with routed rows receive finite values
-        of no meaning (as DeepGEMM's 128-row blocks do).  Every expert run must
-        start on a multiple of ``alignment`` rows (an expert's rows followed by
-        its padding).
+        reads ``-1`` natively: it writes each expert run's routed rows rounded
+        up to 32 rows (16 on the store16 programs of :func:`bs_store16`), and
+        the output rows of ``-1`` entries are unspecified (left untouched or
+        holding values of no meaning, as DeepGEMM's 128-row blocks do).  Every
+        expert run must start on a multiple of ``alignment`` rows (an expert's
+        rows followed by its padding).
     out : Optional[torch.Tensor]
         Contiguous bfloat16 output of shape ``(M, N)``.  Allocated if omitted.
         A 2-byte-aligned output whose address is not a multiple of 16 selects
         the scalar-store route.
     validate_indices : bool
-        Check index range and sortedness (one device-to-host transfer).
+        Check index range and sortedness (one device-to-host transfer).  With
+        FP32 scales and no ``fill_padding`` the same transfer also reads where
+        the expert runs start.  The two-CTA routes then run when every run
+        starts on a multiple of 256 rows; at the shapes whose shape route is
+        two-CTA, an unaligned layout keeps it unless the single-CTA route
+        gives its busiest worker fewer expert segments (one more transfer reads
+        the expert starts per tile).  With a 16-byte-aligned output
+        and at most 255 experts, when at least 90% of the runs start inside a
+        tile of the shape's route and one starts at least half a tile in, the
+        launch uses the expert-aligned program, whose tiles never span two
+        experts.  These choices affect speed only.  Every program computes the
+        same bits for any valid ``m_indices``, so indices that change after
+        preparation (rebound at ``launch`` or rewritten before a graph replay)
+        stay correct; only the chosen program may be slower for them.
     fill_padding : bool
         Accept ``-1`` padding rows in ``m_indices`` (promotion family).  The
         prepared object owns an ``(M,)`` int32 plus ``(M,)`` int64 scratch and
@@ -659,6 +1305,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         Block-scaled family only: the row alignment of expert runs in the
         compact layout, a positive multiple of 32.  Multiples of 128 run the
         single-run schedule; other values the slower 32-row multi-run schedule.
+        The swap-AB routes need ``N`` a multiple of 256, ``M`` a multiple of
+        128, the MN-major ``a_scale`` words and the row-repeated ``b_scale``
+        words; other problems run the non-swapped routes.  The store16
+        programs need the same ``M`` and words, an ``alignment`` multiple of
+        128 and at most 128 routed rows per group (:func:`bs_store16`).
 
     Returns
     -------
@@ -703,6 +1354,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         b, "b", shape=(groups, n, k), dtype=torch.float8_e4m3fn, device=device
     )
     block_scaled = isinstance(a_scale, torch.Tensor) and a_scale.dtype == torch.int32
+    swap_surfaces = None
     if block_scaled:
         if fill_padding:
             raise ValueError(
@@ -723,6 +1375,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         sfb, sfb_gs, sfb_rs, sfb_cs = _packed_weight_scale_strides(
             b_scale, groups=groups, n=n, k=k, device=device
         )
+        swap_surfaces = _swap_scale_surfaces(a_scale, b_scale, m=m, n=n, k=k)
     else:
         a_scale = _require_tensor(
             a_scale,
@@ -746,8 +1399,30 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     out = _require_tensor(
         out, "out", shape=(m, n), dtype=torch.bfloat16, device=device, alignment=2
     )
+    scalar_output = bool(int(out.data_ptr()) % 16)
+    layout = None
+    aligned: Optional[bool] = None
+    layout_tile_m: Optional[int] = None
     if validate_indices:
-        _validate_indices(m_indices, groups, allow_padding=fill_padding or block_scaled)
+        padded = fill_padding or block_scaled
+        layout_tile_rows = 128
+        if _expert_aligned_eligible(
+            arch,
+            groups,
+            block_scaled=block_scaled,
+            fill_padding=fill_padding,
+            scalar_output=scalar_output,
+        ):
+            layout_tile_m = route_geometry(route_for_shape(m, n, k))[0]
+            layout_tile_rows = route_geometry(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)[0]
+        layout, aligned = _validate_indices(
+            m_indices,
+            groups,
+            allow_padding=padded,
+            layout_tile_m=layout_tile_m,
+            layout_tile_rows=layout_tile_rows,
+            read_alignment=not padded,
+        )
     padding_scratch = None
     kernel_indices = m_indices
     if fill_padding:
@@ -757,20 +1432,33 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
             torch.empty((m,), dtype=torch.int64, device=device),
         )
 
-    scalar_output = bool(int(out.data_ptr()) % 16)
     if block_scaled and scalar_output:
         raise ValueError(
             "block-scaled grouped FP8 GEMM requires a 16-byte-aligned output"
         )
-    route, grid = launch_plan(
+    sm_count = device_sm_count(device_index)
+    tile_starts = None
+    if aligned is False and (m, n, k) in _CG2_SHAPE_ROUTE and not scalar_output:
+        tile_starts = _tile_starts(m_indices)
+    route, grid = _launch_plan(
         m,
         n,
         k,
-        sm_count=device_sm_count(device_index),
+        sm_count=sm_count,
         scalar_output=scalar_output,
         block_scaled=block_scaled,
         alignment=alignment,
+        num_groups=groups,
+        arch=arch if swap_surfaces is not None else None,
+        aligned=aligned,
+        tile_starts=tile_starts,
     )
+    if (
+        layout is not None
+        and layout_tile_m is not None
+        and _expert_aligned_preferred(layout[0], layout[1], layout[3], layout_tile_m)
+    ):
+        route, grid = _expert_aligned_plan(n, layout[2], sm_count=sm_count)
     module_name = select_module(arch, route)
     program = PROGRAMS[MODULES[module_name]["program"]]
     module = load_cake_grouped_fp8_gemm_module(module_name)
@@ -802,6 +1490,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
             "sfb_row_stride": sfb_rs,
             "sfb_col_stride": sfb_cs,
         }
+        if route in BS_SWAP_ROUTES:
+            assert swap_surfaces is not None
+            bindings["SFA_packed"], bindings["SFB_packed"], bindings["sf_cols"] = (
+                swap_surfaces
+            )
         a_scale_layout = (tuple(int(v) for v in a_scale.shape), (sfa_rs, sfa_cs))
     else:
         bindings = {

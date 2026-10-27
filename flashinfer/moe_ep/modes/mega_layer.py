@@ -36,10 +36,12 @@ class MoEEpMegaWorkspace:
     """Capacity-profile handle owned by one MegaMoE layer.
 
     Create handles with :meth:`MoEEpMegaLayer.create_workspace`; do not
-    construct them directly. The selected workspace keeps stable addresses
-    until :meth:`destroy` or layer destruction. A stable returned-output
-    address additionally requires ``return_workspace_view=True`` on a backend
-    that supports output views.
+    construct them directly. Fixed workspaces keep stable addresses until
+    destruction. Automatic selection can replace output and scratch storage
+    before capture; reacquire output views after selection. Once captured, an
+    explicit handle keeps its configuration and addresses until destruction.
+    A stable returned-output address additionally requires
+    ``return_workspace_view=True`` on a backend that supports output views.
 
     Creation and destruction are EP collectives. Before destroying a handle,
     callers must synchronize all work and retire every CUDA graph that uses it.
@@ -148,9 +150,9 @@ class MoEEpMegaLayer(nn.Module):
         # Strong tracking is intentional: workspace create/destroy is an EP
         # collective and therefore must never be triggered by rank-local GC.
         # Dict insertion order gives every EP rank the same reverse-allocation
-        # collective teardown order. One live profile per capacity also avoids
-        # presenting pooled aliases as independent concurrency lanes.
-        self._workspaces: dict[tuple[int, int | None], MoEEpMegaWorkspace] = {}
+        # collective teardown order. Automatic handles own independent storage.
+        self._workspaces: dict[int, MoEEpMegaWorkspace] = {}
+        self._retired_tuning_workspaces: list[Any] = []
         self._preprocessing_count = 0
         self._destroyed = False
         self._bootstrap_validated = False
@@ -219,17 +221,21 @@ class MoEEpMegaLayer(nn.Module):
 
         The handle reuses this layer's transformed weights. ``knobs=None``
         inherits the layer's configuration. A dictionary selects fixed knobs
-        for this handle and is copied before allocation. The layer must use
-        fixed knobs, and its default workspace must not already be allocated
-        when overriding its profile.
+        for this handle and is copied before allocation. The default workspace
+        must not already be allocated when overriding its profile.
 
+        Fixed configurations allow one handle per capacity/profile. Backends
+        supporting automatic handles allocate independent storage on every
+        call, with separate tuning state and shared transformed weights.
         ``live_tokens`` selects an offline workload profile without shrinking
         capacity. Explicit knobs take precedence over that profile's cache.
         ``live_tokens=None`` selects full capacity, even when the layer has a
-        different default tuning profile. Handles retain their compiled tactics
+        different default tuning profile. Fixed handles retain compiled tactics
         and stable addresses.
+        Automatic handles warn when ``live_tokens`` is supplied because
+        selection uses the actual warmup or forward batch size.
         Call collectively with matching arguments on all EP ranks before
-        capture. Only one live handle per (capacity, live_tokens) is allowed.
+        capture.
         """
 
         if isinstance(max_tokens_per_rank, bool) or not isinstance(
@@ -240,7 +246,8 @@ class MoEEpMegaLayer(nn.Module):
             raise ValueError("max_tokens_per_rank must be positive")
         if self._destroyed:
             raise MoEEpConfigError("MegaMoE layer has been destroyed")
-        if getattr(self._megakernel_config, "knobs", None) == "auto":
+        automatic = getattr(self._megakernel_config, "knobs", None) == "auto"
+        if automatic and not self._kernel.supports_auto_workspaces:
             raise MoEEpConfigError(
                 "create_workspace() requires fixed/offline-tuned knobs; "
                 "knobs='auto' has mutable per-capacity tuning state"
@@ -249,10 +256,25 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
-        if live_tokens is not None and not self._kernel.supports_live_token_tuning:
+        automatic = automatic and knobs is None
+        if (
+            live_tokens is not None
+            and not automatic
+            and not self._kernel.supports_live_token_tuning
+        ):
             raise MoEEpConfigError("This backend does not support live-token tuning")
+        if automatic and live_tokens is not None:
+            warnings.warn(
+                "live_tokens is ignored for automatic tuning; selection uses "
+                "the actual warmup or forward batch size",
+                UserWarning,
+                stacklevel=2,
+            )
         profile_key = (max_tokens_per_rank, live_tokens)
-        if profile_key in self._workspaces:
+        if not automatic and any(
+            (handle.max_tokens_per_rank, handle.live_tokens) == profile_key
+            for handle in self._workspaces.values()
+        ):
             raise MoEEpConfigError(
                 "a MegaMoE workspace profile for max_tokens_per_rank="
                 f"{max_tokens_per_rank}, live_tokens={live_tokens} already exists on this layer"
@@ -285,7 +307,7 @@ class MoEEpMegaLayer(nn.Module):
             tuning_live_tokens=live_tokens,
         )
         kernel.validate_init(self._bootstrap, fleet_params)
-        if is_default_profile and self._workspace is not None:
+        if is_default_profile and self._workspace is not None and not automatic:
             # Transfer the already-lazy-allocated default profile into the
             # explicit handle without acquiring a second pooled reference.
             backend_workspace = self._workspace
@@ -298,8 +320,12 @@ class MoEEpMegaLayer(nn.Module):
         handle = MoEEpMegaWorkspace(
             self, fleet_params, backend_workspace, kernel=kernel
         )
-        self._workspaces[profile_key] = handle
-        if is_default_profile:
+        self._workspaces[id(handle)] = handle
+        if (
+            is_default_profile
+            and self._workspace is None
+            and self._default_workspace_handle is None
+        ):
             self._default_workspace_handle = handle
         return handle
 
@@ -321,10 +347,7 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError("MegaMoE workspace belongs to a different layer")
         if workspace._destroyed or workspace._backend_workspace is None:
             raise MoEEpConfigError("MegaMoE workspace has been destroyed")
-        if (
-            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
-            is not workspace
-        ):
+        if self._workspaces.get(id(workspace)) is not workspace:
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
@@ -333,10 +356,7 @@ class MoEEpMegaLayer(nn.Module):
     def _destroy_workspace_handle(self, workspace: MoEEpMegaWorkspace) -> None:
         if workspace._destroyed:
             return
-        if (
-            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
-            is not workspace
-        ):
+        if self._workspaces.get(id(workspace)) is not workspace:
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
@@ -358,11 +378,8 @@ class MoEEpMegaLayer(nn.Module):
         workspace._backend_workspace = None
         if self._default_workspace_handle is workspace:
             self._default_workspace_handle = None
-        if (
-            self._workspaces.get((workspace.max_tokens_per_rank, workspace.live_tokens))
-            is workspace
-        ):
-            del self._workspaces[(workspace.max_tokens_per_rank, workspace.live_tokens)]
+        if self._workspaces.get(id(workspace)) is workspace:
+            del self._workspaces[id(workspace)]
 
     @property
     def supports_output_view(self) -> bool:
@@ -371,7 +388,11 @@ class MoEEpMegaLayer(nn.Module):
 
     @property
     def output_buffer(self) -> torch.Tensor:
-        """Stable zero-copy output owned by the default workspace."""
+        """Zero-copy output owned by the current default workspace.
+
+        Reacquire after automatic selection or default-workspace replacement.
+        Captured graphs keep writing to their original workspace's output.
+        """
         _, backend_workspace, kernel = self._resolve_workspace(None)
         return kernel.workspace_output(backend_workspace)
 
@@ -398,6 +419,10 @@ class MoEEpMegaLayer(nn.Module):
         Forces every lazy host-side step — workspace allocation (symmetric
         heap), ``cute.compile``, the ``knobs="auto"`` autotune sweep, and one
         real kernel launch (module load) — then synchronizes the device.
+        Rubin automatic tuning requires an enabled tuning context and can replace
+        a captured default workspace for later selection while retaining its
+        old storage until layer destruction. Explicit handles remain fixed
+        after capture; create another handle when they need further tuning.
 
         COLLECTIVE: call on ALL EP ranks together before any rank starts
         capturing (the kernel has cross-rank device-side barriers, and the
@@ -467,11 +492,16 @@ class MoEEpMegaLayer(nn.Module):
             # The synthetic routing ids are int64, but some backends accept
             # multiple input dtypes. Let the first real batch establish the
             # steady-state signature instead of pinning it to the dummy batch.
-            self._forward_signatures.pop(id(_backend_workspace), None)
+            _, warmed_workspace, _ = self._resolve_workspace(workspace)
+            self._forward_signatures.pop(id(warmed_workspace), None)
 
-    def get_tuned_knobs(self) -> dict[str, Any]:
+    def get_tuned_knobs(
+        self, *, workspace: MoEEpMegaWorkspace | None = None
+    ) -> dict[str, Any]:
         """Return the selected knobs after a successful ``knobs="auto"`` warmup.
 
+        ``workspace=None`` selects the default workspace. Pass an explicit
+        handle to inspect that handle's result independently of other workspaces.
         The returned dictionary is a copy and can be passed as ``knobs`` when
         constructing a fixed layer with the same kernel configuration and
         capacity. This call does not allocate, tune or read a cache file.
@@ -479,7 +509,13 @@ class MoEEpMegaLayer(nn.Module):
         """
         if self._destroyed:
             raise MoEEpConfigError("MegaMoE layer has been destroyed")
-        return self._kernel.get_tuned_knobs()
+        handle = workspace if workspace is not None else self._default_workspace_handle
+        if handle is not None:
+            _, backend_workspace, kernel = self._resolve_workspace(handle)
+        else:
+            # Introspection must not trigger lazy workspace allocation.
+            backend_workspace, kernel = self._workspace, self._kernel
+        return kernel.get_tuned_knobs(backend_workspace)
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
@@ -567,6 +603,17 @@ class MoEEpMegaLayer(nn.Module):
         if backend_workspace is None:
             backend_workspace = self._ensure_workspace()
             validation_key = id(backend_workspace)
+        if workspace is None and kernel.coordinate_workspace_replacement(
+            backend_workspace
+        ):
+            replacement = kernel.prepare_workspace(self._bootstrap, fleet_params)
+            if self._default_workspace_handle is None:
+                self._retired_tuning_workspaces.append(backend_workspace)
+            # Explicit handles keep their original storage and destruction API.
+            self._default_workspace_handle = None
+            self._workspace = backend_workspace = replacement
+            validation_key = id(backend_workspace)
+            previous_signature = None
         if previous_signature is None:
             assert validation_key is not None
             self._forward_signatures[validation_key] = signature
@@ -672,7 +719,7 @@ class MoEEpMegaLayer(nn.Module):
         until the next launch reuses the pooled physical workspace.
         """
         if self._kernel.supports_unfinalized_output:
-            raise MoEEpConfigError("do_finalize=False requires forward_unfinalized()")
+            raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
                 "return_workspace_view=True cannot be combined with t.output"
@@ -729,10 +776,11 @@ class MoEEpMegaLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
 
-        Requires ``do_finalize=False``. Results are contiguous BF16
+        Requires ``finalize_mode=FinalizeMode.NONE``. Results are contiguous BF16
         ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
         ``[T, top_k]`` identity map whose entries index the first result.
-        Weights are one when ``apply_topk_in_fc1=True`` already applied routing.
+        Weights are one when ``apply_routing_weights_before_fc2=True`` already
+        applied routing.
         These tensors match the unfinalized TRTLLM MoE output layout.
 
         All results borrow pooled workspace storage: consume them on the current
@@ -742,7 +790,7 @@ class MoEEpMegaLayer(nn.Module):
         """
         if not self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError(
-                "forward_unfinalized() requires a backend with do_finalize=False"
+                "forward_unfinalized() requires finalize_mode=FinalizeMode.NONE"
             )
         _, backend_workspace, kernel, quantize_input, transformed_weights = (
             self._prepare_inputs(t, workspace=workspace)
@@ -768,6 +816,9 @@ class MoEEpMegaLayer(nn.Module):
         if self._workspace is not None:
             self._kernel.destroy(self._workspace)
             self._workspace = None
+        for workspace in reversed(self._retired_tuning_workspaces):
+            self._kernel.destroy(workspace)
+        self._retired_tuning_workspaces.clear()
         self._staged_kernel = None
         self._staged_workspace = None
         self._staged_transformed = None
