@@ -1718,9 +1718,18 @@ WEIGHT_PF_LEAD_TWINS = {
 A_BOX_ARCHES = frozenset({"sm_100a", "sm_103a"})
 A_BOX_TWINS = {("gelu_erf", "xs"): "xs_ab", ("rmsnorm", "s"): "s_ab"}
 A_BOX_MAX_M = 64
+# Same-tile pre-wait L2 weight prefetch twin of the QKV GEMM's PDL_EARLY half-N tile (Cake ``kimi_k3_vision_gemm``
+# ``s_cs_h_wpl``): where the QKV GEMM's own M is ``QKV_T576_M`` (a 576-token batch) inside its PDL_EARLY window, the
+# launch takes the twin of its tile on the arches of ``QKV_T576_ARCHES``.  Same TileConfig, launch geometry, K order
+# and stored rows as the base tile.
+QKV_T576_ARCHES = frozenset({"sm_103a"})
+QKV_T576_TWINS = {("norm_qkv_rope", "s_cs_h"): "s_cs_h_wpl"}
+QKV_T576_M = 576
 for _base, _twin in WEIGHT_PF_LEAD_TWINS.items():
     TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
 for (_variant, _base), _twin in A_BOX_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+for (_variant, _base), _twin in QKV_T576_TWINS.items():
     TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
 
 
@@ -1735,6 +1744,19 @@ def _weight_pf_lead_twin(name: str, variant: str, M: int, arch: Optional[str]) -
         and pdl_early_on(variant, M)
     ):
         return WEIGHT_PF_LEAD_TWINS[name]
+    return name
+
+
+def _qkv_t576_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s same-tile weight prefetch twin (``QKV_T576_TWINS``) where ``arch`` takes it and M is ``QKV_T576_M``
+    inside the PDL_EARLY window; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in QKV_T576_ARCHES
+        and (variant, name) in QKV_T576_TWINS
+        and int(M) == QKV_T576_M
+        and pdl_early_on(variant, M)
+    ):
+        return QKV_T576_TWINS[variant, name]
     return name
 
 
@@ -1758,8 +1780,9 @@ def select_tile_config(
     round-3 .. round-6 routing (:func:`_select_tile_config_base`), the half-N tail twin of the non-pos forms where the
     census tail fits one half-round (:func:`_half_twin`) and, as the outermost steps, the column-first raster twin of
     the fc1 stream-K pair tile inside the windows of ``arch`` (:func:`_cols_first_twin`), the fc1 forms'
-    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`) and the small-M twins of ``arch``
-    (:func:`_weight_pf_lead_twin`, :func:`_a_box_twin`)."""
+    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`), the small-M twins of ``arch``
+    (:func:`_weight_pf_lead_twin`, :func:`_a_box_twin`) and the QKV tile's 576-token twin of ``arch``
+    (:func:`_qkv_t576_twin`)."""
     cfg = _select_tile_config_base(variant, M, sm_count, arch)
     n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
@@ -1768,6 +1791,7 @@ def select_tile_config(
     name = _cols_first_twin(name, variant, M, arch)
     name = _fc1_tma_tile(name, variant, M)
     name = _weight_pf_lead_twin(name, variant, M, arch)
+    name = _qkv_t576_twin(name, variant, M, arch)
     return TILE_CONFIGS[_a_box_twin(name, variant, M, arch)]
 
 
@@ -2142,7 +2166,7 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
     on the tile count), every token-count boundary of the tile rule and its neighbour, and every edge of the
     form's PDL_EARLY window, of the out-proj pair bands (``WO_PAIR_BANDS``), of its column-first twin windows
     (``COLS_FIRST_WINDOWS`` of every arch) and of its TMA-epilogue tile windows (``FC1_TMA_WINDOWS``; the windows are
-    on M, not on the tile count)."""
+    on M, not on the tile count), and the QKV 576-token twin's M and its neighbours."""
     counts = set(range(1, GEMM_CENSUS_LIMIT + 1, GEMM_BLOCK_M))
     for bound in (
         TINY_M_LIMIT,
@@ -2173,6 +2197,8 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
                 counts.update((lo - 1, lo, hi, hi + 1))
         for lo, hi, _name in FC1_TMA_WINDOWS:
             counts.update((lo - 1, lo, hi, hi + 1))
+    if any(twin_variant == variant for twin_variant, _base in QKV_T576_TWINS):
+        counts.update((QKV_T576_M - 1, QKV_T576_M, QKV_T576_M + 1))
     return tuple(sorted(c for c in counts if 1 <= c <= GEMM_CENSUS_LIMIT))
 
 

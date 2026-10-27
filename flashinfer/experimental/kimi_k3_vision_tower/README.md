@@ -45,7 +45,9 @@ half-width items whenever they fit one half-round with margin, bitwise
 identical per output element to the base tile; on the architectures of
 `cake_backend.WEIGHT_PF_LEAD_ARCHES` the PDL_EARLY QKV, FC0 and FC1 forms up
 to 256 rows run the `*_wpl` twin of their tile, which prefetches the weight
-boxes past the first ring fill into L2 before the grid-dependency wait, and on
+boxes past the first ring fill into L2 before the grid-dependency wait (on
+`cake_backend.QKV_T576_ARCHES`, SM103, the QKV GEMM of a 576-token batch runs
+the same twin of its half-N tile, `s_cs_h_wpl`), and on
 those of `cake_backend.A_BOX_ARCHES` the merger GEMMs up to 64 merged rows run
 the `xs_ab` / `s_ab` twin, which loads a 64-row A box: same launch, same stored
 rows; on `cake_backend.READY_COUNTER_ARCHES` (SM103) a batch inside

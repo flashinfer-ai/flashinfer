@@ -658,6 +658,34 @@ def test_small_m_twins_route_per_arch(arch):
 
 
 @pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_qkv_576_token_twin_routes_per_arch(arch):
+    # The QKV GEMM's same-tile pre-wait weight prefetch twin (``s_cs_h_wpl``) replaces its
+    # PDL_EARLY half-N tile at exactly QKV_T576_M rows, on the arches of QKV_T576_ARCHES only;
+    # every other token count and variant keeps its tile, and the twin keeps the base TileConfig.
+    on = arch in cb.QKV_T576_ARCHES
+    assert sorted(cb.QKV_T576_ARCHES) == ["sm_103a"] and cb.QKV_T576_M == 576
+    assert cb.QKV_T576_TWINS == {("norm_qkv_rope", "s_cs_h"): "s_cs_h_wpl"}
+    m = cb.QKV_T576_M
+    assert cb.gemm_stage_key("norm_qkv_rope", m) == "gemm:norm_qkv_rope:s_cs_h:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", m, arch=arch) == (
+        f"gemm:norm_qkv_rope:{'s_cs_h_wpl' if on else 's_cs_h'}:pdle"
+    )
+    for other in (m - 1, m + 1):
+        assert cb.gemm_stage_key("norm_qkv_rope", other, arch=arch) == (
+            cb.gemm_stage_key("norm_qkv_rope", other)
+        )
+    for variant in cb.GEMM_VARIANTS:
+        if variant != "norm_qkv_rope":
+            for c in (m - 1, m, m + 1):
+                assert "s_cs_h_wpl" not in cb.gemm_stage_key(variant, c, arch=arch)
+    assert (
+        dataclasses.replace(TILE_CONFIGS["s_cs_h_wpl"], name="s_cs_h")
+        == TILE_CONFIGS["s_cs_h"]
+    )
+    assert {m - 1, m, m + 1} <= set(cb.gemm_census_counts("norm_qkv_rope"))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
 def test_ready_counter_key_contract(arch):
     """The ready counters gate batch8_448 (8192 tokens) on sm_103a at 148 SMs on all three edges: its plan lists the
     five twin keys after its GEMM keys, the twins are required and registered there (on no other arch), the counter
