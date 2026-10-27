@@ -312,10 +312,13 @@ def _launched_finalize_kernels(fn):
 
     The kernel names come from CUPTI via the PyTorch profiler, so this records the branch the
     production launcher actually took, independently of canUseFinalizeMoeRoutingWarpKernel.
+    Without CUPTI the profiler cannot trace CUDA kernels; fn then runs untraced and the names
+    are None.
     """
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
+    cuda = torch.profiler.ProfilerActivity.CUDA
+    if cuda not in torch.profiler.supported_activities():
+        return fn(), None
+    with torch.profiler.profile(activities=[cuda]) as prof:
         result = fn()
         torch.cuda.synchronize()
     names = [e.name for e in prof.events() if "finalizeMoeRouting" in e.name]
@@ -349,7 +352,7 @@ def _check(c: _Case, expect_warp_kernel: bool = True):
     assert uses_warp == expect_warp_kernel
 
     new, launched = _launched_finalize_kernels(lambda: _run(c, False, inputs, out_init))
-    if c.num_rows > 0:
+    if c.num_rows > 0 and launched is not None:
         # The launcher must have taken the branch that uses_warp_kernel predicts.
         assert launched, "no finalize kernel was launched"
         is_warp = ["finalizeMoeRoutingWarpKernel" in name for name in launched]
