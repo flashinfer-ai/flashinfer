@@ -124,9 +124,11 @@ class _Program:
     (``preprocess_args``: ``_PREPROCESS_ARGS``, or ``_METADATA_ARGS`` for the
     light metadata stage).
     ``variant`` is the schedule variant of the exact-scan families: ``""``
-    (the ring program), ``"noring"`` or ``"tail"`` (the two-kernel family's
+    (the ring program), ``"noring"``, ``"tail"`` (the two-kernel family's
     2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
-    grid :func:`_tail_grid_size`).
+    grid :func:`_tail_grid_size`) or ``"claim"`` (the two-kernel family's
+    sm_107a varlen ring program that draws its work items at run time,
+    :func:`claim_selected`).
     """
 
     family: str
@@ -294,7 +296,10 @@ _EXACTONE_MODULES = {
 # sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
-# table in-kernel.
+# table in-kernel.  The two-kernel claim programs
+# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`) exist on sm_107a
+# only: their entries are their sole sources (no fold module, never built for
+# another architecture).
 _SM107_MODULES = {
     "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2c8ae2e234",
     "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_c7f567464b",
@@ -336,6 +341,8 @@ _SM107_MODULES = {
     "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_bb43e9dc23",
     "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_065ee313f0",
     "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_b3946eba3a",
+    "exactpre_bf16_varlen_claim": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_bf54776bdb",
+    "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_72edaa28a6",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -409,6 +416,11 @@ _EXACTPRE_SMEM_BYTES = 232320
 # mbarrier); refreshed by the Cake export with the ``exactpre_*_tail`` table
 # entries.
 _EXACTPRE_TAIL_SMEM_BYTES = 232320
+# Main dynamic SMEM of the sm_107a claim programs (``exactpre_*_claim``: the
+# two-kernel varlen ring programs with the 8-byte item hand-off slots and the
+# two claim mbarrier pairs); refreshed by the Cake export with the
+# ``exactpre_*_claim`` table entries.
+_EXACTPRE_CLAIM_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -682,6 +694,7 @@ _VARIANT_SMEM_BYTES = {
     ("exactmeta", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactone", "noring"): _EXACTONE_NORING_SMEM_BYTES,
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
+    ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
 }
 # Cluster shape of the main kernels (the Cake export checks the generated
 # sources against it): the ``_tail`` pair programs launch as 2-CTA clusters
@@ -735,6 +748,14 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
+# The sm_107a-only programs (the claim programs): their ``_SM107_MODULES``
+# entry is their main module on every architecture; only capability (10, 7)
+# routes to them (:func:`claim_selected`).
+_SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
+_PROGRAMS.update(
+    (name, _program(name, _SM107_MODULES[name]))
+    for name in sorted(_SM107_ONLY_PROGRAMS)
+)
 
 
 def _program_name(
@@ -743,7 +764,7 @@ def _program_name(
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
-    one, ``"tail"`` for the two-kernel exact-scan family)."""
+    one, ``"tail"`` or ``"claim"`` for the two-kernel exact-scan family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1572,6 +1593,20 @@ _NORING_RETAINED_FUSED = frozenset({(10, 7)})
 # retained ``exact`` program, which is slower, so those calls keep the fused
 # start schedule.
 _NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM = {(10, 7): 4}
+# sm_107a: one-chunk varlen ring calls with more than this many (sequence,
+# head) items, at least ``_CLAIM_MIN_ITEMS_PER_CTA`` items per CTA of the
+# persistent grid and a state dtype listed in ``_CLAIM_STATE_DTYPES`` take the
+# claim program (``exactpre_<state>_varlen_claim``, :func:`claim_selected`):
+# the two-kernel ring program drawing each CTA's next item at run time from a
+# self-resetting counter (``preprocess_status[1]``) instead of the static
+# grid-stride order, so the CTAs on faster SMs take more items; the bf16
+# program updates the state as the retained start program does (bitwise its
+# outputs), the f32 program as ``exactpre`` does (bitwise its outputs).  On
+# R200, whose SMs do not run at one speed, both are faster than the programs
+# those calls ran before.
+_CLAIM_MIN_ITEMS = {(10, 7): 2048}
+_CLAIM_MIN_ITEMS_PER_CTA = 8
+_CLAIM_STATE_DTYPES = {(10, 7): frozenset({torch.bfloat16, torch.float32})}
 
 
 def fused_selected(
@@ -1732,6 +1767,43 @@ def fused_no_z_extended(
     return (
         items <= max_items_varlen
         and packed_chunks * int(nheads) <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN
+    )
+
+
+def claim_selected(
+    *,
+    mode_varlen: bool,
+    num_sequences: int,
+    seqlen: int,
+    nheads: int,
+    sm_count: int,
+    capability: Optional[tuple[int, int]],
+    variant: str,
+    state_dtype: torch.dtype,
+) -> bool:
+    """Whether a two-kernel call runs the claim program
+    (``exactpre_<state>_varlen_claim``): on a ``capability`` of
+    ``_CLAIM_MIN_ITEMS``, a packed-varlen call of the ring schedule
+    (``variant`` ``""``) whose host-known chunks per item
+    (:func:`host_chunks_per_item`, ``seqlen`` the packed token count) is one,
+    with more than that many ``num_sequences x nheads`` items, at least
+    ``_CLAIM_MIN_ITEMS_PER_CTA`` items per CTA of its persistent grid
+    (:func:`_persistent_grid_size`) and a ``state_dtype`` of
+    ``_CLAIM_STATE_DTYPES``."""
+
+    if capability is None or not mode_varlen or variant:
+        return False
+    key = (int(capability[0]), int(capability[1]))
+    min_items = _CLAIM_MIN_ITEMS.get(key)
+    if min_items is None or state_dtype not in _CLAIM_STATE_DTYPES.get(key, ()):
+        return False
+    chunks = host_chunks_per_item(
+        mode_varlen=True, num_sequences=num_sequences, seqlen=seqlen
+    )
+    items = max(int(num_sequences), 1) * int(nheads)
+    grid = _persistent_grid_size(total_work=items, sm_count=int(sm_count))
+    return (
+        chunks == 1 and items > min_items and items >= _CLAIM_MIN_ITEMS_PER_CTA * grid
     )
 
 
@@ -2532,17 +2604,22 @@ class CakeSSDCombined:
         self._allocations_in_last_run += 1
 
     def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
-        """The runner-owned ``preprocess_status`` word (one int32 per device).
+        """The runner-owned ``preprocess_status`` words (two int32 per device).
 
-        The preprocess stores 1 into it when a packed-sequence id is out of
-        range or non-monotonic (see the class docstring); it is allocated
+        The preprocess stores 1 into word 0 when a packed-sequence id is out of
+        range or non-monotonic (see the class docstring).  Word 1 is the item
+        counter the sm_107a claim programs draw from (:func:`claim_selected`);
+        every complete launch leaves it 0, so a stream's launches see it 0.
+        Like the runner's other per-device workspace (the delta and cumsum
+        tiles, the grid barriers), the words serve one stream at a time: a
+        runner is not used concurrently on two streams.  Both are allocated
         zeroed once per device and never read on the launch path.
         """
 
         status = self._preprocess_status.get(device.index)
         if status is None:
-            self._allocating("the preprocess status word")
-            status = torch.zeros(1, dtype=torch.int32, device=device)
+            self._allocating("the preprocess status words")
+            status = torch.zeros(2, dtype=torch.int32, device=device)
             self._preprocess_status[device.index] = status
         return status
 
@@ -2565,7 +2642,7 @@ class CakeSSDCombined:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         status = self._preprocess_status_buffer(device)
-        value = int(status.item())
+        value = int(status[0].item())
         if reset:
             status.zero_()
         return value
@@ -2848,6 +2925,17 @@ class CakeSSDCombined:
                 variant=variant,
                 state_dtype=self.state_dtype,
             )
+            if claim_selected(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            ):
+                program_family, variant = "exactpre", "claim"
         workspace: dict[str, Any] = {
             "program": _program_name(
                 program_family,
