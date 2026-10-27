@@ -2589,6 +2589,7 @@ class AutoTuner:
                 key_fields[2]
                 for root, env_hash, key_fields in self._managed_decoded
                 if (root, env_hash) == store_id
+                and len(key_fields) == 4
                 and (key_fields[0], key_fields[1], key_fields[3]) in fields
             )
         if not tuned:
