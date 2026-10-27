@@ -10,7 +10,10 @@ stage counts; bulk copies retain their K source through coupled K/V reuse.
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
+from cutlass.base_dsl.common import DSLRuntimeError
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
+from cutlass.pipeline import PipelineState
 
 from ..helpers.gather import gather4_quad
 from ..helpers.nvfp4_kv import (
@@ -94,22 +97,48 @@ def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp,
         )
 
 
-@cute.jit
-def store_v_remote(dst, offset, done, owner, a, b, c, d):
-    """Send sixteen converted V bytes to the peer CTA and credit its completion barrier.
+@dsl_user_op
+def store_v_remote(dst, offset, done, owner, a, b, c, d, *, loc=None, ip=None):
+    """Send sixteen converted V bytes and credit the peer completion barrier.
 
-    Offset is in bytes within the peer V stage. The stage must be acquired
-    before this asynchronous store; the publisher waits for all peer bytes."""
+    Offset is in bytes within an acquired peer V stage. Prefer the native
+    vector store for compiler scheduling. DSL 4.7 validates tuples but then
+    converts them to a scalar; use inline PTX only for that wrapper failure.
+    """
     destination = cute.make_ptr(
         cutlass.Int32,
         dst.toint(Int32) + offset,
         cute.AddressSpace.smem,
         assumed_align=16,
+        loc=loc,
+        ip=ip,
     )
     completion = cute.make_ptr(
-        cutlass.Int64, done.toint(Int32), cute.AddressSpace.smem, assumed_align=8
+        cutlass.Int64,
+        done.toint(Int32),
+        cute.AddressSpace.smem,
+        assumed_align=8,
+        loc=loc,
+        ip=ip,
     )
-    cute.arch.store_async_dsmem(destination, (a, b, c, d), completion, owner)
+    try:
+        cute.arch.store_async_dsmem(
+            destination, (a, b, c, d), completion, owner, loc=loc, ip=ip
+        )
+        return
+    except DSLRuntimeError as error:
+        if "to integer conversion is not supported" not in str(error):
+            raise
+
+    remote = prims.mapa(dst + offset, owner, loc=loc, ip=ip)
+    remote_completion = prims.mapa(done, owner, loc=loc, ip=ip)
+    cute.arch.inline_ptx(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
+        "[{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",
+        read_only_args=[remote.ir_value(), a, b, c, d, remote_completion.ir_value()],
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -249,10 +278,18 @@ def load_nvfp4_source_stage(
     if has_next:
         # Read ahead under the same future consumer token. This wait does not
         # advance/release it; the normal next iteration still owns its release.
-        upcoming = k.page_window.state_src.consumer_state.clone()
-        upcoming.advance()
+        # Construct new scalar values: DSL 4.7 can alias the staged fields
+        # returned by clone(), so advance() also advances the live consumer
+        # and releases the next ring slot instead of the one being read.
+        current = k.page_window.state_src.consumer_state
+        next_stage = (current.index + Int32(1)) % Int32(cfg.sparse_offset_stages)
+        upcoming = PipelineState(
+            cfg.sparse_offset_stages,
+            current.count + Int32(1),
+            next_stage,
+            current.phase ^ Int32(next_stage == Int32(0)),
+        )
         k.page_window.pipeline.consumer_wait(upcoming)
-        next_stage = upcoming.index
     wait_raw_load(raw_bar, loop & Int32(1))
     if fp8_source:
         convert_k_and_exchange_v(

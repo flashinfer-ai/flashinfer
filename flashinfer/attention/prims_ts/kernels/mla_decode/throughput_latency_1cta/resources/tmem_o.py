@@ -32,6 +32,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ....tcgen05_compat import tcgen05_mma_ws
 from ...helpers.constants import (
     WARP_LANES,
 )
@@ -400,7 +401,7 @@ class TmemOResource(MlaResource):
                     stage_info, v_subtile_idx=v_subtile_idx
                 )
                 for _kb in cutlass.range_constexpr(4):
-                    prims.tcgen05_mma_ws(
+                    tcgen05_mma_ws(
                         mma_kind_for_qkv(cfg),
                         prims.make_tmem_ptr(base_addr, Float32),
                         p_desc,

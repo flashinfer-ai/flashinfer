@@ -32,6 +32,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ....tcgen05_compat import tcgen05_mma_ws
 from ...helpers.constants import (
     OCTET_LANES,
     QUAD_LANE_MASK,
@@ -384,7 +385,7 @@ class TmemSResource(MlaResource):
                 if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                     if cutlass.const_expr(cfg.ws_qk):
                         if cutlass.const_expr(cfg.q_nope_tmem and qk_stage_idx < 4):
-                            prims.tcgen05_mma_ws(
+                            tcgen05_mma_ws(
                                 mma_kind_for_qkv(cfg),
                                 tmem_ptr,
                                 prims.make_tmem_ptr(Int32(q_desc), qkv_dtype(cfg)),
@@ -393,7 +394,7 @@ class TmemSResource(MlaResource):
                                 scale_d,
                             )
                         else:
-                            prims.tcgen05_mma_ws(
+                            tcgen05_mma_ws(
                                 mma_kind_for_qkv(cfg),
                                 tmem_ptr,
                                 q_desc,
