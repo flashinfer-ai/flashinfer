@@ -1510,7 +1510,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     plan of 2048 to 16384 padded tokens runs the fused pre-processing (K sums and Q block means, a
     grid barrier, then the quantized operands, in one cooperative launch); any other plan runs the
     statistics launch, which also quantizes Q and the block-mean rows, then the K / V quantizer.  On a
-    part of 170 or 188 SMs a plan of 2048 to 16384 padded tokens runs the overlapped form instead
+    part of 170 or 188 SMs every plan of at least 2048 padded tokens runs the overlapped form instead
     (``minimax_h3_sm120_nvfp4_overlap_grids``): head-major pre-processing producers start first on a
     few SMs (a plain launch), the attention launch, a programmatic dependent of the producers, starts on
     the remaining SMs, each head's attention waiting for its operands, and a second attention launch, a
@@ -1526,6 +1526,12 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
     instantiated more than once from one captured graph (or cloned as child graphs) share this op's
     workspace and must not run concurrently.
+
+    CUDA graphs: the first call for a given ``cu_seqlens_host`` builds the plan's device tables from host
+    lists, a pageable host-to-device copy that a stream capture does not allow. Call the op once for that
+    plan outside the capture before capturing it; later calls reuse the tables, and the capture then
+    records kernel launches only. This holds with ``CUDA_MODULE_LOADING=LAZY`` as well: once the tables
+    exist, the first launch of each program may happen inside the capture.
 
     The E2M1 scores and probabilities carry a larger quantization error than the FP8 operator
     (about 4x the relative L2 error on Gaussian inputs, the same as SageAttention3's own); this
@@ -1644,6 +1650,12 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
     Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
     instantiated more than once from one captured graph (or cloned as child graphs) share this op's
     workspace and must not run concurrently.
+
+    CUDA graphs: the first call for a given ``cu_seqlens_host`` builds the plan's device tables from host
+    lists, a pageable host-to-device copy that a stream capture does not allow. Call the op once for that
+    plan outside the capture before capturing it; later calls reuse the tables, and the capture then
+    records kernel launches only. This holds with ``CUDA_MODULE_LOADING=LAZY`` as well: once the tables
+    exist, the first launch of each program may happen inside the capture.
 
     Parameters
     ----------
