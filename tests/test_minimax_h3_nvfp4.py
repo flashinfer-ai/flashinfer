@@ -144,10 +144,17 @@ def test_norm_program_follows_target_and_destinations(
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     for P in (None, 1, 2, 4, 8):
         for out_format in ("nvfp4", "e4m3"):
-            norm, _ = ops.minimax_h3_nvfp4_programs(torch.device("cuda"), out_format, P)
-            shared = (target, P) == ("sm_103a", 4)
-            assert norm is (programs.NORM_V5 if shared else programs.NORM)
-            assert target in norm.targets
+            for M in (None, 1, 4824, 6095, 6096, 13744):
+                norm, _ = ops.minimax_h3_nvfp4_programs(
+                    torch.device("cuda"), out_format, P, M
+                )
+                staged = (target, P) == ("sm_103a", 4) or (
+                    (out_format, target, P) == ("nvfp4", "sm_103a", 8)
+                    and M is not None
+                    and M >= 6096
+                )
+                assert norm is (programs.NORM_V5 if staged else programs.NORM)
+                assert target in norm.targets
 
 
 @pytest.mark.parametrize("capability", [(9, 0), (10, 7), (12, 0)])
@@ -983,18 +990,20 @@ def _e4m3_cast(values: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
     return scaled.to(torch.float8_e4m3fn)
 
 
-@pytest.mark.parametrize(("M", "P"), [(129, 4), (300, 4), (2048, 4)])
-def test_four_destination_norm_program_writes_the_norm_bytes(
-    monkeypatch, M: int, P: int
-) -> None:
-    """On ``sm_103a`` the four-destination norm program writes the bytes of ``NORM``.
+@pytest.mark.parametrize(
+    ("M", "P"), [(129, 4), (300, 4), (2048, 4), (6096, 8), (7368, 8)]
+)
+def test_staged_norm_program_writes_the_norm_bytes(monkeypatch, M: int, P: int) -> None:
+    """On ``sm_103a`` the staged norm program (``NORM_V5``) writes the bytes of ``NORM``.
 
-    Reference: the ``NORM`` program on the same inputs, every output and debug
-    buffer compared byte for byte.  The (129, 4) and (300, 4) inputs put E2M1
-    rounding ties in the activation: the kernels form the encode factor with
-    approximate reciprocals and the torch oracle of ``test_numerical_reference``
-    with IEEE division, so at a tie the two can pick neighbouring codes; the
-    program-to-program comparison is exact at every element.
+    It serves four destinations and, for ``out_format="nvfp4"``, eight
+    destinations from ``M = 6096`` tokens on.  Reference: the ``NORM`` program
+    on the same inputs, every output and debug buffer compared byte for byte.
+    The (129, 4) and (300, 4) inputs put E2M1 rounding ties in the activation:
+    the kernels form the encode factor with approximate reciprocals and the
+    torch oracle of ``test_numerical_reference`` with IEEE division, so at a tie
+    the two can pick neighbouring codes; the program-to-program comparison is
+    exact at every element.
     """
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103a")
@@ -1049,13 +1058,14 @@ def test_four_destination_norm_program_writes_the_norm_bytes(
             **debug,
         }
 
-    assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P)[0] is programs.NORM_V5
-    four = run()
+    assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P, M)[0] is programs.NORM_V5
+    staged = run()
     with monkeypatch.context() as patch:
         patch.setattr(ops, "_NORM_PROGRAMS", {})
-        assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P)[0] is programs.NORM
+        patch.setattr(ops, "_NORM_PROGRAMS_FROM_M", {})
+        assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P, M)[0] is programs.NORM
         shared = run()
-    for name, tensor in four.items():
+    for name, tensor in staged.items():
         assert torch.equal(tensor.view(torch.uint8), shared[name].view(torch.uint8)), (
             name
         )
