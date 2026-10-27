@@ -116,9 +116,12 @@ def qwen_3_8_block_support(
         sizes and cache spellings, the decode envelope (``decode_max_q_len``, ``decode_capture_rows_max``), the served ``rope_dims``,
         the indexer facts READ off the vendored envelope (``index_sources``, ``index_list_forms``, ``index_cache_dtypes``,
         ``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
-        ``index_state_rows_extra``, ``index_page_sizes``, ``kv_cache_dtypes``, ``fuse_prepare_default``, ``pdl_default``) and
-        ``source`` (the vendored cuDNN Frontend commit / version the kernels come from).  The geometry verdict is the one
-        ``prepare_qwen_3_8_block_bf16`` applies (one shared gate).
+        ``index_state_rows_extra``, ``index_page_sizes``, ``kv_cache_dtypes``, ``fuse_prepare_default``, ``pdl_default``, and -- the
+        sparse core's two bodies -- ``sparse_tiles`` (the bodies this part serves by ``kernel_template``: ``"sparse_d256_f16"``, the tcgen05
+        core, everywhere; ``"sparse_lean_d256_f16"``, the lean decode tile, on cc 10.7) and ``sparse_tile_lean_default`` (whether
+        ``sparse_tile_form="auto"`` consults the lean placement rule on this part; the per-cell reading is
+        ``flashinfer.experimental.qwen_3_8_block.support.sparse_tile``)) and ``source`` (the vendored cuDNN Frontend commit / version the
+        kernels come from).  The geometry verdict is the one ``prepare_qwen_3_8_block_bf16`` applies (one shared gate).
     """
     from .experimental.qwen_3_8_block import support as _impl
 
@@ -265,6 +268,7 @@ def prepare_qwen_3_8_block_bf16(
     fuse_prepare: Optional[bool] = None,
     use_pdl: Optional[bool] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
+    sparse_tile_form: str = "auto",
 ) -> "Qwen38BlockPlan":
     """Declare, check and compile the block for one DECODE shape bucket, outside CUDA-graph capture.
 
@@ -332,13 +336,21 @@ def prepare_qwen_3_8_block_bf16(
         ``None`` = the vendored default (off on the sparse chain today); ``True`` is a typed decline until the vendored tree serves it.
     kv_cache_dtype : Optional[torch.dtype]
         ``None`` = bf16 pools; ``torch.float8_e4m3fn`` is a typed decline until the sparse core's in-kernel dequant arm lands.
+    sparse_tile_form : str
+        WHICH BODY of the sparse core serves the step: ``"auto"`` (default) = the vendored placement rule -- on cc 10.7 the LEAN decode
+        tile (``mma.sync`` + ``cp.async``, no TMEM / TMA / cluster) at ``batch_size x H_kv x q_len_per_req <= 4`` units (``batch_size <= 2``
+        at ``q_len_per_req 1`` on two KV heads; under the in-block indexer the lean tile serves ``q_len_per_req == 1``), the tcgen05 core
+        everywhere else --, ``"lean"`` / ``"tcgen05"`` pin a body (an explicit body the step does not admit is a typed decline naming the
+        arm).  Performance-only: the same function under either body within the vendored tree's budget, never bitwise ACROSS the bodies
+        (bitwise within each); the body that compiled reads back in ``plan.sparse_tile`` (``"sparse_lean_d256_f16"`` / ``"sparse_d256_f16"``).
+        A vocabulary other than these three is a ``ValueError`` before any vendored code.
 
     Returns
     -------
     Qwen38BlockPlan
         ``plan.run(...)`` launches it; ``plan.workspace_size``, ``plan.declaration`` (the compiled-in facts, the stages, the knob
-        readbacks ``fuse_prepare`` / ``use_pdl`` / ``pdl_stages``, ``index_list_form``, ``n_blocks_max``, ``topk_knobs``, the
-        launch count statement, the cache roots) and ``plan.supports(...)`` describe it.
+        readbacks ``fuse_prepare`` / ``use_pdl`` / ``pdl_stages`` / ``sparse_tile_form`` / ``sparse_tile``, ``index_list_form``,
+        ``n_blocks_max``, ``topk_knobs``, the launch count statement, the cache roots) and ``plan.supports(...)`` describe it.
     """
     from .experimental.qwen_3_8_block import api as _impl
 
@@ -367,6 +379,7 @@ def prepare_qwen_3_8_block_bf16(
         fuse_prepare=fuse_prepare,
         use_pdl=use_pdl,
         kv_cache_dtype=kv_cache_dtype,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
@@ -397,6 +410,7 @@ def qwen_3_8_block_bf16_decode(
     plan: Optional["Qwen38BlockPlan"] = None,
     block_ids_out: Optional[torch.Tensor] = None,
     block_lens_out: Optional[torch.Tensor] = None,
+    sparse_tile_form: str = "auto",
 ) -> torch.Tensor:
     """The decode form: ``batch`` sequences x ``q_len_per_req`` new tokens each over the paged caches, the selection made in the block.
 
@@ -454,6 +468,9 @@ def qwen_3_8_block_bf16_decode(
     block_ids_out, block_lens_out : Optional[torch.Tensor]
         Optional ``[batch * q_len_per_req, top_k]`` / ``[batch * q_len_per_req]`` int32 buffers that receive the block's own selection
         (the ids strictly descending then ``-1``; the valid-prefix length) -- tests, A/B, a reuse stack; nothing on the step reads them.
+    sparse_tile_form : str
+        The sparse core's body knob of the bucket's cached plan (as in :func:`prepare_qwen_3_8_block_bf16`; a plan-cache key); ignored
+        when ``plan`` is given (that plan's body runs).
 
     Returns
     -------
@@ -487,6 +504,7 @@ def qwen_3_8_block_bf16_decode(
         plan=plan,
         block_ids_out=block_ids_out,
         block_lens_out=block_lens_out,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
@@ -503,6 +521,7 @@ def qwen_3_8_block_workspace_size(
     decode_split_kv: Optional[int] = None,
     fuse_prepare: Optional[bool] = None,
     ring_cap: Optional[int] = None,
+    sparse_tile_form: str = "auto",
 ) -> int:
     """The workspace bytes a decode plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
     workspace with at init (before its memory profiling, when the caches do not exist yet), at the largest ``(batch_size,
@@ -522,6 +541,9 @@ def qwen_3_8_block_workspace_size(
         The bucket's facts, as in :func:`prepare_qwen_3_8_block_bf16` (``max_pages`` required: the table's columns).
     ring_cap : Optional[int]
         The ring's rows per block (default ``q_len_per_req + 3``, the minimum).
+    sparse_tile_form : str
+        The sparse core's body knob the plan will be made with (as in :func:`prepare_qwen_3_8_block_bf16`): the carve is the body's --
+        the lean tile's split writes a wider partial slab than the core's -- so size the workspace with the knob the plans use.
 
     Returns
     -------
@@ -541,6 +563,7 @@ def qwen_3_8_block_workspace_size(
         decode_split_kv=decode_split_kv,
         fuse_prepare=fuse_prepare,
         ring_cap=ring_cap,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
@@ -614,6 +637,7 @@ class Qwen38BlockWrapper:
         fuse_prepare: Optional[bool] = None,
         use_pdl: Optional[bool] = None,
         kv_cache_dtype: Optional[torch.dtype] = None,
+        sparse_tile_form: str = "auto",
     ) -> None:
         """Plan one shape bucket over this wrapper's workspace, outside CUDA-graph capture.
 
@@ -621,7 +645,7 @@ class Qwen38BlockWrapper:
         ----------
         form : str
             ``"decode"``.
-        weights, w_o, kv_cache, page_size, batch_size, q_len_per_req, max_pages, block_table, max_seq_len, decode_split_kv, index_kv_cache, index_state_cache, index_state_block_table, position_tables, rope_position_tables_only, ring_slots, fuse_prepare, use_pdl, kv_cache_dtype
+        weights, w_o, kv_cache, page_size, batch_size, q_len_per_req, max_pages, block_table, max_seq_len, decode_split_kv, index_kv_cache, index_state_cache, index_state_block_table, position_tables, rope_position_tables_only, ring_slots, fuse_prepare, use_pdl, kv_cache_dtype, sparse_tile_form
             As in :func:`prepare_qwen_3_8_block_bf16` (``weights`` / ``w_o`` are samples: shape and dtype).
         """
         from .experimental.qwen_3_8_block import api as _impl
@@ -652,6 +676,7 @@ class Qwen38BlockWrapper:
             fuse_prepare=fuse_prepare,
             use_pdl=use_pdl,
             kv_cache_dtype=kv_cache_dtype,
+            sparse_tile_form=sparse_tile_form,
         )
 
     @flashinfer_experimental_api(feature=_FEATURE)

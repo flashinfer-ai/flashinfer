@@ -1590,6 +1590,9 @@ def _combine_packed_kernel(
     stats_log2: cutlass.Constexpr[bool],
     sinks: Optional[cute.Tensor] = None,
     prefetch_group: cutlass.Constexpr[int] = 0,
+    cu_q: Optional[cute.Tensor] = None,
+    origin_offsets=None,
+    origin_specs: cutlass.Constexpr = None,
 ) -> None:
     """Four packed rows per CTA; each warp reuses split weights across D.
 
@@ -1604,6 +1607,26 @@ def _combine_packed_kernel(
     if (row >= o_partial.shape[1]) | (row >= cutlass.make_array_view(total_q)[0]):
         # Warp-uniform, with no CTA barriers in this kernel.
         nvvm.exit()
+    o_row, stats_row = cutlass.Int64(row), cutlass.Int64(row)
+    if cutlass.const_expr(cu_q is not None):
+        prefix = cutlass.make_array_view(cu_q)
+        lo, hi = cutlass.Int32(0), cutlass.Int32(cu_q.shape[0] - 1)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if prefix[mid + 1] <= row:
+                lo = mid + 1
+            else:
+                hi = mid
+        local_row = cutlass.Int64(row) - cutlass.Int64(prefix[lo])
+        if cutlass.const_expr(origin_specs[3] is not None):
+            o_row = (
+                cutlass.Int64(cutlass.make_array_view(origin_offsets[3])[lo]) * cutlass.Int64(origin_specs[3][1]) // cutlass.Int64(o_out.stride[1]) + local_row
+            )
+        if cutlass.const_expr(origin_specs[4] is not None):
+            stats_row = (
+                cutlass.Int64(cutlass.make_array_view(origin_offsets[4])[lo]) * cutlass.Int64(origin_specs[4][1]) // cutlass.Int64(origin_specs[4][2])
+                + local_row
+            )
     op = cutlass.make_array_view(o_partial)
     lp = cutlass.make_array_view(lse_partial)
     oo = cutlass.make_array_view(o_out)
@@ -1640,14 +1663,14 @@ def _combine_packed_kernel(
                     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
                     values = (a0, a1, a2, a3)
                     for slot in cutlass.range_constexpr(4):
-                        oo[0, row, head, d0 + slot] = (values[slot] * inv_den).to(o_out.element_type)
+                        oo[0, o_row, head, d0 + slot] = (values[slot] * inv_den).to(o_out.element_type)
                     if cutlass.const_expr(lse_out is not None):
                         if (lane == 0) & (d_base == 0):
                             value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
                             value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
                             if cutlass.const_expr(stats_log2):
                                 value = value * cutlass.Float32(1.4426950408889634)
-                            cutlass.make_array_view(lse_out)[0, head, row] = value
+                            cutlass.make_array_view(lse_out)[0, head, stats_row] = value
             # Warp-uniform branch, no CTA synchronization in either reducer.
             nvvm.exit()
     parallel = n_splits <= 32
@@ -1708,14 +1731,14 @@ def _combine_packed_kernel(
         for slot in cutlass.range_constexpr(4):
             d = d_base + lane + slot * 32
             if d < o_partial.shape[3]:
-                oo[0, row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
+                oo[0, o_row, head, d] = (acc[slot] * inv_den).to(o_out.element_type)
     if cutlass.const_expr(lse_out is not None):
         if lane == 0:
             value = m_safe + cute.math.log(cute.math.max(den, cutlass.Float32(1e-30)), fastmath=True)
             value = cutlass.Float32(arith.select(all_dead.ir_value(), neg_inf.ir_value(), value.ir_value()))
             if cutlass.const_expr(stats_log2):
                 value = value * cutlass.Float32(1.4426950408889634)
-            cutlass.make_array_view(lse_out)[0, head, row] = value
+            cutlass.make_array_view(lse_out)[0, head, stats_row] = value
 
 
 _combine_packed_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2418,6 +2441,10 @@ def _host_ptr_packed(
     stream: _cuda_driver.CUstream = None,
     sinks_ptr: Optional[cute.Pointer] = None,
     prefetch_group: cutlass.Constexpr[int] = 0,
+    cu_q_ptr: Optional[cute.Pointer] = None,
+    origin_ptrs=None,
+    origin_specs: cutlass.Constexpr = None,
+    n_batch: cutlass.Int32 = 0,
 ) -> None:
     """Combine compact [split, packed token, head, D] partials (B must be 1)."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
@@ -2429,7 +2456,15 @@ def _host_ptr_packed(
     grid = ((problem_size[2] + 3) // 4, problem_size[1], 1)
     # The prepared attention host already specializes on split count. Compile
     # just that reducer; standalone runtime-split callers keep the generic one.
-    _combine_packed_kernel(*args, prefetch_group=prefetch_group).launch(grid=grid, block=[THREADS, 1, 1], stream=stream)
+    cu_q = cute.make_tensor(cu_q_ptr, cute.make_layout((n_batch + 1,), stride=(1,))) if cutlass.const_expr(cu_q_ptr is not None) else None
+    offsets = (
+        tuple(cute.make_tensor(ptr, cute.make_layout((n_batch + 1,), stride=(1,))) if ptr is not None else None for ptr in origin_ptrs)
+        if cutlass.const_expr(origin_ptrs is not None)
+        else None
+    )
+    _combine_packed_kernel(*args, prefetch_group=prefetch_group, cu_q=cu_q, origin_offsets=offsets, origin_specs=origin_specs).launch(
+        grid=grid, block=[THREADS, 1, 1], stream=stream
+    )
 
 
 @cute.jit

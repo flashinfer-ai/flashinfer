@@ -384,6 +384,9 @@ def declare(name, fn):
                 "cache_write_fused",
                 "gate_fused",
                 "paged_kv_page_size",
+                "sparse_tile_form",
+                "sparse_tile",
+                "decode_split_kv",
             )
         }
         log(
@@ -628,11 +631,22 @@ except Exception as exc:  # noqa: BLE001
     traceback.print_exc()
 
 
-def form_decode_qsa(*, fused: bool, tables_only: bool, ring_slots: bool):
+def form_decode_qsa(
+    *,
+    fused: bool,
+    tables_only: bool,
+    ring_slots: bool,
+    batch: int = 4,
+    s_q: int = 4,
+    sparse_tile_form: str = "auto",
+):
     """The in-block indexer's DECODE step over the pools (the Qwen 3.8 Flash-Next decode route): a dense [B, S_q] declaration on a
     ``QsaSpec(index_source="indexer", index_band=True)`` geometry with ``kv_source="paged"`` and the two paged side caches -- the
     compressed-key cache ``[num_pages, P / 4, 1, 128]`` on the MAIN block table and the raw-key ring ``[num_ring_blocks, cap, 1, 128]``
-    behind its own ``[B, 1]`` table -- at S_q 4 (the MTP verify width), the four input-contract arms as the keyword arguments say."""
+    behind its own ``[B, 1]`` table -- at B 4 x S_q 4 (the MTP verify width; the tcgen05 core) by default, the four input-contract arms
+    as the keyword arguments say.  ``batch`` / ``s_q`` (appended) shrink the step to the serving stacks' B 1 cells, where the sparse
+    core's body knob ``sparse_tile_form="auto"`` (the FlashInfer default) resolves the LEAN decode tile on cc 10.7 (``B x H_kv x S_q <= 4``
+    units): the lean kernel module is loaded by path only on that route, so the closure needs a trace of it."""
 
     def make():
         g0 = GatedAttentionBlockGeometry(
@@ -645,8 +659,8 @@ def form_decode_qsa(*, fused: bool, tables_only: bool, ring_slots: bool):
             qsa=QsaSpec(top_k=512, index_source="indexer", index_band=True),
         )
         gen = torch.Generator(device=DEV).manual_seed(4)
-        B, S_Q, CAP, D_I = 4, 4, 8, 128
-        kv_lens_l = [40, 0, 17, 64]
+        B, S_Q, CAP, D_I = int(batch), int(s_q), 8, 128
+        kv_lens_l = [40, 0, 17, 64][:B] if B <= 4 else [40, 0, 17, 64] + [64] * (B - 4)
         L_MAX = 64
         max_pages = (L_MAX + PAGE - 1) // PAGE
         n_pages = sum((L + PAGE - 1) // PAGE for L in kv_lens_l) + 3
@@ -724,6 +738,7 @@ def form_decode_qsa(*, fused: bool, tables_only: bool, ring_slots: bool):
             sample_index_state_block_table=ring_table,
             index_state_slot_mapping_present=ring_slots,
             rope_position_tables_only=tables_only,
+            sparse_tile_form=sparse_tile_form,
         )
         ids_out = torch.full((B, S_Q, 512), -7, dtype=torch.int32, device=DEV)
         lens_out = torch.full((B, S_Q), -7, dtype=torch.int32, device=DEV)
@@ -767,6 +782,15 @@ QSA_FORMS = {
     ),
     "decode_qsa_unfused_pertoken": form_decode_qsa(
         fused=False, tables_only=False, ring_slots=False
+    ),
+    # the serving stacks' B 1 cells (appended at the lean-tile re-vendor): ``sparse_tile_form="auto"`` resolves the LEAN decode tile on cc 10.7
+    # at B 1 x S_q 1 (2 units: the vLLM-shaped step, the fused prepare on the position tables with the ring slots) and at B 1 x S_q 2
+    # (4 units, the bound; the per-token unfused arm) -- the lean kernel module and its shared helper enter the closure through these two
+    "decode_qsa_lean_b1_sq1_fused_tables_slots": form_decode_qsa(
+        fused=True, tables_only=True, ring_slots=True, batch=1, s_q=1
+    ),
+    "decode_qsa_lean_b1_sq2_unfused_pertoken": form_decode_qsa(
+        fused=False, tables_only=False, ring_slots=False, batch=1, s_q=2
     ),
 }
 if args.form == "all":

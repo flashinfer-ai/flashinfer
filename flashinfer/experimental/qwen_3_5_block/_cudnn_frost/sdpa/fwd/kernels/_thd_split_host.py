@@ -46,6 +46,8 @@ def host(
     config: cutlass.Constexpr,
     ragged_q_slots: cutlass.Constexpr[bool],
     gate_slots: cutlass.Constexpr[bool] = False,
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """One prepared host owns setup, split attention and final packed combine.
@@ -97,7 +99,10 @@ def host(
         args += (None, (cutlass.Int64(0),) * 3)
     # `stream` BY KEYWORD: the kernel host's `stream` is its last, defaulted slot; the keyword keeps it there whatever a host appends
     # ahead of it.
-    kernel_host(*args, stream=stream)
+    if cutlass.const_expr(thd_origin_ptrs is not None):
+        kernel_host(*args, thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs, stream=stream)
+    else:
+        kernel_host(*args, stream=stream)
     final_stats_strides = (
         (cutlass.Int64(0), cutlass.Int64(lse_ext), cutlass.Int64(1)) if cutlass.const_expr(lse_kind == "head") else (cutlass.Int64(0), cutlass.Int64(1), heads)
     )
@@ -115,10 +120,16 @@ def host(
         stream,
         sinks_ptr=sinks_ptr if cutlass.const_expr(has_sink) else None,
         prefetch_group=(2 if splits <= 2 else 4 if splits <= 4 else 8 if splits <= 8 else 0),
+        cu_q_ptr=meta_ptr + cutlass.Int64(b) if cutlass.const_expr(thd_origin_ptrs is not None) else None,
+        origin_ptrs=thd_origin_ptrs,
+        origin_specs=thd_origin_specs,
+        n_batch=cutlass.Int32(b),
     )
 
 
-def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kind, paged_hnd, ragged_q_slots, has_sink=False, gate_slots=False):
+def compile_host(
+    kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kind, paged_hnd, ragged_q_slots, has_sink=False, gate_slots=False, thd_origin_specs=None
+):
     """Specialize one common pointer host; extents and strides stay dynamic."""
     if lse_kind not in ("head", "token"):
         raise ValueError("prepared packed split Stats must be head- or token-major")
@@ -161,6 +172,12 @@ def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kin
         (cfg.TILE_K, cfg.TILE_O, cfg.SPLIT_KV, bool(cfg.STATS_LOG2), bool(has_sink)),
         ragged_q_slots,
         gate_slots,
+        thd_origin_ptrs=(
+            tuple(P(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, 8 if spec[3] == 64 else 4) if spec is not None else None for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

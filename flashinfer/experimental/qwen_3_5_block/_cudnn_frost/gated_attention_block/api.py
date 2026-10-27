@@ -919,8 +919,14 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
     return max(split, 2) if gated else split
 
 
-def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, sm_count: int) -> int:
-    """The split-KV the block-sparse DECODE mode lowers with when the declaration leaves ``decode_split_kv=None``: the sparse core
+def sparse_decode_split_choice(
+    *, batch: int, h_kv: int, s_q: int, top_k: int, sm_count: int, tile_form: str = "tcgen05", sub_tiles_per_cta: Optional[int] = None, group: int = 1
+) -> int:
+    """The split-KV the block-sparse DECODE mode lowers with when the declaration leaves ``decode_split_kv=None`` -- on the TCGEN05 core
+    (``tile_form="tcgen05"``, the rule below; the default) or on the LEAN tile (``tile_form="lean"``, appended: the LEAN split
+    ``ceil(n_sub / k)`` of ``heuristics.sparse_lean_splits`` -- 65 at ``top_k`` 512 and k 1 -- where k is ``sub_tiles_per_cta`` when pinned,
+    else the default of ``heuristics.sparse_lean_sub_tiles_per_cta`` (1 today; ``group`` = H_q / H_kv feeds its fill model); the lean
+    tile always splits and the combine reads its slab as a ``split``-way split, the same contract).  The tcgen05 core's rule: the sparse core
     runs ONE work item per (sequence, KV head, query row) -- ``B x H_kv x S_q`` items of at most ``ceil((top_k + 1) / 32)`` 32-row
     tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (the FILL rule, ``ceil(SMs / items)``),
     never more than the item's tile count (a larger split has an empty chunk, a dead work item, on every item -- the adapter's own bound)
@@ -956,6 +962,16 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
 
     A PERFORMANCE choice only (the fp32 partials ride the workspace, the combine is one more launch): the same function under every
     value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]`` (the cap binds the DEFAULT only)."""
+    if tile_form == "lean":
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import lean_sparse_split
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import sparse_lean_sub_tiles_per_cta
+
+        k = (
+            int(sub_tiles_per_cta)
+            if sub_tiles_per_cta is not None
+            else sparse_lean_sub_tiles_per_cta(batch=batch, h_kv=h_kv, s_q=s_q, group=group, top_k=top_k, sm_count=sm_count)
+        )
+        return int(lean_sparse_split(int(top_k), k))
     max_tiles = -(-(int(top_k) + 1) // 32)
     if int(sm_count) <= 0:
         return 1
@@ -988,6 +1004,16 @@ SPARSE_DECODE_SPLIT_ITEM_COST_TILES = (
     # the term that keeps the rule from cutting a 17-tile item into two-tile chunks (T 128: split 9's 2304 chunk-items in 11 waves
     # against split 3's 768 in 4); the gate's A/B of the moved cells against their former split is what refits it
 )
+
+
+def _qsa_shared_list_form(qsa, s_q: int) -> bool:
+    """The block-sparse decode mode's LIST FORM over the pools: ``QsaSpec.index_list_form`` as declared, else derived from the step's rows under
+    caller lists -- ONE list per sequence (the shared step-0 list) at ``s_q <=`` the record's shared-list cap, one per row past it and under the
+    in-block indexer.  The ONE derivation the constructor (:meth:`GatedAttentionBlockFwd._qsa_shared_list_derived`) and the static envelope
+    (:meth:`DecodeEnvelope.sparse_tile`) read, so the two readings of the route cannot drift."""
+    if qsa.index_list_form is not None:
+        return qsa.index_list_form == QSA_INDEX_LIST_FORM_SHARED
+    return qsa.index_source != "indexer" and int(s_q) <= int(_sparse_record().index_shared_list_max_tokens)
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1099,52 @@ class DecodeEnvelope:
     index_state_rows_extra: int = 0
     index_page_sizes: Tuple[int, ...] = ()
     fuse_prepare_default: bool = False
+    # appended (the lean block-sparse decode tile): the sparse core's BODIES this part serves on a QsaSpec geometry, by ``kernel_template``
+    # (``heuristics.SPARSE_TILE_TCGEN05`` everywhere the form is served; ``SPARSE_TILE_LEAN`` too on cc 10.7, the lean tile's one part), and
+    # the AUTO pin's reading on this part (``heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7 since the gate measured the lean route, so
+    # ``sparse_tile_form="auto"`` follows the placement rule there and resolves the tcgen05 core on every other part; the explicit ``"lean"``
+    # is served where the body admits the declaration).  The per-CELL reading is :meth:`sparse_tile` (the route reads B x S_q, which a
+    # static envelope cannot carry in one field).
+    sparse_tiles: Tuple[str, ...] = ()
+    sparse_tile_lean_default: bool = False
+    device_cc: Optional[Tuple[int, int]] = dataclasses.field(default=None, compare=False)  # the part :meth:`sparse_tile` reads the AUTO pin and the rule on
+
+    def sparse_tile(
+        self, s_q: int, batch: int, *, sparse_tile_form: str = "auto", decode_split_kv: Optional[int] = None, kv_cache_dtype: Optional[torch.dtype] = None
+    ) -> Optional[str]:
+        """The sparse core's body (its ``kernel_template``) a ``[batch, s_q]`` block-sparse decode step at this geometry takes on this part
+        under ``sparse_tile_form`` (``"auto"`` = the AUTO pin + the placement rule + the admissibility, with a pinned ``decode_split_kv`` kept
+        on the body that honours it; ``"lean"`` / ``"tcgen05"`` as named where the body admits the step, else None = a typed decline at
+        declaration); None off a QsaSpec geometry.  ``kv_cache_dtype`` (appended) is the POOLS' dtype the step is declared over (None = the
+        activations' bf16 / f16): over e4m3 pools stage (4) is the gathered cast + the dense decode tile, NO body of the sparse core, so every
+        form reads None there (the constructor declines an explicit body by name).  The same arithmetic the constructor runs (one copy:
+        ``heuristics``, the list form through :func:`_qsa_shared_list_form`), so a serving stack's dispatch predicate reads the route instead
+        of catching the block's exceptions."""
+        if not self.sparse_core or self._geometry is None or not self.served:
+            return None
+        if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            return None  # e4m3 pools: the gathered cast + the dense decode tile run, no body of the sparse core
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+
+        g = self._geometry
+        q = g.qsa
+        shared = _qsa_shared_list_form(q, int(s_q))
+        reason = _H.sparse_lean_tile_decline(
+            s_q=int(s_q), group=g.gqa_ratio, top_k=q.top_k, thd=False, bottom_right=True, list_per_sequence=shared, seq_kv_lens_present=True
+        )
+        if sparse_tile_form == _H.SPARSE_TILE_FORM_AUTO:
+            form = _H.sparse_tile_form_auto(
+                batch=int(batch), h_kv=g.h_kv, s_q=int(s_q), top_k=q.top_k, device_cc=self.device_cc, admissible=reason is None, split_pinned=decode_split_kv
+            )
+        elif sparse_tile_form == _H.SPARSE_TILE_FORM_LEAN:
+            if reason is not None or (decode_split_kv is not None and int(decode_split_kv) not in _H.sparse_lean_splits(q.top_k)):
+                return None
+            form = _H.SPARSE_TILE_FORM_LEAN
+        else:
+            form = _H.SPARSE_TILE_FORM_TCGEN05
+        if form == _H.SPARSE_TILE_FORM_TCGEN05 and decode_split_kv is not None and not 1 <= int(decode_split_kv) <= _H.sparse_tcgen05_max_split(q.top_k):
+            return None  # the core's split bound [1, ceil((top_k + 1) / 32)]: outside it the declaration is rejected, so no body is read
+        return _H.SPARSE_TILE_LEAN if form == _H.SPARSE_TILE_FORM_LEAN else _H.SPARSE_TILE_TCGEN05
 
 
 @dataclass(frozen=True)
@@ -5425,7 +5497,7 @@ class _SparseSdpa(_Stage):
     on the host (the setup launch normalizes them on device).  ``block_ids`` keeps its ``[T, top_k]`` form with every id
     RELATIVE TO ITS SEQUENCE (block ``j`` of sequence ``b`` = its tokens ``[4j, 4j + 4)``); the LSE is the head-major packed
     ``[1, H_q, T]`` the block already carries at ``B = 1``.  The ONE scratch the arm needs -- the adapter's int32 THD
-    metadata (``THD_META_WORDS(B)``, 16-byte rounded) -- enters the block's engine arm through
+    metadata (``THD_WORK_META_WORDS(B)``, 16-byte rounded) -- enters the block's engine arm through
     :meth:`scratch_workspace_bytes` and is handed back at ``execute(workspace=)``.  A one-sequence packing computes the
     dense ``B = 1`` function bitwise; an empty sequence owns no rows.
 
@@ -5495,9 +5567,17 @@ class _SparseSdpa(_Stage):
         # and the split combine's pair (SparseGqaFwdDslSm107(use_pdl=True)); the block's resolved switch; THD x use_pdl is the adapter's typed
         # decline (the block declines it at declaration first, carrying the adapter's one statement of the fact, `pdl_decline_reason`).
         use_pdl: bool = False,
+        # APPENDED (the lean block-sparse decode tile): the adapter's BODY knob -- the block passes its RESOLVED form ("lean" / "tcgen05":
+        # one decision point, the declaration; "auto" lets the adapter resolve, the standalone callers' reading) and the lean body's k pin;
+        # `kernel_template` reads the compiled body back and `check_support` pins it against the form the block resolved (a route is pinned
+        # by the kernel that compiled, never transcribed).
+        tile_form: str = "auto",
+        sub_tiles_per_cta: Optional[int] = None,
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
+        self.tile_form, self.sub_tiles_per_cta = tile_form, sub_tiles_per_cta
+        self.kernel_template: Optional[str] = None  # the adapter's readback after check_support
         self.use_pdl = bool(use_pdl)  # read back by the block's pdl_stages / use_pdl_effective like every switched stage's
         self.geom = geometry
         self.batch = int(batch)
@@ -5681,8 +5761,20 @@ class _SparseSdpa(_Stage):
             split_kv=self.split_kv,
             # the programmatic-dependent-launch form of the core and its combine (the block's resolved switch; the adapter declines THD x PDL)
             use_pdl=self.use_pdl,
+            # the BODY: the block's resolved form (or "auto" for a standalone reading) and the lean tile's k pin
+            tile_form=self.tile_form,
+            sub_tiles_per_cta=self.sub_tiles_per_cta,
         )
         self._impl.check_support()
+        # the route PINNED by the kernel that will compile (a route is pinned, never transcribed): the adapter's resolved body must be the one the block declared
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO
+
+        if self.tile_form != SPARSE_TILE_FORM_AUTO and self._impl.tile_form != self.tile_form:
+            raise RuntimeError(
+                f"{self.name}: the block resolved sparse_tile_form={self.tile_form!r} but the adapter compiled {self._impl.tile_form!r} (kernel_template "
+                f"{self._impl.kernel_template}); the two readings of the route disagree -- a bug, not a decline"
+            )
+        self.kernel_template = self._impl.kernel_template
 
     def compile(self) -> None:
         if self._impl is None:
@@ -5695,7 +5787,7 @@ class _SparseSdpa(_Stage):
 
     def scratch_workspace_bytes(self) -> int:
         """The adapter's ``scratch_workspace_bytes``: 0 on a dense declaration (the kernel has no GMEM scratch), the int32
-        THD metadata (``THD_META_WORDS(B)`` words, 16-byte rounded) under ``thd=True``; folded into the block's workspace
+        THD metadata (``THD_WORK_META_WORDS(B)`` words, 16-byte rounded) under ``thd=True``; folded into the block's workspace
         like the dense stage's so the size stays honest either way."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
@@ -8315,6 +8407,26 @@ class GatedAttentionBlockFwd(APIBase):
         index_state_slot_mapping_present: bool = False,
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
+        # APPENDED (the lean block-sparse decode tile; performance-only, the block-sparse stage's knob): WHICH BODY of the index-list sparse
+        # core serves stage (4) on a QsaSpec geometry -- "auto" (the default): the placement rule (cc 10.7, B x H_kv x S_q <= 4 units, the
+        # lean body admissible) on the parts of heuristics.SPARSE_LEAN_TILE_DEFAULT_CCS (cc 10.7 since the end-to-end gate measured the lean
+        # route; the bound LEAN_SPARSE_MAX_UNITS = 4 units refit from its table), the tcgen05 core everywhere else; "lean": the lean decode
+        # tile (mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA / CLC; the DECODE mode over the pools at S_q <= 4 under the
+        # shared list -- one list per sequence, every row of the step in one CTA -- or the per-row list at one row per sequence, bf16 /
+        # f16, G <= 16, top_k >= 8; it ALWAYS splits: decode_split_kv None =
+        # the lean split of the default k, or one of heuristics.sparse_lean_splits(top_k), which SELECTS k), a typed decline naming the arm
+        # elsewhere -- never a silent fallback; "tcgen05": the tcgen05 core as before.  The same O / LSE under either body within the
+        # fixed-order-sum budget (never bitwise ACROSS the bodies; bitwise WITHIN each: two launches, replay == eager, paged == dense).  A
+        # pinned decode_split_kv that is not a lean split keeps "auto" on the tcgen05 core (the pin is the stronger knob; the resolved form
+        # reads back).  `sparse_tile_form_requested` keeps the declaration, `sparse_tile_form` the resolved body, `sparse_tile` its
+        # kernel_template (pinned against the compiled kernel at check_support); the envelope's `decode.sparse_tiles` / `.sparse_tile(...)`
+        # / `.sparse_tile_lean_default` say so before anything is declared.  Refused (ValueError) off a QsaSpec geometry unless "auto".
+        sparse_tile_form: str = "auto",
+        # APPENDED: the lean body's k -- its 32-key sub-tiles per CTA (1 .. min(8, n_sub - 1); the split is ceil(n_sub / k)): None = the default
+        # (heuristics.sparse_lean_sub_tiles_per_cta: 1 today, the k >= 2 renderings a measured lever), an int with sparse_tile_form="lean" only
+        # (a lean-only pin: refused by name under "auto" and "tcgen05" so it is never silently ignored); with a pinned decode_split_kv the two
+        # must agree.  Performance-only: the same function under every k.
+        sparse_sub_tiles_per_cta: Optional[int] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -8324,6 +8436,10 @@ class GatedAttentionBlockFwd(APIBase):
         self.geom = geometry
         self.dtype = sample_h.dtype
         self.device = sample_h.device
+        # THE SPARSE TILE FORM (the constructor's note): the vocabulary and the k pin's shape here, device-free; the body is RESOLVED once the
+        # form is known (`_check_serving_declaration` on the block-sparse decode mode, `_resolve_sparse_tile_form_off_decode` on the dense /
+        # packed QsaSpec forms) -- `sparse_tile_form_requested` keeps the declaration, `sparse_tile_form` / `sparse_tile` the resolution.
+        self._check_sparse_tile_form_declaration(sparse_tile_form, sparse_sub_tiles_per_cta, geometry)
         # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- pools in the activation dtype
         # (`kv_cache_dtype` None or that dtype: the same block) -- because the quantized pipelines' quantize stages and the e4m3 write-through
         # carry no griddepcontrol sites yet, so neither of those chains overlaps at its attention link and the switch is a typed decline there
@@ -8587,7 +8703,11 @@ class GatedAttentionBlockFwd(APIBase):
             decode_split_kv,
             decode_route_policy=decode_route_policy,
             decode_q_tile_max=decode_q_tile_max,
+            sparse_tile_form=sparse_tile_form,
+            sparse_sub_tiles_per_cta=sparse_sub_tiles_per_cta,
         )
+        # the dense / packed QsaSpec forms (kv_source="self"): the tcgen05 core; an explicit "lean" there is the lean body's own decline
+        self._resolve_sparse_tile_form_off_decode()
         if self.kv_source == KV_SOURCE_PAGED and not self.thd:
             # The DECODE form: over the pools the per-sequence KV length (kv_lens) is mandatory, so the declaration reads
             # seq_lens_present=True whatever was passed (the dense padding mask it names IS the per-sequence KV length -- bound to
@@ -8642,11 +8762,7 @@ class GatedAttentionBlockFwd(APIBase):
         # the indexer CACHE dtype over the pools (QsaSpec.index_cache_dtype; None = the activation dtype): the compressed-key cache sample / tensor
         # and the ix_q slot are in it (e4m3 = the e4m3 indexer cache, served 2026-10-21); the ring stays the activation dtype
         self.index_cache_dtype = (self.qsa.index_cache_dtype if self.qsa.index_cache_dtype is not None else self.act_dtype) if self.indexer_decode else None
-        list_form = self.qsa.index_list_form if self.qsa is not None else None
-        self.qsa_shared_list = self.sparse_decode and (
-            list_form == QSA_INDEX_LIST_FORM_SHARED
-            or (list_form is None and not self.indexer_decode and self.seq_len <= _sparse_record().index_shared_list_max_tokens)
-        )
+        self.qsa_shared_list = self.sparse_decode and self._qsa_shared_list_derived()
         self.qsa_list_form = (QSA_INDEX_LIST_FORM_SHARED if self.qsa_shared_list else QSA_INDEX_LIST_FORM_PER_ROW) if self.sparse_decode else None
         # The e4m3 KV cache OVER THE POOLS: stage (4) is the gathered cast + the dense decode tile (the block-sparse decode mode at
         # S_q <= 4 only); every other paged form over e4m3 pools, the LSE and a split are typed declines, and the mode norms +
@@ -8884,6 +9000,9 @@ class GatedAttentionBlockFwd(APIBase):
                 split_kv=self.decode_split_kv if self.sparse_decode else 1,
                 # the switch reaches the sparse core and its combine on every arm the adapter serves it on (THD declined above by name)
                 use_pdl=self.use_pdl,
+                # the BODY the declaration resolved (never "auto" here: one decision point) and the lean tile's k pin
+                tile_form=self.sparse_tile_form,
+                sub_tiles_per_cta=self.sparse_sub_tiles_per_cta,
             )
         else:
             # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
@@ -9602,6 +9721,74 @@ class GatedAttentionBlockFwd(APIBase):
             )
         return page_size
 
+    def _check_sparse_tile_form_declaration(self, sparse_tile_form, sparse_sub_tiles_per_cta, geometry) -> None:
+        """The two knobs' argument contract at declaration (device-free): ``sparse_tile_form`` one of the heuristics' vocabulary
+        (``"auto"`` / ``"lean"`` / ``"tcgen05"``), ``sparse_sub_tiles_per_cta`` None or an int >= 1 and ONLY with the explicit ``"lean"`` (a
+        lean-only pin is never silently ignored); off a QsaSpec geometry only ``"auto"`` and no pin (the knobs are the block-sparse stage's).
+        Records the declaration; the resolution follows once the form is known."""
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics import SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORMS
+
+        if not isinstance(sparse_tile_form, str) or sparse_tile_form not in SPARSE_TILE_FORMS:
+            raise ValueError(
+                f"sparse_tile_form must be one of {SPARSE_TILE_FORMS} ('auto' = the placement rule on the measured parts, the tcgen05 core elsewhere; "
+                f"'lean' / 'tcgen05' explicit), got {sparse_tile_form!r}"
+            )
+        k = sparse_sub_tiles_per_cta
+        if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 1):
+            raise ValueError(f"sparse_sub_tiles_per_cta must be None (the default k) or an int >= 1 (the lean tile's 32-key sub-tiles per CTA), got {k!r}")
+        if geometry.qsa is None:
+            if sparse_tile_form != SPARSE_TILE_FORM_AUTO or k is not None:
+                raise ValueError(
+                    f"sparse_tile_form={sparse_tile_form!r} / sparse_sub_tiles_per_cta={k!r} are the block-sparse stage's knobs (a QsaSpec geometry); this "
+                    "geometry declares no QsaSpec, so stage (4) is the dense SDPA -- leave both at their defaults"
+                )
+        if k is not None and sparse_tile_form != SPARSE_TILE_FORM_LEAN:
+            raise ValueError(
+                f"sparse_sub_tiles_per_cta={k} is the lean tile's pin (its sub-tiles per CTA) and needs sparse_tile_form='lean'; under "
+                f"{sparse_tile_form!r} the pin would be ignored where the route resolves the tcgen05 core -- declare 'lean' to force the body"
+            )
+        self.sparse_tile_form_requested: str = sparse_tile_form
+        self.sparse_sub_tiles_per_cta_requested: Optional[int] = k
+        # the RESOLVED body of a QsaSpec block ("lean" / "tcgen05") and its kernel_template (heuristics.SPARSE_TILE_LEAN / SPARSE_TILE_TCGEN05):
+        # None off QsaSpec and over e4m3 pools, where NO body of the sparse core runs (the gathered cast + the dense decode tile)
+        self.sparse_tile_form: Optional[str] = None
+        self.sparse_sub_tiles_per_cta: Optional[int] = None  # the lean body's k; None otherwise
+        self.sparse_tile: Optional[str] = None
+
+    def _resolve_sparse_tile_form_off_decode(self) -> None:
+        """The body of a QsaSpec block OFF the block-sparse decode mode (the dense ``[B, S]`` and the packed forms over the block's own K / V):
+        the tcgen05 core -- the lean tile serves the DECODE form only, so ``"auto"`` and ``"tcgen05"`` resolve to it and an explicit ``"lean"``
+        hears the lean body's own decline (``heuristics.sparse_lean_tile_decline``: THD, or the top-left prefill form).  The decode mode
+        resolved its body in ``_check_serving_declaration`` (``sparse_tile_form`` set -- or, over e4m3 pools, settled that NO body runs:
+        ``sparse_tile_form`` None, so the paged form never comes here); a dense geometry has no body."""
+        if self.qsa is None or self.sparse_tile_form is not None or self.kv_source == KV_SOURCE_PAGED:
+            return
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+
+        if self.sparse_tile_form_requested == _H.SPARSE_TILE_FORM_LEAN:
+            reason = _H.sparse_lean_tile_decline(
+                s_q=self.seq_len,
+                group=self.geom.gqa_ratio,
+                top_k=self.qsa.top_k,
+                thd=self.thd,
+                bottom_right=False,
+                list_per_sequence=False,
+                seq_kv_lens_present=self.seq_lens_present,
+            )
+            raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
+        self.sparse_tile_form = _H.SPARSE_TILE_FORM_TCGEN05
+        self.sparse_tile = _H.SPARSE_TILE_TCGEN05
+
+    def _qsa_shared_list_derived(self, kv_source: Optional[str] = None) -> bool:
+        """The block-sparse decode mode's LIST FORM as a declaration fact (``QsaSpec.index_list_form`` as declared, or derived from ``S_q``
+        under caller lists: ONE list per sequence at ``S_q <= `` the record's shared-list cap, one per row past it and under the in-block
+        indexer) -- ONE derivation (:func:`_qsa_shared_list_form`, the static envelope's too) for the serving declaration (the body's
+        admissibility; ``kv_source`` as given there, before the attribute exists) and the stage's ``list_per_sequence``."""
+        q = self.qsa
+        if q is None or (self.kv_source if kv_source is None else kv_source) != KV_SOURCE_PAGED:
+            return False
+        return _qsa_shared_list_form(q, self.seq_len)
+
     def _pdl_default(self, quant) -> bool:
         """The AUTO reading of ``use_pdl`` (None): True iff this is the dense DECODE form on a decode-tile route (``DecodeRoute.pdl_capable``:
         the tile and its split combine carry the griddepcontrol pair), the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``) and
@@ -10125,6 +10312,8 @@ class GatedAttentionBlockFwd(APIBase):
         decode_split_kv=None,
         decode_route_policy=None,
         decode_q_tile_max=None,
+        sparse_tile_form="auto",
+        sparse_sub_tiles_per_cta=None,
     ):
         """``kv_source`` / ``token_capacity`` at declaration -- the argument contract first (``kv_source`` one of
         :data:`_KV_SOURCES`; ``token_capacity`` None or a positive int equal to the samples' packed row count), then the
@@ -10254,17 +10443,107 @@ class GatedAttentionBlockFwd(APIBase):
                     f"slice of a wider table is not a view it can take -- declare the block on the table it will read), got strides {tuple(bt.stride())}"
                 )
             max_tiles = -(-(self.qsa.top_k + 1) // 32)
-            if decode_split_kv is None:
-                dev = torch.device(device)
-                sm = torch.cuda.get_device_properties(dev).multi_processor_count if (dev.type == "cuda" and torch.cuda.is_available()) else 0
-                split = sparse_decode_split_choice(batch=self.batch, h_kv=g.h_kv, s_q=self.seq_len, top_k=self.qsa.top_k, sm_count=sm)
-            else:
-                split = int(decode_split_kv)
-                if split > max_tiles:
+            dev = torch.device(device)
+            sm = torch.cuda.get_device_properties(dev).multi_processor_count if (dev.type == "cuda" and torch.cuda.is_available()) else 0
+            # THE BODY of the sparse core (the constructor's note on `sparse_tile_form`): resolved HERE, before the split, because the split
+            # is the body's -- the lean tile's splits SELECT its k.  The admissibility and the placement rule are the heuristics' (one copy;
+            # the adapter runs the same functions at check_support and `_SparseSdpa` pins its readback against this resolution).
+            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+
+            top_k = self.qsa.top_k
+            reason = _H.sparse_lean_tile_decline(
+                s_q=self.seq_len,
+                group=g.gqa_ratio,
+                top_k=top_k,
+                thd=False,
+                bottom_right=True,
+                list_per_sequence=self._qsa_shared_list_derived(kv_source),
+                seq_kv_lens_present=True,
+                # the POOLS' dtype, not the activations' alone: over e4m3 pools no half body runs (`kv_cache_e4m3` is settled above)
+                half_dtype=self.dtype in (torch.bfloat16, torch.float16) and not self.kv_cache_e4m3,
+            )
+            if self.kv_cache_e4m3:
+                # THE e4m3 POOLS (kv_cache_dtype): stage (4) is the gathered cast + the DENSE decode tile over the scratch (`upcast_decode`),
+                # NO body of the sparse core -- the body knob has nothing to honour: an explicit body is a typed decline naming the arm (the
+                # lean body's own e4m3 text; the core's named here), never the readback of a kernel that does not run, and "auto" reads back
+                # NO body (`sparse_tile_form` / `sparse_tile` None); the split below is the core's rule, which the e4m3 serving then settles
+                # unsplit (`_check_kv_cache_dtype_serving`).
+                if sparse_tile_form == _H.SPARSE_TILE_FORM_LEAN:
+                    raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
+                if sparse_tile_form == _H.SPARSE_TILE_FORM_TCGEN05:
                     raise NotImplementedError(
-                        f"decode_split_kv={split} exceeds the sparse core's item tile count ceil((top_k + 1) / 32) = {max_tiles} at top_k={self.qsa.top_k}: a larger "
-                        "split has an empty chunk (a dead work item) on every item -- pass a split in [1, that count], or None for the fill rule"
+                        f"sparse_tile_form='tcgen05' over e4m3 pools (kv_cache_dtype={KV_CACHE_E4M3}): the block-sparse decode mode over e4m3 pools runs "
+                        "the gathered cast + the dense decode tile, no body of the sparse core -- leave sparse_tile_form='auto' (sparse_tile reads None there)"
                     )
+                form = None
+            elif sparse_tile_form == _H.SPARSE_TILE_FORM_AUTO:
+                form = _H.sparse_tile_form_auto(
+                    batch=self.batch,
+                    h_kv=g.h_kv,
+                    s_q=self.seq_len,
+                    top_k=top_k,
+                    device_cc=_device_cc_of(device),
+                    admissible=reason is None,
+                    split_pinned=decode_split_kv,
+                )
+            else:
+                form = sparse_tile_form
+            if form == _H.SPARSE_TILE_FORM_LEAN:
+                if reason is not None:
+                    raise NotImplementedError(f"sparse_tile_form='lean' -- {reason}")
+                from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import lean_sparse_n_sub, lean_sparse_split
+
+                n_sub, splits, k_max = lean_sparse_n_sub(top_k), _H.sparse_lean_splits(top_k), _H.sparse_lean_max_sub_tiles_per_cta(top_k)
+                if decode_split_kv is None:
+                    k = (
+                        int(sparse_sub_tiles_per_cta)
+                        if sparse_sub_tiles_per_cta is not None
+                        else _H.sparse_lean_sub_tiles_per_cta(batch=self.batch, h_kv=g.h_kv, s_q=self.seq_len, group=g.gqa_ratio, top_k=top_k, sm_count=sm)
+                    )
+                else:
+                    if int(decode_split_kv) not in splits:
+                        raise NotImplementedError(
+                            f"decode_split_kv={decode_split_kv} with sparse_tile_form='lean': the lean tile's splits at top_k {top_k} are {splits} (ceil(n_sub / k) "
+                            f"at n_sub = {n_sub}; the split SELECTS k, the sub-tiles per CTA) -- pin one of them, or None for the default k; a split of 1 is the "
+                            "tcgen05 core's (the lean tile always splits), as is any other value (sparse_tile_form='tcgen05' / 'auto')"
+                        )
+                    # the explicit k is THE k when given (the adapter's rule: ceil(n_sub / split) is not its inverse); the split must be ITS lean split
+                    k = int(sparse_sub_tiles_per_cta) if sparse_sub_tiles_per_cta is not None else -(-n_sub // int(decode_split_kv))
+                    if sparse_sub_tiles_per_cta is not None and lean_sparse_split(top_k, k) != int(decode_split_kv):
+                        raise ValueError(
+                            f"sparse_sub_tiles_per_cta={k} and decode_split_kv={decode_split_kv} disagree: the lean split of k {k} at top_k {top_k} is "
+                            f"ceil({n_sub} / {k}) = {lean_sparse_split(top_k, k)} -- pin one of the two"
+                        )
+                if not 1 <= k <= k_max:
+                    raise NotImplementedError(
+                        f"sparse_sub_tiles_per_cta={k} must be in [1, {k_max}] at top_k {top_k} (n_sub {n_sub}: the lean tile's sub-tile loop is unrolled at trace "
+                        "time, and k = n_sub would be one chunk = split 1 -- the lean tile always splits)"
+                    )
+                # the lean split ceil(n_sub / k) at this k through the ONE function the test pins too (never a second spelling here)
+                split = sparse_decode_split_choice(
+                    batch=self.batch,
+                    h_kv=g.h_kv,
+                    s_q=self.seq_len,
+                    top_k=top_k,
+                    sm_count=sm,
+                    tile_form=_H.SPARSE_TILE_FORM_LEAN,
+                    sub_tiles_per_cta=k,
+                    group=g.gqa_ratio,
+                )
+                self.sparse_sub_tiles_per_cta = k
+            else:
+                if decode_split_kv is None:
+                    split = sparse_decode_split_choice(batch=self.batch, h_kv=g.h_kv, s_q=self.seq_len, top_k=top_k, sm_count=sm)
+                else:
+                    split = int(decode_split_kv)
+                    if split > max_tiles:
+                        raise NotImplementedError(
+                            f"decode_split_kv={split} exceeds the sparse core's item tile count ceil((top_k + 1) / 32) = {max_tiles} at top_k={top_k}: a larger "
+                            "split has an empty chunk (a dead work item) on every item -- pass a split in [1, that count], or None for the fill rule"
+                        )
+                self.sparse_sub_tiles_per_cta = None
+            self.sparse_tile_form = form
+            self.sparse_tile = None if form is None else (_H.SPARSE_TILE_LEAN if form == _H.SPARSE_TILE_FORM_LEAN else _H.SPARSE_TILE_TCGEN05)
             return kv_source, token_capacity, None, int(max_kv_len), split
         route = decode_route(g, self.seq_len, policy=self.decode_route_policy, max_q_tile=self.decode_q_tile_max, batch=self.batch)
         if not route.served:
@@ -10410,6 +10689,7 @@ class GatedAttentionBlockFwd(APIBase):
             index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
             index_list_form_default=(QSA_INDEX_LIST_FORM_PER_ROW if indexer else QSA_INDEX_LIST_FORM_SHARED) if sparse else "",
             **cls._indexer_envelope_fields(geometry, dtype, cc, decode_reason is None),
+            **cls._sparse_tile_envelope_fields(sparse and decode_reason is None, cc),
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -10420,6 +10700,19 @@ class GatedAttentionBlockFwd(APIBase):
             extend=extend,
             decode=decode,
         )
+
+    @staticmethod
+    def _sparse_tile_envelope_fields(sparse_served: bool, cc) -> dict:
+        """The lean tile's rows of :class:`DecodeEnvelope` for a SERVED block-sparse decode form: the bodies this part serves by
+        ``kernel_template`` (the tcgen05 core everywhere; the lean tile on cc 10.7, its one part -- ``heuristics._SPARSE_LEAN_TILE_RULE_CC``),
+        the AUTO pin's reading on this part (``SPARSE_LEAN_TILE_DEFAULT_CCS``: cc 10.7, the measured part) and the part itself for the per-cell
+        :meth:`DecodeEnvelope.sparse_tile`; empty off the sparse form."""
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _H
+
+        if not sparse_served:
+            return dict(sparse_tiles=(), sparse_tile_lean_default=False, device_cc=cc)
+        tiles = (_H.SPARSE_TILE_TCGEN05,) + ((_H.SPARSE_TILE_LEAN,) if cc is not None and tuple(cc)[:2] == _H._SPARSE_LEAN_TILE_RULE_CC else ())
+        return dict(sparse_tiles=tiles, sparse_tile_lean_default=bool(cc is not None and tuple(cc)[:2] in _H.SPARSE_LEAN_TILE_DEFAULT_CCS), device_cc=cc)
 
     @staticmethod
     def _indexer_envelope_fields(geometry: GatedAttentionBlockGeometry, dtype: torch.dtype, cc, decode_served: bool) -> dict:

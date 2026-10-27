@@ -91,6 +91,18 @@ DECLINE_KEYS: Tuple[str, ...] = (
     "fuse_prepare_rope_tables_unfused",
 )
 INDEX_LIST_FORMS: Tuple[Optional[str], ...] = (None, "per_row", "shared")
+# The sparse core's BODY knob, mirrored from the vendored tree (``sdpa.fwd.heuristics``: the ``tile_form`` vocabulary, the two bodies'
+# ``kernel_template`` names, the AUTO placement bound) and re-read against it by :func:`check_vendored_rules`.  The block-sparse decode
+# step on cc 10.7 has two bodies: the tcgen05 core (``sparse_d256_f16``) and, since the 7301fad21 pin, the LEAN decode tile
+# (``sparse_lean_d256_f16``: ``mma.sync`` + ``cp.async``, 128 threads per m16 tile, no TMEM / TMA / cluster).  ``"auto"`` (this entry's
+# default) takes the lean tile on cc 10.7 inside ``batch x H_kv x q_len <= SPARSE_TILE_LEAN_MAX_UNITS`` units where the body admits the
+# step (under the in-block indexer the per-row list is served at ``q_len_per_req == 1`` only) and the tcgen05 core everywhere else; a
+# performance-only knob: the same function under either body within the tree's fixed-order-sum budget, never bitwise across the bodies.
+SPARSE_TILE_FORM_AUTO = "auto"
+SPARSE_TILE_FORMS: Tuple[str, ...] = ("auto", "lean", "tcgen05")
+SPARSE_TILE_TCGEN05 = "sparse_d256_f16"  # the tcgen05 core's kernel_template (the readback of ``plan.sparse_tile`` on that body)
+SPARSE_TILE_LEAN = "sparse_lean_d256_f16"  # the lean decode tile's kernel_template
+SPARSE_TILE_LEAN_MAX_UNITS = 4  # the AUTO placement bound on cc 10.7: ``batch x H_kv x q_len`` units (B <= 2 at q_len 1 on two KV heads)
 _FOLLOW_UP = (
     "the Qwen 3.8 block serves the DECODE form only: the prefill / extend forms of the in-block indexer (the prompt's compressed keys "
     "written into the paged cache, the ring primed from the prompt) are a later cuDNN Frontend PR's and will be vendored then"
@@ -442,6 +454,11 @@ class Qwen38BlockSupport:
     index_page_sizes: Tuple[int, ...] = ()
     fuse_prepare_default: bool = False
     pdl_default: bool = False
+    # appended (the lean decode tile): the sparse core's bodies this part serves by ``kernel_template`` (the tcgen05 core everywhere the form
+    # is served; the lean tile too on cc 10.7) and whether ``sparse_tile_form="auto"`` consults the lean placement rule on this part
+    # (``True`` on cc 10.7: the measured part); the per-cell reading (which body a ``[batch, q_len]`` step takes) is :func:`sparse_tile`
+    sparse_tiles: Tuple[str, ...] = ()
+    sparse_tile_lean_default: bool = False
 
     def form(self, name: str) -> Qwen38BlockFormSupport:
         if name not in ALL_FORMS:
@@ -503,6 +520,48 @@ def _frost_decode_table(
         index_page_sizes=tuple(int(x) for x in d.index_page_sizes),
         fuse_prepare_default=bool(d.fuse_prepare_default),
         pdl_default=bool(d.pdl_default),
+        sparse_tiles=tuple(str(x) for x in d.sparse_tiles),
+        sparse_tile_lean_default=bool(d.sparse_tile_lean_default),
+    )
+
+
+def sparse_tile(
+    device,
+    geometry: Qwen38BlockGeometry,
+    *,
+    batch_size: int,
+    q_len_per_req: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    decode_split_kv: Optional[int] = None,
+    kv_cache_dtype: Optional[torch.dtype] = None,
+    device_cc_override: Optional[Tuple[int, int]] = None,
+) -> Optional[str]:
+    """Which BODY of the sparse core a ``[batch_size, q_len_per_req]`` decode step at ``geometry`` takes on ``device`` under
+    ``sparse_tile_form`` -- :data:`SPARSE_TILE_LEAN` / :data:`SPARSE_TILE_TCGEN05` (the ``kernel_template`` ``plan.sparse_tile`` reads
+    back), or ``None`` where no body of the sparse core runs (e4m3 pools) or where the explicit body does not admit the step (the plan
+    is then the typed decline).  READ off the vendored envelope's own per-cell rule (``DecodeEnvelope.sparse_tile``: one copy of the
+    placement arithmetic, never re-spelled here); imports the vendored tree.  ``device_cc_override`` (appended) stands in for the
+    device's compute capability for a device-free reading (the host tests ask the cc 10.7 rule from a CPU host)."""
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        GatedAttentionBlockFwd,
+    )
+
+    if sparse_tile_form not in SPARSE_TILE_FORMS:
+        raise ValueError(
+            f"sparse_tile_form must be one of {SPARSE_TILE_FORMS}, got {sparse_tile_form!r}"
+        )
+    check_vendored_rules()
+    cc = device_cc_override if device_cc_override is not None else device_cc(device)
+    env = GatedAttentionBlockFwd.serving_envelope(
+        geometry.frost(), dtype, torch.device(device), device_cc=cc
+    )
+    return env.decode.sparse_tile(
+        int(q_len_per_req),
+        int(batch_size),
+        sparse_tile_form=sparse_tile_form,
+        decode_split_kv=decode_split_kv,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -562,6 +621,8 @@ def qwen_3_8_block_support(
             "index_page_sizes",
             "fuse_prepare_default",
             "pdl_default",
+            "sparse_tiles",
+            "sparse_tile_lean_default",
         )
         if k in table
     }
@@ -592,7 +653,9 @@ def check_vendored_rules() -> Dict[str, Any]:
     (``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
     ``index_state_rows_extra``, ``index_page_sizes``), the scorer's row rule as BEHAVIOUR (``validate_params`` over q_len 1 .. 20 at
     4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``), the projection route's verdicts
-    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it) and, behaviourally, every
+    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it), the sparse core's body knob (the ``tile_form`` vocabulary,
+    the two bodies' ``kernel_template`` names, the AUTO placement bound and the envelope's cc 10.7 reading: both bodies served, the lean
+    rule consulted) and, behaviourally, every
     decline key the README's Errors table names present in ``decode.declines``.  Once per process (the probe's vendored read,
     ``api.prepare``); returns the tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
@@ -604,6 +667,7 @@ def check_vendored_rules() -> Dict[str, Any]:
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block.kernels import (
         proj_gemm,
     )
+    from ..qwen_3_5_block._cudnn_frost.sdpa.fwd import heuristics as _heuristics
 
     _s35.check_vendored_rules()
     g = Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
@@ -619,6 +683,16 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": int(env.index_state_rows_extra),
         "index_page_sizes": tuple(int(x) for x in env.index_page_sizes),
         "decode_capture_rows_max": int(proj_gemm.SMALL_M_MAX),
+        # the sparse core's body knob (the lean decode tile): the vocabulary, the two bodies' kernel_template names, the AUTO placement
+        # bound, and the envelope's reading of the cc 10.7 part (both bodies served, the AUTO pin consulting the lean rule there)
+        "sparse_tile_forms": tuple(_heuristics.SPARSE_TILE_FORMS),
+        "sparse_tile_names": (
+            str(_heuristics.SPARSE_TILE_TCGEN05),
+            str(_heuristics.SPARSE_TILE_LEAN),
+        ),
+        "sparse_tile_lean_max_units": int(_heuristics.LEAN_SPARSE_MAX_UNITS),
+        "sparse_tiles_cc107": tuple(str(x) for x in env.sparse_tiles),
+        "sparse_tile_lean_default_cc107": bool(env.sparse_tile_lean_default),
     }
     mirrored: Dict[str, Any] = {
         "index_head_dims": (INDEX_HEAD_DIM,),
@@ -629,6 +703,11 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": INDEX_STATE_ROWS_EXTRA,
         "index_page_sizes": INDEX_PAGE_SIZES,
         "decode_capture_rows_max": DECODE_CAPTURE_ROWS_MAX,
+        "sparse_tile_forms": SPARSE_TILE_FORMS,
+        "sparse_tile_names": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
+        "sparse_tile_lean_max_units": SPARSE_TILE_LEAN_MAX_UNITS,
+        "sparse_tiles_cc107": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
+        "sparse_tile_lean_default_cc107": True,
     }
     drift = [
         f"{k}: support.py has {mirrored[k]!r}, the vendored tree {facts[k]!r}"

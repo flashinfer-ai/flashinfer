@@ -74,7 +74,16 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 i
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import (
+    LEAN_SPARSE_MAX_SUB_TILES_PER_CTA,
+    LEAN_SPARSE_SERVED_MAX_S_Q,
+    LEAN_SPARSE_TOPK_MIN,
+    lean_sparse_n_sub,
+    lean_sparse_split,
+    sm107_bias_auto_cga,
+    sm107_pair_item_active,
+    sm107_tile_n_pick,
+)
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
@@ -746,6 +755,233 @@ def decode_combine_force_lean(b: int, h_q: int, s_q: int, split: int, device_cc:
     return decode_combine_lean_blocks(b, h_q, s_q) <= DECODE_COMBINE_MAX_LEAN_BLOCKS and not decode_combine_grid_selected(b, h_q, s_q, split, device_cc)
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------
+# The LEAN block-sparse DECODE tile (sm107/sparse_lean_d256_f16.py: mma.sync + cp.async, 128 threads per m16 tile, no TMEM / TMA /
+# CLC) beside the tcgen05 index-list sparse core (sm107/sparse_d256_f16.py) -- the SECOND BODY of ONE function.  The sparse adapter's
+# ``tile_form`` knob ("auto" / "lean" / "tcgen05") is PERFORMANCE-ONLY: the same O / LSE under either body within the fixed-order-sum
+# budget (a 4 x 64-d split-K sum vs one 256-d MMA chain: never bitwise ACROSS the bodies, bitwise WITHIN each), so an autotuner may
+# pick freely.  The rules below are the host reading of WHICH body a launch takes and HOW the lean body is cut; the adapter is the
+# enforcement point and reads them, the gated attention block's block-sparse decode mode reads them through the adapter's vocabulary.
+SPARSE_TILE_FORM_AUTO = "auto"
+SPARSE_TILE_FORM_LEAN = "lean"
+SPARSE_TILE_FORM_TCGEN05 = "tcgen05"
+SPARSE_TILE_FORMS = (SPARSE_TILE_FORM_AUTO, SPARSE_TILE_FORM_LEAN, SPARSE_TILE_FORM_TCGEN05)
+"""The ``tile_form`` vocabulary: ``"auto"`` = the placement rule on the parts of :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` and the tcgen05
+core everywhere else; ``"lean"`` / ``"tcgen05"`` explicit -- honoured where the body serves the declaration, a typed decline naming the
+arm where it does not (never a silent fallback)."""
+SPARSE_TILE_TCGEN05 = "sparse_d256_f16"
+SPARSE_TILE_LEAN = "sparse_lean_d256_f16"
+"""The two bodies' ``kernel_template`` names (the kernel modules' file stems under ``sdpa/fwd/kernels/sm107/``): what the adapter's
+``kernel_template`` and the block's ``sparse_tile`` read back, so a route is PINNED by the kernel that compiled, never transcribed."""
+LEAN_SPARSE_MAX_UNITS = 4
+"""The PLACEMENT bound: the lean tile below ``B x H_kv x S_q <= 4`` units (B <= 2 at S_q 1 and B 1 at S_q 2 on two KV heads), the
+tcgen05 core above.  The lean tile's advantage is the ABSENCE of the tcgen05 core's ~4.5-us per-CTA chain on a launch that is
+latency-bound (one wave of small CTAs: the 212-SM class measured the kernel alone 3.34 vs 5.66 us at B 1 x 8K x S_q 1, +69 %, and the
+chain 8.32 -> 5.75 us); it shrinks as the launch becomes HBM-bound, where both tiles move the same bytes and the lean form's shared
+gather forces a split whose combine on a 768-block grid costs more than the tcgen05 core's lean walk at split 4 (B 32 x S_q 1: a
+modeled -2 %).  The model put the crossover between 32 and 64 units; the gate's bound sweep (B in 1 / 2 / 4 / 8 / 16 / 32 x S_q 1 at 8K / 32K,
+the S_q 4 shared-list cells at B 1 / 4 / 32, every cell the lean body vs the tcgen05 core in the same process) moved this ONE constant to
+the last class that wins inside its control band.
+The gate's table by units level (the lean lever per step, POSITIVE = the lean body faster): 2 units: B 1 x S_q 1 (the e2e block)
++6.8 % / +5.7 % / +4.8 % at 8K / 32K / 128K; 4 units: B 2 x S_q 1 (the e2e block) +1.8 % / +1.3 % at 8K / 32K; 8 units: B 4 x S_q
+1 (the e2e block) -2.6 % / -3.5 % / -2.0 % / -2.2 % at 2K / 8K / 32K / 128K; B 1 x S_q 4 (the shared-list block) +6.4 % / +6.6 % /
++6.8 % at 8K / 32K / 128K; 16 units: B 8 x S_q 1 (the e2e block) -17.2 % / -16.3 % at 8K / 32K; 32 units: B 16 x S_q 1 (the e2e
+block) -44.1 % / -43.6 % at 8K / 32K; B 4 x S_q 4 (the shared-list block) -9.7 % / -8.8 % / -9.2 % at 8K / 32K / 128K; 64 units: B
+32 x S_q 1 (the e2e block) -60.8 % / -58.7 % / -51.3 % at 8K / 32K / 128K; 256 units: B 32 x S_q 4 (the shared-list block) -36.4 %
+/ -36.5 % / -35.7 % at 8K / 32K / 128K; a route class losing beyond its control band excludes every level from it up -> 4."""
+SPARSE_LEAN_TILE_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
+"""The parts on which ``tile_form="auto"`` consults the placement rule (:func:`sparse_decode_lean_tile_selected`) at all: cc 10.7,
+the one line the lean tile exists for, since the end-to-end gate measured the lean route against the tcgen05 route there (the
+measured-default rule of the block's ``DECODE_PDL_DEFAULT_CCS``: a default ships with its table, in the change that measures it; the bar:
+>= 1.0 us AND >= 5 % of the step at B 1 x 8K and B 1 x 32K on the row of record and on the symmetric reading with the arms built in the
+other order, and no route class losing beyond its control band -- a losing class lowers :data:`LEAN_SPARSE_MAX_UNITS` to the last class
+that wins).
+MEASURED 2026-10-26 on an exclusive 212-SM cc 10.7 part at the 2376 MHz lock (CUDA-graph replay, one process per cell with every
+arm, A/B/A x 3 x 100, the control pair within 1 %, every oracle before timing): the lean body vs the tcgen05 core in the same
+block, B 1 x 8K x S_q 1 34.8 -> 32.5 us per decode step (+6.8 %, 2.22 us; +5.9 % / 1.93 us symmetric with the arms built in the
+other order) and B 1 x 32K 36.6 -> 34.6 us (+5.7 %, 1.98 us; +5.6 % symmetric); B 1 x S_q 1 geomean +5.8 %, B 4 x S_q 1 -2.6 %, B
+32 x S_q 1 -57.1 % past the bound; the shared-list caller block at S_q 4 (one list per sequence) B 1 +6.6 %, B 4 -9.2 %;
+route-class cells losing beyond their band: B 4 x 2K x S_q 1 -2.6 %; B 4 x 8K x S_q 1 -3.5 %; B 4 x 32K x S_q 1 -2.0 %; B 4 x 128K
+x S_q 1 -2.2 %; B 4 x 8K x S_q 4 -9.7 %; B 4 x 32K x S_q 4 -8.8 %; B 4 x 128K x S_q 4 -9.2 %; B 8 x 8K x S_q 1 -17.2 %; B 8 x 32K
+x S_q 1 -16.3 %; B 16 x 8K x S_q 1 -44.1 %; B 16 x 32K x S_q 1 -43.6 % -> LEAN_SPARSE_MAX_UNITS 32 -> 4.
+Every other part keeps the tcgen05 core under ``"auto"`` until measured there; the explicit ``"tcgen05"`` keeps the former function on
+the measured part, the explicit ``"lean"`` takes the lean tile wherever the body serves the declaration (past the bound too)."""
+_SPARSE_LEAN_TILE_RULE_CC = (10, 7)
+"""The ONE device line the lean tile exists for (its DSL target is ``sm_107a``; the kernel's own gate): the placement rule answers False
+on every other part whatever the tuple above holds."""
+LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA = 1
+"""The cap on the DEFAULT ``sub_tiles_per_cta`` (k): 1 -- one 32-key sub-tile per CTA, the kill-line rendering (REG 66-72, 4 CTAs per SM
+by registers).  The fill rule of :func:`sparse_lean_fill_sub_tiles` asks for k 2 / 3 / 4 / 7 at B 8 / B 4 x S_q 4 / B 16 / B 32 units,
+but the k >= 2 renderings trace at 104-164 registers (ptxas software-pipelines the unrolled sub-tiles: 3 CTAs per SM; at 512 threads --
+S_q 4 x G 16, four m-tiles -- the hardware cap 65536 / 512 = 128 binds the k >= 2 body, which then spills 7 words, while k 1 spills
+nothing on any rendering: REG <= 79) and their gain over k 1 is unmeasured -- a ``-maxrregcount`` build is the gate's lever, not a default.  A caller pins k through the adapter's
+``sub_tiles_per_cta`` (the block's ``sparse_sub_tiles_per_cta``); the gate's measurement raises this cap, never a transcription."""
+_LEAN_FILL_OCCUPANCY_BY_S_Q = {1: 3, 2: 2}
+"""The fill rule's CTAs per SM by the step's rows (MODEL, DESIGN 2.2 / 4): 3 at S_q 1 (the 72-KiB two-stage form under the standard
+carveout), 2 at S_q 2 (80 KiB), 1 at S_q 3..4 (the 384-512-thread renderings, by registers)."""
+
+
+def sparse_lean_splits(top_k: int) -> Tuple[int, ...]:
+    """The LEAN SPLITS of ``top_k``: ``ceil(n_sub / k)`` for every k in ``1 .. min(8, n_sub - 1)`` (:func:`sparse_lean_max_sub_tiles_per_cta`)
+    with ``n_sub = ceil((top_k + 2) x 4 / 32)`` (``config_sm107.lean_sparse_n_sub``: 65 at top_k 512), descending -- ``(65, 33, 22, 17, 13,
+    11, 10, 9)`` at top_k 512, ``(2,)`` at top_k 8; every entry >= 2 (the lean tile always splits).  The grid's x extent and the combine's
+    partial count; a pinned ``split_kv`` on the lean route must be one of them (it SELECTS k), any other value is a typed decline naming
+    this list."""
+    return tuple(sorted({lean_sparse_split(int(top_k), k) for k in range(1, sparse_lean_max_sub_tiles_per_cta(top_k) + 1)}, reverse=True))
+
+
+def sparse_tcgen05_max_split(top_k: int) -> int:
+    """The tcgen05 core's split bound at ``top_k``: ``ceil((top_k + 1) / 32)`` = the item's tile count (17 at top_k 512; a larger split has an
+    empty chunk on every item).  The adapter's check and the envelope's readback read ONE copy."""
+    return -(-(int(top_k) + 1) // 32)
+
+
+def sparse_lean_max_sub_tiles_per_cta(top_k: int) -> int:
+    """The largest k a lean launch may pin at ``top_k``: ``min(8, n_sub - 1)`` -- the sub-tile loop is unrolled at trace time
+    (``config_sm107.LEAN_SPARSE_MAX_SUB_TILES_PER_CTA``), and the lean tile ALWAYS splits (its O / LSE are the fp32 partials the combine
+    reduces), so k = n_sub, one chunk = split 1, is not a lean rendering: 8 at top_k 512 (n_sub 65), 1 at top_k 8 (n_sub 2)."""
+    n_sub = lean_sparse_n_sub(int(top_k))
+    return max(1, min(LEAN_SPARSE_MAX_SUB_TILES_PER_CTA, n_sub - 1))
+
+
+def sparse_lean_tile_decline(
+    *,
+    s_q: int,
+    group: int,
+    top_k: int,
+    thd: bool = False,
+    bottom_right: bool = True,
+    list_per_sequence: bool = True,
+    seq_kv_lens_present: bool = True,
+    half_dtype: bool = True,
+    softmax_groups: int = 0,
+) -> Optional[str]:
+    """Why the LEAN tile cannot serve a declaration (the arm NAMED), or ``None`` when it can -- the ONE statement the adapter raises for
+    an explicit ``tile_form="lean"`` (``NotImplementedError``) and the block's declaration repeats, and the admissibility ``"auto"`` reads
+    before the placement rule.  The lean body is the DECODE form only: bottom-right rows at the END of each sequence, ONE gathered list
+    per sequence -- ``list_per_sequence=True`` at ``S_q <= config_sm107.LEAN_SPARSE_SERVED_MAX_S_Q`` (4: every row of the step in one CTA,
+    ``n_mt = ceil(S_q x G / 16)`` m16 tiles over one gathered sub-tile), or the per-row list at ``S_q == 1``, which IS the shared list (one
+    row per sequence, the step-0 anchor the row's own position); per-row lists past one row are the core's --, the per-sequence KV length present (the visible range), dense BSHD or paged pools (never THD), bf16 / f16, a group of
+    at most 16 query heads per KV head (the m16 tile's rows), ``top_k`` a multiple of 4 in [8, 512] (below 8 the list is ONE sub-tile =
+    split 1: the tcgen05 core's cell), the tcgen05 core's ``softmax_groups`` knob at its default.  The epilogue gate rides the combine
+    under the lean split (always >= 2), so a gate operand is served.  Every other arm (a sink, a band, log2 stats, a padded-Q trim, a pure
+    list) is the record's own decline, raised before this one."""
+    if thd:
+        return "thd=True (packed sequences) is the tcgen05 core's arm: the lean tile has no claim-counter form -- declare tile_form='tcgen05' or 'auto'"
+    if not bottom_right:
+        return (
+            "the lean tile serves the DECODE form only (bottom_right=True: the step's rows at the end of each sequence); a top-left / prefill "
+            "declaration is the tcgen05 core's -- declare tile_form='tcgen05' or 'auto'"
+        )
+    if not seq_kv_lens_present:
+        return (
+            "the lean tile needs seq_kv_lens (the per-sequence KV length is the decode form's visible range); the tcgen05 core serves a dense "
+            "bottom-right declaration without it -- pass seq_kv_lens or declare tile_form='tcgen05' / 'auto'"
+        )
+    if int(s_q) > LEAN_SPARSE_SERVED_MAX_S_Q:
+        return (
+            f"the lean tile serves S_q <= {LEAN_SPARSE_SERVED_MAX_S_Q} rows per sequence (the serving step's rows under ONE shared list: n_mt m16 "
+            f"tiles over one gathered sub-tile); got S_q = {int(s_q)} -- a longer step is the tcgen05 core's (tile_form='tcgen05' / 'auto')"
+        )
+    if not list_per_sequence and int(s_q) != 1:
+        return (
+            f"per-row lists at S_q = {int(s_q)} > 1: the lean CTA gathers ONE list per sequence (the shared step-0 list, index_list_form='shared'); "
+            "a per-row list is the tcgen05 core's (tile_form='tcgen05' / 'auto')"
+        )
+    if not half_dtype:
+        return "the lean tile serves bf16 / f16 Q / K / V (the mma.sync m16n8k16 half body); the e4m3 pools arm is not wired"
+    if not 1 <= int(group) <= 16:
+        return f"the lean tile packs the token's query-head group on one m16 tile: H_q / H_kv must be in [1, 16], got {int(group)}"
+    if int(top_k) < LEAN_SPARSE_TOPK_MIN or int(top_k) % 4 != 0:
+        return (
+            f"the lean tile serves top_k a multiple of 4 in [{LEAN_SPARSE_TOPK_MIN}, 512] (below {LEAN_SPARSE_TOPK_MIN} the list is one 32-key "
+            f"sub-tile = split 1, the tcgen05 core's cell); got top_k = {int(top_k)}"
+        )
+    if int(softmax_groups or 0) != 0:
+        return (
+            f"softmax_groups={int(softmax_groups)} is the tcgen05 core's softmax-split knob (the lean tile's softmax is per warp on one m16 tile); "
+            "leave it at 0 or declare tile_form='tcgen05'"
+        )
+    return None
+
+
+def sparse_decode_lean_tile_selected(*, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]]) -> bool:
+    """The PLACEMENT rule (DESIGN 7): True iff the lean tile is the body the route prefers for an ADMISSIBLE block-sparse decode
+    launch -- the cc 10.7 line (:data:`_SPARSE_LEAN_TILE_RULE_CC`, the one part the kernel exists for), ``top_k >= 8`` (at least two
+    sub-tiles: a one-sub-tile list is the tcgen05 core's) and ``B x H_kv x S_q <= LEAN_SPARSE_MAX_UNITS`` units; False above the bound
+    (the tcgen05 core with today's split rule) and on every other part.  A dense rule from the configuration (the bound is the one
+    constant the gate moves); admissibility is :func:`sparse_lean_tile_decline`'s business, the AUTO reading's gate on the part is
+    :func:`sparse_tile_form_auto`'s."""
+    if device_cc is None or tuple(device_cc)[:2] != _SPARSE_LEAN_TILE_RULE_CC:
+        return False
+    if int(top_k) < LEAN_SPARSE_TOPK_MIN:
+        return False
+    return int(batch) * int(h_kv) * int(s_q) <= LEAN_SPARSE_MAX_UNITS
+
+
+def sparse_lean_fill_sub_tiles(*, batch: int, h_kv: int, s_q: int, group: int, top_k: int, sm_count: int) -> int:
+    """DESIGN 2.2's FILL RULE for the sub-tiles per CTA, k (MODEL, information): ``units = B x H_kv`` (the S_q rows share one CTA: the
+    shared list), ``k_fill = ceil(n_sub x units / (occ x SMs))`` -- one wave of resident CTAs at the rendering's CTAs per SM
+    (:data:`_LEAN_FILL_OCCUPANCY_BY_S_Q`) --, ``k_bytes = ceil(S_q x G x 1 KiB / 32 KiB)`` -- the fp32 partial a CTA WRITES never exceeds
+    the K + V it READS --, ``k = clamp(max(1, k_fill, k_bytes), 1, min(8, n_sub))``: 1 at B 1 / B 4 x S_q 1, 2 at B 1 x S_q 4 and B 8 x
+    S_q 1, 3 at B 4 x S_q 4, 4 at B 16 x S_q 1, 7 at B 32 x S_q 1 on 212 SMs.  ``sm_count <= 0`` (no CUDA reading) gives 1.  The DEFAULT
+    k is this value capped at :data:`LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA` (:func:`sparse_lean_sub_tiles_per_cta`)."""
+    k_max = sparse_lean_max_sub_tiles_per_cta(top_k)
+    n_sub = lean_sparse_n_sub(int(top_k))
+    if int(sm_count) <= 0:
+        return 1
+    units = max(1, int(batch) * int(h_kv))
+    occ = _LEAN_FILL_OCCUPANCY_BY_S_Q.get(int(s_q), 1)
+    k_fill = _ceil_div(n_sub * units, occ * int(sm_count))
+    k_bytes = _ceil_div(int(s_q) * max(1, int(group)) * 1024, 32 * 1024)
+    return max(1, min(k_max, max(k_fill, k_bytes)))
+
+
+def sparse_lean_sub_tiles_per_cta(*, batch: int, h_kv: int, s_q: int, group: int, top_k: int, sm_count: int) -> int:
+    """The DEFAULT sub-tiles per CTA of a lean launch: the fill rule (:func:`sparse_lean_fill_sub_tiles`) capped at
+    :data:`LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA` = 1 today -- the k >= 2 rows stay off the default until the register lever is
+    measured; a pinned ``sub_tiles_per_cta`` (any k in ``1 .. min(8, n_sub)``) outranks it, the same function under every value."""
+    fill = sparse_lean_fill_sub_tiles(batch=batch, h_kv=h_kv, s_q=s_q, group=group, top_k=top_k, sm_count=sm_count)
+    return max(1, min(fill, LEAN_SPARSE_DEFAULT_MAX_SUB_TILES_PER_CTA, sparse_lean_max_sub_tiles_per_cta(top_k)))
+
+
+def sparse_tile_form_auto(
+    *, batch: int, h_kv: int, s_q: int, top_k: int, device_cc: Optional[Tuple[int, int]], admissible: bool, split_pinned: Optional[int] = None
+) -> str:
+    """What ``tile_form="auto"`` resolves to: :data:`SPARSE_TILE_FORM_LEAN` iff the part is in :data:`SPARSE_LEAN_TILE_DEFAULT_CCS` (the
+    measured default: cc 10.7), the declaration is ``admissible`` on the lean body
+    (:func:`sparse_lean_tile_decline` returned None), the placement rule selects it (:func:`sparse_decode_lean_tile_selected`) and a
+    pinned split, if any, is a lean split of ``top_k`` (a caller who pinned ``split_kv`` to a tcgen05 split, or to 1 = unsplit, keeps the
+    body that honours the pin: the pin is the stronger knob and the resolved form reads back); :data:`SPARSE_TILE_FORM_TCGEN05` otherwise."""
+    if device_cc is None or tuple(device_cc)[:2] not in SPARSE_LEAN_TILE_DEFAULT_CCS:
+        return SPARSE_TILE_FORM_TCGEN05
+    if not admissible or not sparse_decode_lean_tile_selected(batch=batch, h_kv=h_kv, s_q=s_q, top_k=top_k, device_cc=device_cc):
+        return SPARSE_TILE_FORM_TCGEN05
+    if split_pinned is not None and int(split_pinned) not in sparse_lean_splits(top_k):
+        return SPARSE_TILE_FORM_TCGEN05
+    return SPARSE_TILE_FORM_LEAN
+
+
+# The COMBINE FORM the lean splits take on the cc 10.7 line (``sparse_gqa_sm107._sparse_combine_decode_grid`` = the split-aware rule
+# above applied to the lean split), per (B, H_q, S_q, lean split, k) on the 24 / 2 geometry at top_k 512 -- the table DESIGN 2.2 / 14.3
+# asks for, with the measured cells NAMED (212-SM class, the kill-line record: the combine term = lean_chain - lean) and the unmeasured
+# ones owed to the gate.  "decode_grid" = the decode-grid kernel inside its bound (the AUTO entry), "own" = the module's own forms
+# (DECODE_GRID_OFF), "auto_past_bound" = the AUTO entry past the decode-grid bound (= the module's own forms by construction), "lean_walk"
+# = the lean group walk.  The test suite pins every row against the rule.
+SPARSE_LEAN_COMBINE_FORM_CELLS: Tuple[Tuple[int, int, int, int, int, str, str], ...] = (
+    (1, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.40 us (lean_chain 5.745 - lean 3.341 at B 1 x 8K; the model said 3.1)"),
+    (1, 24, 1, 33, 2, "decode_grid", "UNMEASURED (k 2 is off the default)"),
+    (4, 24, 1, 65, 1, "decode_grid", "MEASURED 212 SMs: 2.73 us (lean_chain 8.266 - lean 5.538 at B 4 x 8K)"),
+    (1, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at S_q 4 (96 rows, split 65 >= 8; the step's three m-tiles in one CTA)"),
+    (1, 24, 4, 33, 2, "decode_grid", "UNMEASURED: 96 rows, split 33 >= 8 (k 2 is off the default)"),
+    (4, 24, 4, 65, 1, "decode_grid", "UNMEASURED: the default k at B 4 x S_q 4 (384 rows; 96 lean blocks inside the decode-grid bound at split 65)"),
+    (4, 24, 4, 22, 3, "own", "UNMEASURED: 384 rows below split 32 -- the one-warp-per-row form past 8 splits (DESIGN 14.3: measure, or k 2 -> split 33)"),
+    (8, 24, 1, 33, 2, "auto_past_bound", "UNMEASURED: 192 lean blocks past the decode-grid bound at split 33 > 4 -- the module's own forms"),
+    (16, 24, 1, 17, 4, "auto_past_bound", "UNMEASURED: 384 lean blocks, split 17 -- the bound's edge (B 16: 0 .. +5 % modeled)"),
+    (32, 24, 1, 10, 7, "auto_past_bound", "outside the placement bound (the tcgen05 core's cell: its lean walk at split 3)"),
+)
+
+
 def _decode_tile_combine_cost(split: int, *, grid: Optional[Tuple[int, int, int]], per_partial: Optional[float] = None) -> float:
     """The combine's cost at ``split`` partials, in KV-tile units, for the form the launch takes on the
     cc 10.7 line: ``grid`` = the graph's ``(B, H_q, S_q)``, None = the lean forms (a caller that cannot
@@ -1279,12 +1515,15 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # for the measured prefill families below.
         if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((64, 64), (128, 128), (256, 256)):
             primary = SCHED_NATURAL
+            # The SM100 d64 half THD prefill takes LPT under a sliding window
+            # as well, with or without an attention sink.
+            d64_banded = caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal and facts.window_left is not None
             if (
                 SCHED_LPT in domain
                 and (_prefer_thd_pack_gqa(caps, facts) or (caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal))
-                and facts.window_left is None
+                and (facts.window_left is None or d64_banded)
                 and not facts.right_band_widening
-                and not (facts.has_sink and not _sm107_paged_half(caps, facts))
+                and (not facts.has_sink or _sm107_paged_half(caps, facts) or d64_banded)
             ):
                 # Packing does not remove the causal load imbalance: order the
                 # live token tiles by their GPU-resident lengths. The decoder
@@ -2199,11 +2438,14 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
             (facts.d_qk, facts.d_v), device_cc=facts.device_cc, fp8=not half, thd=facts.thd, paged=facts.has_paged_kv, cga=cga, split_kv=split_kv or 1
         )
     )
+    # The flavor the PACKED leg lands on, as mismatch() selects it: a dense-only small tile (Rubin d32 / d64) walks to d128.
+    packed = SdpaFwdKnobs(pack_gqa=True, split_kv=split_kv, cga=cga)
+    packed_shape = _selected_d_shape(caps, facts, packed)
     return (
         True in caps.pack_gqas
-        and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
-        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts))
-        and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
+        and (caps.pack_gqa_d_shapes is None or packed_shape in caps.pack_gqa_d_shapes)
+        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts, packed))
+        and not (caps.sm_lo == 107 and half and packed_shape == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
@@ -2260,8 +2502,7 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         # (packed matched or beat unpacked on all 72 measured cases, e.g. 1.58 -> 0.94). So does cc 10.7
         # paged THD with GQA16 (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay, with or without a sink): unpacked
         # cga2 2.8 ms against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k (page 16 and 128), 184 vs 43 us at b24 mixed.
-        and facts.h_q // facts.h_kv
-        in ((2, 4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8, 16) if _sm107_paged_half(caps, facts) else (4, 8))
+        and facts.h_q // facts.h_kv in ((2, 4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8, 16))
     )
 
 
@@ -2309,9 +2550,28 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
             # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
             wins = False
+        if _sm107_fp8_dense_d128(caps, facts):
+            # Packed never trails unpacked here at any S_q: unpacked pads every head's last 512-row tile (q576: 1.43-1.75x
+            # the backend vs packed 0.85-0.87) and walks the causal band per head (q2048 square: 1.09 vs 0.93).
+            wins = True
     if wins or (_sm120_d512_windowed(caps, facts) and not (facts.is_fp8 or facts.is_mxfp8)) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
+
+
+def _sm107_fp8_dense_d128(caps: Capabilities, facts) -> bool:
+    """The cc 10.7 per-tensor E4M3 dense (not THD, paged or padded) d128 prefill (the measured scope)."""
+    return (
+        caps.sm_lo == 107
+        and facts.device_cc == (10, 7)
+        and facts.is_fp8
+        and not facts.is_mxfp8
+        and facts.dtype == cudnn.data_type.FP8_E4M3
+        and not facts.thd
+        and not facts.has_paged_kv
+        and not facts.padded
+        and _selected_d_shape(caps, facts) == (128, 128)
+    )
 
 
 def _sm100_f16(caps: Capabilities, facts) -> bool:
@@ -2431,7 +2691,8 @@ def _split_points(
     # for an explicitly REQUESTED split, but this function proposes one on its
     # own, so it has to consult the same set or it hands back a knob the
     # lowering will reject (d64 wires no split; see config_sm100.CfgD64).
-    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts) not in caps.split_d_shapes:
+    # Read on the flavor the SPLIT leg lands on (a dense-only small tile walks to d128), as mismatch() does.
+    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts, SdpaFwdKnobs(split_kv=2, pack_gqa=pack_g > 1, cga=cga)) not in caps.split_d_shapes:
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
@@ -2673,14 +2934,18 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
     return 1, False
 
 
-def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
+
+
+def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = False) -> Tuple[int, bool]:
     """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
-    the split budget of an underfilled single request. Rubin qualification
-    retains the first-wave budget for larger batches and multi-tile queries.
-    Small-batch one-tile prefixes can use up to three waves when no first-wave
-    split fits. Blackwell also admits
+    the split budget of an underfilled single request. On Rubin, GQA (group >= 4)
+    prefill chunks past one Q tile get a two-wave budget; MHA, group 2 and one-tile
+    queries keep the first-wave budget. Small-batch one-tile prefixes can use up to
+    three waves when no first-wave split fits. ``first_wave`` scores Rubin with the first-wave budget only (the runner
+    listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
     """
@@ -2695,7 +2960,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
-        and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
         and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
@@ -2720,8 +2985,8 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             if waves > splits:
                 return 1, False
         return splits, pack
-    # Retain Rubin's first-wave budget, using the same declared packed-token
-    # capacity bound as Blackwell. Never read runtime sequence lengths here.
+    # Rubin budget from the same declared packed-token capacity bound as Blackwell.
+    # Never read runtime sequence lengths here.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
     choices = []
@@ -2730,8 +2995,11 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         units = _d128_thd_split_units(facts, group)
         if not units:
             continue
-        # Keep four KV tiles per partition to amortize setup/combine.
-        budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
+        # Keep four KV tiles per partition to amortize setup/combine. Past one Q tile the declared capacity
+        # overstates mixed-length GQA units, so those chunks get a two-wave budget; MHA / group 2 keep one wave.
+        prefill_gqa = facts.h_q // facts.h_kv >= 4 and min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) > 128
+        waves = SM107_PAGED_PREFILL_SPLIT_WAVES if prefill_gqa and not first_wave else 1
+        budget = min(16, max(1, waves * sm_count // units), max(1, kv_tiles // 4))
         loop_tiles = _ceil_div(kv_tiles, budget)
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:
@@ -2987,6 +3255,12 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
             ),
         )
+        first_splits, first_packed = paged_thd_split_choice(caps, facts, first_wave=True) if caps.sm_lo == 107 else (1, False)
+        if first_splits > 1 and (first_splits, first_packed) != (splits, packed):
+            unique.insert(
+                1,
+                replace(base, cga=_sole(effective_cgas(caps, facts, first_splits)), pack_gqa=first_packed, split_kv=first_splits, sched_policy=SCHED_NATURAL),
+            )
     nonpaged_splits, nonpaged_packed = nonpaged_thd_split_choice(caps, facts)
     if nonpaged_splits > 1:
         unique.insert(

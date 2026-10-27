@@ -93,6 +93,9 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_d128_fa
 # Native half THD flavors whose worklist and Stats stores use packed heads.
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
+# Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
+SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
+
 # Native half flavors whose PREFILL kernel stores the score side outputs -- the graph's optional
 # ``score_max`` / ``score_sum_exp`` fp32 (B, H_q, S_q, 1) ports: per Q row the softmax max in
 # natural units and the fp32 row-sum of exp(s - max), the two operands the LSE is built from
@@ -244,6 +247,12 @@ class TemplateParams:
     # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
     # kernels read it.
     exp2_fma_split: bool = False
+    # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/prefill_d192_d128_f16.py at cta_mma=1,
+    # half precision): the TMA-LDG warp prefetches the K/V tiles one kv step ahead and the next tile's Q / first K/V
+    # into L2, runs its kv loop unrolled 1x, and the dense-causal arm keeps the plain MUFU exp2.  Claimed per arch like
+    # exp2_fma_split: set by the adapter (api_dsl._cga1_l2_prefetch_for) on the cc it is measured on; off, the tile
+    # keeps the develop loader.  Only that kernel reads it.
+    cga1_l2_prefetch: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
     # scalar f32 ex2. The cc 10.7 FP8 / MXFP8 kernels (every flavor; see
@@ -467,7 +476,8 @@ class TemplateParams:
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
-_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
+SM100_NATIVE_D576_SHAPE = (576, 512)
+_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512", "d576"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature.  ONE body of this line reads
 # CFG.EPILOGUE_GATE: the SHARED f16/bf16 d256 prefill (sm100/prefill_d256_f16.py), whose paged / THD / PackGQA
@@ -508,8 +518,10 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 
 
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
-    """Native scalar-tail masking composes with D128 half/per-tensor FP8 split."""
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)
+    """Scalar-tail masking composes with D128 and native Rubin half D512 split."""
+    return (device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)) or (
+        device_cc == (10, 7) and d_shape == (512, 512) and not fp8
+    )
 
 
 def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
@@ -524,13 +536,23 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
-    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
-    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+
+
+def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """Native Rubin D128 unsplit THD prefill, with either CTA width."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 1, 2) and split_kv == 1
+
+
+def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """Rubin's shared two-CTA D128 paged half body packs a divisor of the GQA group."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def supports_nonpaged_d128_thd_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
-    """Rubin's unsplit ragged D128 packing uses the shared two-CTA half body."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 2) and split_kv == 1
+    """Native Rubin ragged D128 packing shares the prefill CTA domain."""
+    return supports_nonpaged_d128_thd_prefill(d_shape, device_cc=device_cc, fp8=fp8, thd=thd, paged=paged, cga=cga, split_kv=split_kv)
 
 
 def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
@@ -542,7 +564,7 @@ def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
     return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
 
 
-def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
+def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False, d512_partial_pack_wired: bool = False) -> None:
     if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # The loader routes an index-list record (qsa_block_topk != 0) to the cc 10.7 sparse kernel
         # (config_sm107.make_cfg_d256_sparse); a dense template must never consume one -- it would read K/V densely and
@@ -723,9 +745,9 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             raise ValueError(f"{flavor}: mma_2x2 selects the d512 2x2-datapath kernel; the other flavors do not consume it")
         if fp8:
             raise ValueError("d512: mma_2x2 is wired for BF16/FP16 inputs only (the fp8 / mxfp8 d512 kernels stay role-split)")
-        if k.paged_kv:
-            raise ValueError("d512: mma_2x2 does not serve paged KV (the d512 rows decline paged anyway)")
-        if k.pack_gqa and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
+        if k.paged_kv and k.d_flavor != 576:
+            raise ValueError("d512: mma_2x2 does not serve paged KV; the three-chunk d576 specialization is required")
+        if k.pack_gqa and not d512_partial_pack_wired and (k.qh_per_kh <= 0 or _D512_2X2_TILE_M % k.qh_per_kh != 0):
             raise ValueError(f"d512: mma_2x2 packs whole GQA groups into its {_D512_2X2_TILE_M}-row tile; qh_per_kh ({k.qh_per_kh}) must divide it")
 
 
@@ -1803,7 +1825,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through
     # getattr so a record built before the field existed takes the role-split arm unchanged.
     if getattr(params, "mma_2x2", False):
-        return make_cfg_d512_2x2(params)
+        return make_cfg_d512_2x2(params, cga_m=2 if params.d_flavor == 576 else 4)
     _validate_params("d512", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv <= DTYPE_E5M2  # E4M3/E5M2 inputs → the fp8 kernel file
@@ -2040,8 +2062,14 @@ class CfgD512X2:
 
     PACK_GQA: int = 0
     QH_PER_KH: int = 1
-    # Whole-group packing only: G must divide TILE_M = 64 (G=128 stays role-split).
+    # SM100 packs whole groups; the native SM107 body also serves divisors of G.
     PACK_G: int = 1
+
+    # D512 has two 256-column K chunks. Native D576 uses three 192-column
+    # chunks so resident Q and both K/V rings fit under the SM100 SMEM cap.
+    N_BMM1_CHUNKS: int = 2
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
 
 def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
@@ -2054,7 +2082,7 @@ def d512_2x2_smem_bytes(cfg: CfgD512X2, n_o_chunks: int = 8) -> dict:
     """
     bpe = cfg.BPE
     q = cfg.TILE_M * cfg.TILE_K * bpe
-    k_sub = (cfg.TILE_N // cfg.CTA_MMA) * (cfg.TILE_K // 2) * bpe  # 64 kv rows x 256 d
+    k_sub = (cfg.TILE_N // cfg.CTA_MMA) * (cfg.TILE_K // cfg.N_BMM1_CHUNKS) * bpe
     v_sub = cfg.TILE_N * (cfg.TILE_O // cfg.CTA_MMA // cfg.N_BMM2_CHUNKS) * bpe  # 128 kv rows x 128 d_v
     o = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
     p = cfg.TILE_M * cfg.TILE_N * bpe
@@ -2107,7 +2135,11 @@ def d512_2x2_geometry_checks(cfg: CfgD512X2) -> tuple:
     n_pairs = cfg.CGA_M // cfg.CTA_MMA
     return (
         (cfg.TILE_M == 64 and cfg.TILE_N == 128, "d512 2x2: TILE_M=64 (cta_group::2 M=128 atom) / TILE_N=128"),
-        (cfg.TILE_K == 512 and cfg.TILE_O == 512, "d512 2x2: d_qk = d_v = 512"),
+        (
+            (cfg.TILE_K == 512 and cfg.N_BMM1_CHUNKS == 2) or (cfg.TILE_K == 576 and cfg.N_BMM1_CHUNKS == 3 and cfg.CGA_M == 2),
+            "2x2 QK geometry requires D512 with two K chunks or D576 with three K chunks and one CTA pair",
+        ),
+        (cfg.TILE_O == 512, "2x2 wide-head geometry requires D_V=512"),
         (cfg.CTA_MMA == 2 and cfg.CGA_N == 1, "d512 2x2: cta_group::2 pairs, CGA_N=1"),
         (cfg.CGA_M in (2, 4) and cfg.CGA_M % cfg.CTA_MMA == 0, f"d512 2x2: CGA_M must be 2 (bring-up arm) or 4; got {cfg.CGA_M}"),
         (cfg.KV_SHARE == n_pairs, f"d512 2x2: KV_SHARE ({cfg.KV_SHARE}) must equal CGA_M // CTA_MMA ({n_pairs})"),
@@ -2185,13 +2217,20 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     the kernel file reads."""
     if not getattr(params, "mma_2x2", False):
         raise ValueError("d512 2x2: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
-    _validate_params("d512", params)
+    native_d576 = params.d_flavor == 576
+    if native_d576 and params.thd_varlen:
+        raise ValueError("d576: native 2x2 attention requires dense Q; THD origins are not wired")
+    _validate_params("d512", params, d512_partial_pack_wired=native_d576)
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError("d512 2x2: BF16/FP16 inputs only")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     n_pairs = cga_m // CfgD512X2.CTA_MMA
     cfg = CfgD512X2(
+        TILE_K=576 if native_d576 else 512,
+        N_BMM1_CHUNKS=3 if native_d576 else 2,
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -2217,7 +2256,7 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
-        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=False),
+        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=native_d576),
     )
     _validate_cfg_d512_2x2(cfg)
     return cfg, _tma_iters(cfg)
@@ -3570,7 +3609,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (not cfg.THD_VARLEN or (cfg.SPLIT_KV > 1 and cfg.PAGED_KV), "d64 decode: THD requires paged split"),
+        (not cfg.THD_VARLEN or cfg.PAGED_KV, "d64 decode: THD requires paged KV"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -3592,8 +3631,11 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen and not (params.split_kv > 1 and params.paged_kv):
-        raise ValueError("d64 decode: THD requires paged split")
+    if params.thd_varlen and not params.paged_kv:
+        # The THD leg of this tile rides the paged loader (page pools through block tables): a ragged K/V
+        # needs the prefill tile's clamped descriptors.  Unsplit, the per-batch O descriptors place the
+        # rows (LSE_KINDS token / head / padded); split, the combine does.
+        raise ValueError("d64 decode: THD requires paged KV")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
@@ -3654,6 +3696,17 @@ class CfgD192(CfgD128):
     # K sub-stages per tile: the TMA D-subtile count (3 x 16 KiB for half input) on the cga1 tile, so each subtile
     # is reloaded for the next tile as soon as BMM1 has read it, instead of after the whole 48 KiB tile; 1 elsewhere.
     K_SUB: int = 1
+    # The L2-prefetching loader (TemplateParams.cga1_l2_prefetch on the half-input cga1 tile): the TMA-LDG warp
+    # prefetches the K/V tiles L2_PREFETCH_KV kv steps ahead of their SMEM load and, with L2_PREFETCH_NEXT_TILE, the
+    # next tile's Q slabs and first K/V tile; tiles with fewer than L2_PREFETCH_MIN_STEPS kv steps issue no prefetch.
+    # Both distances are 0 elsewhere.
+    L2_PREFETCH_KV: int = 0
+    L2_PREFETCH_NEXT_TILE: int = 0
+    L2_PREFETCH_MIN_STEPS: int = 4
+    # Unroll factor of the TMA-LDG warp's kv loop (1 with the L2-prefetching loader, 6 otherwise).
+    LDG_UNROLL: int = 6
+    # The dense-causal exp2 tail emulation of the softmax (0 with the L2-prefetching loader, 1 otherwise).
+    EXP2_TAIL_MIX: int = 1
 
 
 def _d192_smem_bytes(cfg) -> int:
@@ -3698,6 +3751,20 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (
             cfg.K_SUB == ((cfg.TILE_K * cfg.BPE) // 128 if (not fp8 and cfg.CTA_MMA == 1) else 1),
             "d192: K is released per TMA D-subtile on the half-input cga1 tile only",
+        ),
+        (
+            cfg.L2_PREFETCH_KV in (0, 1) and (cfg.L2_PREFETCH_KV == 0 or (not fp8 and cfg.CTA_MMA == 1)),
+            "d192: the L2-prefetching loader (one kv step ahead) belongs to the half-input cga1 tile only",
+        ),
+        (cfg.L2_PREFETCH_NEXT_TILE == cfg.L2_PREFETCH_KV, "d192: the next-tile L2 prefetch comes with the K/V L2 prefetch"),
+        (cfg.L2_PREFETCH_MIN_STEPS >= 1, "d192: L2_PREFETCH_MIN_STEPS must be at least 1"),
+        (
+            cfg.LDG_UNROLL == (1 if cfg.L2_PREFETCH_KV else 6),
+            "d192: the TMA-LDG kv loop is unrolled 1x with the L2-prefetching loader and 6x otherwise",
+        ),
+        (
+            cfg.EXP2_TAIL_MIX == (0 if cfg.L2_PREFETCH_KV else 1),
+            "d192: the dense-causal exp2 tail emulation is folded out with the L2-prefetching loader and kept otherwise",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -3848,6 +3915,8 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     # reload then overlaps a whole iteration instead of the PV->PV window a single stage leaves it.
     stages_v = 2 if (not fp8 and params.cta_mma == 1) else stages_kv
     k_sub = (192 * b) // 128 if (not fp8 and params.cta_mma == 1) else 1  # one slot per 128 B TMA D-subtile
+    half_input_cga1 = not fp8 and params.cta_mma == 1
+    cga1_loader = half_input_cga1 and bool(params.cga1_l2_prefetch)
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
@@ -3871,6 +3940,10 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         STAGES_K=stages_kv,
         STAGES_V=stages_v,
         K_SUB=k_sub,
+        L2_PREFETCH_KV=1 if cga1_loader else 0,
+        L2_PREFETCH_NEXT_TILE=1 if cga1_loader else 0,
+        LDG_UNROLL=1 if cga1_loader else 6,
+        EXP2_TAIL_MIX=0 if cga1_loader else 1,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
@@ -3896,20 +3969,3 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
 
 
 MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
-
-
-def thd_work_prefix_enabled(cfg):
-    """Use indexed task lookup on the single-CTA paged prefix path."""
-    # Shared decoders also receive families without THD_VARLEN or PAGED_KV.
-    # Reject their head geometry before reading fields specific to this path.
-    return bool(
-        cfg.TILE_K == 128
-        and cfg.TILE_O == 128
-        and cfg.THD_VARLEN
-        and cfg.PAGED_KV
-        and cfg.DTYPE_QKV in (2, 3)
-        and cfg.CGA_M == 1
-        and cfg.SPLIT_KV > 1
-        and cfg.BOTTOM_RIGHT
-        and not (cfg.MASK_FLAGS & MASK_SWA)
-    )
