@@ -1179,4 +1179,3 @@ class Sm100BlockScaledMoeEpilogue:
                         cutlass.Int32(0),
                         alpha,
                     )
-        cute.arch.fence_view_async_tmem_load()
