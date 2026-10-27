@@ -2,6 +2,7 @@
   "arches": [
     "sm_120a"
   ],
+  "device_routes": {},
   "policy": {
     "atom_rule": {
       "batch_class_min": [
@@ -175,6 +176,26 @@
       }
     },
     "clean_logits": "raw",
+    "device_rule": {
+      "ctx_windows": {
+        "c16k": [
+          10649,
+          42597
+        ],
+        "c4k": [
+          2662,
+          10649
+        ],
+        "c64k": [
+          42597,
+          170392
+        ]
+      },
+      "tables": {
+        "170": {},
+        "188": {}
+      }
+    },
     "fused_row_bytes": 132,
     "head_dim": 128,
     "heads": [
@@ -4071,5 +4092,5 @@
       ]
     }
   },
-  "schema": "sm120_paged_mqa.v1"
+  "schema": "sm120_paged_mqa.v2"
 }

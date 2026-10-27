@@ -93,6 +93,35 @@ definition carries an SM count, so one delivered text serves every SM count and
 every `sm_count` override. The only compile-line definitions are the page size
 and `next_n` of the texts that several routes share (see "Layout").
 
+## Device routes
+
+The catalog may also carry routes tuned for one device, chosen by the
+device's physical SM count (170: RTX 5090, 188: RTX PRO 6000; the RTX PRO
+6000 Max-Q also has 188 SMs and takes that table without having been
+measured). A prepared call takes a device route only when all of these hold:
+the device's SM count keys a table of `policy.device_rule`, the CTA budget
+equals that SM count (no `sm_count` override; for the one-shot entry,
+`schedule_meta` has `num_sms + 1` rows), and `max_context_hint` lies in one
+of the rule's context windows (half-open, in KV tokens). The table key is
+`h<H>:p<page_kv>:n<next_n>:a<atom>:<window>`, with the atom the default rule
+selects; its value lists `[batch, route]` pairs by batch. A listed batch takes
+its route; a batch strictly between two listed batches takes their route only
+when both list the same one; any other batch, and a `null` entry, runs the
+default route. Every other call runs the default route above, so outputs are
+bitwise the same on every route and only the timing depends on the device.
+`resolve_route(...)` gives the route a call runs; `plan.route_name`,
+`plan.atom_variant` and `plan.num_next_n_atoms` follow it.
+
+A device route named `sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:<tag>` may
+run a different Q atom than the default rule, and its schedule is `static`
+(the shared scheduler) or `dyn`: the CTAs first walk static items, then draw
+items from a pool by ticket. A `dyn` route schedules into a plan-private int32
+`[(1 + dyn_slots) * num_sms + 2, 2]` buffer (`plan.dyn_schedule`), allocated
+at prepare time; its scheduler writes every row, including the ticket counter,
+on every launch, so replay and repeated runs need no fill. On a `dyn` route
+the caller's `schedule_meta` keeps its `[num_sms + 1, 2]` shape and is checked
+but not written.
+
 ## Operands
 
 `prepare_sm120_paged_mqa_logits(q, kv_cache, weights, context_lens,
@@ -279,10 +308,12 @@ batch-only selection, and that the logits entries rebuild the schedule under
 their own hint) and
 the architecture-target gate. It skips on devices without catalogued programs.
 
-## Catalog schema `sm120_paged_mqa.v1`
+## Catalog schema `sm120_paged_mqa.v2`
 
-`sm120_paged_mqa_catalog.json` carries `arches`, `policy`, `programs` and
-`routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
+`sm120_paged_mqa_catalog.json` carries `arches`, `policy`, `programs`,
+`routes` and `device_routes` (schema v2 adds `device_routes`,
+`policy.device_rule` and, with a `dyn` route, `policy.threads.metadata_dyn`;
+the runtime refuses a v1 catalog). Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
 `next_n`, `split_kv` (128 for every exported program, so the metadata entry
 needs no page size), `atom_rule` (the Q-atom selection rule as data:
 `batch_class_min` — the first batch of every batch class, the last class open
@@ -302,4 +333,8 @@ kernel, its logits kernel and the binding of its text), `standalone`, `compile_f
 `ffi_entry` and `arg_plan`. A logits route record has `sequence` (the
 prepared-sequence binding), `kernel_launches` (2), `num_heads`, `page_kv`,
 `next_n`, `next_n_atom`, `atom_variant` and `clean_logits`; the metadata route
-has `stages` (`[["metadata", program]]`) and `sequence: null`.
+has `stages` (`[["metadata", program]]`) and `sequence: null`. A device route
+record has the keys of a logits route plus `schedule` (`{"kind": "static"}`
+or `{"kind": "dyn", "dyn_slots", "dyn_pct", "dyn_seg"}`); `policy.device_rule`
+holds `ctx_windows` (`{name: [low, high]}`) and `tables` (`{sm_count: {key:
+[[batch, device route or null], ...]}}`), as in "Device routes".
