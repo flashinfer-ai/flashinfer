@@ -499,6 +499,10 @@ class Sm100BlockScaledMoeEpilogue:
                     (values[i], values[i + 1]), (scale, scale)
                 )
         converted.store(values.load().to(self.output_dtype))
+        self._store_converted(converted, output, row, channel)
+
+    @cute.jit
+    def _store_converted(self, converted, output, row, channel):
         target = cute.local_tile(output, (1, 16), (row, channel // 16))
         if cutlass.const_expr(self.use_fused_finalize):
             for i in cutlass.range_constexpr(0, 16, 2):
@@ -517,6 +521,41 @@ class Sm100BlockScaledMoeEpilogue:
                 converted,
                 cute.coalesce(target),
             )
+
+    @cute.jit
+    def _scale_pack_transpose(self, top, bottom, scratch, alpha, token_scale, lane):
+        """Transpose pairs of rounded half outputs in one 32-bit TMEM pass."""
+        scaled_values = cute.make_rmem_tensor((32,), cutlass.Float32)
+        scale = alpha
+        if cutlass.const_expr(
+            self.scatter_output
+            and self.final_scale_dtype in (cutlass.BFloat16, cutlass.Float16)
+        ):
+            scale = cutlass.Float32(self.final_scale_dtype(scale))
+        for i in cutlass.range_constexpr(16):
+            if cutlass.const_expr(
+                self.scatter_output
+                and (self.use_per_token_scale or self.use_fused_finalize)
+            ):
+                # Native Ld16x64 ownership: each pair shares one token and
+                # channels c/c+16. Metadata already includes its scale rounding.
+                native_token = 2 * i + (lane // 2) % 2
+                scale = cute.arch.shuffle_sync(token_scale, native_token)
+            scaled = cute.arch.mul_packed_f32x2((top[i], bottom[i]), (scale, scale))
+            scaled_values[2 * i], scaled_values[2 * i + 1] = scaled
+        packed = cute.make_rmem_tensor((16,), cutlass.Float32)
+        packed.store(
+            scaled_values.load().to(self.output_dtype).bitcast(cutlass.Float32)
+        )
+        words = _blockscaled_transpose16x32(packed, scratch)
+        halves = cute.make_rmem_tensor((32,), self.output_dtype)
+        halves.store(words.load().bitcast(self.output_dtype))
+        result = cute.make_rmem_tensor((32,), self.output_dtype)
+        cute.autovec_copy(
+            cute.composition(halves, cute.make_layout(((16, 2),), stride=((2, 1),))),
+            result,
+        )
+        return result
 
     @cute.jit
     def _run_token_group(
@@ -591,6 +630,31 @@ class Sm100BlockScaledMoeEpilogue:
                         norm_const,
                         absmax,
                     )
+        elif cutlass.const_expr(
+            self.activation_type is None
+            and self.output_dtype in (cutlass.BFloat16, cutlass.Float16)
+        ):
+            top = _blockscaled_load16x32(scratch)
+            bottom = _blockscaled_load16x32(scratch + (16 << 16))
+            converted = self._scale_pack_transpose(
+                top, bottom, scratch, alpha, fc2_scale, lane
+            )
+            if cutlass.const_expr(release_acc):
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_state)
+            if token_start + lane < valid_tokens:
+                output_row = route_start + token_start + lane
+                if cutlass.const_expr(self.scatter_output):
+                    output_row = fc2_output_row
+                for half in cutlass.range_constexpr(2):
+                    channel = channel_start + warp * 32 + half * 16
+                    if channel < output_tensor.shape[1]:
+                        values = cute.make_tensor(
+                            converted.iterator + half * 16, cute.make_layout((16,))
+                        )
+                        self._store_converted(
+                            values, output_tensor, output_row, channel
+                        )
         elif cutlass.const_expr(
             self.activation_type == ActivationType.Relu2.value
             or self.activation_type is None
