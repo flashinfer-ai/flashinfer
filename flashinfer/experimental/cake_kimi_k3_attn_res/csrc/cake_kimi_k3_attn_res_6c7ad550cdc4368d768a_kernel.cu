@@ -50,7 +50,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_VALUES_TMEM_OFFSET 0
-#define NUM_PIPE_STAGES 2
+#define NUM_MAIN_STAGES 1
 #define SMEM_SOURCE_BUF_OFF 0
 #define SMEM_SOURCE_BUF_STAGE_BYTES 28672
 #define SMEM_SOURCE_BUF_STRIDE 28672
@@ -299,6 +299,7 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
     // ---- Role: producers ----
     if (warp >= 8 && warp <= 9) {
         { // producers_main
+            unsigned int _phase_consumed = 1;
             if (elect_sync()) {
                 int warp_id_in_role = warp - 8;
                 int stream = warp_id_in_role;
@@ -313,11 +314,9 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         : "memory");
                 }
                 unsigned int stage = 0;
-                unsigned int phase = 0;
-                unsigned int phase_flipped = 1;
                 #pragma unroll 1
                 for (int token = bid + stream * num_bids; token < M; token += 2 * num_bids) {
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -331,8 +330,8 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -346,8 +345,8 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 3 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -361,8 +360,8 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 5 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -376,8 +375,8 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         :: "r"(source_buf_addr + ((stream_u * 2 + stage) * 2 + 1) * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + 7 * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
-                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, phase_flipped);
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
+                    mbarrier_wait(consumed_addr + (stage + stream_u * 2) * 8, _phase_consumed);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive_expect_tx(ready_addr + (stage + stream_u * 2) * 8, 28672);
                     asm volatile(
@@ -391,7 +390,7 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                         :: "r"(delta_buf_addr + stream_u * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (stage + stream_u * 2) * 8)
                         : "memory");
                     stage += 1;
-                    if (stage == 2) { stage = 0; phase ^= 1; phase_flipped ^= 1; }
+                    if (stage == 2) { stage = 0; _phase_consumed ^= 1; }
                 }
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             }
@@ -893,7 +892,7 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
             q_cache[54] = q_pair_33.x;
             q_cache[55] = q_pair_33.y;
             unsigned int consumer_stage = 0;
-            unsigned int consumer_phase = 0;
+            unsigned int _phase_ready = 0;
             #pragma unroll 1
             for (int token_1 = bid + stream_1 * num_bids; token_1 < M; token_1 += 2 * num_bids) {
                 float acc32[56];
@@ -956,7 +955,7 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 float m_running = -3.4028235e+38f;
                 float s_running = 0.0f;
                 unsigned int ring_stage = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq[4];
@@ -2269,9 +2268,9 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction, weight_sum);
                 m_running = new_max;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_420 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_420) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_420) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_421[4];
@@ -3584,9 +3583,9 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction_600, weight_sum_601);
                 m_running = new_max_599;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_851 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_851) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_851) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_852[4];
@@ -4899,9 +4898,9 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction_1031, weight_sum_1032);
                 m_running = new_max_1030;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_1282 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_1282) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_1282) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_1283[4];
@@ -6214,9 +6213,9 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction_1462, weight_sum_1463);
                 m_running = new_max_1461;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 unsigned int ring_stage_1713 = consumer_stage + stream_u_1 * 2;
-                mbarrier_wait(ready_addr + (ring_stage_1713) * 8, consumer_phase);
+                mbarrier_wait(ready_addr + (ring_stage_1713) * 8, _phase_ready);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 float2 local_sum_sq_1714[4];
@@ -7175,7 +7174,7 @@ kernel_cake_kimi_k3_attn_res_6c7ad550cdc4368d768a(__nv_bfloat16* __restrict__ ou
                 s_running = __fmaf_rn(s_running, correction_1902, weight_sum_1903);
                 m_running = new_max_1901;
                 consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 if (token_1 == first_token) {
                     mbarrier_wait(norm_ready_addr, 0);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

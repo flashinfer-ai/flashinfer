@@ -735,11 +735,14 @@ def test_a_packed_register_carry_key_never_falls_back_across_the_carry():
 def test_consumer_regs_pair_cells_take_the_384_thread_programs():
     """Round 20: a ``_cr232`` pair key is the pair kernel built at ``consumer_regs`` 232 (three
     whole warpgroups, 384 threads); its schedule label adds ``_consumer_regs232`` ahead of the grid.
-    The sm_100a (192, 4), (192, 5) and (192, 8) cells and the sm_103a (192, 5) cell at both SM
-    counts run it at both PDL modes."""
-    cells = [("sm_100a", 148, K) for K in (4, 5, 8)] + [
-        ("sm_103a", sm_count, 5) for sm_count in SM_COUNTS
-    ]
+    The sm_100a (192, 4), (192, 5) and (192, 8) cells, the sm_103a (192, 4) and (192, 5) cells at
+    both SM counts and the sm_103a (192, 6) cell at 152 SMs run it at both PDL modes; no cell runs
+    the 320-thread pair program."""
+    cells = (
+        [("sm_100a", 148, K) for K in (4, 5, 8)]
+        + [("sm_103a", sm_count, K) for sm_count in SM_COUNTS for K in (4, 5)]
+        + [("sm_103a", 152, 6)]
+    )
     for arch, sm_count, K in cells:
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, 192, K, pdl)
@@ -753,6 +756,7 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
             ), plan
             record = MODULES[KERNELS[arch][plan.kernel_key]]
             assert record["launch"]["block"][0] == 384, record["launch"]
+    assert all(key.endswith("_cr232") for *_, key in _r2_cells("R2_PAIR_CELLS"))
 
 
 @pytest.mark.parametrize("pdl", (False, True))
