@@ -1996,7 +1996,9 @@ _SHORT_RING_DOMAIN_CASES = (
     (31, 2, 152, "sm_103a", None),
     (32, 2, 152, "sm_103a", "t2_jr_hb"),
     (37, 2, 152, "sm_103a", "t2_jr_hb"),
-    (38, 2, 152, "sm_103a", "t2"),
+    (38, 2, 152, "sm_103a", "t2_jr_hb"),
+    (47, 2, 152, "sm_103a", "t2"),
+    (75, 2, 152, "sm_103a", "t2"),
     (77, 2, 152, "sm_103a", "t2_jr_hb"),
     (256, 2, 152, "sm_103a", "t2_jr_hb"),
     (319, 2, 152, "sm_103a", "t2"),
@@ -2086,9 +2088,8 @@ def test_short_route_falls_back_for_mismatched_shapes() -> None:
 # The two-token ring reducing both tokens' projections together, which two-token calls of 64 heads in 8 groups
 # take at the measured batches of sm_100a at 148 SMs: every batch of the set and its neighbours.
 _JR_BATCH_LIST = (
-    "33, 35, 51, 53-65, 86, 88-100, 104, 107-108, 111, 122, 124-137, 140-141, 158-165, "
-    "168, 172, 174-176, 178, 195-200, 205-206, 232-236, 239-241, 243-245, 248, 254, 256, "
-    "270, 285, 296, 306"
+    "33-35, 51-65, 68, 86, 88-101, 104, 107-108, 110-111, 122-138, 140-141, 158-168, 170, "
+    "172-178, 195-202, 204-206, 232-237, 239-245, 248, 254-256, 270, 285, 296, 306"
 )
 _JR_BATCHES = frozenset(
     batch
@@ -2099,8 +2100,8 @@ _JR_BATCHES = frozenset(
 
 def test_jr_ring_follows_the_measured_batches() -> None:
     """On sm_100a at 148 SMs a two-token call of 64 heads in 8 groups runs the joint-reduction ring exactly at its
-    91 measured batches and the two-token ring at every other batch the ring serves; nothing else changes."""
-    assert len(_JR_BATCHES) == 91
+    109 measured batches and the two-token ring at every other batch the ring serves; nothing else changes."""
+    assert len(_JR_BATCHES) == 109
     for batch_size in range(1, 4097):
         program, head_tiles = cake.mtp_short_program(
             batch_size, 64, 8, 2, 148, "sm_100a"
@@ -2136,9 +2137,8 @@ def test_jr_ring_stays_off_other_devices_and_token_counts() -> None:
 # two-token calls of 64 heads in 8 groups take at the measured batches of sm_103a at 152 SMs.
 _JR_HB_RING = "mtp_short_ring_heads64_groups8_t2_jr_hb"
 _JR_HB_BATCH_LIST = (
-    "32-37, 39-46, 50, 54, 56-71, 73, 77-78, 83-106, 108, 110, 112-116, 118, "
-    "123-145, 147-148, 154, 156-184, 186-188, 190-256, 260, 266, 270, 280, 285, "
-    "296, 304, 320"
+    "32-46, 50, 54-74, 76-78, 81, 83-106, 108, 110, 112-118, 123-148, 154, "
+    "156-184, 186-188, 190-256, 260, 266, 270, 280, 285, 296, 304, 320"
 )
 _JR_HB_BATCHES = frozenset(
     batch
@@ -2149,9 +2149,9 @@ _JR_HB_BATCHES = frozenset(
 
 def test_jr_hb_ring_follows_the_measured_batches() -> None:
     """On sm_103a at 152 SMs a two-token call of 64 heads in 8 groups runs the joint-reduction ring with the
-    per-head state base exactly at its 200 measured batches and the two-token ring at every other batch the ring
+    per-head state base exactly at its 208 measured batches and the two-token ring at every other batch the ring
     serves; nothing else changes."""
-    assert len(_JR_HB_BATCHES) == 200
+    assert len(_JR_HB_BATCHES) == 208
     for batch_size in range(1, 4097):
         program, head_tiles = cake.mtp_short_program(
             batch_size, 64, 8, 2, 152, "sm_103a"
@@ -2223,7 +2223,7 @@ def test_jr_ring_route_takes_the_measured_batches(batch_size, cake_hits) -> None
 
 @requires_blackwell
 @pytest.mark.parametrize("variant", ("plain", "pad"))
-@pytest.mark.parametrize("batch_size", (32, 33, 64, 296, 320))
+@pytest.mark.parametrize("batch_size", (32, 33, 34, 38, 64, 296, 320))
 def test_jr_ring_is_bitwise_the_two_token_ring(
     batch_size, variant, monkeypatch
 ) -> None:
