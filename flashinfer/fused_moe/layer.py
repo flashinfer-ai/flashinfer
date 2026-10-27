@@ -66,6 +66,7 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
+    FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -124,10 +125,12 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
+from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    FrostLowLatencyRunner,
     CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
@@ -174,6 +177,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,

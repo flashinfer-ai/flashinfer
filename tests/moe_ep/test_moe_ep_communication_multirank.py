@@ -2,6 +2,8 @@
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_communication_multirank.py -v
+or via an MPI launcher, including across nodes:
+    mpirun -np 8 pytest tests/moe_ep/test_moe_ep_communication_multirank.py -v
 
 Each rank applies a synthetic expert computation to the rows it receives: a
 token routed to expert ``e`` with weight ``w`` contributes ``w * (e + 1) * x``.
@@ -19,6 +21,40 @@ import pytest
 
 _PG_TIMEOUT = timedelta(minutes=60)
 _BACKENDS = ["nvlink_one_sided", "cake", "nvlink_two_sided"]
+# Set by Open MPI, MPICH/Hydra and PMIx launchers respectively.
+_MPI_LAUNCH_VARS = ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "PMIX_RANK")
+
+
+def _adopt_mpi_launch():
+    """Set torch.distributed's ``env://`` variables from MPI when an MPI
+    launcher started this process instead of torchrun."""
+    if "WORLD_SIZE" in os.environ or not any(
+        var in os.environ for var in _MPI_LAUNCH_VARS
+    ):
+        return
+    import socket
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    master = None
+    if comm.Get_rank() == 0:
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master = (socket.gethostname(), sock.getsockname()[1])
+    master_addr, master_port = comm.bcast(master, root=0)
+    local_rank = comm.Split_type(MPI.COMM_TYPE_SHARED).Get_rank()
+    os.environ.update(
+        RANK=str(comm.Get_rank()),
+        WORLD_SIZE=str(comm.Get_size()),
+        LOCAL_RANK=str(local_rank),
+        MASTER_ADDR=master_addr,
+        MASTER_PORT=str(master_port),
+    )
+
+
+# At import, so that collection's multi-rank checks see WORLD_SIZE.
+_adopt_mpi_launch()
 
 
 def _init_dist():

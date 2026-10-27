@@ -251,8 +251,6 @@ class TmemSResource(MlaResource):
                 Uint32,
                 softmax_scratch_words(self.cfg),
             )
-        self.q_desc_current = Int64(0)
-        self.q_desc_rope_current = Int64(0)
         if cutlass.const_expr(
             self.cfg.kernel_variant == "keeps_mma_ab"
             and self.cfg.num_tokens_per_page != 1
@@ -291,6 +289,16 @@ class TmemSResource(MlaResource):
         # resource later produces QK scores into TMEM.
         del stage_info
         self._make_initial_softmax_vars()
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_descriptor_state(self, stage_info: StageInfo):
+        """Initialize cached Q descriptors in the producer task's scope."""
+        # Persistent HEAD and LOOP have separate runtime skip guards. Seed the
+        # descriptors before those guards so their values dominate every use.
+        del stage_info
+        self.q_desc_current = Int64(0)
+        self.q_desc_rope_current = Int64(0)
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -852,6 +860,20 @@ class TmemSResource(MlaResource):
                     increase_log2 = (candidate - old_anchor) * self.scale_softmax_log2
                     limit = Float32(6.0)
                     if increase_log2 <= limit:
+                        new_max_vals[scale_idx] = old_anchor
+                self.new_max_state[scale_idx] = new_max_vals[scale_idx]
+            elif cutlass.const_expr(cfg.softmax_rescale_threshold_log2 > 0.0):
+                # Threshold skip correction: keep the previous row max while
+                # this K tile raises it by at most the compile-time threshold
+                # (log2 units, like the sparse bound above). P grows by at most
+                # 2**threshold and the unchanged max lets correction skip the
+                # O rescale. The first tile always adopts the new max.
+                old_anchor = old_max_vals[scale_idx]
+                if old_anchor != neg_max_f32():
+                    increase_log2 = (
+                        new_max_vals[scale_idx] - old_anchor
+                    ) * self.scale_softmax_log2
+                    if increase_log2 <= Float32(cfg.softmax_rescale_threshold_log2):
                         new_max_vals[scale_idx] = old_anchor
                 self.new_max_state[scale_idx] = new_max_vals[scale_idx]
             old_max_arr[scale_idx] = old_max_vals[scale_idx]

@@ -21,6 +21,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
     blackwell_msa_sparse_attention,
@@ -31,6 +32,7 @@ from ._common import (
     _compile_cache,
     _cutlass_dtype,
     _fake,
+    _q_offset_explicit,
     _q_offset_tensor,
     _resolve_packed_kv,
 )
@@ -57,8 +59,9 @@ def msa_sparse_attention(
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
-    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
+    """Minimax Sparse Attention forward for SM90, SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -76,7 +79,9 @@ def msa_sparse_attention(
     causal, without an LSE and with ``seqused_k`` rather than ``cu_seqlens_k``
     (see the ``k``, ``k_scale``, ``seqused_k`` and ``k_global_scale``
     parameters below) -- and requires ``topk == 16``. Every other packed-NVFP4
-    layout remains SM120/SM121-only.
+    layout remains SM120/SM121-only. On compute capability 9.0 (H100/H200) both
+    sparse routes take bf16 ``q`` only and write bf16 output; fp16 ``q`` raises
+    ``NotImplementedError``.
 
     Parameters
     ----------
@@ -164,6 +169,11 @@ def msa_sparse_attention(
         capability 10.0/10.3. Warm the workspace eagerly with the exact
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
+    out : torch.Tensor, optional
+        Pre-allocated bf16 output of shape ``(total_q, num_qo_heads, head_dim)``
+        (SM90 only, where the kernels allocate nothing per call and are
+        CUDA-graph capturable as is). Other architectures allocate their own
+        output and reject ``out``.
 
     Returns
     -------
@@ -175,6 +185,11 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if out is not None and not is_sm90a_supported(q.device):
+        raise NotImplementedError(
+            "out= is implemented on SM90; the compute capability 10.0/10.3 and "
+            "SM120/SM121 backends allocate their own output"
+        )
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_attention(
             q,
@@ -202,9 +217,10 @@ def msa_sparse_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3 backend"
         )
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     compute_dtype = q.dtype
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -227,6 +243,70 @@ def msa_sparse_attention(
     topk = q2k_indices.shape[2]
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+
+    if sm90:
+        if return_softmax_lse or return_temperature_lse:
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention does not return an LSE"
+            )
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # softmax_scale and v_global_scale ARE handled (folded into q and the
+            # output); per-tensor scale tensors have no SM90 path and dropping one
+            # silently would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention handles softmax_scale and v_global_scale, "
+                "but not per-tensor k_scale/v_scale/k_global_scale"
+            )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # _views() builds the paged pointers as e4m3; any other dtype is read
+            # with the wrong element stride and returns silent garbage.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
+        if not causal:
+            # Every SM90 sparse-prefill schedule masks causally with no switch;
+            # the flag used to be ignored, which silently returned causal output.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention is causal; causal=False is not supported"
+            )
+        from ._sm90_dispatch import sparse_prefill_sm90
+
+        if out is None:
+            out = torch.zeros(
+                (total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device
+            )
+        elif (
+            out.shape != q.shape
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            # The kernels take out as a raw pointer on q's device.
+            raise ValueError(
+                "out must be a contiguous tensor shaped and typed like q on q's "
+                f"device, got {tuple(out.shape)} {out.dtype} {out.device}"
+            )
+        if q_offset is not None and not isinstance(q_offset, torch.Tensor):
+            # The documented integer form: one offset for every sequence.
+            q_offset = _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, q.device)
+        return sparse_prefill_sm90(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            page_table,
+            seqused_k,
+            out,
+            q_offset=q_offset,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
+        )
 
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     kv_nvfp4 = k.dtype == torch.uint8

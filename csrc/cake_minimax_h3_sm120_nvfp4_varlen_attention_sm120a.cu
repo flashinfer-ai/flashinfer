@@ -4980,6 +4980,11 @@ kernel_minimax_h3_sm120_varlen_attention_sage(const __grid_constant__ CUtensorMa
     }
     mbarrier_wait(q_full_addr, _phase_q_full_0);
     _phase_q_full_0 ^= 1;
+    // Group 0 closes the ping-pong: group 1's pre-arrive puts its arrivals on barrier 1 one round ahead, so its last
+    // arrival forms a round no group-0 sync joins; one more sync completes it before the CTA exits.
+    if (warp < 4) {
+        asm volatile("barrier.sync 1, 256;" ::: "memory");
+    }
 
     // Cleanup
     __syncthreads();
