@@ -488,7 +488,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         scheduler_bytes = 32 * num_tile_info_stages + 48 if use_clc_scheduler else 0
         return (
             (
-                (num_stages * (4 + int(sf_requires_cluster_join)) + acc_stages * 2) * 8
+                (num_stages * (3 + int(sf_requires_cluster_join)) + acc_stages * 2) * 8
                 + 4
                 + scheduler_bytes
                 + 127
@@ -1103,7 +1103,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         @cute.struct
         class SharedStorage:
             a_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            ab_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+            ab_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages]
             sf_ready_barriers: cute.struct.MemRange[
                 cutlass.Int64,
                 self.num_stages if self.sf_requires_cluster_join else 0,
@@ -1379,6 +1379,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
                 defer_sync=True,
                 cta_layout_vmnk=cluster_layout,
+                empty_owner=a_pipe,
             )
         acc_pipe = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
@@ -1616,11 +1617,16 @@ class Sm100BlockScaledGroupedGemmKernel:
                 shared_sf_offset = (sf_row % 32) * 16 + (sf_row // 32) * 4
                 for k_tile in cutlass.range(k_tiles):
                     if cutlass.const_expr(not self.tma_sfb):
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("producer_sf_empty")
-                        ab.producer_acquire(producer)
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
+                        if warp != 0:
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("producer_sf_empty")
+                            # Warp zero acquires this ring with its weight load,
+                            # including any stages prefetched before the PDL wait.
+                            a_pipe.sync_object_empty.wait(
+                                producer.index, producer.phase
+                            )
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
                     if warp == 0:
                         if cutlass.const_expr(self.prefetch_weights_before_wait):
                             # Startup acquired the first weight stages. B/SFB
@@ -1779,11 +1785,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                         if publishes_ancestors:
                             release_gpu()
                     griddepcontrol_launch_dependents()
-                # Each drain mutates its state through every ring stage.
-                # Keep independent copies even when warp zero drains A first.
+                # One empty completion protects all operand storage, including SF.
                 a_pipe.producer_tail(producer.clone())
-            if cutlass.const_expr(not self.tma_sfb):
-                ab.producer_tail(producer.clone())
         elif warp < (8 if self.overlap_epilogue else 4):
             consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.acc_stages
@@ -2064,8 +2067,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             _iket.range_push("mma_release_issue")
                         # Both channel tiles must finish reading the shared B/SFB
                         # stage before any operand pipeline can overwrite it.
-                        if cutlass.const_expr(not self.tma_sfb):
-                            ab.consumer_release(consumer)
                         a_pipe.consumer_release(consumer)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
