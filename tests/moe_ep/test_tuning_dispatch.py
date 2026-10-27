@@ -27,7 +27,9 @@ def dispatched(monkeypatch):
     original = tune.importlib.import_module
 
     def load(name, package=None):
-        if name.startswith(".backends.mega.kernel.") and name.endswith(".tuner"):
+        if name.startswith(".backends.mega.kernel.") and name.endswith(
+            (".tuner", ".next_tuning")
+        ):
             calls.append(name)
             return SimpleNamespace(run_tuning=lambda args: 17)
         return original(name, package)
@@ -238,3 +240,27 @@ def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched)
         == 17
     )
     assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize(
+    "options",
+    [[], ["--no-do-finalize", "--no-apply-routing-weights-before-fc2"]],
+)
+def test_next_blackwell_dispatch(kind, options, dispatched):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm100",
+                "--dtype",
+                kind,
+                "--implementation",
+                "next",
+                *options,
+            ]
+        )
+        == 17
+    )
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]

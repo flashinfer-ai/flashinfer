@@ -3354,7 +3354,30 @@ class BatchPrefillWithPagedKVCacheWrapper:
         >>> wrapper.plan(...)
         """
         if self._backend == "cute-dsl-prims":
-            return (0, 0)
+            qo_indptr_host = qo_indptr.to("cpu")
+            if seq_lens is None:
+                kv_lens_arr_host = get_seq_lens(
+                    paged_kv_indptr.to("cpu"),
+                    paged_kv_last_page_len.to("cpu"),
+                    page_size,
+                )
+            else:
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+            assert self._prims_backend is not None
+            float_bytes = self._prims_backend.paged_workspace_size(
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv_host=kv_lens_arr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_qk,
+                o_dtype=canonicalize_torch_dtype(o_data_type or q_data_type),
+                page_size=page_size,
+                causal=causal,
+                fixed_split_size=fixed_split_size or -1,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
+            )
+            return (float_bytes, 0)
 
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
@@ -4111,7 +4134,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
             if block_tables is None:
                 block_tables = _build_block_tables_from_paged_kv_indices(
@@ -4138,6 +4160,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 causal=causal,
                 sm_scale=sm_scale,
+                float_workspace_buffer=self._float_workspace_buffer,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -6072,8 +6098,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
+            if fixed_split_size not in (-1, None):
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    f"fixed_split_size={fixed_split_size} with ragged K/V"
+                )
             assert self._prims_backend is not None
             self._prims_backend.plan_ragged(
                 qo_indptr=self._qo_indptr_buf,
