@@ -363,7 +363,16 @@ a record serves every admissible geometry and the host never selects by shape:
   long-chunk ring (`_st3_split`) on sm_103a only
   (`cake_backend.dx_split_rule`, `cake_backend.dx_split_eligible`,
   `DX_SPLIT_ARCHES`, `DX_SPLIT_LONG_RING_ARCHES`).  Bitwise: the same K
-  slices and per-element K order on both widths.
+  slices and per-element K order on both widths;
+* `_swab`: the swapped 512-wide `dX` tile (`dX^T = W^T dz^T`: a CTA's 128
+  hidden columns of `W` on the MMA's M, the chunk's 512-token tile on its N,
+  the output stored per thread), at the table ring depth, on sm_103a only
+  (`DX_SWAB_ARCHES`): a chunk of whole 512-token tiles of a cross-entropy
+  loss call (the loss entry point with objective `"ce"`) of at least three
+  chunks (`DW_STREAM_MIN_CHUNKS`) takes it ahead of the split-tail rule
+  (`cake_backend.dx_swab_rule`); the policy objective, the log-probability
+  entry point and calls of fewer chunks keep the other forms.  Bitwise: the
+  same bf16 products summed over the same K slices in the same K order.
 
 On sm_100a the record's 512-wide `dX` stages (`gemm_dx`, `gemm_dx_s`, their
 `_st3` and `_split` forms) run programs built with a 3-deep operand ring and a
@@ -375,6 +384,14 @@ depths differ.
   architectures, with `group_n` = 12 column tiles per block
   (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
   1-D raster.  Bitwise: a permutation of the same tiles.
+* `_tma`: the TMA-epilogue form of the bf16 fused weight-gradient cast
+  (`gemm_dw_cast_bf16_tma`): the deferred cast of the last chunk of a call of
+  at least two chunks whose last chunk has at most 1792 rows
+  (`DW_CAST_TMA_MAX_ROWS`, both architectures; `cake_backend.dw_cast_tma_rule`)
+  reads the old FP32 sum and stores the bf16 tile as TMA sub-tiles.  A
+  one-chunk call (no old sum) and a longer last chunk keep the shipped cast;
+  an explicit `"epi_store"` knob of `gemm_tuning`'s `"dw"` wins over the rule.
+  Bitwise: the same per-element `(old + acc) * g` and round-to-nearest.
 
 The raster height is a scalar of the base forms: `group_m` 16 for the logits
 GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
@@ -399,8 +416,11 @@ autograd entry point; default `None` = no explicit knob) pins knobs explicitly
 per GEMM --
 `{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2, "stages": 4},
 "dw": {"group_m": 32, "group_n": 0}}`; the `dX` GEMM also takes `"split"` (the
-number of trailing wide items run as half items) -- a knob given as `null` pins
-the default -- and wins over the rule for the knobs it names.
+number of trailing wide items run as half items) and `"swap_ab"` (the `_swab`
+tile) -- a knob given as `null` pins the default -- and wins over the rule for
+the knobs it names.  An explicit `"split"`, or a `"stages"` other than the
+table ring depth 4, keeps that form and turns the `_swab` rule off;
+`"swap_ab": true` with such a `"stages"` or a nonzero `"split"` raises.
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
@@ -466,7 +486,7 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 The registry holds one record per architecture (`sm_100a`, `sm_103a`),
 `cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
 launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
-it), with the sixteen base stages above plus the thirteen structural forms the
+it), with the sixteen base stages above plus the sixteen structural forms the
 rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
 named in the pull request.
 
