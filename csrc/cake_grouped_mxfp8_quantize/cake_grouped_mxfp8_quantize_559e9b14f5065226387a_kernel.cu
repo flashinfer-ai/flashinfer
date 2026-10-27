@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_d4646ff749ceed257e5d (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_0a02ddf9363219c97476 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_559e9b14f5065226387a (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_0a02ddf9363219c97476.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f77a5fb3eeaf3833ef94.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_d4646ff749ceed257e5d
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_559e9b14f5065226387a
 #endif
 
 typedef signed char        int8_t;
@@ -128,16 +128,30 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
         _vec_load_0[0] = *reinterpret_cast<const int*>(mask + group);
     }
     unsigned int valid_rows = (((unsigned int)_vec_load_0[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_0[0]) : ((unsigned int)M));
-    unsigned int cta_first = (unsigned int)blockIdx.y * (ROWS * SUBROWS);
-    if (cta_first < valid_rows) {
+    unsigned int tile = blockIdx.y;
+    if (tile * (ROWS * SUBROWS) < valid_rows) {
         if (tid == 0) {
-            unsigned int next_first = (unsigned int)blockIdx.y * (ROWS * SUBROWS) + SUBROWS;
-            if (ROWS > 1 && next_first < valid_rows && valid_rows < (unsigned int)M) {
+            if (ROWS > 1 && valid_rows < (unsigned int)M) {
                 unsigned int k_lo = (unsigned int)blockIdx.x * 7168;
-                unsigned int next_rows = ((valid_rows - next_first) < (SUBROWS) ? (valid_rows - next_first) : (SUBROWS));
-                unsigned int _min_0 = (((unsigned int)K - k_lo) < (7168) ? ((unsigned int)K - k_lo) : (7168));
-                unsigned int span = (next_rows - 1) * (unsigned int)K + _min_0;
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)group * (unsigned long long)M + (unsigned long long)next_first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(span * 2)) : "memory");
+                unsigned int cta_span = (((unsigned int)K - k_lo) < (7168) ? ((unsigned int)K - k_lo) : (7168));
+                unsigned int first = tile * (ROWS * SUBROWS);
+                unsigned int next_first = first + SUBROWS;
+                if (next_first < valid_rows) {
+                    unsigned int next_rows = ((valid_rows - next_first) < (SUBROWS) ? (valid_rows - next_first) : (SUBROWS));
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)group * (unsigned long long)M + (unsigned long long)next_first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(((next_rows - 1) * (unsigned int)K + cta_span) * 2)) : "memory");
+                }
+                unsigned int ahead = group + 3;
+                if (ahead < (unsigned int)gridDim.z) {
+                    int _vec_load_2[1];
+                    {
+                        _vec_load_2[0] = *reinterpret_cast<const int*>(mask + ahead);
+                    }
+                    unsigned int ahead_valid = (((unsigned int)_vec_load_2[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_2[0]) : ((unsigned int)M));
+                    if (first < ahead_valid && ahead_valid < (unsigned int)M) {
+                        unsigned int ahead_rows = ((ahead_valid - first) < (ROWS * SUBROWS) ? (ahead_valid - first) : (ROWS * SUBROWS));
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)ahead * (unsigned long long)M + (unsigned long long)first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(((ahead_rows - 1) * (unsigned int)K + cta_span) * 2)) : "memory");
+                    }
+                }
             }
         }
         unsigned int tid_0 = (unsigned int)tid;
@@ -145,7 +159,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
         uint32_t _fast_div_q_0 = (BLOCKS_PER_ROW.divisor != 1) ? (__umulhi((uint32_t)(flat), BLOCKS_PER_ROW.multiplier) >> BLOCKS_PER_ROW.shift_right) : (uint32_t)(flat);
         uint32_t _fast_div_r_0 = (uint32_t)(flat) - _fast_div_q_0 * (uint32_t)(BLOCKS_PER_ROW.divisor);
         if (_fast_div_q_0 < SUBROWS) {
-            unsigned int first_row = cta_first + _fast_div_q_0;
+            unsigned int first_row = tile * (ROWS * SUBROWS) + _fast_div_q_0;
             if (first_row < valid_rows) {
                 unsigned int k0 = _fast_div_r_0 * 32;
                 unsigned int row = first_row;
@@ -157,11 +171,11 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         if (k0 < (unsigned int)K) {
                             unsigned long long x_offset = global_row * (unsigned long long)K + (unsigned long long)k0;
                             {
-                                const void* _v8p_1 = (const void*)(x + (x_offset));
-                                uint32_t _v8_1_0[8];
+                                const void* _v8p_0 = (const void*)(x + (x_offset));
+                                uint32_t _v8_0_0[8];
                                 asm volatile(
                                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                    : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const char*)_v8p_1 + 0) : "memory");
+                                    : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
 #if CAKE_PROGRAM_VARIANT == 1
                                 asm volatile(
                                     "{\n\t"
@@ -173,7 +187,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 0]))
-                                    : "r"(_v8_1_0[0]));
+                                    : "r"(_v8_0_0[0]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -184,7 +198,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 2]))
-                                    : "r"(_v8_1_0[1]));
+                                    : "r"(_v8_0_0[1]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -195,7 +209,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 4]))
-                                    : "r"(_v8_1_0[2]));
+                                    : "r"(_v8_0_0[2]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -206,7 +220,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 6]))
-                                    : "r"(_v8_1_0[3]));
+                                    : "r"(_v8_0_0[3]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -217,7 +231,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 8]))
-                                    : "r"(_v8_1_0[4]));
+                                    : "r"(_v8_0_0[4]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -228,7 +242,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 10]))
-                                    : "r"(_v8_1_0[5]));
+                                    : "r"(_v8_0_0[5]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -239,7 +253,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 12]))
-                                    : "r"(_v8_1_0[6]));
+                                    : "r"(_v8_0_0[6]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -250,29 +264,29 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 14]))
-                                    : "r"(_v8_1_0[7]));
+                                    : "r"(_v8_0_0[7]));
 #else
-                                (&values[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) << 16);
-                                (&values[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[0]) & 0xffff0000u);
-                                (&values[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) << 16);
-                                (&values[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[1]) & 0xffff0000u);
-                                (&values[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) << 16);
-                                (&values[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[2]) & 0xffff0000u);
-                                (&values[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) << 16);
-                                (&values[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[3]) & 0xffff0000u);
-                                (&values[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) << 16);
-                                (&values[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[4]) & 0xffff0000u);
-                                (&values[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) << 16);
-                                (&values[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[5]) & 0xffff0000u);
-                                (&values[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) << 16);
-                                (&values[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[6]) & 0xffff0000u);
-                                (&values[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) << 16);
-                                (&values[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_0[7]) & 0xffff0000u);
+                                (&values[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
+                                (&values[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
+                                (&values[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
+                                (&values[0 + 2])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) & 0xffff0000u);
+                                (&values[0 + 4])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) << 16);
+                                (&values[0 + 4])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[2]) & 0xffff0000u);
+                                (&values[0 + 6])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) << 16);
+                                (&values[0 + 6])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[3]) & 0xffff0000u);
+                                (&values[0 + 8])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) << 16);
+                                (&values[0 + 8])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[4]) & 0xffff0000u);
+                                (&values[0 + 10])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) << 16);
+                                (&values[0 + 10])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[5]) & 0xffff0000u);
+                                (&values[0 + 12])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) << 16);
+                                (&values[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
+                                (&values[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
+                                (&values[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
 #endif
-                                uint32_t _v8_1_1[8];
+                                uint32_t _v8_0_1[8];
                                 asm volatile(
                                     "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                    : "=r"(_v8_1_1[0]), "=r"(_v8_1_1[1]), "=r"(_v8_1_1[2]), "=r"(_v8_1_1[3]), "=r"(_v8_1_1[4]), "=r"(_v8_1_1[5]), "=r"(_v8_1_1[6]), "=r"(_v8_1_1[7]) : "l"((const char*)_v8p_1 + 32) : "memory");
+                                    : "=r"(_v8_0_1[0]), "=r"(_v8_0_1[1]), "=r"(_v8_0_1[2]), "=r"(_v8_0_1[3]), "=r"(_v8_0_1[4]), "=r"(_v8_0_1[5]), "=r"(_v8_0_1[6]), "=r"(_v8_0_1[7]) : "l"((const char*)_v8p_0 + 32) : "memory");
 #if CAKE_PROGRAM_VARIANT == 1
                                 asm volatile(
                                     "{\n\t"
@@ -284,7 +298,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 16]))
-                                    : "r"(_v8_1_1[0]));
+                                    : "r"(_v8_0_1[0]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -295,7 +309,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 18]))
-                                    : "r"(_v8_1_1[1]));
+                                    : "r"(_v8_0_1[1]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -306,7 +320,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 20]))
-                                    : "r"(_v8_1_1[2]));
+                                    : "r"(_v8_0_1[2]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -317,7 +331,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 22]))
-                                    : "r"(_v8_1_1[3]));
+                                    : "r"(_v8_0_1[3]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -328,7 +342,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 24]))
-                                    : "r"(_v8_1_1[4]));
+                                    : "r"(_v8_0_1[4]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -339,7 +353,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 26]))
-                                    : "r"(_v8_1_1[5]));
+                                    : "r"(_v8_0_1[5]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -350,7 +364,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 28]))
-                                    : "r"(_v8_1_1[6]));
+                                    : "r"(_v8_0_1[6]));
                                 asm volatile(
                                     "{\n\t"
                                     ".reg .b16 h_lo, h_hi;\n\t"
@@ -361,24 +375,24 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                                     "}\n"
                                     : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 30]))
-                                    : "r"(_v8_1_1[7]));
+                                    : "r"(_v8_0_1[7]));
 #else
-                                (&values[0 + 16])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[0]) << 16);
-                                (&values[0 + 16])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[0]) & 0xffff0000u);
-                                (&values[0 + 18])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[1]) << 16);
-                                (&values[0 + 18])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[1]) & 0xffff0000u);
-                                (&values[0 + 20])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[2]) << 16);
-                                (&values[0 + 20])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[2]) & 0xffff0000u);
-                                (&values[0 + 22])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[3]) << 16);
-                                (&values[0 + 22])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[3]) & 0xffff0000u);
-                                (&values[0 + 24])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[4]) << 16);
-                                (&values[0 + 24])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[4]) & 0xffff0000u);
-                                (&values[0 + 26])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[5]) << 16);
-                                (&values[0 + 26])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[5]) & 0xffff0000u);
-                                (&values[0 + 28])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[6]) << 16);
-                                (&values[0 + 28])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[6]) & 0xffff0000u);
-                                (&values[0 + 30])[0] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[7]) << 16);
-                                (&values[0 + 30])[1] = __uint_as_float(static_cast<uint32_t>(_v8_1_1[7]) & 0xffff0000u);
+                                (&values[0 + 16])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) << 16);
+                                (&values[0 + 16])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) & 0xffff0000u);
+                                (&values[0 + 18])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[1]) << 16);
+                                (&values[0 + 18])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[1]) & 0xffff0000u);
+                                (&values[0 + 20])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[2]) << 16);
+                                (&values[0 + 20])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[2]) & 0xffff0000u);
+                                (&values[0 + 22])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[3]) << 16);
+                                (&values[0 + 22])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[3]) & 0xffff0000u);
+                                (&values[0 + 24])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[4]) << 16);
+                                (&values[0 + 24])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[4]) & 0xffff0000u);
+                                (&values[0 + 26])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[5]) << 16);
+                                (&values[0 + 26])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[5]) & 0xffff0000u);
+                                (&values[0 + 28])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[6]) << 16);
+                                (&values[0 + 28])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[6]) & 0xffff0000u);
+                                (&values[0 + 30])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) << 16);
+                                (&values[0 + 30])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) & 0xffff0000u);
 #endif
                             }
                         } else {
@@ -424,28 +438,28 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         magnitudes[29] = fabsf(magnitudes[29]);
                         magnitudes[30] = fabsf(magnitudes[30]);
                         magnitudes[31] = fabsf(magnitudes[31]);
-                        float2 _reg_reduce_max2_2 = {-CAKE_INF, -CAKE_INF};
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[0], magnitudes[1]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[2], magnitudes[3]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[4], magnitudes[5]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[6], magnitudes[7]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[8], magnitudes[9]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[10], magnitudes[11]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[12], magnitudes[13]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[14], magnitudes[15]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[16], magnitudes[17]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[18], magnitudes[19]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[20], magnitudes[21]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[22], magnitudes[23]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[24], magnitudes[25]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[26], magnitudes[27]));
-                        _reg_reduce_max2_2.x = max_noftz(_reg_reduce_max2_2.x, max_noftz(magnitudes[28], magnitudes[29]));
-                        _reg_reduce_max2_2.y = max_noftz(_reg_reduce_max2_2.y, max_noftz(magnitudes[30], magnitudes[31]));
-                        float absmax = row_max_reduce(_reg_reduce_max2_2);
+                        float2 _reg_reduce_max2_1 = {-CAKE_INF, -CAKE_INF};
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[0], magnitudes[1]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[2], magnitudes[3]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[4], magnitudes[5]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[6], magnitudes[7]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[8], magnitudes[9]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[10], magnitudes[11]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[12], magnitudes[13]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[14], magnitudes[15]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[16], magnitudes[17]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[18], magnitudes[19]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[20], magnitudes[21]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[22], magnitudes[23]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[24], magnitudes[25]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[26], magnitudes[27]));
+                        _reg_reduce_max2_1.x = max_noftz(_reg_reduce_max2_1.x, max_noftz(magnitudes[28], magnitudes[29]));
+                        _reg_reduce_max2_1.y = max_noftz(_reg_reduce_max2_1.y, max_noftz(magnitudes[30], magnitudes[31]));
+                        float absmax = row_max_reduce(_reg_reduce_max2_1);
                         unsigned int magnitude = __as_u32(absmax) & 2147483647;
                         int shifted = (int)(magnitude - 65011713) >> 23;
-                        int _max_3 = ((shifted) > (0) ? (shifted) : (0));
-                        unsigned int finite_byte = (unsigned int)_max_3;
+                        int _max_2 = ((shifted) > (0) ? (shifted) : (0));
+                        unsigned int finite_byte = (unsigned int)_max_2;
                         unsigned int saturated_byte = 254;
                         unsigned int scale_byte = ((magnitude > 2139095039) ? saturated_byte : finite_byte);
                         unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
@@ -453,10 +467,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                         unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
                         float inverse = 0.0f;
                         inverse = reinterpret_cast<float*>(&inverse_bits)[0];
-                        const float2 _scale2_4 = {inverse, inverse};
+                        const float2 _scale2_3 = {inverse, inverse};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
-                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_4);
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_3);
                         unsigned long long task = global_row * (unsigned long long)((uint32_t)(BLOCKS_PER_ROW.divisor)) + (unsigned long long)_fast_div_r_0;
                         unsigned long long q_offset = task * 32;
                         unsigned int _packed_0[8];
@@ -565,10 +579,10 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                             _packed_0[7] = _packed;
                         }
                         {
-                            const unsigned* _raw_stv8_5 = reinterpret_cast<const unsigned*>(_packed_0);
+                            const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(_packed_0);
                             asm volatile(
                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
+                                :: "l"((void*)(quantized + q_offset)), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
                         }
                         unsigned int m_tile = row / 128;
                         unsigned int row_in_tile = row - m_tile * 128;

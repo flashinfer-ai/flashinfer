@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-// This unit serves two programs: cake_grouped_mxfp8_quantize_98bd74316db29c8a3854 (CAKE_PROGRAM_VARIANT 0, the default) and
-// cake_grouped_mxfp8_quantize_733c5e13430c7054c22c (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// This unit serves two programs: cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_ee6861f421c1074d1700 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
 // selects the second program with the compile definitions
-// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_733c5e13430c7054c22c.
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_ee6861f421c1074d1700.
 #ifndef CAKE_PROGRAM_VARIANT
 #define CAKE_PROGRAM_VARIANT 0
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_98bd74316db29c8a3854
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_edc6dda5b5a03f02ac2d
 #endif
 
 typedef signed char        int8_t;
@@ -63,7 +63,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 128
+#define THREADS 256
+#define LAUNCH_MIN_BLOCKS 5
 
 #include <math_constants.h>
 
@@ -96,7 +97,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
 CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, CakeFastDivmod BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS, unsigned int ROWS, unsigned int SUBROWS)
 {
     const int tid = threadIdx.x;
@@ -116,24 +117,31 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
         _vec_load_0[0] = *reinterpret_cast<const int*>(mask + group);
     }
     unsigned int valid_rows = (((unsigned int)_vec_load_0[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_0[0]) : ((unsigned int)M));
-    unsigned int cta_first = (unsigned int)blockIdx.y * (ROWS * SUBROWS);
-    if (cta_first < valid_rows) {
+    unsigned int tile = blockIdx.y;
+    if (tile * (ROWS * SUBROWS) < valid_rows) {
         if (tid == 0) {
-            unsigned int next_first = (unsigned int)blockIdx.y * (ROWS * SUBROWS) + SUBROWS;
-            if (ROWS > 1 && next_first < valid_rows && valid_rows < (unsigned int)M) {
-                unsigned int k_lo = (unsigned int)blockIdx.x * 4096;
-                unsigned int next_rows = ((valid_rows - next_first) < (SUBROWS) ? (valid_rows - next_first) : (SUBROWS));
-                unsigned int _min_0 = (((unsigned int)K - k_lo) < (4096) ? ((unsigned int)K - k_lo) : (4096));
-                unsigned int span = (next_rows - 1) * (unsigned int)K + _min_0;
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)group * (unsigned long long)M + (unsigned long long)next_first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(span * 2)) : "memory");
+            unsigned int far_group = group + 2;
+            if (ROWS > 1 && valid_rows < (unsigned int)M && far_group < (unsigned int)gridDim.z) {
+                int _vec_load_3[1];
+                {
+                    _vec_load_3[0] = *reinterpret_cast<const int*>(mask + far_group);
+                }
+                unsigned int far_valid = (((unsigned int)_vec_load_3[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_3[0]) : ((unsigned int)M));
+                unsigned int far_first = tile * (ROWS * SUBROWS);
+                if (far_first < far_valid && far_valid < (unsigned int)M) {
+                    unsigned int far_k_lo = (unsigned int)blockIdx.x * 8192;
+                    unsigned int far_rows = ((far_valid - far_first) < (ROWS * SUBROWS) ? (far_valid - far_first) : (ROWS * SUBROWS));
+                    unsigned int _min_0 = (((unsigned int)K - far_k_lo) < (8192) ? ((unsigned int)K - far_k_lo) : (8192));
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)far_group * (unsigned long long)M + (unsigned long long)far_first) * (unsigned long long)K + (unsigned long long)far_k_lo)), "r"((uint32_t)(((far_rows - 1) * (unsigned int)K + _min_0) * 2)) : "memory");
+                }
             }
         }
         unsigned int tid_0 = (unsigned int)tid;
-        unsigned int flat = (unsigned int)blockIdx.x * 128 + tid_0;
+        unsigned int flat = (unsigned int)blockIdx.x * 256 + tid_0;
         uint32_t _fast_div_q_0 = (BLOCKS_PER_ROW.divisor != 1) ? (__umulhi((uint32_t)(flat), BLOCKS_PER_ROW.multiplier) >> BLOCKS_PER_ROW.shift_right) : (uint32_t)(flat);
         uint32_t _fast_div_r_0 = (uint32_t)(flat) - _fast_div_q_0 * (uint32_t)(BLOCKS_PER_ROW.divisor);
         if (_fast_div_q_0 < SUBROWS) {
-            unsigned int first_row = cta_first + _fast_div_q_0;
+            unsigned int first_row = tile * (ROWS * SUBROWS) + _fast_div_q_0;
             if (first_row < valid_rows) {
                 unsigned int k0 = _fast_div_r_0 * 32;
                 unsigned int row = first_row;
