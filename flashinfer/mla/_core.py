@@ -2150,15 +2150,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         yet include the 128 SWA slots (``128``) or shrink every row uniformly.
         Combined with ``extra_sparse_topk_lens`` the implied 128 is added on
         top of this value.
-
-    Returns
-    -------
-    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
-        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
-        ``[sum_q, 16, 4096]`` and group-major strides
-        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
-        layout described above.
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor]
         Caller-owned, zero-initialized ``uint8`` buffer for the TRTLLM-GEN
         multi-CTA KV split semaphores, sized by
@@ -2201,6 +2192,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "cake"`` rejects them). Footer and inline caches cannot be told apart
         from their shapes, so the format must name the layout the cache was
         written in.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
+        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
+        ``[sum_q, 16, 4096]`` and group-major strides
+        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
+        layout described above.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(

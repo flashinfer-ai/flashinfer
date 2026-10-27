@@ -42,6 +42,7 @@ the backend column indicates which kernel the API wraps.
 
 from functools import lru_cache
 import math
+from typing import Dict, Union
 
 import torch
 
@@ -4871,7 +4872,11 @@ def _dsv4_kv_cache_input(kv_form: str, pool: str, *, optional: bool) -> Tensor:
     )
 
 
+_TraceIO = Dict[str, Union[Tensor, Scalar]]
+
+
 def _dsv4_query_io(ragged: bool):
+    inputs: _TraceIO
     if ragged:
         query_dims = ["num_tokens", "num_heads", "head_dim"]
         output_dims = ["num_tokens", "num_heads", "head_dim_v"]
@@ -4912,7 +4917,7 @@ _DSV4_HEAD_AXES = {
     "kv_pad_dim": Const(abbrev="", value=1),
 }
 
-_DSV4_SCALE_INPUTS = {
+_DSV4_SCALE_INPUTS: _TraceIO = {
     "bmm1_scale": Scalar(
         "float32",
         optional=True,
@@ -4935,8 +4940,8 @@ _DSV4_SCALE_INPUTS = {
 _DSV4_TAGS = ["status:wip", "stage:decode", "mla", "sparse:topk", "model:dsv4"]
 
 
-def _dsv4_sparse_mla_metadata_inputs(*, rope_quant: bool):
-    inputs = {
+def _dsv4_sparse_mla_metadata_inputs(*, rope_quant: bool) -> _TraceIO:
+    inputs: _TraceIO = {
         "sparse_indices": Tensor(
             ["num_index_rows", "sparse_topk"],
             dtype="int32",
@@ -5053,7 +5058,7 @@ def _make_dsv4_sparse_mla_trace(ragged: bool, kv_form: str, rope_quant: bool):
             description="1 for the inline-scale DSv4.1 cache records.",
             extract=_dsv4_inline_scales,
         )
-    inputs = {
+    inputs: _TraceIO = {
         "query": Tensor(query_dims, description="BF16 or FP8 E4M3 query."),
         "swa_kv_cache": _dsv4_kv_cache_input(kv_form, "swa", optional=False),
         "workspace_buffer": Tensor(["workspace_bytes"], dtype="uint8"),
@@ -5085,7 +5090,7 @@ def _make_dsv4_sparse_mla_trace(ragged: bool, kv_form: str, rope_quant: bool):
             dtype="float32",
             description="Per-position [cos(32), sin(32)] for interleaved RoPE.",
         )
-        outputs = {
+        outputs: _TraceIO = {
             "output": Tensor(
                 [
                     "num_q_tokens",
