@@ -1518,11 +1518,19 @@ class Sm100BlockScaledGroupedGemmKernel:
                         first_producer.advance()
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
-        if cutlass.const_expr(self.enable_iket):
-            _iket.range_push("startup_dependency_wait")
-        griddepcontrol_wait()
-        if cutlass.const_expr(self.enable_iket):
-            _iket.range_pop()
+        waits_for_payload = cutlass.Boolean(True)
+        if cutlass.const_expr(
+            self.use_clc_scheduler and self.prefetch_weights_before_wait
+        ):
+            # The same startup release that permits weight prefetch publishes
+            # routing metadata. Only payload readers need the dependency wait.
+            waits_for_payload = warp != self.schedule_warp
+        if waits_for_payload:
+            if cutlass.const_expr(self.enable_iket):
+                _iket.range_push("startup_dependency_wait")
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.enable_iket):
+                _iket.range_pop()
         if cutlass.const_expr(self.pdl_signal_at == "startup"):
             if cutlass.const_expr(self.publish_routing_before_signal):
                 # Only warp zero triggers at startup; on publication owners,
@@ -1532,7 +1540,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         if publishes_ancestors:
                             release_gpu()
                     griddepcontrol_launch_dependents()
-            else:
+            elif waits_for_payload:
                 if cutlass.const_expr(
                     self.enable_pdl
                     and self.scatter_output
@@ -2140,6 +2148,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 info_pipe.producer_tail(info_producer)
                 if cta_rank == 0:
                     clc_pipe.producer_tail(clc_producer)
+                if cutlass.const_expr(self.prefetch_weights_before_wait):
+                    griddepcontrol_wait()
         pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
         ).arrive_and_wait()
