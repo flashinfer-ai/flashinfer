@@ -441,7 +441,6 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             unsigned int _phase_fn_empty = 1;
             unsigned int _phase_stage_empty_e = 1;
-            unsigned int _phase_stage_empty = 1;
             if (elect_sync()) {
                 const int bid_0 = (int)bid;
                 const int grid = (int)num_bids;
@@ -510,7 +509,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                             tma_2d_gmem2smem(dy2_addr + ld_stage * 86016, (&dY), k0 + 8192, t0, stage_full_addr + (ld_stage) * 8);
                             tma_2d_gmem2smem(dy3_addr + ld_stage * 86016, (&dY), k0 + 12288, t0, stage_full_addr + (ld_stage) * 8);
                             mbarrier_arrive_expect_tx(stage_full_addr + (ld_stage) * 8, 40960);
-                            mbarrier_wait(stage_empty_addr + (ld_stage) * 8, _phase_stage_empty);
+                            mbarrier_wait(stage_empty_addr + (ld_stage) * 8, _phase_stage_empty_e);
                             tma_2d_gmem2smem(x0_addr + ld_stage * 86016, (&X), k0, t0, stage_full_x_addr + (ld_stage) * 8);
                             tma_2d_gmem2smem(x1_addr + ld_stage * 86016, (&X), k0 + 4096, t0, stage_full_x_addr + (ld_stage) * 8);
                             tma_2d_gmem2smem(x2_addr + ld_stage * 86016, (&X), k0 + 8192, t0, stage_full_x_addr + (ld_stage) * 8);
@@ -563,7 +562,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                                 }
                             }
                             ld_stage += 1;
-                            if (ld_stage == 2) { ld_stage = 0; _phase_stage_empty_e ^= 1; _phase_stage_empty ^= 1; }
+                            if (ld_stage == 2) { ld_stage = 0; _phase_stage_empty_e ^= 1; }
                         }
                     }
                 }
@@ -584,7 +583,6 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
             unsigned int _phase_fn_full = 0;
             unsigned int _phase_acc_empty = 1;
             unsigned int _phase_stage_full_z = 0;
-            unsigned int _phase_stage_full_x = 0;
             #pragma unroll 1
             for (int j_1 = 0; j_1 < n_mine_1; j_1++) {
                 int u_1 = bid_0_1 + j_1 * grid_1;
@@ -787,7 +785,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                     "}\n"
                     :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
                         elect_commit(acc_full_addr + (acc_mm) * 8);
-                        mbarrier_wait(stage_full_x_addr + (mm_stage) * 8, _phase_stage_full_x);
+                        mbarrier_wait(stage_full_x_addr + (mm_stage) * 8, _phase_stage_full_z);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
@@ -1052,7 +1050,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                         acc_mm += 1;
                         if (acc_mm == 2) { acc_mm = 0; _phase_acc_empty ^= 1; }
                         mm_stage += 1;
-                        if (mm_stage == 2) { mm_stage = 0; _phase_stage_full_z ^= 1; _phase_stage_full_x ^= 1; }
+                        if (mm_stage == 2) { mm_stage = 0; _phase_stage_full_z ^= 1; }
                     }
                     elect_commit(fn_empty_addr);
                     _phase_fn_full ^= 1;
@@ -1140,9 +1138,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
             }
             int qa_pre = 0;
             unsigned int _phase_acc_full = 0;
-            unsigned int _phase_stage_full_x_1 = 0;
-            unsigned int _phase_stage_full = 0;
-            unsigned int _phase_dfn_full = 0;
+            unsigned int _phase_stage_full_x = 0;
             #pragma unroll 1
             for (int j_2 = 0; j_2 < n_mine_2; j_2++) {
                 int u_2 = bid_0_2 + j_2 * grid_2;
@@ -1279,9 +1275,9 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                     unsigned int wv1[5];
                     unsigned int xr0[2];
                     unsigned int xr1[2];
-                    mbarrier_wait(stage_full_x_addr + (ep_stage) * 8, _phase_stage_full_x_1);
-                    mbarrier_wait(stage_full_addr + (ep_stage) * 8, _phase_stage_full);
-                    mbarrier_wait(dfn_full_addr + (acc_ep) * 8, _phase_dfn_full);
+                    mbarrier_wait(stage_full_x_addr + (ep_stage) * 8, _phase_stage_full_x);
+                    mbarrier_wait(stage_full_addr + (ep_stage) * 8, _phase_stage_full_x);
+                    mbarrier_wait(dfn_full_addr + (acc_ep) * 8, _phase_acc_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int rb0 = sbase + offg[0] + rowb0;
                     unsigned int rb1 = rb0 + 1024;
@@ -2778,7 +2774,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                         mbarrier_arrive(acc_empty_addr + (acc_ep) * 8);
                     }
                     acc_ep += 1;
-                    if (acc_ep == 2) { acc_ep = 0; _phase_acc_full ^= 1; _phase_dfn_full ^= 1; }
+                    if (acc_ep == 2) { acc_ep = 0; _phase_acc_full ^= 1; }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     __syncwarp();
@@ -2791,7 +2787,7 @@ kernel_cake_mhc_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, cons
                         mbarrier_arrive(stage_empty_addr + (ep_stage) * 8);
                     }
                     ep_stage += 1;
-                    if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x_1 ^= 1; _phase_stage_full ^= 1; }
+                    if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x ^= 1; }
                 }
                 unsigned long long kcol = (unsigned long long)(i_str * 4096 + s_3 * 64 + dl);
                 unsigned long long pbase = (unsigned long long)p_3 * 393216;
