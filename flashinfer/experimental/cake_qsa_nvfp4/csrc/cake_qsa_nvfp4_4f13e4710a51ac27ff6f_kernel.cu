@@ -158,6 +158,11 @@ kernel_cake_qsa_nvfp4_4f13e4710a51ac27ff6f(__nv_bfloat16* __restrict__ q, uint8_
     // === Task calls (declaration order) ===
     int row = blockIdx.x;
     int kv_head = blockIdx.y;
+#if __CUDA_ARCH__ == 800
+    int linear = blockIdx.x + gridDim.x * blockIdx.y;
+    row = linear / gridDim.y;
+    kv_head = linear - row * gridDim.y;
+#endif
     int split = blockIdx.z;
     int tid_0 = tid;
     int warp_1 = tid_0 >> 5;
@@ -356,7 +361,6 @@ kernel_cake_qsa_nvfp4_4f13e4710a51ac27ff6f(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(lut_s_addr), "r"(2071689984), "r"(3229614080u) : "memory");
     }
     unsigned int lut_regs[2];
-#else
 #endif
     float o[32];
     o[0] = 0.0f;
@@ -650,7 +654,6 @@ kernel_cake_qsa_nvfp4_4f13e4710a51ac27ff6f(__nv_bfloat16* __restrict__ q, uint8_
         asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
             : "=r"(*reinterpret_cast<uint32_t*>(&lut_regs[0])), "=r"(*reinterpret_cast<uint32_t*>(&lut_regs[(0) + 1]))
             : "r"(lut_s_addr));
-#else
 #endif
         if (warp_1 < 2 && multi) {
             int column_0 = (tile + 3 * num_splits) * 64 + token;

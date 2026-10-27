@@ -158,6 +158,12 @@ kernel_cake_qsa_nvfp4_ecb46ae2b040daa1c35d(__nv_bfloat16* __restrict__ q, uint8_
     // === Task calls (declaration order) ===
     int row = blockIdx.x;
     int kv_head = blockIdx.y;
+#if __CUDA_ARCH__ == 1200
+#else
+    int linear = blockIdx.x + gridDim.x * blockIdx.y;
+    row = linear / gridDim.y;
+    kv_head = linear - row * gridDim.y;
+#endif
     int split = blockIdx.z;
     int tid_0 = tid;
     int warp_1 = tid_0 >> 5;
