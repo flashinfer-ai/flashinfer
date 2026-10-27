@@ -1284,41 +1284,41 @@ class NVFP4QuantizePerTokenKernel:
         if tidx == Int32(0):
             mPerTokenScale[row_idx] = per_token_scale
 
-        # Pass 2: quantise the register copy.
+        # Pass 2: quantise only owned blocks; tail lanes still joined the amax pass.
         for j in cutlass.range_constexpr(self.blocks_per_thread):
             sf_col_idx = tidx + Int32(j * self.threads)
-            h0, h1, h2, h3, h4, h5, h6, h7 = words[j]
-            if cutlass.const_expr(self.is_bfloat16):
-                scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_bfloat(
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    h4,
-                    h5,
-                    h6,
-                    h7,
-                    global_encode_scale,
-                    self.disable_fp4_quant_fast_math,
-                    self.nvfp4_4over6_config,
-                    row_amax,
-                )
-            else:
-                scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_half(
-                    h0,
-                    h1,
-                    h2,
-                    h3,
-                    h4,
-                    h5,
-                    h6,
-                    h7,
-                    global_encode_scale,
-                    self.disable_fp4_quant_fast_math,
-                    self.nvfp4_4over6_config,
-                    row_amax,
-                )
             if sf_col_idx < num_sf_blocks_per_row:
+                h0, h1, h2, h3, h4, h5, h6, h7 = words[j]
+                if cutlass.const_expr(self.is_bfloat16):
+                    scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_bfloat(
+                        h0,
+                        h1,
+                        h2,
+                        h3,
+                        h4,
+                        h5,
+                        h6,
+                        h7,
+                        global_encode_scale,
+                        self.disable_fp4_quant_fast_math,
+                        self.nvfp4_4over6_config,
+                        row_amax,
+                    )
+                else:
+                    scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_half(
+                        h0,
+                        h1,
+                        h2,
+                        h3,
+                        h4,
+                        h5,
+                        h6,
+                        h7,
+                        global_encode_scale,
+                        self.disable_fp4_quant_fast_math,
+                        self.nvfp4_4over6_config,
+                        row_amax,
+                    )
                 sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
                 mScales[sf_offset] = scale_fp8
                 out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
