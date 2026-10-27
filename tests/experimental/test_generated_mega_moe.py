@@ -37,6 +37,15 @@ TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
 # with the TP/EP routes.
 SHARED_TOKENS = (1, 16, 128, 512, 1024, 4096)
 TOP_K, HIDDEN = 6, 5120
+# The TP/EP routes of up to 32 tokens, whose dispatch marks a foreign route's
+# token_to_permuted entry -1 from its pair loop, and the rank each case runs
+# as: rank 0, and rank 1 of the expert-parallel cases.
+ROUTING_CHANGE_TOKENS = (1, 4, 16, 32)
+ROUTING_CHANGE_RANKS = [
+    (case, rank)
+    for case, geometry in TP_EP_CASES.items()
+    for rank in ((0, 1) if geometry["ep"] > 1 else (0,))
+]
 
 
 @pytest.fixture(autouse=True)
@@ -736,3 +745,123 @@ def test_ep_rank_matches_the_global_program(case, num_tokens):
     masked = dict(inputs, topk_idx=torch.where(local, inputs["topk_idx"], -1))
     plan = _v3_runtime.prepare_pipeline(masked)
     torch.testing.assert_close(run_once(plan), partial, atol=0, rtol=0)
+
+
+def fresh_plan_output(inputs):
+    """Output of one launch of a plan prepared for ``inputs`` on a workspace of
+    its own; the plan is released before the caller prepares another."""
+    plan = _v3_runtime.prepare_pipeline(inputs)
+    output = run_once(plan)
+    del plan
+    return output
+
+
+def masked_routing(inputs):
+    """The routing of ``inputs`` with -1 slots added and nothing else: tokens
+    1 mod 4 are masked the way a routing gate writes them (every slot -1,
+    weight 0) and tokens 0 mod 4 with a local slot drop their first local
+    slot, whose weight stays nonzero and which must not count. Returns the
+    ids, the weights and the ``[T, top_k]`` mask of the slots this rank
+    computes under the routing of ``inputs`` and routes nowhere under the
+    masked one."""
+    local = local_slots(inputs)
+    token = torch.arange(inputs["num_tokens"], device="cuda")
+    masked = token % 4 == 1
+    dropped = ((token % 4 == 0) & local.any(dim=1)).nonzero().squeeze(1)
+    ids = inputs["topk_idx"].clone()
+    weights = inputs["topk_weights"].clone()
+    ids[masked] = -1
+    weights[masked] = 0.0
+    ids[dropped, local.to(torch.int8).argmax(dim=1)[dropped]] = -1
+    return ids, weights, local & (ids < 0)
+
+
+@pytest.mark.parametrize("num_tokens", ROUTING_CHANGE_TOKENS)
+@pytest.mark.parametrize(
+    ("case", "rank"),
+    ROUTING_CHANGE_RANKS,
+    ids=[f"{case}-rank{rank}" for case, rank in ROUTING_CHANGE_RANKS],
+)
+def test_tp_ep_routing_change_on_one_workspace(case, rank, num_tokens):
+    """One plan, one workspace, two routings of a TP/EP route of up to 32
+    tokens (the dispatch form that marks a foreign route's token_to_permuted
+    entry -1 from its pair loop). Routing B is routing A with -1 slots added
+    and nothing else (tokens 1 mod 4 masked at weight 0, tokens 0 mod 4
+    dropping their first local slot at nonzero weight), so B's rows and tiles
+    fit the pools prepared for A, and it is written in place into the route
+    tensors the plan binds. A launch of B after a launch of A marks -1 an
+    entry the launch before wrote as a real row: the one order in which an
+    entry read before the dispatch's store would add a row to the combine.
+    Three alternations, three more with every entry pre-filled to row 0, and
+    the alternation captured as one graph reproduce the outputs of fresh plans
+    of both routings bit for bit, leave every -1 slot's entry -1 and the
+    workspace clean."""
+    inputs, xs = case_inputs(case, num_tokens, rank=rank)
+    bound_ids, bound_weights = inputs["topk_idx"], inputs["topk_weights"]
+    ids_a, weights_a = bound_ids.clone(), bound_weights.clone()
+    local_a = local_slots(inputs)
+    ids_b, weights_b, flipped = masked_routing(inputs)
+    # Token 0 holds a local slot on every rank, so every token count flips one.
+    assert flipped.any().item()
+    unrouted_b = ids_b < 0
+    inputs_b = dict(inputs, topk_idx=ids_b, topk_weights=weights_b)
+    ref_a = fresh_plan_output(inputs)
+    ref_b = fresh_plan_output(inputs_b)
+    torch.testing.assert_close(ref_a, model_reference(inputs, xs), atol=1.0, rtol=0.1)
+    torch.testing.assert_close(ref_b, model_reference(inputs_b, xs), atol=1.0, rtol=0.1)
+    plan = _v3_runtime.prepare_pipeline(inputs)
+    bindings = plan.stages[0].bindings
+    # The plan binds int32 and flat views of the caller's route tensors: a
+    # routing copied into those tensors is the routing of the next launch.
+    assert bindings["topk_idx_i32"].data_ptr() == bound_ids.data_ptr()
+    assert bindings["topk_weights"].data_ptr() == bound_weights.data_ptr()
+    cleared = scratch_cleared(plan)
+    permuted = bindings["token_to_permuted"].reshape(ids_a.shape)
+
+    def launch(ids, weights):
+        bound_ids.copy_(ids)
+        bound_weights.copy_(weights)
+        return run_once(plan)
+
+    def check_b(output, entries):
+        torch.testing.assert_close(output, ref_b, atol=0, rtol=0)
+        assert (entries[unrouted_b] == -1).all().item()
+        check_v3_workspace(plan, scratch_cleared=cleared)
+
+    def check_a(output, entries):
+        torch.testing.assert_close(output, ref_a, atol=0, rtol=0)
+        assert (entries[~local_a] == -1).all().item()
+        assert (entries[local_a] >= 0).all().item()
+        check_v3_workspace(plan, scratch_cleared=cleared)
+
+    check_a(launch(ids_a, weights_a), permuted)
+    for _ in range(3):
+        check_b(launch(ids_b, weights_b), permuted)
+        check_a(launch(ids_a, weights_a), permuted)
+    # Row 0 of the pools is a real row: an entry read as 0 would add
+    # expert_output[0] to the combine.
+    for _ in range(3):
+        permuted.fill_(0)
+        check_b(launch(ids_b, weights_b), permuted)
+        check_a(launch(ids_a, weights_a), permuted)
+    # The alternation captured once: the route copies are memcpy nodes, which
+    # the kernel nodes depend on fully, and the launch before every B launch
+    # is an A launch, whose entries a read before the dispatch's store returns.
+    output_b = torch.empty_like(plan.outputs)
+    entries_b = torch.empty_like(permuted)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(3):
+            bound_ids.copy_(ids_b)
+            bound_weights.copy_(weights_b)
+            plan.run()
+            output_b.copy_(plan.outputs)
+            entries_b.copy_(permuted)
+            bound_ids.copy_(ids_a)
+            bound_weights.copy_(weights_a)
+            plan.run()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        check_b(output_b, entries_b)
+        check_a(plan.outputs, permuted)
