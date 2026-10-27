@@ -683,6 +683,13 @@ FRONT_SK_MIN_GAIN = (
 FRONT_EVICT_FIRST_MAX_PAIR_ROWS = (
     2  # weight boxes re-read by <= 2 pair rows stream evict_first
 )
+#: Larger re-read bounds for ``evict_first`` (pair rows) where it measured faster; a re-route of the weights' L2
+#: policy only, so the outputs stay bitwise.  Per shared-intermediate width on every qualified part: the TP8 rows of
+#: three pair rows (T = 513-768).
+FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_I_LOCAL = {768: 3}
+#: Per (shared-intermediate width, SM count), above that: on 152-SM parts (GB300 / GB200) every TP8 row up to
+#: T = 16384 and the TP1 rows up to T = 2048.  148-SM parts (B200 / B300) keep the bounds above.
+FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_PART = {(768, 152): 64, (6144, 152): 8}
 
 
 def front_split_plan(cluster_tiles: int, sm_count: int = SM_COUNT) -> dict[str, int]:
@@ -718,10 +725,20 @@ def front_split_plan(cluster_tiles: int, sm_count: int = SM_COUNT) -> dict[str, 
     }
 
 
-def front_evict_first(m_tiles: int) -> bool:
+def front_evict_first(m_tiles: int, i_local: int, sm_count: int = SM_COUNT) -> bool:
     """Round-8 lever 13b: shapes whose weight boxes are re-read by at most two pair rows (T <= 512)
-    stream the weights with the ``evict_first`` L2 policy (a separate kernel instance)."""
-    return (m_tiles // CTA_GROUP) <= FRONT_EVICT_FIRST_MAX_PAIR_ROWS
+    stream the weights with the ``evict_first`` L2 policy (a separate kernel instance); the TP8
+    front also at three pair rows (``FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_I_LOCAL``), and further rows
+    on 152-SM parts (``FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_PART``).  The decision is the plan's
+    ``evict_first`` field; the kernel key composes it (``front_kernel_key``)."""
+    i_local = int(i_local)
+    limit = FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_PART.get(
+        (i_local, int(sm_count)),
+        FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_I_LOCAL.get(
+            i_local, FRONT_EVICT_FIRST_MAX_PAIR_ROWS
+        ),
+    )
+    return (m_tiles // CTA_GROUP) <= limit
 
 
 # Round-4 lever T1F stage 2: on 152-SM parts the TP1 front rows of more than 128 and at most 512 tokens (one and two
@@ -768,7 +785,7 @@ def prefill_front_plan(
     n_tiles = front_n_tiles(i_local, block_n)
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     sk = front_split_plan(cluster_tiles, sm_count)
-    evict_first = bool(front_evict_first(m_tiles))
+    evict_first = bool(front_evict_first(m_tiles, i_local, sm_count))
     if block_n != FRONT_BLOCK_N and (sk["sk_max_seg"] != 1 or not evict_first):
         raise AssertionError(
             f"the {block_n}-wide front instance runs whole evict_first tiles only (M={M}, plan {sk})"
@@ -1105,7 +1122,7 @@ def route_kernel_keys(
         return (
             front_kernel_key(
                 i_local,
-                front_evict_first(m_tiles_for(num_tokens)),
+                front_evict_first(m_tiles_for(num_tokens), i_local, sm_count),
                 front_block_n(num_tokens, i_local, sm_count),
             ),
         )

@@ -342,7 +342,29 @@ def test_front_split_plan_rules():
     assert prefill_front_plan(256, i_local_for_tp(1))["grid"] == cb.front_grid(
         cb.m_tiles_for(256), i_local_for_tp(1)
     )
-    assert cb.front_evict_first(4) and not cb.front_evict_first(6)
+    # evict_first weights up to two pair rows; the TP8 front up to three (T <= 768); on 152 SMs the
+    # TP8 front up to 64 pair rows (T <= 16384) and the TP1 front up to eight (T <= 2048).
+    assert cb.front_evict_first(4, 6144) and not cb.front_evict_first(6, 6144)
+    assert cb.front_evict_first(6, 768) and not cb.front_evict_first(8, 768)
+    assert cb.front_evict_first(6, 768, 148) and not cb.front_evict_first(8, 768, 148)
+    assert cb.front_evict_first(128, 768, 152)
+    assert not cb.front_evict_first(130, 768, 152)
+    assert cb.front_evict_first(16, 6144, 152)
+    assert not cb.front_evict_first(18, 6144, 152)
+    assert prefill_front_plan(768, i_local_for_tp(8))["evict_first"]
+    assert prefill_front_plan(513, i_local_for_tp(8))["evict_first"]
+    assert not prefill_front_plan(769, i_local_for_tp(8))["evict_first"]
+    assert not prefill_front_plan(768, i_local_for_tp(1))["evict_first"]
+    assert prefill_front_plan(16384, i_local_for_tp(8), 152)["evict_first"]
+    assert not prefill_front_plan(16385, i_local_for_tp(8), 152)["evict_first"]
+    assert prefill_front_plan(2048, i_local_for_tp(1), 152)["evict_first"]
+    assert not prefill_front_plan(2049, i_local_for_tp(1), 152)["evict_first"]
+    for sm_count in QUALIFIED_SM_COUNTS:
+        assert route_kernel_keys("front", 8, 768, sm_count) == ("front:i768e1",)
+    assert route_kernel_keys("front", 1, 768, 148) == ("front:i6144",)
+    assert route_kernel_keys("front", 1, 768, 152) == ("front:i6144e1",)
+    assert route_kernel_keys("front", 8, 4096, 148) == ("front:i768",)
+    assert route_kernel_keys("front", 8, 4096, 152) == ("front:i768e1",)
 
 
 def test_prefill_tail_plan_and_trigger():
@@ -551,8 +573,12 @@ def test_plans_follow_the_device_sm_count():
             same_front = route_kernel_keys(
                 "front", tp, tokens, 148
             ) == route_kernel_keys("front", tp, tokens, 152)
-            # The TP1 front rows of 129..512 tokens take the 224-wide tile on 152 SMs.
-            assert same_front == (tp != 1 or not DECODE_MAX_T < tokens <= 512)
+            # The TP1 front rows of 129..512 tokens take the 224-wide tile on 152 SMs, which also
+            # stream the front weights evict_first further: TP8 up to 16384 tokens, TP1 up to 2048.
+            differs = (tp == 1 and DECODE_MAX_T < tokens <= 2048) or (
+                tp == 8 and 768 < tokens <= 16384
+            )
+            assert same_front == (not differs)
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
                 "tail", tp, tokens, 152
             )
@@ -930,7 +956,7 @@ def test_front_matches_reference(tp, tokens):
         shared_act,
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
-    assert runner.kernel_keys == route_kernel_keys("front", tp, tokens)
+    assert runner.kernel_keys == route_kernel_keys("front", tp, tokens, runner.sm_count)
     runner()
     torch.cuda.synchronize()
     expected = front_reference(x, w)
@@ -971,6 +997,67 @@ def test_front_matches_reference(tp, tokens):
         torch.equal(a, b)
         for a, b in zip(first, (logits, latent, shared_act), strict=True)
     )
+
+
+def _front_case(device, tp, tokens, seed):
+    w = shard(_weights(device), tp, 0)
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    x = (
+        torch.randn(tokens, HIDDEN, generator=gen, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    shared_gate_up = torch.cat(
+        [w["shared_gate_weight"], w["shared_up_weight"]], dim=0
+    ).contiguous()
+    return w, x, shared_gate_up
+
+
+def _front_run(w, x, shared_gate_up, tp):
+    """Prepare and launch the front on fresh NaN-filled outputs; the runner and its outputs."""
+    tokens, device = x.shape[0], x.device
+    outs = (
+        torch.full((tokens, NUM_EXPERTS), float("nan"), device=device),
+        torch.full((tokens, LATENT), float("nan"), dtype=torch.bfloat16, device=device),
+        torch.full(
+            (tokens, SHARED_INTERMEDIATE // tp),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    )
+    runner = prepare_kimi_k3_latent_moe_front(
+        x, w["gate_weight"], w["down_weight"], shared_gate_up, *outs
+    )
+    runner()
+    torch.cuda.synchronize()
+    return runner, outs
+
+
+@pytest.mark.parametrize(("tp", "tokens"), ((8, 640), (8, 768), (8, 4096), (1, 1024)))
+def test_front_evict_first_rows_are_a_reroute(monkeypatch, tp, tokens):
+    """The rows past the two-pair-row bound that stream the weights evict_first (TP8 up to three
+    pair rows; on 152 SMs every TP8 row and TP1 up to eight): the same outputs, bitwise, as the
+    default-policy instance."""
+    device = _require_program("front", tp, tokens)
+    il = i_local_for_tp(tp)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if not cb.front_evict_first(cb.m_tiles_for(tokens), il, sm_count):
+        pytest.skip(
+            f"T={tokens} TP{tp} keeps the default weight policy on {sm_count} SMs"
+        )
+    w, x, shared_gate_up = _front_case(device, tp, tokens, 2700 + tokens)
+    runner, outs = _front_run(w, x, shared_gate_up, tp)
+    assert runner.kernel_keys == (f"front:i{il}e1",)
+    monkeypatch.setattr(cb, "FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_I_LOCAL", {})
+    monkeypatch.setattr(cb, "FRONT_EVICT_FIRST_MAX_PAIR_ROWS_BY_PART", {})
+    cb.prefill_front_plan.cache_clear()
+    try:
+        default, default_outs = _front_run(w, x, shared_gate_up, tp)
+    finally:
+        cb.prefill_front_plan.cache_clear()
+    assert default.kernel_keys == (f"front:i{il}",)
+    assert all(torch.equal(a, b) for a, b in zip(outs, default_outs, strict=True))
 
 
 @pytest.mark.parametrize("tokens", SMOKE_TOKENS)
