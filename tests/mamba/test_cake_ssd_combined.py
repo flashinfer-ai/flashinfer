@@ -7214,11 +7214,29 @@ def test_source_sm107_fp32_one_chunk_items_above_the_bound_take_exactpre():
 
 
 @pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
-def test_source_sm107_retained_noring_call_takes_the_fused_program(monkeypatch, arch):
+@pytest.mark.parametrize(
+    ("num_seqs", "sm107_program"),
+    (
+        # 3 / 6 x 128 = 384 / 768 items: at most four items per SM (212 SMs)
+        (3, "exactfused_bf16_varlen_noring"),
+        (6, "exactfused_bf16_varlen_noring"),
+        # 7 x 128 = 896 and 8 x 128 = 1024 items: the ring exactpre program
+        (7, "exactpre_bf16_varlen"),
+        (8, "exactpre_bf16_varlen"),
+        # 24 x 128 = 3072 items: the ring two-kernel family is the retained
+        # exact program (above the 2048-item one-chunk bound)
+        (24, "exactfused_bf16_varlen_noring"),
+    ),
+)
+def test_source_sm107_retained_noring_call_takes_the_fused_program(
+    monkeypatch, arch, num_seqs, sm107_program
+):
     """On SM107 a call the retained ``exact_*_noring`` program would serve
-    (8 packed 64-token sequences x 128 heads with z: one-chunk items outside
-    the fused varlen window, on the start schedule) runs the fused program
-    of the same variant instead; SM103 keeps the retained program."""
+    (packed 64-token sequences x 128 heads with z: one-chunk items outside
+    the fused varlen window, on the start schedule) runs the ring
+    ``exactpre`` program where it has more than four items per SM and its
+    ring two-kernel family is ``exactpre``, else the fused program of the
+    same variant; SM103 keeps the retained program."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -7233,7 +7251,8 @@ def test_source_sm107_retained_noring_call_takes_the_fused_program(monkeypatch, 
         has_z=True,
         arch=arch,
     )
-    num_seqs, tokens = 8, 64
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    tokens = 64
     seqlen = num_seqs * tokens
     x = torch.empty((1, seqlen, 128, 64), dtype=torch.bfloat16)
     dt = torch.empty((1, seqlen, 128), dtype=torch.float32)
@@ -7249,8 +7268,119 @@ def test_source_sm107_retained_noring_call_takes_the_fused_program(monkeypatch, 
     }
     runner.run(x, dt, A, B, C, **kwargs)
     ((name, _launch),) = calls
-    expected = "exactfused" if arch == "sm_107a" else "exact"
-    assert name == f"{expected}_bf16_varlen_noring"
+    expected = sm107_program if arch == "sm_107a" else "exact_bf16_varlen_noring"
+    assert name == expected
+
+
+def test_source_sm107_fused_window_extension_without_z():
+    """On SM107 calls without z whose fused program needs no stage take the
+    fused program beyond the seed window: batched one-chunk calls up to 2048
+    items, packed-varlen calls up to 512 items within 512 packed
+    chunk-items; other capabilities and larger calls keep the seed window."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._FUSED_NO_Z_MAX_ITEMS == {(10, 7): (2048, 512)}
+
+    def ext(capability, num_sequences, chunks, mode_varlen, nheads=8):
+        return module.fused_no_z_extended(
+            capability=capability,
+            nheads=nheads,
+            num_sequences=num_sequences,
+            nchunks=chunks if not mode_varlen else num_sequences * chunks,
+            mode_varlen=mode_varlen,
+            total_tokens=num_sequences * chunks * 128,
+        )
+
+    # batched: 256 x 8 heads = 2048 one-chunk items (perf_batched_256x1)
+    assert ext((10, 7), 256, 1, False)
+    assert ext((10, 7), 136, 1, False)
+    assert not ext((10, 7), 257, 1, False)
+    assert not ext((10, 7), 192, 2, False)
+    # varlen: 64 x 8 heads = 512 one-chunk items (perf_varlen_64x1)
+    assert ext((10, 7), 64, 1, True)
+    assert ext((10, 7), 4, 1, True, nheads=128)
+    assert not ext((10, 7), 65, 1, True)
+    # 16 x 8 heads x 8 chunks: 1024 packed chunk-items
+    assert not ext((10, 7), 16, 8, True)
+    for capability in ((10, 0), (10, 3)):
+        assert not ext(capability, 256, 1, False)
+        assert not ext(capability, 64, 1, True)
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("form", "has_z", "sm107_family"),
+    (
+        ("batched", False, "exactfused"),
+        ("batched", True, "exactpre"),
+        ("caller", False, "exactfused"),
+        ("cu_seqlens", False, "exactfused"),
+        ("caller", True, "exactpre"),
+        # the triple form deriving its table keeps the two-kernel program
+        ("derived", False, "exactpre"),
+    ),
+)
+def test_source_sm107_no_z_calls_take_the_fused_program(
+    monkeypatch, arch, form, has_z, sm107_family
+):
+    """On SM107 a call without z outside the seed fused window but inside
+    the extension (256 x 8 heads batched one-chunk items; 64 x 8 heads
+    packed 128-token sequences) runs the fused program where it needs no
+    stage ahead of it; calls with z, the derived-table triple form and
+    SM103 keep the two-kernel program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    varlen = form != "batched"
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=varlen,
+        has_initial_states=varlen,
+        has_z=has_z,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs = 64 if varlen else 256
+    batch, seqlen = (1, num_seqs * 128) if varlen else (num_seqs, 128)
+    x = torch.empty((batch, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {}
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if varlen:
+        kwargs["initial_states"] = torch.empty(
+            (num_seqs, 8, 64, 128), dtype=torch.bfloat16
+        )
+        if form == "cu_seqlens":
+            kwargs["cu_seqlens"] = torch.arange(
+                0, (num_seqs + 1) * 128, 128, dtype=torch.int32
+            )
+        else:
+            kwargs["seq_idx"] = torch.arange(
+                num_seqs, dtype=torch.int32
+            ).repeat_interleave(128)[None]
+            kwargs["chunk_indices"] = torch.arange(num_seqs, dtype=torch.int32)
+            kwargs["chunk_offsets"] = torch.zeros(num_seqs, dtype=torch.int32)
+            if form == "caller":
+                kwargs["seq_chunk_cumsum"] = torch.arange(
+                    num_seqs + 1, dtype=torch.int32
+                )
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    mode = "varlen" if varlen else "batched"
+    if arch == "sm_107a":
+        assert name == f"{sm107_family}_bf16_{mode}"
+    else:
+        # SM103: the seed window; one-chunk two-kernel calls keep the
+        # retained start program there (no SM103 one-chunk exactpre rule)
+        assert name == f"exact_bf16_{mode}"
 
 
 def test_source_fused_route_mirrors_the_seed_rule():
@@ -7646,12 +7776,13 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     assert launch["preprocess_grid"][0] >= 1
     assert len(runner._workspaces) == 3
 
-    # Outside the fused window (257 one-token sequences > 256 items) the
-    # trusted table keeps the two-kernel program: one chunk per item, so the
-    # retained start ``exact`` program (``two_kernel_family``) -- on sm_107a,
-    # with more items than SMs (one on this device) and at most 2048, the
-    # ``exactpre`` program.
-    count = 257
+    # Outside the fused window (513 one-token sequences: more than 256 items,
+    # and more than the 512 items of the sm_107a extension for calls without
+    # z) the trusted table keeps the two-kernel program: one chunk per item,
+    # so the retained start ``exact`` program (``two_kernel_family``) -- on
+    # sm_107a, with more items than SMs (one on this device) and at most
+    # 2048, the ``exactpre`` program.
+    count = 513
     ids = torch.arange(count, dtype=torch.int32)
     wide = {
         "seq_idx": ids.reshape(1, count),

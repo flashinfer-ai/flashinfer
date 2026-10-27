@@ -1561,6 +1561,17 @@ _ONE_CHUNK_EXACTPRE_STATE_DTYPES = {(10, 7): frozenset({torch.float32})}
 # sm_107a: a call the retained ``exact_*_noring`` program would serve takes
 # the fused one-kernel program instead (bf16 state, 8 x 64: 1.34x).
 _NORING_RETAINED_FUSED = frozenset({(10, 7)})
+# sm_107a: a packed-varlen call outside the fused window that the start
+# schedule (``noring``) would serve runs the ring schedule instead where it
+# has more than this many (sequence, head) items per SM and its ring
+# two-kernel family is ``exactpre`` (one-chunk items up to
+# ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS``): there the ring program is faster than
+# the fused start schedule in every call form, outputs bitwise identical.
+# With fewer items per SM the two are close and the cu_seqlens form loses;
+# above ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` items the ring family is the
+# retained ``exact`` program, which is slower, so those calls keep the fused
+# start schedule.
+_NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM = {(10, 7): 4}
 
 
 def fused_selected(
@@ -1672,6 +1683,56 @@ def two_kernel_family(
     ):
         return "exactpre"
     return "exact"
+
+
+# sm_107a (R200, 212 SMs) only: calls without ``z`` whose fused program runs
+# without a stage ahead of it -- batched calls, the cu_seqlens form and the
+# seq_idx triple form with a caller ``seq_chunk_cumsum`` -- take the fused
+# program beyond the seed window (:func:`fused_selected`) up to these
+# (sequence, head) item bounds, where the fused kernel's in-CTA dt work costs
+# less than the segment preprocess launch it replaces: batched one-chunk
+# calls up to the seed's 2048 chunk-items, packed-varlen calls up to 512
+# items within the seed's 512 packed chunk-items (sequences of at most one
+# chunk); outputs are bitwise those of the two-kernel ``exactpre`` program.
+# Past these bounds the fused program stops winning.  With ``z`` it loses on
+# most shapes, so calls with ``z`` keep the seed window.
+_FUSED_NO_Z_MAX_ITEMS = {(10, 7): (2048, 512)}  # (batched, varlen)
+
+
+def fused_no_z_extended(
+    *,
+    capability,
+    nheads: int,
+    num_sequences: int,
+    nchunks: int,
+    mode_varlen: bool,
+    total_tokens: int,
+) -> bool:
+    """The fused-window extension of ``capability`` for calls without ``z``
+    (``_FUSED_NO_Z_MAX_ITEMS``; ``False`` on capabilities it does not list):
+    batched one-chunk calls (``nchunks`` 1) with at most its batched item
+    bound and ``_FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED`` chunk-items;
+    packed-varlen calls with at most its varlen item bound and
+    ``_FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN`` packed chunk-items.  The runner
+    applies it only where the fused program needs no stage ahead of it and
+    the call has no ``z``."""
+
+    bounds = _FUSED_NO_Z_MAX_ITEMS.get((int(capability[0]), int(capability[1])))
+    if bounds is None:
+        return False
+    max_items_batched, max_items_varlen = bounds
+    items = max(int(num_sequences), 1) * int(nheads)
+    if not mode_varlen:
+        return (
+            int(nchunks) == 1
+            and items <= max_items_batched
+            and items <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED
+        )
+    packed_chunks = -(-int(total_tokens) // _CHUNK_SIZE)
+    return (
+        items <= max_items_varlen
+        and packed_chunks * int(nheads) <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN
+    )
 
 
 # Tail-wave pair program (``_tail``): the two-kernel exact-scan kernel launched
@@ -2634,6 +2695,21 @@ class CakeSSDCombined:
                 total_tokens=batch * seqlen,
             )
         )
+        if (
+            not fused
+            and not chunk_parallel
+            and not derives_table
+            and not self.has_z
+            and fused_no_z_extended(
+                capability=capability,
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                nchunks=nchunks,
+                mode_varlen=self.has_varlen,
+                total_tokens=batch * seqlen,
+            )
+        ):
+            fused = True
         # The two-kernel pair program (``tail_selected``) is judged after the
         # fused route and before the ring / noring choice; its route and the
         # retained ``exact`` family are disjoint (16 chunks per item imply
@@ -2671,6 +2747,36 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             )
         )
+        # sm_107a: the start schedule of a packed-varlen call outside the
+        # fused window gives way to the ring ``exactpre`` program above
+        # ``_NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM`` items per SM (judged
+        # before the retained-noring rule below, on the forms that rule
+        # sends to the fused program).
+        ring_items_per_sm = _NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM.get(
+            (int(capability[0]), int(capability[1]))
+        )
+        if (
+            ring_items_per_sm is not None
+            and self.has_varlen
+            and not chunk_parallel
+            and not fused
+            and not tail
+            and variant == "noring"
+            and (not derives_table or light_stage or one_launch)
+            and num_sequences * self.nheads > ring_items_per_sm * sm_count
+            and two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant="",
+                state_dtype=self.state_dtype,
+            )
+            == "exactpre"
+        ):
+            variant = ""
         if (
             tuple(capability) in _NORING_RETAINED_FUSED
             and not chunk_parallel
