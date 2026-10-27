@@ -349,6 +349,12 @@ _SM107_MODULES = {
     "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_72edaa28a6",
     "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_ef9dd3bbea",
     "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_094f7fd546",
+    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_c8567c055e",
+    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_7ea229dbf3",
+    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_ba88fc6e85",
+    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_8cc806049c",
+    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_19ced571a6",
+    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_672a508390",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -713,6 +719,8 @@ _VARIANT_SMEM_BYTES = {
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
     ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
+    ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
+    ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
 }
 # Main dynamic SMEM of the sm_107a renders (``_SM107_MODULES`` entries) whose
 # pool differs from their family and variant literal, by (family, mode,
@@ -791,7 +799,7 @@ def _program_name(
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
     one, ``"tail"``, ``"claim"`` or ``"ibulk"`` for the two-kernel exact-scan
-    family)."""
+    family, ``"tablefirst"`` or ``"tableroles"`` for the one-launch family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -1896,6 +1904,44 @@ def ibulk_selected(
         total_work >= _IBULK_MIN_ITEMS_PER_SM * sm_count
         and chunks_per_item <= _IBULK_MAX_CHUNKS_PER_ITEM
     )
+
+
+# sm_107a: the one-launch ring programs (``exactone_<state>_varlen``) in
+# two further prologue forms, each a program of its own chosen by the
+# launch grid (:func:`_persistent_grid_size`).  Below
+# ``_EXACTONE_TABLE_ROLES_MIN_GRID`` CTAs ``tablefirst``: the CTA derives
+# its private sequence table before the barrier setup, so the derivation's
+# two dependent table loads overlap the mbarrier init and the TMEM alloc.
+# From it on ``tableroles``: each role passes the table barrier right
+# before its work loop instead of in the prologue, so its entry code runs
+# while the derivation's loads are in flight.  Integer table plumbing only:
+# the outputs are bitwise those of the ``exactone`` program.  The
+# ``noring`` calls keep their program.
+_EXACTONE_TABLE_ROLES_MIN_GRID = {(10, 7): 128}
+_EXACTONE_TABLE_STATE_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
+
+
+def exactone_table_variant(
+    *,
+    capability: Optional[tuple[int, int]],
+    variant: str,
+    state_dtype: torch.dtype,
+    grid: int,
+) -> str:
+    """The variant of a one-launch (``exactone``) call: on a capability of
+    ``_EXACTONE_TABLE_ROLES_MIN_GRID``, a ring call (``variant`` ``""``)
+    of a ``_EXACTONE_TABLE_STATE_DTYPES`` state takes ``"tablefirst"`` at a
+    launch ``grid`` below that many CTAs and ``"tableroles"`` from it on;
+    every other call keeps ``variant``."""
+
+    if capability is None or variant or state_dtype not in _EXACTONE_TABLE_STATE_DTYPES:
+        return variant
+    roles_min = _EXACTONE_TABLE_ROLES_MIN_GRID.get(
+        (int(capability[0]), int(capability[1]))
+    )
+    if roles_min is None:
+        return variant
+    return "tablefirst" if grid < roles_min else "tableroles"
 
 
 # Tail-wave pair program (``_tail``): the two-kernel exact-scan kernel launched
@@ -3050,6 +3096,15 @@ class CakeSSDCombined:
                 )
             ):
                 variant = "ibulk"
+        if program_family == "exactone":
+            variant = exactone_table_variant(
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+                grid=_persistent_grid_size(
+                    total_work=num_sequences * self.nheads, sm_count=sm_count
+                ),
+            )
         workspace: dict[str, Any] = {
             "program": _program_name(
                 program_family,

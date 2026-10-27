@@ -1733,7 +1733,10 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             program_triple,
             fused,
         )
-        assert program_cu.split("_", 1)[1] == program_triple.split("_", 1)[1], (
+        ring_triple = _without_table_form(
+            module, program_triple, state_dtype=state_dtype, num_sequences=len(lengths)
+        )
+        assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
             program_cu,
             program_triple,
         )
@@ -3903,6 +3906,30 @@ def _derived_family(module, lengths, *, nheads=8):
     )
 
 
+def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
+    """The ring one-launch program a derived-table call stands for on this
+    device: ``name`` without the prologue form that ``exactone_table_variant``
+    picks for the call's launch grid (SM107: ``tablefirst`` below its grid
+    threshold, ``tableroles`` from it on).  The forms move only where the CTA
+    prologue derives the table; the arithmetic is the ring program's.  Every
+    other program is returned as is."""
+
+    program = module._PROGRAMS[name]
+    if program.family != "exactone" or program.variant == "noring":
+        return name
+    form = module.exactone_table_variant(
+        capability=torch.cuda.get_device_capability(),
+        variant="",
+        state_dtype=state_dtype,
+        grid=module._persistent_grid_size(
+            total_work=num_sequences * nheads,
+            sm_count=module._sm_count(torch.cuda.current_device()),
+        ),
+    )
+    assert program.variant == form, (name, form)
+    return name[: -len(form) - 1] if form else name
+
+
 def _two_kernel_program(module, name, *, num_sequences, seqlen):
     """Assert ``name`` is the two-kernel program of a packed-varlen call
     (``two_kernel_family``) and return its family."""
@@ -4015,8 +4042,13 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case, arch):
         # SM103 and SM107 derive a runner-owned table in the fused main kernel's
         # CTA prologue: the one-launch exactone program (the stage's grid is 0,
         # nothing is published), its scratch one row per CTA (one CTA here:
-        # 2 items on this 1-SM device).
-        assert name == "exactone_bf16_varlen"
+        # 2 items on this 1-SM device; on SM107 a grid that small takes the
+        # tablefirst form).
+        assert name == (
+            "exactone_bf16_varlen_tablefirst"
+            if arch == "sm_107a"
+            else "exactone_bf16_varlen"
+        )
         assert launch["preprocess_grid"] == (0, 1, 1)
         assert launch["main_grid"] == (1, 1, 1)
         assert set(preprocess) == set(module._PREPROCESS_ARGS)
@@ -4761,14 +4793,28 @@ def test_source_program_table_names_shipped_sources():
         if (variant, state) != ("_noring", "f32")
     } | {"exactpre_bf16_varlen_claim", "exactpre_f32_varlen_claim"} | {
         f"exactpre_{state}_varlen_ibulk" for state in ("bf16", "f16")
+    } | {
+        "exactone_bf16_varlen_tablefirst",
+        "exactone_bf16_varlen_tableroles",
+        "exactone_f16_varlen_tablefirst",
+        "exactone_f16_varlen_tableroles",
+        "exactone_f32_varlen_tablefirst",
+        "exactone_f32_varlen_tableroles",
     }
-    # The sm_107a-only programs (the claim and initial-state bulk programs): their
+    # The sm_107a-only programs (the claim and initial-state bulk programs and the
+    # one-launch programs in the tablefirst / tableroles prologue forms): their
     # ``_SM107_MODULES`` entry is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
         "exactpre_f32_varlen_claim",
         "exactpre_bf16_varlen_ibulk",
         "exactpre_f16_varlen_ibulk",
+        "exactone_bf16_varlen_tablefirst",
+        "exactone_bf16_varlen_tableroles",
+        "exactone_f16_varlen_tablefirst",
+        "exactone_f16_varlen_tableroles",
+        "exactone_f32_varlen_tablefirst",
+        "exactone_f32_varlen_tableroles",
     } == module._SM107_ONLY_PROGRAMS
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
@@ -4786,9 +4832,11 @@ def test_source_program_table_names_shipped_sources():
     # The exactone programs are the SM103 render of the same six fused varlen
     # entries: their own device modules, never the exactfused files (on
     # sm_107a too: the one-launch render beside the exactfused one).
-    assert set(module._EXACTONE_MODULES) == {
-        name for name in module._PROGRAMS if name.startswith("exactone_")
-    }
+    assert (
+        set(module._EXACTONE_MODULES)
+        == {name for name in module._PROGRAMS if name.startswith("exactone_")}
+        - module._SM107_ONLY_PROGRAMS
+    )
     assert {
         name.replace("exactone_", "exactfused_", 1) for name in module._EXACTONE_MODULES
     } == {name for name in module._EXACTFUSED_MODULES if "_varlen" in name}
@@ -4839,13 +4887,13 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 44
+    assert len(module._SM107_MODULES) == 50
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
     }
     for name, own in module._SM107_MODULES.items():
-        if name.startswith("exactone_"):
+        if name.startswith("exactone_") and name not in module._SM107_ONLY_PROGRAMS:
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
             assert twin != own, (name, twin)
     assert len(set(module._SM107_MODULES.values())) == len(module._SM107_MODULES)
@@ -4909,7 +4957,14 @@ def test_source_program_table_names_shipped_sources():
         template_path, main_args, smem_bytes = family_host[family]
         if variant:
             (variant_name,) = variant
-            assert variant_name in ("noring", "tail", "claim", "ibulk")
+            assert variant_name in (
+                "noring",
+                "tail",
+                "claim",
+                "ibulk",
+                "tablefirst",
+                "tableroles",
+            )
             assert family in (
                 "exact",
                 "exactfused",
@@ -4923,7 +4978,9 @@ def test_source_program_table_names_shipped_sources():
                 assert (state_key, mode) in (("bf16", "varlen"), ("f32", "varlen"))
             if variant_name == "ibulk":
                 assert (state_key, mode) in (("bf16", "varlen"), ("f16", "varlen"))
-            assert (variant_name in ("claim", "ibulk")) == (
+            if variant_name in ("tablefirst", "tableroles"):
+                assert family == "exactone" and mode == "varlen"
+            assert (variant_name in ("claim", "ibulk", "tablefirst", "tableroles")) == (
                 name in module._SM107_ONLY_PROGRAMS
             )
             smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
@@ -4933,6 +4990,8 @@ def test_source_program_table_names_shipped_sources():
                     ("exact", "noring"): module._EXACT_NORING_SMEM_BYTES,
                     ("exactfused", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
                     ("exactmeta", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
+                    ("exactone", "tablefirst"): module._EXACTONE_SMEM_BYTES,
+                    ("exactone", "tableroles"): module._EXACTONE_SMEM_BYTES,
                     ("exactone", "noring"): module._EXACTONE_NORING_SMEM_BYTES,
                     ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
                     ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
@@ -6816,7 +6875,12 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
         )
     else:
         family = "exactfused"
-    assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    exact_program = exact.program
+    if form == "triple":
+        exact_program = _without_table_form(
+            module, exact_program, state_dtype=state_dtype, num_sequences=len(lengths)
+        )
+    assert exact_program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     written = {slot for slot in slots if slot >= 0}
@@ -7133,9 +7197,12 @@ def test_source_exact_scan_variant_programs():
         len([name for name in module._PROGRAMS if name.startswith("exactmeta_")]) == 5
     )
     # The exactone programs: the SM103 render of the same five fused varlen
-    # entries (one launch), their own device modules.
-    assert len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 5
-    assert len(module._PROGRAMS) == 60
+    # entries (one launch), their own device modules, and the sm_107a-only
+    # programs in the tablefirst / tableroles prologue forms.
+    assert (
+        len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 11
+    )
+    assert len(module._PROGRAMS) == 66
 
 
 @pytest.mark.parametrize(
@@ -7311,6 +7378,40 @@ def test_source_sm107_claim_rule():
         module._program_name("exactpre", state_dtype, True, "claim")
         for state_dtype in module._CLAIM_STATE_DTYPES[(10, 7)]
     } == {name for name in module._SM107_ONLY_PROGRAMS if name.endswith("_claim")}
+
+
+def test_source_sm107_exactone_table_rule():
+    """``exactone_table_variant``: on SM107 a one-launch ring call takes the
+    tablefirst program at a launch grid below 128 CTAs and the
+    tableroles program from it on; ``noring`` calls and other
+    architectures keep their program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._EXACTONE_TABLE_ROLES_MIN_GRID == {(10, 7): 128}
+
+    def variant(grid, capability=(10, 7), current="", state_dtype=torch.bfloat16):
+        return module.exactone_table_variant(
+            capability=capability, variant=current, state_dtype=state_dtype, grid=grid
+        )
+
+    assert variant(grid=1) == "tablefirst"
+    assert variant(grid=127) == "tablefirst"
+    assert variant(grid=128) == "tableroles"
+    assert variant(grid=212) == "tableroles"
+    assert variant(grid=8, current="noring") == "noring"
+    assert variant(grid=212, current="noring") == "noring"
+    assert variant(grid=8, capability=(10, 3)) == ""
+    assert variant(grid=8, capability=(10, 0)) == ""
+    assert variant(grid=8, capability=None) == ""
+    for state_dtype in (torch.bfloat16, torch.float16, torch.float32):
+        assert variant(grid=8, state_dtype=state_dtype) == "tablefirst"
+        assert variant(grid=212, state_dtype=state_dtype) == "tableroles"
+    # the programs it selects are exactly the sm_107a-only one-launch entries
+    assert {
+        module._program_name("exactone", state_dtype, True, form)
+        for state_dtype in module._EXACTONE_TABLE_STATE_DTYPES
+        for form in ("tablefirst", "tableroles")
+    } == {name for name in module._SM107_ONLY_PROGRAMS if name.startswith("exactone_")}
 
 
 @pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
@@ -8095,8 +8196,13 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     else:
         # ... on SM103 and SM107 the one-launch exactone program: no stage
         # (grid 0); the fused main kernel's CTA prologue derives the table into its row
-        # of the runner's scratch (one CTA: 2 items on this 1-SM device)
-        assert name == "exactone_bf16_varlen"
+        # of the runner's scratch (one CTA: 2 items on this 1-SM device; on
+        # SM107 a grid that small takes the tablefirst form)
+        assert name == (
+            "exactone_bf16_varlen_tablefirst"
+            if arch == "sm_107a"
+            else "exactone_bf16_varlen"
+        )
         assert module._PROGRAMS[name].family == "exactone"
         assert set(launch["preprocess"]) == set(module._PREPROCESS_ARGS)
         assert launch["preprocess_grid"] == (0, 1, 1)
