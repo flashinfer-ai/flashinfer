@@ -1198,13 +1198,13 @@ def test_rejects_invalid_operands():
 
 
 # ---------------------------------------------------------------------------
-# Device scratch ownership and concurrency (per-runner control words, per-launch partials)
+# Device scratch ownership and concurrency (per-runner control words, per-stream partials)
 # ---------------------------------------------------------------------------
 
 
 def test_partial_workspace_and_control_word_sizes():
-    """Split prefill plans take one ``128 x block_n`` FP32 slot per contributor CTA per launch (whole plans none) and
-    every runner's control words fit one KiB in 128-byte slots."""
+    """Split prefill plans use one ``128 x block_n`` FP32 slot per contributor CTA (whole plans none) and every
+    runner's control words fit one KiB in 128-byte slots."""
     for sm_count in QUALIFIED_SM_COUNTS:
         for tp in SUPPORTED_TP:
             for tokens in sorted(set(cb.ROW_TOKENS) | {129, 300, 511, 1000, 3000}):
@@ -1235,9 +1235,9 @@ def test_partial_workspace_and_control_word_sizes():
 
 
 def test_ws_programs_never_trigger_dependents():
-    """A program bound to a per-launch partial workspace (``('buffer', 'ws')`` in its argument plan) must not
-    trigger ``griddepcontrol.launch_dependents``: a dependent launched early could be handed the recycled block
-    while the program still writes it."""
+    """A program bound to a partial workspace (``('buffer', 'ws')`` in its argument plan) must not trigger
+    ``griddepcontrol.launch_dependents``: a dependent launched early on the same stream could write the stream's
+    workspace (or a recycled block) while the program still uses it."""
     csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
     ws_programs = [
         name
@@ -1372,7 +1372,7 @@ def _force_tail_plan(monkeypatch, **overrides):
 # Rows whose launches make progress side by side on every qualified part with the registered programs, so a
 # concurrent mismatch can only come from shared device state:
 #   unfused_split: the TP1 T=256 tail on the non-fused stream-K program (tail_gemm:tp1e0f0t1): its split tiles
-#     use the last-arriver fix-up only (no cross-CTA wait); the isolation row of the per-launch partials and the
+#     use the last-arriver fix-up only (no cross-CTA wait); the isolation row of the per-stream partials and the
 #     per-runner arrival counters;
 #   claimed_112: the TP1 T=256 tail on the claimed program (tail_gemm:tp1e0f1t1ci, cooperative 112-CTA grid): a
 #     second grid starts while the first one's last CTAs retire (claim ticket and retirement words);
@@ -1449,7 +1449,7 @@ def _gate(streams):
 )
 def test_runner_control_words_private(stage, tp, tokens, num_partials):
     """Two identically prepared runners own disjoint, zero control words that every launch returns to zero; a
-    dropped runner's words are never handed out again; split plans size their per-launch partials from the plan."""
+    dropped runner's words are never handed out again; split plans size their partial workspace from the plan."""
     device = _require_program(stage, tp, tokens, num_partials)
     r1 = _prepare(device, stage, tp, tokens, num_partials)
     r2 = _prepare(device, stage, tp, tokens, num_partials)
@@ -1487,8 +1487,9 @@ def test_runner_control_words_private(stage, tp, tokens, num_partials):
 
 
 def test_no_shared_mutable_scratch():
-    """The package holds no mutable device tensor shared by runners: module-level device memory is the never-read
-    buffers and the control-word slabs, whose slots belong to one runner (or one functional-call lane) each."""
+    """The package holds no mutable device tensor shared across streams: module-level device memory is the
+    never-read buffers, the control-word slabs, whose slots belong to one runner (or one functional-call lane)
+    each, and one partial workspace per (device, stream)."""
     device = _require_program("tail", 8, 256)
     _require_program("front", 8, 256)
     _require_program("tail", 8, 16)
@@ -1500,7 +1501,12 @@ def test_no_shared_mutable_scratch():
     ]
     for name in ("_SCRATCH", "_TAIL_WS", "_FRONT_WS"):
         assert not hasattr(cb, name)
+    for r in runners:
+        r()
+    torch.cuda.synchronize()
     never = {t.data_ptr() for pair in cb._READ_NEVER.values() for t in pair}
+    lanes = {workspace.data_ptr() for _, workspace in cb._WS_LANES.values()}
+    assert lanes and len(lanes) == len(cb._WS_LANES)
     chunks = [_byte_range(t) for slab in cb._CTRL_SLABS.values() for t in slab._pinned]
 
     def in_slab(t):
@@ -1522,7 +1528,9 @@ def test_no_shared_mutable_scratch():
     for name, value in vars(cb).items():
         for t in tensors(value):
             if t.is_cuda:
-                assert t.data_ptr() in never or in_slab(t), name
+                assert t.data_ptr() in never or in_slab(t) or t.data_ptr() in lanes, (
+                    name
+                )
     seen = []
     for r in runners:
         for t in _control_tensors(r):
@@ -1536,6 +1544,72 @@ def test_no_shared_mutable_scratch():
                     assert launch.kwargs[name].data_ptr() in never
         if r.stage == "tail" and r.route == "decode":
             assert r.launches[0].kwargs["out_r"].data_ptr() in never
+
+
+def test_partial_workspace_stream_lanes(monkeypatch):
+    """Eager split launches reuse one partial workspace per (device, stream), grown to the largest plan launched
+    there and not reallocated once it fits; distinct streams use distinct workspaces; a launch under capture takes
+    a graph-pool block and leaves the stream workspaces alone; eager launches beside a replaying graph of another
+    runner stay bitwise."""
+    device = _require_program("tail", 1, 1024)
+    big = _prepare(device, "tail", 1, 1024, seed=31)
+    small = _x2_runner(device, monkeypatch, "unfused_split", 11)
+    small_ws, big_ws = small.launches[-1].ws_numel, big.launches[-1].ws_numel
+    if not 0 < small_ws < big_ws:
+        pytest.skip(
+            f"needs two split plans of different sizes, got {small_ws}, {big_ws}"
+        )
+    big()
+    torch.cuda.synchronize()
+    refs = {id(r): _snapshot(r.outputs) for r in (small, big)}
+
+    def check(what):
+        torch.cuda.synchronize()
+        for r in (small, big):
+            _assert_bitwise(r.outputs, refs[id(r)], f"{what} {r.num_tokens}")
+            _assert_words_zero(r, what)
+
+    monkeypatch.setattr(cb, "_WS_LANES", {})
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(s1):
+        small()
+    first = cb._WS_LANES[(device.index, s1.cuda_stream)]
+    assert first[0] == small_ws
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated(device)
+    with torch.cuda.stream(s1):
+        small()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == allocated
+    assert cb._WS_LANES[(device.index, s1.cuda_stream)][1] is first[1]
+    with torch.cuda.stream(s1):
+        big()
+        grown = cb._WS_LANES[(device.index, s1.cuda_stream)]
+        small()
+    assert grown[0] == big_ws and grown[1] is not first[1]
+    assert cb._WS_LANES[(device.index, s1.cuda_stream)][1] is grown[1]
+    del first
+    check("one stream")
+    with torch.cuda.stream(s2):
+        small()
+    other = cb._WS_LANES[(device.index, s2.cuda_stream)]
+    assert other[1].data_ptr() != grown[1].data_ptr()
+    check("second stream")
+    lanes = {key: id(lane[1]) for key, lane in cb._WS_LANES.items()}
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        big()
+    assert {key: id(lane[1]) for key, lane in cb._WS_LANES.items()} == lanes
+    for rnd in range(20):
+        _nan_fill(small.outputs)
+        _nan_fill(big.outputs)
+        torch.cuda.synchronize()
+        _gate((s1, s2))
+        with torch.cuda.stream(s2):
+            graph.replay()
+        with torch.cuda.stream(s1):
+            small()
+        check(f"eager beside replay {rnd}")
 
 
 @pytest.mark.parametrize("row", _X2_ROWS)

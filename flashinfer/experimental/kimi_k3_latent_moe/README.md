@@ -88,7 +88,8 @@ kimi_k3_latent_moe_tail(routed, norm_weight, up_weight, shared_act, shared_down,
 ## Concurrency
 
 The programs keep two kinds of mutable device scratch beside the caller's
-buffers, and the package owns them so that distinct runners never share any:
+buffers, and the package owns them so that launches on distinct streams or
+graphs never share any:
 
 - **Control words** (the decode grid counter, the prefill stream-K arrival
   counters and the fused-norm semaphores / claim ticket / retirement count) must
@@ -101,24 +102,29 @@ buffers, and the package owns them so that distinct runners never share any:
   new words inside the capture (one zero-fill kernel node in that graph).
 - **Partials** (the FP32 stream-K workspace of split prefill plans: one
   `128 x block_n` slot per contributor CTA of every split tile, written before it
-  is read inside one launch) are taken per launch with
-  `torch.empty` from PyTorch's caching allocator on the launch stream: reuse is
-  stream-ordered, and under CUDA Graph capture the block belongs to that graph's
-  memory pool.  This is the only allocation at launch (whole plans and the
-  decode route allocate nothing), so an out-of-memory error can surface at a
-  split-plan launch.
+  is read inside one launch).  An eager launch uses one workspace per (device,
+  stream), allocated on that stream at its first split launch and grown to the
+  largest split plan launched there; later launches on the stream reuse it in
+  stream order (as PyTorch's caching allocator reuses a block on its stream),
+  and distinct streams never share one.  The workspaces are held for the life
+  of the process: one per stream that ran a split plan eagerly (TP1 `T = 1024`
+  needs 29 MiB on a 148-SM part).  A launch under CUDA Graph capture takes a
+  block of the graph's memory pool instead, once, at capture.  Whole plans and
+  the decode route use no workspace; an out-of-memory error can surface at the
+  first eager split launch on a stream, when its workspace grows, or at capture.
 
 Contract:
 
-- Distinct runners share no mutable device state: launches of distinct
-  runners on any streams, host threads, green contexts or CUDA Graphs never mix
-  their control words or partials.
+- Distinct runners never share control words; runners launched on one
+  stream share that stream's partial workspace in stream order, and launches on
+  distinct streams, host threads, green contexts or CUDA Graphs never mix their
+  control words or partials.
 - A runner must not run concurrently with itself (its outputs, `y_workspace` and
   control words are its own): use one runner per concurrent stream.
 - CUDA Graphs that share one PyTorch memory pool (`pool=`) must not replay
   concurrently (PyTorch's rule for any graph that allocates).
-- `runner()` launches on the current stream of the runner's device; it enters
-  that device when another one is current.
+- `runner()` launches on the current stream of the runner's device, whichever
+  device is current.
 - The one-shot `kimi_k3_latent_moe_front` / `kimi_k3_latent_moe_tail` calls
   prepare per call: eager calls share one set of control words per device,
   stream and size (calls on one stream are stream-ordered), and a call under
@@ -130,7 +136,9 @@ Contract:
   offers fewer SMs (a smaller green context), it runs nothing and raises a
   `RuntimeError` naming the route and the SMs it needs; the CUDA runtime's last
   error is cleared, so later work in the process is unaffected.  Captured on
-  such a stream, the launch fails the capture, again with no lasting error.
+  such a stream, the launch fails the capture, again with no lasting error;
+  note that `torch.cuda.graph` leaves its capture stream current when the
+  capture fails, so restore the caller's stream before launching further work.
 
 ## Tested physical configurations
 

@@ -84,14 +84,15 @@ def prepare_kimi_k3_latent_moe_front(
     -------
     KimiK3LatentMoeRunner
         Calling it launches the route on the current stream with no host
-        synchronization and returns the three outputs; a split prefill plan
-        takes its FP32 partial workspace per launch from PyTorch's caching
-        allocator on that stream (from the graph's memory pool under capture),
-        and nothing else is allocated at launch.  The runner owns its control
-        words, so launches of distinct runners never mix device state; a runner
-        must not run concurrently with itself, and graphs that share one memory
-        pool must not replay concurrently.  CUDA Graph capture of the runner is
-        supported; prepare before capture, once per layer and shape.
+        synchronization and returns the three outputs; an eager split prefill
+        plan uses that stream's FP32 partial workspace (allocated at the
+        stream's first split launch and grown to the largest plan launched
+        there), a captured one a block of the graph's memory pool.  The runner
+        owns its control words, so launches on distinct streams or graphs never
+        mix device state; a runner must not run concurrently with itself, and
+        graphs that share one memory pool must not replay concurrently.  CUDA
+        Graph capture of the runner is supported; prepare before capture, once
+        per layer and shape.
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_front(
         x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
@@ -175,15 +176,16 @@ def prepare_kimi_k3_latent_moe_tail(
     -------
     KimiK3LatentMoeRunner
         Calling it launches the route on the current stream with no host
-        synchronization and returns ``(y_workspace, out)``; a split prefill plan
-        takes its FP32 partial workspace per launch from PyTorch's caching
-        allocator on that stream (from the graph's memory pool under capture),
-        and nothing else is allocated at launch.  The runner owns its control
-        words, so launches of distinct runners never mix device state; a runner
-        must not run concurrently with itself (nor share its outputs or
-        ``y_workspace`` with a concurrent runner), and graphs that share one
-        memory pool must not replay concurrently.  CUDA Graph capture of the
-        runner is supported; prepare before capture, once per layer and shape.
+        synchronization and returns ``(y_workspace, out)``; an eager split
+        prefill plan uses that stream's FP32 partial workspace (allocated at the
+        stream's first split launch and grown to the largest plan launched
+        there), a captured one a block of the graph's memory pool.  The runner
+        owns its control words, so launches on distinct streams or graphs never
+        mix device state; a runner must not run concurrently with itself (nor
+        share its outputs or ``y_workspace`` with a concurrent runner), and
+        graphs that share one memory pool must not replay concurrently.  CUDA
+        Graph capture of the runner is supported; prepare before capture, once
+        per layer and shape.
     """
     return _backend(backend).prepare_kimi_k3_latent_moe_tail(
         routed,

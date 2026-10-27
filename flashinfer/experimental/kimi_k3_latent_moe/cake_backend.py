@@ -38,10 +38,11 @@ norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
 through a logical key resolved in ``cake_jit.KERNELS``.  Weights are read in
 the model layout (``nn.Linear`` ``[out, in]`` BF16); nothing is copied or
 packed, and a prepared runner is CUDA Graph safe.  Distinct runners share no
-mutable device state: each prepared runner owns its zero-initialised control
-words (``_CtrlSlab``), and a split prefill plan takes its FP32 stream-K partial
-workspace per launch from PyTorch's caching allocator on the launch stream (from
-the graph's memory pool under capture), the only allocation at launch.  Every
+mutable device state across streams: each prepared runner owns its
+zero-initialised control words (``_CtrlSlab``), and an eager launch of a split
+prefill plan uses the FP32 stream-K partial workspace of its (device, stream),
+grown to the largest split plan launched there (a launch under capture takes a
+block of the graph's memory pool).  Every
 plan is derived from the device's own SM count (``QUALIFIED_SM_COUNTS``
 names the physical counts the programs are qualified on; other counts are refused).
 See ``README.md`` in this package (section "Concurrency").
@@ -54,7 +55,7 @@ import functools
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import torch
 import tvm_ffi
@@ -1143,7 +1144,7 @@ def generated_program_available(
 
 
 # ---------------------------------------------------------------------------
-# Device scratch: per-runner control words, per-launch partial workspace
+# Device scratch: per-runner control words, per-stream partial workspace
 # ---------------------------------------------------------------------------
 #
 # The programs use two kinds of mutable device scratch, owned so that distinct runners never share any:
@@ -1157,11 +1158,13 @@ def generated_program_available(
 #   reused, so a CUDA Graph that captured a runner replays into valid private words after the runner is
 #   dropped, and a third-party PDL kernel between two runners cannot make them share a word.
 # * Partials: the FP32 stream-K workspace of split plans, written before it is read inside one launch.
-#   Each launch takes it from PyTorch's caching allocator on the launch stream (``torch.empty``: reuse is
-#   stream-ordered; under CUDA Graph capture the block comes from the graph's pool).  A program that binds a
-#   per-launch workspace must not trigger ``griddepcontrol.launch_dependents`` (a dependent launched early
-#   could receive the recycled block while the program still writes it); the package test checks it.
-#   Whole plans bind ``_READ_NEVER``.
+#   An eager launch uses the workspace of its (device, stream) (``_WS_LANES``), grown to the largest split
+#   plan launched there: launches on one stream are stream-ordered, so they reuse it as PyTorch's caching
+#   allocator reuses a block on its stream, and distinct streams never share one.  A launch under CUDA Graph
+#   capture allocates its block from the graph's memory pool instead (once, at capture).  A program that binds
+#   a partial workspace must not trigger ``griddepcontrol.launch_dependents`` (a dependent launched early could
+#   write the block while the program still uses it); the package test checks it.  Whole plans bind
+#   ``_READ_NEVER``.
 
 #: Control words are handed out in 128-byte slots of 32 four-byte words.
 CTRL_SLOT_WORDS = 32
@@ -1218,14 +1221,32 @@ _CTRL_LANES: dict[
     tuple[int, int, int, int], tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
 ] = {}
 _READ_NEVER: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-# The raw handle of a device's current stream without building a ``torch.cuda.Stream``.
-_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+# Eager split-plan launches: ``(elements, FP32 workspace)`` per (device, stream handle).
+_WS_LANES: dict[tuple[int, int], tuple[int, torch.Tensor]] = {}
+_FFI_DEVICES: dict[int, Any] = {}
+
+# Launch-path queries without building Python stream objects.
+# The raw handle of the current stream of device ``index``.
+_RAW_STREAM: Callable[[int], int] = getattr(
+    torch._C,
+    "_cuda_getCurrentRawStream",
+    lambda index: torch.cuda.current_stream(index).cuda_stream,
+)
+# Whether the current stream of the current device is capturing a CUDA Graph.
+_CAPTURING: Callable[[], bool] = getattr(
+    torch._C, "_cuda_isCurrentStreamCapturing", torch.cuda.is_current_stream_capturing
+)
+_CURRENT_DEVICE: Callable[[], int] = getattr(
+    torch._C, "_cuda_getDevice", torch.cuda.current_device
+)
+_use_raw_stream = tvm_ffi.use_raw_stream
 
 
-def _current_stream_handle(index: int) -> int:
-    if _RAW_STREAM is not None:
-        return int(_RAW_STREAM(index))
-    return int(torch.cuda.current_stream(index).cuda_stream)
+def _ffi_device(index: int) -> Any:
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return device
 
 
 def _ctrl_layout(n_i32: int, n_u32: int) -> tuple[int, int]:
@@ -1247,25 +1268,32 @@ def _ctrl_slab(index: int) -> _CtrlSlab:
 def _control_words(
     index: int, n_i32: int, n_u32: int, *, lane: bool = False
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Zero control words on ``cuda:index``: an int32 view of ``n_i32`` words and a uint32 view of ``n_u32``
-    words (``None`` for a zero count), in one slot.
+    """Zero control words on ``cuda:index`` (the current device): an int32 view of ``n_i32`` words and a uint32
+    view of ``n_u32`` words (``None`` for a zero count), in one slot.
 
     ``lane=False`` (``prepare_*``): a fresh slot owned by the runner.  ``lane=True`` (the one-shot functional
     entry points): eager calls share one slot per (device, current stream, word counts) -- calls on one stream
     are stream-ordered and every launch returns the words to zero -- while a call under CUDA Graph capture
-    takes a fresh slot, so concurrently replayed graphs never share words.
+    takes a fresh slot, so concurrently replayed graphs never share words.  A lane hit takes no lock.
     """
+    if lane and not _CAPTURING():
+        views = _CTRL_LANES.get((index, _RAW_STREAM(index), n_i32, n_u32))
+        if views is not None:
+            return views
+        return _new_lane(index, n_i32, n_u32)
+    return _slot_views(_ctrl_slab(index), n_i32, n_u32)
+
+
+def _new_lane(
+    index: int, n_i32: int, n_u32: int
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     slab = _ctrl_slab(index)  # outside ``_CTRL_LOCK``, which creating the slab takes
-    if lane and not torch.cuda.is_current_stream_capturing():
-        key = (index, _current_stream_handle(index), int(n_i32), int(n_u32))
+    key = (index, _RAW_STREAM(index), n_i32, n_u32)
+    with _CTRL_LOCK:
         views = _CTRL_LANES.get(key)
         if views is None:
-            with _CTRL_LOCK:
-                views = _CTRL_LANES.get(key)
-                if views is None:
-                    views = _CTRL_LANES[key] = _slot_views(slab, n_i32, n_u32)
-        return views
-    return _slot_views(slab, n_i32, n_u32)
+            views = _CTRL_LANES[key] = _slot_views(slab, n_i32, n_u32)
+    return views
 
 
 def _slot_views(
@@ -1283,7 +1311,7 @@ def _read_never(index: int) -> tuple[torch.Tensor, torch.Tensor]:
     """``(fp32 [1024], uint64 timeline)`` of ``cuda:index``, bound where no registered program reads or
     writes: the decode tail's ``out_r``, every decode ``tl`` (written only by diagnostic instances, which are
     never registered) and the ``ws`` of whole prefill plans (only multi-segment items touch it; a split plan's
-    per-launch workspace replaces it at launch).  Never initialised and never written."""
+    partial workspace replaces it at launch).  Never initialised and never written."""
     entry = _READ_NEVER.get(index)
     if entry is None:
         dev = torch.device("cuda", index)
@@ -1299,7 +1327,7 @@ def _read_never(index: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _partial_ws_numel(stage: str, plan: dict[str, Any]) -> int:
-    """FP32 elements of one launch's stream-K partial workspace (0: a whole plan, which writes none).
+    """FP32 elements of the stream-K partial workspace one launch uses (0: a whole plan, which writes none).
 
     One ``128 x block_n`` slot per contributor CTA: ``sk_tiles`` split tiles of ``sk_max_seg`` segments of
     ``CTA_GROUP`` CTAs (the front's slot is 256 wide, the tail's follows the plan's tile).  A plan that
@@ -1324,6 +1352,21 @@ def _arrival_counter_words(plan: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Per-program facts of the launch binding: the argument position of the ``ws`` buffer, and the programs that
+# launch cooperatively.
+_WS_POSITION: dict[str, int] = {
+    name: position
+    for name, record in MODULES.items()
+    for position, (kind, arg) in enumerate(record["arg_plan"])
+    if kind == "buffer" and arg == "ws"
+}
+_COOPERATIVE: frozenset[str] = frozenset(
+    name
+    for name, record in MODULES.items()
+    if record.get("launch", {}).get("cooperative")
+)
+
+
 def _bind(
     arch: str, key: str, kwargs: dict[str, Any]
 ) -> tuple[Callable[..., Any], tuple, int, int]:
@@ -1335,17 +1378,14 @@ def _bind(
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     cooperative_ctas = (
         grid["grid_x"] * grid["grid_y"] * grid["grid_z"]
-        if record.get("launch", {}).get("cooperative")
+        if module_name in _COOPERATIVE
         else 0
     )
     arguments = []
-    ws_slot = -1
     for kind, name in record["arg_plan"]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
-            if kind == "buffer" and name == "ws":
-                ws_slot = len(arguments)
             arguments.append(kwargs[name])
         else:
             raise KeyError(
@@ -1356,7 +1396,7 @@ def _bind(
     return (
         getattr(module, record["ffi_entry"]),
         tuple(arguments),
-        ws_slot,
+        _WS_POSITION.get(module_name, -1),
         cooperative_ctas,
     )
 
@@ -1388,46 +1428,111 @@ def _clear_cuda_last_error() -> None:
         lib.cudaGetLastError()
 
 
-@dataclass(frozen=True)
-class _Launch:
-    stage: str
-    key: str
-    module: str
-    kwargs: dict[str, Any] = field(repr=False)
-    entry: Callable[..., Any] = field(repr=False)
-    arguments: tuple = field(repr=False)
-    # Split prefill plans: FP32 elements of the per-launch partial workspace that replaces the ``ws``
-    # argument at position ``ws_slot`` (``kwargs["ws"]`` is then the never-read placeholder).
-    ws_slot: int = -1
-    ws_numel: int = 0
-    device: Optional[torch.device] = field(default=None, repr=False)
-    # CTAs of a cooperative launch (0: not cooperative); all of them must be resident at once.
-    cooperative_ctas: int = 0
+def _grow_ws_lane(index: int, stream: int, numel: int) -> tuple[int, torch.Tensor]:
+    """The workspace of (``cuda:index``, ``stream``), (re)allocated for at least ``numel`` elements.
 
-    def __call__(self) -> None:
-        arguments: Sequence[Any] = self.arguments
-        if self.ws_numel:
-            with_ws = list(arguments)
-            # Written before it is read inside this launch, so never initialised.  The block returns to the
-            # launch stream's cache when the reference drops (stream-ordered reuse); under capture it is a
-            # block of the graph's memory pool.
-            with_ws[self.ws_slot] = torch.empty(
-                self.ws_numel, dtype=torch.float32, device=self.device
+    ``stream`` is the current stream of ``cuda:index``, so the caching allocator ties the block to it; a
+    replaced (smaller) block returns to that stream's cache, which reuses it only for work queued after the
+    launches that used it."""
+    with _CTRL_LOCK:
+        lane = _WS_LANES.get((index, stream))
+        if lane is None or lane[0] < numel:
+            workspace = torch.empty(
+                numel, dtype=torch.float32, device=torch.device("cuda", index)
             )
-            arguments = with_ws
+            lane = _WS_LANES[(index, stream)] = (numel, workspace)
+    return lane
+
+
+class _Launch:
+    """One bound program launch of a runner."""
+
+    __slots__ = (
+        "stage",
+        "key",
+        "module",
+        "kwargs",
+        "entry",
+        "arguments",
+        "device_index",
+        "ws_numel",
+        "ws_head",
+        "ws_tail",
+        "cooperative_ctas",
+    )
+
+    def __init__(
+        self,
+        stage: str,
+        key: str,
+        module: str,
+        kwargs: dict[str, Any],
+        entry: Callable[..., Any],
+        arguments: tuple,
+        device_index: int,
+        ws_slot: int = -1,
+        ws_numel: int = 0,
+        cooperative_ctas: int = 0,
+    ) -> None:
+        self.stage = stage
+        self.key = key
+        self.module = module
+        self.kwargs = kwargs
+        self.entry = entry
+        self.arguments = arguments
+        self.device_index = device_index
+        # Split prefill plans: FP32 elements of the partial workspace that replaces the ``ws`` argument
+        # (``kwargs["ws"]`` is then the never-read placeholder) between ``ws_head`` and ``ws_tail``.
+        self.ws_numel = ws_numel
+        self.ws_head = arguments[:ws_slot] if ws_numel else ()
+        self.ws_tail = arguments[ws_slot + 1 :] if ws_numel else ()
+        # CTAs of a cooperative launch (0: not cooperative); all of them must be resident at once.
+        self.cooperative_ctas = cooperative_ctas
+
+    def __repr__(self) -> str:
+        return (
+            f"_Launch(stage={self.stage!r}, key={self.key!r}, module={self.module!r})"
+        )
+
+    def __call__(self, stream: int) -> None:
+        """Launch on ``stream``, the current stream of the launch's device (set as the FFI stream)."""
         try:
-            self.entry(*arguments)
+            if self.ws_numel:
+                self.entry(*self.ws_head, self.partial_ws(stream), *self.ws_tail)
+            else:
+                self.entry(*self.arguments)
         except Exception as exc:
-            if not self.cooperative_ctas or _COOPERATIVE_TOO_LARGE not in str(exc):
-                raise
-            # Nothing ran.  Clear the runtime's last error, so the caller's next CUDA work does not fail on it.
-            _clear_cuda_last_error()
-            raise RuntimeError(
-                f"{self.key} ({self.stage}): the cooperative launch of {self.cooperative_ctas} CTAs needs at "
-                f"least {self.min_sms()} SMs resident at once, more than the launch stream offers (a smaller "
-                "green context or a partitioned device); launch it on a stream with that many SMs "
-                f"(CUDA: {_COOPERATIVE_TOO_LARGE})"
-            ) from None
+            if self.cooperative_ctas and _COOPERATIVE_TOO_LARGE in str(exc):
+                self._refused()
+            raise
+
+    def partial_ws(self, stream: int) -> torch.Tensor:
+        """The partial workspace of a launch on ``stream``: the stream's workspace when eager, a block of the
+        graph's memory pool under capture (written before it is read inside the launch, so never initialised)."""
+        index = self.device_index
+        if _CURRENT_DEVICE() == index:
+            capturing = _CAPTURING()
+        else:
+            with torch.cuda.device(index):
+                capturing = _CAPTURING()
+        if capturing:
+            return torch.empty(
+                self.ws_numel, dtype=torch.float32, device=torch.device("cuda", index)
+            )
+        lane = _WS_LANES.get((index, stream))
+        if lane is None or lane[0] < self.ws_numel:
+            lane = _grow_ws_lane(index, stream, self.ws_numel)
+        return lane[1]
+
+    def _refused(self) -> None:
+        # Nothing ran.  Clear the runtime's last error, so the caller's next CUDA work does not fail on it.
+        _clear_cuda_last_error()
+        raise RuntimeError(
+            f"{self.key} ({self.stage}): the cooperative launch of {self.cooperative_ctas} CTAs needs at "
+            f"least {self.min_sms()} SMs resident at once, more than the launch stream offers (a smaller "
+            "green context or a partitioned device); launch it on a stream with that many SMs "
+            f"(CUDA: {_COOPERATIVE_TOO_LARGE})"
+        ) from None
 
     def min_sms(self) -> int:
         """SMs a cooperative launch needs: its CTAs, as many per SM as the program's shared memory allows
@@ -1436,7 +1541,7 @@ class _Launch:
             return 0
         smem = int(MODULES[self.module]["launch"]["dynamic_smem_bytes"])
         per_sm_smem = getattr(
-            torch.cuda.get_device_properties(self.device),
+            torch.cuda.get_device_properties(self.device_index),
             "shared_memory_per_multiprocessor",
             0,
         )
@@ -1466,9 +1571,9 @@ def _make_launch(
         kwargs,
         entry,
         arguments,
+        device_index,
         ws_slot,
-        int(ws_numel),
-        torch.device("cuda", device_index),
+        ws_numel,
         cooperative_ctas,
     )
 
@@ -1484,13 +1589,13 @@ class KimiK3LatentMoeRunner:
     Prepare a new runner when a shape or a tensor binding changes.
 
     The runner owns its control words (never freed, so a graph that captured
-    it stays valid after the runner is dropped); a split prefill plan takes
-    its FP32 partial workspace per launch from PyTorch's caching allocator on
-    the launch stream (from the graph's memory pool under capture).  Distinct
-    runners share no mutable device state, so their launches on any streams or
-    graphs never mix control words or partials; a runner must not run
-    concurrently with itself, and graphs that share one memory pool must not
-    replay concurrently.
+    it stays valid after the runner is dropped).  An eager launch of a split
+    prefill plan uses the FP32 partial workspace of its (device, stream),
+    shared in stream order with the other launches on that stream; a launch
+    under capture takes a block of the graph's memory pool.  Launches on
+    distinct streams or graphs never mix control words or partials; a runner
+    must not run concurrently with itself, and graphs that share one memory
+    pool must not replay concurrently.
     """
 
     stage: str
@@ -1517,19 +1622,18 @@ class KimiK3LatentMoeRunner:
     def launch_count(self) -> int:
         return len(self.launches)
 
-    def _submit(self) -> tuple[torch.Tensor, ...]:
-        with tvm_ffi.use_torch_stream():
-            for launch in self.launches:
-                launch()
-        return self.outputs
-
     def launch(self) -> tuple[torch.Tensor, ...]:
-        # The bindings launch on the stream of the runner's device that ``use_torch_stream`` sets for the
-        # current device, and the partial workspace comes from that device's current stream: enter it.
-        if torch.cuda.current_device() != self.device_index:
-            with torch.cuda.device(self.device_index):
-                return self._submit()
-        return self._submit()
+        # The current stream of the runner's device (whichever device is current) becomes the FFI stream the
+        # bindings launch on; each binding enters the device of its operands.
+        index = self.device_index
+        stream = _RAW_STREAM(index)
+        device = _FFI_DEVICES.get(index)
+        if device is None:
+            device = _ffi_device(index)
+        with _use_raw_stream(device, stream):
+            for launch in self.launches:
+                launch(stream)
+        return self.outputs
 
     __call__ = launch
 
@@ -1673,7 +1777,8 @@ def _prepare_front(
             counters, _ = _control_words(
                 index, _arrival_counter_words(plan), 0, lane=lane
             )
-            ws, _ = _read_never(index)  # a split plan's partials replace it per launch
+            # A split plan's partial workspace replaces it at launch.
+            ws, _ = _read_never(index)
             kwargs = dict(
                 A=x,
                 WG=gate_weight,
@@ -1731,8 +1836,9 @@ def kimi_k3_latent_moe_front(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Complete front operator for one rank into the caller-owned ``logits`` / ``latent`` / ``shared_act``.
 
-    Eager calls share one set of control words per device, stream and size (calls on one stream are
-    stream-ordered); a call under CUDA Graph capture takes fresh words, which are never freed.
+    Eager calls share one set of control words per device, stream and size and the stream's partial workspace
+    (calls on one stream are stream-ordered); a call under CUDA Graph capture takes fresh words, which are never
+    freed, and a block of the graph's memory pool.
     """
     return _prepare_front(
         x,
@@ -1869,7 +1975,8 @@ def _prepare_tail(
             counters, norm_counter = _control_words(
                 index, _arrival_counter_words(plan), NORM_COUNTER_WORDS, lane=lane
             )
-            ws, _ = _read_never(index)  # a split plan's partials replace it per launch
+            # A split plan's partial workspace replaces it at launch.
+            ws, _ = _read_never(index)
             gemm_key = tail_gemm_kernel_key(
                 tp,
                 plan["weights_evict_first"],
@@ -1968,8 +2075,9 @@ def kimi_k3_latent_moe_tail(
 ) -> torch.Tensor:
     """Complete tail for one rank into the caller-owned ``out`` (``y_workspace`` receives the normalised latent).
 
-    Eager calls share one set of control words per device, stream and size (calls on one stream are
-    stream-ordered); a call under CUDA Graph capture takes fresh words, which are never freed.
+    Eager calls share one set of control words per device, stream and size and the stream's partial workspace
+    (calls on one stream are stream-ordered); a call under CUDA Graph capture takes fresh words, which are never
+    freed, and a block of the graph's memory pool.
     """
     _prepare_tail(
         routed,
