@@ -367,6 +367,7 @@ ROUND_SWITCH_ENVS = (
     "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM",
     "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL",
     "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM",
 )
 
 
@@ -393,6 +394,7 @@ def test_ep1_round_switch_defaults(monkeypatch) -> None:
     assert runner.compact_form == 1 and runner.publish_form == 1
     assert runner.per_route_publish_pdl is True
     assert runner.fc2_early_max_tokens == 128
+    assert runner.prefix_form == 1
     x, ids, weights = _make_inputs(37, LOCAL_EXPERTS, 59, device)
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
@@ -515,6 +517,108 @@ def test_ep1_fc2_early_switch_validation() -> None:
         {"fc2_early_max_tokens": -1},
         {"fc2_early_max_tokens": True},
     ):
+        with pytest.raises((MoEEpConfigError, ValueError)):
+            _build_layer(1, 0, device, token_capacity=33, **kwargs)
+
+
+class _DispatchSpy:
+    """Forwards to the runner's fused dispatch module and records the prefix form of
+    each fused dispatch launch."""
+
+    def __init__(self, module) -> None:
+        self._module = module
+        self.calls: list[int] = []
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    def sm90_cake_dispatch_fused_bf16(self, *args):
+        self.calls.append(int(args[-1]))
+        return self._module.sm90_cake_dispatch_fused_bf16(*args)
+
+
+# Round sizes around the fused / grid-strided dispatch bound (fused up to 512 tokens,
+# grid-strided from 513) and the small-route instance bound (T * top_k <= 1024).
+DISPATCH_SWITCH_TOKENS = (1, 8, 64, 128, 129, 512, 513, 700)
+# The dispatch paths these tests exercise (the shipped defaults), pinned so that the
+# backend environment of a run cannot route the rounds elsewhere.
+DISPATCH_PATHS = dict(
+    fused_begin=2, fused_dispatch_max_tokens=512, grid_dispatch_min_tokens=513
+)
+
+
+@requires_sm90
+@pytest.mark.parametrize("mode", ["random", "masked", "hot", "dup_rank"])
+def test_ep1_dispatch_switches_bitwise(mode: str) -> None:
+    """prefix_form 1 writes the same bytes as prefix_form 0 in fused and grid-strided
+    dispatch rounds, and a graph replay of a small round stays bitwise equal."""
+    device = torch.device("cuda", 0)
+    capacity = max(DISPATCH_SWITCH_TOKENS)
+    layers = {
+        form: _build_layer(
+            1, 0, device, token_capacity=capacity, prefix_form=form, **DISPATCH_PATHS
+        )
+        for form in (0, 1)
+    }
+    _, w13, w2 = layers[0]
+    for form, (layer, _w13, _w2) in layers.items():
+        assert _warm_runner(layer, device).prefix_form == form
+    runner = _warm_runner(layers[1][0], device)
+    spy = _DispatchSpy(runner.dispatch_module)
+    runner.dispatch_module = spy
+    try:
+        for num_tokens in DISPATCH_SWITCH_TOKENS:
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 89 + num_tokens, device, mode=mode
+            )
+            spy.calls.clear()
+            outputs = {}
+            for key, (layer, _w13, _w2) in layers.items():
+                outputs[key] = _forward(layer, x, ids, weights).clone()
+                torch.cuda.synchronize()
+            assert spy.calls == ([1] if num_tokens <= 512 else []), (
+                num_tokens,
+                spy.calls,
+            )
+            _check(
+                outputs[1],
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep1 {mode} T={num_tokens} prefix_form 1",
+            )
+            assert torch.equal(outputs[1], outputs[0]), f"T={num_tokens}"
+        # graph replay of a small round
+        layer = layers[1][0]
+        x, ids, weights = _make_inputs(16, LOCAL_EXPERTS, 97, device, mode=mode)
+        reference = _forward(layers[0][0], x, ids, weights).clone()
+        static = [t.clone() for t in (x, ids, weights)]
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            _forward(layer, *static)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = _forward(layer, *static)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_output, reference)
+    finally:
+        runner.dispatch_module = spy._module
+
+
+@requires_sm90
+def test_ep1_dispatch_switch_validation() -> None:
+    """prefix_form rejects values other than 0, 1 and None."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    device = torch.device("cuda", 0)
+    for kwargs in ({"prefix_form": 2}, {"prefix_form": True}):
         with pytest.raises((MoEEpConfigError, ValueError)):
             _build_layer(1, 0, device, token_capacity=33, **kwargs)
 
@@ -1104,6 +1208,7 @@ def test_ep_shared_workspace_round_paths(mode: str) -> None:
         publish_form=0,
         per_route_publish_pdl=False,
         fc2_early_max_tokens=0,
+        prefix_form=0,
     )
     ref, w13, w2 = _build_layer(
         world_size, rank, device, token_capacity=capacity, **off
@@ -1237,6 +1342,77 @@ def test_ep_fc2_early_straddle_bitwise(mode: str) -> None:
                     w2,
                     label=f" ep{world_size} rank{rank} {mode} cap {capacity} round {index} T={num_tokens} fc2_early",
                 )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_dispatch_switches_straddle_bitwise(mode: str) -> None:
+    """The prefix form is rank-local: in one round the ranks' token counts straddle the
+    small-route bound (128 tokens at top_k 8) and the fused / grid-strided bound (512),
+    and ranks mix the forms; every layer stays bitwise equal to prefix_form 0."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = 640
+    # own pool key for the mixed layer on every rank (see test_ep_per_route_publish_pdl_bitwise)
+    layers = {
+        name: _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            **DISPATCH_PATHS,
+            **kwargs,
+        )
+        for name, kwargs in (
+            ("off", dict(prefix_form=0)),
+            ("on", dict(prefix_form=1)),
+            ("mixed", dict(prefix_form=rank % 2, init_timeout_s=601.0)),
+        )
+    }
+    _, w13, w2 = layers["off"]
+    runner = _warm_runner(layers["on"][0], device)
+    assert runner.prefix_form == 1
+    plans = (
+        lambda r: 128 + r % 2,
+        lambda r: 127 + 2 * (r % 2),
+        lambda r: 0 if r == 0 else 16,
+        lambda r: 512 + r % 2,
+        lambda r: 1 + r,
+        lambda r: 640 - 3 * r,
+    )
+    for index, plan in enumerate(plans):
+        num_tokens = plan(rank)
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            191 + 13 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        if num_tokens:
+            _check(
+                outputs["on"],
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} round {index} T={num_tokens} dispatch switches",
+            )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["off"]), (
+                f"{name} differs at round {index} T={num_tokens}"
+            )
     dist.barrier()
 
 

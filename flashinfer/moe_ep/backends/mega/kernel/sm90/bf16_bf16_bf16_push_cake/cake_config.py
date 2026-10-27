@@ -99,6 +99,14 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     once it is released (same tiles, same instruction stream per tile, same
     bits).  ``0`` disables it.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS`` (default ``128``).
+
+    ``prefix_form`` selects how the single-launch dispatches compute the
+    receiver-side prefix (``fused_begin`` 2): ``1`` lets the fused dispatch of
+    rounds with ``T * top_k <= 1024`` and the grid dispatch compute it with the
+    whole block (an integer block scan over the (expert, source) keys and one
+    warp scan per source), ``0`` walks the keys with one thread in every
+    dispatch.  Both store the same values.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM`` (default ``1``).
     """
 
     intermediate_size: int
@@ -119,3 +127,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     publish_form: int | None = None
     per_route_publish_pdl: bool | None = None
     fc2_early_max_tokens: int | None = None
+    prefix_form: int | None = None

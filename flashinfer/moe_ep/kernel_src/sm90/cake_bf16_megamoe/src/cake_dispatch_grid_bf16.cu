@@ -39,7 +39,9 @@
 //      then one system-scope fence per block;  grid barrier;
 //   4. publish: block 0 releases every count cell of this source (zero counts
 //      included) in parallel;
-//   5. fuse_prefix: block 0 runs the vendored `wait_prefix` body.
+//   5. fuse_prefix: block 0 runs the vendored `wait_prefix` body (prefix form
+//      0) or the same integer prefix sums computed by the whole block (form 1,
+//      wait_prefix_parallel).
 //
 // Slot rule (as the vendored kernels): meta slot = key base + rank inside the
 // key, payload slot = destination payload base + carrier rank, a duplicate
@@ -161,6 +163,125 @@ struct PrefixArgs {
   int max_rows_per_key;
 };
 
+// Receiver prefix, form 1: the outputs of the vendored `wait_prefix` serial loop
+// computed by the whole block.  Every output is an integer prefix sum of the
+// same counts (integer addition is associative), so every stored value equals
+// the serial loop's; only the order of the block's global stores changes, and
+// every reader runs after this kernel.  The cells, tags, checks, the m_cap trap
+// and the zero-row cdone releases are those of the serial form (the same
+// outputs are stored before the m_cap check); the base cells, which every
+// source releases before its count cells, are waited for first.
+//   a. exclusive int64 scan of cnt in key order idx = e * eps + s (a contiguous
+//      chunk per thread, warp shuffle scan, per-warp partials): seg_out_base,
+//      offsets[e] = scan[e * eps], pad_base[e] and the total;
+//   b. one warp per source s: exclusive scan of cnt[e * eps + s] over e:
+//      seg_src_base = sbase[s] + scan, column total = rows_per_src[s].
+// cnt [nkeys], sbase [eps], srows [eps]: shared memory of the caller.
+__device__ __forceinline__ void wait_prefix_parallel(const PushLayout& L, const PrefixArgs& pa,
+                                                     uint32_t tag, int32_t* cnt, int32_t* sbase,
+                                                     int32_t* srows) {
+  __shared__ long long s_part[kWarps + 1];  // per-warp partials, then the total
+  int const E = L.num_local_experts;
+  int const eps = L.ep_size;
+  int const nkeys = E * eps;
+  int const tid = threadIdx.x;
+  int const lane = tid & 31;
+  int const warp = tid >> 5;
+  uint64_t* cells = reinterpret_cast<uint64_t*>(L.window(L.rank) + L.count_cells_offset);
+  for (int s = tid; s < eps; s += kThreads) {
+    sbase[s] = wait_tag_u64(L, L.base_cell(L.rank, s), tag);
+  }
+  for (int i = tid; i < nkeys; i += kThreads) {
+    int c = wait_tag_u64(L, cells + i, tag);
+    if (c < 0 || c > pa.max_rows_per_key) {  // protocol corruption, not overflow
+      printf("sm90_push: bad count %d for (expert %d, src %d), max %d\n", c, i / eps, i % eps,
+             pa.max_rows_per_key);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+    }
+    cnt[i] = c;
+  }
+  __syncthreads();
+  // a. per-thread chunk sums and their warp-inclusive scan
+  int const ipt = (nkeys + kThreads - 1) / kThreads;
+  int const begin = min(tid * ipt, nkeys);
+  int const end = min(begin + ipt, nkeys);
+  long long local = 0;
+  for (int i = begin; i < end; ++i) local += cnt[i];
+  long long incl = local;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    long long const v = __shfl_up_sync(0xffffffffu, incl, off);
+    if (lane >= off) incl += v;
+  }
+  if (lane == 31) s_part[warp] = incl;
+  // b. per-source column scans (warp-uniform loop)
+  int const epl = (E + 31) / 32;
+  int const e0 = min(lane * epl, E);
+  int const e1 = min(e0 + epl, E);
+  for (int s = warp; s < eps; s += kWarps) {
+    int csum = 0;
+    for (int e = e0; e < e1; ++e) csum += cnt[e * eps + s];
+    int cincl = csum;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      int const v = __shfl_up_sync(0xffffffffu, cincl, off);
+      if (lane >= off) cincl += v;
+    }
+    int src_row = sbase[s] + (cincl - csum);
+    for (int e = e0; e < e1; ++e) {
+      int const idx = e * eps + s;
+      pa.seg_src_base[idx] = src_row;
+      src_row += cnt[idx];
+    }
+    if (lane == 31) srows[s] = cincl;
+  }
+  __syncthreads();
+  long long acc = incl - local;
+  for (int w = 0; w < warp; ++w) acc += s_part[w];
+  int e = begin / eps;
+  int s = begin - e * eps;
+  for (int i = begin; i < end; ++i) {
+    if (s == 0) {
+      pa.offsets[e] = acc;
+      // deep_gemm::compute_padded_offset(acc, e): 32-align with headroom
+      pa.pad_base[e] = static_cast<int32_t>((acc + static_cast<int64_t>(e) * 31) / 32 * 32);
+    }
+    pa.seg_out_base[i] = static_cast<int32_t>(acc);
+    acc += cnt[i];
+    if (++s == eps) {
+      s = 0;
+      ++e;
+    }
+  }
+  if (tid == kThreads - 1) s_part[kWarps] = acc;  // grand total (the last chunk ends at nkeys)
+  __syncthreads();
+  if (tid == 0) {
+    int64_t const total = s_part[kWarps];
+    if (total > static_cast<int64_t>(pa.m_cap)) {
+      printf("sm90_push: accumulated row count %lld exceeds m_cap %d\n",
+             static_cast<long long>(total), pa.m_cap);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+      return;
+    }
+    pa.offsets[E] = total;
+    pa.seg_out_base[nkeys] = static_cast<int32_t>(total);
+    *pa.m_dev = static_cast<int32_t>(total);
+    int64_t p = (static_cast<int64_t>(pa.m_cap) + static_cast<int64_t>(E) * 31) / 32 * 32;
+    *pa.p_dev = static_cast<int32_t>(p < 1 ? 1 : p);
+    *pa.next_row = 0;  // reset the persistent-compact work queue
+  }
+  __syncthreads();
+  for (int src = tid; src < eps; src += kThreads) {
+    int const rows = srows[src];
+    pa.rows_per_src[src] = rows;
+    if (rows == 0) {  // no combine rows will flow back to src: publish now
+      st_release_sys_u64(L.cdone_cell(src, L.rank), pack_count_tag(0, tag));
+    }
+  }
+}
+
 // Per-round scratch (see the file comment).
 struct GridScratch {
   int32_t* lc;        // [nkeys + eps]: records per key, then carriers per destination
@@ -177,7 +298,8 @@ struct GridScratch {
 //   phase 1: A = per-key counts -> bases, C = per-destination carrier counts -> bases
 //   phase 2 (block 0): A = per-key totals (kept for phase 4), B = exclusive scan, C = meta bases
 //   phase 5 (block 0): A = received counts, C = source bases, D = per-source accumulators
-template <int TOP_K>
+//   (form 1: per-source row totals)
+template <int TOP_K, int PREFIX_FORM>
 __global__ void __launch_bounds__(kThreads, kMinBlocks)
     dispatch_grid_dedup_kernel(PushLayout L, const uint8_t* __restrict__ x_bytes,
                                int bytes_per_token, const int32_t* __restrict__ topk_ids,
@@ -412,6 +534,10 @@ __global__ void __launch_bounds__(kThreads, kMinBlocks)
   int32_t* sbase = sC;  // [eps]
   int32_t* sacc = sD;   // [eps]
   __syncthreads();      // sA (per-key totals) has been published above
+  if constexpr (PREFIX_FORM == 1) {
+    wait_prefix_parallel(L, pa, tag, cnt, sbase, sacc);
+    return;
+  }
   uint64_t* cells = reinterpret_cast<uint64_t*>(L.window(L.rank) + L.count_cells_offset);
   for (int i = tid; i < nkeys; i += kThreads) {
     int c = wait_tag_u64(L, cells + i, tag);
@@ -467,12 +593,12 @@ __global__ void __launch_bounds__(kThreads, kMinBlocks)
   }
 }
 
-template <int TOP_K>
+template <int TOP_K, int PREFIX_FORM>
 void launch_grid_dispatch(const PushLayout& L, const uint8_t* x_bytes, int bytes_per_token,
                           const int32_t* ids, const float* w, int32_t* rc, GridScratch s, int lt,
                           int device_id, cudaStream_t stream, int fuse_begin, int fuse_prefix,
                           PrefixArgs pa) {
-  auto kernel = dispatch_grid_dedup_kernel<TOP_K>;
+  auto kernel = dispatch_grid_dedup_kernel<TOP_K, PREFIX_FORM>;
   int const nkeys = L.num_local_experts * L.ep_size;
   size_t const smem = static_cast<size_t>(2 * nkeys + 1 + 2 * L.ep_size) * sizeof(int32_t);
   TVM_FFI_ICHECK(smem <= 48 * 1024) << "dispatch_grid: E*ep = " << nkeys << " needs " << smem
@@ -515,12 +641,15 @@ void launch_grid_dispatch(const PushLayout& L, const uint8_t* x_bytes, int bytes
 
 }  // namespace
 
-void sm90_cake_dispatch_grid_bf16(
-    TensorView x, TensorView topk_ids, TensorView topk_w, LAYOUT_PARAMS, TensorView round_ctr,
-    TensorView lc, TensorView loff, TensorView ploff, TensorView keybase, TensorView bases,
-    TensorView items, TensorView iloc, TensorView item_ctr, int64_t fuse_begin, int64_t fuse_prefix,
-    TensorView rows_per_src, TensorView offsets, TensorView seg_src_base, TensorView seg_out_base,
-    TensorView pad_base, TensorView m_dev, TensorView p_dev, TensorView next_row, int64_t m_cap) {
+void sm90_cake_dispatch_grid_bf16(TensorView x, TensorView topk_ids, TensorView topk_w,
+                                  LAYOUT_PARAMS, TensorView round_ctr, TensorView lc,
+                                  TensorView loff, TensorView ploff, TensorView keybase,
+                                  TensorView bases, TensorView items, TensorView iloc,
+                                  TensorView item_ctr, int64_t fuse_begin, int64_t fuse_prefix,
+                                  TensorView rows_per_src, TensorView offsets,
+                                  TensorView seg_src_base, TensorView seg_out_base,
+                                  TensorView pad_base, TensorView m_dev, TensorView p_dev,
+                                  TensorView next_row, int64_t m_cap, int64_t prefix_form) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   int64_t const T = x.size(0);
@@ -597,14 +726,20 @@ void sm90_cake_dispatch_grid_bf16(
   auto* ids = static_cast<const int32_t*>(topk_ids.data_ptr());
   auto* w = static_cast<const float*>(topk_w.data_ptr());
   auto* rc = static_cast<int32_t*>(round_ctr.data_ptr());
+  TVM_FFI_ICHECK(prefix_form == 0 || prefix_form == 1)
+      << "dispatch_grid: prefix_form must be 0 or 1, got " << prefix_form;
   int const fb = fuse_begin != 0 ? 1 : 0;
   int const fp = fuse_prefix != 0 ? 1 : 0;
   int const lt = static_cast<int>(T);
   int const bpt = static_cast<int>(H) * 2;
   int const dev = x.device().device_id;
-#define CAKE_GRID_DISPATCH_CASE(KV)                                                   \
-  case KV:                                                                            \
-    launch_grid_dispatch<KV>(L, xb, bpt, ids, w, rc, s, lt, dev, stream, fb, fp, pa); \
+#define CAKE_GRID_DISPATCH_CASE(KV)                                                        \
+  case KV:                                                                                 \
+    if (prefix_form == 1) {                                                                \
+      launch_grid_dispatch<KV, 1>(L, xb, bpt, ids, w, rc, s, lt, dev, stream, fb, fp, pa); \
+    } else {                                                                               \
+      launch_grid_dispatch<KV, 0>(L, xb, bpt, ids, w, rc, s, lt, dev, stream, fb, fp, pa); \
+    }                                                                                      \
     break;
   switch (K) {
     CAKE_GRID_DISPATCH_CASE(1)

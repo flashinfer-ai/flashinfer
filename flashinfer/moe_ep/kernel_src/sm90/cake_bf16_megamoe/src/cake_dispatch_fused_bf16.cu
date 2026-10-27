@@ -44,7 +44,12 @@
 //   * fuse_prefix: block 0 then runs the receiver-side `wait_prefix` body (wait
 //     for every source's count and base cells, expert-major prefix, segment
 //     tables, zero-row cdone releases) in place of the vendored kernel, with the
-//     same cells, checks, traps and outputs.
+//     same cells, checks, traps and outputs.  Prefix form 0 is the vendored
+//     body (one thread walks the E x eps keys); form 1 computes the same
+//     integer prefix sums with the whole block (see wait_prefix_parallel).
+//     The host runs form 1 only in the small-route instance; the large-route
+//     instance keeps form 0 (its register bound leaves no room for form 1
+//     without more local-memory spills).
 //
 // Cells, tags, SlotMeta fields, pool-head packing and the overflow / invalid
 // expert traps are those of the vendored protocol, so a peer running the
@@ -165,6 +170,125 @@ struct PrefixArgs {
   int m_cap;
   int max_rows_per_key;
 };
+
+// Receiver prefix, form 1: the outputs of the vendored `wait_prefix` serial loop
+// computed by the whole block.  Every output is an integer prefix sum of the
+// same counts (integer addition is associative), so every stored value equals
+// the serial loop's; only the order of the block's global stores changes, and
+// every reader runs after this kernel.  The cells, tags, checks, the m_cap trap
+// and the zero-row cdone releases are those of the serial form (the same
+// outputs are stored before the m_cap check); the base cells, which every
+// source releases before its count cells, are waited for first.
+//   a. exclusive int64 scan of cnt in key order idx = e * eps + s (a contiguous
+//      chunk per thread, warp shuffle scan, per-warp partials): seg_out_base,
+//      offsets[e] = scan[e * eps], pad_base[e] and the total;
+//   b. one warp per source s: exclusive scan of cnt[e * eps + s] over e:
+//      seg_src_base = sbase[s] + scan, column total = rows_per_src[s].
+// cnt [nkeys], sbase [eps], srows [eps]: shared memory of the caller.
+__device__ __forceinline__ void wait_prefix_parallel(const PushLayout& L, const PrefixArgs& pa,
+                                                     uint32_t tag, int32_t* cnt, int32_t* sbase,
+                                                     int32_t* srows) {
+  __shared__ long long s_part[kWarps + 1];  // per-warp partials, then the total
+  int const E = L.num_local_experts;
+  int const eps = L.ep_size;
+  int const nkeys = E * eps;
+  int const tid = threadIdx.x;
+  int const lane = tid & 31;
+  int const warp = tid >> 5;
+  uint64_t* cells = reinterpret_cast<uint64_t*>(L.window(L.rank) + L.count_cells_offset);
+  for (int s = tid; s < eps; s += kThreads) {
+    sbase[s] = wait_tag_u64(L, L.base_cell(L.rank, s), tag);
+  }
+  for (int i = tid; i < nkeys; i += kThreads) {
+    int c = wait_tag_u64(L, cells + i, tag);
+    if (c < 0 || c > pa.max_rows_per_key) {  // protocol corruption, not overflow
+      printf("sm90_push: bad count %d for (expert %d, src %d), max %d\n", c, i / eps, i % eps,
+             pa.max_rows_per_key);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+    }
+    cnt[i] = c;
+  }
+  __syncthreads();
+  // a. per-thread chunk sums and their warp-inclusive scan
+  int const ipt = (nkeys + kThreads - 1) / kThreads;
+  int const begin = min(tid * ipt, nkeys);
+  int const end = min(begin + ipt, nkeys);
+  long long local = 0;
+  for (int i = begin; i < end; ++i) local += cnt[i];
+  long long incl = local;
+#pragma unroll
+  for (int off = 1; off < 32; off <<= 1) {
+    long long const v = __shfl_up_sync(0xffffffffu, incl, off);
+    if (lane >= off) incl += v;
+  }
+  if (lane == 31) s_part[warp] = incl;
+  // b. per-source column scans (warp-uniform loop)
+  int const epl = (E + 31) / 32;
+  int const e0 = min(lane * epl, E);
+  int const e1 = min(e0 + epl, E);
+  for (int s = warp; s < eps; s += kWarps) {
+    int csum = 0;
+    for (int e = e0; e < e1; ++e) csum += cnt[e * eps + s];
+    int cincl = csum;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      int const v = __shfl_up_sync(0xffffffffu, cincl, off);
+      if (lane >= off) cincl += v;
+    }
+    int src_row = sbase[s] + (cincl - csum);
+    for (int e = e0; e < e1; ++e) {
+      int const idx = e * eps + s;
+      pa.seg_src_base[idx] = src_row;
+      src_row += cnt[idx];
+    }
+    if (lane == 31) srows[s] = cincl;
+  }
+  __syncthreads();
+  long long acc = incl - local;
+  for (int w = 0; w < warp; ++w) acc += s_part[w];
+  int e = begin / eps;
+  int s = begin - e * eps;
+  for (int i = begin; i < end; ++i) {
+    if (s == 0) {
+      pa.offsets[e] = acc;
+      // deep_gemm::compute_padded_offset(acc, e): 32-align with headroom
+      pa.pad_base[e] = static_cast<int32_t>((acc + static_cast<int64_t>(e) * 31) / 32 * 32);
+    }
+    pa.seg_out_base[i] = static_cast<int32_t>(acc);
+    acc += cnt[i];
+    if (++s == eps) {
+      s = 0;
+      ++e;
+    }
+  }
+  if (tid == kThreads - 1) s_part[kWarps] = acc;  // grand total (the last chunk ends at nkeys)
+  __syncthreads();
+  if (tid == 0) {
+    int64_t const total = s_part[kWarps];
+    if (total > static_cast<int64_t>(pa.m_cap)) {
+      printf("sm90_push: accumulated row count %lld exceeds m_cap %d\n",
+             static_cast<long long>(total), pa.m_cap);
+      publish_abort_all(L, tag);
+      asm volatile("trap;");
+      return;
+    }
+    pa.offsets[E] = total;
+    pa.seg_out_base[nkeys] = static_cast<int32_t>(total);
+    *pa.m_dev = static_cast<int32_t>(total);
+    int64_t p = (static_cast<int64_t>(pa.m_cap) + static_cast<int64_t>(E) * 31) / 32 * 32;
+    *pa.p_dev = static_cast<int32_t>(p < 1 ? 1 : p);
+    *pa.next_row = 0;  // reset the persistent-compact work queue
+  }
+  __syncthreads();
+  for (int src = tid; src < eps; src += kThreads) {
+    int const rows = srows[src];
+    pa.rows_per_src[src] = rows;
+    if (rows == 0) {  // no combine rows will flow back to src: publish now
+      st_release_sys_u64(L.cdone_cell(src, L.rank), pack_count_tag(0, tag));
+    }
+  }
+}
 
 // Ranks of token t's routes among the earlier routes (route-only pass; the
 // first token of a block gets them from the combined pass of step 1c): s_eid /
@@ -308,8 +432,10 @@ __device__ __forceinline__ void store_token(
 // The small-route instance keeps the original launch bounds (its codegen).
 constexpr int kLargeMinBlocks = 4;
 
-// Kernel body shared by the two instances (route ids in smem: ROUTE_CAP).
-template <int TOP_K, int ROUTE_CAP>
+// Kernel body shared by the two instances (route ids in smem: ROUTE_CAP);
+// PREFIX_FORM selects the receiver prefix form of step 5 (0 serial, 1 parallel;
+// the small-route instance only).
+template <int TOP_K, int ROUTE_CAP, int PREFIX_FORM>
 __device__ __forceinline__ void dispatch_fused_dedup_body(
     PushLayout L, const uint8_t* __restrict__ x_bytes, int bytes_per_token,
     const int32_t* __restrict__ topk_ids, const float* __restrict__ topk_w, int32_t* round_ctr,
@@ -522,6 +648,10 @@ __device__ __forceinline__ void dispatch_fused_dedup_body(
   int32_t* sbase = cnt + nkeys;  // [eps]
   int32_t* sacc = sbase + eps;   // [eps]
   __syncthreads();
+  if constexpr (PREFIX_FORM == 1) {
+    wait_prefix_parallel(L, pa, tag, cnt, sbase, sacc);
+    return;
+  }
   uint64_t* cells = reinterpret_cast<uint64_t*>(L.window(L.rank) + L.count_cells_offset);
   for (int i = tid; i < nkeys; i += kThreads) {
     int c = wait_tag_u64(L, cells + i, tag);
@@ -579,20 +709,21 @@ __device__ __forceinline__ void dispatch_fused_dedup_body(
 
 // Small-route instance (T * top_k <= kMaxRoutes, one block per token): the
 // launch bounds of the original single-instance kernel.
-template <int TOP_K>
+template <int TOP_K, int PREFIX_FORM>
 __global__ void __launch_bounds__(kThreads)
     dispatch_fused_dedup_kernel(PushLayout L, const uint8_t* __restrict__ x_bytes,
                                 int bytes_per_token, const int32_t* __restrict__ topk_ids,
                                 const float* __restrict__ topk_w, int32_t* round_ctr,
                                 int32_t* __restrict__ bases, int local_num_tokens, int fuse_begin,
                                 int fuse_prefix, PrefixArgs pa) {
-  dispatch_fused_dedup_body<TOP_K, kMaxRoutes>(L, x_bytes, bytes_per_token, topk_ids, topk_w,
-                                               round_ctr, bases, local_num_tokens, fuse_begin,
-                                               fuse_prefix, pa);
+  dispatch_fused_dedup_body<TOP_K, kMaxRoutes, PREFIX_FORM>(
+      L, x_bytes, bytes_per_token, topk_ids, topk_w, round_ctr, bases, local_num_tokens, fuse_begin,
+      fuse_prefix, pa);
 }
 
 // Large-route instance (T * top_k <= kMaxRoutesLarge): register-bounded to
 // kLargeMinBlocks blocks per SM so a T = 512 grid is co-resident on 132 SMs.
+// Prefix form 0 only: form 1 spills more under this register bound.
 template <int TOP_K>
 __global__ void __launch_bounds__(kThreads, kLargeMinBlocks)
     dispatch_fused_dedup_kernel_large(PushLayout L, const uint8_t* __restrict__ x_bytes,
@@ -600,17 +731,19 @@ __global__ void __launch_bounds__(kThreads, kLargeMinBlocks)
                                       const float* __restrict__ topk_w, int32_t* round_ctr,
                                       int32_t* __restrict__ bases, int local_num_tokens,
                                       int fuse_begin, int fuse_prefix, PrefixArgs pa) {
-  dispatch_fused_dedup_body<TOP_K, kMaxRoutesLarge>(L, x_bytes, bytes_per_token, topk_ids, topk_w,
-                                                    round_ctr, bases, local_num_tokens, fuse_begin,
-                                                    fuse_prefix, pa);
+  dispatch_fused_dedup_body<TOP_K, kMaxRoutesLarge, 0>(L, x_bytes, bytes_per_token, topk_ids,
+                                                       topk_w, round_ctr, bases, local_num_tokens,
+                                                       fuse_begin, fuse_prefix, pa);
 }
 
-template <int TOP_K, int ROUTE_CAP>
+template <int TOP_K, int ROUTE_CAP, int PREFIX_FORM>
 void launch_fused_dispatch(const PushLayout& L, const uint8_t* x_bytes, int bytes_per_token,
                            const int32_t* ids, const float* w, int32_t* rc, int32_t* bases, int lt,
                            int device_id, cudaStream_t stream, int fuse_begin, int fuse_prefix,
                            PrefixArgs pa) {
-  auto kernel = dispatch_fused_dedup_kernel<TOP_K>;
+  static_assert(ROUTE_CAP == kMaxRoutes || PREFIX_FORM == 0,
+                "the large-route instance runs prefix form 0");
+  auto kernel = dispatch_fused_dedup_kernel<TOP_K, PREFIX_FORM>;
   if constexpr (ROUTE_CAP > kMaxRoutes) kernel = dispatch_fused_dedup_kernel_large<TOP_K>;
   int const nkeys = L.num_local_experts * L.ep_size;
   size_t const smem = static_cast<size_t>(ROUTE_CAP + 2 * nkeys + 1 + L.ep_size) * sizeof(int32_t);
@@ -662,7 +795,8 @@ void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView
                                    int64_t fuse_begin, int64_t fuse_prefix, TensorView rows_per_src,
                                    TensorView offsets, TensorView seg_src_base,
                                    TensorView seg_out_base, TensorView pad_base, TensorView m_dev,
-                                   TensorView p_dev, TensorView next_row, int64_t m_cap) {
+                                   TensorView p_dev, TensorView next_row, int64_t m_cap,
+                                   int64_t prefix_form) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   int64_t const T = x.size(0);
@@ -723,20 +857,26 @@ void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView
     pa.m_cap = static_cast<int>(m_cap);
     pa.max_rows_per_key = L.t_cap * L.top_k;  // one source's routes for one expert
   }
+  TVM_FFI_ICHECK(prefix_form == 0 || prefix_form == 1)
+      << "dispatch_fused: prefix_form must be 0 or 1, got " << prefix_form;
   int const fb = fuse_begin != 0 ? 1 : 0;
   int const fp = fuse_prefix != 0 ? 1 : 0;
   int const lt = static_cast<int>(T);
   int const bpt = static_cast<int>(H) * 2;
   int const dev = x.device().device_id;
-#define CAKE_DISPATCH_CASE(KV)                                                                    \
-  case KV:                                                                                        \
-    if (large) {                                                                                  \
-      launch_fused_dispatch<KV, kMaxRoutesLarge>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, \
-                                                 fp, pa);                                         \
-    } else {                                                                                      \
-      launch_fused_dispatch<KV, kMaxRoutes>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp,  \
-                                            pa);                                                  \
-    }                                                                                             \
+  // prefix form 1 runs in the small-route instance only
+#define CAKE_DISPATCH_CASE(KV)                                                                   \
+  case KV:                                                                                       \
+    if (large) {                                                                                 \
+      launch_fused_dispatch<KV, kMaxRoutesLarge, 0>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, \
+                                                    fb, fp, pa);                                 \
+    } else if (prefix_form == 1) {                                                               \
+      launch_fused_dispatch<KV, kMaxRoutes, 1>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb,  \
+                                               fp, pa);                                          \
+    } else {                                                                                     \
+      launch_fused_dispatch<KV, kMaxRoutes, 0>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb,  \
+                                               fp, pa);                                          \
+    }                                                                                            \
     break;
   switch (K) {
     CAKE_DISPATCH_CASE(1)

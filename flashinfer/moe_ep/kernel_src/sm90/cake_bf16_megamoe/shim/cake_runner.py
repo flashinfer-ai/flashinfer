@@ -68,6 +68,7 @@ __all__ = [
     "PDL_ENV",
     "PDL_LATE_ENV",
     "PER_ROUTE_PUBLISH_PDL_ENV",
+    "PREFIX_FORM_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
     "GRID_DISPATCH_MIN_TOKENS_ENV",
     "PUBLISH_FORM_ENV",
@@ -183,6 +184,13 @@ COPY_FORMS = (0, 1)
 # 0 disables it.  FC1 and FC2 are rank-local, so ranks may differ per round.
 FC2_EARLY_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS"
 FC2_EARLY_MAX_TOKENS = 128
+# Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
+# (default) = the small-round fused dispatch and the grid dispatch compute the
+# integer prefix sums over the E x ep (expert, source) keys with the whole block,
+# 0 = one thread walks the keys (the vendored wait_prefix body) in every
+# dispatch.  The 129..512-token fused dispatch walks the keys with one thread in
+# both settings.  Both forms write the same values, so ranks may differ.
+PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
 
 
 def _env_flag(name: str) -> bool:
@@ -360,6 +368,7 @@ class Sm90CakeBf16MoERunner:
         publish_form: int | None = None,
         per_route_publish_pdl: bool | None = None,
         fc2_early_max_tokens: int | None = None,
+        prefix_form: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -453,6 +462,7 @@ class Sm90CakeBf16MoERunner:
             )
         self._fc2_early_max_tokens = early_max  # effective value fixed after the JIT
         self._gemm_sched: torch.Tensor | None = None
+        self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
         self._per_route_publish_pdl = (
             _per_route_publish_pdl_default()
             if per_route_publish_pdl is None
@@ -623,6 +633,11 @@ class Sm90CakeBf16MoERunner:
     def fc2_early_max_tokens(self) -> int:
         """Largest round (local tokens) that starts FC2 in FC1's tail wave (0 = off)."""
         return self._fc2_early_max_tokens
+
+    @property
+    def prefix_form(self) -> int:
+        """Receiver prefix form of the single-launch dispatches (0 or 1; see ``PREFIX_FORM_ENV``)."""
+        return self._prefix_form
 
     @property
     def fused_begin(self) -> int:
@@ -901,6 +916,7 @@ class Sm90CakeBf16MoERunner:
                         pipe._p_dev,
                         pipe._next_row,
                         pipe.m_cap,
+                        self._prefix_form,
                     )
                 elif use_fused:
                     pipe = self.pipe
@@ -922,6 +938,7 @@ class Sm90CakeBf16MoERunner:
                         pipe._p_dev,
                         pipe._next_row,
                         pipe.m_cap,
+                        self._prefix_form,
                     )
                 else:
                     self.pipe.proto_dispatch(x, topk_ids, topk_weights)

@@ -260,7 +260,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} grid_dispatch_min_tokens must be an int >= 0 or None, got "
                 f"{kcfg.grid_dispatch_min_tokens!r}"
             )
-        for name in ("compact_form", "publish_form"):
+        for name in ("compact_form", "publish_form", "prefix_form"):
             value = getattr(kcfg, name)
             if value is not None and (isinstance(value, bool) or value not in (0, 1)):
                 raise MoEEpConfigError(
@@ -398,6 +398,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 publish_form=kcfg.publish_form,
                 per_route_publish_pdl=kcfg.per_route_publish_pdl,
                 fc2_early_max_tokens=kcfg.fc2_early_max_tokens,
+                prefix_form=kcfg.prefix_form,
             )
         except Exception:
             pipe.destroy()
@@ -433,6 +434,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.publish_form,
             kcfg.per_route_publish_pdl,
             kcfg.fc2_early_max_tokens,
+            kcfg.prefix_form,
             float(kcfg.init_timeout_s),
         )
 
