@@ -29,7 +29,8 @@ counts 1, 5, 63, 64, 65, 1000 and 4097 with documents of lengths 1, 2 and 3
 and empty documents before, between and after others, channel counts 128,
 136, 256, 384, 512, 768, 1024, 1280, 1344, 1536, 1600, 2048 and 2560 (the
 round-6 tile rule splits 1280 as five 32-vector tiles of four token sub-tiles,
-1536 and 2560 as 64-vector tiles of two; 1344 and 1600 keep the legacy form),
+1536 and 2560 as 64-vector tiles of two; 1344 and 1600, with no 32-multiple
+divisor, take the forward's and the backward's own fallback tiles),
 the ``[1, S, C]`` layout, document isolation, bitwise reproducibility of the
 gradients, CUDA Graph capture and replay of changing shapes, argument
 validation, the workspace helpers and one ``S x C > 2^31`` case guarded by free
@@ -41,16 +42,22 @@ their combination -- each with a NaN-poisoned workspace, run-to-run bitwise
 gradients and graph replay; a route an architecture has not rendered yet
 skips its tests, and the registry test fails until every route's libraries
 are in ``build.json``.  An architecture whose route ships several programs
-selects one by the channel count: the suite checks that exactly one runs per
-call, that every program of the route runs for some channel count on both
-sides of its threshold, that the workspace is sized for the largest partial
-buffer over every route, and that a routed row's ``dx`` equals the fallback
-program's bits.  The backward is two launches on one stream -- the selected
+(every backward route; the forward routes on sm_107a) selects one by the
+channel count: the suite checks that exactly one runs per call, that every
+program of the route runs for some channel count on both sides of its
+threshold, that the workspace is sized for the largest partial buffer over
+every route, and that a routed row's ``dx`` (forward: ``y``) equals the
+fallback program's bits.  The backward is two launches on one stream -- the selected
 program, then its ``reduce`` program with programmatic dependent launch -- and
 the suite holds the launch order, the registry's grid-rule kinds and
 FlashInfer issue #7038's recipe: a kernel resident on another stream does not
 stall the backward (``busy <= 2 x alone``) and leaves ``dweight`` bitwise
-unchanged.
+unchanged.  The forward takes its token chunks from int32 counters in a
+forward workspace that every launch leaves zero: the suite checks its size
+rule, one caller-owned buffer over repeated calls of every forward route,
+two streams with two buffers running at once, CUDA Graph capture and replay
+with and without a caller-owned buffer, and the package's per-(device,
+stream) buffer of the calls that pass none.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -64,6 +71,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -84,6 +92,12 @@ cake_causal_conv1d_train_backward_workspace_bytes = (
     pkg.cake_causal_conv1d_train_backward_workspace_bytes
 )
 cake_causal_conv1d_train_forward = pkg.cake_causal_conv1d_train_forward
+cake_causal_conv1d_train_forward_workspace = (
+    pkg.cake_causal_conv1d_train_forward_workspace
+)
+cake_causal_conv1d_train_forward_workspace_bytes = (
+    pkg.cake_causal_conv1d_train_forward_workspace_bytes
+)
 is_cake_causal_conv1d_train_supported = pkg.is_cake_causal_conv1d_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -119,9 +133,11 @@ SEED = 2033
 # one eight-token stage of the big-channel backward program) and at the new
 # tile geometries; C = 1280 (160 vectors: five 32-vector tiles, four token
 # sub-tiles each), 1536 (192: three 64-vector tiles of two sub-tiles), 2560
-# (320: five 64-vector tiles of two), 1344 (168: no 32-multiple divisor, the
-# legacy form with warp 1 clipped and warps 2-3 idle) and 1600 (200: 128 + 72,
-# two whole warps plus eight lanes).
+# (320: five 64-vector tiles of two), and on the fallbacks (no 32-multiple
+# divisor), forward | backward, 1344 (168: four whole 42-vector tiles of three
+# sub-tiles | three 64-vector tiles of two, the last 40 vectors) and 1600 (200:
+# five whole 40-vector tiles of three | seven 32-vector tiles of four, the last
+# eight vectors).
 CASES = (
     (1, 128, None),
     (5, 136, (2, 0, 3)),
@@ -167,23 +183,34 @@ GRAPH_CASES = (
     (4097, 2560, (1000, 0, 3, 3094)),
 )
 GRAPH_REPLAYS = 4
-# The literal channel-split table of CONTRACT §3 at the backward's geometry (128
-# threads x 8 channels): C -> (ct_vec, n_sub, n_ch_tiles) under the round-6 rule
-# and under the legacy rule the KCP path keeps.
+# The literal channel-split tables of CONTRACT §3 at 128 threads x 8 channels:
+# C -> (ct_vec, n_sub, n_ch_tiles) under the forward's and the backward's rule
+# (D1 wherever cv <= 128 or a multiple of 32 divides cv, the role's fallback at
+# C 1032, 1152, 1160, 1344, 1408, 1600, 1920, 2176, 2688 and 3200) and under the
+# legacy rule the KCP path keeps.
 CHANNEL_SPLIT_TABLE = {
-    128: ((16, 8, 1), (16, 8, 1)),
-    256: ((32, 4, 1), (32, 4, 1)),
-    512: ((64, 2, 1), (64, 2, 1)),
-    768: ((96, 1, 1), (96, 1, 1)),
-    1024: ((128, 1, 1), (128, 1, 1)),
-    1160: ((128, 1, 2), (128, 1, 2)),
-    1280: ((32, 4, 5), (128, 1, 2)),
-    1344: ((128, 1, 2), (128, 1, 2)),
-    1536: ((64, 2, 3), (128, 1, 2)),
-    2048: ((128, 1, 2), (128, 1, 2)),
-    2560: ((64, 2, 5), (128, 1, 3)),
-    4096: ((128, 1, 4), (128, 1, 4)),
-    8192: ((128, 1, 8), (128, 1, 8)),
+    128: ((16, 8, 1), (16, 8, 1), (16, 8, 1)),
+    256: ((32, 4, 1), (32, 4, 1), (32, 4, 1)),
+    384: ((48, 2, 1), (48, 2, 1), (48, 2, 1)),
+    512: ((64, 2, 1), (64, 2, 1), (64, 2, 1)),
+    768: ((96, 1, 1), (96, 1, 1), (96, 1, 1)),
+    1024: ((128, 1, 1), (128, 1, 1), (128, 1, 1)),
+    1032: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1152: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1160: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1280: ((32, 4, 5), (32, 4, 5), (128, 1, 2)),
+    1344: ((42, 3, 4), (64, 2, 3), (128, 1, 2)),
+    1408: ((64, 2, 3), (64, 2, 3), (128, 1, 2)),
+    1536: ((64, 2, 3), (64, 2, 3), (128, 1, 2)),
+    1600: ((40, 3, 5), (32, 4, 7), (128, 1, 2)),
+    1920: ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+    2048: ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+    2176: ((32, 4, 9), (32, 4, 9), (128, 1, 3)),
+    2560: ((64, 2, 5), (64, 2, 5), (128, 1, 3)),
+    2688: ((42, 3, 8), (32, 4, 11), (128, 1, 3)),
+    3200: ((32, 4, 13), (32, 4, 13), (128, 1, 4)),
+    4096: ((128, 1, 4), (128, 1, 4), (128, 1, 4)),
+    8192: ((128, 1, 8), (128, 1, 8), (128, 1, 8)),
 }
 # The call settings that resolve to each backward route (the forward route
 # follows: fwd, fwd_dt, fwd_bias, fwd, fwd_bias).
@@ -619,37 +646,73 @@ def _backward(x, w, cu, dy, b, policy, **kwargs):
     return grads[0], grads[1], (grads[2] if b is not None else None)
 
 
+def _fallback_of_record(cv: int, role: str) -> int:
+    """The role's fallback at 128 threads in exact arithmetic: of every multiple of 32 (and, for the forward, every
+    divisor of cv from 40 to 128), the highest lane use cv / (n_ch_tiles x ct_vec) x (ct_vec x (128 // ct_vec) /
+    128), n_ch_tiles = ceil(cv / ct_vec), the larger on a tie."""
+
+    candidates = set(range(32, 129, 32))
+    if role == "fwd":
+        candidates |= {d for d in range(40, 129) if cv % d == 0}
+    return max(
+        candidates,
+        key=lambda d: (Fraction(cv * (128 // d), -(-cv // d) * 128), d),
+    )
+
+
 def test_channel_split_literal_table() -> None:
-    """The host tile rule against the literal table of CONTRACT §3 (round-6 and legacy forms), and its
-    invariants over every multiple of eight up to 8192."""
+    """The host tile rule of each role against the literal table of CONTRACT §3 (the forward's, the backward's and
+    the legacy forms), and its invariants over every multiple of eight up to 8192."""
 
     geometry = {"threads": 128, "vec": 8}
-    for C, (new, legacy) in CHANNEL_SPLIT_TABLE.items():
-        assert loader.channel_split(C, geometry=geometry) == new, C
+    for C, (fwd, bwd, legacy) in CHANNEL_SPLIT_TABLE.items():
+        assert loader.channel_split(C, geometry=geometry, role="fwd") == fwd, C
+        assert loader.channel_split(C, geometry=geometry, role="bwd") == bwd, C
         assert loader.channel_split(C, geometry=geometry, legacy=True) == legacy, C
+        for role in ("fwd", "bwd"):
+            assert (
+                loader.channel_split(C, geometry=geometry, role=role, legacy=True)
+                == legacy
+            ), (C, role)
     for C in range(8, 8193, 8):
         cv = C // 8
-        for legacy in (False, True):
-            ct_vec, n_sub, n_ch_tiles = loader.channel_split(
-                C, geometry=geometry, legacy=legacy
-            )
-            assert 1 <= ct_vec <= 128 and n_sub == 128 // ct_vec, (C, legacy)
-            assert n_ch_tiles == -(-cv // ct_vec), (C, legacy)
-            if cv <= 128 or legacy:
-                assert ct_vec == min(cv, 128), (C, legacy)
-            else:
-                # A multiple of 32 dividing cv with the highest lane use, else 128.
-                assert ct_vec == 128 or (ct_vec % 32 == 0 and cv % ct_vec == 0), C
-                assert all(
-                    ct_vec * n_sub >= width * (128 // width)
-                    for width in range(32, 129, 32)
-                    if cv % width == 0
-                ), C
+        divisors = [d for d in range(32, 129, 32) if cv % d == 0]
+        splits = {
+            role: loader.channel_split(C, geometry=geometry, role=role)
+            for role in ("fwd", "bwd")
+        }
+        splits["legacy"] = loader.channel_split(C, geometry=geometry, legacy=True)
+        for key, (ct_vec, n_sub, n_ch_tiles) in splits.items():
+            assert 1 <= ct_vec <= 128 and n_sub == 128 // ct_vec, (C, key)
+            assert n_ch_tiles == -(-cv // ct_vec), (C, key)
+        assert splits["legacy"][0] == min(cv, 128), C
+        if cv <= 128:
+            assert splits["fwd"][0] == splits["bwd"][0] == cv, C
+        elif divisors:
+            # D1: a multiple of 32 dividing cv with the highest lane use, the same for both roles.
+            ct_vec = max(divisors, key=lambda d: (d * (128 // d), d))
+            assert splits["fwd"][0] == splits["bwd"][0] == ct_vec, C
+        else:
+            for role in ("fwd", "bwd"):
+                assert splits[role][0] == _fallback_of_record(cv, role), (C, role)
+            assert splits["bwd"][0] % 32 == 0, C
+            assert splits["fwd"][0] % 32 == 0 or (
+                splits["fwd"][0] >= 40 and cv % splits["fwd"][0] == 0
+            ), C
     with pytest.raises(ValueError):
-        loader.channel_split(12, geometry=geometry)
-    assert loader.plan(5, 1280, 3, geometry=geometry)["ct_vec"] == 32
+        loader.channel_split(12, geometry=geometry, role="bwd")
+    for role in (None, "reduce", "dx"):
+        with pytest.raises(ValueError):
+            loader.channel_split(1280, geometry=geometry, role=role)
+        with pytest.raises(ValueError):
+            loader.plan(5, 1280, 3, geometry=geometry, role=role)
+    assert loader.plan(5, 1280, 3, geometry=geometry, role="bwd")["ct_vec"] == 32
+    assert loader.plan(5, 1344, 3, geometry=geometry, role="fwd")["ct_vec"] == 42
+    assert loader.plan(5, 1344, 3, geometry=geometry, role="bwd")["ct_vec"] == 64
     assert loader.plan(5, 1280, 3, geometry=geometry, legacy=True)["ct_vec"] == 128
-    assert set(loader.plan(5, 1280, 3, geometry=geometry)) == set(loader.PLAN_SCALARS)
+    assert set(loader.plan(5, 1280, 3, geometry=geometry, role="bwd")) == set(
+        loader.PLAN_SCALARS
+    )
     assert "flags" in loader.LOGICAL_SCALARS and "flags" not in loader.PLAN_SCALARS
 
 
@@ -808,6 +871,71 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
+@pytest.mark.parametrize("kind", ("fwd", "fwd_dt", "fwd_bias"))
+def test_forward_programs_switch_on_channel_count(kind) -> None:
+    """Exactly one forward program of the route runs per call, every program of the route runs for some channel
+    count, and on both sides of each channel threshold ``y`` matches the reference and equals, bit for bit, the
+    route's fallback program launched on its own (every forward program rounds ``y`` as the static one does)."""
+
+    _require_route(kind)
+    arch = _arch()
+    names = loader.route_modules(arch, kind)
+    thresholds = _backward_thresholds(arch, kind)
+    if not thresholds:
+        pytest.skip(
+            f"the {kind} route on {arch} ships one program ({names[0]}); nothing switches"
+        )
+    fallback = _fallback_program(arch, kind)
+    record = loader.MODULES[fallback]
+    device = _device()
+    channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    launched = set()
+    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
+        for C in channels:
+            selected = loader.selected_modules(arch, kind, C=C, S=S)
+            assert len(selected) == 1, f"S={S} C={C}: {selected}"
+            launched.add(selected[0])
+            x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
+            label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
+            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+            _assert_within(
+                y,
+                reference_forward(x, w, cu, b),
+                atol=Y_ATOL,
+                rtol=Y_RTOL,
+                label=f"y {label}",
+            )
+            scalars = loader.plan(
+                S,
+                C,
+                int(cu.numel()) - 1,
+                geometry=record["grid_rule"]["geometry"],
+                role=record["role"],
+            )
+            y_fallback = torch.full_like(y, float("nan"))
+            values = {
+                "x": x,
+                "w": w,
+                "cu": cu,
+                "y": y_fallback,
+                "work": torch.zeros(
+                    loader.counter_words(record, scalars["n_ch_tiles"]),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                **{key: int(scalars[key]) for key in loader.PLAN_SCALARS},
+                "flags": pkg._flags(w, b=b),
+            }
+            if b is not None:
+                values["b"] = b
+            loader.run_module(fallback, values, device_index=device.index)
+            torch.cuda.synchronize(device)
+            assert torch.equal(y, y_fallback), (
+                f"y of {selected[0]} differs from the fallback program {fallback}: {label}"
+            )
+    assert launched == set(names), f"never launched {set(names) - launched}"
+
+
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
 def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
     """A row the channel count routes to a selected program gets the same ``dx`` bits as the fallback program
@@ -825,7 +953,11 @@ def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
     dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
     record = loader.MODULES[fallback]
     scalars = loader.plan(
-        S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
+        S,
+        C,
+        int(cu.numel()) - 1,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
     )
     grid_x = loader.launch_grid(record, device_index=device.index)[0]
     rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -990,7 +1122,7 @@ def test_cuda_graph_replays_match_eager_per_route(kind) -> None:
 def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> None:
     """A backward call is two launches: the program ``C`` selects, then that record's ``reduce`` program with
     the main grid's CTA count as its ``main_ctas`` scalar, a partial view of that grid's rows and ``ceil(C / 4)``
-    CTAs; the forward launches its route in order."""
+    CTAs; the forward launches the one program its route selects for ``C``."""
 
     S, C, docs = 1000, 512, "perf"
     device = _device()
@@ -1010,7 +1142,9 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     values, reduce_values = launched[0][1], launched[1][1]
     assert reduce_values == values, "both launches see one argument set"
     grid_x = loader.launch_grid(record, device_index=device.index)[0]
-    _, _, n_ch_tiles = loader.channel_split(C, geometry=record["grid_rule"]["geometry"])
+    _, _, n_ch_tiles = loader.channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+    )
     assert values["main_ctas"] == grid_x
     assert tuple(values["partial"].shape) == (
         loader.partial_rows(grid_x, n_ch_tiles),
@@ -1024,7 +1158,17 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
         loader.launch_grid(reduce, device_index=device.index)
     launched.clear()
     cake_causal_conv1d_train_forward(x, w, cu)
-    assert [name for name, _, _ in launched] == list(loader.route_modules(arch, "fwd"))
+    assert [name for name, _, _ in launched] == list(
+        loader.selected_modules(arch, "fwd", C=C, S=S)
+    )
+    # The forward passes its token-chunk counters: int32, at least two words per channel tile of its plan.
+    forward = loader.MODULES[launched[0][0]]
+    work = launched[0][1]["work"]
+    _, _, fwd_tiles = loader.channel_split(
+        C, geometry=forward["grid_rule"]["geometry"], role="fwd"
+    )
+    assert work.dtype == torch.int32 and work.numel() >= 2 * fwd_tiles
+    assert loader.counter_words(forward, fwd_tiles) == 2 * fwd_tiles
 
 
 def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
@@ -1332,7 +1476,11 @@ def test_dt_route_with_f32_taps_matches_default_route_bitwise(case) -> None:
         name = _fallback_program(arch, kind)
         record = loader.MODULES[name]
         scalars = loader.plan(
-            S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
+            S,
+            C,
+            int(cu.numel()) - 1,
+            geometry=record["grid_rule"]["geometry"],
+            role=record["role"],
         )
         grid_x = loader.launch_grid(record, device_index=device.index)[0]
         rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -1409,7 +1557,9 @@ def test_workspace_bytes_and_layout() -> None:
         large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
         assert small == large > 0, "the workspace is independent of S"
         layout = loader.workspace_layout(record, C, device_index=device.index)
-        _, _, n_ch_tiles = loader.channel_split(C, geometry=geometry)
+        _, _, n_ch_tiles = loader.channel_split(
+            C, geometry=geometry, role=record["role"]
+        )
         assert layout["grid"] == grid
         assert (
             layout["rows"]
@@ -1439,7 +1589,9 @@ def test_workspace_bytes_and_layout() -> None:
             for C in (T - 8, T, 8192):
                 selected = loader.MODULES[loader.selected_modules(arch, kind, C=C)[0]]
                 _, _, n_ch_tiles = loader.channel_split(
-                    C, geometry=selected["grid_rule"]["geometry"]
+                    C,
+                    geometry=selected["grid_rule"]["geometry"],
+                    role=selected["role"],
                 )
                 rows = loader.partial_rows(
                     loader.launch_grid(selected, device_index=device.index)[0],
@@ -1455,13 +1607,17 @@ def test_workspace_bytes_and_layout() -> None:
     # One channel tile holds up to threads x vec channels (a partial row per CTA): 1024 for the backward's eight
     # channels per thread; 8192 channels are eight tiles; C = 136 is 17 channel vectors (seven sub-tiles of 17).
     vec, threads = geometry["vec"], geometry["threads"]
-    assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
-    assert loader.channel_split(8192, geometry=geometry) == (
+    assert loader.channel_split(threads * vec, geometry=geometry, role="bwd") == (
+        threads,
+        1,
+        1,
+    )
+    assert loader.channel_split(8192, geometry=geometry, role="bwd") == (
         threads,
         1,
         8192 // (threads * vec),
     )
-    assert loader.channel_split(136, geometry=geometry) == (
+    assert loader.channel_split(136, geometry=geometry, role="bwd") == (
         136 // vec,
         threads // (136 // vec),
         1,
@@ -1476,6 +1632,280 @@ def test_workspace_bytes_and_layout() -> None:
         cake_causal_conv1d_train_backward_workspace_bytes(-1, 512, device)
     with pytest.raises(ValueError):
         cake_causal_conv1d_train_backward_workspace_bytes(1, 130, device)
+
+
+# Forward workspace rows: whole-row and multi-sub-tile tiles, the forward's fallback tiles (1344, 1600), a
+# 2560-channel plan of five tiles and the S = 5 row below one stage.
+FORWARD_WORKSPACE_CASES = (
+    (1000, 512, "perf"),
+    (4097, 1280, (1000, 0, 3, 3094)),
+    (4097, 1344, (1000, 0, 3, 3094)),
+    (1000, 1600, "perf"),
+    (4097, 2560, (1000, 0, 3, 3094)),
+    (65, 256, (64, 1)),
+    (5, 1536, (2, 0, 3)),
+)
+# The backward route settings whose inputs select each forward route.
+FORWARD_ROUTE_SETTINGS = {"fwd": "bwd", "fwd_dt": "bwd_dt", "fwd_bias": "bwd_bias"}
+
+
+def _forward_tiles(C: int) -> int:
+    """The forward's channel tiles for ``C`` at the forward records' geometry."""
+
+    record = loader.MODULES[loader.route_modules(_arch(), "fwd")[0]]
+    return loader.channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role="fwd"
+    )[2]
+
+
+def test_forward_workspace_bytes() -> None:
+    """Two int32 counters per channel tile of the forward's plan, the most over every forward route; independent
+    of ``S``; the allocated buffer is zero."""
+
+    device = _device()
+    arch = _arch()
+    assert loader.forward_kinds(arch) == ("fwd", "fwd_dt", "fwd_bias")
+    geometries = set()
+    for kind in loader.forward_kinds(arch):
+        for name in loader.route_modules(arch, kind):
+            record = loader.MODULES[name]
+            assert record["workspace_rule"] == {
+                "kind": "tile_counters",
+                "words_per_tile": 2,
+            }, name
+            geometries.add(tuple(sorted(record["grid_rule"]["geometry"].items())))
+    assert len(geometries) == 1
+    for C in (8, 128, 136, 1024, 1160, 1280, 1344, 1600, 2560, 3200, 8192):
+        tiles = _forward_tiles(C)
+        assert loader.forward_workspace_words(arch, C) == 2 * tiles, C
+        small = cake_causal_conv1d_train_forward_workspace_bytes(1, C, device)
+        large = cake_causal_conv1d_train_forward_workspace_bytes(262401, C, device)
+        assert small == large == 4 * 2 * tiles, C
+    workspace = cake_causal_conv1d_train_forward_workspace(65536, 2560, device)
+    assert workspace.dtype == torch.int32 and workspace.device == device
+    assert workspace.numel() == 2 * _forward_tiles(2560) and workspace.is_contiguous()
+    assert int(torch.count_nonzero(workspace)) == 0
+    with pytest.raises(ValueError):
+        cake_causal_conv1d_train_forward_workspace_bytes(-1, 512, device)
+    with pytest.raises(ValueError):
+        cake_causal_conv1d_train_forward_workspace_bytes(1, 130, device)
+
+
+def test_forward_reuses_one_workspace_over_calls_and_routes() -> None:
+    """One caller-owned buffer serves repeated calls of every forward route and channel count in turn: every launch
+    leaves the counters zero, and ``y`` is within the reference and bitwise the call without a workspace."""
+
+    device = _device()
+    workspace = cake_causal_conv1d_train_forward_workspace(
+        1,
+        max(
+            FORWARD_WORKSPACE_CASES,
+            key=lambda case: cake_causal_conv1d_train_forward_workspace_bytes(
+                1, case[1], device
+            ),
+        )[1],
+        device,
+    )
+    problems = []
+    for kind, settings in FORWARD_ROUTE_SETTINGS.items():
+        _require_route(settings)
+        for S, C, docs in FORWARD_WORKSPACE_CASES:
+            x, w, cu, _, b, _ = _route_inputs(S, C, docs, settings, key=13)
+            assert (
+                loader.forward_route(
+                    bias=b is not None, bf16_taps=w.dtype == torch.bfloat16
+                )
+                == kind
+            )
+            problems.append((kind, S, C, x, w, cu, b, reference_forward(x, w, cu, b)))
+    for repeat in range(3):
+        for kind, S, C, x, w, cu, b, expected in problems:
+            label = f"repeat {repeat} {kind} S={S} C={C}"
+            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b, workspace=workspace)
+            torch.cuda.synchronize(device)
+            assert int(torch.count_nonzero(workspace)) == 0, label
+            _assert_within(y, expected, atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}")
+            assert torch.equal(y, cake_causal_conv1d_train_forward(x, w, cu, bias=b)), (
+                label
+            )
+
+
+def test_forward_on_two_streams_with_two_workspaces() -> None:
+    """Two streams, each with its own buffer (or the package's buffer of each stream), run the forward at once:
+    every ``y`` is bitwise the one-stream result and every buffer ends zero."""
+
+    device = _device()
+    S, C, docs = 131072, 1280, "perf"
+    x, w, cu, _ = _inputs(S, C, docs, key=17)
+    expected = cake_causal_conv1d_train_forward(x, w, cu)
+    torch.cuda.synchronize(device)
+    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+    assert streams[0].cuda_stream != streams[1].cuda_stream
+    workspaces = [
+        cake_causal_conv1d_train_forward_workspace(S, C, device) for _ in streams
+    ]
+    calls = 6
+    for owned in (True, False):
+        outs = [[torch.empty_like(x) for _ in range(calls)] for _ in streams]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        for i in range(calls):
+            for s, stream in enumerate(streams):
+                with torch.cuda.stream(stream):
+                    cake_causal_conv1d_train_forward(
+                        x,
+                        w,
+                        cu,
+                        out=outs[s][i],
+                        workspace=workspaces[s] if owned else None,
+                    )
+        torch.cuda.synchronize(device)
+        for s in range(len(streams)):
+            for i in range(calls):
+                assert torch.equal(outs[s][i], expected), (owned, s, i)
+        held = (
+            workspaces
+            if owned
+            else [
+                pkg._FORWARD_WORKSPACES[(device.index, stream.cuda_stream)]
+                for stream in streams
+            ]
+        )
+        assert held[0].data_ptr() != held[1].data_ptr()
+        assert all(int(torch.count_nonzero(ws)) == 0 for ws in held), owned
+
+
+def test_forward_workspace_cache_per_device_and_stream() -> None:
+    """A call without a workspace uses the zeroed buffer the package keeps for its device and current stream:
+    reused by the stream's later calls, replaced by a larger zeroed one when a call needs more channel tiles (and
+    kept for the smaller ones after it), and never shared by two streams."""
+
+    device = _device()
+    cache = pkg._FORWARD_WORKSPACES
+    small = _inputs(1000, 512, "perf", key=19)[:3]
+    large = _inputs(4097, 2560, (1000, 0, 3, 3094), key=19)[:3]
+    stream, other = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    key = (device.index, stream.cuda_stream)
+    other_key = (device.index, other.cuda_stream)
+    cache.pop(key, None)
+    cache.pop(other_key, None)
+    for tensor in (*small, *large):
+        tensor.record_stream(stream)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    other.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        y1 = cake_causal_conv1d_train_forward(*small)
+        first = cache[key]
+        assert first.dtype == torch.int32 and first.numel() == 2 * _forward_tiles(512)
+        y2 = cake_causal_conv1d_train_forward(*small)
+        assert cache[key] is first
+        y3 = cake_causal_conv1d_train_forward(*large)
+        grown = cache[key]
+        assert grown is not first and grown.numel() == 2 * _forward_tiles(2560)
+        y4 = cake_causal_conv1d_train_forward(*small)
+        assert cache[key] is grown
+    with torch.cuda.stream(other):
+        y5 = cake_causal_conv1d_train_forward(*small)
+    torch.cuda.synchronize(device)
+    assert cache[other_key].data_ptr() != cache[key].data_ptr()
+    assert int(torch.count_nonzero(cache[key])) == 0
+    assert int(torch.count_nonzero(cache[other_key])) == 0
+    assert torch.equal(y1, y2) and torch.equal(y1, y4) and torch.equal(y1, y5)
+    _assert_within(
+        y1, reference_forward(*small), atol=Y_ATOL, rtol=Y_RTOL, label="y C=512"
+    )
+    _assert_within(
+        y3, reference_forward(*large), atol=Y_ATOL, rtol=Y_RTOL, label="y C=2560"
+    )
+
+
+def test_forward_cuda_graph_with_and_without_workspace() -> None:
+    """A captured forward with a caller-owned buffer reuses it on every replay (left zero after each); one without
+    a buffer captures a zeroed buffer of its own and leaves the package's cached buffers alone.  Replays equal
+    eager, also when the two graphs replay at once on two streams."""
+
+    device = _device()
+    cache = pkg._FORWARD_WORKSPACES
+    for kind, settings in FORWARD_ROUTE_SETTINGS.items():
+        _require_route(settings)
+        S, C, docs = 4097, 1344, (1000, 0, 3, 3094)
+        x, w, cu, _, b, _ = _route_inputs(S, C, docs, settings, key=23)
+        eager = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+        workspace = cake_causal_conv1d_train_forward_workspace(S, C, device)
+        y_owned, y_own_buffer = torch.empty_like(x), torch.empty_like(x)
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            cake_causal_conv1d_train_forward(
+                x, w, cu, bias=b, out=y_owned, workspace=workspace
+            )
+            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize(device)
+        before = {key: held.data_ptr() for key, held in cache.items()}
+        owned, own_buffer = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(owned, stream=side):
+            cake_causal_conv1d_train_forward(
+                x, w, cu, bias=b, out=y_owned, workspace=workspace
+            )
+        with torch.cuda.graph(own_buffer, stream=side):
+            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+        assert {key: held.data_ptr() for key, held in cache.items()} == before, kind
+        for replay in range(GRAPH_REPLAYS):
+            y_owned.fill_(float("nan"))
+            y_own_buffer.fill_(float("nan"))
+            owned.replay()
+            own_buffer.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(y_owned, eager) and torch.equal(y_own_buffer, eager), (
+                kind,
+                replay,
+            )
+            assert int(torch.count_nonzero(workspace)) == 0, (kind, replay)
+        streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        for _replay in range(GRAPH_REPLAYS):
+            with torch.cuda.stream(streams[0]):
+                owned.replay()
+            with torch.cuda.stream(streams[1]):
+                own_buffer.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(y_owned, eager) and torch.equal(y_own_buffer, eager), kind
+        assert int(torch.count_nonzero(workspace)) == 0, kind
+
+
+def test_forward_workspace_validation() -> None:
+    S, C = 4097, 1280
+    x, w, cu, _ = _inputs(S, C, (1000, 0, 3, 3094))
+    words = cake_causal_conv1d_train_forward_workspace_bytes(S, C, _device()) // 4
+    with pytest.raises(ValueError, match="workspace holds"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(words - 1, dtype=torch.int32, device=_device()),
+        )
+    with pytest.raises(ValueError, match="torch.int32"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(4 * words, dtype=torch.uint8, device=_device()),
+        )
+    with pytest.raises(ValueError, match="1-D"):
+        cake_causal_conv1d_train_forward(
+            x,
+            w,
+            cu,
+            workspace=torch.zeros(1, words, dtype=torch.int32, device=_device()),
+        )
+    with pytest.raises(ValueError, match="must live on"):
+        cake_causal_conv1d_train_forward(
+            x, w, cu, workspace=torch.zeros(words, dtype=torch.int32)
+        )
+    with pytest.raises(TypeError):
+        cake_causal_conv1d_train_forward(x, w, cu, workspace=[0] * words)
 
 
 def test_argument_validation() -> None:
@@ -1610,7 +2040,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == pkg.__name__
+    # The manifest names the package by its FlashInfer import path, also in a copy
+    # vendored under another name (``pkg.__name__`` is then the copy's).
+    assert manifest["package"] == "flashinfer.cake_causal_conv1d_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()
@@ -1711,16 +2143,24 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert record["workspace_rule"] is None, name
             assert reduce_core <= logical <= reduce_core | {"db", "flags"}, name
         else:
-            assert record["workspace_rule"] is None and not {"dw", "db"} & logical, name
+            # A forward program takes its token chunks from the ``work`` counters: two int32 words per channel
+            # tile (the next-chunk counter and the done-CTA counter).
+            assert record["workspace_rule"] == {
+                "kind": "tile_counters",
+                "words_per_tile": 2,
+            }, name
+            assert "work" in logical and not {"dw", "db", "partial"} & logical, name
+        assert (
+            record["workspace_rule"] is None
+            or record["workspace_rule"]["kind"] in loader.WORKSPACE_KINDS
+        ), name
         if "b" in logical:
             assert "flags" in logical, name
-        # The selection vocabulary: forward records carry no rule; a backward rule is
-        # ``channels_at_least`` with one positive multiple-of-8 threshold per architecture it names.
+        # The selection vocabulary: a forward or backward rule is ``channels_at_least`` with one positive
+        # multiple-of-8 threshold per architecture it names.
         rule = loader.select_rule(record)
-        if record["role"] == "fwd":
-            assert rule is None, name
         if rule is not None:
-            assert record["role"] == "bwd", name
+            assert record["role"] in ("fwd", "bwd"), name
             assert set(rule) == {"kind", "channels"}, name
             assert rule["kind"] in loader.SELECT_KINDS, name
             assert set(rule["channels"]) <= set(record["arches"]), name
@@ -1761,19 +2201,15 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert "--prec-div=true" in entry["nvcc_flags"]
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
-    # Per architecture and backward route: exactly one fallback record, every routed record's rule names
-    # the architecture with its own threshold (distinct thresholds, at most three routed programs), one
-    # program selected per channel count -- the highest threshold at most C, the fallback below the
-    # lowest -- and a forward route selects nothing.
+    # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
+    # rule names the architecture with its own threshold (distinct thresholds, at most three routed
+    # programs), one program selected per channel count -- the highest threshold at most C, the fallback
+    # below the lowest.
     for arch in loader.ARCHES:
         for kind in loader.KINDS:
             if kind not in loader.ROUTES[arch]:
                 continue
             names = loader.route_modules(arch, kind)
-            if loader.route_role(kind) == "fwd":
-                assert loader.selected_modules(arch, kind, C=512) == names
-                assert all(loader.select_rule(loader.MODULES[n]) is None for n in names)
-                continue
             rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
             fallbacks = [name for name, rule in rules.items() if rule is None]
             assert len(fallbacks) == 1, (arch, kind, fallbacks)

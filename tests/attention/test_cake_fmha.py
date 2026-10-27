@@ -383,9 +383,9 @@ def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
 
     members = get_cake_fmha_manifest()["components"]["context_bf16"]["source_family"]
     generic_members = [m for m in members if "NUM_M_BLOCKS" not in m["selector"]]
-    exact_members = [m for m in members if "NUM_M_BLOCKS" in m["selector"]]
-    assert len(generic_members) == 6
-    assert len(exact_members) == 2
+    # The q511 / q257 one-tile programs ship as the generated unit
+    # csrc/cake_fmha_context_bf16/, not as registry members.
+    assert len(generic_members) == len(members) == 6
     assert {
         member["sources"][arch]
         for member in generic_members
@@ -393,9 +393,7 @@ def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
     } == {"cuda/context_bf16/default.cu"}
     csrc_dir = get_cake_fmha_csrc_dir()
     for arch in ("sm_100a", "sm_103a"):
-        assert not (csrc_dir / f"cuda/context_bf16/{arch}/default.cu").exists()
-        for member in exact_members:
-            assert member["sources"][arch].startswith(f"cuda/context_bf16/{arch}/")
+        assert not (csrc_dir / f"cuda/context_bf16/{arch}").exists()
     text = (csrc_dir / "cuda/context_bf16/default.cu").read_text(encoding="utf-8")
     assert "#define __CUDA_ARCH__" not in text
     assert (
@@ -1132,69 +1130,6 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
     assert "-DHEADS_PER_GROUP=2" in spec.extra_cuda_cflags
     assert "-DPACK_G=2" in spec.extra_cuda_cflags
     assert "-DTOK_PER_STAGE=64" in spec.extra_cuda_cflags
-
-
-@pytest.mark.parametrize(
-    ("profile", "args", "expected"),
-    [
-        (
-            "q511",
-            ("sm100a", 11, 10, 2, 5, 32, 1),
-            {
-                "ENABLE_SINK": 0,
-                "HEADS_PER_GROUP": 5,
-                "IS_CAUSAL": 1,
-                "L2_SWIZZLE": 1,
-                "NUM_M_BLOCKS": 11,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 32,
-                "RETURN_LSE": 0,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        ),
-        (
-            "q257",
-            ("sm103a", 6, 10, 2, 5, 1024, 8),
-            {
-                "ENABLE_SINK": 0,
-                "HEADS_PER_GROUP": 5,
-                "IS_CAUSAL": 1,
-                "L2_SWIZZLE": 8,
-                "NUM_M_BLOCKS": 6,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 1024,
-                "RETURN_LSE": 0,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        ),
-    ],
-)
-def test_cake_fmha_context_bf16_exact_profile_selector(profile, args, expected) -> None:
-    from flashinfer.jit import cake_fmha as cake_jit
-
-    assert (
-        cake_jit._validate_context_specialization(
-            *args,
-            is_causal=True,
-            return_lse=False,
-            enable_sink=False,
-            exact_profile=profile,
-        )
-        == expected
-    )
-    with pytest.raises(ValueError, match="does not match its fixed selector"):
-        cake_jit._validate_context_specialization(
-            *args[:-1],
-            8 if args[-1] == 1 else 1,
-            is_causal=True,
-            return_lse=False,
-            enable_sink=False,
-            exact_profile=profile,
-        )
 
 
 def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> None:
@@ -2470,41 +2405,53 @@ def test_cake_fmha_context_hd256_route_requires_exact_workspace(
     assert select(misaligned) is None
 
 
-def test_cake_fmha_context_bf16_exact_route_loads_exact_member(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("target", "profile", "shape", "program"),
+    [
+        ("sm100a", "q511", (11, 10, 2, 5, 32, 1), "Q511_SM100A"),
+        ("sm103a", "q511", (11, 10, 2, 5, 32, 1), "Q511_SM103A"),
+        ("sm100a", "q257", (6, 10, 2, 5, 1024, 8), "Q257_SM100A"),
+        ("sm103a", "q257", (6, 10, 2, 5, 1024, 8), "Q257_SM103A"),
+    ],
+)
+def test_cake_fmha_context_bf16_exact_route_loads_generated_program(
+    monkeypatch, target, profile, shape, program
+) -> None:
     sentinel = object()
-    observed = {}
-
-    def load(*args, **kwargs):
-        observed["args"] = args
-        observed["kwargs"] = kwargs
-        return sentinel
-
-    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
-    monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", load)
+    observed = []
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api,
+        "_load_cake_fmha_context_program",
+        lambda route: observed.append(route) or sentinel,
+    )
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_context_bf16_module",
+        lambda *args, **kwargs: pytest.fail("the JIT module serves no exact route"),
+    )
+    num_m_blocks, num_q_heads, num_kv_heads, pack_g, page_size, l2_swizzle = shape
     route = cake_api.CakeFmhaContextRoute(
-        target="sm103a",
+        target=target,
         component="context_bf16",
-        num_m_blocks=11,
-        num_q_heads=10,
-        num_kv_heads=2,
-        pack_g=5,
-        page_size=32,
-        l2_swizzle=1,
+        num_m_blocks=num_m_blocks,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        pack_g=pack_g,
+        page_size=page_size,
+        l2_swizzle=l2_swizzle,
         is_causal=True,
         return_lse=False,
         enable_sink=False,
-        exact_profile="q511",
+        exact_profile=profile,
+        program=program,
     )
     assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
-    assert observed == {
-        "args": ("sm103a", 11, 10, 2, 5, 32, 1),
-        "kwargs": {
-            "is_causal": True,
-            "return_lse": False,
-            "enable_sink": False,
-            "exact_profile": "q511",
-        },
-    }
+    assert observed == [route]
+    with pytest.raises(RuntimeError, match="has no program"):
+        cake_api.get_cake_fmha_context_module(
+            torch.device("cpu"), dataclasses.replace(route, program=None)
+        )
 
 
 def test_cake_fmha_context_fp8_route_omits_bf16_exact_profile(monkeypatch) -> None:
@@ -2917,34 +2864,32 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         return_lse=False,
         enable_sink=False,
+        program="B256",
     )
-    assert (
-        cake_api.select_cake_fmha_context_route(
-            fp8_query.device,
-            query=fp8_query,
-            key_cache=fp8_key,
-            value_cache=torch.empty_like(fp8_key),
-            out=torch.empty_like(fp8_query),
-            block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
-            seq_lens=torch.tensor([64, 64], dtype=torch.int32),
-            batch_size=2,
-            max_q_len=32,
-            max_kv_len=64,
-            window_left=-1,
-            bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
-            bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
-            sinks=None,
-            uses_shared_paged_kv_idx=False,
-            cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
-            cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
-            key_block_scales=None,
-            value_block_scales=None,
-            skip_softmax_threshold_scale_factor=1e-30,
-            is_causal=True,
-            lse=None,
-        )
-        == fp8_route
-    )
+    assert cake_api.select_cake_fmha_context_route(
+        fp8_query.device,
+        query=fp8_query,
+        key_cache=fp8_key,
+        value_cache=torch.empty_like(fp8_key),
+        out=torch.empty_like(fp8_query),
+        block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        batch_size=2,
+        max_q_len=32,
+        max_kv_len=64,
+        window_left=-1,
+        bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
+        bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
+        sinks=None,
+        uses_shared_paged_kv_idx=False,
+        cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=1e-30,
+        is_causal=True,
+        lse=None,
+    ) == dataclasses.replace(fp8_route, device_scales=True, program="B256_SCALE_PTR")
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
 
@@ -2963,7 +2908,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         ("q257", 257, 1024, 1024, False, 6, 8),
     ],
 )
-def test_cake_context_exact_mask_profile_requires_uniform_runtime_lengths(
+def test_cake_context_exact_mask_profile_selects_on_host_scalars(
     monkeypatch,
     profile,
     q_len,
@@ -3028,15 +2973,47 @@ def test_cake_context_exact_mask_profile_requires_uniform_runtime_lengths(
         return_lse=False,
         enable_sink=False,
         exact_profile=profile,
+        program=f"{profile.upper()}_SM103A",
     )
 
+    # The programs read the lengths at run time: shorter KV lengths keep the
+    # route, and selection never reads a tensor value (meta tensors).
     nonuniform = kwargs["seq_lens"].clone()
     nonuniform[-1] -= 1
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            query.device, **{**kwargs, "seq_lens": nonuniform}
+        )
+        == route
+    )
+    meta = {
+        name: value.to("meta")
+        for name, value in kwargs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    meta_route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **{**kwargs, **meta}
+    )
+    assert meta_route == route
+    # The switch back to uniform lengths: the host reads the lengths, serves a
+    # uniform batch and keeps a non-uniform one on the generic JIT route.
+    monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", True)
+    assert cake_api.select_cake_fmha_context_route(query.device, **kwargs) == route
     generic = cake_api.select_cake_fmha_context_route(
         query.device, **{**kwargs, "seq_lens": nonuniform}
     )
     assert generic is not None
-    assert generic.exact_profile is None
+    assert generic.exact_profile is None and generic.program is None
+    monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", False)
+    # A query row count off batch x max_q_len (ragged query lengths) keeps the
+    # generic program.
+    ragged = cake_api.select_cake_fmha_context_route(
+        query.device,
+        **{**kwargs, "query": query[:-1], "out": kwargs["out"][:-1]},
+    )
+    assert ragged is not None
+    assert ragged.exact_profile is None
+    assert ragged.program is None
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:
