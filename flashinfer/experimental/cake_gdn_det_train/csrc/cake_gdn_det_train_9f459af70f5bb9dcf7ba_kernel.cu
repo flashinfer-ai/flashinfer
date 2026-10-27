@@ -629,12 +629,13 @@ kernel_cake_gdn_det_train_9f459af70f5bb9dcf7ba(__nv_bfloat16* __restrict__ qn, _
             dhpk[_lp] = *(uint32_t*)&_bf2;
         }
         __syncthreads();
-        float g_last = s_g[g_off + n_valid - 1];
-        float _exp2_11 = approx_exp2(g_last);
-        const float2 _scale2_12 = {_exp2_11, _exp2_11};
+        int _max_11 = ((n_valid) > (1) ? (n_valid) : (1));
+        float g_last = s_g[g_off + _max_11 - 1];
+        float _exp2_12 = approx_exp2(g_last);
+        const float2 _scale2_13 = {_exp2_12, _exp2_12};
         #pragma unroll
         for (int _ls = 0; _ls < 32; _ls++)
-            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_dh)[_ls], _scale2_12);
+            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_dh)[_ls], _scale2_13);
         #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
             #pragma unroll
@@ -672,8 +673,8 @@ kernel_cake_gdn_det_train_9f459af70f5bb9dcf7ba(__nv_bfloat16* __restrict__ qn, _
                     int tok_1 = (tb * 2 + half) * 8 + quad * 2 + e;
                     float decay = 0.0f;
                     if (tok_1 < n_valid) {
-                        float _exp2_13 = approx_exp2(g_last - s_g[g_off + tok_1]);
-                        decay = _exp2_13;
+                        float _exp2_14 = approx_exp2(g_last - s_g[g_off + tok_1]);
+                        decay = _exp2_14;
                     }
                     float dl_a = ((e == 0) ? __uint_as_float(dvl_frag[half * 2] << 16) : __uint_as_float(dvl_frag[half * 2] & 4294901760u));
                     float dl_b = ((e == 0) ? __uint_as_float(dvl_frag[half * 2 + 1] << 16) : __uint_as_float(dvl_frag[half * 2 + 1] & 4294901760u));
@@ -711,62 +712,62 @@ kernel_cake_gdn_det_train_9f459af70f5bb9dcf7ba(__nv_bfloat16* __restrict__ qn, _
                 float gain_hi = s_gain[g_off + ks2 * 16 + quad * 2 + 1];
                 float gain_lo8 = s_gain[g_off + ks2 * 16 + 8 + quad * 2];
                 float gain_hi8 = s_gain[g_off + ks2 * 16 + 8 + quad * 2 + 1];
-                uint32_t _bf16x2_scale_pair_14;
+                uint32_t _bf16x2_scale_pair_15;
                 {
-                    uint32_t _bf16x2_pair_15 = a_frag_mn[0];
-                    float _bf16x2_lo_15;
-                    float _bf16x2_hi_15;
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_15) : "h"((uint16_t)(_bf16x2_pair_15 & 0xFFFFu)));
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_15) : "h"((uint16_t)(_bf16x2_pair_15 >> 16)));
-                    _bf16x2_lo_15 *= gain_lo;
-                    _bf16x2_hi_15 *= gain_hi;
-                    uint32_t _bf16x2_out_15;
-                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_15) : "f"(_bf16x2_hi_15), "f"(_bf16x2_lo_15));
-                    _bf16x2_scale_pair_14 = _bf16x2_out_15;
+                    uint32_t _bf16x2_pair_16 = a_frag_mn[0];
+                    float _bf16x2_lo_16;
+                    float _bf16x2_hi_16;
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_16) : "h"((uint16_t)(_bf16x2_pair_16 & 0xFFFFu)));
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_16) : "h"((uint16_t)(_bf16x2_pair_16 >> 16)));
+                    _bf16x2_lo_16 *= gain_lo;
+                    _bf16x2_hi_16 *= gain_hi;
+                    uint32_t _bf16x2_out_16;
+                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_16) : "f"(_bf16x2_hi_16), "f"(_bf16x2_lo_16));
+                    _bf16x2_scale_pair_15 = _bf16x2_out_16;
                 }
-                a_frag_mn[0] = _bf16x2_scale_pair_14;
-                uint32_t _bf16x2_scale_pair_16;
+                a_frag_mn[0] = _bf16x2_scale_pair_15;
+                uint32_t _bf16x2_scale_pair_17;
                 {
-                    uint32_t _bf16x2_pair_17 = a_frag_mn[1];
-                    float _bf16x2_lo_17;
-                    float _bf16x2_hi_17;
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_17) : "h"((uint16_t)(_bf16x2_pair_17 & 0xFFFFu)));
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_17) : "h"((uint16_t)(_bf16x2_pair_17 >> 16)));
-                    _bf16x2_lo_17 *= gain_lo;
-                    _bf16x2_hi_17 *= gain_hi;
-                    uint32_t _bf16x2_out_17;
-                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_17) : "f"(_bf16x2_hi_17), "f"(_bf16x2_lo_17));
-                    _bf16x2_scale_pair_16 = _bf16x2_out_17;
+                    uint32_t _bf16x2_pair_18 = a_frag_mn[1];
+                    float _bf16x2_lo_18;
+                    float _bf16x2_hi_18;
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_18) : "h"((uint16_t)(_bf16x2_pair_18 & 0xFFFFu)));
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_18) : "h"((uint16_t)(_bf16x2_pair_18 >> 16)));
+                    _bf16x2_lo_18 *= gain_lo;
+                    _bf16x2_hi_18 *= gain_hi;
+                    uint32_t _bf16x2_out_18;
+                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_18) : "f"(_bf16x2_hi_18), "f"(_bf16x2_lo_18));
+                    _bf16x2_scale_pair_17 = _bf16x2_out_18;
                 }
-                a_frag_mn[1] = _bf16x2_scale_pair_16;
-                uint32_t _bf16x2_scale_pair_18;
+                a_frag_mn[1] = _bf16x2_scale_pair_17;
+                uint32_t _bf16x2_scale_pair_19;
                 {
-                    uint32_t _bf16x2_pair_19 = a_frag_mn[2];
-                    float _bf16x2_lo_19;
-                    float _bf16x2_hi_19;
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_19) : "h"((uint16_t)(_bf16x2_pair_19 & 0xFFFFu)));
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_19) : "h"((uint16_t)(_bf16x2_pair_19 >> 16)));
-                    _bf16x2_lo_19 *= gain_lo8;
-                    _bf16x2_hi_19 *= gain_hi8;
-                    uint32_t _bf16x2_out_19;
-                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_19) : "f"(_bf16x2_hi_19), "f"(_bf16x2_lo_19));
-                    _bf16x2_scale_pair_18 = _bf16x2_out_19;
+                    uint32_t _bf16x2_pair_20 = a_frag_mn[2];
+                    float _bf16x2_lo_20;
+                    float _bf16x2_hi_20;
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_20) : "h"((uint16_t)(_bf16x2_pair_20 & 0xFFFFu)));
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_20) : "h"((uint16_t)(_bf16x2_pair_20 >> 16)));
+                    _bf16x2_lo_20 *= gain_lo8;
+                    _bf16x2_hi_20 *= gain_hi8;
+                    uint32_t _bf16x2_out_20;
+                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_20) : "f"(_bf16x2_hi_20), "f"(_bf16x2_lo_20));
+                    _bf16x2_scale_pair_19 = _bf16x2_out_20;
                 }
-                a_frag_mn[2] = _bf16x2_scale_pair_18;
-                uint32_t _bf16x2_scale_pair_20;
+                a_frag_mn[2] = _bf16x2_scale_pair_19;
+                uint32_t _bf16x2_scale_pair_21;
                 {
-                    uint32_t _bf16x2_pair_21 = a_frag_mn[3];
-                    float _bf16x2_lo_21;
-                    float _bf16x2_hi_21;
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_21) : "h"((uint16_t)(_bf16x2_pair_21 & 0xFFFFu)));
-                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_21) : "h"((uint16_t)(_bf16x2_pair_21 >> 16)));
-                    _bf16x2_lo_21 *= gain_lo8;
-                    _bf16x2_hi_21 *= gain_hi8;
-                    uint32_t _bf16x2_out_21;
-                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_21) : "f"(_bf16x2_hi_21), "f"(_bf16x2_lo_21));
-                    _bf16x2_scale_pair_20 = _bf16x2_out_21;
+                    uint32_t _bf16x2_pair_22 = a_frag_mn[3];
+                    float _bf16x2_lo_22;
+                    float _bf16x2_hi_22;
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_lo_22) : "h"((uint16_t)(_bf16x2_pair_22 & 0xFFFFu)));
+                    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(_bf16x2_hi_22) : "h"((uint16_t)(_bf16x2_pair_22 >> 16)));
+                    _bf16x2_lo_22 *= gain_lo8;
+                    _bf16x2_hi_22 *= gain_hi8;
+                    uint32_t _bf16x2_out_22;
+                    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_bf16x2_out_22) : "f"(_bf16x2_hi_22), "f"(_bf16x2_lo_22));
+                    _bf16x2_scale_pair_21 = _bf16x2_out_22;
                 }
-                a_frag_mn[3] = _bf16x2_scale_pair_20;
+                a_frag_mn[3] = _bf16x2_scale_pair_21;
             }
             #pragma unroll
             for (int nb5 = 0; nb5 < 8; nb5++) {
@@ -798,8 +799,8 @@ kernel_cake_gdn_det_train_9f459af70f5bb9dcf7ba(__nv_bfloat16* __restrict__ qn, _
                 int gtok2 = gi2 * 128 + tid_2;
                 if (gtok2 < 64) {
                     s_g[next_g_off + gtok2] = g_next[gi2];
-                    float _exp2_22 = approx_exp2(g_next[gi2]);
-                    s_gain[next_g_off + gtok2] = _exp2_22 * scale;
+                    float _exp2_23 = approx_exp2(g_next[gi2]);
+                    s_gain[next_g_off + gtok2] = _exp2_23 * scale;
                 }
             }
         }

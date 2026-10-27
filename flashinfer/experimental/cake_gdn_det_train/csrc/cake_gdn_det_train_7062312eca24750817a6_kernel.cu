@@ -499,12 +499,13 @@ kernel_cake_gdn_det_train_7062312eca24750817a6(__nv_bfloat16* __restrict__ kn, _
             }
             asm volatile("cp.async.commit_group;");
         }
-        float g_last = s_g[g_off + n_valid - 1];
-        float _exp2_9 = approx_exp2(g_last);
-        const float2 _scale2_10 = {_exp2_9, _exp2_9};
+        int _max_9 = ((n_valid) > (1) ? (n_valid) : (1));
+        float g_last = s_g[g_off + _max_9 - 1];
+        float _exp2_10 = approx_exp2(g_last);
+        const float2 _scale2_11 = {_exp2_10, _exp2_10};
         #pragma unroll
         for (int _ls = 0; _ls < 16; _ls++)
-            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_h)[_ls], _scale2_10);
+            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(acc_h)[_ls], _scale2_11);
         #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
             #pragma unroll
@@ -617,8 +618,8 @@ kernel_cake_gdn_det_train_7062312eca24750817a6(__nv_bfloat16* __restrict__ kn, _
                     int tok_1 = (tb * 2 + half) * 8 + quad * 2 + e;
                     float decay = 0.0f;
                     if (tok_1 < n_valid) {
-                        float _exp2_11 = approx_exp2(g_last - s_g[g_off + tok_1]);
-                        decay = _exp2_11;
+                        float _exp2_12 = approx_exp2(g_last - s_g[g_off + tok_1]);
+                        decay = _exp2_12;
                     }
                     float u_a = ((e == 0) ? __uint_as_float(u_frag[half * 2] << 16) : __uint_as_float(u_frag[half * 2] & 4294901760u));
                     float u_b = ((e == 0) ? __uint_as_float(u_frag[half * 2 + 1] << 16) : __uint_as_float(u_frag[half * 2 + 1] & 4294901760u));
