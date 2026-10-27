@@ -1221,7 +1221,9 @@ KNOWN_TACTIC_KEYS = frozenset(
 # weight-tile stages as a swapped-role 128 x 8 MMA instead of a second token tile.
 # Without an explicit tactic, :func:`gemm_plan` takes it for 128 < M <= 136 on these
 # (arch, K, N) cells at the architecture's :data:`MEASURED_SM_COUNT`.
-FOLD_CELLS = frozenset({("sm_100a", 7168, 18432), ("sm_103a", 7168, 18432)})
+FOLD_CELLS = frozenset(
+    {("sm_100a", 7168, 18432), ("sm_100a", 8192, 28672), ("sm_103a", 7168, 18432)}
+)
 FOLD_TACTIC = {
     "tile_n": 128,
     "deep_k": False,

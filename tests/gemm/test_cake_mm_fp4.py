@@ -799,7 +799,8 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
     # Each architecture ships on a 148- and a 152-SM part (sm_100a: B200 / GB200,
     # sm_103a: B300 / GB300) and registers the kernels of its measured part.  The
     # validated matrix resolves on both parts; on the other part an edge row whose own
-    # tactic selects an unregistered kernel runs the measured part's kernel, and every
+    # tactic selects an unregistered kernel runs the measured part's default kernel (the
+    # FOLD_CELLS / B2_FOLD_CELLS rules hold at the measured SM count only), and every
     # other row keeps its own.
     registered = KERNELS[arch]
     missing = sorted(set(required_kernel_keys(arch, sm_count)) - set(registered))
@@ -833,7 +834,8 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
                 if own_key in registered:
                     assert key == own_key, (m, n, k, out_f16)
                 else:
-                    assert key == reference.kernel_key, (m, n, k, out_f16)
+                    default = cb._gemm_plan(m, n, k, out_f16, arch, measured)
+                    assert key == default.kernel_key, (m, n, k, out_f16)
     assert served
 
 
@@ -1378,12 +1380,13 @@ def test_gemm_alone_entry_prefetch_matches_plain_program(n, k, out_dtype):
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("m", [129, 130, 136, 257, 264, 272])
-def test_token_remainder_fold_matches_route(m, out_dtype):
-    # On a token-remainder fold cell (K 7168, N 18432 at the measured SM count)
-    # mm_fp4 and the prepared GEMM run the fold program, bitwise equal to the program
-    # of the plan without the fold (the 2-CTA pair program over the plain token tiles).
+@pytest.mark.parametrize("n,k", [(18432, 7168), (28672, 8192)])
+def test_token_remainder_fold_matches_route(m, n, k, out_dtype):
+    # On a token-remainder fold cell (a FOLD_CELLS / B2_FOLD_CELLS (K, N) at the
+    # measured SM count) mm_fp4 and the prepared GEMM run the fold program, bitwise
+    # equal to the program of the plan without the fold (the 2-CTA pair program over
+    # the plain token tiles).
     device = _require_program()
-    n, k = 18432, 7168
     out_f16 = out_dtype == torch.float16
     _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
         m, n, k, torch.bfloat16, device, seed=500 + m
