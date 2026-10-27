@@ -732,11 +732,11 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
             unsigned int group_token_offset = 0;
             unsigned int group_ready = 0;
             int task_iteration = 0;
-            int task_pipe_task_iteration = 0;
-            unsigned int _phase_task_full = 0;
             unsigned int _phase_empty = 1;
             while (1) {
-                mbarrier_wait(task_full_addr + (task_pipe_task_iteration) * 8, _phase_task_full);
+                int _stage_task_full = (int)((unsigned int)task_iteration % 4);
+                int _parity_task_full = (int)((unsigned int)task_iteration / 4 % 2);
+                mbarrier_wait(task_full_addr + (_stage_task_full) * 8, _parity_task_full);
                 task[0] = task_infos[task_iteration % 4 * 8];
                 task[1] = task_infos[task_iteration % 4 * 8 + 1];
                 task[2] = task_infos[task_iteration % 4 * 8 + 2];
@@ -812,8 +812,6 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
                     group_ready = 1;
                 }
                 task_iteration += 1;
-                task_pipe_task_iteration += 1;
-                if (task_pipe_task_iteration == 4) { task_pipe_task_iteration = 0; _phase_task_full ^= 1; }
             }
         }
     }
@@ -825,11 +823,11 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
             unsigned int task_1[8];
             unsigned int b_stage = 0;
             int task_iteration_1 = 0;
-            int task_pipe_task_iteration_1 = 0;
-            unsigned int _phase_task_full_1 = 0;
             unsigned int _phase_empty_1 = 1;
             while (1) {
-                mbarrier_wait(task_full_addr + (task_pipe_task_iteration_1) * 8, _phase_task_full_1);
+                int _stage_task_full_1 = (int)((unsigned int)task_iteration_1 % 4);
+                int _parity_task_full_1 = (int)((unsigned int)task_iteration_1 / 4 % 2);
+                mbarrier_wait(task_full_addr + (_stage_task_full_1) * 8, _parity_task_full_1);
                 task_1[0] = task_infos[task_iteration_1 % 4 * 8];
                 task_1[1] = task_infos[task_iteration_1 % 4 * 8 + 1];
                 task_1[2] = task_infos[task_iteration_1 % 4 * 8 + 2];
@@ -867,8 +865,6 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
                     if (b_stage == 11) { b_stage = 0; _phase_empty_1 ^= 1; }
                 }
                 task_iteration_1 += 1;
-                task_pipe_task_iteration_1 += 1;
-                if (task_pipe_task_iteration_1 == 4) { task_pipe_task_iteration_1 = 0; _phase_task_full_1 ^= 1; }
             }
         }
     }
@@ -881,14 +877,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
             unsigned int mma_stage = 0;
             int completed_tasks = 0;
             unsigned int accum_cursor = 0;
-            unsigned int _phase_task_full_2 = 0;
             unsigned int _phase_tmem_empty = 1;
             unsigned int _phase_full = 0;
             if (cta_rank == 0) {
                 int task_iteration_2 = 0;
-                int task_pipe_task_iteration_2 = 0;
                 while (1) {
-                    mbarrier_wait(task_full_addr + (task_pipe_task_iteration_2) * 8, _phase_task_full_2);
+                    int _stage_task_full_2 = (int)((unsigned int)task_iteration_2 % 4);
+                    int _parity_task_full_2 = (int)((unsigned int)task_iteration_2 / 4 % 2);
+                    mbarrier_wait(task_full_addr + (_stage_task_full_2) * 8, _parity_task_full_2);
                     task_2[0] = task_infos[task_iteration_2 % 4 * 8];
                     task_2[1] = task_infos[task_iteration_2 % 4 * 8 + 1];
                     task_2[2] = task_infos[task_iteration_2 % 4 * 8 + 2];
@@ -941,8 +937,6 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
                     accum_cursor += 1;
                     if (accum_cursor == 2) { accum_cursor = 0; _phase_tmem_empty ^= 1; }
                     task_iteration_2 += 1;
-                    task_pipe_task_iteration_2 += 1;
-                    if (task_pipe_task_iteration_2 == 4) { task_pipe_task_iteration_2 = 0; _phase_task_full_2 ^= 1; }
                 }
                 if (completed_tasks > 0) {
                     mbarrier_wait(tmem_empty_addr + (((accum_cursor + 1 < 2) ? accum_cursor + 1 : (unsigned int)0)) * 8, ((accum_cursor + 1 < 2) ? _phase_tmem_empty : _phase_tmem_empty ^ 1));
@@ -1623,10 +1617,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
             asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task_4[8];
             int task_iteration_3 = 0;
-            int task_pipe_task_iteration_3 = 0;
-            unsigned int _phase_task_full_3 = 0;
             while (1) {
-                mbarrier_wait(task_full_addr + (task_pipe_task_iteration_3) * 8, _phase_task_full_3);
+                int _stage_task_full_3 = (int)((unsigned int)task_iteration_3 % 4);
+                int _parity_task_full_3 = (int)((unsigned int)task_iteration_3 / 4 % 2);
+                mbarrier_wait(task_full_addr + (_stage_task_full_3) * 8, _parity_task_full_3);
                 task_4[0] = task_infos[task_iteration_3 % 4 * 8];
                 task_4[1] = task_infos[task_iteration_3 % 4 * 8 + 1];
                 task_4[2] = task_infos[task_iteration_3 % 4 * 8 + 2];
@@ -1639,13 +1633,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
                     break;
                 }
                 unsigned int accum_stage_1 = task_iteration_3 % 2;
-                int _stage_tmem_full = (int)((unsigned int)task_iteration_3 % 2);
                 int _parity_tmem_full = (int)((unsigned int)task_iteration_3 / 2 % 2);
-                mbarrier_wait(tmem_full_addr + (_stage_tmem_full) * 8, _parity_tmem_full);
+                mbarrier_wait(tmem_full_addr + (accum_stage_1) * 8, _parity_tmem_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                    :: "r"((task_empty_addr + (task_pipe_task_iteration_3) * 8) & 0xFEFFFFFF) : "memory");
+                    :: "r"((task_empty_addr + ((int)((unsigned int)task_iteration_3 % 4)) * 8) & 0xFEFFFFFF) : "memory");
                 if (task_4[0] == 1) {
                     unsigned int epi_warp = warp - 8;
                     unsigned int epi_wg = epi_warp / 4;
@@ -1982,8 +1975,6 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a(int* __restrict__
                     asm volatile("barrier.sync 2, 256;" ::: "memory");
                 }
                 task_iteration_3 += 1;
-                task_pipe_task_iteration_3 += 1;
-                if (task_pipe_task_iteration_3 == 4) { task_pipe_task_iteration_3 = 0; _phase_task_full_3 ^= 1; }
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             unsigned int l2_tag = (unsigned int)1 << 31;
