@@ -141,6 +141,29 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
     },
+    "cake_moe_grouped_gemm_1f3e79d325688a81921f": {
+        "library": "cake_moe_grouped_gemm_1f3e79d325688a81921f",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
     "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb": {
         "library": "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
         "ffi_entry": "run",
@@ -237,8 +260,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
     },
-    "cake_moe_grouped_gemm_8e06fc35b22c38f05d5d": {
-        "library": "cake_moe_grouped_gemm_8e06fc35b22c38f05d5d",
+    "cake_moe_grouped_gemm_91100899e34d05c9b2bb": {
+        "library": "cake_moe_grouped_gemm_91100899e34d05c9b2bb",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -535,7 +558,12 @@ ROUTES: dict[str, dict[str, Any]] = {
             },
             {
                 "name": "main_wide",
-                "program": "cake_moe_grouped_gemm_8e06fc35b22c38f05d5d",
+                "program": "cake_moe_grouped_gemm_91100899e34d05c9b2bb",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide_ef",
+                "program": "cake_moe_grouped_gemm_1f3e79d325688a81921f",
                 "specializations": {},
             },
         ],
