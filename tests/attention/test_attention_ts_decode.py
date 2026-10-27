@@ -1443,16 +1443,16 @@ _FMHA_CASES = (
             mask_type="causal",
         ),
         _policy(
-            "swaps_mma_ab",
-            32,
-            splits=4,
+            "keeps_mma_ab",
+            64,
+            splits=7,
             split=True,
-            cluster=True,
-            separate=False,
+            cluster=False,
+            separate=True,
             persistent=False,
         ),
         "mixed",
-        id="F5-fp8-fp16-sq4-swaps-q32-cluster",
+        id="F5-fp8-fp16-sq4-keeps-q64-s7-separate",
     ),
     _param(
         _case(

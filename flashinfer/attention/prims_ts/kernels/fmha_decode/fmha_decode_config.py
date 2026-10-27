@@ -2495,8 +2495,9 @@ class FmhaDecodeConfig:
         ``supports_grouped_keeps`` decides whether the kernel runs a config;
         automatic selection, with or without a cost comparison, takes a recipe
         only on the launches it is qualified for. Paged FP8 qualifies the
-        established cost-model recipes. Paged 16-bit Q128 qualifies the fixed
-        multi-token launches that the grouped-Q cost model scores; single-token
+        established cost-model recipes everywhere and every paged FP8 recipe
+        on the fixed multi-token launches that the grouped-Q cost model
+        scores. Paged 16-bit Q128 qualifies those launches only. Single-token
         and variable-length launches keep their previous tiles.
         """
         if not self.supports_grouped_keeps:
@@ -2516,7 +2517,10 @@ class FmhaDecodeConfig:
             and self.tile_size_kv == 128
             and self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
         ):
-            return profile in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES
+            return (
+                profile in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES
+                or self._in_grouped_q_selection_scope
+            )
         return True
 
     @property
