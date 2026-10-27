@@ -29,6 +29,8 @@ NVFP4_TUNING_VERSION = "nvfp4_single_k64_scale_ring_candidates_v2"
 def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the complete MX core and NV conversion fields."""
     core, conversion = split_nvfp4_conversion_tactic(tactic)
+    # The MX schema checks the pull buffer against the dispatch-pull fields.
+    core["compact_pull_buffer"] = conversion["compact_pull_buffer"]
     return dict(normalize_mxfp4_optimization_tactic(core), **conversion)
 
 

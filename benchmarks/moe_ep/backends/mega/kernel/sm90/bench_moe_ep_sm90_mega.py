@@ -410,6 +410,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-compact-pull-buffer restores the 4-slot buffer",
     )
     p.add_argument(
+        "--dispatch-pull-batch",
+        type=int,
+        default=1,
+        help="FP8: dispatch pull rows in flight per active dispatch warp (1..4; "
+        "> 1 needs --no-compact-pull-buffer). MXFP4 takes dispatch_pull_batch "
+        "in --mxfp4-knobs-json",
+    )
+    p.add_argument(
+        "--dispatch-pull-rotate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="FP8: rotate the dispatch warp -> pull row assignment every pass. "
+        "MXFP4 takes dispatch_pull_rotate in --mxfp4-knobs-json",
+    )
+    p.add_argument(
         "--generate-c",
         action="store_true",
         default=False,
@@ -533,6 +548,8 @@ _FP8_EXPLICIT_KNOBS = frozenset(
         "fold_producer_warps",
         "compact_pull_buffer",
         "generate_c",
+        "dispatch_pull_batch",
+        "dispatch_pull_rotate",
     }
 )
 _FP8_REQUIRED_EXPLICIT_KNOBS = frozenset(
@@ -624,6 +641,7 @@ def _parse_knobs_json(value: str, backend: str) -> dict[str, object]:
         "tail_split_pairs",
         "compact_pull_buffer",
         "generate_c",
+        "dispatch_pull_rotate",
     ):
         if name in knobs and not isinstance(knobs[name], bool):
             raise ValueError(f"--fp8-knobs-json {name} must be boolean")
@@ -679,6 +697,8 @@ _MANUAL_TACTIC_OPTIONS = (
         "--swap-token-tile",
         "--compact-pull-buffer",
         "--no-compact-pull-buffer",
+        "--dispatch-pull-batch",
+        "--dispatch-pull-rotate",
         "--generate-c",
     }
 )
@@ -717,6 +737,8 @@ def _resolve_sweep(
                 "--generate-c",
                 "--compact-pull-buffer",
                 "--no-compact-pull-buffer",
+                "--dispatch-pull-batch",
+                "--dispatch-pull-rotate",
             }
         )
         if fp8_only:
@@ -1186,6 +1208,8 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         combine_format=combine_format,
         active_dispatch_warps=args.active_dispatch_warps,
         compact_pull_buffer=args.compact_pull_buffer,
+        dispatch_pull_batch=args.dispatch_pull_batch,
+        dispatch_pull_rotate=args.dispatch_pull_rotate,
         fc1_store_offload=args.fc1_store_offload,
         fc1_early_done_publish=args.fc1_early_done_publish,
         fold_producer_warps=args.fold_producer_warps,
@@ -1230,6 +1254,8 @@ def _runtime_tactic(args: argparse.Namespace, workspace) -> dict[str, object]:
         "fc1_store_offload": bool(kernel.fc1_store_offload),
         "fc1_early_done_publish": bool(kernel.fc1_early_done_publish),
         "fold_producer_warps": bool(kernel.fold_producer_warps),
+        "dispatch_pull_batch": int(kernel.token_comm.pull_batch),
+        "dispatch_pull_rotate": bool(kernel.token_comm.pull_rotate),
     }
 
 

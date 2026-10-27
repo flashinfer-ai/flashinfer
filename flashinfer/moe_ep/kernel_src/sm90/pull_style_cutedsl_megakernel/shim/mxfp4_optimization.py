@@ -27,6 +27,63 @@ from .mxfp4_tuner import (
 MXFP4_STRATEGY_FIELDS = frozenset({"fc2_tail_n8", "fc1_ready_mode", "tail_split_pairs"})
 
 
+# Pull-buffer tactic fields: the compact (one slot per active warp) buffer,
+# rows in flight per active dispatch warp, and the per-pass rotation of the
+# warp -> row assignment.  A normalized tactic carries them only when they
+# differ from these defaults, so tactics, candidate sets and cache entries that
+# do not use them keep their identity.  Applying a tactic resets omitted fields
+# to the defaults.
+MXFP4_PULL_DEFAULTS: dict[str, Any] = {
+    "compact_pull_buffer": False,
+    "dispatch_pull_batch": 1,
+    "dispatch_pull_rotate": False,
+}
+
+
+def _normalize_pull_fields(
+    tactic: Mapping[str, Any], core: Mapping[str, Any]
+) -> dict[str, Any]:
+    compact = tactic.get("compact_pull_buffer", False)
+    batch = tactic.get("dispatch_pull_batch", 1)
+    rotate = tactic.get("dispatch_pull_rotate", False)
+    if type(compact) is not bool:
+        raise ValueError("compact_pull_buffer must be a bool")
+    if type(batch) is not int or not 1 <= batch <= 4:
+        raise ValueError("dispatch_pull_batch must be an int in 1..4")
+    if type(rotate) is not bool:
+        raise ValueError("dispatch_pull_rotate must be a bool")
+    if batch > 1:
+        # The batch keeps rows in the idle slots of the 4-slot pull buffer of
+        # the serial epi_warps dispatch path.
+        if compact:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires compact_pull_buffer=False"
+            )
+        if (
+            core["token_back_mode"] != "epi_warps"
+            or core["dedup_dispatch"]
+            or core["grouped_token_back"]
+        ):
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires token_back_mode='epi_warps' "
+                "without dedup_dispatch / grouped_token_back"
+            )
+        if batch * core["active_dispatch_warps"] > 4:
+            raise ValueError(
+                "dispatch_pull_batch * active_dispatch_warps must not exceed the 4 pull slots"
+            )
+    selected = {
+        "compact_pull_buffer": compact,
+        "dispatch_pull_batch": batch,
+        "dispatch_pull_rotate": rotate,
+    }
+    return {
+        name: value
+        for name, value in selected.items()
+        if value != MXFP4_PULL_DEFAULTS[name]
+    }
+
+
 def normalize_mxfp4_optimization_tactic(
     tactic: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -38,6 +95,8 @@ def normalize_mxfp4_optimization_tactic(
     """
     if not isinstance(tactic, Mapping):
         raise TypeError("MXFP4 tactic must be a mapping")
+    pull_fields = {k: v for k, v in tactic.items() if k in MXFP4_PULL_DEFAULTS}
+    tactic = {k: v for k, v in tactic.items() if k not in MXFP4_PULL_DEFAULTS}
     legacy_strategy_fields = MXFP4_STRATEGY_FIELDS - {"tail_split_pairs"}
     present = legacy_strategy_fields.intersection(tactic)
     if present and present != legacy_strategy_fields:
@@ -65,7 +124,11 @@ def normalize_mxfp4_optimization_tactic(
         if ready != "tile":
             raise ValueError("MXFP4 tail_split_pairs requires fc1_ready_mode='tile'")
     return dict(
-        core, fc2_tail_n8=tail, fc1_ready_mode=ready, tail_split_pairs=tail_pairs
+        core,
+        fc2_tail_n8=tail,
+        fc1_ready_mode=ready,
+        tail_split_pairs=tail_pairs,
+        **_normalize_pull_fields(pull_fields, core),
     )
 
 

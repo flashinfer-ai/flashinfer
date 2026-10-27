@@ -143,6 +143,26 @@ not picked them up):
   and `_weight_sf_state` (default identity); the NV shim supplies only the
   delayed scale-producer loop and early-release policy. Preserve these hooks
   when reapplying the scale-ring extension.
+- Dispatch pull batch + rotation and swap-AB FC1/FC2 dedup (2026-10-26,
+  measured on PR #6465 in October): `src/src/token_comm.py` ctor knobs
+  `pull_batch` (default 1) / `pull_rotate` (default False) and properties
+  `pull_batch` / `pull_rotate`. `_dispatch_pull_batched` keeps R rows in
+  flight in the idle slots of the 4-slot pull buffer (R x
+  active_dispatch_warps <= 4; full buffer; no dispatch-side token-back,
+  dedup or grouped token-back). Rotation makes pass k take row
+  `k*G + (g + k) % G`; the serial loop keeps that index incremental.
+  `src/src/ptx_helpers.py` adds `red_add_relaxed_gpu_s32_raw`.
+  `megamoe_kernel_fp8.py` takes ctor kwargs `dispatch_pull_batch` /
+  `dispatch_pull_rotate`. `epilogue_fp8_swapab.py` and the MX
+  `run_wgmma_task_tile` take `n_half` as a runtime value, so FC1 and FC2
+  share one code copy. Host side, FP8: shim config fields + compile key,
+  backend config, and bench `--dispatch-pull-batch` /
+  `--[no-]dispatch-pull-rotate`. MX/NV: both fields are tactic fields, and
+  `compact_pull_buffer` becomes an MX tactic field (NV already had it). See
+  `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`. A normalized tactic
+  omits these fields at their defaults, so existing candidate sets and cache
+  provenance keep their identity. Explicit frontend/backend values override
+  the tactic, as `token_back_mode` does. The drop tree has none of this.
 
 ## Layout
 

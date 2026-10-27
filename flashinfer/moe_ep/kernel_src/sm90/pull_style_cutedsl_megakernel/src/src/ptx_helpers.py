@@ -537,3 +537,18 @@ def _fence_rel_gpu(
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """
     llvm.fence(llvm.AtomicOrdering.release, syncscope="device", loc=loc, ip=ip)
+
+@dsl_user_op
+def red_add_relaxed_gpu_s32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -> None:
+    """``red.relaxed.gpu.global.add.s32``; callers order prior writes with a fence."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

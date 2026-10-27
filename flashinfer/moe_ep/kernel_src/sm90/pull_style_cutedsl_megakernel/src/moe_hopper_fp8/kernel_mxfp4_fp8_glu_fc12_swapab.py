@@ -1597,7 +1597,7 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         tCrB: cute.Tensor,
         accumulators: cute.Tensor,
         accum_temp: cute.Tensor,
-        n_half: cutlass.Constexpr,
+        n_half,
         ab_pipeline,
         weight_sf_pipeline,
         ab_consumer_state,
