@@ -54,9 +54,10 @@ struct CollectiveMainloopFwd {
   using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
   using SmemLayoutDS = typename Ktraits::SmemLayoutDS;
   using SmemLayoutAtomDS = typename Ktraits::SmemLayoutAtomDS;
+  // Compact correction strides can exceed INT32_MAX even when each extent fits.
   using LayoutDS = decltype(blocked_product(
-      SmemLayoutAtomDS{}, make_layout(make_shape(int32_t(0), int32_t(0), int32_t(0), int32_t(0)),
-                                      make_stride(int32_t(0), _1{}, int32_t(0), int32_t(0)))));
+      SmemLayoutAtomDS{}, make_layout(make_shape(int64_t(0), int64_t(0), int64_t(0), int64_t(0)),
+                                      make_stride(int64_t(0), _1{}, int64_t(0), int64_t(0)))));
   using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
   using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
   using ShapeSF = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
@@ -194,8 +195,11 @@ struct CollectiveMainloopFwd {
         make_tma_copy(GmemTiledCopy{}, mVt, SmemLayoutVt{}(_, _, _0{}),
                       make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), _1{});
     auto [Seqlen_Q, Seqlen_K, HeadNum, Batch] = args.shape_ds;
+    // Widen before tile_to_shape multiplies extents, not after a stride overflows.
     LayoutDS layout_ds = tile_to_shape(
-        SmemLayoutAtomDS{}, make_shape(Seqlen_Q, Seqlen_K, HeadNum, Batch), Step<_2, _1, _3, _4>{});
+        SmemLayoutAtomDS{},
+        make_shape(int64_t(Seqlen_Q), int64_t(Seqlen_K), int64_t(HeadNum), int64_t(Batch)),
+        Step<_2, _1, _3, _4>{});
     Tensor mDS = make_tensor(make_gmem_ptr(args.ptr_ds), layout_ds);
     TMA_DS tma_load_ds =
         make_tma_copy(GmemTiledCopy{}, mDS, SmemLayoutDS{}(_, _, _0{}),
