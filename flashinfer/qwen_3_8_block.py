@@ -310,8 +310,10 @@ def prepare_qwen_3_8_block_bf16(
     decode_split_kv : Optional[int]
         The split-KV of the sparse tile -- ``None`` = the fill rule, an int the explicit split; a performance knob (the same function).
     workspace_buffer : Optional[torch.Tensor]
-        A caller-owned uint8 buffer of at least ``plan.workspace_size`` bytes (the serving idiom: ONE buffer for every bucket, sized at the
-        largest); the plan allocates (and zeroes) its own when ``None``.
+        A caller-owned uint8 buffer of at least ``plan.workspace_size`` bytes (the serving idiom: ONE buffer for every bucket, sized at
+        the MAXIMUM of :func:`qwen_3_8_block_workspace_size` over every bucket the stack will plan -- not at the largest batch: under
+        ``sparse_tile_form="auto"`` a smaller batch can take the lean body, whose split-KV slab is wider than the core's at a larger
+        batch); the plan allocates (and zeroes) its own when ``None``.
     index_kv_cache : torch.Tensor
         REQUIRED: the paged compressed-key cache ``[num_pages, page_size / 4, 1, 128]`` bf16 whose page axis is the MAIN block table's (one
         row per complete 4-token block; the step writes the block it completes, the scorer reads every complete block).
@@ -524,8 +526,12 @@ def qwen_3_8_block_workspace_size(
     sparse_tile_form: str = "auto",
 ) -> int:
     """The workspace bytes a decode plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
-    workspace with at init (before its memory profiling, when the caches do not exist yet), at the largest ``(batch_size,
-    q_len_per_req)`` bucket it will plan.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
+    workspace with at init (before its memory profiling, when the caches do not exist yet) -- as the MAXIMUM of this query over
+    EVERY ``(batch_size, q_len_per_req)`` bucket it will plan, with the knobs it will plan them with.  The largest batch is not the
+    largest workspace: under ``sparse_tile_form="auto"`` the batch 1 and 2 buckets take the lean body, whose split-KV partial slab
+    (split 65 at the default k) is wider than the tcgen05 core's at batch 4 (at the 24 / 2 geometry, q_len 1, page 16, 512 pages,
+    ring_cap 4: about 3.3 MB at batch 2 against about 1.8 MB at batch 4), so a buffer sized from the largest batch alone is rejected
+    by the smaller bucket's plan with the typed workspace error.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
     the projection engines' scratch; the compile is served from the in-process memo or the compiled-plan cache after the first
     process).  The carve depends on the bucket, ``max_pages x page_size`` (the block table's reach) and the split -- never on the
     caches' page count or strides -- so the number equals the compiled plan's ``workspace_size``.  Typed errors as
@@ -569,8 +575,9 @@ def qwen_3_8_block_workspace_size(
 
 class Qwen38BlockWrapper:
     """Plan-and-run wrapper for the Qwen 3.8 Flash-Next gated attention block: one instance per (layer group, shape bucket),
-    FlashInfer's ``plan()`` / ``run()`` idiom over a caller-owned workspace -- the serving idiom (one workspace sized at the largest
-    bucket serves every bucket and every layer run in turn on one stream).
+    FlashInfer's ``plan()`` / ``run()`` idiom over a caller-owned workspace -- the serving idiom (one workspace sized at the maximum of
+    :func:`qwen_3_8_block_workspace_size` over every bucket the stack plans serves every bucket and every layer run in turn on one
+    stream; under ``"auto"`` the largest batch is not the largest workspace).
 
     .. warning::
         ``Qwen38BlockWrapper`` is experimental: it provides no compatibility guarantees and may change or be removed

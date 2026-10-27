@@ -39,8 +39,10 @@ and its split-K reducer), six at 128 rows; no memset, no memcpy, no host read; t
 
 `prepare_qwen_3_8_block_bf16("decode", ...)` returns the plan behind the form (`Qwen38BlockPlan`: `run`, `workspace_size`,
 `declaration`, `supports`); `Qwen38BlockWrapper(workspace_buffer, kv_layout, geometry=...)` is the same thing in FlashInfer's
-`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the largest bucket serves every
-`(batch, q_len)` bucket and every layer run in turn on one stream. The functional entry point keeps its own small LRU (32 entries, one
+`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the maximum of
+`qwen_3_8_block_workspace_size` over every `(batch, q_len)` bucket the stack plans serves every bucket and every layer run in turn on
+one stream (under `"auto"` the largest batch is not the largest workspace: the batch 1 and 2 buckets take the lean body, whose
+split-KV slab is wider than the core's at batch 4). The functional entry point keeps its own small LRU (32 entries, one
 per shape bucket, each owning a zeroed workspace; the Qwen 3.5 rules of retention and release, one LRU per package) --
 `flashinfer.experimental.qwen_3_8_block.api.clear_plan_cache()` drops them.
 

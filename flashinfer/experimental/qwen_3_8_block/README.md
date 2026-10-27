@@ -39,8 +39,10 @@ and its split-K reducer), six at 128 rows; no memset, no memcpy, no host read; t
 
 `prepare_qwen_3_8_block_bf16("decode", ...)` returns the plan behind the form (`Qwen38BlockPlan`: `run`, `workspace_size`,
 `declaration`, `supports`); `Qwen38BlockWrapper(workspace_buffer, kv_layout, geometry=...)` is the same thing in FlashInfer's
-`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the largest bucket serves every
-`(batch, q_len)` bucket and every layer run in turn on one stream. The functional entry point keeps its own small LRU (32 entries, one
+`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the maximum of
+`qwen_3_8_block_workspace_size` over every `(batch, q_len)` bucket the stack plans serves every bucket and every layer run in turn on
+one stream (under `"auto"` the largest batch is not the largest workspace: the batch 1 and 2 buckets take the lean body, whose
+split-KV slab is wider than the core's at batch 4). The functional entry point keeps its own small LRU (32 entries, one
 per shape bucket, each owning a zeroed workspace; the Qwen 3.5 rules of retention and release, one LRU per package) --
 `flashinfer.experimental.qwen_3_8_block.api.clear_plan_cache()` drops them.
 
@@ -79,7 +81,9 @@ weights = qwen_3_8_block_pack_weights(layer.qkv_proj.weight, layer.q_norm.weight
 w_o = layer.o_proj.weight                                                          # [d_model, H_q * 256], used as is
 cos_pos, sin_pos = qwen_3_8_block_rope_position_tables(layer.rotary_emb.cos_sin_cache, num_positions=max_num_blocks_per_req * page_size, dtype=torch.bfloat16)
 
-# init: one workspace for every (batch, q_len) bucket; one plan per bucket, planned where the stack warms its kernels (outside capture)
+# init: one workspace for every (batch, q_len) bucket; one plan per bucket, planned where the stack warms its kernels (outside capture);
+# size it at the MAX of qwen_3_8_block_workspace_size over every bucket you will plan (not the largest batch: "auto" takes the lean
+# body at batch 1 and 2, whose slab is wider than the core's at batch 4)
 workspace = torch.empty(sup_workspace_bytes, dtype=torch.uint8, device="cuda")     # >= every bucket's plan.workspace_size
 w = Qwen38BlockWrapper(workspace, "UNIFIED", geometry=geometry)
 w.plan("decode", weights=weights, w_o=w_o, kv_cache=layer.kv_cache, page_size=page_size, batch_size=B, q_len_per_req=1 + num_spec,

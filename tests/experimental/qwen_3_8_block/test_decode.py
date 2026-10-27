@@ -866,3 +866,81 @@ def test_compiled_plan_cache_reloads_the_decode_form():
     assert torch.equal(out, out2), (
         "a plan reloaded from the files differs from the compiled one"
     )
+
+
+def test_shared_workspace_is_sized_over_every_planned_bucket_not_the_largest_batch():
+    """Under ``sparse_tile_form="auto"`` the workspace need is NOT monotonic in the batch: batch 2 (and 1) take the lean body, whose
+    split-KV partial slab (split 65 at the default k) is wider than the tcgen05 core's at batch 4, so the serving idiom sizes the ONE
+    shared workspace at the MAX of ``qwen_3_8_block_workspace_size`` over every planned bucket.  A buffer sized from the batch-4 query
+    alone is rejected by the batch-2 plan with the typed workspace error (never an unsafe launch); sized from the maximum it serves both."""
+    from flashinfer.qwen_3_8_block import (
+        Qwen38BlockWrapper,
+        qwen_3_8_block_workspace_size,
+    )
+
+    g = _geometry("24_2")
+    cases = {
+        b: Qsa38PagedCase(g, (8192,) * b, 1, page_size=16, seed=21 + b) for b in (2, 4)
+    }
+    for c in cases.values():
+        c.prime()
+    max_pages = int(cases[4].block_table.shape[1])
+    sized = {
+        b: qwen_3_8_block_workspace_size(
+            "decode",
+            geometry=g,
+            device="cuda",
+            page_size=16,
+            batch_size=b,
+            q_len_per_req=1,
+            max_pages=max_pages,
+        )
+        for b in (2, 4)
+    }
+    core4 = qwen_3_8_block_workspace_size(
+        "decode",
+        geometry=g,
+        device="cuda",
+        page_size=16,
+        batch_size=4,
+        q_len_per_req=1,
+        max_pages=max_pages,
+        sparse_tile_form="tcgen05",
+    )
+    assert sized[4] == core4 and sized[2] > sized[4], (
+        sized
+    )  # AUTO: the core at batch 4, the lean body (the wider slab) at batch 2
+
+    def _plan_into(ws, case):
+        w = Qwen38BlockWrapper(ws, "NHD", geometry=g)
+        w.plan(
+            "decode",
+            weights=case.weights38,
+            w_o=case.w_o,
+            kv_cache=case.kv_cache,
+            page_size=16,
+            batch_size=case.b,
+            q_len_per_req=1,
+            block_table=case.block_table,
+            **case.plan_args(),
+        )
+        return w
+
+    too_small = torch.empty(
+        sized[4], dtype=torch.uint8, device="cuda"
+    )  # the largest-batch idiom
+    with pytest.raises(ValueError, match="workspace"):
+        _plan_into(too_small, cases[2])
+    ws = torch.empty(
+        max(sized.values()), dtype=torch.uint8, device="cuda"
+    )  # the max over the planned buckets
+    for b in (4, 2):
+        w = _plan_into(ws, cases[b])
+        assert (
+            w.plan_info.workspace_size == sized[b]
+            and w.plan_info.workspace_size <= ws.numel()
+        )
+        out = _run(w.plan_info, cases[b])
+        _check_step(
+            cases[b], w.plan_info, out, f"shared workspace over the max, batch {b}"
+        )
