@@ -38,9 +38,9 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# One-launch rows (M <= 8: the four-token program at 1 / 4, the eight-token program at 6 / 8), K3-ESS rows with the
-# one-shot / two-shot ESS K1 up to the last ESS row 960, and the first cp.async.bulk persistent rows 961 / 962.
-GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300, 960, 961, 962)
+# One-launch rows (M <= 8: the four-token program at 1 / 4, the eight-token program at 6 / 8), the one-shot ESS
+# rows, and the rows on both sides of every route-table boundary.
+GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300, 319, 320, 960, 961, 962)
 GPU_MAX_TOKENS = 1024
 
 
@@ -84,43 +84,71 @@ def test_route_selection_by_token_count():
     for M in (9, 12, 16):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == ("k1_oneshot_ess", "k3_ess:grouped")
-    for M in (17, 32, 128, 255, 256, 257, 512, 960):
-        assert cb.route_kernel_keys(M, 3) == (
-            "k1_twoshot_ess:grouped",
-            "k3_ess:grouped",
-        )
-    # persistent K3 pipeline with cp.async.bulk pushes (pinned) from K3_PERSIST_MIN_TOKENS on
+    # route table above the one-shot rows: (first M, form)
+    assert cb.ROUTE_TABLE == (
+        (17, "ess"),
+        (320, "reduce"),
+        (961, "persist"),
+    )
     assert cb.GROUPED_MAX_TOKENS == 960
     assert cb.K3_PERSIST_MIN_TOKENS == cb.BULK_MIN_TOKENS == 961
-    for M in (961, 962, 1024, 2048, 4096):
-        assert cb.route_kernel_keys(M, 3) == (
-            "k1_twoshot:pinned",
-            "k3_persist_bulk:pinned",
-        )
+    expected = {
+        17: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        32: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        128: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        255: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        256: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        257: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        319: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        320: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        512: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        960: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        961: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        962: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        1024: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        2048: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        4096: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+    }
+    for M, keys in expected.items():
+        for rank in (0, 3, 11):
+            assert cb.route_kernel_keys(M, rank) == keys, M
     for M in (1, 4, 5, 8):
         assert len(cb.route_kernel_keys(M, 0)) == 1
-    for M in (9, 255, 256, 257, 960, 961, 4096):
-        assert len(cb.route_kernel_keys(M, 0)) == 2
     assert cb.k3_form_for(8) == "k123" and cb.k3_form_for(9) == "ess"
-    assert cb.k3_form_for(256) == "ess" and cb.k3_form_for(960) == "ess"
-    assert cb.k3_form_for(961) == "persist_bulk"
+    for M, keys in expected.items():
+        tail = keys[-1].split(":")[0]
+        assert cb.k3_form_for(M) == {"k3_ess": "ess", "k3_reduce": "reduce"}.get(
+            tail, "persist_bulk"
+        ), M
+    for M in (9, 16):
+        with pytest.raises(ValueError):
+            cb.route_form_for(M)
     # the plain grouped two-shot K1 and the plain persistent K3 stay registered, but no token count selects them
     selected = {key for M in range(1, 4097) for key in cb.route_kernel_keys(M, 0)}
     assert selected == set(cake_jit.required_kernel_keys()) - {
         "k1_twoshot:grouped",
         "k3_persist:grouped",
     }
-    # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
+    # K3-ESS: one CTA per token and column half; persistent forms (reduce mode, bulk): min(M, SM count)
     assert cb.k3_grid(9, 152, 0) == (9, 2, 1)
+    assert cb.k3_grid(17, 148, 3) == (17, 2, 1)
+    assert cb.k3_grid(17, 152, 3) == (17, 2, 1)
     assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
+    assert cb.k3_grid(255, 148, 3) == (255, 2, 1)
     assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
-    assert cb.k3_grid(256, 152, 3) == (256, 2, 1)
-    assert cb.k3_grid(960, 148, 3) == (960, 2, 1)
+    assert cb.k3_grid(319, 148, 3) == (319, 2, 1)
+    assert cb.k3_grid(319, 152, 3) == (319, 2, 1)
+    assert cb.k3_grid(320, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(320, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(960, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(960, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(961, 148, 3) == (148, 2, 1)
     assert cb.k3_grid(961, 152, 3) == (152, 2, 1)
     assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(4096, 152, 3) == (152, 2, 1)
     with pytest.raises(ValueError):
         cb.k3_grid(4096, 0, 3)
-    assert len(cake_jit.required_kernel_keys()) == 9
+    assert len(cake_jit.required_kernel_keys()) == 10
     assert set(cake_jit.required_kernel_keys()) == {
         "k1_oneshot_ess",
         "k1_twoshot_ess:grouped",
@@ -129,6 +157,7 @@ def test_route_selection_by_token_count():
         "k123:c4",
         "k123:c8",
         "k3_ess:grouped",
+        "k3_reduce:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
     }
@@ -219,7 +248,7 @@ def test_launch_kwargs_cover_every_generated_argument_plan():
     workspace = _LaunchKwargsWorkspace()
     cases = [
         (M, rank, cb.route_kernel_keys(M, rank))
-        for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 960, 961, 1024)
+        for M in (1, 4, 5, 8, 9, 16, 17, 128, 255, 256, 300, 319, 320, 960, 961, 1024)
         for rank in (0, 5, 11)
     ]
     # registered programs no token count selects: the plain grouped two-shot K1 and the plain persistent K3

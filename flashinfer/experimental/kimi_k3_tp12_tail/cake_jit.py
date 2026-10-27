@@ -62,16 +62,22 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   scatter (the persistent tail scatters the shared partial itself);
 #   ``pinned`` (the per-rank pinned retry body) for ``M >= 961``; the
 #   ``grouped`` program stays registered, but no token count selects it;
-# * ``k3_ess:grouped``  the tail for ``8 < M <= 960`` after an ESS K1: owner
+# * ``k3_ess:grouped``  the tail for ``8 < M < 320`` after an ESS K1: owner
 #   reduce of the scattered shared columns, fused add of this rank's cuBLAS
 #   up-projection slice, one BF16 rounding and the multicast all-gather of
 #   the output row; one CTA per token and column half, no shared operand;
+# * ``k3_reduce:grouped``  the tail for ``320 <= M <= 960`` after an ESS K1:
+#   the reduce mode of the persistent K3 (below) on ``min(M, SM count)`` CTAs
+#   per column half, each walking its tokens as a two-stage pipeline (owner
+#   reduce + add + rounding + multicast ``t``, gather ``t - 2P``) over the
+#   slots the ESS K1 filled; it takes the persistent K3's arguments and does
+#   not read the shared partial;
 # * ``k3_persist:grouped``  the full K3 (own scatter of the shared partial,
 #   owner reduce + add + rounding, all-gather) on a persistent grid of
 #   ``min(M, SM count)`` CTAs per column half, each walking its tokens as a
 #   three-stage pipeline (scatter ``t``, owner reduce + multicast ``t - P``,
 #   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap;
-#   registered, but no token count selects it (the ESS tail serves
+#   registered, but no token count selects it (the ESS K1 routes serve
 #   ``M <= 960``);
 # * ``k3_persist_bulk:pinned``  the persistent K3 whose reduce-scatter stage
 #   pushes the shared columns with ``cp.async.bulk``, pinned poll schedule
@@ -412,6 +418,41 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": "5a82ab4ac6c5a42c3d88fa23095684400c96037850f8010c95322df9b4595f2d",
     },
+    "cake_kimi_k3_tp12_tail_fbbd46e05f4bc0a48277": {
+        "role": "kernel",
+        "sources": [
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_fbbd46e05f4bc0a48277_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_fbbd46e05f4bc0a48277_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "shared"],
+            ["buffer", "gemm_slice"],
+            ["buffer", "out"],
+            ["buffer", "peer_ptrs"],
+            ["raw_pointer", "mcast_ptr"],
+            ["buffer", "buffer_flags"],
+            ["parameter", "num_tokens"],
+            ["parameter", "rank"],
+            ["parameter", "my_col_begin"],
+            ["parameter", "my_cols"],
+            ["parameter", "gemm_plane_stride"],
+            ["parameter", "num_gemm_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "049d2222d7d9ec4c24bcba962bf956f3a0e88c15fe351a0f74b1167811a82d2b",
+    },
 }
 
 KERNELS: dict[str, str] = {
@@ -424,6 +465,7 @@ KERNELS: dict[str, str] = {
     "k3_ess:grouped": "cake_kimi_k3_tp12_tail_f1ce43c00dd2fc5bc34e",
     "k3_persist:grouped": "cake_kimi_k3_tp12_tail_c111cf3eb49021f4e43c",
     "k3_persist_bulk:pinned": "cake_kimi_k3_tp12_tail_6810b839a07c32c7d662",
+    "k3_reduce:grouped": "cake_kimi_k3_tp12_tail_fbbd46e05f4bc0a48277",
 }
 
 ARCHES = ("sm_100a", "sm_103a")
@@ -449,21 +491,22 @@ def _nvcc_flags(arches: list[str]) -> list[str]:
 
 
 def required_kernel_keys() -> tuple[str, ...]:
-    """Every registered logical kernel: nine keys, the same programs on both arches.
+    """Every registered logical kernel: ten keys, the same programs on both arches.
 
     ``k1_twoshot:grouped`` and ``k3_persist:grouped`` stay registered, but the current
     token thresholds select neither.
     """
-    # Unreachable, hence not registered: ``k1_twoshot_ess:pinned`` and ``k3_ess:pinned``
-    # (the ESS range ``M <= 960`` is grouped-only), ``k3_persist:pinned`` and
-    # ``k3_persist_bulk:grouped`` (the cp.async.bulk form serves the whole persistent
-    # range ``M >= 961``).
+    # Unreachable, hence not registered: ``k1_twoshot_ess:pinned``, ``k3_ess:pinned`` and
+    # ``k3_reduce:pinned`` (the ESS range ``M <= 960`` is grouped-only),
+    # ``k3_persist:pinned`` and ``k3_persist_bulk:grouped`` (the cp.async.bulk form serves
+    # the whole persistent range ``M >= 961``).
     return (
         "k1_oneshot_ess",
         "k1_twoshot_ess:grouped",
         *(f"k1_twoshot:{schedule}" for schedule in POLL_SCHEDULES),
         *(f"k123:c{capacity}" for capacity in K23_CAPACITIES),
         "k3_ess:grouped",
+        "k3_reduce:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
     )
