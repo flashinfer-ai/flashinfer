@@ -81,7 +81,8 @@ Fix group 1, re-run Step 1 and the checks in Step 2, then draft the PR descripti
 template with group 2 under "Reviewer Notes". A self-review that finds nothing on a
 non-trivial diff is a signal to look again, not a pass.
 
-When filling in the template's CI-target field, list the test files the diff touches or the
-`tests/<area>/` directories covering touched source (paths under `tests/`, not source paths).
+The template's suggested-CI-targets field is optional; if you fill it in, list the test files
+the diff touches or the `tests/<area>/` directories covering touched source (paths under
+`tests/`, not source paths).
 Leave the full-scope checkbox unticked unless the change is cross-cutting, and give the reason
 if you tick it.

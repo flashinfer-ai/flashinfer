@@ -27,8 +27,8 @@ Thank you for contributing to FlashInfer! Before we review your pull request, pl
 - [ ] This PR requires **full-scope** CI, not targeted tests (expensive; justify below).
       Reason: <!-- e.g. cross-cutting change to shared infrastructure -->
 
-  CI target when the box above is unchecked (paths under `tests/`, whitespace-separated;
-  reviewers copy this into `@flashinfer-bot run <targets>` / `/bot run <targets>`): `tests/...`
+  Suggested CI test targets (optional; paths under `tests/`, whitespace-separated — a starting
+  point for `@flashinfer-bot run <targets>` / `/bot run <targets>`, reviewers may adjust): `tests/...`
 
 ## 🔬 Experimental Track
 

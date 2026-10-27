@@ -74,8 +74,10 @@ Where defendability matters more:
 When you start CI on a PR, pass a test target: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) or
 `/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths under `tests/`. A bare `run` with
 no target starts the full suite, which is expensive — reserve it for a final pre-merge check
-of a cross-cutting change. The PR's Tests section should name the targets; if it doesn't, ask
-the author for them rather than defaulting to a full run.
+of a cross-cutting change. The PR template has an optional "suggested CI test targets" field;
+treat it as a starting point, not an obligation on either side — derive the scope from the
+diff (the touched test files, or the `tests/<area>/` directories covering touched source)
+rather than defaulting to a full run.
 
 ## Non-focus
 
