@@ -1303,7 +1303,12 @@ def _forced_tile_config(n: int) -> Optional[str]:
 # 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
 # them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
 # overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
-# projections; everything else keeps today's resolution.
+# projections; everything else keeps today's resolution.  N is a multiple of 256 (the forced tile's grid) on every branch but
+# the last: a weight whose 64-row tiles overflow a wave is admitted at N % 128 == 0 too, because its 128-row tiles divide such an
+# N exactly -- the indexer band's slab (QsaSpec.index_band: 13312 + 640 = 13952 = 109 x 128 columns at the 24/2 geometry, whose
+# 218 64-row tiles overflow every served part) is the case, and it takes the SAME 128-row swap-AB names the 32/2 slab does (109
+# CTAs: the half-wave launch a band padded to 768 columns would make, with no pad in the weight).  An N that 128 divides but 256
+# does not whose 64-row tiles FIT one wave keeps today's resolution (the narrow and one-wave branches are unmeasured off the 256 grid).
 SMALL_M_MAX = 128
 _SMALL_M_SPLIT_K_MAX = 8
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
@@ -1325,7 +1330,8 @@ def small_m_tile_config(
 ) -> Optional[str]:
     """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
     apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
-    operand, an extent the TMA 16-byte rule refuses, an N that 256 does not divide).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
+    operand, an extent the TMA 16-byte rule refuses, an N off the route's tile grids: 256 must divide N, or 128 where the 64-row
+    tiles overflow a wave -- the indexer band's 13952-column slab).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
     to the same name on every part of one SM-count class, so a recorded plan name replays."""
     if m <= 0 or n <= 0 or k <= 0:
         # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
@@ -1341,9 +1347,10 @@ def small_m_tile_config(
         # The swapped problem reads the weight as the K-contiguous A operand and stores the output M-major: both extents
         # fall under TMA's 16-byte contiguous-extent rule at 2 bytes per element.
         return None
-    if n % 256:
-        # An N the forced tile never existed for keeps today's resolution (the graph route; under ``capture_safe`` the typed
-        # refusal at the first capture): the indexer band's + 640 columns (``QsaSpec.index_band``) are the serving case.
+    if n % 128:
+        # An N that 128 does not divide keeps today's resolution (the graph route; under ``capture_safe`` the typed refusal at
+        # compile): the overflow branch's 128-row tiles would leave a partial tile, and the 64-row-tile branches below are gated
+        # to the 256 grid (``n % 256`` and one wave), so 13376 = 209 x 64 is declined as well.
         return None
     if sm_count is None:
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_config import _sm_count
@@ -1354,6 +1361,13 @@ def small_m_tile_config(
         tn *= 2
     ctas_64 = -(-n // 64)
     ctas_128 = -(-n // 128)
+    if n % 256 and ctas_64 <= sm_count:
+        # An N that 128 divides but 256 does not, whose 64-row tiles FIT one wave: the narrow and the one-wave branches below were
+        # measured on 256-multiples only, so it keeps today's resolution (the graph route; under ``capture_safe`` the typed refusal
+        # at compile).  The one served off-grid N -- the indexer band's slab, ``QsaSpec.index_band``: 13312 + 640 = 13952 = 109 x 128
+        # -- overflows the wave on every served part (218 64-row tiles) and takes the overflow branch's 128-row tiles, which divide
+        # it exactly (no partial tile).
+        return None
     if 3 * ctas_64 < sm_count:
         # NARROW weight (fewer than a third of a wave of 64-row tiles).  With a DEEP K (>= 64 K tiles) 128-row weight tiles
         # and the split-K slice count that fills ONE wave (a slice count that overflows the wave loses its tail: 32/2 out
@@ -1380,7 +1394,8 @@ def small_m_tile_config(
         if -(-m // 128) * ctas_64 <= sm_count:
             return "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
         return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
-    # The 64-row tiles overflow a wave: 128-row weight tiles (one wave up to N = 128 x SMs; 32/2 slab, 136 CTAs).
+    # The 64-row tiles overflow a wave: 128-row weight tiles (one wave up to N = 128 x SMs; 32/2 slab, 136 CTAs; the indexer
+    # band's 13952-column slab, 109 CTAs -- the one N off the 256 grid the route names a tile for).
     if m <= 64:
         return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_swapAB"
     return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
@@ -1389,7 +1404,11 @@ def small_m_tile_config(
 def _auto_tile_name(m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool) -> Optional[str]:
     """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`; on the ``sm100`` compiler family
     only -- its names are the tcgen05 tree's catalog, so a process on the ``sm120`` family keeps the family-aware fallback below),
-    else the forced 256-wide tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile)."""
+    else the forced 256-wide tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile).
+    A None here IS the graph route: ``build_proj_gemm(capture_safe=True)`` declines it typed, and the block sets ``capture_safe`` on a
+    projection stage only where this resolver names a tile for the stage's own shape (``_Projection.resolves_a_jit_tile``) -- the
+    indexer band's slab (N 13952, off the 256 grid) resolves here at ``m <= SMALL_M_MAX`` only, so a band declaration past 128 rows
+    keeps the graph route and its documented capture refusal."""
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost import arch_family
 
     name = (
@@ -1994,7 +2013,8 @@ def _capture_safe_graph_route_message(label: str, m: int, k: int, n: int, tile_c
     return (
         f"{label}: capture_safe=True needs the forced-tile JIT route, but this plan resolves to the graph route ({resolved}; m={m}, k={k}, "
         f"n={n}, tile_config={tile_config!r}): the graph route creates a cuDNN handle at the first execute per stream, which cannot happen "
-        f"inside a CUDA-graph capture -- use an N that 256 divides (the forced tile {_FORCED_TILE_NAME!r}), or name a tile_config explicitly"
+        f"inside a CUDA-graph capture -- use an N that 256 divides (the forced tile {_FORCED_TILE_NAME!r}), a shape the small-M route "
+        f"names a tile for (m <= {SMALL_M_MAX} on a dense bf16 / f16 K-major projection), or name a tile_config explicitly"
     )
 
 

@@ -1596,6 +1596,55 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
+@pytest.mark.parametrize(
+    "vocab_size", [1023, 1024, 1025, 4095, 4096, 4097, 32000, 32001, 128256, 151937]
+)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_chain_speculative_sampling_residual_normalizer(vocab_size, deterministic):
+    # The residual relu(target - draft) is spread over many indices with unequal mass,
+    # so the value of its sum decides where the inverse-CDF walk stops. A reduction
+    # that drops tiles, vector lanes, or the cross-thread step samples from a truncated
+    # distribution and lowers the mean sampled index. The stride is not a multiple of
+    # the vector width, so every lane carries mass.
+    batch_size = 512
+    draft_probs = torch.zeros(batch_size, 1, vocab_size, device="cuda:0")
+    draft_probs[..., 0] = 1.0
+    draft_token_ids = torch.zeros((batch_size, 1), device="cuda:0", dtype=torch.int32)
+    target_probs = torch.zeros(batch_size, 2, vocab_size, device="cuda:0")
+    idx = torch.arange(1, vocab_size, 65, device="cuda:0")
+    weights = torch.arange(1, idx.numel() + 1, device="cuda:0", dtype=torch.float32)
+    probs = weights / weights.sum()
+    target_probs[:, 0, idx] = probs
+    target_probs[:, 1, 0] = 1.0
+    expected_mean = (idx.double() * probs.double()).sum()
+    variance = ((idx.double() - expected_mean) ** 2 * probs.double()).sum()
+
+    samples = []
+    for seed in (12345, 999, 7):
+        output_token_ids, accepted_num, _ = (
+            flashinfer.sampling.chain_speculative_sampling(
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                deterministic=deterministic,
+                seed=seed,
+                offset=17,
+            )
+        )
+        # The draft token has no target mass, so every row resamples the residual.
+        assert torch.all(accepted_num == 0)
+        assert torch.all(output_token_ids[:, 1:] == -1)
+        assert torch.all(
+            torch.isin(output_token_ids[:, 0], idx.to(output_token_ids.dtype))
+        )
+        samples.append(output_token_ids[:, 0].double())
+
+    drawn = torch.cat(samples)
+    # Six standard errors: a correct kernel fails this about once in 5e8 runs.
+    standard_error = (variance / drawn.numel()).sqrt()
+    assert (drawn.mean() - expected_mean).abs() < 6 * standard_error
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
