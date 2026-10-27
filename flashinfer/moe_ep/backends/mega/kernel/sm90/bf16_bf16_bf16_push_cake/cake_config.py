@@ -61,6 +61,11 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     launch.  Neither switch changes a stored value.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_PDL`` / ``FLASHINFER_SM90_CAKE_BF16_PDL_LATE`` /
     ``FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN`` (default: off / off / ``0``).
+
+    ``fused_dispatch_max_tokens`` is the largest round (tokens per rank) that
+    takes the single-launch fused dispatch (``None``:
+    ``FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS``, default 128; at
+    most 512).  It changes no stored value.
     """
 
     intermediate_size: int
@@ -75,3 +80,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     pdl: bool | int | None = None
     pdl_late: bool | None = None
     fused_begin: int | None = None
+    fused_dispatch_max_tokens: int | None = None

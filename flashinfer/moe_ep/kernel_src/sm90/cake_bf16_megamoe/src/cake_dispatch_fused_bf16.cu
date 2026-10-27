@@ -49,8 +49,12 @@
 // Cells, tags, SlotMeta fields, pool-head packing and the overflow / invalid
 // expert traps are those of the vendored protocol, so a peer running the
 // vendored `wait_prefix` / compact kernels consumes this dispatch unchanged.
-// The host keeps this path for T <= kMaxTokens (T * top_k <= kMaxRoutes) and
-// falls back to the vendored kernels above that.
+// The host keeps this path for T * top_k <= kMaxRoutesLarge and falls back to
+// the vendored kernels above that.  Rounds with T * top_k <= kMaxRoutes launch
+// the small-route instance (one block per token); larger rounds launch the
+// large-route instance with grid = min(T, co-resident blocks), where a block
+// whose grid is smaller than T loops over tokens t = blockIdx.x + i * gridDim.x
+// (its later tokens derive their route ranks after the reservation barrier).
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -72,7 +76,8 @@ constexpr int kMaxEpSize = 32;
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
 constexpr int kMaxTopK = 8;
-constexpr int kMaxRoutes = 1024;  // T * top_k bound of the fused path (route ids in smem)
+constexpr int kMaxRoutes = 1024;  // T * top_k bound of the small-route instance (route ids in smem)
+constexpr int kMaxRoutesLarge = 4096;  // T * top_k bound of the large-route instance
 
 PushLayout build_layout(int64_t peer_bases, int64_t ep_size, int64_t rank,
                         int64_t num_local_experts, int64_t pool_rows, int64_t meta_rows,
@@ -144,8 +149,9 @@ __device__ __forceinline__ int warp_sum(int v) {
   return v;
 }
 
-// grid = max(T, 1) blocks (cooperative), block = kThreads.  Dynamic smem:
-// route ids [kMaxRoutes], lc [nkeys], exclusive scan [nkeys + 1], pc [eps].
+// grid = max(T, 1) blocks (small-route instance) or min(max(T, 1), co-resident
+// blocks) (large-route instance), cooperative, block = kThreads.  Dynamic smem:
+// route ids [ROUTE_CAP], lc [nkeys], exclusive scan [nkeys + 1], pc [eps].
 // Receiver-side prefix outputs (the arguments of the vendored `wait_prefix`).
 struct PrefixArgs {
   int32_t* rows_per_src;
@@ -160,20 +166,162 @@ struct PrefixArgs {
   int max_rows_per_key;
 };
 
+// Ranks of token t's routes among the earlier routes (route-only pass; the
+// first token of a block gets them from the combined pass of step 1c): s_eid /
+// s_dst / s_carrier (step 1b) and s_loff / s_ploff for token t.  Same rule as
+// step 1c, restricted to the routes r < (t + 1) * TOP_K.
 template <int TOP_K>
-__global__ void __launch_bounds__(kThreads)
-    dispatch_fused_dedup_kernel(PushLayout L, const uint8_t* __restrict__ x_bytes,
-                                int bytes_per_token, const int32_t* __restrict__ topk_ids,
-                                const float* __restrict__ topk_w, int32_t* round_ctr,
-                                int32_t* __restrict__ bases, int local_num_tokens, int fuse_begin,
-                                int fuse_prefix, PrefixArgs pa) {
+__device__ __forceinline__ void token_route_ranks(const int32_t* s_ids, int t, int E, int tid,
+                                                  int lane, int warp, int* s_eid, int* s_dst,
+                                                  int* s_carrier, int* s_loff, int* s_ploff,
+                                                  int (*s_red)[2 * TOP_K]) {
+  if (tid == 0) {
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      int const eid = s_ids[t * TOP_K + k];
+      if (eid < 0) {
+        s_eid[k] = -1;
+        s_dst[k] = -1;
+        s_carrier[k] = 0;
+        continue;
+      }
+      int const d = expert_owner_rank(eid, E);
+      int carrier = 1;
+#pragma unroll
+      for (int j = 0; j < TOP_K; ++j) {
+        if (j < k && s_dst[j] == d) carrier = 0;
+      }
+      s_eid[k] = eid;
+      s_dst[k] = d;
+      s_carrier[k] = carrier;
+    }
+  }
+  __syncthreads();
+  int cl[TOP_K], cp[TOP_K];
+#pragma unroll
+  for (int k = 0; k < TOP_K; ++k) cl[k] = cp[k] = 0;
+  int const n_before = (t + 1) * TOP_K;
+  for (int r = tid; r < n_before; r += kThreads) {
+    int const eid = s_ids[r];
+    if (eid < 0) continue;
+    int const tok = r / TOP_K;
+    int const kk = r - tok * TOP_K;
+    int const d = expert_owner_rank(eid, E);
+    bool carrier = true;
+#pragma unroll
+    for (int j = 0; j < TOP_K; ++j) {
+      if (j < kk) {
+        int const ej = s_ids[tok * TOP_K + j];
+        if (ej >= 0 && expert_owner_rank(ej, E) == d) carrier = false;
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      if (s_eid[k] >= 0 && r < t * TOP_K + k) {
+        if (eid == s_eid[k]) ++cl[k];
+        if (carrier && s_carrier[k] && d == s_dst[k]) ++cp[k];
+      }
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < TOP_K; ++k) {
+    int const a = warp_sum(cl[k]);
+    int const b = warp_sum(cp[k]);
+    if (lane == 0) {
+      s_red[warp][k] = a;
+      s_red[warp][TOP_K + k] = b;
+    }
+  }
+  __syncthreads();
+  if (tid < 2 * TOP_K) {
+    int sum = 0;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) sum += s_red[w][tid];
+    if (tid < TOP_K) {
+      s_loff[tid] = sum;
+    } else {
+      s_ploff[tid - TOP_K] = sum;
+    }
+  }
+  __syncthreads();
+}
+
+// Step 3 for token t: its SlotMeta records and carrier payload rows.
+template <int TOP_K>
+__device__ __forceinline__ void store_token(
+    const PushLayout& L, const uint8_t* __restrict__ x_bytes, int bytes_per_token,
+    const float* __restrict__ topk_w, const int32_t* __restrict__ bases, const int32_t* s_scan,
+    int t, int E, int eps, int tid, const int* s_eid, const int* s_dst, const int* s_carrier,
+    const int* s_loff, const int* s_ploff, int* s_pslot) {
+  if (tid == 0) {
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      if (s_eid[k] < 0) {
+        s_pslot[k] = 0;
+        continue;
+      }
+      int const d = s_dst[k];
+      int const meta_base = __ldcg(bases + d);
+      int const payload_base = __ldcg(bases + eps + d);
+      int const slot = meta_base + (s_scan[s_eid[k]] - s_scan[d * E]) + s_loff[k];
+      int pslot;
+      if (s_carrier[k]) {
+        pslot = payload_base + s_ploff[k];
+      } else {  // duplicate destination: reuse the carrier's row (k' < k)
+        pslot = 0;
+#pragma unroll
+        for (int j = 0; j < TOP_K; ++j) {
+          if (j < k && s_dst[j] == d) pslot = s_pslot[j];
+        }
+      }
+      s_pslot[k] = pslot;
+      SlotMeta* m = L.pool_meta(d, slot);
+      m->src_token = t;
+      m->src_rank_k = pack_rank_k(L.rank, k);
+      m->weight = topk_w[t * TOP_K + k];
+      m->payload_slot = pslot;
+    }
+  }
+  __syncthreads();
+  uint4* dst[TOP_K];
+#pragma unroll
+  for (int k = 0; k < TOP_K; ++k) {
+    dst[k] = (s_eid[k] < 0 || !s_carrier[k])
+                 ? nullptr
+                 : reinterpret_cast<uint4*>(L.pool_row(s_dst[k], s_pslot[k]));
+  }
+  const uint4* src =
+      reinterpret_cast<const uint4*>(x_bytes + static_cast<uint64_t>(t) * bytes_per_token);
+  int const nv = bytes_per_token >> 4;
+  for (int v = tid; v < nv; v += kThreads) {
+    uint4 const pk = src[v];
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      if (dst[k] != nullptr) dst[k][v] = pk;
+    }
+  }
+}
+
+// The large-route instance is register-bounded to kLargeMinBlocks blocks per SM
+// (<= 64 registers at 256 threads), so a T = 512 grid (one block per token) is
+// co-resident on 132 SMs; the token loop only engages when it still is not.
+// The small-route instance keeps the original launch bounds (its codegen).
+constexpr int kLargeMinBlocks = 4;
+
+// Kernel body shared by the two instances (route ids in smem: ROUTE_CAP).
+template <int TOP_K, int ROUTE_CAP>
+__device__ __forceinline__ void dispatch_fused_dedup_body(
+    PushLayout L, const uint8_t* __restrict__ x_bytes, int bytes_per_token,
+    const int32_t* __restrict__ topk_ids, const float* __restrict__ topk_w, int32_t* round_ctr,
+    int32_t* __restrict__ bases, int local_num_tokens, int fuse_begin, int fuse_prefix,
+    PrefixArgs pa) {
   extern __shared__ int32_t smem[];
   int const E = L.num_local_experts;
   int const eps = L.ep_size;
   int const nkeys = E * eps;
   int const n_routes = local_num_tokens * TOP_K;
-  int32_t* s_ids = smem;               // [kMaxRoutes]
-  int32_t* s_lc = s_ids + kMaxRoutes;  // [nkeys]  records per (expert, this source)
+  int32_t* s_ids = smem;               // [ROUTE_CAP]
+  int32_t* s_lc = s_ids + ROUTE_CAP;   // [nkeys]  records per (expert, this source)
   int32_t* s_scan = s_lc + nkeys;      // [nkeys + 1]  exclusive prefix of s_lc
   int32_t* s_pc = s_scan + nkeys + 1;  // [eps]  carrier (payload) rows per destination
   __shared__ int s_eid[TOP_K], s_dst[TOP_K], s_carrier[TOP_K], s_loff[TOP_K], s_ploff[TOP_K];
@@ -341,52 +489,18 @@ __global__ void __launch_bounds__(kThreads)
 
   // 3. this token's SlotMeta records and carrier payload rows
   if (has_token) {
-    if (tid == 0) {
-#pragma unroll
-      for (int k = 0; k < TOP_K; ++k) {
-        if (s_eid[k] < 0) {
-          s_pslot[k] = 0;
-          continue;
-        }
-        int const d = s_dst[k];
-        int const meta_base = __ldcg(bases + d);
-        int const payload_base = __ldcg(bases + eps + d);
-        int const slot = meta_base + (s_scan[s_eid[k]] - s_scan[d * E]) + s_loff[k];
-        int pslot;
-        if (s_carrier[k]) {
-          pslot = payload_base + s_ploff[k];
-        } else {  // duplicate destination: reuse the carrier's row (k' < k)
-          pslot = 0;
-#pragma unroll
-          for (int j = 0; j < TOP_K; ++j) {
-            if (j < k && s_dst[j] == d) pslot = s_pslot[j];
-          }
-        }
-        s_pslot[k] = pslot;
-        SlotMeta* m = L.pool_meta(d, slot);
-        m->src_token = t;
-        m->src_rank_k = pack_rank_k(L.rank, k);
-        m->weight = topk_w[t * TOP_K + k];
-        m->payload_slot = pslot;
-      }
-    }
-    __syncthreads();
-    uint4* dst[TOP_K];
-#pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      dst[k] = (s_eid[k] < 0 || !s_carrier[k])
-                   ? nullptr
-                   : reinterpret_cast<uint4*>(L.pool_row(s_dst[k], s_pslot[k]));
-    }
-    const uint4* src =
-        reinterpret_cast<const uint4*>(x_bytes + static_cast<uint64_t>(t) * bytes_per_token);
-    int const nv = bytes_per_token >> 4;
-    for (int v = tid; v < nv; v += kThreads) {
-      uint4 const pk = src[v];
-#pragma unroll
-      for (int k = 0; k < TOP_K; ++k) {
-        if (dst[k] != nullptr) dst[k][v] = pk;
-      }
+    store_token<TOP_K>(L, x_bytes, bytes_per_token, topk_w, bases, s_scan, t, E, eps, tid, s_eid,
+                       s_dst, s_carrier, s_loff, s_ploff, s_pslot);
+  }
+  if constexpr (ROUTE_CAP > kMaxRoutes) {
+    // large-route instance with grid < T: this block's later tokens
+    for (int tt = t + static_cast<int>(gridDim.x); tt < local_num_tokens;
+         tt += static_cast<int>(gridDim.x)) {
+      __syncthreads();  // the previous token's s_eid / s_pslot / ranks are consumed
+      token_route_ranks<TOP_K>(s_ids, tt, E, tid, lane, warp, s_eid, s_dst, s_carrier, s_loff,
+                               s_ploff, s_red);
+      store_token<TOP_K>(L, x_bytes, bytes_per_token, topk_w, bases, s_scan, tt, E, eps, tid, s_eid,
+                         s_dst, s_carrier, s_loff, s_ploff, s_pslot);
     }
   }
   __syncthreads();                       // the block's remote stores are issued
@@ -463,24 +577,55 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// Small-route instance (T * top_k <= kMaxRoutes, one block per token): the
+// launch bounds of the original single-instance kernel.
 template <int TOP_K>
+__global__ void __launch_bounds__(kThreads)
+    dispatch_fused_dedup_kernel(PushLayout L, const uint8_t* __restrict__ x_bytes,
+                                int bytes_per_token, const int32_t* __restrict__ topk_ids,
+                                const float* __restrict__ topk_w, int32_t* round_ctr,
+                                int32_t* __restrict__ bases, int local_num_tokens, int fuse_begin,
+                                int fuse_prefix, PrefixArgs pa) {
+  dispatch_fused_dedup_body<TOP_K, kMaxRoutes>(L, x_bytes, bytes_per_token, topk_ids, topk_w,
+                                               round_ctr, bases, local_num_tokens, fuse_begin,
+                                               fuse_prefix, pa);
+}
+
+// Large-route instance (T * top_k <= kMaxRoutesLarge): register-bounded to
+// kLargeMinBlocks blocks per SM so a T = 512 grid is co-resident on 132 SMs.
+template <int TOP_K>
+__global__ void __launch_bounds__(kThreads, kLargeMinBlocks)
+    dispatch_fused_dedup_kernel_large(PushLayout L, const uint8_t* __restrict__ x_bytes,
+                                      int bytes_per_token, const int32_t* __restrict__ topk_ids,
+                                      const float* __restrict__ topk_w, int32_t* round_ctr,
+                                      int32_t* __restrict__ bases, int local_num_tokens,
+                                      int fuse_begin, int fuse_prefix, PrefixArgs pa) {
+  dispatch_fused_dedup_body<TOP_K, kMaxRoutesLarge>(L, x_bytes, bytes_per_token, topk_ids, topk_w,
+                                                    round_ctr, bases, local_num_tokens, fuse_begin,
+                                                    fuse_prefix, pa);
+}
+
+template <int TOP_K, int ROUTE_CAP>
 void launch_fused_dispatch(const PushLayout& L, const uint8_t* x_bytes, int bytes_per_token,
                            const int32_t* ids, const float* w, int32_t* rc, int32_t* bases, int lt,
                            int device_id, cudaStream_t stream, int fuse_begin, int fuse_prefix,
                            PrefixArgs pa) {
   auto kernel = dispatch_fused_dedup_kernel<TOP_K>;
+  if constexpr (ROUTE_CAP > kMaxRoutes) kernel = dispatch_fused_dedup_kernel_large<TOP_K>;
   int const nkeys = L.num_local_experts * L.ep_size;
-  size_t const smem = static_cast<size_t>(kMaxRoutes + 2 * nkeys + 1 + L.ep_size) * sizeof(int32_t);
+  size_t const smem = static_cast<size_t>(ROUTE_CAP + 2 * nkeys + 1 + L.ep_size) * sizeof(int32_t);
   TVM_FFI_ICHECK(smem <= 48 * 1024) << "dispatch_fused: E*ep = " << nkeys << " needs " << smem
                                     << "B smem, over the 48KB static limit";
-  int const grid = std::max(lt, 1);
   int sms = 0, per_sm = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_id);
   cudaError_t occ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kThreads,
                                                                   static_cast<int>(smem));
   TVM_FFI_ICHECK(occ == cudaSuccess)
       << "dispatch_fused: occupancy query failed: " << cudaGetErrorString(occ);
-  TVM_FFI_ICHECK(grid <= per_sm * sms)
+  // large-route instance: blocks loop over tokens when T exceeds the co-resident capacity
+  int const grid =
+      ROUTE_CAP > kMaxRoutes ? std::max(std::min(lt, per_sm * sms), 1) : std::max(lt, 1);
+  TVM_FFI_ICHECK(grid >= 1 && grid <= per_sm * sms)
       << "dispatch_fused: grid " << grid << " exceeds the co-resident capacity " << per_sm * sms;
   PushLayout layout = L;
   void* args[] = {&layout,
@@ -536,8 +681,9 @@ void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView
   TVM_FFI_ICHECK(K == L.top_k) << "dispatch_fused: top_k mismatch";
   TVM_FFI_ICHECK(topk_ids.size(0) == T && topk_w.size(0) == T && topk_w.size(1) == K)
       << "dispatch_fused: routing shape mismatch";
-  TVM_FFI_ICHECK(T * K <= kMaxRoutes)
-      << "dispatch_fused: T * top_k = " << T * K << " exceeds " << kMaxRoutes;
+  TVM_FFI_ICHECK(T * K <= kMaxRoutesLarge)
+      << "dispatch_fused: T * top_k = " << T * K << " exceeds " << kMaxRoutesLarge;
+  bool const large = T * K > kMaxRoutes;
   TVM_FFI_ICHECK(bases.numel() >= 2 * L.ep_size) << "dispatch_fused: bases scratch too small";
   auto stream = get_stream(x.device());
   auto* xb = static_cast<const uint8_t*>(x.data_ptr());
@@ -582,26 +728,27 @@ void sm90_cake_dispatch_fused_bf16(TensorView x, TensorView topk_ids, TensorView
   int const lt = static_cast<int>(T);
   int const bpt = static_cast<int>(H) * 2;
   int const dev = x.device().device_id;
+#define CAKE_DISPATCH_CASE(KV)                                                                    \
+  case KV:                                                                                        \
+    if (large) {                                                                                  \
+      launch_fused_dispatch<KV, kMaxRoutesLarge>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, \
+                                                 fp, pa);                                         \
+    } else {                                                                                      \
+      launch_fused_dispatch<KV, kMaxRoutes>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp,  \
+                                            pa);                                                  \
+    }                                                                                             \
+    break;
   switch (K) {
-    case 1:
-      launch_fused_dispatch<1>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
-      break;
-    case 2:
-      launch_fused_dispatch<2>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
-      break;
-    case 4:
-      launch_fused_dispatch<4>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
-      break;
-    case 6:
-      launch_fused_dispatch<6>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
-      break;
-    case 8:
-      launch_fused_dispatch<8>(L, xb, bpt, ids, w, rc, bp, lt, dev, stream, fb, fp, pa);
-      break;
+    CAKE_DISPATCH_CASE(1)
+    CAKE_DISPATCH_CASE(2)
+    CAKE_DISPATCH_CASE(4)
+    CAKE_DISPATCH_CASE(6)
+    CAKE_DISPATCH_CASE(8)
     default:
       TVM_FFI_ICHECK(false) << "dispatch_fused: unsupported top_k " << K
                             << " (supported: 1, 2, 4, 6, 8)";
   }
+#undef CAKE_DISPATCH_CASE
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_cake_dispatch_fused_bf16, sm90_cake_dispatch_fused_bf16);

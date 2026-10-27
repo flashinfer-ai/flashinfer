@@ -242,6 +242,15 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} fused_begin must be 0, 1, 2 or None, got {kcfg.fused_begin!r}"
             )
+        if kcfg.fused_dispatch_max_tokens is not None and not (
+            isinstance(kcfg.fused_dispatch_max_tokens, int)
+            and not isinstance(kcfg.fused_dispatch_max_tokens, bool)
+            and 1 <= kcfg.fused_dispatch_max_tokens <= 512
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_dispatch_max_tokens must be an int in [1, 512] or None, got "
+                f"{kcfg.fused_dispatch_max_tokens!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -353,6 +362,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 pdl=kcfg.pdl,
                 pdl_late=kcfg.pdl_late,
                 fused_begin=kcfg.fused_begin,
+                fused_dispatch_max_tokens=kcfg.fused_dispatch_max_tokens,
             )
         except Exception:
             pipe.destroy()
@@ -382,6 +392,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.pdl,
             kcfg.pdl_late,
             kcfg.fused_begin,
+            kcfg.fused_dispatch_max_tokens,
             float(kcfg.init_timeout_s),
         )
 

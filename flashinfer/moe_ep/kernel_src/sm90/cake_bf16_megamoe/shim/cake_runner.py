@@ -62,6 +62,7 @@ __all__ = [
     "PDL_EDGE_TAIL",
     "PDL_ENV",
     "PDL_LATE_ENV",
+    "FUSED_DISPATCH_MAX_TOKENS_ENV",
     "Sm90CakeBf16MoERunner",
 ]
 
@@ -75,11 +76,18 @@ __all__ = [
 FUSED_COMBINE_TAIL_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL"
 # Sender-side dispatch: one cooperative launch (count + reserve + store_publish)
 # vs. the vendored three kernels.  Used for dedup dispatch with
-# T <= FUSED_DISPATCH_MAX_TOKENS and T * top_k <= FUSED_DISPATCH_MAX_ROUTES;
-# larger rounds and non-dedup pipes always take the vendored kernels.
+# T <= the fused-dispatch token bound (default FUSED_DISPATCH_MAX_TOKENS, at most
+# FUSED_DISPATCH_MAX_TOKENS_LIMIT; FUSED_DISPATCH_MAX_TOKENS_ENV or the runner's
+# ``fused_dispatch_max_tokens``) and T * top_k <= FUSED_DISPATCH_MAX_ROUTES_LIMIT;
+# larger rounds and non-dedup pipes always take the vendored kernels.  Rounds
+# with T * top_k <= FUSED_DISPATCH_MAX_ROUTES launch the kernel's small-route
+# instance, larger ones its large-route instance.
 FUSED_DISPATCH_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH"
 FUSED_DISPATCH_MAX_TOKENS = 128
 FUSED_DISPATCH_MAX_ROUTES = 1024
+FUSED_DISPATCH_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS"
+FUSED_DISPATCH_MAX_TOKENS_LIMIT = 512
+FUSED_DISPATCH_MAX_ROUTES_LIMIT = 4096
 # Combine wire format (NOT interoperable: every rank of a pipe must agree, checked
 # at construction).  "prereduced": the expert rank pre-reduces the routes of a
 # token that landed on it in fp32 (ascending k), rounds once to bf16 and sends
@@ -144,6 +152,11 @@ def _fused_combine_tail_default() -> bool:
 
 def _fused_dispatch_default() -> bool:
     return _env_flag(FUSED_DISPATCH_ENV)
+
+
+def _fused_dispatch_max_tokens_default() -> int:
+    raw = os.environ.get(FUSED_DISPATCH_MAX_TOKENS_ENV)
+    return FUSED_DISPATCH_MAX_TOKENS if raw is None else int(raw.strip())
 
 
 def _pdl_mask(value: bool | int | str) -> int:
@@ -265,6 +278,7 @@ class Sm90CakeBf16MoERunner:
         pdl: bool | int | None = None,
         pdl_late: bool | None = None,
         fused_begin: int | None = None,
+        fused_dispatch_max_tokens: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -316,6 +330,17 @@ class Sm90CakeBf16MoERunner:
         if level == 2 and pipe.E * pipe.ep + 2 * pipe.ep > _FUSED_PREFIX_MAX_KEYS:
             level = 1
         self._fused_begin = level
+        max_tokens = (
+            _fused_dispatch_max_tokens_default()
+            if fused_dispatch_max_tokens is None
+            else int(fused_dispatch_max_tokens)
+        )
+        if not 1 <= max_tokens <= FUSED_DISPATCH_MAX_TOKENS_LIMIT:
+            raise ValueError(
+                f"fused_dispatch_max_tokens must be in [1, {FUSED_DISPATCH_MAX_TOKENS_LIMIT}], "
+                f"got {max_tokens!r}"
+            )
+        self._fused_dispatch_max_tokens = max_tokens
         # the per-route wire publishes through this package's twin under PDL
         self._own_per_route = (
             bool(self._pdl & PDL_EDGE_PUBLISH)
@@ -429,6 +454,11 @@ class Sm90CakeBf16MoERunner:
         return (1 if self._pdl & edge else 0) | (2 if self._pdl_late else 0)
 
     @property
+    def fused_dispatch_max_tokens(self) -> int:
+        """Largest round (tokens) that takes the single-launch fused dispatch."""
+        return self._fused_dispatch_max_tokens
+
+    @property
     def fused_begin(self) -> int:
         """Round-opening fusion level of small rounds (0, 1 or 2; see ``FUSED_BEGIN_ENV``)."""
         return self._fused_begin
@@ -438,8 +468,8 @@ class Sm90CakeBf16MoERunner:
         return (
             self._fused_dispatch
             and pipe.config.dedup_dispatch
-            and num_tokens <= FUSED_DISPATCH_MAX_TOKENS
-            and num_tokens * pipe.K <= FUSED_DISPATCH_MAX_ROUTES
+            and num_tokens <= self._fused_dispatch_max_tokens
+            and num_tokens * pipe.K <= FUSED_DISPATCH_MAX_ROUTES_LIMIT
         )
 
     # ------------------------------------------------------------------ setup
