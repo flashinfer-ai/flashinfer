@@ -1321,6 +1321,32 @@ DECODE_TABLE_M_RANGES: dict[
             ),
         ),
     },
+    "sm_103a": {
+        "50,28,2048": (
+            (
+                1537,
+                2048,
+                {
+                    "route": "gemm",
+                    "gemm_bk": 128,
+                    "gemm_skf": 1,
+                    "gemm_rstaged_skf": 1,
+                },
+            ),
+        ),
+        "192,2,16384": (
+            (
+                4097,
+                12288,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1},
+            ),
+            (
+                16384,
+                16384,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1},
+            ),
+        ),
+    },
 }
 
 ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
