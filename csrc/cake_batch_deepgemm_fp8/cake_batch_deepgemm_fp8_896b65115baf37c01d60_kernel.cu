@@ -67,9 +67,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_SFB_STAGE_BYTES 512
 #define SMEM_SMEM_SFB_STRIDE 23552
 #define SMEM_EPI_STAGING_OFF 189440
-#define SMEM_EPI_STAGING_STAGE_BYTES 8192
-#define SMEM_EPI_STAGING_STRIDE 8192
-#define SMEM_TOTAL 197632
+#define SMEM_EPI_STAGING_STAGE_BYTES 12288
+#define SMEM_EPI_STAGING_STRIDE 12288
+#define SMEM_TOTAL 201728
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -221,11 +221,10 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
         : "r"(tmem_addr));
 }
 
-
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) void
-kernel_cake_batch_deepgemm_fp8_2642f6d0ddcc73579cb8(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_batch_deepgemm_fp8_896b65115baf37c01d60(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -411,49 +410,116 @@ kernel_cake_batch_deepgemm_fp8_2642f6d0ddcc73579cb8(const __grid_constant__ CUte
                 mbarrier_wait(mainloop_done_addr + (epi_stage) * 8, _phase_mainloop_done);
                 unsigned int off_m = raw_m_block * 128;
                 unsigned int off_n = n_block * 48;
-                int slab_row0 = epi_warp * 64;
+                int slab_row0 = epi_warp * 96;
+                unsigned int n_valid = shape_n - off_n;
+                int lean_row = epi_warp * 32;
+                int lean_set0 = slab_row0 + (int)(epi_panel % 1) * 96;
+                asm volatile("cp.async.bulk.wait_group.read 0;");
+                __syncwarp();
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                int lean_row0 = lean_set0 + 0;
+                float lean_ld[16];
+                int lean_col = (int)epi_stage * 48 + 0;
+                int lean_taddr = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col;
+                tmem_ld_x8(&lean_ld[0], lean_taddr);
+                int lean_col_0 = (int)epi_stage * 48 + 8;
+                int lean_taddr_1 = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col_0;
+                tmem_ld_x8(&lean_ld[8], lean_taddr_1);
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                int lean_srow = lean_row0 + lane;
+                unsigned int lean_bf16[4];
                 #pragma unroll
-                for (int panel = 0; panel < 3; panel++) {
-                    unsigned int panel_col0 = off_n + (unsigned int)(panel * 16);
-                    int staging_row0 = slab_row0 + (int)(epi_panel % 2) * 32;
-                    if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 1;");
-                    }
-                    __syncwarp();
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    #pragma unroll
-                    for (int n_chunk = 0; n_chunk < 2; n_chunk++) {
-                        int row = epi_warp * 32;
-                        int col = (int)epi_stage * 48 + panel * 16 + n_chunk * 8;
-                        int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
-                        float _tmem_load_0[8];
-                        tmem_ld_x8(&_tmem_load_0[0], tmem_addr);
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        unsigned int _tmem_load_0_bf16[4];
-                        #pragma unroll
-                        for (int _lp = 0; _lp < 4; _lp++) {
-                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                            _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
-                        }
-                        int staging_row = staging_row0 + lane;
-                        int swz_col = n_chunk * 8 ^ (staging_row >> 2 & 1) << 3;
-                        __nv_bfloat16* _sv_ptr = reinterpret_cast<__nv_bfloat16*>(epi_staging + (staging_row * 16 + swz_col));
-                        reinterpret_cast<int4*>(_sv_ptr + 0)[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
-                    }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    asm volatile("tcgen05.fence::before_thread_sync;");
-                    __syncwarp();
-                    if (elect_sync()) {
-                        if (store_tile != 0) {
-                            if (panel_col0 < shape_n) {
-                                tma_store_3d((&C_tma), panel_col0, off_m + (unsigned int)(epi_warp * 32), selected_group, epi_staging_addr + (unsigned int)(staging_row0 * 32));
-                            }
-                        }
-                        asm volatile("cp.async.bulk.commit_group;");
-                    }
-                    __syncwarp();
-                    epi_panel = epi_panel + 1;
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld[_lp*2 + 0], lean_ld[_lp*2+1 + 0]));
+                    lean_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
+                int lean_swz = 0 ^ (lean_srow >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow * 16 + lean_swz));
+                reinterpret_cast<int4*>(_sv_ptr + 0)[0] = reinterpret_cast<int4*>(lean_bf16)[0];
+                unsigned int lean_bf16_2[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld[_lp*2 + 8], lean_ld[_lp*2+1 + 8]));
+                    lean_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                }
+                int lean_swz_3 = 8 ^ (lean_srow >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr_4 = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow * 16 + lean_swz_3));
+                reinterpret_cast<int4*>(_sv_ptr_4 + 0)[0] = reinterpret_cast<int4*>(lean_bf16_2)[0];
+                int lean_row0_5 = lean_set0 + 32;
+                float lean_ld_6[16];
+                int lean_col_7 = (int)epi_stage * 48 + 16;
+                int lean_taddr_8 = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col_7;
+                tmem_ld_x8(&lean_ld_6[0], lean_taddr_8);
+                int lean_col_9 = (int)epi_stage * 48 + 24;
+                int lean_taddr_10 = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col_9;
+                tmem_ld_x8(&lean_ld_6[8], lean_taddr_10);
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                int lean_srow_11 = lean_row0_5 + lane;
+                unsigned int lean_bf16_12[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld_6[_lp*2 + 0], lean_ld_6[_lp*2+1 + 0]));
+                    lean_bf16_12[_lp] = *(uint32_t*)&_bf2;
+                }
+                int lean_swz_13 = 0 ^ (lean_srow_11 >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr_14 = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow_11 * 16 + lean_swz_13));
+                reinterpret_cast<int4*>(_sv_ptr_14 + 0)[0] = reinterpret_cast<int4*>(lean_bf16_12)[0];
+                unsigned int lean_bf16_15[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld_6[_lp*2 + 8], lean_ld_6[_lp*2+1 + 8]));
+                    lean_bf16_15[_lp] = *(uint32_t*)&_bf2;
+                }
+                int lean_swz_16 = 8 ^ (lean_srow_11 >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr_17 = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow_11 * 16 + lean_swz_16));
+                reinterpret_cast<int4*>(_sv_ptr_17 + 0)[0] = reinterpret_cast<int4*>(lean_bf16_15)[0];
+                int lean_row0_18 = lean_set0 + 64;
+                float lean_ld_19[16];
+                int lean_col_20 = (int)epi_stage * 48 + 32;
+                int lean_taddr_21 = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col_20;
+                tmem_ld_x8(&lean_ld_19[0], lean_taddr_21);
+                int lean_col_22 = (int)epi_stage * 48 + 40;
+                int lean_taddr_23 = taddr + (unsigned int)(lean_row << 16) + (unsigned int)lean_col_22;
+                tmem_ld_x8(&lean_ld_19[8], lean_taddr_23);
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                int lean_srow_24 = lean_row0_18 + lane;
+                unsigned int lean_bf16_25[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld_19[_lp*2 + 0], lean_ld_19[_lp*2+1 + 0]));
+                    lean_bf16_25[_lp] = *(uint32_t*)&_bf2;
+                }
+                int lean_swz_26 = 0 ^ (lean_srow_24 >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr_27 = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow_24 * 16 + lean_swz_26));
+                reinterpret_cast<int4*>(_sv_ptr_27 + 0)[0] = reinterpret_cast<int4*>(lean_bf16_25)[0];
+                unsigned int lean_bf16_28[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lean_ld_19[_lp*2 + 8], lean_ld_19[_lp*2+1 + 8]));
+                    lean_bf16_28[_lp] = *(uint32_t*)&_bf2;
+                }
+                int lean_swz_29 = 8 ^ (lean_srow_24 >> 2 & 1) << 3;
+                __nv_bfloat16* _sv_ptr_30 = reinterpret_cast<__nv_bfloat16*>(epi_staging + (lean_srow_24 * 16 + lean_swz_29));
+                reinterpret_cast<int4*>(_sv_ptr_30 + 0)[0] = reinterpret_cast<int4*>(lean_bf16_28)[0];
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                __syncwarp();
+                if (elect_sync()) {
+                    if (store_tile != 0) {
+                        if (0 < n_valid) {
+                            tma_store_3d((&C_tma), off_n + 0, off_m + (unsigned int)(epi_warp * 32), selected_group, epi_staging_addr + (unsigned int)((lean_set0 + 0) * 32));
+                        }
+                        if (16 < n_valid) {
+                            tma_store_3d((&C_tma), off_n + 16, off_m + (unsigned int)(epi_warp * 32), selected_group, epi_staging_addr + (unsigned int)((lean_set0 + 32) * 32));
+                        }
+                        if (32 < n_valid) {
+                            tma_store_3d((&C_tma), off_n + 32, off_m + (unsigned int)(epi_warp * 32), selected_group, epi_staging_addr + (unsigned int)((lean_set0 + 64) * 32));
+                        }
+                    }
+                    asm volatile("cp.async.bulk.commit_group;");
+                }
+                __syncwarp();
+                epi_panel = epi_panel + 1;
                 if (elect_sync()) {
                     mbarrier_arrive(epilogue_done_addr + (epi_stage) * 8);
                 }
