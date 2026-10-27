@@ -2947,19 +2947,35 @@ kernel_cake_fmha_context_fp8_d427125833943a3251b5(const __grid_constant__ CUtens
         { // scheduler_main
             unsigned int total_tiles_4 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_4 = total_tiles_4 + 1;
+            bool static_first = (unsigned int)num_ctas <= total_tiles_4;
             unsigned int _phase_work_id_empty_0 = 1;
             if (elect_sync()) {
                 #pragma unroll 1
                 for (unsigned int tile_iter_4 = 0; tile_iter_4 < max_rounds_4; tile_iter_4++) {
                     mbarrier_wait(work_id_empty_addr, _phase_work_id_empty_0);
                     _phase_work_id_empty_0 ^= 1;
-                    unsigned int _atomic_old_0 = atomicAdd(dynamic_counter, 1);
+                    unsigned int _atomic_old_0;
+                    if (static_first) {
+                        if (tile_iter_4 == 0) {
+                            _atomic_old_0 = (unsigned int)blockIdx.x;
+                        } else {
+                            unsigned int _atomic_fetch_add_0 = atomicAdd(dynamic_counter, 1);
+                            _atomic_old_0 = _atomic_fetch_add_0 + (unsigned int)num_ctas;
+                        }
+                    } else {
+                        unsigned int _atomic_fetch_add_1 = atomicAdd(dynamic_counter, 1);
+                        _atomic_old_0 = _atomic_fetch_add_1;
+                    }
                     work_id_slot[0] = _atomic_old_0;
                     mbarrier_arrive(work_id_full_addr);
                     if (_atomic_old_0 >= total_tiles_4) {
                         unsigned int last_fetch = total_tiles_4 + (unsigned int)num_ctas - 1;
                         if (_atomic_old_0 == last_fetch) {
-                            unsigned int reset_add = -(last_fetch + 1);
+                            unsigned int counter_draws = last_fetch + 1;
+                            if (static_first) {
+                                counter_draws = total_tiles_4;
+                            }
+                            unsigned int reset_add = -counter_draws;
                             unsigned int _atomic_old_1 = atomicAdd(dynamic_counter, reset_add);
                         }
                         break;
