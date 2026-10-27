@@ -1017,6 +1017,7 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
             # fused_moe_100 also targets SM110 and must ship in its provider.
