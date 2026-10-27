@@ -54,6 +54,7 @@ def _resolve_gate_up_clamp(
     "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
 )
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+    _config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     supports_output_view = True
 
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:

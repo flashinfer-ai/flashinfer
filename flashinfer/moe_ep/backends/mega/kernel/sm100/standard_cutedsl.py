@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from .....config import FinalizeMode
@@ -18,8 +20,20 @@ from .....core.validation.common import (
 )
 from .....weights import PrequantizedMoEWeights
 
+if TYPE_CHECKING:
+    from .mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
 
 class _StandardBlockScaledBackend(MegaKernelBackend):
+    _config: (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    )
     supports_output_view = True
     supports_auto_workspaces = True
     quant_kind: str | None = None

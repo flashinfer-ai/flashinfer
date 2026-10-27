@@ -699,8 +699,11 @@ cached knobs or the initial estimate without searching. A later tune context
 can finish a pending search.
 
 ```python
+from dataclasses import replace
 from flashinfer import autotune_v2
 
+backend = replace(backend, megakernel=replace(backend.megakernel, knobs="auto"))
+layer = MoEEpLayer(bootstrap, fleet_params, weights, backend=backend)
 with autotune_v2():
     layer.warmup(tensors)
 knobs = layer.get_tuned_knobs()
