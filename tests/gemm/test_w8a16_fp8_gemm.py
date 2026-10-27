@@ -860,6 +860,30 @@ def test_w8a16_fp8_gemm_caller_workspace_reuse(algo, dtype):
 # ---------------------------------------------------------------------------
 
 
+def test_w8a16_fp8_gemm_native_invalid_device():
+    """Invalid native device IDs raise without leaving a CUDA error that would make
+    the next valid split-K reduction fail. Wide IDs must not narrow to a valid one."""
+    dev = torch.device("cuda", torch.cuda.current_device())
+    mod = get_w8a16_fp8_gemm_module(dev, torch.bfloat16)
+    algo = {9: 10, 10: 5}[_major()]
+    m, n, k = 16, 128, 1024
+    need = mod.w8a16_fp8_gemm_workspace_bytes(m, n, k, dev.index, algo)
+    assert need > 0
+    workspace = torch.empty(need, device=dev, dtype=torch.uint8)
+    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
+    weight = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5], device=dev)
+    out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
+    expected = torch.full_like(out, 512.0)
+
+    for invalid in (-1, torch.cuda.device_count(), 2**32 + dev.index, -(2**32)):
+        with pytest.raises(RuntimeError, match="CUDA device"):
+            mod.w8a16_fp8_gemm_workspace_bytes(m, n, k, invalid, algo)
+        mod.w8a16_fp8_gemm(out, act, weight, scale, None, workspace, algo)
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+
+
 def test_w8a16_fp8_gemm_native_checks():
     """The module's own FFI entry points reject what the contract says they reject,
     independently of the Python guards: the other activation dtype, misaligned out

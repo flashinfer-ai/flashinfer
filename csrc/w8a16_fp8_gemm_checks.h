@@ -83,9 +83,18 @@ struct W8A16Operands {
   int num_sms = 0;
 };
 
-inline int W8A16NumSms(int device_id) {
+inline int W8A16NumSms(int64_t device_id) {
+  TVM_FFI_ICHECK(device_id >= 0 && device_id <= INT32_MAX)
+      << "CUDA device id must be between 0 and " << INT32_MAX << ", got " << device_id;
   int num_sms = 0;
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
+  const cudaError_t status =
+      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
+  if (status != cudaSuccess || num_sms <= 0) {
+    (void)cudaGetLastError();  // A rejected query must not leave an error for the next launch.
+  }
+  TVM_FFI_ICHECK(status == cudaSuccess && num_sms > 0)
+      << "cannot query a positive SM count for CUDA device " << device_id << ": "
+      << cudaGetErrorString(status) << " (SM count " << num_sms << ")";
   return num_sms;
 }
 
@@ -275,7 +284,7 @@ void W8A16LaunchGemm(const TensorView& out, const TensorView& act, const TensorV
 template <typename Launcher, typename T>
 int64_t W8A16QueryWorkspaceBytes(int64_t M, int64_t N, int64_t K, int64_t device_id, int64_t algo) {
   W8A16CheckDims(M, N, K);
-  const int num_sms = W8A16NumSms(static_cast<int>(device_id));
+  const int num_sms = W8A16NumSms(device_id);
   typename Launcher::Plan plan;
   W8A16CheckPlan(Launcher::Resolve(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                                    num_sms, algo, &plan),
