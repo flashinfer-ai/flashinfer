@@ -436,7 +436,10 @@ _BLOCK_TAIL_MIN_K = 768
 # 262144, B = 1-8, k = 1000; 8 rounds, two buffer placements, eager and graph, bitwise identical): the chain runs
 # 0.949-0.987 of the `_bt_tia` launch on GB300 at V = 151936, 0.936-0.970 of the `_bt` launch on B200 at V = 262144 and
 # 0.975-0.994 at V = 151936 B = 2-8, and 0.935-0.984 on H100.  B200's V = 151936 B = 1 cell keeps the tail (eager
-# 1.002 / 1.010, graph 0.992), and so does V = 128256 everywhere: the `_lp` build keeps the 2 k + 64 candidate need
+# 1.002 / 1.010, graph 0.992), and so do its B = 2 and 4 cells: the chain ran 0.980-0.996 of the tail there on those
+# two B200 nodes but 1.003-1.011 on a third, in all 8 eager / graph x placement rows (8 rounds; unchanged cells
+# 0.998-1.002).
+# V = 128256 keeps the tail everywhere: the `_lp` build keeps the 2 k + 64 candidate need
 # that round 14 lowered to 1.5 k + 64 in the `_bt` build only, so its k = 1000 rows there miss the whole-list gather
 # (H100 1.18-1.27).
 _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
@@ -445,7 +448,7 @@ _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
     (10, 3): 128256,
 }
 _BLOCK_TAIL_ABOVE_VOCAB_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
-    (10, 0): frozenset({(151936, 1)}),
+    (10, 0): frozenset({(151936, 1), (151936, 2), (151936, 4)}),
 }
 
 

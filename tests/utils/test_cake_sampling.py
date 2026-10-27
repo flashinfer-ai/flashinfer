@@ -1304,7 +1304,7 @@ _R15_PLAN_CHANGES = {
     **{
         ("B200", vocab, batch, 1000): ("8_16_1 f8 1L", "8_16_1 f550 2L")
         for vocab, batch in itertools.product((151936, 262144), (1, 2, 4, 8))
-        if (vocab, batch) != (151936, 1)
+        if (vocab, batch) not in ((151936, 1), (151936, 2), (151936, 4))
     },
     **{
         ("GB300", 151936, batch, 1000): ("8_16_1 f2056 1L", "8_16_1 f550 2L")
@@ -1378,8 +1378,8 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     """Round 15's host levers change the launch plans of the owner cells (vocab x batch 1-128 x top-k 10 / 50 / 1000)
     on H100, B200, GB300, R200 and RTX PRO 6000 exactly on the cells of ``_R15_PLAN_CHANGES``, each to the listed plan,
     against the plans of the round-14 tables: LP-BT 3a moves the cluster-8 k = 1000 rows above V = 128256 at B = 1-8
-    from the whole-CTA tail to the leader-push chain on 9.0 / 10.0 / 10.3 (B200's V = 151936 B = 1 cell and every
-    V = 128256 cell keep the tail); L-PK2 adds measured stage-1 picks on H100, B200 and GB300, two of them in the
+    from the whole-CTA tail to the leader-push chain on 9.0 / 10.0 / 10.3 (B200's V = 151936 B = 1, 2 and 4 cells and
+    every V = 128256 cell keep the tail); L-PK2 adds measured stage-1 picks on H100, B200 and GB300, two of them in the
     CTA-local-select top-k class only (top-k 10 changes, top-k 50 keeps its plan).  R200 and RTX PRO 6000 keep every
     plan."""
     if not torch.cuda.is_available():
@@ -2684,20 +2684,24 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     assert not cs._fuse_block_tail(1, 8, 32, False, 148, 1000, False)
     assert not cs._fuse_block_tail(16, 4, 16, True, 148, 1000, False)
     # the vocabulary bound (round 15, lever LP-BT 3a): 9.0 / 10.0 / 10.3 run the tail up to V = 128256 and the
-    # leader-push chain above it, except B200's V = 151936 B = 1 cell
+    # leader-push chain above it, except B200's V = 151936 B = 1, 2 and 4 cells
     assert cs._BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY == {
         (9, 0): 128256,
         (10, 0): 128256,
         (10, 3): 128256,
     }
-    assert {(10, 0): frozenset({(151936, 1)})} == cs._BLOCK_TAIL_ABOVE_VOCAB_CELLS
+    assert {
+        (10, 0): frozenset({(151936, 1), (151936, 2), (151936, 4)})
+    } == cs._BLOCK_TAIL_ABOVE_VOCAB_CELLS
     for cap in ((9, 0), (10, 0), (10, 3)):
         for batch in (1, 2, 4, 8):
             for vocab in (96193, 128256, 128257, 151936, 262144):
                 got = cs._fuse_block_tail(
                     batch, 8, 16, True, 148, 1000, False, vocab, cap
                 )
-                kept = vocab <= 128256 or (cap, vocab, batch) == ((10, 0), 151936, 1)
+                kept = vocab <= 128256 or (
+                    cap == (10, 0) and vocab == 151936 and batch in (1, 2, 4)
+                )
                 assert got == kept, (cap, vocab, batch)
     with pytest.raises(ValueError):
         cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False, None, (10, 3))
