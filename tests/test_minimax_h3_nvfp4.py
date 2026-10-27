@@ -1071,6 +1071,44 @@ def test_staged_norm_program_writes_the_norm_bytes(monkeypatch, M: int, P: int) 
         )
 
 
+@pytest.mark.parametrize(
+    ("M", "out_format", "staged"),
+    [(6095, "nvfp4", False), (6096, "nvfp4", True), (6096, "e4m3", False)],
+)
+def test_prepared_operation_launches_the_routed_norm_program(
+    M: int, out_format: str, staged: bool
+) -> None:
+    """A prepared eight-destination operation on ``sm_103a`` launches the norm
+    program of its route: ``NORM_V5`` for ``out_format="nvfp4"`` from
+    ``M = 6096`` tokens on, ``NORM`` below that and for ``e4m3``.
+
+    The kernels of one run are read from the CUDA profiler trace, so the check
+    covers the programs the operation prepared, not only the routing table.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("requires SM103a")
+    pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
+
+    operation, values = _prepare_zero_smoke(-1, M=M, P=8, out_format=out_format)
+    operation.run(**values)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+        operation.run(**values)
+        torch.cuda.synchronize()
+    launched = sorted(
+        event.name
+        for event in trace.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and event.name.startswith("kernel_cake_minimax_h3_nvfp4_pre_attention_")
+    )
+    norm = programs.NORM_V5 if staged else programs.NORM
+    gemm = programs.FUSED_PACK_K96 if out_format == "nvfp4" else programs.FUSED_E4M3_K96
+    assert launched == sorted([norm.kernel, gemm.kernel])
+
+
 def _e4m3_step(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """One E4M3 code step at the larger magnitude: 2^(e - 3) for normals, 2^-9 below 2^-6."""
     magnitude = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
