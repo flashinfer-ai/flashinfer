@@ -167,6 +167,17 @@ not picked them up):
   H2560/I640/E512/top10/EP2 in October): `src/moe_hopper_fp8/mxfp4_policy.py` resolves
   `paired_stores` for tile K 128 as well as 256. Output-invariant; K256
   tiles are unchanged. Not in the drop tree.
+- FC1/FC2 next-stage wait + LDSM under the WGMMAs for K128 MXFP4 tiles
+  (2026-10-27, measured on H2560/I640/E512/top10/EP2 in October):
+  `_mma_mxfp4_hybrid_fc1` and `_mma_mxfp4_hybrid_fc2` in
+  `kernel_mxfp4_fp8_glu_fc12_swapab.py` wait for and load stage 0 before
+  the K loop; each iteration waits for the next stage and loads its packed
+  weights after the (last) WGMMA commit, while the WGMMAs read the
+  converted registers. Only token tiles of N >= 64 use it
+  (`_prefetch_next_stage`): N16/N32 tiles measured 2-3% slower with it and
+  keep the in-order loop, compiled exactly as before. The K256 paths
+  (`*_k256*`, NV's FC1 K256 override) are unchanged. NV K128 tiles share
+  these loops. Not in the drop tree.
 
 ## Layout
 
