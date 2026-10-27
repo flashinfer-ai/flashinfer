@@ -4210,6 +4210,13 @@ _RENDERED_FOLD_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> the generated build of a chain-route main
+# module that also writes the BF16 window maps of the tail windows (the map
+# pass's states).  The runtime takes it instead of the ``_RENDERED_ROUTES``
+# program when it launches the chain composite without the map launch; every
+# other launch of the module keeps the routed program.
+_RENDERED_MAP_FOLD_ROUTES = {"sm_100a": {}, "sm_103a": {}}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,

@@ -3681,6 +3681,35 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch(
         return _build_kda_module(factory, *args, **kwargs)
 
 
+class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch(
+    FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
+):
+    """Chain-route main windows that also write the window maps of the tail windows.
+
+    The factory row is the indexed-initial main's; the body is that module's
+    map-fold build (``_chain_map_fold_factory``), whose ``tape_e`` slot takes
+    the composite's BF16 map states.  Raises ``_ChainMapFoldUnavailable``,
+    before any module is built, when the module has none.
+    """
+
+    @staticmethod
+    def _build_kda_module(factory, *args, **kwargs):
+        if getattr(factory, "func", None) is _factory and factory.args == (
+            "compiled_bf16_fused_m128",
+        ):
+            if (
+                _chain_map_fold_program(
+                    *factory.args, *args, **{**factory.keywords, **kwargs}
+                )
+                is None
+            ):
+                raise _ChainMapFoldUnavailable
+            factory = partial(
+                _chain_map_fold_factory, *factory.args, **factory.keywords
+            )
+        return _build_kda_module(factory, *args, **kwargs)
+
+
 def _affine_lean_map_enabled() -> bool:
     """Kernel round 2: build the prefix maps with the pair-map producer + prefix chain instead of the map pass.
 
@@ -3720,15 +3749,7 @@ class _PairMapFoldUnavailable(Exception):
     """The composite's main module has no pair-map fold build on this device."""
 
 
-def _pair_map_fold_program(
-    name,
-    *args,
-    route_heads=None,
-    route_work_bins=False,
-    owner_helper=False,
-    owner_helper_pool=False,
-    **kwargs,
-):
+def _pair_map_fold_program(name, *args, **kwargs):
     """The pair-map fold build of the factory row's main module, or ``None``.
 
     ``None`` when the row has no module on this device, when the head-count
@@ -3737,6 +3758,25 @@ def _pair_map_fold_program(
     (a fold build has neither), or when the loader names no fold build of the
     module (``_RENDERED_FOLD_ROUTES``).  The routing keywords are not part of
     the row's key (a pooled owner/helper build is an owner/helper build).
+    """
+    return _main_fold_program("_RENDERED_FOLD_ROUTES", name, *args, **kwargs)
+
+
+def _main_fold_program(
+    table,
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
+):
+    """The build the loader table ``table`` names for the factory row's module.
+
+    ``None`` under the conditions of ``_pair_map_fold_program``, for the
+    fold table ``table`` (``_RENDERED_FOLD_ROUTES`` or
+    ``_RENDERED_MAP_FOLD_ROUTES``).
     """
     del owner_helper_pool
     arch = detect_gpu_arch()
@@ -3755,7 +3795,7 @@ def _pair_map_fold_program(
         arch, {}
     ):
         return None
-    return _kda_registry._RENDERED_FOLD_ROUTES.get(arch, {}).get(module)
+    return getattr(_kda_registry, table, {}).get(arch, {}).get(module)
 
 
 def _pair_map_fold_factory(name, *args, **kwargs):
@@ -3769,6 +3809,55 @@ def _pair_map_fold_factory(name, *args, **kwargs):
     program = _pair_map_fold_program(name, *args, **kwargs)
     if program is None:
         raise _PairMapFoldUnavailable
+    return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _chain_map_fold_enabled() -> bool:
+    """Kernel round 8: the chain composite's main body writes the window maps itself.
+
+    Default on where the loader names the main module's map-fold build
+    (``_RENDERED_MAP_FOLD_ROUTES``); ``CAKE_KDA_CHAIN_MAP_FOLD=0`` keeps the
+    map launch (the control for the paired comparison).
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_CHAIN_MAP_FOLD", "1") != "0"
+
+
+def _chain_map_fold_routed(device) -> bool:
+    """The loader names a chain map-fold build for ``device``."""
+    import torch
+
+    arch = {(10, 0): "sm_100a", (10, 3): "sm_103a"}.get(
+        torch.cuda.get_device_capability(device)
+    )
+    return bool(getattr(_kda_registry, "_RENDERED_MAP_FOLD_ROUTES", {}).get(arch))
+
+
+class _ChainMapFoldUnavailable(Exception):
+    """The chain composite's main module has no map-fold build on this device."""
+
+
+def _chain_map_fold_program(name, *args, **kwargs):
+    """The map-fold build of the factory row's main module, or ``None``.
+
+    ``None`` under the conditions of ``_pair_map_fold_program``, for the
+    loader's ``_RENDERED_MAP_FOLD_ROUTES``.
+    """
+    return _main_fold_program("_RENDERED_MAP_FOLD_ROUTES", name, *args, **kwargs)
+
+
+def _chain_map_fold_factory(name, *args, **kwargs):
+    """The map-fold build of the factory row's main module.
+
+    Same argument plan as the routed program; the build also writes the BF16
+    state of every tail window's map (identity initial state, zero values,
+    the map pass's operation order) through ``tape_e``, window ``p`` at
+    ``[p - 1, head]``.
+    """
+    program = _chain_map_fold_program(name, *args, **kwargs)
+    if program is None:
+        raise _ChainMapFoldUnavailable
     return _kda_registry.PreparedKernel(program, detect_gpu_arch())
 
 
@@ -4329,11 +4418,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             and _affine_pair_map_fold_enabled()
             and _pair_map_fold_routed(q.device)
         )
+        # Kernel round 8: on the chain route the main body also writes the
+        # BF16 window maps of the tail windows (bitwise the map pass's) when
+        # the loader names the main module's map-fold build; the composite
+        # then launches no map pass.
+        self._chain_map_fold = bool(
+            not self._apply_route
+            and not self._use_output_projection
+            and compute_dtype == "bf16"
+            and num_parts > 1
+            and _chain_map_fold_enabled()
+            and _chain_map_fold_routed(q.device)
+        )
         main_launch_cls = (
             FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch
             if self._pair_map_fold
             else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
             if self._apply_route
+            else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch
+            if self._chain_map_fold
             else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
         )
         main_args = (
@@ -4366,6 +4469,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         try:
             self._main = main_launch_cls(*main_args, **main_kwargs)
+        except _ChainMapFoldUnavailable:
+            # The main module has no map-fold build: the map pass writes the maps.
+            self._chain_map_fold = False
+            self._main = FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch(
+                *main_args, **main_kwargs
+            )
         except _PairMapFoldUnavailable:
             # The main module has no fold build (the body without checkpoint
             # rows, for one): the pair-map producer writes the maps.
@@ -4381,6 +4490,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             use_state_indices=1,
         )
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
+        if self._chain_map_fold:
+            # The map-fold build writes every tail window's BF16 map state
+            # through the main body's (otherwise unused) training-tape slot,
+            # window p at [p - 1, head]: the scan reads it as the map pass's.
+            self._main.args["tape_e"] = self._map_state.view(-1)
+            self._main.__dict__.pop("_launch_records", None)
+            self.schedule += "_mapfold"
         self._correction = None
         if not self._use_output_projection and not self._apply_route:
             correction_cls: type[FlashKDABlackwellFP32SlabM128PDLConsumerLaunch]
@@ -4725,6 +4841,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         # kernel it does not depend on.
         self._map_first = (
             not self._apply_route
+            and not self._chain_map_fold
             and self._correction is not None
             and self._map.prepare_module is None
             and getattr(self._map.module, "name", None) in _MAP_FIRST_MODULES
@@ -4912,6 +5029,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ),
                 prefix,
             ]
+        if getattr(self, "_chain_map_fold", False):
+            # The main body wrote the window maps: no map launch.  The map
+            # pass stays constructed for the plan-cache ABI.
+            return []
         return _settled_launch_records(self._map)
 
     def _index_prep_arguments(self) -> tuple:
