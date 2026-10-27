@@ -462,7 +462,11 @@ non-invariant default tactic.
 
    Coverage is limited to the SM100/SM103 ``mm_mxfp8(backend="cute-dsl")``
    runners. On SM107 the untuned low-M default can still split K, so the mode
-   gives no bitwise guarantee there yet.
+   gives no bitwise guarantee there yet. Other runners with split-K tactics,
+   such as ``mm_fp4(backend="cute-dsl")`` and the ``cutedsl_low_latency``
+   block-scaled GEMMs, are not classified yet: they keep the default
+   ``is_batch_invariant_tactic`` (every tactic allowed) and may still select
+   split-K under the mode.
 
 
 Interaction with other autotuner features:
