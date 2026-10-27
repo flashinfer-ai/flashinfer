@@ -195,6 +195,8 @@ def test_grouped_block_fp8_admitted_candidates(tokens, activation, prequantized)
         else [("warp_mma", g, 2, 128) for g in (2, 4)]
         + ([("warp_mma", 4, 4, 128)] if tokens == 4 else [])
     )
+    if not hopper and (tokens == 4 or activation in (ReLU2(), SiLU())):
+        expected.append(("warp_mma", 2 if tokens == 4 else 4, 2, 128, True))
     assert [v for v in choices if v[0] != "ffma"] == expected
     graphs = []
     for tactic in expected:
@@ -257,3 +259,139 @@ def test_grouped_block_fp8_unmeasured_cases_keep_fma(case):
     *_, runner, inputs = _admitted_setup(**args)
     choices = runner.get_valid_tactics(inputs, None)
     assert len(choices) == 16 and all(t[0] == "ffma" for t in choices)
+
+
+@pytest.mark.parametrize(
+    "tokens,activation,group", [(4, SwiGLU(), 2), (8, ReLU2(), 4), (8, SiLU(), 4)]
+)
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_sm120_block_fp8_weight_first_cache_and_live_graphs(
+    tokens, activation, group, prequantized, monkeypatch
+):
+    _require_gpu(allow_sm90=True, allow_sm120=True)
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Block-FP8 weight-first choices are qualified on SM120")
+    from cutlass import cute
+    from flashinfer.fused_moe.backends.frost_low_latency import runtime
+
+    cache = {}
+    monkeypatch.setattr(runtime, "_COMPILED", cache)
+    cases = []
+    for _ in range(2):
+        cfg, _x, _sf, _ids, _scores, view, runner, inputs = _admitted_setup(
+            tokens, activation, prequantized
+        )
+        view = dict(view)
+        for key, index in (
+            ("fc1_expert_weights", 3),
+            ("fc1_block_scales", 4),
+            ("fc2_expert_weights", 5),
+            ("fc2_block_scales", 6),
+        ):
+            view[key] = inputs[index]
+        cases.append((runner, inputs, view))
+    old = ("warp_mma", group, 2, 128)
+    overlap = (*old, True)
+    runner, inputs, _ = cases[0]
+    choices = runner.get_valid_tactics(inputs, None)
+    assert old in choices and overlap in choices
+    assert "block-fp8-grouped-tc-v2" in runner._cache_key_extras()
+    a = runner.forward(inputs, old).clone()
+    b = runner.forward(inputs, overlap).clone()
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert len(cache) == 2 and {key[4] for key in cache} == {old, overlap}
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Different live block-FP8 buffers recompiled")
+
+    monkeypatch.setattr(cute, "compile", unexpected)
+    graphs = []
+    for runner, inputs, _ in cases:
+        for tactic in (old, overlap):
+            runner.forward(inputs, tactic)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                runner.forward(inputs, tactic)
+            graphs.append(graph)
+    for epoch in range(2):
+        for index, (_runner, inputs, view) in enumerate(cases):
+            x, _qx, xs, w1, s1, w2, s2, ids, scores = inputs[:9]
+            x.copy_((-x.float() * (0.5 if index else 0.75)).to(x.dtype))
+            w1.copy_((-w1.float()).to(w1.dtype))
+            w2.copy_((w2.float() * 0.5).to(w2.dtype))
+            s1.mul_(1.1)
+            s2.mul_(0.9)
+            if prequantized:
+                xs.mul_(0.8)
+            ids.add_(1).remainder_(17)
+            scores.fill_(0.1)
+            if epoch:
+                ids[0, 0], ids[-1, -1] = -1, 17
+                scores[0, 0], scores[-1, -1] = float("nan"), float("inf")
+            _, expected, _ = _reference(
+                x, xs if prequantized else None, ids, scores, view, activation, True
+            )
+            for graph in graphs[2 * index : 2 * index + 2]:
+                for buffer in inputs[9:14]:
+                    buffer.fill_(float("nan"))
+                graph.replay()
+                _check(inputs[13], expected)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tokens2",
+        "hidden",
+        "intermediate",
+        "topk",
+        "swiglu_t8",
+        "relu2_t4",
+        "silu_t4",
+        "custom_swiglu",
+        "raw",
+        "group",
+        "stage",
+        "tile",
+        "false_flag",
+    ],
+)
+def test_sm120_block_fp8_weight_first_rejects_manual_tactics(case, monkeypatch):
+    _require_gpu(allow_sm90=True, allow_sm120=True)
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Block-FP8 weight-first choices are qualified on SM120")
+    from cutlass import cute
+
+    args = {}
+    if case == "tokens2":
+        args["tokens"] = 2
+    elif case == "hidden":
+        args["hidden"] = 256
+    elif case == "intermediate":
+        args["intermediate"] = 128
+    elif case == "topk":
+        args["topk"] = 8
+    elif case == "swiglu_t8":
+        args["tokens"] = 8
+    elif case in ("relu2_t4", "silu_t4"):
+        args["activation"] = ReLU2() if case == "relu2_t4" else SiLU()
+    elif case == "custom_swiglu":
+        args["activation"] = SwiGLU(alpha=1.702)
+    elif case == "raw":
+        args["finalize"] = False
+    *_, runner, inputs = _admitted_setup(**args)
+    tactic = (
+        "warp_mma",
+        4 if case == "group" else 2,
+        4 if case == "stage" else 2,
+        64 if case == "tile" else 128,
+        case != "false_flag",
+    )
+    assert tactic not in runner.get_valid_tactics(inputs, None)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Unqualified block-FP8 tactic reached compilation")
+
+    monkeypatch.setattr(cute, "compile", unexpected)
+    with pytest.raises(ValueError, match="Grouped DeepSeek FP8|Weight-first block-FP8"):
+        runner.forward(inputs, tactic)

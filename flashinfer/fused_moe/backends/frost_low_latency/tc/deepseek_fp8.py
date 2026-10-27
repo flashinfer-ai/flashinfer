@@ -12,6 +12,8 @@ from .runtime import combine_kernel, _TACTICS
 from ..fma.deepseek_fp8_kernel import quantize
 from ..fma.activation_config import lower_activation
 
+_WEIGHT_FIRST_TACTICS = {("warp_mma", group, 2, 128, True) for group in (2, 4)}
+
 
 @cute.jit
 def launch(
@@ -38,6 +40,7 @@ def launch(
     narrow: cutlass.Constexpr,
     architecture: cutlass.Constexpr,
     stream,
+    weight_first: cutlass.Constexpr = False,
 ):
     if cutlass.const_expr(x.element_type == cutlass.BFloat16):
         quantize(x, qx, xs).launch(
@@ -53,7 +56,16 @@ def launch(
         first_hopper(w1, qx, ids, raw, stream, s1, xs)
     else:
         first_warp = WarpGroupedProjection(
-            True, group, stages, tile, k, name, gated, parameters, block_scaled=True
+            True,
+            group,
+            stages,
+            tile,
+            k,
+            name,
+            gated,
+            parameters,
+            block_scaled=True,
+            weight_first=weight_first,
         )
         first_warp(w1, qx, ids, raw, stream, s1, xs)
     quantize(raw, mid, ms).launch(
@@ -66,7 +78,7 @@ def launch(
         second_hopper(w2, mid, ids, routes, stream, s2, ms)
     else:
         second_warp = WarpGroupedProjection(
-            False, group, stages, tile, k, block_scaled=True
+            False, group, stages, tile, k, block_scaled=True, weight_first=weight_first
         )
         second_warp(w2, mid, ids, routes, stream, s2, ms)
     combine_kernel(routes, ids, scores, out, cute.size(w1, mode=[0]), narrow).launch(
@@ -77,10 +89,13 @@ def launch(
 
 
 def execute(inputs, config, tactic):
+    from ....api import QuantFormat, ReLU2, SiLU, SwiGLU
     from ..runtime import _COMPILED, _COMPILE_LOCK
     from .....utils import get_compute_capability
 
-    if tactic not in _TACTICS or tactic[0] not in ("wgmma", "warp_mma"):
+    if (tactic not in _TACTICS and tactic not in _WEIGHT_FIRST_TACTICS) or tactic[
+        0
+    ] not in ("wgmma", "warp_mma"):
         raise ValueError("Grouped DeepSeek FP8 requires a valid SM90/SM120 tactic")
     if len(inputs) != 15:
         raise ValueError("Grouped DeepSeek FP8 requires canonical block-scale inputs")
@@ -88,6 +103,30 @@ def execute(inputs, config, tactic):
     architecture = 90 if tactic[0] == "wgmma" else 120
     if get_compute_capability(x.device) != (architecture // 10, architecture % 10):
         raise ValueError(f"Grouped {tactic[0]} decode requires SM{architecture}")
+    weight_first = len(tactic) == 5
+    if weight_first and not (
+        architecture == 120
+        and config.quant.weight is QuantFormat.DeepSeekFp8
+        and config.quant.activation is QuantFormat.DeepSeekFp8
+        and config.quant.output is QuantFormat.BF16
+        and x.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and x.shape[1] == 2048
+        and raw.shape[1] == config.experts.intermediate_size == 512
+        and ids.shape[1] == config.routing.top_k == 10
+        and config.finalize.do_finalize
+        and (
+            (x.shape[0] == 4 and config.activation == SwiGLU() and tactic[1] == 2)
+            or (
+                x.shape[0] == 8
+                and config.activation in (ReLU2(), SiLU())
+                and tactic[1] == 4
+            )
+        )
+    ):
+        raise ValueError(
+            "Weight-first block-FP8 decode requires qualified SM120 T4 SwiGLU/group2 "
+            "or T8 ReLU2/SiLU/group4, H2048/I512/top-k10 and finalized BF16 output"
+        )
     if (
         not config.finalize.do_finalize
         or x.shape[0] > 8
@@ -100,7 +139,7 @@ def execute(inputs, config, tactic):
         )
     tensors = tuple(inputs[:14])
     key = (
-        "grouped-block-fp8-ffi-v1",
+        "grouped-block-fp8-ffi-v2",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,
@@ -121,13 +160,14 @@ def execute(inputs, config, tactic):
                     compiled = cute.compile(
                         launch,
                         *(from_dlpack(t) for t in tensors),
-                        *tactic[1:],
+                        *tactic[1:4],
                         name,
                         config.activation.is_gated,
                         parameters,
                         narrow,
                         architecture,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                        **({"weight_first": True} if weight_first else {}),
                         options=f"--gpu-arch sm_{architecture}a --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
