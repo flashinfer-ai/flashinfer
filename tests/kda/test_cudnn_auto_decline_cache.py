@@ -72,6 +72,10 @@ def test_cache_does_not_retain_tensors_or_exception_tracebacks():
 def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     calls = []
 
+    if change == "frontend":
+        # Make the version transition independent of the installed release.
+        monkeypatch.setattr(la.cudnn, "__version__", "1.31.0")
+
     def decline(*args, **kwargs):
         calls.append(1)
         error = NotImplementedError("unsupported")
