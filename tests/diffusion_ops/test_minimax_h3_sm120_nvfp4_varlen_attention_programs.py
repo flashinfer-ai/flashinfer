@@ -326,7 +326,7 @@ OVERLAP_NODELTA = (
         # pre-processing plan takes the warp-specialised form
         ((0, 2049), 171, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
         ((0, 16384), 186, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
-        ((0, 16385), 170, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_NODELTA),
+        ((0, 16385), 171, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_NODELTA),
         ((0, 3000, 3000), 171, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         ((0, 2049), 169, (PREPROCESS,), ATTENTION, ATTENTION_NODELTA),
         # the mean segment counts the empty segments
@@ -340,10 +340,10 @@ OVERLAP_NODELTA = (
         ),
         # the compensated route's warp-specialised form stops below a mean of 16384 tokens
         ((0, 16384), 189, (PREPROCESS,), ATTENTION, ATTENTION_WS_NODELTA),
-        ((0, 16385), 188, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_WS_NODELTA),
+        ((0, 16385), 189, (STATS, QUANTIZE_KV_HBLK64), ATTENTION, ATTENTION_WS_NODELTA),
         (
             (0, 8368, 16736, 25104, 33472),
-            188,
+            189,
             (STATS, QUANTIZE_KV_HBLK64),
             ATTENTION_WS,
             ATTENTION_WS_NODELTA,
@@ -381,14 +381,59 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
     assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False) == (
         OVERLAP_NODELTA
     )
-    # a plan outside the fused pre-processing keeps the separate launches
-    small, large = _plan((0, 1920)), _plan((0, 16385))
+    # a plan below the fused pre-processing keeps the separate launches
+    small = _plan((0, 1920))
     assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
         small, num_sms
     )
     assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
-        large, num_sms
+        small, num_sms, delta=False
     )
+
+
+@pytest.mark.parametrize(
+    ("bounds", "num_sms", "delta_overlaps"),
+    [
+        ((0, 16385), 170, True),
+        ((0, 16385), 188, True),
+        ((0, 5000, 5000, 21000, 21129), 170, True),
+        ((0, 5000, 5000, 21000, 21129), 188, True),
+        ((0, 8368, 16736, 25104, 33472), 170, True),
+        ((0, 8368, 16736, 25104, 33472), 188, True),
+        ((0, 33472), 170, True),
+        ((0, 33472), 188, True),
+        # the compensated route overlaps up to an attention-weighted mean segment of
+        # 36864 tokens on 188 SMs and 40960 tokens on 170 SMs
+        ((0, 36864), 188, True),
+        ((0, 36865), 188, False),
+        ((0, 38592), 188, False),
+        ((0, 38592), 170, True),
+        ((0, 40960), 170, True),
+        ((0, 40961), 170, False),
+        ((0, 48768), 170, False),
+        ((0, 48768), 188, False),
+        ((0, 109901, 109952), 170, False),
+        ((0, 109901, 109952), 188, False),
+    ],
+)
+def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
+    bounds, num_sms, delta_overlaps
+) -> None:
+    plan = _plan(bounds)
+    programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms)
+    if delta_overlaps:
+        assert programs == OVERLAP
+    else:
+        assert programs == (STATS, QUANTIZE_KV_HBLK64, ATTENTION)
+    # the uncompensated route overlaps every long plan
+    assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False) == (
+        OVERLAP_NODELTA
+    )
+    # an SM count without an overlap width keeps the separate launches
+    for delta in (True, False):
+        assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
+            plan, num_sms + 1, delta=delta
+        )
 
 
 @pytest.mark.parametrize(
@@ -410,6 +455,26 @@ def test_overlap_grids_follow_the_sm_count(num_sms, num_units, expected) -> None
     )
     with pytest.raises(ValueError):
         ops.minimax_h3_sm120_nvfp4_overlap_grids(0, num_units=num_units)
+
+
+@pytest.mark.parametrize(
+    ("num_sms", "padded_tokens", "expected"),
+    [
+        (170, None, (128, 126, 42)),
+        (170, 16384, (128, 126, 42)),
+        (170, 16512, (106, 192, 64)),
+        (188, 16384, (142, 138, 46)),
+        (188, 16512, (142, 138, 46)),
+        (171, 16512, None),
+    ],
+)
+def test_long_plans_overlap_at_the_long_width(num_sms, padded_tokens, expected) -> None:
+    assert (
+        ops.minimax_h3_sm120_nvfp4_overlap_grids(
+            num_sms, num_units=1792, padded_tokens=padded_tokens
+        )
+        == expected
+    )
 
 
 def test_head_major_unit_rows_cover_every_unit_once() -> None:

@@ -118,6 +118,18 @@ _WS_MAX_MEAN_SEGMENT = 16384
 # each head's operands are published by a ready flag the attention CTAs wait on before their loads, and the
 # words reset themselves in every complete call.
 _OVERLAP_WIDTH = {170: 42, 188: 46}
+# A plan of more than 16384 padded tokens (the statistics / quantizer plans) takes the overlapped form too when its
+# attention-weighted mean segment length -- the sum of the squared segment lengths over the token count, which the
+# pre-processing share of the call falls with -- is at most ``_OVERLAP_LONG_MAX_SEGMENT[(SM count, delta)]`` tokens
+# (no entry: never), with the overlap width ``_OVERLAP_WIDTH_LONG``.  The compensated route's bound stops where the
+# hidden pre-processing no longer pays for the per-unit Q load of its overlap attention (no next-unit prefetch).
+_OVERLAP_WIDTH_LONG = {170: 64, 188: 46}
+_OVERLAP_LONG_MAX_SEGMENT = {
+    (170, True): 40960,
+    (170, False): 1 << 40,
+    (188, True): 36864,
+    (188, False): 1 << 40,
+}
 _OVERLAP_PRODUCERS_PER_SM = 3
 _HCTR_WORDS_PER_HEAD = 5
 _HCTR_TAIL_WORDS = 8
@@ -708,7 +720,9 @@ def minimax_h3_sm120_nvfp4_programs(
     lead leaves free, then the tail attention launch."""
     padded = int(plan.padded_tokens)
     fused = _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS
-    if fused and int(num_sms) in _OVERLAP_WIDTH:
+    if int(num_sms) in _OVERLAP_WIDTH and (
+        fused or _overlap_long(plan, num_sms, delta)
+    ):
         if delta:
             return (ATTENTION_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_TAIL)
         return (ATTENTION_NODELTA_LEAD, PREPROCESS_HEAD_MAJOR, ATTENTION_NODELTA_TAIL)
@@ -729,6 +743,20 @@ def minimax_h3_sm120_nvfp4_programs(
     else:
         attention = ATTENTION if delta else ATTENTION_NODELTA
     return (*pre, attention)
+
+
+def _overlap_long(plan, num_sms: int, delta: bool) -> bool:
+    """Whether a plan of more than 16384 padded tokens takes the overlapped form on a part of ``num_sms`` SMs: its
+    attention-weighted mean segment length ``sum(len ** 2) / tokens`` is at most
+    ``_OVERLAP_LONG_MAX_SEGMENT[(num_sms, delta)]``."""
+    if int(plan.padded_tokens) <= _PREPROCESS_MAX_TOKENS:
+        return False
+    limit = _OVERLAP_LONG_MAX_SEGMENT.get((int(num_sms), bool(delta)))
+    if limit is None:
+        return False
+    bounds = [int(b) for b in plan.bounds]
+    squares = sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:], strict=False))
+    return squares <= limit * bounds[-1]
 
 
 def minimax_h3_sm120_nvfp4_launch_grids(
@@ -791,7 +819,7 @@ def minimax_h3_sm120_nvfp4_launch_grids(
 
 
 def minimax_h3_sm120_nvfp4_overlap_grids(
-    num_sms: int, *, num_units: int
+    num_sms: int, *, num_units: int, padded_tokens: Optional[int] = None
 ) -> Optional[Tuple[int, int, int]]:
     """The ``(lead attention, producers, tail attention)`` launch grids of the overlapped form on a device of
     ``num_sms`` SMs, or ``None`` when that SM count has no overlap width ``P`` (170 SMs: 42, 188 SMs: 46):
@@ -805,6 +833,8 @@ def minimax_h3_sm120_nvfp4_overlap_grids(
     width = _OVERLAP_WIDTH.get(sms)
     if width is None:
         return None
+    if padded_tokens is not None and int(padded_tokens) > _PREPROCESS_MAX_TOKENS:
+        width = _OVERLAP_WIDTH_LONG.get(sms, width)
     lead = max(1, min(sms - width, int(num_units)))
     return lead, _OVERLAP_PRODUCERS_PER_SM * width, width
 
@@ -958,7 +988,9 @@ class _Nvfp4Launch:
         if overlap:
             # (lead attention, producers, tail attention): the producers take the pre-processing slot, the
             # lead the attention slot; the attention CTAs take the head-major units
-            grids = minimax_h3_sm120_nvfp4_overlap_grids(sms, num_units=plan.num_units)
+            grids = minimax_h3_sm120_nvfp4_overlap_grids(
+                sms, num_units=plan.num_units, padded_tokens=plan.padded_tokens
+            )
             assert grids is not None
             attention_grid, preprocess_grid, tail_grid = grids
             slots = (slots[1], slots[0])
