@@ -194,25 +194,60 @@ jobs:
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          TEAM: ci-users
         run: |
-          # Fetch all issue comments, newest first. GitHub's list endpoint
-          # returns oldest-first by default; reverse after fetching.
-          # Only trust comments from repo collaborators — an outside
-          # contributor must not be able to inject a test scope.
-          COMMENTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --jq '[.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")] | .[].body' \
-            2>/dev/null) || COMMENTS=""
+          # Fetch comment author + body pairs. We authorise each candidate
+          # against the same repo-role / ci-users team check that
+          # ci-bot-commands.yml uses, so an org member who is not in ci-users
+          # and has no write access cannot influence the test scope.
+
+          # Pre-fetch ci-users team members once (same call as ci-bot-commands).
+          TEAM_MEMBERS=$(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${ORG}/teams/${TEAM}/members" \
+            --jq '.[].login' 2>/dev/null) || TEAM_MEMBERS=""
+
+          is_authorized() {
+            local LOGIN="$1"
+            # Repo role check (admin/maintain/write/triage).
+            local ROLE
+            ROLE=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${REPO}/collaborators/${LOGIN}/permission" \
+              --jq '.role_name' 2>/dev/null) || ROLE="none"
+            case "$ROLE" in
+              admin|maintain|write|triage) return 0 ;;
+            esac
+            # ci-users team membership.
+            if printf '%s\n' "$TEAM_MEMBERS" | grep -qx "$LOGIN"; then
+              return 0
+            fi
+            return 1
+          }
+
+          # Fetch all comments (oldest-first from API). Each line is
+          # LOGIN<TAB>BODY; we walk in reverse so the newest match wins.
+          COMMENTS_JSON=$(gh api --paginate \
+            "/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | @base64' 2>/dev/null) || COMMENTS_JSON=""
 
           # Walk comments in reverse (newest first) to find the most recent
           # `@flashinfer-bot run <paths>` command. A bare `@flashinfer-bot run`
           # (no paths) means "full suite" — treat the same as no match.
           SCOPE_ARGS=""
-          while IFS= read -r line; do
-            # Strip fenced code blocks to match ci-bot-commands.yml behaviour
-            MATCH=$(printf '%s' "$line" | tr -d '\r' \
+          while IFS= read -r encoded; do
+            [[ -z "$encoded" ]] && continue
+            COMMENT_BODY=$(echo "$encoded" | base64 -d | jq -r '.body // ""')
+            COMMENT_LOGIN=$(echo "$encoded" | base64 -d | jq -r '.user.login // ""')
+
+            # Only consider comments containing a scoped bot command.
+            MATCH=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
               | awk '
                   /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 }; next }
                   /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 }; next }
@@ -221,11 +256,18 @@ jobs:
               | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+run[[:space:]]+\S' \
               | sed -E 's/^[[:space:]]*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+//' \
               | sed -E 's/[[:space:]]+$//') || MATCH=""
+
             if [[ -n "$MATCH" ]]; then
-              SCOPE_ARGS="$MATCH"
-              break
+              # Verify the commenter is authorized (repo role or ci-users).
+              if is_authorized "$COMMENT_LOGIN"; then
+                SCOPE_ARGS="$MATCH"
+                # Don't break — keep going so the LAST (newest) authorized
+                # scoped command wins after we finish the oldest-first list.
+              else
+                echo "Skipping scope from unauthorized commenter: $COMMENT_LOGIN"
+              fi
             fi
-          done < <(printf '%s\n' "$COMMENTS" | tac)
+          done <<< "$COMMENTS_JSON"
 
           if [[ -z "$SCOPE_ARGS" ]]; then
             echo "No previous scoped run found; full suite will run"
