@@ -1922,9 +1922,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
     # refreshing a retained FA2 schedule, while eager wrappers may switch freely.
     initially_cudnn = capture_backend == "cudnn"
     admitted = [initially_cudnn]
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: admitted[0])
     q, k, v, qo, ip, ix, last = _paged_inputs()
     ix = ix.cuda()
     out = torch.empty_like(q)
@@ -2031,9 +2029,7 @@ def test_paged_auto_capture_reserves_initialized_page_capacity(
         )
     # Select the provider independently of evolving performance heuristics.
     admitted = [True]
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: admitted[0])
     q = torch.randn(64, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(page_capacity, 16, 2, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
@@ -2119,9 +2115,7 @@ def test_paged_auto_query_capacity_switch_preserves_capture(
     ):
         pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Exercise capacity changes independently of evolving performance heuristics.
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: True)
     torch.manual_seed(43)
     q = torch.randn(128, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(256, 16, 2, 128, device="cuda", dtype=q.dtype)
