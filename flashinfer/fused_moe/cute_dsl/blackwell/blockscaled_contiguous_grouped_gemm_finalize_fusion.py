@@ -2665,11 +2665,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 )
                 for row_block in cutlass.range_constexpr(self.sfb_row_blocks):
                     row = sf_row + row_block * 128
-                    sf_source_row = cutlass.Int32(0)
-                    if row < valid:
-                        sf_source_row = route_start + row
                     activation_sf_offsets[row_block] = _blockscaled_sf_offset(
-                        sf_source_row, 0, padded_k, self.sf_vec_size
+                        route_start + row, 0, padded_k, self.sf_vec_size
                     )
                 shared_sf_offset = (sf_row % 32) * 16 + (sf_row // 32) * 4
                 for k_tile in cutlass.range(k_tiles):
