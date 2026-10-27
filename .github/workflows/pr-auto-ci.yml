@@ -292,27 +292,47 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           SCOPE_ARGS: ${{ steps.scope.outputs.scope_args }}
         run: |
+          # Helper: clear all existing ci/test-scope-N statuses on this SHA so
+          # pr-test.yml sees no scope and runs the full suite.
+          clear_stale_scopes() {
+            local MAX
+            MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+              --jq '[.statuses[].context
+                | select(test("^ci/test-scope-[0-9]+$"))
+                | sub("^ci/test-scope-"; "") | tonumber] | max // 0') \
+              || MAX=0
+            MAX=${MAX:-0}
+            for ((i = 1; i <= MAX; i++)); do
+              gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+                -f state=success \
+                -f context="ci/test-scope-$i" \
+                -f description="" > /dev/null 2>&1 || true
+            done
+          }
+
           # Validate and chunk the scope paths using the same script as
-          # ci-bot-commands.yml. If validation fails, fall back to the full suite
-          # rather than blocking — the author can always re-scope with
-          # @flashinfer-bot run <paths>.
+          # ci-bot-commands.yml. If validation fails, clear any stale scope
+          # statuses and fall back to the full suite rather than blocking —
+          # the author can always re-scope with @flashinfer-bot run <paths>.
           if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE_ARGS" --root tests/ --no-check-exists --test-path \
                 2>/tmp/scope_err); then
-            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); running full suite"
+            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); clearing stale scopes and running full suite"
+            clear_stale_scopes
             exit 0
           fi
 
           if ! CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
                 2>/tmp/scope_err); then
-            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); running full suite"
+            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); clearing stale scopes and running full suite"
+            clear_stale_scopes
             exit 0
           fi
 
           mapfile -t CHUNKS <<< "$CHUNKED"
 
-          # Clear any stale scope statuses from a previous run on this SHA.
+          # Find the high-water mark of existing scope statuses on this SHA.
           PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
             --jq '[.statuses[].context
               | select(test("^ci/test-scope-[0-9]+$"))
