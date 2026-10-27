@@ -1484,6 +1484,42 @@ _GPU = pytest.mark.skipif(
 )
 
 
+def _skip_without_nvfp4_programs(component: str) -> None:
+    """Skip a test of an NVFP4 program where the CUDA toolkit cannot build it
+    (their routes fail closed to compat_v1 there, see ``cake_fmha``)."""
+    if component != "context_nvfp4":
+        return
+    unavailable = cake_api.context_nvfp4_programs_unavailable()
+    if unavailable is not None:
+        pytest.skip(f"the NVFP4 context programs are not built here: {unavailable}")
+
+
+@_GPU
+def test_cake_context_nvfp4_programs_fail_closed_without_their_toolkit(
+    monkeypatch,
+) -> None:
+    """On a CUDA toolkit that cannot assemble the NVFP4 programs (their PTX ISA
+    9.4 packed multiply needs CUDA 13.4), a route to one of them loads
+    compat_v1 with a warning instead of a build ptxas rejects, and the program
+    loader itself refuses the build."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    kwargs = _context_kwargs("nvfp4_b4_q511_k2047", device="meta")
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.component == "context_nvfp4"
+    assert route.program is not None
+    reason = "a toolkit that cannot assemble the programs"
+    monkeypatch.setattr(cake_api, "context_nvfp4_programs_unavailable", lambda: reason)
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_MODULES", {})
+    with pytest.raises(RuntimeError, match=reason):
+        cake_api._load_cake_fmha_context_program(route)
+    with pytest.warns(RuntimeWarning, match="failed closed to compat_v1"):
+        module = cake_api.get_cake_fmha_context_module(torch.device("cuda"), route)
+    assert not isinstance(module, cake_api.CakeFmhaContextProgramModule)
+    assert module is cake_api.load_cake_fmha_compat_module(target)
+
+
 @pytest.fixture
 def served_programs(monkeypatch):
     """The generated programs the context dispatch loads, in call order."""
@@ -1701,6 +1737,8 @@ def test_cake_context_quantized_programs_match_reference(
 
     _whole_tile_routes(monkeypatch)
     target = cake_api._cake_fmha_target(torch.device("cuda"))
+    if case["kv_dtype"] == "nvfp4":
+        _skip_without_nvfp4_programs("context_nvfp4")
     if program.startswith("Q511"):
         program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
     original = prefill.trtllm_batch_context_with_kv_cache
@@ -1886,6 +1924,7 @@ def test_cake_context_programs_match_the_jit_route_bitwise(
     _whole_tile_routes(monkeypatch)
     row, batch, max_q = BITWISE_ROWS[name]
     case = _context_case(row, batch, max_q)
+    _skip_without_nvfp4_programs(case.component)
     program = case.programs[cake_api._cake_fmha_target(torch.device("cuda"))]
     out = _run_context(case)
     assert served_programs == [program]

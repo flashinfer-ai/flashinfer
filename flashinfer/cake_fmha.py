@@ -3644,6 +3644,29 @@ class _DeviceTorchStream:
         self.device.__exit__(*args)
 
 
+# The NVFP4 context programs dequantize their E2M1 pages with the PTX ISA 9.4
+# packed multiply ``mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4`` (CUDA 13.4 or
+# newer); an older nvcc / ptxas rejects the instruction, so on such a toolkit
+# a route to one of them fails closed to compat_v1 instead of a build error.
+CONTEXT_NVFP4_PROGRAMS_MIN_CUDA = "13.4"
+
+
+def context_nvfp4_programs_unavailable() -> str | None:
+    """Why this CUDA toolkit cannot build the NVFP4 context programs, or ``None``."""
+
+    from .jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+
+    if is_cuda_version_at_least(CONTEXT_NVFP4_PROGRAMS_MIN_CUDA):
+        return None
+    return (
+        "the generated NVFP4 context programs spell the E2M1 x E4M3 page "
+        "dequantization as the PTX ISA 9.4 packed multiply "
+        "(mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4), which needs CUDA "
+        f"{CONTEXT_NVFP4_PROGRAMS_MIN_CUDA} or newer; the CUDA toolkit found is "
+        f"{get_cuda_version()}"
+    )
+
+
 _CONTEXT_PROGRAM_MODULES: dict[tuple[str, str, str], CakeFmhaContextProgramModule] = {}
 
 
@@ -3672,6 +3695,10 @@ def _load_cake_fmha_context_program(
         raise RuntimeError(
             f"Cake FMHA {route.component} names no generated program {route.program!r}"
         )
+    if route.component == "context_nvfp4":
+        unavailable = context_nvfp4_programs_unavailable()
+        if unavailable is not None:
+            raise RuntimeError(f"Cake FMHA cannot build {pinned[0]}: {unavailable}")
     loader_name = f"cake_fmha_{route.component}"
     loader = importlib.import_module(f".jit.{loader_name}", __package__)
     program = getattr(loader, route.program, None)
@@ -3710,6 +3737,16 @@ def get_cake_fmha_context_module(
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA context route target does not match the device")
     if route.program is not None:
+        if route.component == "context_nvfp4":
+            unavailable = context_nvfp4_programs_unavailable()
+            if unavailable is not None:
+                warnings.warn(
+                    f"Cake FMHA NVFP4 context program {route.program} failed closed "
+                    f"to compat_v1: {unavailable}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return load_cake_fmha_compat_module(route.target)
         return _load_cake_fmha_context_program(route)
     if route.exact_profile is not None:
         raise RuntimeError(
