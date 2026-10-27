@@ -76,7 +76,12 @@ from . import cake_build
 # ``wave_sync_mode``; the 512-wide k tile's ``main_halves`` and
 # ``main_wave_halves`` stages are the twins of ``main`` and ``main_wave`` that
 # release the accumulator in two halves, launched on the architectures of
-# ``k512_release_archs``.
+# ``k512_release_archs``; its ``main_halves_k256t`` stage is the twin of
+# ``main_halves`` that runs the tiles left after the full waves as 256-column
+# half tiles, whose split tail the tail-reduce stage of the 256-wide k tile's
+# route sums, launched in its place on the architectures of
+# ``k256_tail_archs`` when K is at most ``k256_tail_max_k`` and the groups
+# average at least ``k256_tail_min_rows`` rows.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_05258dbe307cb47d829e": {
         "library": "cake_moe_grouped_gemm_05258dbe307cb47d829e",

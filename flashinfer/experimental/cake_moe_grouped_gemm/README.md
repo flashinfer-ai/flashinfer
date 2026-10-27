@@ -175,6 +175,21 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   `sm_100a` and `sm_103a` the `main_wave_halves` program keeps the A tile in
   the collector and synchronizes the waves every eight waves. None of these
   changes the output bits.
+- Weight-gradient k256 tail (`wgrad_k256_tail`): on the architectures listed
+  in `k256_tail_archs`, when `K` (the columns of `dW[e]` and of `x`) is at
+  most `k256_tail_max_k` and the groups average at least `k256_tail_min_rows`
+  rows (`sum_m // E`), as in the down projection over few groups, the main
+  kernel is the route's `main_halves_k256t` stage instead of `main_halves`:
+  the A-collector half-release kernel runs only the full waves of the 512-wide
+  tile, then the tiles left as the 256-column half tiles of the 256-wide
+  tiling, walked n-major (`raster_rows` 0). The last partial wave of that
+  tiling is split as the 256-wide k tile splits its tail (`tail_tile_k` 256 in
+  `wgrad_tail_tiles` / `wgrad_tail_plan`): each half tile runs as
+  `tail_splits` k-step chunks whose fp32 partials, 256 x 256 slots
+  `j * tail_splits + s`, the tail-reduce stage of the 256-wide tile's route
+  sums (`wgrad_reduce_grid` CTAs). Every element accumulates its rows in the
+  order of the 256-wide k tile, so where the two plans split the same tiles
+  the same way the output bits are that tile's.
 - Workspaces (allocated at preparation, retained by the launch object): the
   per-CTA TMA descriptor slots of the weight gradient (a ring of nine
   descriptor pairs per CTA: a group switch edits the next pair and warms the
@@ -196,14 +211,15 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 
 `GroupedGemmLaunch.plan` exposes `grid`, `tile_k`, `tail_splits`,
 `raster_rows`, `launches` and, for `fwd` / `dgrad`, `tile_n`, `clusters`, `c0`
-and `c1`, for `wgrad` `wave_mode`, for inspection and tests; `GroupedGemmLaunch.stages`
+and `c1`, for `wgrad` `tail_tile_k` (the k width of the split tail tiles) and
+`wave_mode`, for inspection and tests; `GroupedGemmLaunch.stages`
 names the bound stages in launch order.
 
 ## Build targets and layout
 
 The programs are exact-architecture tcgen05 payloads built for the exact
 targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`).
-`cake_jit.PROGRAMS` lists nineteen libraries, one per kernel and build, each a
+`cake_jit.PROGRAMS` lists twenty libraries, one per kernel and build, each a
 kernel and a host-binding translation unit under `csrc/cake_moe_grouped_gemm/`
 shared by the architectures it is built for (an architecture-dependent line is
 folded under `__CUDA_ARCH__`):
@@ -221,9 +237,10 @@ folded under `__CUDA_ARCH__`):
   stage).
 - the 512-wide k tile's A-collector main kernel that releases the
   accumulator in two halves (`main_halves`): with the planned tile walk for
-  `sm_100a` and `sm_103a`, without it for `sm_107a`; the wave-synchronized
-  A-collector kernel that releases it in two halves (`main_wave_halves`), for
-  `sm_100a` and `sm_103a`.
+  `sm_100a` and `sm_103a`, without it for `sm_107a`; for `sm_107a` its twin
+  that runs the tiles left after the full waves as 256-column half tiles
+  (`main_halves_k256t`); the wave-synchronized A-collector kernel that
+  releases it in two halves (`main_wave_halves`), for `sm_100a` and `sm_103a`.
 - the 512-wide k tile's main kernel for `sm_107a`, a second `main` stage
   beside the one built for `sm_100a` and `sm_103a`.
 - the weight-gradient main kernel with a 256- or 512-wide k tile and the
