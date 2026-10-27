@@ -2145,7 +2145,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         active = cutlass.Boolean(False)
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
-                info_pipe.producer_tail(info_producer)
+                # The final CTA join drains all terminal metadata consumers.
                 if cta_rank == 0:
                     clc_pipe.producer_tail(clc_producer)
                 if cutlass.const_expr(self.prefetch_weights_before_wait):
