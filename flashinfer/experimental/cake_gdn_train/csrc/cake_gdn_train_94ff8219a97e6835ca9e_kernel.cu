@@ -805,7 +805,7 @@ kernel_cake_gdn_train_94ff8219a97e6835ca9e(const __grid_constant__ CUtensorMap q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_dh), "r"(1), "r"(((uint32_t)(136414352) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
+                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_dh), "r"(1), "r"((((uint32_t)(136414352)) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
                     tcgen05_commit(dh_ready_addr);
                     tcgen05_commit(rest_empty_addr);
                     _phase_rest_full ^= 1;

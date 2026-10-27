@@ -1008,7 +1008,6 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
             unsigned int k_stage = 0;
             unsigned int acc_stage_1 = 0;
             unsigned int work_stage_7 = 0;
-            unsigned int k_phase = 0;
             unsigned int a_token = 0;
             unsigned int b_token = 0;
             unsigned int sfa_token = 0;
@@ -1016,6 +1015,7 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
             unsigned int m_tile_7 = first_m;
             unsigned int n_tile_7 = first_n;
             unsigned int _phase_mma_free = 1;
+            unsigned int _phase_a_full = 0;
             unsigned int _phase_work_full_7 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_7 = 0; _tile_iter_7 < grid_m * grid_n; _tile_iter_7++) {
@@ -1027,18 +1027,18 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                 #pragma unroll 2
                 for (int route_k_4 = 0; route_k_4 < route_k_extent_6; route_k_4++) {
                     int route_slot = 0;
-                    uint32_t _mbar_token_0 = mbarrier_try_wait(a_full_addr + (k_stage) * 8, k_phase);
+                    uint32_t _mbar_token_0 = mbarrier_try_wait(a_full_addr + (k_stage) * 8, _phase_a_full);
                     a_token = _mbar_token_0;
-                    uint32_t _mbar_token_1 = mbarrier_try_wait(b_full_addr + (k_stage) * 8, k_phase);
+                    uint32_t _mbar_token_1 = mbarrier_try_wait(b_full_addr + (k_stage) * 8, _phase_a_full);
                     b_token = _mbar_token_1;
-                    uint32_t _mbar_token_2 = mbarrier_try_wait(tmem_sfa_full_addr + (k_stage) * 8, k_phase);
+                    uint32_t _mbar_token_2 = mbarrier_try_wait(tmem_sfa_full_addr + (k_stage) * 8, _phase_a_full);
                     sfa_token = _mbar_token_2;
-                    uint32_t _mbar_token_3 = mbarrier_try_wait(tmem_sfb_full_addr + (k_stage) * 8, k_phase);
+                    uint32_t _mbar_token_3 = mbarrier_try_wait(tmem_sfb_full_addr + (k_stage) * 8, _phase_a_full);
                     sfb_token = _mbar_token_3;
-                    mbarrier_wait_token(a_full_addr + (k_stage) * 8, k_phase, a_token);
-                    mbarrier_wait_token(b_full_addr + (k_stage) * 8, k_phase, b_token);
-                    mbarrier_wait_token(tmem_sfa_full_addr + (k_stage) * 8, k_phase, sfa_token);
-                    mbarrier_wait_token(tmem_sfb_full_addr + (k_stage) * 8, k_phase, sfb_token);
+                    mbarrier_wait_token(a_full_addr + (k_stage) * 8, _phase_a_full, a_token);
+                    mbarrier_wait_token(b_full_addr + (k_stage) * 8, _phase_a_full, b_token);
+                    mbarrier_wait_token(tmem_sfa_full_addr + (k_stage) * 8, _phase_a_full, sfa_token);
+                    mbarrier_wait_token(tmem_sfb_full_addr + (k_stage) * 8, _phase_a_full, sfb_token);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (k_stage) * 1024);
                     int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (k_stage) * 64);
@@ -1063,7 +1063,7 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                         elect_commit(k_done_addr + (k_stage) * 8);
                     }
                     k_stage += 1;
-                    if (k_stage == 9) { k_stage = 0; k_phase ^= 1; }
+                    if (k_stage == 9) { k_stage = 0; _phase_a_full ^= 1; }
                 }
                 acc_stage_1 += 1;
                 if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_free ^= 1; }
