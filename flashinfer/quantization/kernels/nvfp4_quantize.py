@@ -1122,6 +1122,7 @@ class NVFP4QuantizePerTokenKernel:
             global_encode_scale, per_token_scale = self._row_scales(
                 row_amax, global_scale_inv
             )
+            quant_decode_scale = per_token_scale
             if cutlass.const_expr(self.fold_out_scale):
                 per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
             if tidx == Int32(0):
@@ -1139,6 +1140,7 @@ class NVFP4QuantizePerTokenKernel:
                         self.disable_fp4_quant_fast_math,
                         self.nvfp4_4over6_config,
                         row_amax,
+                        quant_decode_scale,
                     )
                 else:
                     scale_fp8, packed64 = process_nvfp4_block_half(
@@ -1148,6 +1150,7 @@ class NVFP4QuantizePerTokenKernel:
                         self.disable_fp4_quant_fast_math,
                         self.nvfp4_4over6_config,
                         row_amax,
+                        quant_decode_scale,
                     )
 
                 sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
@@ -1249,6 +1252,7 @@ class NVFP4QuantizePerTokenKernel:
         global_encode_scale, per_token_scale = self._row_scales(
             row_amax, global_scale_inv
         )
+        quant_decode_scale = per_token_scale
         if cutlass.const_expr(self.fold_out_scale):
             per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
         if tidx == Int32(0):
@@ -1272,6 +1276,7 @@ class NVFP4QuantizePerTokenKernel:
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                     row_amax,
+                    quant_decode_scale,
                 )
             else:
                 scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_half(
@@ -1287,6 +1292,7 @@ class NVFP4QuantizePerTokenKernel:
                     self.disable_fp4_quant_fast_math,
                     self.nvfp4_4over6_config,
                     row_amax,
+                    quant_decode_scale,
                 )
             if sf_col_idx < num_sf_blocks_per_row:
                 sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
