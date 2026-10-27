@@ -61,6 +61,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.quantization.quantization_cute_dsl_utils import (
+    _nvfp4_standard_quant_from_amax,
     float_to_ue8m0_fast,
     ue8m0_to_inv_scale_fast,
 )
@@ -461,6 +462,16 @@ class Sm100BlockScaledMoeEpilogue:
                 scale = ue8m0_to_inv_scale_fast(sf)
                 if channel % self.sf_vec_size == 0:
                     output_sf[row, channel] = sf.to(cutlass.Uint8)
+            elif cutlass.const_expr(
+                self.output_dtype == cutlass.Float4E2M1FN
+                and self.sf_dtype == cutlass.Float8E4M3FN
+                and self.sf_vec_size == 16
+            ):
+                # Share standalone standard fast quantization while keeping
+                # the activation values in FP32 through the FP4 conversion.
+                sf, scale = _nvfp4_standard_quant_from_amax(absmax, norm_const, False)
+                if channel % self.sf_vec_size == 0:
+                    output_sf[row, channel] = sf.bitcast(cutlass.Float8E4M3FN)
             elif cutlass.const_expr(self.output_dtype == cutlass.Float4E2M1FN):
                 sf = (absmax * cutlass.Float32(1.0 / 6.0) * norm_const).to(
                     self.sf_dtype
