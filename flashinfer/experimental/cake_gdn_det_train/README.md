@@ -41,6 +41,16 @@ chunk and segment tables on the host; without it the `meta` kernel builds
 them on the device.  The device route plans its scans for a bound layout, so
 the two routes can pick different plans and agree to rounding, not bitwise.
 
+The entry point checks its inputs before the first launch and raises
+`ValueError`: every tensor on the device of `q`, `k` of the shape of `q`,
+`v`, `g` and `beta` over the tokens of `q`, `HV` a positive multiple of `H`,
+`initial_state` of shape `[N, HV, 128, 128]`, `cu_seqlens` a 1-D int32 / int64
+tensor with a batch of 1, and `cu_seqlens_cpu` with as many offsets, starting
+at 0, not decreasing and ending at the tokens of `q` (an empty sequence is
+allowed).  These checks read tensor metadata only; the host offsets are
+checked when their layout is first planned.  The device route trusts the values
+of `cu_seqlens`, since reading them would synchronize the device.
+
 ## Chain
 
 The forward runs the prep (Q/K L2 norm, gate cumsum), the tcgen05 WY stage and

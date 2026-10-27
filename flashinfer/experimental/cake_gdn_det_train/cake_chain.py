@@ -1480,6 +1480,108 @@ def gdn_chunk_backward(
 # --------------------------------------------------------------------------- #
 _META_FRONT: dict = {}
 _META_FRONT_LIMIT = 256
+_OFFSET_DTYPES = (torch.int32, torch.int64)
+# the checked tensors in check order; the last two are optional (None skips them)
+_INPUT_NAMES = ("q", "k", "v", "g", "beta", "initial_state", "cu_seqlens")
+_OPTIONAL_INPUT = 5
+
+
+def _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu) -> None:
+    """The API-boundary checks of :func:`chunk_gated_delta_rule`: devices, shapes and the offsets' form, from tensor
+    metadata only (no device synchronization; the values of ``cu_seqlens_cpu`` are checked when its layout is first
+    planned, those of the device ``cu_seqlens`` not at all).  FLA's ``chunk_gated_delta_rule`` checks the head
+    counts, the batch of a packed call and the rows of ``initial_state``; the rest is this backend's contract.
+
+    Every call pays these checks, so they read the cheapest metadata: ``is_cuda`` and ``get_device()`` instead of
+    ``torch.device`` objects (made only for an error message), each shape once."""
+    index = -1
+    for i, t in enumerate((q, k, v, g, beta, initial_state, cu_seqlens)):
+        if t is None and i >= _OPTIONAL_INPUT:
+            continue
+        if not isinstance(t, torch.Tensor) or not t.is_cuda:
+            raise ValueError(f"{_INPUT_NAMES[i]} must be a CUDA tensor")
+        if i == 0:
+            index = t.get_device()
+        elif t.get_device() != index:
+            raise ValueError(f"{_INPUT_NAMES[i]} is on {t.device}, q on {q.device}")
+    q_shape, v_shape = q.shape, v.shape
+    if len(q_shape) != 4 or q_shape[3] != HEAD_DIM:
+        raise ValueError(f"q must be [B, T, H, {HEAD_DIM}]; got {tuple(q_shape)}")
+    if k.shape != q_shape:
+        raise ValueError(
+            f"k must have q's shape {tuple(q_shape)}; got {tuple(k.shape)}"
+        )
+    if (
+        len(v_shape) != 4
+        or v_shape[0] != q_shape[0]
+        or v_shape[1] != q_shape[1]
+        or v_shape[3] != HEAD_DIM
+    ):
+        raise ValueError(
+            f"v must be [{q_shape[0]}, {q_shape[1]}, HV, {HEAD_DIM}]; got {tuple(v_shape)}"
+        )
+    num_heads, num_v_heads = q_shape[2], v_shape[2]
+    if num_heads == 0 or num_v_heads == 0 or num_v_heads % num_heads != 0:
+        raise ValueError(f"the value heads (HV={num_v_heads}) must be a positive multiple of the q / k heads "
+                         f"(H={num_heads})")  # fmt: skip
+    gate_shape = v_shape[:3]
+    if g.shape != gate_shape:
+        raise ValueError(f"g must be {tuple(gate_shape)}; got {tuple(g.shape)}")
+    if beta.shape != gate_shape:
+        raise ValueError(f"beta must be {tuple(gate_shape)}; got {tuple(beta.shape)}")
+    if cu_seqlens is None:
+        num_seqs = q_shape[0]
+    else:
+        offsets = cu_seqlens.numel()
+        if (
+            cu_seqlens.dim() != 1
+            or offsets < 2
+            or cu_seqlens.dtype not in _OFFSET_DTYPES
+        ):
+            raise ValueError(f"cu_seqlens must be a 1-D int32 / int64 tensor of at least two offsets; got "
+                             f"{cu_seqlens.dtype} {tuple(cu_seqlens.shape)}")  # fmt: skip
+        if q_shape[0] != 1:
+            raise ValueError("cu_seqlens requires a leading batch dimension of 1")
+        num_seqs = offsets - 1
+        if cu_seqlens_cpu is not None:
+            if isinstance(cu_seqlens_cpu, torch.Tensor):
+                if (
+                    cu_seqlens_cpu.dim() != 1
+                    or cu_seqlens_cpu.dtype not in _OFFSET_DTYPES
+                ):
+                    raise ValueError(f"cu_seqlens_cpu must be a 1-D int32 / int64 tensor; got {cu_seqlens_cpu.dtype} "
+                                     f"{tuple(cu_seqlens_cpu.shape)}")  # fmt: skip
+                count = cu_seqlens_cpu.numel()
+            else:
+                count = len(cu_seqlens_cpu)
+            if count != offsets:
+                raise ValueError(
+                    f"cu_seqlens_cpu has {count} offsets, cu_seqlens {offsets}"
+                )
+    if initial_state is not None:
+        state_shape = (num_seqs, num_v_heads, HEAD_DIM, HEAD_DIM)
+        if initial_state.shape != state_shape:
+            raise ValueError(f"initial_state must be {state_shape} (one state per sequence); got "
+                             f"{tuple(initial_state.shape)}")  # fmt: skip
+
+
+def _host_offsets(cu_seqlens_cpu) -> tuple[int, ...]:
+    """The host offsets as a tuple of ints (one ``tolist`` for a tensor, which may also live on the device)."""
+    if isinstance(cu_seqlens_cpu, torch.Tensor):
+        return tuple(cu_seqlens_cpu.tolist())
+    return tuple(int(x) for x in cu_seqlens_cpu)
+
+
+def _check_offsets(layout: tuple[int, ...], total_tokens: int) -> None:
+    """The host offsets of a packed call start at 0, do not decrease and end at the tokens of ``q`` (an empty
+    sequence is allowed)."""
+    if (
+        layout[0] != 0
+        or layout[-1] != total_tokens
+        or any(b < a for a, b in zip(layout[:-1], layout[1:], strict=True))
+    ):
+        raise ValueError(f"cu_seqlens_cpu must start at 0, not decrease and end at the {total_tokens} tokens of q; "
+                         f"got {list(layout[:4])}{' ...' if len(layout) > 4 else ''} ending at {layout[-1]}")  # fmt: skip
 
 
 def _chunk_meta(
@@ -1508,13 +1610,16 @@ def _chunk_meta(
                                   scan_config=options.scan_config, segment_chunks=options.segment_chunks),
         )  # fmt: skip
     else:
-        layout = tuple(int(x) for x in cu_seqlens_cpu)
+        layout = _host_offsets(cu_seqlens_cpu)
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
     key = (layout, int(num_v_heads), int(index), total_tokens, options.pins)
     if options.host_cache:
         meta = _META_FRONT.get(key)
         if meta is not None:
             return meta
+    if cu_seqlens is not None:
+        # a layout reaches the table cache only after this check, so a cache hit is a checked layout
+        _check_offsets(layout, total_tokens)
     plans = scan_plans(total_tokens, len(seq_lens), int(num_v_heads), int(index), seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
     meta = _host_chunk_meta(seq_lens, plans, int(index))
@@ -1627,6 +1732,12 @@ def chunk_gated_delta_rule(
     the host) selects the host-table route, without it the ``meta`` kernel builds the tables on the device.  Returns
     ``(o, final_state)``; ``final_state`` is ``None`` unless ``output_final_state``.  The keyword-only arguments are
     the plan pins of :class:`ChainOptions`.
+
+    The inputs are checked before the first launch (``ValueError``): every tensor on q's CUDA device, ``k`` of q's
+    shape, ``v`` / ``g`` / ``beta`` of q's tokens, ``HV`` a positive multiple of ``H``, ``initial_state`` ``[N, HV,
+    128, 128]``, ``cu_seqlens`` 1-D int32 / int64 with a batch of 1, ``cu_seqlens_cpu`` as many offsets, from 0, not
+    decreasing, to the tokens of ``q``.  The device route trusts the values of ``cu_seqlens`` (reading them would
+    synchronize): the same contract, unchecked.
     """
     if (
         q.dtype != torch.bfloat16
@@ -1634,6 +1745,7 @@ def chunk_gated_delta_rule(
         or v.dtype != torch.bfloat16
     ):
         raise NotImplementedError("q/k/v must be bfloat16")
+    _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu)
     options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
                            warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
                            dhu_scan=dhu_scan, prep=prep)  # fmt: skip

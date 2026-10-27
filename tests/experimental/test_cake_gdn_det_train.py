@@ -23,9 +23,10 @@ campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tab
 packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
 and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
 unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
-initial / final state with its gradients, the pre-scan capacity, and the bitwise contracts: two runs, the two table
-routes on one plan, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte alignment (the plain prep), and an
-equal-length batch against the same sequences packed.
+initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
+contracts: two runs, the two table routes on one plan, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
+alignment (the plain prep), and an equal-length batch against the same sequences packed; and the input contract: every
+rejected input raises before the first launch, and the device route does not synchronize.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer: a build
 that vendors the package under another import path runs it unchanged after pointing the ``PACKAGES`` entry at its
@@ -571,6 +572,31 @@ def test_initial_and_final_state(pins, device) -> None:
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
 
 
+@pytest.mark.parametrize("route", ["host", "device"])
+def test_empty_sequences_carry_their_state(route, device) -> None:
+    # the offsets may repeat (FLA's contract): an empty sequence passes its initial state through and its final-state
+    # gradient back to dh0
+    seq_lens, heads = (200, 0, 333, 0), (2, 4)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=37)
+    gen = torch.Generator().manual_seed(41)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    got = _run(
+        inputs,
+        seq_lens,
+        route=route,
+        initial_state=h0,
+        output_final_state=True,
+        dht=dht,
+    )
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
+
+
 # --------------------------------------------------------------------------- long layouts and the pre-scan capacity
 
 # Layouts whose device-route bound layout (one sequence of ``T // 64 + N - (N - 1)`` chunks) prices a split longer
@@ -738,3 +764,171 @@ def test_rejects_unsupported_inputs(device) -> None:
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
+
+
+# One packed call of three sequences (100, 30, 34 tokens; H = 2, HV = 4) with an initial state, and the argument each
+# rejected case replaces; every one raises ValueError before the first launch.
+def _invalid_calls(device):
+    inputs = _inputs((100, 30, 34), (2, 4), torch.float32, device, seed=29)
+    q, k, v, g, beta = (inputs[n] for n in ("q", "k", "v", "g", "beta"))
+    cu = torch.tensor([0, 100, 130, 164], dtype=torch.int64)
+    h0 = torch.zeros(3, 4, HEAD_DIM, HEAD_DIM, device=device)
+    base = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "initial_state": h0, "cu_seqlens": cu.to(device),
+            "cu_seqlens_cpu": cu}  # fmt: skip
+    cases = {
+        "q-on-host": {"q": q.cpu()},
+        "g-on-host": {"g": g.cpu()},
+        "initial-state-on-host": {"initial_state": h0.cpu()},
+        "cu-seqlens-on-host": {"cu_seqlens": cu},
+        "k-heads": {"k": k[:, :, :1]},
+        "head-dim-64": {"q": q[..., :64], "k": k[..., :64]},
+        "v-tokens": {"v": v[:, :100]},
+        "value-heads-not-a-multiple": {
+            "v": v[:, :, :3],
+            "g": g[:, :, :3],
+            "beta": beta[:, :, :3],
+        },
+        "no-value-heads": {
+            "v": v[:, :, :0],
+            "g": g[:, :, :0],
+            "beta": beta[:, :, :0],
+            "initial_state": h0[:, :0],
+        },
+        "g-shape": {"g": g[:, :, :2]},
+        "beta-shape": {"beta": beta[:, :100]},
+        "initial-state-rows": {"initial_state": h0[:2]},
+        "initial-state-dims": {
+            "initial_state": torch.zeros(3, 4, 64, HEAD_DIM, device=device)
+        },
+        "cu-seqlens-2d": {"cu_seqlens": cu.to(device).view(1, -1)},
+        "cu-seqlens-float": {"cu_seqlens": cu.to(device).float()},
+        "cu-seqlens-one-offset": {
+            "cu_seqlens": cu[:1].to(device),
+            "cu_seqlens_cpu": cu[:1],
+        },
+        "host-offsets-count": {"cu_seqlens_cpu": torch.tensor([0, 130, 164])},
+        "host-offsets-float": {"cu_seqlens_cpu": cu.double()},
+        "host-offsets-start": {"cu_seqlens_cpu": torch.tensor([4, 100, 130, 164])},
+        "host-offsets-decreasing": {"cu_seqlens_cpu": torch.tensor([0, 130, 100, 164])},
+        "host-offsets-end": {"cu_seqlens_cpu": torch.tensor([0, 100, 130, 160])},
+        "host-offsets-list-end": {"cu_seqlens_cpu": [0, 100, 130, 200]},
+        "g-not-a-tensor": {"g": None},
+        "beta-not-a-tensor": {"beta": 0.5},
+        "k-on-meta": {"k": k.to("meta")},
+        "cu-seqlens-list": {"cu_seqlens": [0, 100, 130, 164]},
+    }
+    return base, cases
+
+
+_INVALID_IDS = (
+    "q-on-host", "g-on-host", "initial-state-on-host", "cu-seqlens-on-host", "k-heads", "head-dim-64", "v-tokens",
+    "value-heads-not-a-multiple", "no-value-heads", "g-shape", "beta-shape", "initial-state-rows",
+    "initial-state-dims", "cu-seqlens-2d", "cu-seqlens-float", "cu-seqlens-one-offset", "host-offsets-count",
+    "host-offsets-float", "host-offsets-start", "host-offsets-decreasing", "host-offsets-end", "host-offsets-list-end",
+    "g-not-a-tensor", "beta-not-a-tensor", "k-on-meta", "cu-seqlens-list",
+)  # fmt: skip
+
+# The exact message of each rejected case (the checks' contract: type and text).
+_OFFSETS = "cu_seqlens must be a 1-D int32 / int64 tensor of at least two offsets; got "
+_HOST_OFFSETS = (
+    "cu_seqlens_cpu must start at 0, not decrease and end at the 164 tokens of q; got "
+)
+_INVALID_MESSAGES = {
+    "q-on-host": "q must be a CUDA tensor",
+    "g-on-host": "g must be a CUDA tensor",
+    "initial-state-on-host": "initial_state must be a CUDA tensor",
+    "cu-seqlens-on-host": "cu_seqlens must be a CUDA tensor",
+    "k-heads": "k must have q's shape (1, 164, 2, 128); got (1, 164, 1, 128)",
+    "head-dim-64": "q must be [B, T, H, 128]; got (1, 164, 2, 64)",
+    "v-tokens": "v must be [1, 164, HV, 128]; got (1, 100, 4, 128)",
+    "value-heads-not-a-multiple": "the value heads (HV=3) must be a positive multiple of the q / k heads (H=2)",
+    "no-value-heads": "the value heads (HV=0) must be a positive multiple of the q / k heads (H=2)",
+    "g-shape": "g must be (1, 164, 4); got (1, 164, 2)",
+    "beta-shape": "beta must be (1, 164, 4); got (1, 100, 4)",
+    "initial-state-rows": "initial_state must be (3, 4, 128, 128) (one state per sequence); got (2, 4, 128, 128)",
+    "initial-state-dims": "initial_state must be (3, 4, 128, 128) (one state per sequence); got (3, 4, 64, 128)",
+    "cu-seqlens-2d": _OFFSETS + "torch.int64 (1, 4)",
+    "cu-seqlens-float": _OFFSETS + "torch.float32 (4,)",
+    "cu-seqlens-one-offset": _OFFSETS + "torch.int64 (1,)",
+    "host-offsets-count": "cu_seqlens_cpu has 3 offsets, cu_seqlens 4",
+    "host-offsets-float": "cu_seqlens_cpu must be a 1-D int32 / int64 tensor; got torch.float64 (4,)",
+    "host-offsets-start": _HOST_OFFSETS + "[4, 100, 130, 164] ending at 164",
+    "host-offsets-decreasing": _HOST_OFFSETS + "[0, 130, 100, 164] ending at 164",
+    "host-offsets-end": _HOST_OFFSETS + "[0, 100, 130, 160] ending at 160",
+    "host-offsets-list-end": _HOST_OFFSETS + "[0, 100, 130, 200] ending at 200",
+    "g-not-a-tensor": "g must be a CUDA tensor",
+    "beta-not-a-tensor": "beta must be a CUDA tensor",
+    "k-on-meta": "k must be a CUDA tensor",
+    "cu-seqlens-list": "cu_seqlens must be a CUDA tensor",
+}  # fmt: skip
+
+
+def _call_rejected(call) -> ValueError:
+    with pytest.raises(ValueError) as error:
+        chunk_gated_delta_rule(
+            call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
+            output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
+            use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+    return error.value
+
+
+@pytest.mark.parametrize("case", _INVALID_IDS)
+def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> None:
+    base, cases = _invalid_calls(device)
+    assert set(cases) == set(_INVALID_IDS) == set(_INVALID_MESSAGES)
+    call = {**base, **cases[case]}
+    stages = _record_launches(monkeypatch)
+    assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
+    assert stages == [], stages
+    # the unmodified call is accepted
+    o, final = chunk_gated_delta_rule(
+        base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
+        output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
+        use_qk_l2norm_in_kernel=True,
+    )  # fmt: skip
+    assert o.shape == base["v"].shape and final.shape == base["initial_state"].shape
+
+
+@pytest.mark.parametrize("name", ["k", "beta", "initial_state", "cu_seqlens"])
+def test_rejects_inputs_on_another_device(name, device, monkeypatch) -> None:
+    # every tensor must be on q's device: one input moved to a second device raises before the first launch
+    if torch.cuda.device_count() < 2:
+        pytest.skip("a second CUDA device required")
+    other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
+    base, _ = _invalid_calls(device)
+    call = {**base, name: base[name].to(other)}
+    stages = _record_launches(monkeypatch)
+    assert str(_call_rejected(call)) == f"{name} is on {other}, q on {device}"
+    assert stages == [], stages
+
+
+def test_device_route_does_not_synchronize(device) -> None:
+    # the checks read tensor metadata only: a device-route forward and backward runs under the error sync-debug mode
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=31)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int32, device=device)
+    h0 = torch.zeros(
+        len(seq_lens), 4, HEAD_DIM, HEAD_DIM, device=device, requires_grad=True
+    )
+
+    def call():
+        leaves = {
+            n: inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        o, final = chunk_gated_delta_rule(
+            leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
+            output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+        ((o.float() * inputs["do"].float()).sum() + final.sum()).backward()
+
+    call()  # loads the libraries and fills the caches
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        call()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()
