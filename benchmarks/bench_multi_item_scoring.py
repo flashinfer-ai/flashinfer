@@ -18,6 +18,7 @@ import flashinfer
 
 
 def make_inputs(batch, prefix, items, item_len, group, dtype):
+    """Build paged MIS inputs and dense output/LSE references for one shape."""
     torch.manual_seed(20261020)
     page, heads, dim = 16, 4, 128
     qlen = items * (item_len + 1)
@@ -90,6 +91,7 @@ def make_inputs(batch, prefix, items, item_len, group, dtype):
 
 
 def plan_options(policy):
+    """Translate the benchmark split policy into wrapper planning arguments."""
     if policy == "no_split":
         return {"disable_split_kv": True}
     if policy == "fixed_8_pages":
@@ -98,6 +100,7 @@ def plan_options(policy):
 
 
 def measure(function):
+    """Return per-call CUDA-event times from warm graphs with 20 calls each."""
     for _ in range(5):
         function()
     graph = torch.cuda.CUDAGraph()
@@ -121,6 +124,7 @@ def measure(function):
 
 
 def main():
+    """Validate MIS output and LSE, then save graph timing samples as JSON."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name, value in [
         ("prefix", 8192),
@@ -177,7 +181,7 @@ def main():
         independent_reference_passed=True,
         reference_snapshot="CPU copy before JIT loading and native execution",
         post_timing_reference_passed=True,
-        timing="Preallocated output/LSE; warm-L2 CUDA graphs20 calls,40 warm rounds,25 samples; attention+merge, excludes planning and allocation",
+        timing="Preallocated output/LSE; warm-L2 CUDA graphs: 20 calls, 40 warm rounds, 25 samples; attention+merge, excludes planning and allocation",
     )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

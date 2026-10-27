@@ -17,6 +17,7 @@ import flashinfer
 @pytest.mark.parametrize("page_size", [16, 32])
 @pytest.mark.parametrize("tail_fill", [float("nan"), float("inf"), 7.0])
 def test_mis_prefetch_partial_v_tail(dtype, layout, group, page_size, tail_fill):
+    """Keep unused V padding invisible when MIS jumps to a partial last page."""
     prefix, item_len, num_items, kv_heads, dim = 17, 15, 32, 4, 128
     kv_len = prefix + (item_len + 1) * num_items
     pages = math.ceil(kv_len / page_size)

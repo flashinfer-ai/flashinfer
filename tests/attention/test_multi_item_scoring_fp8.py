@@ -17,6 +17,7 @@ from flashinfer.utils import get_compute_capability
 
 @functools.cache
 def _reference_case_maker():
+    """Load the shared dense-case builder for standalone and importlib tests."""
     # Support pytest's importlib mode and running this file on its own.
     spec = importlib.util.spec_from_file_location(
         "_mis_fp8_reference",
@@ -39,6 +40,7 @@ def _reference_case_maker():
 def test_mis_fp8_physical_scale_bounds(
     q_dtype, kv_dtype, layout, group, head_dim, policy, prefix, items, query_tokens
 ):
+    """Match quantized MIS references with token/head scales across tile jumps."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     if (
@@ -133,6 +135,7 @@ def _dense_reference(q, kv, scale, meta, prefix, items, head_dim, group):
 def test_mis_fp8_query_prefetch_bounds(
     layout, group, policy, prefix, items, query_tokens
 ):
+    """Check FP8-query MIS prefetch against a dense reference on SM120."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     if get_compute_capability(torch.device("cuda:0")) != (12, 0):
@@ -165,6 +168,7 @@ def test_mis_fp8_query_prefetch_bounds(
 
 
 def test_mis_fp8_query_rejects_token_head_scales():
+    """Reject token/head KV scales when the query dtype is FP8."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     _, _, meta, _, _ = _reference_case_maker()([(17, [31] * 2)])

@@ -160,6 +160,7 @@ def _make_case(
     ],
 )
 def test_mis_split_kv_tile_skip(dtype, requests, options):
+    """Match dense MIS output and LSE when leading masked split tiles are skipped."""
     q, kv, metadata, reference, ref_lse = _make_case(requests, dtype=dtype, **options)
     workspace = torch.full((128 * 1024 * 1024,), 255, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -174,6 +175,7 @@ def test_mis_split_kv_tile_skip(dtype, requests, options):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("row_base", [16, 64, 128])
 def test_mis_tile_skip_gqa3_zero_margin(dtype, row_base):
+    """Preserve the first visible content key at packed GQA-3 tile boundaries."""
     # At these candidate packed-tile starts, the first query is the last
     # content token of an item whose first content key is exactly 128.
     group, prefix, item_len = 3, 31, 31
@@ -202,6 +204,7 @@ def test_mis_tile_skip_gqa3_zero_margin(dtype, row_base):
 @pytest.mark.parametrize("page_size", [16, 32])
 @pytest.mark.parametrize("tail_fill", [float("nan"), float("inf")])
 def test_mis_tile_skip_unused_v_tail(dtype, layout, page_size, tail_fill):
+    """Exclude NaN/Inf V padding after a leading-tile skip with no prefix."""
     q, kv, metadata, reference, ref_lse = _make_case(
         [(0, [15] * 31 + [14])],
         dtype=dtype,
@@ -227,6 +230,7 @@ def test_mis_tile_skip_unused_v_tail(dtype, layout, page_size, tail_fill):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mis_tile_skip_cuda_graph_replan(dtype):
+    """Replay a captured MIS call after item boundaries change in place."""
     q, kv, metadata, reference, ref_lse = _make_case([(128, [31] * 16)], dtype=dtype)
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -294,6 +298,7 @@ def test_mis_tile_skip_cuda_graph_replan(dtype):
     ],
 )
 def test_mis_tile_skip_head_dims_window_and_soft_cap(dtype, policy, requests, options):
+    """Match dense MIS references across head dimensions, windows and soft caps."""
     q, kv, metadata, reference, ref_lse = _make_case(requests, dtype=dtype, **options)
     workspace = torch.full((512 * 1024 * 1024,), 255, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
