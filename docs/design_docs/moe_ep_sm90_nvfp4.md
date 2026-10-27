@@ -190,7 +190,7 @@ slot counts. This changes buffering, not the numerical operation: same-core
 sf0/sf2 output remains byte-identical.
 
 The candidate table includes five measured SF2 profiles: R1/R2 variants
-of the T512 and T1024 seeds, and one R1 variant of the T2048 seed. Their
+of the T512 and T1024 seeds, and one R1 variant of the T4096/T16384 seed. Their
 admission uses geometry, protocol and shared-memory legality, without GPU
 product-name or live-token restrictions. T512/T1024 reference capacity
 buckets use R1 SF2 defaults; the other eleven reference defaults use SF0.
