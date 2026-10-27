@@ -3697,6 +3697,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws8_bf16_two_shot_b5(__nv_bfloat16* __res
         if (tid == 0) {
             mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 16);
         }
+        unsigned int clr_words[4];
+        #pragma unroll
+        for (int clr_word = 0; clr_word < 4; clr_word++) {
+            clr_words[clr_word] = 2147516416;
+        }
+        long long clr_base = (long long)clear_epoch * comm_stride_elems;
+        int clr_high = access + tokens * 896;
+        if (access < clear_size / 8) {
+            asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clr_base + (long long)access * 8)), "r"(clr_words[(0) + 0]), "r"(clr_words[(0) + 1]), "r"(clr_words[(0) + 2]), "r"(clr_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        }
+        if (clr_high < clear_size / 8) {
+            asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clr_base + (long long)clr_high * 8)), "r"(clr_words[(0) + 0]), "r"(clr_words[(0) + 1]), "r"(clr_words[(0) + 2]), "r"(clr_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        }
         asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(uint32_t(_phase_rms_exchange)), "r"(uint32_t(10000000)) : "memory");
         asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
         float cluster_sum = 0.0f;
@@ -3730,7 +3743,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws8_bf16_two_shot_b5(__nv_bfloat16* __res
     }
     long long clear_base = (long long)clear_epoch * comm_stride_elems;
     #pragma unroll 4
-    for (int access_1 = first_access; access_1 < clear_size / 8; access_1 += access_stride) {
+    for (int access_1 = access + tokens * 896; access_1 < clear_size / 8; access_1 += access_stride) {
         asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clear_base + (long long)access_1 * 8)), "r"(clear_words[(0) + 0]), "r"(clear_words[(0) + 1]), "r"(clear_words[(0) + 2]), "r"(clear_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
     }
     if (bid == 0) {
