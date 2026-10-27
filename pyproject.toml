@@ -25,14 +25,14 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
 
 [project.optional-dependencies]
-b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
+b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl[cu13]>=4.8.0", "rich>=13", "safetensors>=0.6"]
 # Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
 ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
-cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
-# Native Rubin MegaMoE uses APIs absent from the general CUDA-extra floor.
-sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0.dev0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
+cu12 = ["nvidia-cutlass-dsl>=4.8.0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.8.0"]
+# Native Rubin MegaMoE also needs NVSHMEM and PyTorch.
+sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
