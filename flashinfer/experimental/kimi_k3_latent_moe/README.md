@@ -32,19 +32,19 @@ passed as one `[2 * 6144/TP, 7168]` concatenation) + `RowParallel`
 | stage | tokens | program | launches |
 | --- | --- | --- | --- |
 | front | `T <= 128` | weight-streaming swapped-AB tcgen05 kernel (`decode:*`): 128-row weight tiles are the MMA A operand, the tokens the padded B operand (N in {8, 16, 32, 64, 128}), router / latent / shared SiTU tiles in one unified tile space; aligned 2-CTA cluster pairs when `2 x tiles` fits one wave (TP8; from N 16 both CTAs of a pair finalize half the values, `_sf`), one CTA per tile otherwise (TP1) | 1 |
-| front | `T > 128` | persistent 2-CTA tcgen05 GEMM (`front:i<6144/TP>[e1]`; the `e1` instance streams the weights `evict_first` for `T <= 512`, at TP8 for `T <= 768`, and on 152-SM parts at TP8 for `T <= 16384` and at TP1 for `T <= 2048`), 256x256 pair tiles over the K-concatenated `[gate; down; shared_gate; shared_up]` rows with class-specific epilogues; the trailing wave's tiles run as two aligned K halves with fp32 partials and a fixed-order fix-up when that fits one wave (`front_split_plan`) | 1 |
+| front | `T > 128` | persistent 2-CTA tcgen05 GEMM (`front:i<6144/TP>[e1]`; the `e1` instance streams the weights `evict_first` for `T <= 512`, at TP8 for `T <= 768`, and on 152-SM parts at TP8 for `T <= 16384` and at TP1 for `T <= 2048`), 256x256 pair tiles over the K-concatenated `[gate; down; shared_gate; shared_up]` rows with class-specific epilogues; the trailing wave's tiles run as two aligned K halves with fp32 partials and a fixed-order fix-up when that fits one wave (`front_split_plan`); the TP8 rows of 16 row tiles (`T` 1793-2048, every qualified part) and of 8 row tiles (`T` 897-1024, `sm_103a` 152-SM parts) run the fold form (`front:i768e1fold`, `front_fold_plan`): one item per resident cluster, lanes of 8 (4) clusters splitting the flattened K iterations evenly, the raw fp32 accumulator carried across a lane boundary and the trailing-wave plan's split tiles kept, so the outputs are bitwise those of `front_split_plan`; it launches cooperatively, and a device that holds fewer co-resident clusters than its grid keeps the trailing-wave plan | 1 |
 | tail | `T <= 128` | the same streaming kernel with the KimiRMSNorm fused into the launch (`decode:*_f*`): the epilogue warps normalise the routed rows while the TMA warp streams the shared-down segment; for the smallest T the normalised rows are written straight into a resident smem B operand (`_sb`, staged rows `_rs`), larger T use the global `y_workspace` protocol; from N 32 with one routed partial both CTAs of a pair finalize half the tokens (`_sf`), the TP1 tail arriving on the `y_workspace` counter as soon as its rows are written (`_ea`) and the TP8 tail at N 32 / 64 prefetching its first up-projection weight tiles into L2 during the wait (`_upf`) | 1 |
 | tail | `T > 128` | one-pass RMSNorm kernel (`tail_norm:e<0|1>[pk]`, late / early PDL trigger chosen from the GEMM grid; the `pk` instance, for the TP8 rows of one routed partial from 2048 tokens, keeps the row as packed bf16x2 words) + persistent 2-CTA GEMM (`tail_gemm:tp<1|8>`) over `[up slice | shared down]` with trailing-wave stream-K, launched programmatic-dependent | 2 |
 
 The host planner (`cake_backend.decode_front_plan`, `decode_tail_plan`,
-`prefill_front_plan`, `front_split_plan`, `prefill_tail_plan`, `split_plan`) is the Cake planner re-implemented; every
+`prefill_front_plan`, `front_split_plan`, `front_fold_plan`, `prefill_tail_plan`, `split_plan`) is the Cake planner re-implemented; every
 plan names its physical kernel through a logical key registered in
 `cake_jit.KERNELS` (one program per key, compiled for both SM100a and SM103a
 from the same source; `cake_jit.SPECIALIZATIONS` adds the compile-line
 constants of keys that share a program, e.g. the TP1 / TP8 front and tail
 GEMMs).  Every token count from 1 to 16384, both tensor-parallel degrees and
 any number of routed partials resolve to a registered program.  Every plan is
-derived from the device's own SM count (`torch.cuda.get_device_properties(...).multi_processor_count`):
+derived from the device's own architecture and SM count (`torch.cuda.get_device_properties(...).multi_processor_count`):
 the decode grids are tile-bound (94 / 112 / 131 co-resident CTAs on every
 qualified part) and the prefill GEMMs receive their resident-pair windows
 (`num_items`, `full_items`, `sk_*`) as launch arguments, so one program serves
@@ -94,15 +94,16 @@ graphs never share any:
 - **Control words** (the decode grid counter, the prefill stream-K arrival
   counters and the fused-norm semaphores / claim ticket / retirement count) must
   read zero before a launch, and every launch returns them to zero.  Each
-  `prepare_*` call takes its own words (at most 1 KiB) from a per-device slab
+  `prepare_*` call takes its own words (at most 1.25 KiB) from a per-device slab
   that is zeroed and synchronised once; they are never freed or reused, so a
   CUDA Graph that captured a runner stays valid after the runner is dropped.
   Prepare once per layer and shape, before capture: preparing under capture
   takes a free slab slot (no graph node), or, with the slab exhausted, zeroes
   new words inside the capture (one zero-fill kernel node in that graph).
 - **Partials** (the FP32 stream-K workspace of split prefill plans: one
-  `128 x block_n` slot per contributor CTA of every split tile, written before it
-  is read inside one launch).  An eager launch uses one workspace per (device,
+  `128 x block_n` slot per contributor CTA of every split tile, and two
+  `128 x 256` slots per CTA of the front's fold form, written before they are
+  read inside one launch).  An eager launch uses one workspace per (device,
   stream), allocated on that stream at its first split launch and grown to the
   largest split plan launched there; later launches on the stream reuse it in
   stream order (as PyTorch's caching allocator reuses a block on its stream),
@@ -131,8 +132,8 @@ Contract:
   capture takes fresh words, which are never freed.  Prefer prepared runners
   under capture and where a PDL kernel that never waits on its predecessor can
   sit between two calls on one stream.
-- A cooperative route (the decode routes and the claimed tail) needs its whole
-  grid resident at once, one CTA per SM.  Launched eagerly on a stream that
+- A cooperative route (the decode routes, the claimed tail and the front's fold
+  form) needs its whole grid resident at once, one CTA per SM.  Launched eagerly on a stream that
   offers fewer SMs (a smaller green context), it runs nothing and raises a
   `RuntimeError` naming the route and the SMs it needs; the CUDA runtime's last
   error is cleared, so later work in the process is unaffected.  Captured on

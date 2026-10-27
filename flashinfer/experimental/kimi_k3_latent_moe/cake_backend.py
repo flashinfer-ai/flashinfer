@@ -32,7 +32,7 @@ tcgen05 GEMM per stage (the tail additionally runs a one-pass RMSNorm kernel
 first and launches its GEMM programmatic-dependent).  The decode planner
 (N padding, ring depth, cluster pairs, resident B operand, staged rows, issue
 gate) and the prefill planner (persistent pair tiles, trailing-wave stream-K,
-norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
+the front's fold form, norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
 ``kimi_k3_latent_moe_decode`` / ``kimi_k3_latent_moe_front`` /
 ``kimi_k3_latent_moe_tail``; every plan names the physical generated kernel
 through a logical key resolved in ``cake_jit.KERNELS``.  Weights are read in
@@ -43,7 +43,7 @@ zero-initialised control words (``_CtrlSlab``), and an eager launch of a split
 prefill plan uses the FP32 stream-K partial workspace of its (device, stream),
 grown to the largest split plan launched there (a launch under capture takes a
 block of the graph's memory pool).  Every
-plan is derived from the device's own SM count (``QUALIFIED_SM_COUNTS``
+plan is derived from the device's own architecture and SM count (``QUALIFIED_SM_COUNTS``
 names the physical counts the programs are qualified on; other counts are refused).
 See ``README.md`` in this package (section "Concurrency").
 """
@@ -763,29 +763,120 @@ def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
     return FRONT_BLOCK_N
 
 
+# Fold form of the prefill front GEMM (key suffix ``fold``, evict_first weights): a static schedule of one item per
+# cluster.  Lanes of G clusters split the flattened K iterations of the pair tiles evenly (a unit is one weight column
+# times the lane's G pair rows, which its clusters read in step); a lane boundary inside a tile carries the raw FP32
+# accumulator to the next lane, and the split tiles of the trailing-wave plan keep its two K runs and their sum
+# ``(0 + P0) + P1``, so the outputs are bitwise those of ``front_split_plan``.  Its CTAs wait for words other CTAs
+# release, so it launches cooperatively: every CTA of its grid resident at once.  Taken where it measured faster: the
+# TP8 rows of 16 row tiles (T = 1793-2048) with G = 8 on every qualified part, and the TP8 rows of 8 row tiles
+# (T = 897-1024) with G = 4 on sm_103a 152-SM parts (GB300).  The plan travels in the stream-K arguments:
+# ``num_items`` = clusters, ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and
+# ``sk_max_seg`` = 2 * t0 + fold_all, t0 the trailing-wave plan's whole tiles.
+FRONT_FOLD_I_LOCAL = SHARED_INTERMEDIATE // 8  # TP8 only
+#: Pair rows per lane (G) by row-tile count, on every qualified part.
+FRONT_FOLD_LANE_ROWS = {16: 8}
+#: Pair rows per lane by (row tiles, architecture, SM count), on those parts only.
+FRONT_FOLD_LANE_ROWS_BY_PART = {(8, "sm_103a", 152): 4}
+
+
+def front_fold_plan(
+    m_tiles: int, i_local: int, sm_count: int = SM_COUNT, arch: str = "sm_100a"
+) -> Optional[dict[str, int]]:
+    """Fold-form work plan of the prefill front GEMM, or ``None`` where the trailing-wave plan stays.
+
+    ``lanes = sm_count // 2 // G`` lanes of G clusters, one item per cluster; the ``units x 112`` flattened K
+    iterations split evenly over the lanes.  ``sk_max_seg`` selects the mode: ``2 * t0`` keeps the split tiles of
+    ``front_split_plan`` (``t0`` its whole tiles; every tile when it splits none), plus one when a lane is shorter
+    than a unit (``fold_all``).  The workspace holds two ``128 x 256`` FP32 slots and two self-resetting counters
+    per CTA (``ws_slots``).  Keys as ``front_split_plan`` plus ``fold`` and ``ws_slots``.
+    """
+    m_tiles, i_local, sm_count = int(m_tiles), int(i_local), int(sm_count)
+    if i_local != FRONT_FOLD_I_LOCAL:
+        return None
+    lane_rows = FRONT_FOLD_LANE_ROWS_BY_PART.get(
+        (m_tiles, str(arch), sm_count), FRONT_FOLD_LANE_ROWS.get(m_tiles)
+    )
+    if lane_rows is None:
+        return None
+    pair_rows = m_tiles // CTA_GROUP
+    lanes = sm_count // CTA_GROUP // lane_rows
+    if pair_rows % lane_rows or lanes < 2:
+        return None
+    n_tiles = front_n_tiles(i_local)
+    total = pair_rows // lane_rows * n_tiles * FRONT_NUM_K_ITERS
+    split = front_split_plan(pair_rows * n_tiles, sm_count)
+    if split["sk_max_seg"] > 1:
+        # The split tiles keep their two K runs: every lane spans one to one and a half units.
+        if not lanes * FRONT_NUM_K_ITERS <= total <= lanes * FRONT_NUM_K_ITERS * 3 // 2:
+            return None
+        max_seg = 2 * split["full_items"]
+    else:
+        fold_all = total < lanes * FRONT_NUM_K_ITERS
+        # A lane at least half a unit long: a unit has at most three parts.
+        if fold_all and 2 * total < lanes * FRONT_NUM_K_ITERS:
+            return None
+        max_seg = 2 * pair_rows * n_tiles + int(fold_all)
+    clusters = lanes * lane_rows
+    return {
+        "num_items": clusters,
+        "full_items": lane_rows,
+        "sk_ipc": lanes,
+        "sk_max_seg": max_seg,
+        "sk_total": total,
+        "sk_tiles": 0,
+        "fold": True,
+        "ws_slots": 2 * clusters * CTA_GROUP,
+    }
+
+
 def front_kernel_key(
-    i_local: int, evict_first: bool = False, block_n: int = FRONT_BLOCK_N
+    i_local: int,
+    evict_first: bool = False,
+    block_n: int = FRONT_BLOCK_N,
+    fold: bool = False,
 ) -> str:
-    """``front:i<I_local>[e1][n224]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance, ``n224`` the
-    224-wide pair tile."""
+    """``front:i<I_local>[e1][n224|fold]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance,
+    ``n224`` the 224-wide pair tile and ``fold`` the fold-form program."""
     return (
         f"front:i{int(i_local)}"
         + ("e1" if evict_first else "")
         + ("" if block_n == FRONT_BLOCK_N else f"n{int(block_n)}")
+        + ("fold" if fold else "")
     )
 
 
 @_cached_plan
 def prefill_front_plan(
-    M: int, i_local: int, sm_count: int = SM_COUNT
+    M: int,
+    i_local: int,
+    sm_count: int = SM_COUNT,
+    arch: str = "sm_100a",
+    resident_clusters: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Host plan of the prefill front GEMM (one persistent launch) for ``M`` tokens of one rank."""
+    """Host plan of the prefill front GEMM (one persistent launch) for ``M`` tokens of one rank on an ``arch``
+    device of ``sm_count`` SMs.
+
+    ``resident_clusters`` is the device's co-resident cluster count of the fold-form launch: the fold plan needs
+    every one of its clusters resident and keeps the trailing-wave plan below that (``None``: the qualified parts'
+    count, which holds every fold plan)."""
     m_tiles = m_tiles_for(M)
     block_n = front_block_n(M, i_local, sm_count)
     n_tiles = front_n_tiles(i_local, block_n)
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
-    sk = front_split_plan(cluster_tiles, sm_count)
-    evict_first = bool(front_evict_first(m_tiles, i_local, sm_count))
+    fold = (
+        front_fold_plan(m_tiles, i_local, sm_count, arch)
+        if block_n == FRONT_BLOCK_N
+        else None
+    )
+    if fold is not None and (
+        resident_clusters is None or int(resident_clusters) >= fold["num_items"]
+    ):
+        # The fold programs stream the weights evict_first.
+        sk, evict_first = fold, True
+    else:
+        sk = dict(front_split_plan(cluster_tiles, sm_count), fold=False, ws_slots=0)
+        evict_first = bool(front_evict_first(m_tiles, i_local, sm_count))
     if block_n != FRONT_BLOCK_N and (sk["sk_max_seg"] != 1 or not evict_first):
         raise AssertionError(
             f"the {block_n}-wide front instance runs whole evict_first tiles only (M={M}, plan {sk})"
@@ -800,6 +891,13 @@ def prefill_front_plan(
         evict_first=evict_first,
         grid=sk["num_items"] * CTA_GROUP,
         **sk,
+    )
+
+
+def prefill_front_kernel_key(plan: dict[str, Any]) -> str:
+    """The logical kernel key of a ``prefill_front_plan``."""
+    return front_kernel_key(
+        plan["i_local"], plan["evict_first"], plan["block_n"], plan["fold"]
     )
 
 
@@ -1103,10 +1201,12 @@ def route_kernel_keys(
     num_tokens: int,
     sm_count: int = SM_COUNT,
     num_partials: int = 1,
+    arch: str = "sm_100a",
 ) -> tuple[str, ...]:
-    """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)`` on a
-    ``sm_count``-SM device; ``num_partials`` is the tail's routed-partial count ``P`` (the decode
-    tail instance and the prefill tail's norm instance depend on it; the front does not)."""
+    """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)`` on an
+    ``arch`` device of ``sm_count`` SMs; ``num_partials`` is the tail's routed-partial count ``P``
+    (the decode tail instance and the prefill tail's norm instance depend on it; the front does not).
+    The front's fold form is planned for a device that holds its clusters (``prefill_front_plan``)."""
     if tp not in SUPPORTED_TP:
         raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
     if num_tokens < 1:
@@ -1120,10 +1220,8 @@ def route_kernel_keys(
                 decode_kernel_key(decode_front_plan(num_tokens, i_local, sm_count)),
             )
         return (
-            front_kernel_key(
-                i_local,
-                front_evict_first(m_tiles_for(num_tokens), i_local, sm_count),
-                front_block_n(num_tokens, i_local, sm_count),
+            prefill_front_kernel_key(
+                prefill_front_plan(num_tokens, i_local, sm_count, arch)
             ),
         )
     if stage == "tail":
@@ -1151,13 +1249,16 @@ def route_kernel_keys(
     raise ValueError(f"stage must be 'front' or 'tail', got {stage!r}")
 
 
-def required_kernel_keys(sm_count: int = SM_COUNT) -> tuple[str, ...]:
-    """Every logical kernel the validated route set can select (both stages, TP 1 / 8, all row tokens)."""
+def required_kernel_keys(
+    sm_count: int = SM_COUNT, arch: str = "sm_100a"
+) -> tuple[str, ...]:
+    """Every logical kernel the validated route set can select on an ``arch`` device of ``sm_count`` SMs (both
+    stages, TP 1 / 8, all row tokens)."""
     keys: list[str] = []
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
             for tokens in ROW_TOKENS:
-                for key in route_kernel_keys(stage, tp, tokens, sm_count):
+                for key in route_kernel_keys(stage, tp, tokens, sm_count, arch=arch):
                     if key not in keys:
                         keys.append(key)
     return tuple(keys)
@@ -1214,7 +1315,7 @@ def generated_program_available(
 ) -> bool:
     """True when this checkout registers the programs for ``device`` (optionally: one exact route).
 
-    The route is resolved with the device's SM count and, for the tail, the caller's
+    The route is resolved with the device's architecture and SM count and, for the tail, the caller's
     routed-partial count ``num_partials`` (the decode tail instance and the TP8 prefill norm
     instance depend on it), so the answer is exactly what ``prepare_kimi_k3_latent_moe_*``
     would require.
@@ -1224,12 +1325,12 @@ def generated_program_available(
     if arch is None or not MODULES or count not in QUALIFIED_SM_COUNTS:
         return False
     if stage is None and tp is None and num_tokens is None:
-        return cake_jit.route_available(arch, required_kernel_keys(count))
+        return cake_jit.route_available(arch, required_kernel_keys(count, arch))
     if stage is None or tp is None or num_tokens is None:
         raise ValueError("pass stage, tp and num_tokens together or none of them")
     try:
         keys = route_kernel_keys(
-            stage, int(tp), int(num_tokens), count, int(num_partials)
+            stage, int(tp), int(num_tokens), count, int(num_partials), arch=arch
         )
     except ValueError:
         return False
@@ -1424,9 +1525,12 @@ def _partial_ws_numel(stage: str, plan: dict[str, Any]) -> int:
 
     One ``128 x block_n`` slot per contributor CTA: ``sk_tiles`` split tiles of ``sk_max_seg`` segments of
     ``CTA_GROUP`` CTAs (the front's slot is 256 wide, the tail's follows the plan's tile).  A plan that
-    carries partials between its items states its slots the same way (the front lane form: ``sk_tiles``
-    clusters of ``sk_max_seg`` 1, one carry slot per CTA).
+    carries partials between its items states its slot count in ``ws_slots`` (the front fold form: two
+    ``128 x 256`` slots per CTA).
     """
+    ws_slots = int(plan.get("ws_slots", 0))
+    if ws_slots:
+        return ws_slots * BLOCK_M * FRONT_BLOCK_N
     sk_tiles = int(plan.get("sk_tiles", 0))
     if sk_tiles == 0:
         return 0
@@ -1436,8 +1540,94 @@ def _partial_ws_numel(stage: str, plan: dict[str, Any]) -> int:
 
 def _arrival_counter_words(plan: dict[str, Any]) -> int:
     """int32 stream-K arrival counters of a prefill plan: one per split tile and CTA rank, at least two (the
-    front lane form: one carry counter per CTA of its ``sk_tiles`` clusters)."""
+    front fold form: one per workspace slot, ``ws_slots``; the reader of a slot resets its counter)."""
+    ws_slots = int(plan.get("ws_slots", 0))
+    if ws_slots:
+        return ws_slots
     return max(2, int(plan.get("sk_tiles", 0)) * CTA_GROUP)
+
+
+_RESIDENT_CLUSTERS: dict[tuple[int, int, int], int] = {}
+# An empty kernel: the co-resident cluster count of a one-CTA-per-SM launch depends on the launch shape only.
+_OCCUPANCY_PROBE = "cake_kimi_k3_latent_moe_occupancy_probe"
+_OCCUPANCY_PROBE_PTX = (
+    ".version 8.0\n.target sm_90\n.address_size 64\n"
+    f".visible .entry {_OCCUPANCY_PROBE}()\n{{\n\tret;\n}}\n"
+)
+
+
+def _resident_clusters(device_index: int, block_threads: int, smem_bytes: int) -> int:
+    """Co-resident two-CTA clusters of ``cuda:device_index`` for CTAs of ``block_threads`` threads and
+    ``smem_bytes`` dynamic shared memory (``cuOccupancyMaxActiveClusters``, queried once per device and
+    shape on an empty probe kernel launched with that shape).  The front programs take more than half
+    of an SM's shared memory, so they run one CTA per SM and the count follows the part's GPC topology,
+    not ``SM count / 2``."""
+    key = (int(device_index), int(block_threads), int(smem_bytes))
+    count = _RESIDENT_CLUSTERS.get(key)
+    if count is not None:
+        return count
+    from cuda.bindings import driver
+
+    def checked(result):
+        status = result[0]
+        if status != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cluster occupancy query: {status!r}")
+        return result[1] if len(result) == 2 else None
+
+    ctx = checked(driver.cuDevicePrimaryCtxRetain(int(device_index)))
+    try:
+        checked(driver.cuCtxSetCurrent(ctx))
+        module = checked(driver.cuModuleLoadData(_OCCUPANCY_PROBE_PTX.encode() + b"\0"))
+        try:
+            func = checked(
+                driver.cuModuleGetFunction(module, _OCCUPANCY_PROBE.encode())
+            )
+            checked(
+                driver.cuFuncSetAttribute(
+                    func,
+                    driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    int(smem_bytes),
+                )
+            )
+            attr = driver.CUlaunchAttribute()
+            attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+            attr.value.clusterDim.x = CTA_GROUP
+            attr.value.clusterDim.y = 1
+            attr.value.clusterDim.z = 1
+            config = driver.CUlaunchConfig()
+            config.gridDimX = CTA_GROUP
+            config.gridDimY = 1
+            config.gridDimZ = 1
+            config.blockDimX = int(block_threads)
+            config.blockDimY = 1
+            config.blockDimZ = 1
+            config.sharedMemBytes = int(smem_bytes)
+            config.attrs = [attr]
+            config.numAttrs = 1
+            count = int(checked(driver.cuOccupancyMaxActiveClusters(func, config)))
+        finally:
+            checked(driver.cuModuleUnload(module))
+    finally:
+        checked(driver.cuDevicePrimaryCtxRelease(int(device_index)))
+    _RESIDENT_CLUSTERS[key] = count
+    return count
+
+
+def _front_resident_clusters(device_index: int, arch: str, i_local: int) -> int:
+    """Co-resident clusters of the fold-form front program's launch on ``cuda:device_index`` (the current
+    device).  The query loads a module, which a CUDA Graph capture must not see: under capture, before the
+    device's first query, it answers 0, so that prepare keeps the trailing-wave plan (the same outputs,
+    bitwise)."""
+    key = front_kernel_key(i_local, True, fold=True)
+    launch = MODULES[kernel_module_name(arch, key)]["launch"]
+    shape = (
+        int(device_index),
+        int(launch["block"][0]),
+        int(launch["dynamic_smem_bytes"]),
+    )
+    if shape not in _RESIDENT_CLUSTERS and _CAPTURING():
+        return 0
+    return _resident_clusters(*shape)
 
 
 # ---------------------------------------------------------------------------
@@ -1865,8 +2055,11 @@ def _prepare_front(
             )
             route = "decode"
         else:
-            plan = prefill_front_plan(T, i_local, sm_count)
-            key = front_kernel_key(i_local, plan["evict_first"], plan["block_n"])
+            resident = None
+            if front_fold_plan(m_tiles_for(T), i_local, sm_count, arch) is not None:
+                resident = _front_resident_clusters(index, arch, i_local)
+            plan = prefill_front_plan(T, i_local, sm_count, arch, resident)
+            key = prefill_front_kernel_key(plan)
             counters, _ = _control_words(
                 index, _arrival_counter_words(plan), 0, lane=lane
             )

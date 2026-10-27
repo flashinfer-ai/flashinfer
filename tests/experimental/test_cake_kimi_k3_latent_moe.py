@@ -367,6 +367,79 @@ def test_front_split_plan_rules():
     assert route_kernel_keys("front", 8, 4096, 152) == ("front:i768e1",)
 
 
+def test_front_fold_plan_rules():
+    """The fold form serves the TP8 rows of 16 row tiles (T = 1793-2048) on every qualified part: nine lanes of
+    eight clusters in the carry mode (the trailing-wave plan runs those 192 pair tiles whole); and the TP8 rows of
+    8 row tiles (T = 897-1024) on sm_103a 152-SM parts: 19 lanes of four clusters keeping the trailing-wave plan's
+    20 split tiles.  Every other row keeps the trailing-wave plan, and so does a device whose co-resident cluster
+    count does not hold the fold grid."""
+    il = i_local_for_tp(8)
+    carry = dict(
+        num_items=72,
+        full_items=8,
+        sk_ipc=9,
+        sk_max_seg=2 * 192,
+        sk_total=24 * 112,
+        sk_tiles=0,
+        fold=True,
+        ws_slots=2 * 144,
+    )
+    for sm_count in QUALIFIED_SM_COUNTS:
+        assert front_split_plan(192, sm_count)["sk_tiles"] == 0
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            assert cb.front_fold_plan(16, il, sm_count, arch) == carry
+            for tokens in (1793, 1800, 2000, 2047, 2048):
+                plan = prefill_front_plan(tokens, il, sm_count, arch)
+                assert plan["m_tiles"] == 16 and plan["grid"] == 144
+                assert plan["evict_first"] and {k: plan[k] for k in carry} == carry
+                assert route_kernel_keys("front", 8, tokens, sm_count, arch=arch) == (
+                    "front:i768e1fold",
+                )
+            for tokens in (1792, 2049, 4096):
+                assert not prefill_front_plan(tokens, il, sm_count, arch)["fold"]
+                key = route_kernel_keys("front", 8, tokens, sm_count, arch=arch)[0]
+                assert "fold" not in key
+            assert cb.front_fold_plan(16, i_local_for_tp(1), sm_count, arch) is None
+            for m_tiles in (2, 4, 6, 14, 18, 32):
+                assert cb.front_fold_plan(m_tiles, il, sm_count, arch) is None
+    split = dict(
+        num_items=76,
+        full_items=4,
+        sk_ipc=19,
+        sk_max_seg=2 * 76,
+        sk_total=24 * 112,
+        sk_tiles=0,
+        fold=True,
+        ws_slots=2 * 152,
+    )
+    assert cb.front_fold_plan(8, il, 152, "sm_103a") == split
+    # t0 = the trailing-wave plan's 76 whole tiles; its 20 split tiles keep their two K runs.
+    assert front_split_plan(96, 152)["full_items"] == 76
+    assert front_split_plan(96, 152)["sk_tiles"] == 20
+    for sm_count, arch in ((148, "sm_100a"), (148, "sm_103a"), (152, "sm_100a")):
+        assert cb.front_fold_plan(8, il, sm_count, arch) is None
+    for tokens in (897, 1000, 1024):
+        assert route_kernel_keys("front", 8, tokens, 152, arch="sm_103a") == (
+            "front:i768e1fold",
+        )
+        assert route_kernel_keys("front", 8, tokens, 152, arch="sm_100a") == (
+            "front:i768e1",
+        )
+        assert route_kernel_keys("front", 8, tokens, 148, arch="sm_103a") == (
+            "front:i768",
+        )
+    # Occupancy guard: fewer co-resident clusters than the fold grid keep the trailing-wave plan.
+    assert prefill_front_plan(2048, il, 148, "sm_100a", 72)["fold"]
+    fallback = prefill_front_plan(2048, il, 148, "sm_100a", 71)
+    assert not fallback["fold"] and fallback["ws_slots"] == 0
+    assert fallback["num_items"] == 192 and fallback["sk_tiles"] == 0
+    assert cb.prefill_front_kernel_key(fallback) == "front:i768"
+    fallback = prefill_front_plan(1024, il, 152, "sm_103a", 75)
+    assert not fallback["fold"] and fallback["sk_tiles"] == 20
+    assert cb.prefill_front_kernel_key(fallback) == "front:i768e1"
+    assert cb.front_kernel_key(il, True, fold=True) == "front:i768e1fold"
+
+
 def test_prefill_tail_plan_and_trigger():
     plan = prefill_tail_plan(256, 8)
     assert (
@@ -440,13 +513,14 @@ COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384
 COVERAGE_PARTIALS = (1, 2, 4)
 
 
-def _reached_programs(sm_count):
-    """The registered programs the routes of the public contract select on ``sm_count`` SMs."""
+def _reached_programs(sm_count, arch):
+    """The registered programs the routes of the public contract select on an ``arch`` device of ``sm_count``
+    SMs."""
     keys = set()
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
             for tokens in COVERAGE_TOKENS:
-                keys.update(route_kernel_keys(stage, tp, tokens, sm_count))
+                keys.update(route_kernel_keys(stage, tp, tokens, sm_count, arch=arch))
     for tp in SUPPORTED_TP:
         for num_partials in COVERAGE_PARTIALS:
             for tokens in (
@@ -467,8 +541,9 @@ def _reached_programs(sm_count):
     return {KERNELS[key] for key in keys if key in KERNELS}
 
 
+@pytest.mark.parametrize("arch", tuple(SUPPORTED_COMPUTE_CAPABILITIES.values()))
 @pytest.mark.parametrize("sm_count", QUALIFIED_SM_COUNTS)
-def test_route_keys_are_registered_for_every_token_count(sm_count):
+def test_route_keys_are_registered_for_every_token_count(sm_count, arch):
     """Every route of the public contract resolves to a registered program on every qualified SM
     count (no token-range holes; the 152-SM plans differ from the 148-SM plans in runtime values --
     stream-K windows, resident pairs -- and in the TP1 tail rows that take the 256 x 512 pair tile
@@ -480,15 +555,15 @@ def test_route_keys_are_registered_for_every_token_count(sm_count):
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
             for tokens in COVERAGE_TOKENS:
-                keys = route_kernel_keys(stage, tp, tokens, sm_count)
+                keys = route_kernel_keys(stage, tp, tokens, sm_count, arch=arch)
                 assert 1 <= len(keys) <= 2
                 for key in keys:
                     assert key in KERNELS, (
-                        f"{stage} tp{tp} T={tokens} on {sm_count} SMs: {key} is not registered"
+                        f"{stage} tp{tp} T={tokens} on {arch} with {sm_count} SMs: {key} is not registered"
                     )
                     reached.add(KERNELS[key])
-                for arch in arches:
-                    assert cake_jit.route_available(arch, keys)
+                for registered in arches:
+                    assert cake_jit.route_available(registered, keys)
     for tp in SUPPORTED_TP:
         for num_partials in COVERAGE_PARTIALS:
             for tokens in range(1, DECODE_MAX_T + 1):
@@ -512,13 +587,17 @@ def test_route_keys_are_registered_for_every_token_count(sm_count):
                         f"tail tp{tp} T={tokens} P={num_partials} on {sm_count} SMs: {key}"
                     )
                     reached.add(KERNELS[key])
-    # Every registered program is reachable on some qualified SM count (on 152 SMs the TP1 tail rows of
+    # Every registered program is reachable on some qualified part (on 152 SMs the TP1 tail rows of
     # 129..512 tokens take the 192-wide instance, so the 256-wide ring-6 / ring-7 program serves 148 SMs
     # only; the TP1 front rows there take the 224-wide instance), serves every registered architecture once
     # and carries a complete launch contract.
     assert reached <= set(MODULES)
     assert set().union(
-        *(_reached_programs(count) for count in QUALIFIED_SM_COUNTS)
+        *(
+            _reached_programs(count, part_arch)
+            for count in QUALIFIED_SM_COUNTS
+            for part_arch in SUPPORTED_COMPUTE_CAPABILITIES.values()
+        )
     ) == set(MODULES)
     for name, record in MODULES.items():
         assert tuple(record["arches"]) == arches, name
@@ -574,9 +653,10 @@ def test_plans_follow_the_device_sm_count():
                 "front", tp, tokens, 148
             ) == route_kernel_keys("front", tp, tokens, 152)
             # The TP1 front rows of 129..512 tokens take the 224-wide tile on 152 SMs, which also
-            # stream the front weights evict_first further: TP8 up to 16384 tokens, TP1 up to 2048.
+            # stream the front weights evict_first further: TP8 up to 16384 tokens, TP1 up to 2048;
+            # the fold form serves the TP8 rows of 16 row tiles on both counts.
             differs = (tp == 1 and DECODE_MAX_T < tokens <= 2048) or (
-                tp == 8 and 768 < tokens <= 16384
+                tp == 8 and 768 < tokens <= 16384 and cb.m_tiles_for(tokens) != 16
             )
             assert same_front == (not differs)
             same_tail = route_kernel_keys("tail", tp, tokens, 148) == route_kernel_keys(
@@ -956,7 +1036,9 @@ def test_front_matches_reference(tp, tokens):
         shared_act,
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
-    assert runner.kernel_keys == route_kernel_keys("front", tp, tokens, runner.sm_count)
+    assert runner.kernel_keys == route_kernel_keys(
+        "front", tp, tokens, runner.sm_count, arch=runner.arch
+    )
     runner()
     torch.cuda.synchronize()
     expected = front_reference(x, w)
@@ -1058,6 +1140,66 @@ def test_front_evict_first_rows_are_a_reroute(monkeypatch, tp, tokens):
         cb.prefill_front_plan.cache_clear()
     assert default.kernel_keys == (f"front:i{il}",)
     assert all(torch.equal(a, b) for a, b in zip(outs, default_outs, strict=True))
+
+
+@pytest.mark.parametrize("tokens", (1000, 1024, 1800, 2000, 2048))
+def test_front_fold_matches_the_trailing_wave_plan(monkeypatch, tokens):
+    """The TP8 rows the fold form serves (16 row tiles on every qualified part, 8 on sm_103a 152-SM parts): the
+    device holds the fold grid, the outputs match the reference and are bitwise those of the trailing-wave plan
+    the occupancy guard falls back to, and re-launches, CUDA-graph replays and the one-shot entry point reproduce
+    them with every counter back at zero."""
+    tp = 8
+    il = i_local_for_tp(tp)
+    device = _require_program("front", tp, tokens)
+    arch = _gpu_arch()
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    m_tiles = cb.m_tiles_for(tokens)
+    fold = cb.front_fold_plan(m_tiles, il, sm_count, arch)
+    if fold is None:
+        pytest.skip(f"no fold route for T={tokens} on {arch} with {sm_count} SMs")
+    resident = cb._front_resident_clusters(0, arch, il)
+    assert sm_count // 2 >= resident >= fold["num_items"]
+    w, x, shared_gate_up = _front_case(device, tp, tokens, 2300 + tokens)
+    runner, outs = _front_run(w, x, shared_gate_up, tp)
+    assert runner.kernel_keys == ("front:i768e1fold",)
+    assert runner.plan["fold"] and runner.plan["grid"] == 2 * fold["num_items"]
+    launch = runner.launches[0]
+    assert launch.cooperative_ctas == runner.plan["grid"]
+    assert launch.ws_numel == 2 * runner.plan["grid"] * cb.BLOCK_M * cb.FRONT_BLOCK_N
+    expected = front_reference(x, w)
+    _assert_close("logits", outs[0], expected["logits"], LOGITS_ATOL, LOGITS_RTOL)
+    _assert_close("latent", outs[1], expected["latent"], ATOL, RTOL)
+    _assert_close("shared_act", outs[2], expected["shared_act"], ATOL, RTOL)
+    first = _snapshot(outs)
+    _assert_words_zero(runner, "fold launch")
+    for rnd in range(3):
+        _nan_fill(outs)
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise(outs, first, f"fold re-launch {rnd}")
+        _assert_words_zero(runner, f"fold re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill(outs)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise(outs, first, f"fold replay {rnd}")
+        _assert_words_zero(runner, f"fold replay {rnd}")
+    _nan_fill(outs)
+    kimi_k3_latent_moe_front(
+        x, w["gate_weight"], w["down_weight"], shared_gate_up, *outs
+    )
+    torch.cuda.synchronize()
+    _assert_bitwise(outs, first, "fold one-shot entry point")
+    monkeypatch.setattr(
+        cb, "_front_resident_clusters", lambda *args: fold["num_items"] - 1
+    )
+    whole, whole_outs = _front_run(w, x, shared_gate_up, tp)
+    assert not whole.plan["fold"]
+    assert whole.kernel_keys == (
+        cb.front_kernel_key(il, cb.front_evict_first(m_tiles, il, sm_count)),
+    )
+    _assert_bitwise(whole_outs, first, "trailing-wave plan")
 
 
 @pytest.mark.parametrize("tokens", SMOKE_TOKENS)
@@ -1423,35 +1565,46 @@ def test_rejects_invalid_operands():
 
 
 def test_partial_workspace_and_control_word_sizes():
-    """Split prefill plans use one ``128 x block_n`` FP32 slot per contributor CTA (whole plans none) and every
-    runner's control words fit one KiB in 128-byte slots."""
+    """Split prefill plans use one ``128 x block_n`` FP32 slot per contributor CTA (whole plans none), the front
+    fold form two ``128 x 256`` slots and two counters per CTA, and every runner's control words fit one KiB in
+    128-byte slots (the fold form's 1.25 KiB on 152 SMs)."""
     for sm_count in QUALIFIED_SM_COUNTS:
-        for tp in SUPPORTED_TP:
-            for tokens in sorted(set(cb.ROW_TOKENS) | {129, 300, 511, 1000, 3000}):
-                if tokens <= DECODE_MAX_T:
-                    continue
-                tail = prefill_tail_plan(tokens, tp, sm_count)
-                front = prefill_front_plan(tokens, i_local_for_tp(tp), sm_count)
-                for stage, plan, block_n, n_u32 in (
-                    ("tail", tail, tail["block_n"], cb.NORM_COUNTER_WORDS),
-                    ("front", front, cb.FRONT_BLOCK_N, 0),
-                ):
-                    slots = plan["sk_tiles"] * plan["sk_max_seg"] * cb.CTA_GROUP
-                    assert cb._partial_ws_numel(stage, plan) == (
-                        slots * cb.BLOCK_M * block_n
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            for tp in SUPPORTED_TP:
+                for tokens in sorted(set(cb.ROW_TOKENS) | {129, 300, 511, 1000, 3000}):
+                    if tokens <= DECODE_MAX_T:
+                        continue
+                    tail = prefill_tail_plan(tokens, tp, sm_count)
+                    front = prefill_front_plan(
+                        tokens, i_local_for_tp(tp), sm_count, arch
                     )
-                    words = cb._arrival_counter_words(plan)
-                    assert words == max(2, plan["sk_tiles"] * cb.CTA_GROUP)
-                    u32_off, slot_words = cb._ctrl_layout(words, n_u32)
-                    assert u32_off >= words and u32_off % cb.CTRL_SLOT_WORDS == 0
-                    assert slot_words % cb.CTRL_SLOT_WORDS == 0
-                    assert slot_words >= u32_off + n_u32 and 4 * slot_words <= 1024
+                    for stage, plan, block_n, n_u32 in (
+                        ("tail", tail, tail["block_n"], cb.NORM_COUNTER_WORDS),
+                        ("front", front, cb.FRONT_BLOCK_N, 0),
+                    ):
+                        if plan.get("fold"):
+                            slots = expected_words = 2 * plan["grid"]
+                            max_bytes = 1280
+                        else:
+                            slots = plan["sk_tiles"] * plan["sk_max_seg"] * cb.CTA_GROUP
+                            expected_words = max(2, plan["sk_tiles"] * cb.CTA_GROUP)
+                            max_bytes = 1024
+                        assert cb._partial_ws_numel(stage, plan) == (
+                            slots * cb.BLOCK_M * block_n
+                        )
+                        words = cb._arrival_counter_words(plan)
+                        assert words == expected_words
+                        u32_off, slot_words = cb._ctrl_layout(words, n_u32)
+                        assert u32_off >= words and u32_off % cb.CTRL_SLOT_WORDS == 0
+                        assert slot_words % cb.CTRL_SLOT_WORDS == 0
+                        assert slot_words >= u32_off + n_u32
+                        assert 4 * slot_words <= max_bytes
     assert cb._ctrl_layout(0, cb.DECODE_COUNTER_WORDS) == (0, cb.CTRL_SLOT_WORDS)
-    # A plan that carries partials between its items states them the same way: the front lane form's sk_tiles
-    # clusters of sk_max_seg 1 take one carry slot and one carry counter per CTA.
-    lane = dict(sk_tiles=72, sk_max_seg=1)
-    assert cb._partial_ws_numel("front", lane) == 144 * cb.BLOCK_M * cb.FRONT_BLOCK_N
-    assert cb._arrival_counter_words(lane) == 144
+    # A plan that carries partials between its items states its slots in ``ws_slots``: the front fold form's two
+    # slots and two counters per CTA.
+    fold = dict(sk_tiles=0, sk_max_seg=384, ws_slots=288)
+    assert cb._partial_ws_numel("front", fold) == 288 * cb.BLOCK_M * cb.FRONT_BLOCK_N
+    assert cb._arrival_counter_words(fold) == 288
 
 
 def test_ws_programs_never_trigger_dependents():
@@ -1596,12 +1749,41 @@ def _force_tail_plan(monkeypatch, **overrides):
 #     per-runner arrival counters;
 #   claimed_112: the TP1 T=256 tail on the claimed program (tail_gemm:tp1e0f1t1ci, cooperative 112-CTA grid): a
 #     second grid starts while the first one's last CTAs retire (claim ticket and retirement words);
-#   decode_coop: the TP1 T=16 decode tail (cooperative fused norm, grid counter).
-_X2_ROWS = ("unfused_split", "claimed_112", "decode_coop")
+#   decode_coop: the TP1 T=16 decode tail (cooperative fused norm, grid counter);
+#   front_fold: the TP8 T=2048 front on the fold program (front:i768e1fold, cooperative 144-CTA grid): its CTAs
+#     wait for the carries other CTAs release (per-runner counters, per-stream partials).
+_X2_ROWS = ("unfused_split", "claimed_112", "decode_coop", "front_fold")
+
+
+def _x2_front_fold_runner(device, seed):
+    tp, tokens = 8, 2048
+    _require_program("front", tp, tokens)
+    args = _front_args(device, tp, tokens, seed)
+    runner = prepare_kimi_k3_latent_moe_front(*args)
+    assert runner.kernel_keys == ("front:i768e1fold",)
+    runner()
+    torch.cuda.synchronize()
+    x, gate_weight, down_weight, shared_gate_up, logits, latent, shared_act = args
+    i_local = SHARED_INTERMEDIATE // tp
+    expected = front_reference(
+        x,
+        dict(
+            gate_weight=gate_weight,
+            down_weight=down_weight,
+            shared_gate_weight=shared_gate_up[:i_local],
+            shared_up_weight=shared_gate_up[i_local:],
+        ),
+    )
+    _assert_close("logits", logits, expected["logits"], LOGITS_ATOL, LOGITS_RTOL)
+    _assert_close("latent", latent, expected["latent"], ATOL, RTOL)
+    _assert_close("shared_act", shared_act, expected["shared_act"], ATOL, RTOL)
+    return runner
 
 
 def _x2_runner(device, monkeypatch, row, seed):
     """A runner of ``row`` (``_X2_ROWS``) on its own inputs, checked once against the torch reference."""
+    if row == "front_fold":
+        return _x2_front_fold_runner(device, seed)
     tokens = 16 if row == "decode_coop" else 256
     if row == "unfused_split":
         _force_tail_plan(monkeypatch, fused_norm=False, claim_items=False)
@@ -1660,6 +1842,7 @@ def _gate(streams):
         ("front", 8, 16, 1),
         ("front", 8, 256, 1),
         ("front", 1, 1024, 1),
+        ("front", 8, 2048, 1),
         ("tail", 8, 8, 2),
         ("tail", 1, 16, 1),
         ("tail", 1, 256, 1),
@@ -1686,7 +1869,9 @@ def test_runner_control_words_private(stage, tp, tokens, num_partials):
             if "ws" in launch.kwargs:
                 ws_numel = cb._partial_ws_numel(stage, r.plan)
                 assert launch.ws_numel == ws_numel
-                assert (ws_numel > 0) == (r.plan["sk_tiles"] > 0)
+                assert (ws_numel > 0) == (
+                    r.plan["sk_tiles"] > 0 or r.plan.get("ws_slots", 0) > 0
+                )
                 assert launch.kwargs["ws"].data_ptr() == (
                     cb._read_never(device.index)[0].data_ptr()
                 )
@@ -1857,7 +2042,7 @@ def test_concurrent_streams_x2(monkeypatch, row):
         _assert_words_zero(r, row)
 
 
-@pytest.mark.parametrize("row", ("unfused_split", "decode_coop"))
+@pytest.mark.parametrize("row", ("unfused_split", "decode_coop", "front_fold"))
 def test_graphs_replayed_concurrently(monkeypatch, row):
     """Graphs capturing two runners (default private pools) replay concurrently on two streams bitwise."""
     device = torch.device("cuda", 0) if torch.cuda.is_available() else None
@@ -2042,7 +2227,7 @@ def test_functional_first_call_on_fresh_slab(monkeypatch, stage, tp, tokens):
     _assert_bitwise(outputs, reference, f"{stage} first one-shot call")
 
 
-@pytest.mark.parametrize("row", ("decode_coop", "claimed_112"))
+@pytest.mark.parametrize("row", ("decode_coop", "claimed_112", "front_fold"))
 def test_cooperative_refusal_in_small_green_context(monkeypatch, row):
     """A cooperative route launched eagerly on a green context with fewer SMs than it needs raises a clean error
     naming the route and its minimum SMs and leaves no CUDA error behind: the next torch op and a full-device
