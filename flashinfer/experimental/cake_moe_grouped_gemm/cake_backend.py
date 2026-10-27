@@ -34,9 +34,17 @@ decisions exactly from ``HOST_PLAN_CONSTANTS``.
 Program choice.  ``fwd`` and ``dgrad`` launch the 512-column output tile (the
 route's ``main_wide`` stage) when the output columns are a multiple of
 ``wide_block_n`` and the architecture is listed in ``wide_fwd_archs`` /
-``wide_dgrad_archs``, else the 256-column tile (``main``).  The weight gradient
-launches the wave-synchronised build (``main_wave``) from ``wave_sync_min_k``
-on the architectures ``wave_sync_archs`` lists for its k tile, with the
+``wide_dgrad_archs``, else the 256-column tile (``main``).  On the
+architectures of ``dgrad_evict_first_archs`` the data gradient launches the
+twin of its wide tile that loads G and stores dX with the L2 evict-first policy
+(``main_wide_ef``) when the groups average at least
+``dgrad_evict_first_min_rows`` rows (``sum_m // E``) and dX has at least
+``dgrad_evict_first_min_k`` columns (``K``).  The weight gradient takes the
+512-wide k tile when ``K`` is a multiple of 512, the architecture is listed in
+``k512_archs`` and the groups average at least the architecture's
+``k512_min_rows_per_group`` rows, else the 256-wide tile.  It launches the
+wave-synchronised build (``main_wave``) from ``wave_sync_min_k`` on the
+architectures ``wave_sync_archs`` lists for its k tile, with the
 architecture's ``wave_sync_mode``; with the 512-wide k tile on the
 architectures listed in ``k512_release_archs`` it launches the twin of that
 build that releases the accumulator in two halves (``main_halves`` /
@@ -255,14 +263,17 @@ def select_wgrad_tile(
     num_groups: int,
     constants: Optional[dict[str, Any]] = None,
 ) -> int:
-    """The production k-tile rule for a weight gradient of shape ``(sum_m, num_groups, k)``."""
+    """The production k-tile rule for a weight gradient of shape ``(sum_m, num_groups, k)``:
+    the row threshold is the architecture's ``k512_min_rows_per_group``."""
     c = constants or host_plan_constants()
+    k512_archs = tuple(c["k512_archs"])
+    min_rows = c["k512_min_rows_per_group"]
     return wgrad_tile_k(
         k,
         arch,
         sum_m / max(num_groups, 1),
-        k512_archs=tuple(c["k512_archs"]),
-        k512_min_rows_per_group=int(c["k512_min_rows_per_group"]),
+        k512_archs=k512_archs,
+        k512_min_rows_per_group=int(min_rows[arch]) if arch in k512_archs else 0,
     )
 
 
@@ -374,6 +385,28 @@ def plan_wgrad(
     )
 
 
+def dgrad_evict_first(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the data gradient's wide tile takes its L2 evict-first twin.
+
+    ``k`` is the dgrad ``K``, the columns of ``dX`` (``w.shape[2]``); the reduction runs
+    over ``N`` (``w.shape[1]``).  The twin keeps each group's weights resident in L2 when a
+    group spans many 256-row blocks: the groups average at least
+    ``dgrad_evict_first_min_rows`` rows (``sum_m // num_groups``) and every 256-row block
+    has at least ``dgrad_evict_first_min_k / wide_block_n`` column tiles."""
+    c = constants or host_plan_constants()
+    return (
+        arch in c["dgrad_evict_first_archs"]
+        and sum_m // max(num_groups, 1) >= int(c["dgrad_evict_first_min_rows"])
+        and k >= int(c["dgrad_evict_first_min_k"])
+    )
+
+
 def select_row_stage(
     name: str,
     op: str,
@@ -381,12 +414,23 @@ def select_row_stage(
     k: int,
     arch: str,
     constants: Optional[dict[str, Any]] = None,
+    *,
+    sum_m: int,
+    num_groups: int,
 ) -> tuple[str, int]:
     """``(stage, tile_n)`` of route ``name`` for ``fwd`` / ``dgrad``: ``main_wide`` with the wide
-    tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with ``block_n``."""
+    tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with
+    ``block_n``; a data gradient takes ``main_wide_ef`` in place of ``main_wide`` where
+    ``dgrad_evict_first`` holds and the route serves it on ``arch``."""
     c = constants or host_plan_constants()
     tile_n = fwd_dgrad_tile_n(op, n, k, arch, c)
     if tile_n != int(c["block_n"]) and stage_served(name, "main_wide", arch):
+        if (
+            op == "dgrad"
+            and dgrad_evict_first(k, arch, sum_m, num_groups, c)
+            and stage_served(name, "main_wide_ef", arch)
+        ):
+            return "main_wide_ef", tile_n
         return "main_wide", tile_n
     return "main", int(c["block_n"])
 
@@ -736,7 +780,9 @@ def _prepare_row_op(
         )
     arch = arch_for(device)
     name = select_module(op, arch)
-    stage, tile_n = select_row_stage(name, op, n, k, arch, c)
+    stage, tile_n = select_row_stage(
+        name, op, n, k, arch, c, sum_m=sum_m, num_groups=num_groups
+    )
     plan = plan_fwd_dgrad(
         op,
         sum_m=sum_m,
@@ -796,7 +842,8 @@ def prepare_grouped_gemm_dgrad(
     ``g``: ``[sum_m, N]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``K % 256 == 0``, ``N % 64 == 0`` (the
     512-column tile when ``K % 512 == 0`` on the architectures of
-    ``wide_dgrad_archs``).
+    ``wide_dgrad_archs``, its L2 evict-first twin where ``dgrad_evict_first``
+    holds for ``K``, ``sum_m`` and ``E``).
     """
     return _prepare_row_op("dgrad", g, w, offs, out)
 

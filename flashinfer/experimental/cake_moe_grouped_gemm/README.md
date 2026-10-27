@@ -116,7 +116,15 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   (`fwd`) or `wide_dgrad_archs` (`dgrad`), 256 (`block_n`) otherwise. The
   512-column programs are the routes' `main_wide` stage; every output element
   accumulates its k steps in the same order in both tiles, so both give the
-  same bits.
+  same bits. The `sm_107a` `dgrad` program of that stage keeps each G tile in
+  the tensor core's A collector for both 256-column halves of the tile.
+- `dgrad` L2 evict-first twin (`dgrad_evict_first`): on the architectures
+  listed in `dgrad_evict_first_archs`, when the groups average at least
+  `dgrad_evict_first_min_rows` rows (`sum_m // E`) and `dX` has at least
+  `dgrad_evict_first_min_k` columns (`K`), the wide tile is the route's
+  `main_wide_ef` stage: the same program with G loaded and `dX` stored under
+  the L2 evict-first policy, so a group's weights stay resident in L2 while
+  its row blocks stream past them. Its output is bitwise that of `main_wide`.
 - `fwd` / `dgrad` tile order on `sm_100a` / `sm_103a`: the column tiles of
   every 256-row block are split between two claim queues, one per locality
   domain of the device, in proportion to the clusters that claim each queue
@@ -126,10 +134,10 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   split. The `sm_107a` programs stride the tiles over the clusters in the same
   row-block-major order and ignore the queues.
 - Weight-gradient k tile (`select_wgrad_tile`): 512 when `K % 512 == 0`, the
-  architecture is listed for it and the average rows per group reach the
-  delivered threshold; 256 otherwise. The two tiles are separate registered
-  programs; the fp32 output is the compile-line specialization
-  `-DWGRAD_OUT=32` of the bf16 program.
+  architecture is listed in `k512_archs` and the average rows per group reach
+  the architecture's `k512_min_rows_per_group`; 256 otherwise. The two tiles
+  are separate registered programs; the fp32 output is the compile-line
+  specialization `-DWGRAD_OUT=32` of the bf16 program.
 - Weight-gradient tail: the tiles of the last partial wave are split into
   `tail_splits` k-step chunks over all clusters (`wgrad_tail_tiles`,
   `wgrad_tail_plan`, a closed-form cost model of rounds, partial traffic and one

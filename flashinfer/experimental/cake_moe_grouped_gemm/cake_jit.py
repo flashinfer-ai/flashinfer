@@ -48,17 +48,26 @@ from . import cake_build
 # among the route's: a route may name two stages of one name whose programs
 # serve disjoint architectures (the forward and data-gradient ``main`` and
 # ``main_wide`` stages: the domain-scheduled program on sm_100a / sm_103a, the
-# static program on sm_107a; the 512-wide k tile's weight-gradient ``main``
-# stage: one build on sm_100a / sm_103a, another on sm_107a), so a stage is
-# looked up per architecture (``stage_binding``).  The
-# host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``:
-# the forward and data-gradient ``main_wide`` stage is the program with the
-# 512-column output tile (``wide_block_n``), launched on the architectures of
-# ``wide_fwd_archs`` / ``wide_dgrad_archs`` when the output columns are a
-# multiple of it; the weight-gradient ``main_wave`` stage is the main program
-# with wave synchronisation, launched from ``wave_sync_min_k`` on the
-# architectures ``wave_sync_archs`` lists for the k tile, with the
-# architecture's ``wave_sync_mode``; the 512-wide k tile's ``main_halves`` and
+# static program on sm_107a, whose data-gradient ``main_wide`` program keeps
+# each G tile in the tensor core's A collector for both 256-column halves of
+# the output tile; the 512-wide k tile's weight-gradient ``main`` stage: one
+# build on sm_100a / sm_103a, another on sm_107a), so a stage is looked up per
+# architecture (``stage_binding``).  The host chooses among the stages a route
+# serves by ``HOST_PLAN_CONSTANTS``: the forward and data-gradient
+# ``main_wide`` stage is the program with the 512-column output tile
+# (``wide_block_n``), launched on the architectures of ``wide_fwd_archs`` /
+# ``wide_dgrad_archs`` when the output columns are a multiple of it; the
+# data-gradient ``main_wide_ef`` stage is its twin that loads G and stores dX
+# with the L2 evict-first policy, so the group's weights stay resident in L2,
+# launched in its place on the architectures of ``dgrad_evict_first_archs``
+# when the groups average at least ``dgrad_evict_first_min_rows`` rows and the
+# output has at least ``dgrad_evict_first_min_k`` columns; the weight gradient
+# takes the 512-wide k tile on the architectures of ``k512_archs`` when the
+# groups average at least the architecture's ``k512_min_rows_per_group`` rows;
+# the weight-gradient ``main_wave`` stage is the main program with wave
+# synchronisation, launched from ``wave_sync_min_k`` on the architectures
+# ``wave_sync_archs`` lists for the k tile, with the architecture's
+# ``wave_sync_mode``; the 512-wide k tile's ``main_halves`` and
 # ``main_wave_halves`` stages are the twins of ``main`` and ``main_wave`` that
 # release the accumulator in two halves, launched on the architectures of
 # ``k512_release_archs``.
@@ -651,7 +660,10 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "block_n": 256,
     "wide_block_n": 512,
     "wide_fwd_archs": ["sm_100a", "sm_103a", "sm_107a"],
-    "wide_dgrad_archs": ["sm_100a", "sm_103a"],
+    "wide_dgrad_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "dgrad_evict_first_archs": ["sm_107a"],
+    "dgrad_evict_first_min_rows": 16384,
+    "dgrad_evict_first_min_k": 4096,
     "block_k": 64,
     "cta_group": 2,
     "cluster_m": 256,
@@ -659,14 +671,14 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "tmap_slot_bytes": 128,
     "tmap_slots_per_cta": 18,
     "k512_archs": ["sm_100a", "sm_103a", "sm_107a"],
-    "k512_release_archs": ["sm_100a", "sm_103a"],
-    "k512_min_rows_per_group": 8192,
+    "k512_release_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "k512_min_rows_per_group": {"sm_100a": 8192, "sm_103a": 8192, "sm_107a": 4096},
     "wave_sync_min_k": 4096,
     "wave_sync_archs": {
         256: ["sm_100a", "sm_103a"],
-        512: ["sm_100a", "sm_103a", "sm_107a"],
+        512: ["sm_100a", "sm_103a"],
     },
-    "wave_sync_mode": {"sm_100a": 2, "sm_103a": 2, "sm_107a": 1},
+    "wave_sync_mode": {"sm_100a": 2, "sm_103a": 2},
     "wave_sync_words": 2,
     "sched_words": 4224,
     "sched_rest": [0, 2147483648, 0],
