@@ -4188,13 +4188,18 @@ _CONTEXT_FP8_SPLIT_COSTS: dict[str, tuple[float, ...]] = {
     "sm100a": (5.294, 1.529, 3.327, 3.425, 1.383, 1.661, 0.014),
     "sm103a": (5.703, 1.247, 2.046, 0.256, 3.705, 1.648, 0.023),
 }
-# The share of the partial store and the merge that a split tile holding one
-# 128-row query stage costs, against a tile of two stages (the program stores
-# and merges the rows of the stages its queries reach), per target.  Fitted to
-# timed split launches of the same plan over two packs (B200, GB300).
-_CONTEXT_FP8_SPLIT_ONE_STAGE: dict[str, float] = {
-    "sm100a": 0.750,
-    "sm103a": 0.734,
+# The query rows of a tile scale its unit and its partial store and merge (the
+# program loads, stores and merges the rows of the stages its queries reach):
+# a tile of ``r`` of 256 query rows (``r = min(max_q_len x pack, 256)`` in a
+# launch of one m-block, else 256) pays ``S0 + (1 - S0) x r / 256`` of a full
+# tile's partial store and merge and ``U0 + (1 - U0) x r / 256`` of its unit.
+# The split choice compares packs under these costs
+# (:func:`_context_fp8_split_choice`); a pack's own plan keeps the costs
+# above.  ``(S0, U0)`` per target, fitted with the costs above fixed to timed
+# split launches of every shipped pack (B200, GB300).
+_CONTEXT_FP8_SPLIT_ROWS: dict[str, tuple[float, float]] = {
+    "sm100a": (0.640, 0.302),
+    "sm103a": (0.591, 0.124),
 }
 # A split must be predicted faster than the whole-tile schedule by both
 # margins (2 % and 0.5 us: the smallest that timed plans of B200 and GB300
@@ -4232,6 +4237,36 @@ def _context_fp8_tile_blocks(
     return blocks
 
 
+@functools.lru_cache(maxsize=256)
+def _context_fp8_split_costs(
+    target: str, max_q_len: int, pack: int
+) -> tuple[float, ...] | None:
+    """The split cost model of a launch of ``pack`` at ``max_q_len`` query
+    tokens: :data:`_CONTEXT_FP8_SPLIT_COSTS` with the unit, the partial store
+    and the merge scaled by the query rows of its tiles
+    (:data:`_CONTEXT_FP8_SPLIT_ROWS`), or ``None`` for a target without one."""
+
+    costs = _CONTEXT_FP8_SPLIT_COSTS.get(target)
+    rows = 256
+    if max_q_len <= 2 * (128 // pack):
+        rows = min(max_q_len * pack, 256)
+    if costs is None or rows == 256:
+        return costs
+    s0, u0 = _CONTEXT_FP8_SPLIT_ROWS.get(target, (1.0, 1.0))
+    store_share = s0 + (1.0 - s0) * rows / 256
+    unit_share = u0 + (1.0 - u0) * rows / 256
+    fixed, block, unit, store, merge0, merge1, extra = costs
+    return (
+        fixed,
+        block,
+        unit * unit_share,
+        store * store_share,
+        merge0 * store_share,
+        merge1 * store_share,
+        extra,
+    )
+
+
 def _context_fp8_split_makespan(
     blocks: list[int],
     sm_count: int,
@@ -4239,19 +4274,15 @@ def _context_fp8_split_makespan(
     split_blocks: int,
     num_splits: int,
     costs: tuple[float, ...],
-    one_stage: float = 1.0,
 ) -> float:
     """The predicted time of a plan: the persistent CTAs draw the work units in
     ticket order (the split units split-major, then the other tiles whole), a
     unit costs ``unit + blocks x block`` (plus the partial store when its tile
     has more than one unit), the tile's last finisher merges, and the launch
-    adds its fixed cost and the extra units' share.  ``one_stage`` scales the
-    partial store and the merge (a launch whose tiles hold one query stage
-    stores and merges the rows of one stage:
-    :data:`_CONTEXT_FP8_SPLIT_ONE_STAGE`)."""
+    adds its fixed cost and the extra units' share (``costs``: a launch's
+    :func:`_context_fp8_split_costs`)."""
 
     fixed, block, unit, store, merge0, merge1, extra = costs
-    store, merge0, merge1 = store * one_stage, merge0 * one_stage, merge1 * one_stage
     tiles = len(blocks)
     split_tiles = min(split_tiles, tiles) if num_splits > 1 else 0
     ctas = min(sm_count, tiles + (num_splits - 1) * split_tiles)
@@ -4289,7 +4320,7 @@ def _context_fp8_split_makespan(
 
 
 @functools.lru_cache(maxsize=1024)
-def _context_fp8_split_plan(
+def _context_fp8_split_search(
     target: str,
     batch_size: int,
     max_q_len: int,
@@ -4297,16 +4328,24 @@ def _context_fp8_split_plan(
     num_q_heads: int,
     pack: int,
     sm_count: int,
-) -> tuple[int, int, int] | None:
-    """``(split_tiles, split_blocks, num_splits)`` of the split-KV launch the
-    cost model predicts fastest, or ``None`` when no split beats the
-    whole-tile schedule by the margins (a pure function of its integers,
-    cached).  The candidates split the tiles the idle CTAs of the last wave
-    can take, ``num_splits`` from 2 up, ``split_blocks`` the even split of the
-    longest tile; at most ``sm_count - 1`` tiles split, so the per-tile
-    counters fit in the counter buffer after its first word."""
+    rows: bool,
+) -> tuple[tuple[int, int, int] | None, float, float] | None:
+    """The split of a launch of ``pack`` the cost model predicts fastest
+    (:data:`_CONTEXT_FP8_SPLIT_COSTS`, scaled by the query rows of its tiles
+    where ``rows``: :func:`_context_fp8_split_costs`), its predicted time
+    and the whole-tile schedule's, or ``None`` without a cost model or for a
+    launch of more than :data:`_CONTEXT_FP8_SPLIT_MAX_WAVES` waves of tiles (a
+    pure function of its integers, cached).  The candidates split the tiles
+    the idle CTAs of the last wave can take, ``num_splits`` from 2 up,
+    ``split_blocks`` the even split of the longest tile; at most ``sm_count -
+    1`` tiles split, so the per-tile counters fit in the counter buffer after
+    its first word."""
 
-    costs = _CONTEXT_FP8_SPLIT_COSTS.get(target)
+    costs = (
+        _context_fp8_split_costs(target, max_q_len, pack)
+        if rows
+        else _CONTEXT_FP8_SPLIT_COSTS.get(target)
+    )
     blocks = _context_fp8_tile_blocks(
         batch_size, max_q_len, max_kv_len, num_q_heads, pack
     )
@@ -4333,13 +4372,44 @@ def _context_fp8_split_plan(
             )
             if time < best_time:
                 best, best_time = (split_tiles, split_blocks, num_splits), time
+    return best, best_time, whole
+
+
+def _context_fp8_split_gain(time: float, faster: float) -> bool:
+    """Whether ``faster`` beats ``time`` by both split margins."""
+
+    return (
+        faster <= time * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
+        and time - faster >= _CONTEXT_FP8_SPLIT_ABS_MARGIN
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_split_plan(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, int, int] | None:
+    """``(split_tiles, split_blocks, num_splits)`` of the split-KV launch of
+    ``pack`` the cost model (:data:`_CONTEXT_FP8_SPLIT_COSTS`) predicts
+    fastest (:func:`_context_fp8_split_search`), or ``None`` when no split
+    beats the whole-tile schedule by the margins (a pure function of its
+    integers, cached)."""
+
+    found = _context_fp8_split_search(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count, False
+    )
     if (
-        best is None
-        or best_time > whole * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
-        or whole - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+        found is None
+        or found[0] is None
+        or not _context_fp8_split_gain(found[2], found[1])
     ):
         return None
-    return best
+    return found[0]
 
 
 @functools.lru_cache(maxsize=1024)
@@ -4357,52 +4427,78 @@ def _context_fp8_split_choice(
     its integers, cached).
 
     The plan is ``pack``'s (:func:`_context_fp8_split_plan`), except for a
-    launch of one m-block of two query stages whose plan splits every tile: a
-    smaller shipped pack whose tiles hold every query token in one stage runs
-    the same split (``split_blocks`` and ``num_splits``) over its tiles, where
-    the cost model predicts it faster by the margins.  Every query row meets
-    the same KV units, merged in the same order, so the output is the same;
-    the launch only has more, cheaper units (one stage stored and merged)."""
+    launch of one m-block, whose tiles a smaller shipped pack holds in one
+    query stage each (fewer query rows per tile: the cost model's units,
+    partial stores and merges cost less, :func:`_context_fp8_split_costs`):
+
+    - a launch of two query stages whose plan splits every tile runs the same
+      split (``split_blocks`` and ``num_splits``) over the tiles of a smaller
+      pack, where predicted faster by the margins: every query row meets the
+      same KV units, merged in the same order, so the output is the same;
+    - then the launch takes the best split of a smaller pack (its own plan)
+      where predicted faster than that by the margins: its rows meet other KV
+      units, so the output differs by the rounding of the FP32 merge only."""
 
     plan = _context_fp8_split_plan(
         target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
     )
-    if plan is None:
-        return None
-    share = _CONTEXT_FP8_SPLIT_ONE_STAGE.get(target, 1.0)
+    choice = None if plan is None else (pack, plan)
     tokens = 128 // pack
-    if share >= 1.0 or not tokens < max_q_len <= 2 * tokens:
-        return pack, plan
-    costs = _CONTEXT_FP8_SPLIT_COSTS[target]
+    costs = _context_fp8_split_costs(target, max_q_len, pack)
     blocks = _context_fp8_tile_blocks(
         batch_size, max_q_len, max_kv_len, num_q_heads, pack
     )
-    if plan[0] < len(blocks):
-        return pack, plan
-    _, split_blocks, num_splits = plan
-    time = _context_fp8_split_makespan(blocks, sm_count, *plan, costs)
-    best, best_time = (pack, plan), time
-    for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1):
-        if smaller >= pack or pack % smaller or max_q_len > 128 // smaller:
-            continue
-        blocks = _context_fp8_tile_blocks(
-            batch_size, max_q_len, max_kv_len, num_q_heads, smaller
-        )
-        if len(blocks) > sm_count - 1:
-            continue
-        candidate = (len(blocks), split_blocks, num_splits)
-        candidate_time = _context_fp8_split_makespan(
-            blocks, sm_count, *candidate, costs, share
-        )
-        if candidate_time < best_time:
-            best, best_time = (smaller, candidate), candidate_time
     if (
-        best[0] == pack
-        or best_time > time * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
-        or time - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+        costs is None
+        or max_q_len > 2 * tokens
+        or len(blocks) > _CONTEXT_FP8_SPLIT_MAX_WAVES * sm_count
     ):
-        return pack, plan
-    return best
+        return choice
+    smaller_packs = [
+        smaller
+        for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
+        if smaller < pack and pack % smaller == 0
+    ]
+    time = _context_fp8_split_makespan(blocks, sm_count, *(plan or (0, 1, 1)), costs)
+    if plan is not None and max_q_len > tokens and plan[0] == len(blocks):
+        repack: tuple[int, tuple[int, int, int]] | None = None
+        repack_time = time
+        for smaller in smaller_packs:
+            tiles = _context_fp8_tile_blocks(
+                batch_size, max_q_len, max_kv_len, num_q_heads, smaller
+            )
+            tile_costs = _context_fp8_split_costs(target, max_q_len, smaller)
+            if len(tiles) > sm_count - 1 or tile_costs is None:
+                continue
+            candidate = (len(tiles), plan[1], plan[2])
+            candidate_time = _context_fp8_split_makespan(
+                tiles, sm_count, *candidate, tile_costs
+            )
+            if candidate_time < repack_time:
+                repack, repack_time = (smaller, candidate), candidate_time
+        if repack is not None and _context_fp8_split_gain(time, repack_time):
+            choice, time = repack, repack_time
+    challenger: tuple[int, tuple[int, int, int]] | None = None
+    challenger_time = time
+    for smaller in smaller_packs:
+        found = _context_fp8_split_search(
+            target,
+            batch_size,
+            max_q_len,
+            max_kv_len,
+            num_q_heads,
+            smaller,
+            sm_count,
+            True,
+        )
+        if found is None:
+            continue
+        own_plan, own_time, _ = found
+        if own_plan is not None and own_time < challenger_time:
+            challenger, challenger_time = (smaller, own_plan), own_time
+    if challenger is not None and _context_fp8_split_gain(time, challenger_time):
+        return challenger
+    return choice
 
 
 def _context_fp8_launch_split_plan(
