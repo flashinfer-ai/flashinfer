@@ -350,7 +350,10 @@ SM103_NARROW_ROUTES = [
 # multiple of 64), PACKED on 8 rows without a bias and 9 to 16 with one from 3584
 # output features, with a bias 28 to 32 rows from 2048 output features, without one
 # 9 to 16 rows from 1728; the M=64 tiles at 2048 to 3072 output features (corners,
-# and the measured shapes past them).
+# and the measured shapes past them); PACKED on 17 to 23 rows without a bias whose
+# activations take less than 128 KiB, from an input of 2048 on 17 to 21 rows and from
+# 2816 / 2688 on 22 / 23 rows (the corners, the first input past 128 KiB, an input
+# below the start, 24 rows and a bias keep their kernels).
 SM107_ROUTES = [
     (4, 384, 16384, True, "PACKED_NARROW_U4"),
     (3, 512, 16384, True, "PACKED_NARROW_U4"),
@@ -421,6 +424,19 @@ SM107_ROUTES = [
     (28, 1536, 4096, True, None),
     (32, 2048, 3072, True, "PACKED"),
     (64, 4096, 3072, True, "ACCUMULATORS"),
+    (17, 4096, 3848, False, "PACKED"),
+    (17, 4096, 3856, False, "ACCUMULATORS"),
+    (22, 3408, 2976, False, "PACKED"),
+    (21, 3456, 2048, False, "PACKED"),
+    (22, 3408, 2816, False, "PACKED"),
+    (22, 3408, 2808, False, "ACCUMULATORS"),
+    (23, 3456, 2688, False, "PACKED"),
+    (23, 3456, 2680, False, "ACCUMULATORS"),
+    (23, 3456, 2048, False, "ACCUMULATORS"),
+    (23, 4096, 2856, False, "ACCUMULATORS"),
+    (20, 4096, 2040, False, "ACCUMULATORS"),
+    (24, 4096, 2048, False, "ACCUMULATORS"),
+    (20, 4096, 3272, True, None),
 ]
 ROUTES = (
     [
