@@ -159,17 +159,24 @@ jobs:
           # Filter by head repository to avoid cancelling runs from a different
           # fork that happens to share the same branch name.
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            STALE_RUNS=$(gh run list \
-              --repo "${{ github.repository }}" \
-              --workflow "pr-test.yml" \
-              --branch "$HEAD_REF" \
-              --json databaseId,status,headSha,headRepository \
-              --jq "[.[]
-                | select(.headSha != \"${HEAD_SHA}\"
-                  and (.status == \"in_progress\" or .status == \"queued\")
-                  and (.headRepository.full_name // .headRepository.name) == \"${HEAD_REPO}\")]
-                | .[].databaseId" \
-              2>/dev/null) || STALE_RUNS=""
+            # Use the workflow runs API directly — gh run list doesn't expose
+            # head_repository, which we need to avoid cancelling runs from a
+            # different fork that shares the same branch name.
+            WORKFLOW_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows/pr-test.yml" \
+              --jq '.id' 2>/dev/null) || WORKFLOW_ID=""
+
+            if [[ -n "$WORKFLOW_ID" ]]; then
+              STALE_RUNS=$(gh api "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs?branch=${HEAD_REF}&event=pull_request&per_page=50" \
+                --jq "[.workflow_runs[]
+                  | select(.head_sha != \"${HEAD_SHA}\"
+                    and (.status == \"in_progress\" or .status == \"queued\")
+                    and .head_repository.full_name == \"${HEAD_REPO}\")]
+                  | .[].id" \
+                2>/dev/null) || STALE_RUNS=""
+            else
+              echo "::warning::Could not resolve pr-test.yml workflow ID; skipping stale run cancellation"
+              STALE_RUNS=""
+            fi
 
             for RUN_ID in $STALE_RUNS; do
               echo "Cancelling stale run $RUN_ID (previous commit)"
