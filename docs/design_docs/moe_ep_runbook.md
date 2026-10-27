@@ -577,7 +577,7 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
 # 1) hold a 4-GPU node; run every command through the container helper:
-JOBID=$(sbatch --parsable -A coreai_libraries_cudnn -p batch -N1 \
+JOBID=$(sbatch --parsable -A "$SLURM_ACCOUNT" -p batch -N1 \
     --ntasks-per-node=1 --time=04:00:00 -J fi.vllm_e2e.hold \
     --output=$W/logs/hold_%j.log --wrap "sleep 14400")
 # 2) one-time venv: vllm==0.25.1 + editable fi branch + patch_0251 (keeps
@@ -639,6 +639,26 @@ prefill chunks), per-role offline knob caches.
 ---
 
 ## Blackwell standard autotuning
+
+`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` selects standard inference
+with MXFP4 weights, MXFP8 E4M3 activations and BF16 output. Hidden and
+intermediate sizes must be multiples of 128. Supply canonical BF16 weights
+or packed E2M1 weights with unswizzled per-32 E8M0 scales; preprocessing
+packs the gate/up layout once at construction.
+
+With `MegaConfig.quantize_input=True`, eligible BF16 inputs use fused
+quantization and workspace staging. `quantize_input=False` takes E4M3 data
+and linear E8M0 scales, copies them into the workspace, and uses the shared
+route-staging kernel to convert IDs and scores and zero masked scores.
+Unsupported layouts or `FLASHINFER_MEGA_FUSED_STAGE=0` use Torch staging.
+As on the other Blackwell paths, callers supply valid routing values.
+This configuration supports default/fixed knobs and `knobs="auto"` below;
+offline tuning uses `--arch sm100 --implementation next --dtype mxfp4_mxfp8`.
+For GenPhase, use `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`
+with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
+
+Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
+weight, staging and shared-workspace graph-replay checks.
 
 The `sm100_nvfp4_nvfp4_bf16_cutedsl_next` and
 `sm100_mxfp8_mxfp8_bf16_cutedsl_next` selectors support `knobs="auto"` through

@@ -400,7 +400,7 @@ def fused_quant_stage(
     ``scale_multiplier`` optionally supplies the rounded ``norm_const / 6``
     factor used by the caller's NVFP4 quantization contract.
     ``mxfp8_normal_scales`` clamps MXFP8 scales to the normal FP32 range,
-    matching Rubin's Torch quantizer; other callers retain the full E8M0 range.
+    matching the block-scaled Torch quantizer; other callers retain the full E8M0 range.
     ``num_experts`` optionally checks route bounds, uniqueness and finite
     unmasked scores in the same kernel, before narrowing IDs to int32.
     ``fuse_tail_mask`` additionally masks all trailing routing rows in that

@@ -308,7 +308,9 @@ def test_route_staging_rebinds_and_replays(
 
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
     monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
-    monkeypatch.setattr(routing_staging, "_COMPILED", {})
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared_staging
+
+    monkeypatch.setattr(shared_staging, "_COMPILED", {})
     topk, capacity = 6, 1032
     workspace = SimpleNamespace()
     ids_out = torch.full((capacity, topk), -7, device="cuda", dtype=torch.int32)
@@ -326,7 +328,7 @@ def test_route_staging_rebinds_and_replays(
     scores.fill_(1)
     routing_staging.stage_routes(ids, scores, ids_out, scores_out, workspace=workspace)
     torch.cuda.synchronize()
-    assert len(routing_staging._COMPILED) == 1
+    assert len(shared_staging._COMPILED) == 1
 
     def unexpected_compile(*args, **kwargs):
         pytest.fail("A new row count must reuse the warmed route-staging kernel")
