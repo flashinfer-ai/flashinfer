@@ -431,6 +431,8 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
+        # MXFP8 Q/K: float8_e4m3fn data with one E8M0 scale per 32 channels.
+        torch.float8_e8m0fnu: "float8_e8m0fnu",
         torch.int8: "int8",
     }
     try:
@@ -438,7 +440,8 @@ def _dtype_key(dtype: torch.dtype) -> str:
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts context supports torch.float16, torch.bfloat16, "
-            f"torch.float8_e4m3fn, and torch.int8 Q/K; got {dtype}"
+            "torch.float8_e4m3fn, torch.float8_e8m0fnu (MXFP8), and torch.int8 "
+            f"Q/K; got {dtype}"
         ) from error
 
 
@@ -446,10 +449,11 @@ def _v_dtype_follows_qk(q_dtype: torch.dtype, v_dtype: torch.dtype) -> bool:
     """Whether V may take ``v_dtype`` next to ``q_dtype`` Q/K.
 
     V matches Q/K except on the QK-BF16/PV-FP8 path and under a Sage recipe's
-    Int8 Q/K, which keep E4M3 V.
+    Int8 Q/K or MXFP8 Q/K, which keep E4M3 V.
     """
-    return v_dtype == q_dtype or (
-        q_dtype in (torch.bfloat16, torch.int8) and v_dtype == torch.float8_e4m3fn
+    return (v_dtype == q_dtype and q_dtype != torch.float8_e8m0fnu) or (
+        q_dtype in (torch.bfloat16, torch.int8, torch.float8_e8m0fnu)
+        and v_dtype == torch.float8_e4m3fn
     )
 
 
@@ -1371,6 +1375,10 @@ def _resolve_context_plan_geometry(
         raise NotImplementedError(
             "mask_type='variable_window' requires fixed [B, S, H, D] tensors"
         )
+    if qk_dtype == torch.float8_e8m0fnu and (packed_query or window_left > 0):
+        raise NotImplementedError(
+            "MXFP8 Q/K requires fixed [B, S, H, D] tensors and no left window"
+        )
 
     batch_size = _validate_static_extent(batch_size, "batch_size")
     max_q_len = _validate_static_extent(max_q_len, "max_q_len")
@@ -1427,12 +1435,15 @@ def _resolve_context_plan_geometry(
         head_paired=head_paired,
         uniform_packed_lengths=False,
         has_q_offset=has_q_offset,
+        # The single-tile causal form keeps P in tensor memory, which MXFP8
+        # Q/K cannot use.
         causal_single_kv_tile=(
             mask_type == "causal"
             and not packed_query
             and not head_paired
             and max_q_len == max_kv_len
             and max_kv_len <= _CONTEXT_KV_TILE_N
+            and qk_dtype != torch.float8_e8m0fnu
         ),
         packed_dense_k_mask=packed_query and mask_type == "dense",
         sage=sage,
@@ -1568,6 +1579,7 @@ def _make_context_scheduler_probe(
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
         torch.int8: cutlass.Int8,
     }
     probe = _make_context_kernel(
@@ -2011,8 +2023,13 @@ def _get_compiled_context(
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
         "int8": cutlass.Int8,
+        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
     }
     input_qk_dtype = dtype_map[qk_dtype_key]
+    # MXFP8 Q/K names the E8M0 scale dtype; the Q and K tensors hold E4M3.
+    qk_data_dtype = (
+        cutlass.Float8E4M3FN if qk_dtype_key == "float8_e8m0fnu" else input_qk_dtype
+    )
     input_pv_dtype = dtype_map[pv_dtype_key]
     out_dtype = dtype_map[out_dtype_key]
     has_variable_window = mask_type == "variable_window"
@@ -2098,6 +2115,8 @@ def _get_compiled_context(
         output_scale: cutlass.Float32 | cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
+        q_scales: cute.Tensor | None,
+        k_scales: cute.Tensor | None,
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
@@ -2124,10 +2143,10 @@ def _get_compiled_context(
                 output_scale,
                 static_max_active_clusters,
                 stream,
-                qo_indptr,
-                kv_indptr,
-                max_q_len,
-                runtime_max_seq_len_k,
+                cum_seqlen_q=qo_indptr,
+                cum_seqlen_k=kv_indptr,
+                max_seqlen_q=max_q_len,
+                max_seqlen_k=runtime_max_seq_len_k,
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
@@ -2148,6 +2167,8 @@ def _get_compiled_context(
                 output_scale,
                 static_max_active_clusters,
                 stream,
+                q_scales=q_scales,
+                k_scales=k_scales,
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
@@ -2195,8 +2216,8 @@ def _get_compiled_context(
         out_shape = (*q_shape[:-1], head_dim_vo)
         qo_indptr_shape = (1,)
         kv_indptr_shape = (1,)
-    q_fake = fake_compact(input_qk_dtype, q_shape, 16)
-    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
+    q_fake = fake_compact(qk_data_dtype, q_shape, 16)
+    k_fake = fake_compact(qk_data_dtype, kv_shape, 16)
     v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
     out_fake = fake_compact(out_dtype, out_shape, 16)
     lse_fake = (
@@ -2275,6 +2296,34 @@ def _get_compiled_context(
         if sage_scale_layout is not None
         else None
     )
+    # MXFP8 Q/K scale atoms, one 512-byte 128x4 atom per tile and head. The
+    # tile counts follow the Q and K/V extents, symbolic under runtime lengths.
+    q_scales_fake = k_scales_fake = None
+    if qk_dtype_key == "float8_e8m0fnu":
+        q_scales_fake = fake_compact(
+            cutlass.Uint8,
+            (
+                batch_size,
+                num_qo_heads,
+                cute.sym_int()
+                if compile_spec.runtime_lengths
+                else cute.ceil_div(max_q_len, 128),
+                512,
+            ),
+            16,
+        )
+        k_scales_fake = fake_compact(
+            cutlass.Uint8,
+            (
+                batch_size,
+                num_kv_heads,
+                cute.sym_int()
+                if compile_spec.runtime_lengths
+                else cute.ceil_div(max_seq_len_k, 128),
+                512,
+            ),
+            16,
+        )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -2297,6 +2346,8 @@ def _get_compiled_context(
                 output_scale_fake,
                 qo_indptr_fake,
                 kv_indptr_fake,
+                q_scales_fake,
+                k_scales_fake,
                 variable_window_starts_fake,
                 variable_window_ends_fake,
                 variable_window_cta_starts_fake,
@@ -2543,6 +2594,28 @@ def _get_compiled_paged_context(
     return compiled, policy
 
 
+def _mxfp8_scale_atoms(
+    scales: torch.Tensor, tensor: torch.Tensor, name: str, validate: bool
+) -> torch.Tensor:
+    """View the MXFP8 scales of ``tensor`` as the kernel's ``[B, H, tiles, 512]``
+    byte atoms, one 512-byte 128x4 atom per 128-token tile and head."""
+    batch_size, seq_len, num_heads, _ = tensor.shape
+    shape = (batch_size, num_heads, (seq_len + 127) // 128, 512)
+    if validate:
+        _validate_tensor(scales, name)
+        if scales.device != tensor.device:
+            raise ValueError(f"{name} must be on {tensor.device}, got {scales.device}")
+        _validate_alignment(scales, name, 16)
+        if scales.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError(f"{name} must hold uint8 or float8_e8m0fnu bytes")
+        if scales.numel() != math.prod(shape) or not scales.is_contiguous():
+            raise ValueError(
+                f"{name} must be a contiguous tensor of {math.prod(shape)} bytes, "
+                f"one 512-byte atom per 128-token tile and head; got {tuple(scales.shape)}"
+            )
+    return scales.view(torch.uint8).reshape(shape)
+
+
 def _validate_runtime_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2557,10 +2630,16 @@ def _validate_runtime_inputs(
     _validate_base_tensors(q, k, v, allow_mla=True)
     if q.device != geometry.device:
         raise ValueError(f"q must be on {geometry.device}, got {q.device}")
-    if q.dtype != geometry.qk_dtype:
-        raise ValueError(f"q must have dtype {geometry.qk_dtype}, got {q.dtype}")
-    if k.dtype != geometry.qk_dtype:
-        raise ValueError(f"k must have dtype {geometry.qk_dtype}, got {k.dtype}")
+    # MXFP8 Q/K plans name the E8M0 scale dtype, but the data is actually E4M3.
+    qk_dtype = (
+        torch.float8_e4m3fn
+        if geometry.qk_dtype == torch.float8_e8m0fnu
+        else geometry.qk_dtype
+    )
+    if q.dtype != qk_dtype:
+        raise ValueError(f"q must have dtype {qk_dtype}, got {q.dtype}")
+    if k.dtype != qk_dtype:
+        raise ValueError(f"k must have dtype {qk_dtype}, got {k.dtype}")
     if v.dtype != geometry.pv_dtype:
         raise ValueError(f"v must have dtype {geometry.pv_dtype}, got {v.dtype}")
     v_shape = (*k.shape[:-1], geometry.head_dim_vo or geometry.head_dim)
@@ -2930,6 +3009,9 @@ class BatchPrefillTSWrapper:
         Sage V-mean restoration cannot be combined with attention sinks.
         Equivalent plans reuse policy and compiled-kernel caches.
         VC runs sharing a plan must not overlap.
+        q_dtype=k_dtype=torch.float8_e8m0fnu selects MXFP8 Q/K: float8_e4m3fn data
+        with one E8M0 scale per 32 channels, E4M3 V by default, fixed dense or causal
+        plans only; every run then supplies q_scales and k_scales.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
@@ -2942,7 +3024,13 @@ class BatchPrefillTSWrapper:
             resolved_out_dtype = torch.bfloat16
         else:
             resolved_out_dtype = q_dtype
-        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if v_dtype is not None:
+            resolved_v_dtype = v_dtype
+        elif k_dtype == torch.float8_e8m0fnu:
+            # MXFP8 Q/K keeps E4M3 V.
+            resolved_v_dtype = torch.float8_e4m3fn
+        else:
+            resolved_v_dtype = k_dtype
         if k_dtype != q_dtype:
             raise NotImplementedError(
                 "attention-ts context requires Q and K to use the same dtype; "
@@ -3058,6 +3146,8 @@ class BatchPrefillTSWrapper:
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
         *,
+        q_scales: Optional[torch.Tensor] = None,
+        k_scales: Optional[torch.Tensor] = None,
         variable_window_token_starts: Optional[torch.Tensor] = None,
         variable_window_token_ends: Optional[torch.Tensor] = None,
         variable_window_cta_starts: Optional[torch.Tensor] = None,
@@ -3102,7 +3192,10 @@ class BatchPrefillTSWrapper:
         Sage plans require matching SageAttentionParams; their prepared scales
         are refreshed on the current stream before attention.
         VC plans require vc=VCAttentionParams(...) with permuted K and residual V;
-        its per-channel V scale multiplies output_scale in the plan-owned buffer."""
+        its per-channel V scale multiplies output_scale in the plan-owned buffer.
+        MXFP8 plans require q_scales and k_scales, one 512-byte 128x4 scale atom per
+        128-token tile and head as mxfp8_quantize_bshd writes them; other plans
+        reject them."""
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -3196,6 +3289,22 @@ class BatchPrefillTSWrapper:
             )
         if sage is not None and validate:
             validate_sage_params(sage, state.sage.scale_shapes, device=geometry.device)
+        mxfp8 = geometry.qk_dtype == torch.float8_e8m0fnu
+        if (q_scales is not None) != mxfp8 or (k_scales is not None) != mxfp8:
+            raise ValueError(
+                "q_scales and k_scales are required by an MXFP8 plan and rejected "
+                "by a plan without MXFP8 Q/K"
+            )
+        runtime_q_scales = runtime_k_scales = None
+        if mxfp8:
+            # One 512-byte 128x4 atom per 128-token tile and head.
+            runtime_q_scales, runtime_k_scales = (
+                _mxfp8_scale_atoms(scales, tensor, name, validate)
+                for scales, tensor, name in (
+                    (q_scales, q, "q_scales"),
+                    (k_scales, k, "k_scales"),
+                )
+            )
         if geometry.mask_type == "variable_window":
             if (
                 variable_window_token_starts is None
@@ -3296,6 +3405,8 @@ class BatchPrefillTSWrapper:
             output_scale,
             runtime_qo_indptr,
             runtime_kv_indptr,
+            runtime_q_scales,
+            runtime_k_scales,
             runtime_window_starts,
             runtime_window_ends,
             runtime_window_cta_starts,
@@ -3366,7 +3477,13 @@ class BatchPrefillPagedTSWrapper:
         if not isinstance(use_attention_sinks, bool):
             raise TypeError("use_attention_sinks must be a bool")
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
-        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if v_dtype is not None:
+            resolved_v_dtype = v_dtype
+        elif k_dtype == torch.float8_e8m0fnu:
+            # MXFP8 Q/K keeps E4M3 V.
+            resolved_v_dtype = torch.float8_e4m3fn
+        else:
+            resolved_v_dtype = k_dtype
         if k_dtype != q_dtype:
             raise NotImplementedError(
                 "attention-ts paged context requires Q and K to use the same "
