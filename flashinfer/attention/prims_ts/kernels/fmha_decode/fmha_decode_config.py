@@ -3227,13 +3227,7 @@ class FmhaDecodeConfig:
             self._uses_contiguous_grouped_keeps_recipe
             and direct
             and not self.use_paged_kv
-            and not any(
-                (
-                    self.use_variable_seqlens_q,
-                    self.use_sliding_window_causal,
-                    self.use_attention_sinks,
-                )
-            )
+            and not any((self.use_variable_seqlens_q, self.use_attention_sinks))
         ):
             return True
         if self.use_sage_attention:
@@ -3264,11 +3258,14 @@ class FmhaDecodeConfig:
         if self.use_paged_kv and (
             paged_16bit_q128 or profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
         ):
-            # Paged grouped Keeps recipes exclude sliding windows and attention
-            # sinks. The 16-bit Q128 recipe, which reuses the contiguous 16-bit
-            # resources, runs fixed or packed Q in direct nonpersistent
-            # launches; the FP8 recipes run fixed Q, direct or split.
-            if self.use_sliding_window_causal or self.use_attention_sinks:
+            # Paged grouped Keeps recipes exclude attention sinks, and run a
+            # sliding window in direct launches only. The 16-bit Q128 recipe,
+            # which reuses the contiguous 16-bit resources, runs fixed or
+            # packed Q in direct nonpersistent launches; the FP8 recipes run
+            # fixed Q, direct or split.
+            if self.use_attention_sinks or (
+                self.use_sliding_window_causal and not direct
+            ):
                 return False
             if paged_16bit_q128:
                 return direct and not self.use_persistent_scheduler
@@ -5114,11 +5111,9 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
         or cfg.use_split_kv
         or split_kv_mode != "disabled"
         or cfg.use_transform_kv
-        or cfg.use_sliding_window_causal
     ):
         raise ValueError(
-            "query_paired supports no block-sparse routes, sliding windows, "
-            "split-KV or transform-KV"
+            "query_paired supports no block-sparse routes, split-KV or transform-KV"
         )
 
 

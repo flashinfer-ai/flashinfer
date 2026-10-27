@@ -156,7 +156,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. FP16/BF16 D128 plans add grouped Keeps Q128 on direct launches without a sliding window; automatic selection takes it for fixed multi-token launches with page sizes 4 to 128. |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. FP16/BF16 D128 plans add grouped Keeps Q128 on direct launches; automatic selection takes it for fixed multi-token launches with page sizes 4 to 128. Paged grouped Keeps profiles run a causal sliding window on direct launches only. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
@@ -213,13 +213,14 @@ bound the kernel and the paired grid needs fewer CTA waves.
   unpaired ones and pairs the plan when that costs less.
 - `True`: pair whenever the launch supports it: an FP16, BF16, or FP8
   recipe with head dim 128 (64 or 128 for FP8, which pairs fixed Q only),
-  no sliding window, at least two Q tiles in a request, and enough
-  unpaired Q tiles to fill one wave of CTAs. Other launches plan unpaired.
+  at least two Q tiles in a request, and enough unpaired Q tiles to fill
+  one wave of CTAs. Other launches plan unpaired.
 - `False`: never pair.
 
 The plan's policy records the outcome. Paired plans do not split K/V. In a
-causal plan the CTA streams the K/V range of its later Q tile, and the
-earlier tile masks the extra K/V tile that range can add.
+causal plan the CTA streams the union of its Q tiles' K/V ranges, from the
+earlier tile's sliding-window start to the later tile's causal end, and each
+tile masks the keys outside its own range.
 
 ## Tensor and metadata layouts
 

@@ -465,6 +465,12 @@ def resolve_keeps_tile_context(
         window_start_idx = _sliding_window_start_idx(
             cfg, seq_len_kv, seq_len_q, q_token_base
         )
+    if cutlass.const_expr(cfg.q_groups_per_cta > 1 and cfg.use_sliding_window_causal):
+        # The CTA's stream starts at its first Q tile's window; a later tile
+        # masks the keys before its own window.
+        window_start_idx = _sliding_window_start_idx(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
 
     tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
     is_valid_effective_tile = effective_tile_idx < effective_total_kv_tiles

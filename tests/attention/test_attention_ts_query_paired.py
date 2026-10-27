@@ -163,6 +163,7 @@ class _PagedPairedCase:
     head_dim: int = _HEAD_DIM
     # Per-request Q lengths of a packed batch, cycled over the batch.
     q_lens: tuple[int, ...] | None = None
+    window_left: int = -1
 
     @property
     def kv_lens(self) -> tuple[int, ...]:
@@ -173,22 +174,34 @@ class _PagedPairedCase:
 
 _PAGED_CASES = (
     _PagedPairedCase("bf16_group8_three_tiles", heads_q_per_kv=8, seq_len_q=48),
-    # One token per Q tile: five tiles leave the last CTA's second tile past
-    # the sequence.
+    # A CTA's K/V stream starts at its first Q tile's window, 16 tokens
+    # before its second tile's.
     _PagedPairedCase(
-        "bf16_group128_causal_page64",
+        "bf16_group8_causal_window",
+        heads_q_per_kv=8,
+        seq_len_q=64,
+        mask_type="causal",
+        window_left=127,
+    ),
+    # One token per Q tile: five tiles leave the last CTA's second tile past
+    # the sequence, and each tile masks its own window, one key after the
+    # previous tile's.
+    _PagedPairedCase(
+        "bf16_group128_causal_window_page64",
         heads_q_per_kv=128,
         seq_len_q=5,
         num_kv_heads=4,
         page_size=64,
         mask_type="causal",
+        window_left=31,
     ),
     _PagedPairedCase(
-        "bf16_group8_packed_causal",
+        "bf16_group8_packed_causal_window",
         heads_q_per_kv=8,
         seq_len_q=64,
         mask_type="causal",
         q_lens=(64, 5, 33, 48, 17),
+        window_left=300,
     ),
     # Paired FP8 CTAs beyond one wave run on the persistent scheduler.
     _PagedPairedCase(
@@ -220,6 +233,7 @@ def _paged_decode_case(case: _PagedPairedCase):
         output_dtype=case.output_dtype or case.dtype,
         cache_form="tuple",
         mask_type=case.mask_type,
+        window_left=case.window_left,
         device="cuda",
         seed=20261020,
     )
