@@ -262,7 +262,17 @@ def _ws(batch):
 
 
 def _run(
-    probs, k, p, seed, offset, *, variant=None, out=None, pdl=True, flags=0
+    probs,
+    k,
+    p,
+    seed,
+    offset,
+    *,
+    variant=None,
+    out=None,
+    pdl=True,
+    flags=0,
+    stage23_flags=None,
 ) -> Run:
     batch = probs.shape[0]
     ws = _ws(batch)
@@ -330,7 +340,9 @@ def _run(
             1,
             threads,
             items,
-            stage23_variant_flags(probs.device),
+            stage23_variant_flags(probs.device)
+            if stage23_flags is None
+            else stage23_flags,
             1 if pdl else 0,
             stream,
         )
@@ -1326,10 +1338,10 @@ def _plan_text(plan) -> str:
     return f"{stage1} f{plan.launch_flags} {'1L' if plan.one_launch else '2L'}"
 
 
-def _emulated_plans(monkeypatch) -> dict:
-    """``(device, vocab, batch, top-k) -> plan text`` of every ``_PLAN_CELLS`` cell on every ``_PLAN_DEVICES`` device
-    (None where no frozen stage-1 variant covers the vocabulary), computed on the host: the device queries answer for
-    the emulated device and the per-device caches are bypassed."""
+def _emulated_launch_plans(monkeypatch) -> dict:
+    """``(device, vocab, batch, top-k) -> _launch_plan`` of every ``_PLAN_CELLS`` cell on every ``_PLAN_DEVICES``
+    device (None where no frozen stage-1 variant covers the vocabulary), computed on the host: the device queries
+    answer for the emulated device and the per-device caches are bypassed."""
     devices = dict(enumerate(_PLAN_DEVICES.items(), start=1 << 16))  # no real device
     plans = {}
     with monkeypatch.context() as m:
@@ -1347,11 +1359,19 @@ def _emulated_plans(monkeypatch) -> dict:
         for index, (name, _) in devices.items():
             for vocab, batch, k in _PLAN_CELLS:
                 try:
-                    plan = _plan_text(launch_plan(index, batch, vocab, k))
+                    plan = launch_plan(index, batch, vocab, k)
                 except ValueError:
                     plan = None
                 plans[name, vocab, batch, k] = plan
     return plans
+
+
+def _emulated_plans(monkeypatch) -> dict:
+    """``(device, vocab, batch, top-k) -> plan text`` (``_plan_text``) of ``_emulated_launch_plans``."""
+    return {
+        cell: None if plan is None else _plan_text(plan)
+        for cell, plan in _emulated_launch_plans(monkeypatch).items()
+    }
 
 
 def test_round15_host_levers_change_only_their_cells(monkeypatch):
@@ -1386,6 +1406,84 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     # the cluster-8 V = 128256 k = 1000 cells keep the whole-CTA tail where they ran it (H100's measured picks)
     for batch in (1, 2, 4, 8):
         assert new["H100", 128256, batch, 1000] == "8_16_1 f8 1L"
+
+
+def test_stage23_slab_form_exceptions(monkeypatch):
+    """Each per-slab stage-2/3 form exception names a form the frozen module exports for that slab.  On the emulated
+    devices every two-launch plan dispatches the per-capability form, except the (256, 4) slab on RTX PRO 6000
+    (12, 0), which dispatches the int_tests + one_cmp_select form: its 24 top-k 1000 owner cells."""
+    if not torch.cuda.is_available():
+        # without CUDA every k > 64 launch plans the two-launch chain
+        pytest.skip("CUDA required")
+    forms = {
+        (v["threads"], v["items"], int(v["variant_flags"]))
+        for v in load_manifest()["stage23"]
+    }
+    for cap, slabs in cs._STAGE23_SLAB_FLAGS_BY_CAPABILITY.items():
+        for (threads, items), flags in slabs.items():
+            assert (threads, items, flags) in forms, (cap, threads, items, flags)
+    assert cs._STAGE23_SLAB_FLAGS_BY_CAPABILITY == {(12, 0): {(256, 4): 3}}
+    table = cake_sampling_jit.stage23_flags_by_capability()
+    excepted = []
+    for (name, vocab, batch, k), plan in _emulated_launch_plans(monkeypatch).items():
+        if plan is None or plan.one_launch:
+            continue
+        cap = _PLAN_DEVICES[name][0]
+        want = table.get(cap, table[None])
+        if cap == (12, 0) and (plan.threads, plan.items) == (256, 4):
+            want = 3
+            excepted.append((vocab, batch, k))
+        assert plan.stage23_flags == want, (name, vocab, batch, k, plan)
+    assert sorted(excepted) == sorted(
+        itertools.product(
+            (32768, 128256, 151936), (1, 2, 4, 8, 16, 32, 64, 128), (1000,)
+        )
+    )
+
+
+def test_stage23_forms_of_a_slab_sample_bitwise_alike():
+    """Every static stage-2/3 form the frozen module exports for the (256, 4) slab samples the same tokens and the
+    same renormalized probabilities on this device, so a per-slab form choice never changes the output."""
+    _require_supported_device()
+    man = load_manifest()
+    flags = sorted(
+        {
+            int(v["variant_flags"])
+            for v in man["stage23"]
+            if (v["threads"], v["items"]) == (256, 4)
+        }
+    )
+    assert len(flags) >= 2
+    vocab = 32768
+    s1 = min(
+        (v["cluster"], v["ept"])
+        for v in _stage1_builds(man)
+        if 512 * v["cluster"] * v["ept"] >= vocab
+        and not v["stream"]
+        and not v["fused_tail"]
+        and not v["fused_block_tail"]
+        and not v["coarse_sample"]
+        and not v["spec_sample"]
+        and not v["coarse_push"]
+        and not v["leader_push"]
+    )
+    probs = _probs(4, vocab, seed=31)
+    pn = probs.cpu().numpy()
+    pn[2, (np.arange(700) * 13) % vocab] = np.float32(2**-12)
+    pn[3, [5, vocab - 2]] = np.inf
+    probs.copy_(torch.tensor(pn, device="cuda"))
+    for k, p in ((1000, 0.9), (600, 0.5), (1000, 1.0)):
+        runs = [
+            _run(probs, k, p, 0xC0DE, 7, variant=(s1, (256, 4)), stage23_flags=f)
+            for f in flags
+        ]
+        for f, run in zip(flags[1:], runs[1:], strict=True):
+            assert np.array_equal(run.samples, runs[0].samples), (k, p, f)
+            assert np.array_equal(run.renorm, runs[0].renorm, equal_nan=True), (
+                k,
+                p,
+                f,
+            )
 
 
 # --------------------------------------------------------------------------- adversarial

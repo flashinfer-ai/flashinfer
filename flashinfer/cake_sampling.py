@@ -336,10 +336,27 @@ def _stage23_variant_flags(device_index: int) -> int:
     return table.get(_device_capability(device_index), table[None])
 
 
+# Per-slab exceptions to the per-capability form: capability -> {(threads, items): variant_flags}.  RTX PRO 6000
+# (12, 0): the (256, 4) slab, which every top-k above 512 runs, dispatches the int_tests + one_cmp_select form; on two
+# boards it took 0.929-0.992x of the base form's call time on all 24 top-k 1000 benchmark cells (eager and CUDA
+# graph), while the same form on every slab slowed the 32 x 2 slab of the top-k 10 / 50 cells by up to 1 %.
+_STAGE23_SLAB_FLAGS_BY_CAPABILITY: dict[tuple[int, int], dict[tuple[int, int], int]] = {
+    (12, 0): {(256, 4): 3},
+}
+
+
+def _stage23_plan_flags(device_index: int, threads: int, items: int) -> int:
+    """``variant_flags`` of the stage-2/3 form a plan with the ``(threads, items)`` slab dispatches on the device:
+    its ``_STAGE23_SLAB_FLAGS_BY_CAPABILITY`` exception, else the per-capability form."""
+    slabs = _STAGE23_SLAB_FLAGS_BY_CAPABILITY.get(_device_capability(device_index), {})
+    return slabs.get((threads, items), _stage23_variant_flags(device_index))
+
+
 def stage23_variant_flags(device: torch.device | int | None = None) -> int:
     """Bit mask of the static stage-2/3 features dispatched on ``device`` (``STAGE23_FEATURE_BITS``); 0 = base
-    form (f64 tests, max / min exchange), the form every unlisted architecture runs.  Cached per device index:
-    the eager k > 64 path calls this on every launch."""
+    form (f64 tests, max / min exchange), the form every unlisted architecture runs.  A slab listed in
+    ``_STAGE23_SLAB_FLAGS_BY_CAPABILITY`` for the device's capability dispatches its own form instead.  Cached per
+    device index: the eager k > 64 path calls this on every launch."""
     if isinstance(device, int):
         index = device
     elif device is None or device.index is None:
@@ -1957,7 +1974,7 @@ def _launch_plan(
         items,
         launch_flags,
         fused or fused_block,
-        _stage23_variant_flags(device_index),
+        _stage23_plan_flags(device_index, threads, items),
     )
 
 
