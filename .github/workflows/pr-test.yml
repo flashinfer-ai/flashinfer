@@ -629,6 +629,40 @@ jobs:
 
 
   # ---------------------------------------------------------------------------
+  # Test Selection Preview (shadow mode)
+  # ---------------------------------------------------------------------------
+  # Reports which test files the change can affect, from the static dependency
+  # graph in scripts/pr_checks/select_tests.py, and whether a requested scope
+  # covers them. It does not change what runs and is not part of the required
+  # check; it collects evidence before selection is trusted to skip anything.
+  test-selection-preview:
+    name: Test Selection Preview
+    needs: [gate, setup]
+    if: github.event_name == 'pull_request' && needs.gate.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    # Runs the PR's own copy of the script, so it gets no write scopes.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report selection
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUESTED_TEST_PATH: ${{ needs.setup.outputs.test_scope }}
+        run: |
+          python3 scripts/pr_checks/select_tests.py \
+            --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --requested-scope "$REQUESTED_TEST_PATH" \
+            --format markdown >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:

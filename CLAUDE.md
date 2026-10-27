@@ -17,6 +17,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Run full parameter matrices | `pytest tests/ --full` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
+| List test files a diff can affect | `python3 scripts/pr_checks/select_tests.py --base origin/main` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
 | Run linting | `pre-commit run -a` |
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
@@ -218,6 +219,19 @@ worker counts without GPU topology or measured memory capacity.
 
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+
+`scripts/pr_checks/select_tests.py` lists the test files a diff can affect, from a
+static graph of what each test loads: imports (including imports inside functions,
+module names held in strings, `.py` files named by path, and modules exposed through
+`sys.path` from directories that are not packages), the kernel sources those modules
+name, their `#include` closure, and nearby data files. Python files that no test
+imports, such as sources loaded from a manifest, belong to the reached files in
+their directory. A package installed under another top-level name needs an entry
+in the script's `MODULE_ALIASES`, as `b12x` has. Global inputs such as
+requirements, CI images, `3rdparty`, `tests/conftest.py` and the test-lane scripts
+select everything, as does any error. PR Test runs it as the non-blocking "Test
+Selection Preview" job; it does not change what runs. `--explain TEST` prints the
+chain that selects a test.
 
 Collection stdout/stderr, including best-effort JIT prewarm warnings, is retained
 under `junit/collection-*/*.log` and uploaded with the public CI telemetry. Each
