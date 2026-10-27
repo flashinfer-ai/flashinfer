@@ -1,3 +1,5 @@
+import pytest
+
 from types import SimpleNamespace
 
 from flashinfer.gemm.kernels.cutile._tune_select import TIE_REL_TOL, rank_measurements
@@ -29,6 +31,7 @@ def _key(cfg):
     )
 
 
+@pytest.mark.cpu_only
 def test_ci_overlap_tie_prefers_key_order():
     # occupancy=8 measures fastest but within combined error margins of
     # occupancy=1, so the config key decides.
@@ -40,6 +43,7 @@ def test_ci_overlap_tie_prefers_key_order():
     assert [m.config.occupancy for m in ranked] == [1, 8]
 
 
+@pytest.mark.cpu_only
 def test_rel_tol_floor_catches_narrow_ci():
     # Gap exceeds the combined error margins but stays under TIE_REL_TOL of
     # the best mean, so it is still treated as a tie.
@@ -54,6 +58,7 @@ def test_rel_tol_floor_catches_narrow_ci():
     assert [m.config.occupancy for m in ranked] == [1, 8]
 
 
+@pytest.mark.cpu_only
 def test_gap_outside_both_rules_is_not_tied():
     # The gap exceeds the combined error margins (0.7) and TIE_REL_TOL of the
     # best mean (2.0), so the slower candidate must keep its latency rank
@@ -69,6 +74,7 @@ def test_gap_outside_both_rules_is_not_tied():
     assert [m.config.occupancy for m in ranked] == [8, 1]
 
 
+@pytest.mark.cpu_only
 def test_clear_winner_stays_first():
     measurements = [
         _measure(50.0, 0.1, occupancy=8),
@@ -78,6 +84,7 @@ def test_clear_winner_stays_first():
     assert [m.config.occupancy for m in ranked] == [8, 1]
 
 
+@pytest.mark.cpu_only
 def test_non_tied_tail_keeps_latency_order():
     measurements = [
         _measure(52.3, 0.5, occupancy=8),
@@ -89,6 +96,7 @@ def test_non_tied_tail_keeps_latency_order():
     assert [m.mean_us for m in ranked] == [52.6, 52.3, 60.0, 70.0]
 
 
+@pytest.mark.cpu_only
 def test_input_order_does_not_matter():
     measurements = [
         _measure(52.6, 0.5, occupancy=1),
@@ -101,6 +109,7 @@ def test_input_order_does_not_matter():
     assert forward[0].config.occupancy == 1
 
 
+@pytest.mark.cpu_only
 def test_all_measurements_are_returned():
     measurements = [_measure(50.0 + i, 0.5, occupancy=1 + i % 4) for i in range(8)]
     ranked = rank_measurements(measurements, _key)
@@ -108,6 +117,7 @@ def test_all_measurements_are_returned():
     assert {id(m) for m in ranked} == {id(m) for m in measurements}
 
 
+@pytest.mark.cpu_only
 def test_single_measurement():
     measurements = [_measure(52.3, 0.5, occupancy=8)]
     ranked = rank_measurements(measurements, _key)
