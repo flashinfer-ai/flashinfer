@@ -721,12 +721,12 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
             mbarrier_init(smem + 432, 4);
             mbarrier_init(smem + 440, 4);
             mbarrier_init(smem + 448, 4);
-            // state_ready: 5 barriers, init_count=1
-            mbarrier_init(smem + 456, 1);
-            mbarrier_init(smem + 464, 1);
-            mbarrier_init(smem + 472, 1);
-            mbarrier_init(smem + 480, 1);
-            mbarrier_init(smem + 488, 1);
+            // state_ready: 5 barriers, init_count=2
+            mbarrier_init(smem + 456, 2);
+            mbarrier_init(smem + 464, 2);
+            mbarrier_init(smem + 472, 2);
+            mbarrier_init(smem + 480, 2);
+            mbarrier_init(smem + 488, 2);
             // final_ready: 5 barriers, init_count=1
             mbarrier_init(smem + 496, 1);
             mbarrier_init(smem + 504, 1);
@@ -1642,6 +1642,10 @@ kernel_flashkda_bf16_fused_m128_vtile(__nv_bfloat16* __restrict__ q, FlashKDATen
                     "}\n"
                     :: "r"(tmem_tmem_state), "r"(_mma_b_lo_14), "r"(tmem_tmem_u2_inp), "r"(1));
                     elect_commit2(state_ready_addr + (mma_stage) * 8, smem_free_addr + (mma_stage) * 8);
+                }
+                if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(state_ready_addr + (mma_stage) * 8);
                 }
                 mma_stage += 1;
                 if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_ready ^= 1; _phase_state_diag_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; }
