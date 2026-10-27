@@ -661,7 +661,7 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     mbarrier_wait(dh_full_addr, _phase_dh_full_0);
                     _phase_dh_full_0 ^= 1;
                     float hd = 0.0f;
-                    int krow = tid_1 >> 1;
+                    int krow = tid_1 >> 1 ^ (tid_1 & 1) << 2;
                     int vh0 = (tid_1 & 1) * 64;
                     #pragma unroll
                     for (int seg = 0; seg < 4; seg++) {
@@ -688,10 +688,51 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             (&_unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(dhraw[_pair]) << 16);
                             (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dhraw[_pair]) & 0xffff0000u);
                         }
+                        float _hd_prod[16];
+                        _hd_prod[0] = _unpack_bf16_0[0] * _unpack_bf16_1[0];
+                        _hd_prod[1] = _unpack_bf16_0[1] * _unpack_bf16_1[1];
+                        _hd_prod[2] = _unpack_bf16_0[2] * _unpack_bf16_1[2];
+                        _hd_prod[3] = _unpack_bf16_0[3] * _unpack_bf16_1[3];
+                        _hd_prod[4] = _unpack_bf16_0[4] * _unpack_bf16_1[4];
+                        _hd_prod[5] = _unpack_bf16_0[5] * _unpack_bf16_1[5];
+                        _hd_prod[6] = _unpack_bf16_0[6] * _unpack_bf16_1[6];
+                        _hd_prod[7] = _unpack_bf16_0[7] * _unpack_bf16_1[7];
+                        _hd_prod[8] = _unpack_bf16_0[8] * _unpack_bf16_1[8];
+                        _hd_prod[9] = _unpack_bf16_0[9] * _unpack_bf16_1[9];
+                        _hd_prod[10] = _unpack_bf16_0[10] * _unpack_bf16_1[10];
+                        _hd_prod[11] = _unpack_bf16_0[11] * _unpack_bf16_1[11];
+                        _hd_prod[12] = _unpack_bf16_0[12] * _unpack_bf16_1[12];
+                        _hd_prod[13] = _unpack_bf16_0[13] * _unpack_bf16_1[13];
+                        _hd_prod[14] = _unpack_bf16_0[14] * _unpack_bf16_1[14];
+                        _hd_prod[15] = _unpack_bf16_0[15] * _unpack_bf16_1[15];
+                        unsigned int _hd_prod_bf16[8];
                         #pragma unroll
-                        for (int j = 0; j < 16; j++) {
-                            hd = hd + (float)(__nv_bfloat16)(_unpack_bf16_0[j] * _unpack_bf16_1[j]);
+                        for (int _lp = 0; _lp < 8; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_hd_prod[_lp*2 + 0], _hd_prod[_lp*2+1 + 0]));
+                            _hd_prod_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        float _hd_prod_r[16];
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 8; _pair++) {
+                            (&_hd_prod_r[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_hd_prod_bf16[_pair]) << 16);
+                            (&_hd_prod_r[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_hd_prod_bf16[_pair]) & 0xffff0000u);
+                        }
+                        hd = hd + _hd_prod_r[0];
+                        hd = hd + _hd_prod_r[1];
+                        hd = hd + _hd_prod_r[2];
+                        hd = hd + _hd_prod_r[3];
+                        hd = hd + _hd_prod_r[4];
+                        hd = hd + _hd_prod_r[5];
+                        hd = hd + _hd_prod_r[6];
+                        hd = hd + _hd_prod_r[7];
+                        hd = hd + _hd_prod_r[8];
+                        hd = hd + _hd_prod_r[9];
+                        hd = hd + _hd_prod_r[10];
+                        hd = hd + _hd_prod_r[11];
+                        hd = hd + _hd_prod_r[12];
+                        hd = hd + _hd_prod_r[13];
+                        hd = hd + _hd_prod_r[14];
+                        hd = hd + _hd_prod_r[15];
                     }
                     float hd_w = 0.0f;
                     float s = hd;
@@ -1969,34 +2010,38 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(b_drained_addr);
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
-                    int t = tid_1 >> 2;
-                    int d0 = (tid_1 & 3) * 32;
+                    int t = tid_1 >> 3;
+                    int t1 = t + 32;
+                    int c0 = tid_1 & 7;
                     if (t < clen) {
-                        long long base = (long long)(trow + t) * (long long)dv_tstride + (long long)(hv * 128 + d0);
-                        int chunk_0 = d0 >> 3 ^ t & 7;
+                        long long base = (long long)(trow + t) * (long long)dv_tstride + (long long)(hv * 128 + c0 * 8);
+                        int chunk_0 = c0 ^ t & 7;
                         unsigned int q0[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q0[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_0 << 4))));
                         reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + base))[0] = reinterpret_cast<int4*>(q0)[0];
-                        int chunk_1 = (d0 >> 3) + 1 ^ t & 7;
+                        int chunk_1 = c0 + 8 ^ t & 7;
                         unsigned int q1[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_1 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 8)))[0] = reinterpret_cast<int4*>(q1)[0];
-                        int chunk_2 = (d0 >> 3) + 2 ^ t & 7;
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 64)))[0] = reinterpret_cast<int4*>(q1)[0];
+                    }
+                    if (t1 < clen) {
+                        long long base1 = (long long)(trow + t1) * (long long)dv_tstride + (long long)(hv * 128 + c0 * 8);
+                        int chunk_2 = c0 ^ t1 & 7;
                         unsigned int q2[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 3]))
-                            : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_2 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 16)))[0] = reinterpret_cast<int4*>(q2)[0];
-                        int chunk_3 = (d0 >> 3) + 3 ^ t & 7;
+                            : "r"(stage_dv_addr + (unsigned int)(t1 * 256 + (chunk_2 << 4))));
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + base1))[0] = reinterpret_cast<int4*>(q2)[0];
+                        int chunk_3 = c0 + 8 ^ t1 & 7;
                         unsigned int q3[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 3]))
-                            : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_3 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 24)))[0] = reinterpret_cast<int4*>(q3)[0];
+                            : "r"(stage_dv_addr + (unsigned int)(t1 * 256 + (chunk_3 << 4))));
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base1 + 64)))[0] = reinterpret_cast<int4*>(q3)[0];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dv_stored_addr);
@@ -3248,63 +3293,71 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync 1, 256;" ::: "memory");
-                            int t_0 = tid_1 >> 2;
-                            int d0_1 = (tid_1 & 3) * 32;
+                            int t_0 = tid_1 >> 3;
+                            int t1_0 = t_0 + 32;
+                            int c0_0 = tid_1 & 7;
                             if (t_0 < clen) {
-                                long long base_1 = (long long)(trow + t_0) * (long long)dqk_tstride + (long long)(hq * 128 + d0_1);
-                                int chunk_0_1 = d0_1 >> 3 ^ t_0 & 7;
+                                long long base_1 = (long long)(trow + t_0) * (long long)dqk_tstride + (long long)(hq * 128 + c0_0 * 8);
+                                int chunk_0_1 = c0_0 ^ t_0 & 7;
                                 unsigned int q0_1[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 3]))
                                     : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_0_1 << 4))));
                                 reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + base_1))[0] = reinterpret_cast<int4*>(q0_1)[0];
-                                int chunk_1_1 = (d0_1 >> 3) + 1 ^ t_0 & 7;
+                                int chunk_1_1 = c0_0 + 8 ^ t_0 & 7;
                                 unsigned int q1_1[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 3]))
                                     : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_1_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 8)))[0] = reinterpret_cast<int4*>(q1_1)[0];
-                                int chunk_2_1 = (d0_1 >> 3) + 2 ^ t_0 & 7;
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 64)))[0] = reinterpret_cast<int4*>(q1_1)[0];
+                            }
+                            if (t1_0 < clen) {
+                                long long base1_1 = (long long)(trow + t1_0) * (long long)dqk_tstride + (long long)(hq * 128 + c0_0 * 8);
+                                int chunk_2_1 = c0_0 ^ t1_0 & 7;
                                 unsigned int q2_1[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_2_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 16)))[0] = reinterpret_cast<int4*>(q2_1)[0];
-                                int chunk_3_1 = (d0_1 >> 3) + 3 ^ t_0 & 7;
+                                    : "r"(stage_dq_addr + (unsigned int)(t1_0 * 256 + (chunk_2_1 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + base1_1))[0] = reinterpret_cast<int4*>(q2_1)[0];
+                                int chunk_3_1 = c0_0 + 8 ^ t1_0 & 7;
                                 unsigned int q3_1[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_3_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 24)))[0] = reinterpret_cast<int4*>(q3_1)[0];
+                                    : "r"(stage_dq_addr + (unsigned int)(t1_0 * 256 + (chunk_3_1 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base1_1 + 64)))[0] = reinterpret_cast<int4*>(q3_1)[0];
                             }
-                            int t_2 = tid_1 >> 2;
-                            int d0_3 = (tid_1 & 3) * 32;
+                            int t_2 = tid_1 >> 3;
+                            int t1_2 = t_2 + 32;
+                            int c0_2 = tid_1 & 7;
                             if (t_2 < clen) {
-                                long long base_2 = (long long)(trow + t_2) * (long long)dqk_tstride + (long long)(hq * 128 + d0_3);
-                                int chunk_0_2 = d0_3 >> 3 ^ t_2 & 7;
+                                long long base_2 = (long long)(trow + t_2) * (long long)dqk_tstride + (long long)(hq * 128 + c0_2 * 8);
+                                int chunk_0_2 = c0_2 ^ t_2 & 7;
                                 unsigned int q0_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 3]))
                                     : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_0_2 << 4))));
                                 reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + base_2))[0] = reinterpret_cast<int4*>(q0_2)[0];
-                                int chunk_1_2 = (d0_3 >> 3) + 1 ^ t_2 & 7;
+                                int chunk_1_2 = c0_2 + 8 ^ t_2 & 7;
                                 unsigned int q1_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 3]))
                                     : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_1_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 8)))[0] = reinterpret_cast<int4*>(q1_2)[0];
-                                int chunk_2_2 = (d0_3 >> 3) + 2 ^ t_2 & 7;
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 64)))[0] = reinterpret_cast<int4*>(q1_2)[0];
+                            }
+                            if (t1_2 < clen) {
+                                long long base1_2 = (long long)(trow + t1_2) * (long long)dqk_tstride + (long long)(hq * 128 + c0_2 * 8);
+                                int chunk_2_2 = c0_2 ^ t1_2 & 7;
                                 unsigned int q2_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q2_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_2_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 16)))[0] = reinterpret_cast<int4*>(q2_2)[0];
-                                int chunk_3_2 = (d0_3 >> 3) + 3 ^ t_2 & 7;
+                                    : "r"(stage_dk_addr + (unsigned int)(t1_2 * 256 + (chunk_2_2 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + base1_2))[0] = reinterpret_cast<int4*>(q2_2)[0];
+                                int chunk_3_2 = c0_2 + 8 ^ t1_2 & 7;
                                 unsigned int q3_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&q3_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_3_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 24)))[0] = reinterpret_cast<int4*>(q3_2)[0];
+                                    : "r"(stage_dk_addr + (unsigned int)(t1_2 * 256 + (chunk_3_2 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base1_2 + 64)))[0] = reinterpret_cast<int4*>(q3_2)[0];
                             }
                         }
                     }
@@ -3379,9 +3432,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         mbarrier_arrive_expect_tx(dovn_full_addr, 32768);
                         #pragma unroll
                         for (int seg_1 = 0; seg_1 < 2; seg_1++) {
-                            int c0 = seg_1 * 64;
-                            tma_3d_gmem2smem(smem_v3_addr + (unsigned int)(seg_1 * 8192), (&do_tma), c0, hv_1, trow_1, dovn_full_addr);
-                            tma_3d_gmem2smem(smem_v4_addr + (unsigned int)(seg_1 * 8192), (&vn_tma), c0, hv_1, row0_1, dovn_full_addr);
+                            int c0_1 = seg_1 * 64;
+                            tma_3d_gmem2smem(smem_v3_addr + (unsigned int)(seg_1 * 8192), (&do_tma), c0_1, hv_1, trow_1, dovn_full_addr);
+                            tma_3d_gmem2smem(smem_v4_addr + (unsigned int)(seg_1 * 8192), (&vn_tma), c0_1, hv_1, row0_1, dovn_full_addr);
                         }
                         mbarrier_wait(b_committed_addr, _phase_b_committed_0);
                         _phase_b_committed_0 ^= 1;
