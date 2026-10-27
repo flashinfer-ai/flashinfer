@@ -1554,6 +1554,13 @@ _TWO_KERNEL_ROUTE_MIN_CHUNKS = 2
 # 512-2048 items 1.015-1.06x faster than ``exact``; 8192-20480 items
 # 0.99-1.02x (kept).
 _TWO_KERNEL_ONE_CHUNK_MAX_ITEMS = {(10, 7): 2048}
+# sm_107a: one-chunk ring calls with these state dtypes take ``exactpre``
+# above the item bound too (fp32 state, 8192-20480 items: 1.016-1.031x
+# faster than ``exact``).
+_ONE_CHUNK_EXACTPRE_STATE_DTYPES = {(10, 7): frozenset({torch.float32})}
+# sm_107a: a call the retained ``exact_*_noring`` program would serve takes
+# the fused one-kernel program instead (bf16 state, 8 x 64: 1.34x).
+_NORING_RETAINED_FUSED = frozenset({(10, 7)})
 
 
 def fused_selected(
@@ -1617,6 +1624,7 @@ def two_kernel_family(
     sm_count: Optional[int] = None,
     capability: Optional[tuple[int, int]] = None,
     variant: str = "",
+    state_dtype: Optional[torch.dtype] = None,
 ) -> str:
     """Two-kernel program family of a call the chunk-parallel and fused routes
     left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
@@ -1633,7 +1641,9 @@ def two_kernel_family(
     On a ``capability`` of ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` one-chunk
     items take ``exactpre`` as well when the call's ``num_sequences x
     nheads`` items exceed ``sm_count`` and are at most that bound and its
-    scan ``variant`` is the ring schedule (``""``).
+    scan ``variant`` is the ring schedule (``""``); on a ``capability`` of
+    ``_ONE_CHUNK_EXACTPRE_STATE_DTYPES`` a ``state_dtype`` it lists takes
+    ``exactpre`` above that bound too.
     """
 
     chunks = host_chunks_per_item(
@@ -1650,6 +1660,16 @@ def two_kernel_family(
     )
     items = max(int(num_sequences), 1) * int(nheads or 0)
     if max_items is not None and not variant and sm_count < items <= max_items:
+        return "exactpre"
+    if (
+        max_items is not None
+        and not variant
+        and sm_count < items
+        and state_dtype
+        in _ONE_CHUNK_EXACTPRE_STATE_DTYPES.get(
+            (int(capability[0]), int(capability[1])), ()
+        )
+    ):
         return "exactpre"
     return "exact"
 
@@ -2651,6 +2671,26 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             )
         )
+        if (
+            tuple(capability) in _NORING_RETAINED_FUSED
+            and not chunk_parallel
+            and not fused
+            and not tail
+            and variant == "noring"
+            and two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen if self.has_varlen else seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            )
+            == "exact"
+            and (not derives_table or light_stage or one_launch)
+        ):
+            fused = True
         if chunk_parallel:
             program_family = family
         elif fused:
@@ -2671,6 +2711,7 @@ class CakeSSDCombined:
                 sm_count=sm_count,
                 capability=capability,
                 variant=variant,
+                state_dtype=self.state_dtype,
             )
         workspace: dict[str, Any] = {
             "program": _program_name(
