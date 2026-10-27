@@ -4202,7 +4202,9 @@ _requires_selective_sm100 = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3), (10, 7), (12, 0)])
+@pytest.mark.parametrize(
+    "capability", [(9, 0), (10, 0), (10, 3), (10, 7), (12, 0), (12, 1)]
+)
 def test_selective_constructor_device_support(monkeypatch, capability):
     """Unsupported devices reject before device-scope entry or workspace allocation."""
     from flashinfer.attn_scores import selective_capacity
@@ -4228,6 +4230,51 @@ def test_selective_constructor_device_support(monkeypatch, capability):
             max_batch_size=1,
             num_pages=8,
             device=device,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("layout_source", ["explicit", "exemplar"])
+def test_selective_constructor_rejects_device_before_native_jit(
+    monkeypatch, layout_source
+):
+    """Unsupported CUDA devices reject before native JIT or workspace allocation."""
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        pytest.skip("requires an unsupported selective device")
+
+    from flashinfer.attn_scores import selective_capacity
+    from flashinfer.jit import selective_repair_if, selective_sample_ladder
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    layout = (
+        {"num_pages": 8, "device": device}
+        if layout_source == "explicit"
+        else {
+            "kv_layout": torch.empty((8, 128, 1, 132), dtype=torch.uint8, device=device)
+        }
+    )
+
+    def unexpected_preparation(*args, **kwargs):
+        raise AssertionError("unsupported device reached native JIT or allocation")
+
+    monkeypatch.setattr(
+        selective_sample_ladder,
+        "gen_selective_sample_ladder_module",
+        unexpected_preparation,
+    )
+    monkeypatch.setattr(
+        selective_repair_if, "gen_selective_repair_if_module", unexpected_preparation
+    )
+    monkeypatch.setattr(
+        selective_capacity, "_CapacityStepInputs", unexpected_preparation
+    )
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        FP8PagedMQATopKWrapper(
+            strategy="selective",
+            max_context_length=1024,
+            max_chunk_size=1,
+            max_batch_size=1,
+            **layout,
         )
 
 
@@ -8162,7 +8209,7 @@ def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
     return expected_thresholds, expected_bins, expected_ladder, expected_populations
 
 
-@_requires_selective_cuda
+@_requires_selective_sm100
 @pytest.mark.parametrize("segments", [4, 8, 16, 32, 64, 128])
 def test_native_ladder_matches_signed_histogram(segments):
     """Crossings, inclusive populations, and bank policy match a host oracle."""
@@ -8203,7 +8250,7 @@ def test_native_ladder_matches_signed_histogram(segments):
 # Native sample ladder
 
 
-@_requires_selective_cuda
+@_requires_selective_sm100
 @pytest.mark.parametrize("top_k", [1, 31, 128, 512])
 @pytest.mark.parametrize("segments", [4, 8, 12, 16, 32, 64, 128])
 def test_cuda_sample_ladder_policy_and_graph(top_k, segments):
