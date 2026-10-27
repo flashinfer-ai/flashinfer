@@ -2124,6 +2124,43 @@ MODULES: dict[str, dict[str, Any]] = {
         "defines": [],
         "instantiations": {},
     },
+    "cake_selective_state_update_c8d4a1d9d1f10d2bfef5": {
+        "sources": [
+            "cake_selective_state_update_c8d4a1d9d1f10d2bfef5_kernel.cu",
+            "cake_selective_state_update_c8d4a1d9d1f10d2bfef5_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "state_tma"],
+            ["buffer", "x"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["parameter", "batch_size"],
+            ["parameter", "nheads"],
+            ["parameter", "dim"],
+            ["parameter", "dstate"],
+            ["parameter", "ngroups"],
+            ["parameter", "token_steps"],
+            ["parameter", "head_tiles"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "defines": [],
+        "instantiations": {},
+        "arches": [
+            "sm_103a",
+        ],
+    },
     "cake_selective_state_update_cfaa7ed6d28c5e210f1f": {
         "sources": [
             "cake_selective_state_update_cfaa7ed6d28c5e210f1f_kernel.cu",
@@ -2949,6 +2986,7 @@ PROGRAMS: dict[str, str] = {
     "mtp_short_ring_heads64_groups8_t1_stp": "cake_selective_state_update_e459e2b0bd3726248707",
     "mtp_short_ring_heads64_groups8_t2": "cake_selective_state_update_48a347bb1a0e177124fb",
     "mtp_short_ring_heads64_groups8_t2_jr": "cake_selective_state_update_1620c93b881020ba8397",
+    "mtp_short_ring_heads64_groups8_t2_jr_hb": "cake_selective_state_update_c8d4a1d9d1f10d2bfef5",
     "stp_dim128_fp32": "cake_selective_state_update_4d2ff3309e21d5caaded",
     "stp_dim128_fp32_l2_prefetch": "cake_selective_state_update_ef556b69e0d68747bdfd",
     "stp_dim128_hpc1_mb4": "cake_selective_state_update_1620e61f3308698efb02",
@@ -3027,10 +3065,14 @@ _MTP_SHORT_RING_DOMAIN: dict[tuple[str, int], tuple[int, Optional[int], int]] = 
     ("sm_103a", 1): (64, 96, 2),
     ("sm_103a", 2): (32, None, 0),
 }
-# The two-token ring that reduces both tokens' projections together (``joint_reduce``; output and state bitwise the
-# two-token ring's): per (architecture, SM count) the inclusive batch intervals in which a two-token call the ring
-# serves runs it instead, each batch measured faster than the ring.
-_MTP_SHORT_RING_JR_PROGRAM = "mtp_short_ring_heads64_groups8_t2_jr"
+# The two-token rings that reduce both tokens' projections together (``joint_reduce``; on sm_103a with each
+# consumer's state base set before the head's first wait, ``head_base``; output and state bitwise the two-token
+# ring's), by architecture, and per (architecture, SM count) the inclusive batch intervals in which a two-token call
+# the ring serves runs the architecture's one instead, each batch measured faster than the ring.
+_MTP_SHORT_RING_JR_PROGRAMS: dict[str, str] = {
+    "sm_100a": "mtp_short_ring_heads64_groups8_t2_jr",
+    "sm_103a": "mtp_short_ring_heads64_groups8_t2_jr_hb",
+}
 _MTP_SHORT_RING_JR_BATCHES: dict[tuple[str, int], tuple[tuple[int, int], ...]] = {
     ("sm_100a", 148): (
         (33, 33),
@@ -3062,6 +3104,34 @@ _MTP_SHORT_RING_JR_BATCHES: dict[tuple[str, int], tuple[tuple[int, int], ...]] =
         (285, 285),
         (296, 296),
         (306, 306),
+    ),
+    ("sm_103a", 152): (
+        (32, 37),
+        (39, 46),
+        (50, 50),
+        (54, 54),
+        (56, 71),
+        (73, 73),
+        (77, 78),
+        (83, 106),
+        (108, 108),
+        (110, 110),
+        (112, 116),
+        (118, 118),
+        (123, 145),
+        (147, 148),
+        (154, 154),
+        (156, 184),
+        (186, 188),
+        (190, 256),
+        (260, 260),
+        (266, 266),
+        (270, 270),
+        (280, 280),
+        (285, 285),
+        (296, 296),
+        (304, 304),
+        (320, 320),
     ),
 }
 
@@ -3320,9 +3390,10 @@ def mtp_short_program(
     On 64 heads of 8 groups the TMA-ring build of the launch's token count runs inside its domain
     (``_MTP_SHORT_RING_DOMAIN``): a batch in the range of the architecture and token count, and a last wave of
     eight-head CTAs (two per SM) filled at least to the bound, or a whole number of waves; a two-token call the ring
-    serves at a batch of ``_MTP_SHORT_RING_JR_BATCHES`` for the architecture and SM count runs the joint-reduction
-    ring.  Smaller batches, and batches that leave the ring's last wave nearly empty, run the build folding those
-    counts with one CTA per batch row and head.  Every other head and group count runs the prefetch build.
+    serves at a batch of ``_MTP_SHORT_RING_JR_BATCHES`` for the architecture and SM count runs the architecture's
+    joint-reduction ring (``_MTP_SHORT_RING_JR_PROGRAMS``).  Smaller batches, and batches that leave the ring's last
+    wave nearly empty, run the build folding those counts with one CTA per batch row and head.  Every other head and
+    group count runs the prefetch build.
     """
     if (nheads, ngroups) != (64, 8):
         return "mtp_short_prefetch", 0
@@ -3338,7 +3409,7 @@ def mtp_short_program(
                 if token_steps == 2 and any(
                     low <= batch_size <= high for low, high in jr
                 ):
-                    return _MTP_SHORT_RING_JR_PROGRAM, head_tiles
+                    return _MTP_SHORT_RING_JR_PROGRAMS[arch], head_tiles
                 return f"mtp_short_ring_heads64_groups8_t{token_steps}", head_tiles
     return "mtp_short_prefetch_heads64_groups8", 0
 
