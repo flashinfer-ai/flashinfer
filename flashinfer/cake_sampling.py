@@ -1712,7 +1712,6 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (151936, 64, False): (2, 16, True),
         (32768, 64, True): (2, 16, True),
         (128256, 128, True): (1, 16, True),
-        (151936, 16, True): (4, 16, True),
         (151936, 128, True): (1, 16, True),
     },
     # R200, 208 SMs
