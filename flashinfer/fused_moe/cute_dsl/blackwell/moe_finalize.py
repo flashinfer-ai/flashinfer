@@ -23,13 +23,20 @@ _kernel_cache: dict[tuple, Any] = {}
 
 
 @dsl_user_op
-def _fma_rn(a, b, c, *, loc=None, ip=None):
-    return cutlass.Float32(
+def _mul_bf16_pair(word, scale, loc=None, ip=None):
+    # A separate first multiply preserves signed zero, as in MegaMoE combine.
+    return cutlass.Uint64(
         llvm.inline_asm(
-            T.f32(),
-            [cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b, c)],
-            "fma.rn.f32 $0, $1, $2, $3;",
-            "=f,f,f,f",
+            T.i64(),
+            [
+                cutlass.Uint32(word).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(scale).ir_value(loc=loc, ip=ip),
+            ],
+            "{ .reg .b32 lo, hi; .reg .b64 pair, scales; "
+            "shl.b32 lo, $1, 16; and.b32 hi, $1, 0xffff0000; "
+            "mov.b64 pair, {lo, hi}; mov.b64 scales, {$2, $2}; "
+            "mul.rn.f32x2 $0, pair, scales; }",
+            "=l,r,f",
             has_side_effects=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -39,14 +46,36 @@ def _fma_rn(a, b, c, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _mul_rn(a, b, loc=None, ip=None):
-    # A separate first multiply preserves signed zero, as in MegaMoE combine.
-    return cutlass.Float32(
+def _fma_bf16_pair(word, scale, accum, loc=None, ip=None):
+    return cutlass.Uint64(
         llvm.inline_asm(
-            T.f32(),
-            [cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b)],
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
+            T.i64(),
+            [
+                cutlass.Uint32(word).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(scale).ir_value(loc=loc, ip=ip),
+                cutlass.Uint64(accum).ir_value(loc=loc, ip=ip),
+            ],
+            "{ .reg .b32 lo, hi; .reg .b64 pair, scales; "
+            "shl.b32 lo, $1, 16; and.b32 hi, $1, 0xffff0000; "
+            "mov.b64 pair, {lo, hi}; mov.b64 scales, {$2, $2}; "
+            "fma.rn.f32x2 $0, pair, scales, $3; }",
+            "=l,r,f,l",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _to_bf16_pair(accum, loc=None, ip=None):
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint64(accum).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 lo, hi; mov.b64 {lo, hi}, $1; cvt.rn.bf16x2.f32 $0, hi, lo; }",
+            "=r,l",
             has_side_effects=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -59,12 +88,12 @@ def _bf16_vector(pointer):
     # Every row and per-thread offset is a multiple of eight BF16 elements.
     return cute.make_tensor(
         cute.make_ptr(
-            cutlass.BFloat16,
+            cutlass.Uint32,
             pointer.toint(),
             pointer.memspace,
             assumed_align=16,
         ),
-        cute.make_layout((8,)),
+        cute.make_layout((4,)),
     )
 
 
@@ -121,11 +150,11 @@ class _MoeFinalizeKernel:
 
         rows = cute.make_rmem_tensor((self.top_k,), cutlass.Int32)
         weights = cute.make_rmem_tensor((self.top_k,), cutlass.Float32)
-        accum = cute.make_rmem_tensor((8, self.vectors_per_thread), cutlass.Float32)
-        accum.fill(0.0)
-        values = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+        accum = cute.make_rmem_tensor((4, self.vectors_per_thread), cutlass.Uint64)
+        accum.fill(0)
+        values = cute.make_rmem_tensor((4,), cutlass.Uint32)
         copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), cutlass.Uint32, num_bits_per_copy=128
         )
 
         # The caller guarantees routing is ready before FC2 signals us.
@@ -154,21 +183,22 @@ class _MoeFinalizeKernel:
                     if vector_column < self.hidden_size:
                         offset = row * self.hidden_size + vector_column
                         cute.copy(copy_atom, _bf16_vector(input_ptr + offset), values)
-                        for element in cutlass.range_constexpr(8):
+                        for element in cutlass.range_constexpr(4):
                             if cutlass.const_expr(slot == 0):
-                                accum[element, vector] = _mul_rn(
-                                    cutlass.Float32(values[element]), weights[slot]
+                                accum[element, vector] = _mul_bf16_pair(
+                                    values[element], weights[slot]
                                 )
                             else:
-                                accum[element, vector] = _fma_rn(
-                                    cutlass.Float32(values[element]),
+                                accum[element, vector] = _fma_bf16_pair(
+                                    values[element],
                                     weights[slot],
                                     accum[element, vector],
                                 )
         for vector in cutlass.range_constexpr(self.vectors_per_thread):
             vector_column = column + vector * self.threads * 8
             if vector_column < self.hidden_size:
-                values.store(accum[None, vector].load().to(cutlass.BFloat16))
+                for element in cutlass.range_constexpr(4):
+                    values[element] = _to_bf16_pair(accum[element, vector])
                 offset = cutlass.Int64(token_idx) * self.hidden_size + vector_column
                 cute.copy(copy_atom, values, _bf16_vector(output_ptr + offset))
 
