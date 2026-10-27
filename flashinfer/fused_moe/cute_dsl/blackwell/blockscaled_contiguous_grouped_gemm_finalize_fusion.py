@@ -164,7 +164,11 @@ def _blockscaled_dynamic_mma(
     """Issue native blockscaled MMAs with a runtime token-width descriptor."""
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
-    n_bits = (((cutlass.Int32(valid_tokens) + 15) & -16) >> 3) << 17
+    # Blockscaled MMA requires eight columns per CTA in the group.
+    n_alignment = 8 * cta_group
+    n_bits = (
+        ((cutlass.Int32(valid_tokens) + n_alignment - 1) & -n_alignment) >> 3
+    ) << 17
     for inner_k in range(cute.size(a, mode=[2])):
         a_atom = a[(None, 0, inner_k)]
         b_atom = b[(None, 0, inner_k)]
