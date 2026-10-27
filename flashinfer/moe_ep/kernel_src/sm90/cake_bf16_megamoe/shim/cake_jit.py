@@ -293,7 +293,15 @@ def gen_sm90_cake_bf16_combine_tail_prereduced_module() -> JitSpec:
 _GROUPED_GEMM_PACKAGE = "cake_sm90_bf16_megamoe"
 _GROUPED_GEMM_ARCH = "sm_90a"
 _GROUPED_GEMM_MANIFEST = _SOURCE_DIR / f"{_GROUPED_GEMM_PACKAGE}_manifest.json"
-GROUPED_GEMM_STAGES = ("fc1_gated", "fc1_gated_clamp", "fc2")
+# FC2 early-start pair (runner fc2_early_max_tokens): FC1 variants that release
+# per-m-tile readiness counters and an FC2 that claims its tiles dynamically.
+GROUPED_GEMM_EARLY_STAGES = ("fc1_gated_signal", "fc1_gated_clamp_signal", "fc2_early")
+GROUPED_GEMM_STAGES = (
+    "fc1_gated",
+    "fc1_gated_clamp",
+    "fc2",
+    *GROUPED_GEMM_EARLY_STAGES,
+)
 
 
 def _manifest_path() -> Path:
@@ -334,7 +342,7 @@ def grouped_gemm_manifest() -> dict[str, Any]:
 
 
 def grouped_gemm_record(stage: str) -> dict[str, Any]:
-    """Manifest record of one generated stage (``fc1_gated`` / ``fc1_gated_clamp`` / ``fc2``)."""
+    """Manifest record of one generated stage (``GROUPED_GEMM_STAGES``)."""
     if stage not in GROUPED_GEMM_STAGES:
         raise ValueError(
             f"unknown grouped GEMM stage {stage!r}; expected one of {GROUPED_GEMM_STAGES}"

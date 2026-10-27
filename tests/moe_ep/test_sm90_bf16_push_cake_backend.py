@@ -366,6 +366,7 @@ ROUND_SWITCH_ENVS = (
     "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM",
     "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM",
     "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL",
+    "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS",
 )
 
 
@@ -391,10 +392,131 @@ def test_ep1_round_switch_defaults(monkeypatch) -> None:
     assert runner.grid_dispatch_min_tokens == 513
     assert runner.compact_form == 1 and runner.publish_form == 1
     assert runner.per_route_publish_pdl is True
+    assert runner.fc2_early_max_tokens == 128
     x, ids, weights = _make_inputs(37, LOCAL_EXPERTS, 59, device)
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
     _check(output, x, ids, weights, w13, w2, label=" ep1 round switch defaults")
+
+
+class _GemmSpy:
+    """Forwards to the runner's grouped GEMM launcher and records whether each FC1 /
+    FC2 launch of a round took the early-start pair (a ``sched`` buffer)."""
+
+    def __init__(self, gemm) -> None:
+        self._gemm = gemm
+        self.calls: list[tuple[str, bool]] = []
+
+    def __getattr__(self, name):
+        return getattr(self._gemm, name)
+
+    def fc1(self, *args, **kwargs):
+        self.calls.append(("fc1", kwargs.get("sched") is not None))
+        return self._gemm.fc1(*args, **kwargs)
+
+    def fc2(self, *args, **kwargs):
+        self.calls.append(("fc2", kwargs.get("sched") is not None))
+        return self._gemm.fc2(*args, **kwargs)
+
+
+# Round sizes around the FC2 early-start window (0 < local tokens <= 128 by default).
+FC2_EARLY_TOKENS = (1, 8, 16, 32, 64, 128, 129, 160)
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "hot", "masked"])
+def test_ep1_fc2_early_window_bitwise(mode: str, wire: str) -> None:
+    """Rounds with 0 < tokens <= fc2_early_max_tokens run the early-start GEMM pair and
+    write the same bytes as the regular pair; larger rounds run the regular pair."""
+    device = torch.device("cuda", 0)
+    capacity = max(FC2_EARLY_TOKENS)
+    ref, w13, w2 = _build_layer(
+        1, 0, device, combine_wire=wire, token_capacity=capacity, fc2_early_max_tokens=0
+    )
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        fc2_early_max_tokens=128,
+    )
+    assert _warm_runner(ref, device).fc2_early_max_tokens == 0
+    runner = _warm_runner(layer, device)
+    assert runner.fc2_early_max_tokens == 128
+    spy = _GemmSpy(runner.gemm)
+    runner.gemm = spy
+    try:
+        _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device)
+    finally:
+        runner.gemm = spy._gemm
+
+
+def _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device) -> None:
+    for num_tokens in (0,) + FC2_EARLY_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 61 + num_tokens, device, mode=mode
+        )
+        spy.calls.clear()
+        output = _forward(layer, x, ids, weights).clone()
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        if num_tokens:
+            early = num_tokens <= 128
+            assert spy.calls == [("fc1", early), ("fc2", early)], (
+                num_tokens,
+                spy.calls,
+            )
+        else:  # an empty round never takes the early-start pair
+            assert not any(e for _, e in spy.calls), spy.calls
+        assert torch.equal(output, reference), f"T={num_tokens}"
+        if num_tokens:
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep1 {wire} {mode} T={num_tokens} fc2_early",
+            )
+    # graph replay of a window round, then a regular round on the same layer
+    x, ids, weights = _make_inputs(16, LOCAL_EXPERTS, 71, device, mode=mode)
+    reference = _forward(ref, x, ids, weights).clone()
+    static = [t.clone() for t in (x, ids, weights)]
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _forward(layer, *static)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = _forward(layer, *static)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(static_output, reference)
+    x2, ids2, weights2 = _make_inputs(160, LOCAL_EXPERTS, 73, device, mode=mode)
+    output2 = _forward(layer, x2, ids2, weights2).clone()
+    reference2 = _forward(ref, x2, ids2, weights2).clone()
+    torch.cuda.synchronize()
+    assert torch.equal(output2, reference2)
+
+
+@requires_sm90
+def test_ep1_fc2_early_switch_validation() -> None:
+    """fc2_early_max_tokens rejects negative and non-int values."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    device = torch.device("cuda", 0)
+    for kwargs in (
+        {"fc2_early_max_tokens": -1},
+        {"fc2_early_max_tokens": True},
+    ):
+        with pytest.raises((MoEEpConfigError, ValueError)):
+            _build_layer(1, 0, device, token_capacity=33, **kwargs)
 
 
 @requires_sm90
@@ -981,6 +1103,7 @@ def test_ep_shared_workspace_round_paths(mode: str) -> None:
         compact_form=0,
         publish_form=0,
         per_route_publish_pdl=False,
+        fc2_early_max_tokens=0,
     )
     ref, w13, w2 = _build_layer(
         world_size, rank, device, token_capacity=capacity, **off
@@ -1029,6 +1152,91 @@ def test_ep_shared_workspace_round_paths(mode: str) -> None:
     runners = {id(_find_runner(layer)) for layer in layers}
     assert len(runners) == 1, "layers of one config must share one pooled runner"
     assert id(_find_runner(ref)) not in runners
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_fc2_early_straddle_bitwise(mode: str) -> None:
+    """The FC2 early start is rank-local: in one round some ranks run the early-start
+    pair (<= 128 local tokens) and others the regular pair (> 128 or no tokens), also on
+    the per-route wire whose publish is a PDL launch (8-token pipes); every layer stays
+    bitwise equal to a layer with the early start off."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    for capacity, common, plans in (
+        (
+            160,
+            {},
+            (
+                lambda r: 128 + r % 2,
+                lambda r: 127 + 2 * (r % 2),
+                lambda r: 0 if r == 0 else 16,
+                lambda r: 1 + r,
+            ),
+        ),
+        (
+            8,
+            dict(
+                combine_wire="per_route",
+                pdl=6,
+                pdl_late=True,
+                per_route_publish_pdl=True,
+            ),
+            (lambda r: 8, lambda r: 1 + r % 8, lambda r: 0 if r == 0 else 8),
+        ),
+    ):
+        ref, w13, w2 = _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            fc2_early_max_tokens=0,
+            **common,
+        )
+        layer, _w13, _w2 = _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            fc2_early_max_tokens=128,
+            **common,
+        )
+        runner = _warm_runner(layer, device)
+        assert runner.fc2_early_max_tokens == 128
+        if common:
+            assert runner.combine_wire == "per_route" and runner.per_route_publish_pdl
+        for index, plan in enumerate(plans):
+            num_tokens = plan(rank)
+            x, ids, weights = _make_inputs(
+                num_tokens,
+                total_experts,
+                151 + 11 * index + rank,
+                device,
+                mode=mode,
+                rank=rank,
+                world_size=world_size,
+            )
+            reference = _forward(ref, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(output, reference), (
+                f"capacity {capacity} round {index} T={num_tokens}"
+            )
+            if num_tokens:
+                _check(
+                    output,
+                    x,
+                    ids,
+                    weights,
+                    w13,
+                    w2,
+                    label=f" ep{world_size} rank{rank} {mode} cap {capacity} round {index} T={num_tokens} fc2_early",
+                )
     dist.barrier()
 
 

@@ -52,6 +52,8 @@ __all__ = [
     "COMBINE_WIRE_ENV",
     "COMPACT_FORM_ENV",
     "COPY_FORMS",
+    "FC2_EARLY_MAX_TOKENS",
+    "FC2_EARLY_MAX_TOKENS_ENV",
     "FUSED_BEGIN_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
@@ -173,6 +175,14 @@ _FUSED_PREFIX_MAX_KEYS = (
 COMPACT_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM"
 PUBLISH_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM"
 COPY_FORMS = (0, 1)
+# FC2 early start in the decode window: rounds with 0 < local tokens <= this bound
+# launch FC1 variants that release per-m-tile readiness counters and an FC2 that
+# claims its tiles dynamically as they become ready (no griddepcontrol.wait), so
+# FC2 tiles fill the SMs that FC1's tail wave leaves free.  Same tiles, same
+# instruction stream per tile, same bits; larger rounds run the regular pair.
+# 0 disables it.  FC1 and FC2 are rank-local, so ranks may differ per round.
+FC2_EARLY_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS"
+FC2_EARLY_MAX_TOKENS = 128
 
 
 def _env_flag(name: str) -> bool:
@@ -260,6 +270,11 @@ def _form(value: int | None, env: str, name: str) -> int:
     return form
 
 
+def _fc2_early_max_tokens_default() -> int:
+    raw = os.environ.get(FC2_EARLY_MAX_TOKENS_ENV)
+    return FC2_EARLY_MAX_TOKENS if raw is None else int(raw.strip())
+
+
 def _combine_wire_default(token_capacity: int) -> str:
     """Default combine wire: the environment override when set, otherwise the
     per-shape default (``per_route`` when ``token_capacity`` is at or below
@@ -344,6 +359,7 @@ class Sm90CakeBf16MoERunner:
         compact_form: int | None = None,
         publish_form: int | None = None,
         per_route_publish_pdl: bool | None = None,
+        fc2_early_max_tokens: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -426,6 +442,17 @@ class Sm90CakeBf16MoERunner:
         self._grid_dispatch_min_tokens = grid_min
         self._compact_form = _form(compact_form, COMPACT_FORM_ENV, "compact_form")
         self._publish_form = _form(publish_form, PUBLISH_FORM_ENV, "publish_form")
+        early_max = (
+            _fc2_early_max_tokens_default()
+            if fc2_early_max_tokens is None
+            else int(fc2_early_max_tokens)
+        )
+        if early_max < 0:
+            raise ValueError(
+                f"fc2_early_max_tokens must be >= 0, got {fc2_early_max_tokens!r}"
+            )
+        self._fc2_early_max_tokens = early_max  # effective value fixed after the JIT
+        self._gemm_sched: torch.Tensor | None = None
         self._per_route_publish_pdl = (
             _per_route_publish_pdl_default()
             if per_route_publish_pdl is None
@@ -519,6 +546,21 @@ class Sm90CakeBf16MoERunner:
                 else None
             )
             self.gemm = gemm if gemm is not None else create_grouped_gemm(clamp=clamp)
+            if not (
+                pipe.E <= 1023  # the FC2 tile id carries the expert in 10 bits
+                and min(pipe.H, self.I) >= 256  # >= 4 k-stages per FC2 tile
+                and getattr(self.gemm, "supports_early_start", False)
+            ):
+                self._fc2_early_max_tokens = 0
+            if self._fc2_early_max_tokens > 0:
+                # FC2 tile ticket, FC2 exit ticket, FC1 go word, FC1 CTA count, then one
+                # FC1 readiness counter per m-tile: zeroed once here and kept zeroed by
+                # FC2's last CTA every round (no per-round memset, graph-safe)
+                self._gemm_sched = torch.zeros(
+                    16 + self.m_buf // 128 + pipe.E,
+                    dtype=torch.int32,
+                    device=pipe.device,
+                )
             return None
 
         _run_guarded_phase(pipe._comm, pipe.rank, "cake-bf16-jit", _jit)
@@ -576,6 +618,11 @@ class Sm90CakeBf16MoERunner:
     def publish_form(self) -> int:
         """Pre-reduced publish kernel form (0 or 1; see ``PUBLISH_FORM_ENV``)."""
         return self._publish_form
+
+    @property
+    def fc2_early_max_tokens(self) -> int:
+        """Largest round (local tokens) that starts FC2 in FC1's tail wave (0 = off)."""
+        return self._fc2_early_max_tokens
 
     @property
     def fused_begin(self) -> int:
@@ -949,22 +996,48 @@ class Sm90CakeBf16MoERunner:
                         self._pdl_flag(PDL_EDGE_COMPACT),
                         self._compact_form,
                     )
+                # FC2 early start in the decode window (rank-local: no cross-rank protocol)
+                sched = (
+                    self._gemm_sched
+                    if 0 < num_tokens <= self._fc2_early_max_tokens
+                    else None
+                )
                 with _record_stage("fc1", nv):
-                    self.gemm.fc1(
-                        self.a1,
-                        weights.w13,
-                        pipe._offsets,
-                        self.h2,
-                        pdl=bool(self._pdl & PDL_EDGE_FC1),
-                    )
+                    if sched is not None:
+                        self.gemm.fc1(
+                            self.a1,
+                            weights.w13,
+                            pipe._offsets,
+                            self.h2,
+                            pdl=bool(self._pdl & PDL_EDGE_FC1),
+                            sched=sched,
+                        )
+                    else:
+                        self.gemm.fc1(
+                            self.a1,
+                            weights.w13,
+                            pipe._offsets,
+                            self.h2,
+                            pdl=bool(self._pdl & PDL_EDGE_FC1),
+                        )
                 with _record_stage("fc2", nv):
-                    self.gemm.fc2(
-                        self.h2,
-                        weights.w2,
-                        pipe._offsets,
-                        self.y,
-                        pdl=bool(self._pdl & PDL_EDGE_FC2),
-                    )
+                    if sched is not None:
+                        self.gemm.fc2(
+                            self.h2,
+                            weights.w2,
+                            pipe._offsets,
+                            self.y,
+                            pdl=bool(self._pdl & PDL_EDGE_FC2),
+                            sched=sched,
+                        )
+                    else:
+                        self.gemm.fc2(
+                            self.h2,
+                            weights.w2,
+                            pipe._offsets,
+                            self.y,
+                            pdl=bool(self._pdl & PDL_EDGE_FC2),
+                        )
                 if self._combine_wire in _PREREDUCED_WIRES:
                     split = (
                         1 if self._combine_wire == COMBINE_WIRE_PREREDUCED_HILO else 0

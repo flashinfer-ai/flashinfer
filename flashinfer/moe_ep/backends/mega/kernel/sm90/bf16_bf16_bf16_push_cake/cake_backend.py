@@ -272,6 +272,15 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} per_route_publish_pdl must be a bool or None, got {kcfg.per_route_publish_pdl!r}"
             )
+        if kcfg.fc2_early_max_tokens is not None and not (
+            isinstance(kcfg.fc2_early_max_tokens, int)
+            and not isinstance(kcfg.fc2_early_max_tokens, bool)
+            and kcfg.fc2_early_max_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_max_tokens must be an int >= 0 or None, got "
+                f"{kcfg.fc2_early_max_tokens!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -388,6 +397,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 compact_form=kcfg.compact_form,
                 publish_form=kcfg.publish_form,
                 per_route_publish_pdl=kcfg.per_route_publish_pdl,
+                fc2_early_max_tokens=kcfg.fc2_early_max_tokens,
             )
         except Exception:
             pipe.destroy()
@@ -422,6 +432,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.compact_form,
             kcfg.publish_form,
             kcfg.per_route_publish_pdl,
+            kcfg.fc2_early_max_tokens,
             float(kcfg.init_timeout_s),
         )
 

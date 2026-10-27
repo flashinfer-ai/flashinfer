@@ -92,6 +92,13 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     are unaffected.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL`` (default on).  It
     changes no stored value.
+
+    ``fc2_early_max_tokens`` starts FC2 inside FC1's tail wave in rounds with
+    at most that many local tokens: FC1 releases a readiness counter per
+    128-row tile, FC2 claims its tiles dynamically and reads each tile's input
+    once it is released (same tiles, same instruction stream per tile, same
+    bits).  ``0`` disables it.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS`` (default ``128``).
     """
 
     intermediate_size: int
@@ -111,3 +118,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     compact_form: int | None = None
     publish_form: int | None = None
     per_route_publish_pdl: bool | None = None
+    fc2_early_max_tokens: int | None = None

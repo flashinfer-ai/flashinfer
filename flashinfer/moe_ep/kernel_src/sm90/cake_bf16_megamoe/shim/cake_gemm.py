@@ -177,8 +177,28 @@ class ExportedGroupedGemm:
         fc1_stage = "fc1_gated_clamp" if clamp is not None else "fc1_gated"
         self._fc1 = gen_sm90_cake_bf16_grouped_gemm_module(fc1_stage).build_and_load()
         self._fc2 = gen_sm90_cake_bf16_grouped_gemm_module("fc2").build_and_load()
+        self._early_fc1_stage = f"{fc1_stage}_signal"
+        self._early: tuple[Any, Any] | None = None
         self._sm_count: dict[int, int] = {}
         self._destroyed = False
+
+    # FC2 early start: FC1 releases per-m-tile readiness counters into ``sched``
+    # and FC2 claims its tiles dynamically without griddepcontrol.wait, so FC2
+    # tiles run on the SMs that FC1's tail wave leaves free (same tiles, same
+    # bits).  Separate sealed modules; the FC1 / FC2 modules above are untouched.
+    supports_early_start = True
+
+    def _early_modules(self) -> tuple[Any, Any]:
+        if self._early is None:
+            from .cake_jit import gen_sm90_cake_bf16_grouped_gemm_module
+
+            self._early = (
+                gen_sm90_cake_bf16_grouped_gemm_module(
+                    self._early_fc1_stage
+                ).build_and_load(),
+                gen_sm90_cake_bf16_grouped_gemm_module("fc2_early").build_and_load(),
+            )
+        return self._early
 
     def _grid_x(self, device: torch.device) -> int:
         index = (
@@ -200,6 +220,7 @@ class ExportedGroupedGemm:
         offsets: torch.Tensor,
         out: torch.Tensor,
         pdl: bool = False,
+        extra: tuple[Any, ...] = (),
     ) -> None:
         if self._destroyed:
             raise RuntimeError("ExportedGroupedGemm has been destroyed")
@@ -215,6 +236,7 @@ class ExportedGroupedGemm:
             w,
             offsets,
             out,
+            *extra,
             self._grid_x(a.device),
             1,
             1,
@@ -228,7 +250,21 @@ class ExportedGroupedGemm:
         out: torch.Tensor,
         *,
         pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
+        # early-start pair: release per-m-tile readiness into sched
+        if sched is not None:
+            self._launch(
+                self._early_modules()[0],
+                gated=True,
+                a=a,
+                w=w13,
+                offsets=offsets,
+                out=out,
+                pdl=pdl,
+                extra=(sched,),
+            )
+            return
         self._launch(
             self._fc1, gated=True, a=a, w=w13, offsets=offsets, out=out, pdl=pdl
         )
@@ -241,7 +277,21 @@ class ExportedGroupedGemm:
         out: torch.Tensor,
         *,
         pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
+        # early-start pair: must follow fc1(..., sched=sched) on the same stream
+        if sched is not None:
+            self._launch(
+                self._early_modules()[1],
+                gated=False,
+                a=h,
+                w=w2,
+                offsets=offsets,
+                out=out,
+                pdl=pdl,
+                extra=(sched, sched, 0),  # no per-expert FC2 completion counters
+            )
+            return
         self._launch(
             self._fc2, gated=False, a=h, w=w2, offsets=offsets, out=out, pdl=pdl
         )
