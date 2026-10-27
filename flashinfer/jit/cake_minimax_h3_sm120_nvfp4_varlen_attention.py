@@ -17,13 +17,12 @@ cooperative), the statistics launch that also quantizes Q (STATS) and the K/V qu
 in its short-plan and long-plan work orders (QUANTIZE_KV, QUANTIZE_KV_HBLK64) of the
 other plans, and the attention launch of the compensated and uncompensated routes in the
 base and warp-specialised forms (ATTENTION, ATTENTION_NODELTA, ATTENTION_WS,
-ATTENTION_WS_NODELTA), and the overlapped form of the fused plans: the lead attention
-launch (ATTENTION_LEAD, ATTENTION_NODELTA_LEAD, a plain launch), the head-major pre-
-processing producers (PREPROCESS_HEAD_MAJOR) and the tail attention launch
-(ATTENTION_TAIL, ATTENTION_NODELTA_TAIL), each shipped for sm_120a. Load every program
-before the first overlapped call: the lead CTAs wait on flags only the producers set, so
-a lazy module load of the producers or the tail behind a running lead would never
-complete. The host module
+ATTENTION_WS_NODELTA), and the overlapped form of the fused plans in launch order: the
+head-major pre-processing producers (PREPROCESS_HEAD_MAJOR, a plain launch), the lead
+attention launch (ATTENTION_LEAD, ATTENTION_NODELTA_LEAD) and the tail attention launch
+(ATTENTION_TAIL, ATTENTION_NODELTA_TAIL), each shipped for sm_120a. A CTA of the overlap
+waits only on CTAs launched before it in its call, so a lazy module load only delays a
+call. The host module
 ``flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention`` selects the
 programs, computes the grids and launches them behind
 ``minimax_h3_sm120_varlen_attention_nvfp4`` and
@@ -548,10 +547,10 @@ PREPROCESS_HEAD_MAJOR = cake_program.CakeProgram(
         "v_sf",
         "hctr",
     ),
-    block=(256, 1, 1),
+    block=(768, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=16512,
-    use_pdl=True,
+    dynamic_smem_bytes=49536,
+    use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
 )
@@ -607,7 +606,7 @@ ATTENTION_LEAD = cake_program.CakeProgram(
     block=(256, 1, 1),
     cluster=(1, 1, 1),
     dynamic_smem_bytes=66560,
-    use_pdl=False,
+    use_pdl=True,
     cooperative=False,
     needs_device_linking=False,
 )
@@ -719,7 +718,7 @@ ATTENTION_NODELTA_LEAD = cake_program.CakeProgram(
     block=(256, 1, 1),
     cluster=(1, 1, 1),
     dynamic_smem_bytes=48128,
-    use_pdl=False,
+    use_pdl=True,
     cooperative=False,
     needs_device_linking=False,
 )

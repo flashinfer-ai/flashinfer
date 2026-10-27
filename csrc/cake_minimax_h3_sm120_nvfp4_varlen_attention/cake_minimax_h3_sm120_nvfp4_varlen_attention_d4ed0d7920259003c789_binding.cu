@@ -141,6 +141,15 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_tile_table
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+  {
+    // Once per thread per device: the kernel's function attributes hold per device.
+    static thread_local uint64_t prepared_devices = 0;
+    const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
+    if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789), cudaFuncAttributeMaxDynamicSharedMemorySize, 49536), "cudaFuncSetAttribute");
+      prepared_devices |= device_bit;
+    }
+  }
   void* v_Q = DataPtr(a_Q);
   void* v_K = DataPtr(a_K);
   void* v_V = DataPtr(a_V);
@@ -169,14 +178,9 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_tile_table
   void* kernel_args[] = {&v_Q, &v_K, &v_V, &v_tile_table, &v_seg_tile_begin, &v_tok_seg, &v_cu_seqlens, &v_partials, &v_counters, &v_mean_k, &v_q_mean, &v_q4, &v_k4, &v_q_sf, &v_k_sf, &v_qm4, &v_qm_sf, &v_vt4, &v_v_sf, &v_hctr, &v_num_tiles, &v_total_tokens, &v_total_padded, &v_num_heads, &v_num_kblocks};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
-  config.blockDim = dim3(256, 1, 1);
-  config.dynamicSmemBytes = 16512;
+  config.blockDim = dim3(768, 1, 1);
+  config.dynamicSmemBytes = 49536;
   config.stream = stream;
-  cudaLaunchAttribute attrs[1] = {};
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = attrs;
-  config.numAttrs = 1;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789), kernel_args),
             "cudaLaunchKernelExC");
 }
