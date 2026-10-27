@@ -48,6 +48,7 @@ FP8 = torch.float8_e4m3fn
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_route_table_delivers_one_fused_program_for_world_size_four():
     program = loader.main_program(4)
     assert program in loader.PROGRAMS
@@ -59,6 +60,7 @@ def test_route_table_delivers_one_fused_program_for_world_size_four():
             loader.main_program(world_size)
 
 
+@pytest.mark.cpu_only
 def test_program_record_carries_the_fused_launcher_contract():
     record = loader.PROGRAMS[loader.main_program(4)]
     # The device unit and its thin tvm-ffi launcher, both directly under the package.
@@ -114,6 +116,7 @@ def test_program_record_carries_the_fused_launcher_contract():
     }
 
 
+@pytest.mark.cpu_only
 def test_frozen_trace_time_choices_are_recorded_not_exposed():
     assert loader.COMM_MODE == "p2p"
     assert loader.TRANSPORT == "pull"
@@ -124,6 +127,7 @@ def test_frozen_trace_time_choices_are_recorded_not_exposed():
     assert loader.CAPABILITY_ARCH == {(10, 0): "sm_100a"}
 
 
+@pytest.mark.cpu_only
 def test_spec_names_carry_the_exact_architecture(monkeypatch):
     specs = []
 
@@ -163,6 +167,7 @@ def test_spec_names_carry_the_exact_architecture(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "rows, expected",
     [(1, 128), (127, 128), (128, 128), (129, 256), (1024, 1024), (4133, 4224)],
@@ -173,12 +178,14 @@ def test_ceil128_rounds_up_to_the_chunk(rows, expected):
     assert loader.chunk_capacity(rows) == expected // 128
 
 
+@pytest.mark.cpu_only
 def test_ceil128_rejects_non_positive_rows():
     for rows in (0, -1):
         with pytest.raises(ValueError, match="positive"):
             loader.ceil128(rows)
 
 
+@pytest.mark.cpu_only
 def test_workspace_bytes_is_two_n_times_four_slots_times_ceil128_rows():
     # C_cap=8, 4 slots (3 sender + 1 result), 12 column tiles, 64 KiB tiles: 24 MiB.
     assert loader.workspace_bytes(1024, 3072, 4) == 25165824
@@ -191,6 +198,7 @@ def test_workspace_bytes_is_two_n_times_four_slots_times_ceil128_rows():
         loader.slots_per_chunk(8)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "max_rows, flag_bytes", [(1024, 64), (8192, 512), (65536, 4096), (1, 8)]
 )
@@ -200,6 +208,7 @@ def test_flag_words_are_two_per_chunk(max_rows, flag_bytes):
     assert loader.FLAG_WORD_BYTES_PER_CHUNK == 8
 
 
+@pytest.mark.cpu_only
 def test_ctl_words_follow_the_control_block_layout():
     # arr[C_cap] | red_done[C_cap] | cta_arrivals[1024] | exit | EP | steal[C_cap]
     expected_words = (
@@ -213,6 +222,7 @@ def test_ctl_words_follow_the_control_block_layout():
         loader.ctl_words(0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "m, n, expected",
     [
@@ -228,6 +238,7 @@ def test_pair_tiles_count_two_cta_row_pairs_times_column_tiles(m, n, expected):
     assert loader.grid_n(n) == n // 256
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "m, n, max_clusters, expected",
     [
@@ -244,11 +255,13 @@ def test_launch_grid_is_two_ctas_per_co_resident_cluster_bounded_by_the_pair_til
     assert loader.launch_grid(m, n, max_clusters=max_clusters) == expected
 
 
+@pytest.mark.cpu_only
 def test_launch_grid_requires_a_positive_cluster_count():
     with pytest.raises(ValueError, match="max_clusters"):
         loader.launch_grid(1, 256, max_clusters=0)
 
 
+@pytest.mark.cpu_only
 def test_validate_shape_enforces_the_operand_contract():
     assert loader.validate_shape(1, 256, 128) == (1, 256, 128)
     assert loader.validate_shape(4133, 3072, 768) == (4133, 3072, 768)
@@ -333,6 +346,7 @@ def _operands(m, n=N, k_l=K_L, *, index=0):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rows", [1, 37, 1024, 4133])
 @pytest.mark.parametrize("n", [256, 3072, 14336])
 @pytest.mark.parametrize("k_l", [128, 768, 1024])
@@ -344,6 +358,7 @@ def test_validation_admits_any_rows_and_the_tile_multiples(monkeypatch, rows, n,
     assert (call.device_index, call.group_name) == (0, "g")
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_dtype_rank_and_shape_mismatches(monkeypatch):
     _patch_distributed(monkeypatch)
     group = _fake_group(4, 0)
@@ -370,6 +385,7 @@ def test_validation_rejects_dtype_rank_and_shape_mismatches(monkeypatch):
         backend._validate(*_operands((1 << 20) + 1, 1024), group)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_strided_and_foreign_device_operands(monkeypatch):
     _patch_distributed(monkeypatch)
     group = _fake_group(4, 0)
@@ -393,6 +409,7 @@ def test_validation_rejects_strided_and_foreign_device_operands(monkeypatch):
         backend._validate(cpu, sa, w, sw, group)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_other_groups_world_sizes_and_backends(monkeypatch):
     _patch_distributed(monkeypatch, backend_name="gloo")
     with pytest.raises(ValueError, match="NCCL"):
@@ -409,6 +426,7 @@ def test_validation_rejects_other_groups_world_sizes_and_backends(monkeypatch):
         backend._validate(*_operands(256), _fake_group(4, 0))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("symm_backend", ["CUDA", "NVSHMEM", "cuda", "nvshmem"])
 def test_validation_admits_the_cuda_and_nvshmem_symmetric_memory_backends(
     monkeypatch, symm_backend
@@ -420,6 +438,7 @@ def test_validation_admits_the_cuda_and_nvshmem_symmetric_memory_backends(
     backend._validate(*_operands(256), _fake_group(4, 0))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("symm_backend", ["NCCL", None, "XPU"])
 def test_validation_rejects_other_symmetric_memory_backends_without_selecting_one(
     monkeypatch, symm_backend
@@ -434,6 +453,7 @@ def test_validation_rejects_other_symmetric_memory_backends_without_selecting_on
     assert selected == []
 
 
+@pytest.mark.cpu_only
 def test_group_name_is_required():
     with pytest.raises(ValueError, match="group_name"):
         backend._group_name(SimpleNamespace())
@@ -443,6 +463,7 @@ def _call(m=256, n=N, k_l=K_L, *, rank=1, index=0):
     return backend._Call(index, rank, 4, "g", "sm_100a", m, n, k_l)
 
 
+@pytest.mark.cpu_only
 def test_out_must_match_the_result_contract():
     call = _call(250)
     like = _CudaLike((250, K_L), FP8)
@@ -465,6 +486,7 @@ def test_out_must_match_the_result_contract():
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.cpu_only
 def test_backend_entrypoints_reject_non_cake_routes():
     with pytest.raises(ValueError, match="exactly 'cake'"):
         backend.fp8_rowwise_gemm_allreduce_cake(
@@ -476,6 +498,7 @@ def test_backend_entrypoints_reject_non_cake_routes():
         )
 
 
+@pytest.mark.cpu_only
 def test_public_entrypoint_routes_auto_and_cake_to_the_backend(monkeypatch):
     dispatcher = importlib.import_module(
         "flashinfer.comm.fp8_rowwise_gemm_allreduce.fp8_rowwise_gemm_allreduce"
@@ -504,6 +527,7 @@ def test_public_entrypoint_routes_auto_and_cake_to_the_backend(monkeypatch):
         dispatcher.fp8_rowwise_gemm_allreduce(a, sa, w, sw, group, backend="trtllm")
 
 
+@pytest.mark.cpu_only
 def test_public_prepare_forwards_the_row_capacity(monkeypatch):
     dispatcher = importlib.import_module(
         "flashinfer.comm.fp8_rowwise_gemm_allreduce.fp8_rowwise_gemm_allreduce"
@@ -536,6 +560,7 @@ def test_public_prepare_forwards_the_row_capacity(monkeypatch):
         dispatcher.prepare_fp8_rowwise_gemm_allreduce(a, sa, w, sw, group, backend="x")
 
 
+@pytest.mark.cpu_only
 def test_package_exports_the_public_names():
     package = importlib.import_module("flashinfer.comm.fp8_rowwise_gemm_allreduce")
     comm = importlib.import_module("flashinfer.comm")
@@ -550,6 +575,7 @@ def test_package_exports_the_public_names():
     )
 
 
+@pytest.mark.cpu_only
 def test_public_entrypoints_carry_the_flashinfer_api_decorator():
     dispatcher = importlib.import_module(
         "flashinfer.comm.fp8_rowwise_gemm_allreduce.fp8_rowwise_gemm_allreduce"
@@ -596,6 +622,7 @@ class _FakeHandle:
         return self.pads[peer]
 
 
+@pytest.mark.cpu_only
 def test_rendezvous_guard_checks_topology_and_size(monkeypatch):
     tensor = torch.empty(64, dtype=torch.uint8)
     handles = []
@@ -655,6 +682,7 @@ def _patch_allocation(monkeypatch, *, handles, max_clusters=74, loaded=None):
     return events, allocated
 
 
+@pytest.mark.cpu_only
 def test_allocation_places_the_readiness_words_in_the_signal_pad_when_they_fit(
     monkeypatch,
 ):
@@ -693,6 +721,7 @@ def test_allocation_places_the_readiness_words_in_the_signal_pad_when_they_fit(
     assert workspace.max_clusters == 74 and workspace.captured is False
 
 
+@pytest.mark.cpu_only
 def test_allocation_uses_a_dedicated_symmetric_buffer_when_the_pad_is_too_small(
     monkeypatch,
 ):
@@ -721,6 +750,7 @@ def test_allocation_uses_a_dedicated_symmetric_buffer_when_the_pad_is_too_small(
     assert events[-2:] == [("sync",), ("barrier", group)]
 
 
+@pytest.mark.cpu_only
 def test_allocation_refuses_inside_capture_and_an_oversubscribed_grid(monkeypatch):
     s_bytes = loader.workspace_bytes(128, N, 4)
     handle = _FakeHandle(
@@ -770,6 +800,7 @@ def _workspace(*, max_rows, n=N, rank=1, max_clusters=74, program=None, module=N
     )
 
 
+@pytest.mark.cpu_only
 def test_one_shot_cache_serves_a_fitting_workspace_without_a_collective(monkeypatch):
     group = _fake_group(4, 1)
     call = _call(1000)
@@ -794,6 +825,7 @@ def test_one_shot_cache_serves_a_fitting_workspace_without_a_collective(monkeypa
         backend._workspace_of(group, 0, 2 * N)
 
 
+@pytest.mark.cpu_only
 def test_one_shot_cache_refuses_to_grow_a_captured_workspace_before_any_collective(
     monkeypatch,
 ):
@@ -819,6 +851,7 @@ def test_one_shot_cache_refuses_to_grow_a_captured_workspace_before_any_collecti
     assert backend._prepare_one_shot(_call(128), group) == (state, workspace)
 
 
+@pytest.mark.cpu_only
 def test_one_shot_growth_retires_the_previous_workspace_and_poisons_on_failure(
     monkeypatch,
 ):
@@ -860,6 +893,7 @@ def test_one_shot_growth_retires_the_previous_workspace_and_poisons_on_failure(
     assert backend._WORKSPACES[key] is grown
 
 
+@pytest.mark.cpu_only
 def test_launch_state_is_cached_per_device_and_group(monkeypatch):
     group = _fake_group(4, 2)
     monkeypatch.setattr(backend, "_LAUNCH_STATES", {})
@@ -870,6 +904,7 @@ def test_launch_state_is_cached_per_device_and_group(monkeypatch):
         backend._launch_state(_call(rank=3), group)
 
 
+@pytest.mark.cpu_only
 def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch):
     _patch_distributed(monkeypatch, rank=3)
     group = _fake_group(4, 3)
@@ -903,6 +938,7 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
         launcher._validate_call(*_operands(1, index=1))
 
 
+@pytest.mark.cpu_only
 def test_prepare_requires_the_capacity_to_cover_the_sample(monkeypatch):
     _patch_distributed(monkeypatch)
     with pytest.raises(ValueError, match="max_rows=100 is smaller"):
@@ -911,6 +947,7 @@ def test_prepare_requires_the_capacity_to_cover_the_sample(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_capacity_agreement_names_every_rank_that_differs(monkeypatch):
     table = {0: 4133, 1: 4133, 2: 4133, 3: 4160}
 
@@ -927,6 +964,7 @@ def test_capacity_agreement_names_every_rank_that_differs(monkeypatch):
     backend._agree_capacity(_fake_group(4, 2), 4133, world_size=4, device=cpu)
 
 
+@pytest.mark.cpu_only
 def test_prepare_agrees_the_capacity_before_any_allocation(monkeypatch):
     _patch_distributed(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -949,6 +987,7 @@ def test_prepare_agrees_the_capacity_before_any_allocation(monkeypatch):
     assert backend._LAUNCH_STATES == {}
 
 
+@pytest.mark.cpu_only
 def test_launch_refuses_a_workspace_smaller_than_the_call_without_poisoning():
     state = backend._LaunchState(rank=1, world_size=4)
     with pytest.raises(RuntimeError, match="holds 128 rows, the call needs 256"):
@@ -991,6 +1030,7 @@ def _launch_fixture(monkeypatch, *, capturing=False, error=None):
     return state, workspace, module, tails
 
 
+@pytest.mark.cpu_only
 def test_launch_binds_every_argument_by_name_in_the_recorded_order(monkeypatch):
     state, workspace, module, tails = _launch_fixture(monkeypatch)
     a, sa, w, sw = _operands(1000)
@@ -1022,6 +1062,7 @@ def test_launch_binds_every_argument_by_name_in_the_recorded_order(monkeypatch):
     assert tails == [(4242, 0)] and workspace.captured is False
 
 
+@pytest.mark.cpu_only
 def test_captured_launch_marks_the_workspace_and_skips_the_tail(monkeypatch):
     state, workspace, module, tails = _launch_fixture(monkeypatch, capturing=True)
     a, sa, w, sw = _operands(37)
@@ -1033,6 +1074,7 @@ def test_captured_launch_marks_the_workspace_and_skips_the_tail(monkeypatch):
     assert tails == []
 
 
+@pytest.mark.cpu_only
 def test_launch_failure_poisons_the_state(monkeypatch):
     state, workspace, module, _ = _launch_fixture(
         monkeypatch, error=RuntimeError("boom")
@@ -1048,6 +1090,7 @@ def test_launch_failure_poisons_the_state(monkeypatch):
     assert len(module.calls) == 1
 
 
+@pytest.mark.cpu_only
 def test_launch_refuses_unknown_launcher_arguments(monkeypatch):
     state, workspace, module, _ = _launch_fixture(monkeypatch)
     monkeypatch.setattr(
@@ -1063,6 +1106,7 @@ def test_launch_refuses_unknown_launcher_arguments(monkeypatch):
     assert module.calls == [] and state.poisoned
 
 
+@pytest.mark.cpu_only
 def test_cross_stream_join_waits_on_the_previous_tail_and_skips_capture(monkeypatch):
     state = backend._LaunchState(rank=1, world_size=4)
     waited = []

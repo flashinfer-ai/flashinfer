@@ -20,6 +20,8 @@ they run without a GPU or an MPI harness by stubbing the FFI module -- the real
 ``tests/comm/test_cake_moe_alltoall_multi_gpu.py`` path needs multi-rank NVLink hardware.
 """
 
+import pytest
+
 import torch
 
 from flashinfer.moe_ep.backends.split.comm.cake import kernels as a2a
@@ -66,6 +68,7 @@ def _patch(monkeypatch, wrap_calls):
     monkeypatch.setattr(a2a, "wrap_workspace", fake_wrap)
 
 
+@pytest.mark.cpu_only
 def test_cache_none_rebuilds_every_call(monkeypatch):
     """``None`` (the default) must preserve the pre-cache behaviour exactly."""
     calls = []
@@ -76,6 +79,7 @@ def test_cache_none_rebuilds_every_call(monkeypatch):
     assert len(calls) == 4, "two payloads x two calls should rebuild every view"
 
 
+@pytest.mark.cpu_only
 def test_cache_hits_on_second_dispatch(monkeypatch):
     """A populated cache must serve identical keys without rebuilding.
 
@@ -94,6 +98,7 @@ def test_cache_hits_on_second_dispatch(monkeypatch):
         assert a is b, "a cache hit must hand back the same view object"
 
 
+@pytest.mark.cpu_only
 def test_cache_rebinds_when_workspace_changes(monkeypatch):
     """A new workspace must invalidate every cached view.
 
@@ -122,6 +127,7 @@ class _IdentityInt(int):
     __eq__ = object.__eq__
 
 
+@pytest.mark.cpu_only
 def test_cache_key_survives_an_identity_hashing_ffi_int(monkeypatch):
     """The key must hash by value even if the FFI hands back a wrapper.
 

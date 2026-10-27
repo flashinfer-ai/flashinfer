@@ -357,6 +357,7 @@ def _binding_form(record: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
     assert len(PROGRAMS) == 53
@@ -461,16 +462,17 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
 
 
 def _checkout_source_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / SOURCE_DIR
+    return Path(__file__).resolve().parents[3] / SOURCE_DIR
 
 
+@pytest.mark.cpu_only
 def test_program_sources_exist_and_declare_their_kernels() -> None:
     source_dir = _checkout_source_dir()
     if not source_dir.is_dir():
         pytest.skip(f"{source_dir} is not part of this checkout")
     for program, record in PROGRAMS.items():
         kernel, binding = (
-            Path(__file__).resolve().parents[2] / source for source in record["sources"]
+            Path(__file__).resolve().parents[3] / source for source in record["sources"]
         )
         assert kernel.is_file(), kernel
         assert binding.is_file(), binding
@@ -520,6 +522,7 @@ def test_program_sources_exist_and_declare_their_kernels() -> None:
     }
 
 
+@pytest.mark.cpu_only
 def test_limits_and_selection_constants_match_the_contract() -> None:
     assert LIMITS == {
         "hidden": 6144,
@@ -655,6 +658,7 @@ def _resolve_rest(
     return period, tuple((word, rest if run == "rest" else run) for word, run in fills)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("key", sorted(WINDOWS))
 @pytest.mark.parametrize("cap", CAPACITIES)
 def test_window_plan_matches_the_kernel_contract(key: str, cap: int) -> None:
@@ -714,6 +718,7 @@ def test_window_plan_matches_the_kernel_contract(key: str, cap: int) -> None:
     assert loader.window_contract(family, world_size, input_format) is WINDOWS[key]
 
 
+@pytest.mark.cpu_only
 def test_window_keys_and_buffer_params_match_the_programs() -> None:
     assert set(WINDOWS) == {
         "allreduce/2/bf16",
@@ -747,6 +752,7 @@ def test_window_keys_and_buffer_params_match_the_programs() -> None:
         loader.window_contract("rmsnorm", 4, "bf16")
 
 
+@pytest.mark.cpu_only
 def test_window_bytes_at_the_default_capacity() -> None:
     """Hand-computed sizes at the default capacity of 16384 rows."""
     one_shot = _registry_window("allreduce/2/bf16", 16384)["buffers"]
@@ -770,6 +776,7 @@ def test_window_bytes_at_the_default_capacity() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("rows", "grid", "expected"),
     [
@@ -803,11 +810,13 @@ def test_select_bv_rule(rows: int, grid: int, expected: int) -> None:
     assert rule == expected
 
 
+@pytest.mark.cpu_only
 def test_select_bv_rejects_an_empty_grid() -> None:
     with pytest.raises(ValueError):
         loader.select_bv(1024, 0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("rows", "grid", "expected"),
     [
@@ -840,11 +849,13 @@ def test_select_prefetch_rule(rows: int, grid: int, expected: bool) -> None:
     )
 
 
+@pytest.mark.cpu_only
 def test_select_prefetch_rejects_an_empty_grid() -> None:
     with pytest.raises(ValueError):
         loader.select_prefetch(4096, 0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", TARGETS)
 @pytest.mark.parametrize("input_format", INPUT_FORMATS)
 def test_program_for_two_shot_picks_the_targets_forms(
@@ -872,6 +883,7 @@ def test_program_for_two_shot_picks_the_targets_forms(
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", TARGETS)
 def test_program_for_one_shot_and_fused_norm(target: str) -> None:
     """The one-shot and fused-norm calls resolve the target's whole program, or its band program inside the
@@ -1026,6 +1038,7 @@ def synthetic_bands(monkeypatch):
     loader.program_for.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_select_rows_rule_is_inclusive_at_the_threshold() -> None:
     probes = (1, BAND_THRESHOLD - 1, BAND_THRESHOLD, BAND_THRESHOLD + 1, 16384)
     assert [loader.select_rows(rows, "prefix", BAND_THRESHOLD) for rows in probes] == [
@@ -1048,6 +1061,7 @@ def test_select_rows_rule_is_inclusive_at_the_threshold() -> None:
         loader.select_rows(0, "prefix", BAND_THRESHOLD)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_program_for_dispatches_the_band_inside_its_rows(
     synthetic_bands, prefetch: bool
@@ -1107,6 +1121,7 @@ def test_program_for_dispatches_the_band_inside_its_rows(
             assert record[key] != value, (band, key)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("prefetch", [False, True])
 def test_program_for_keeps_the_whole_program_without_a_band(
     synthetic_bands, prefetch: bool
@@ -1150,6 +1165,7 @@ def test_program_for_keeps_the_whole_program_without_a_band(
         ) == (f"tp2_oneshot_bf16{ONESHOT_BF16_FORMS[target]}")
 
 
+@pytest.mark.cpu_only
 def test_program_for_refuses_two_bands_serving_one_call(
     synthetic_bands, monkeypatch
 ) -> None:
@@ -1215,6 +1231,7 @@ def synthetic_oneshot_band(monkeypatch):
     loader.program_for.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_program_for_dispatches_the_one_shot_band_at_or_above_its_threshold(
     synthetic_oneshot_band,
 ) -> None:
@@ -1270,6 +1287,7 @@ def test_program_for_dispatches_the_one_shot_band_at_or_above_its_threshold(
             assert program not in loader.SELECT_ROWS, (output_format, rows)
 
 
+@pytest.mark.cpu_only
 def test_grid_max_is_the_least_bound_of_the_programs(monkeypatch) -> None:
     """Every workspace's programs bound its grid at the CTAs its control window provisions (4096, on every
     path), and the bound of a selection is the least of its programs'."""
@@ -1297,6 +1315,7 @@ def test_grid_max_is_the_least_bound_of_the_programs(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_build_targets_follow_flashinfer_cuda_arch_list(monkeypatch) -> None:
     def pin(arch_list: str) -> None:
         monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
@@ -1325,6 +1344,7 @@ def test_build_targets_follow_flashinfer_cuda_arch_list(monkeypatch) -> None:
         loader.target_capabilities.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_exact_target_table() -> None:
     assert set(loader.TARGET_FLAGS) == set(TARGETS)
     assert (
@@ -1344,6 +1364,7 @@ def test_exact_target_table() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_e2m1_rounding_table() -> None:
     values = torch.tensor(
         [
@@ -1404,6 +1425,7 @@ def test_e2m1_rounding_table() -> None:
     assert ties.tolist() == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
 
 
+@pytest.mark.cpu_only
 def test_e4m3_saturates_and_keeps_nan() -> None:
     values = torch.tensor(
         [448.0, 449.0, 1e9, -1e9, 0.0, 0.1, 1.0, math.nan], dtype=torch.float32
@@ -1416,6 +1438,7 @@ def test_e4m3_saturates_and_keeps_nan() -> None:
     assert codes[7].item() == 0x7F
 
 
+@pytest.mark.cpu_only
 def test_float32_primitives_are_correctly_rounded() -> None:
     generator = torch.Generator().manual_seed(7)
     a = torch.randn(256, generator=generator) * 1e3
@@ -1452,6 +1475,7 @@ def test_float32_primitives_are_correctly_rounded() -> None:
             assert error <= abs(exact - Fraction(down[i].item())), (name, i)
 
 
+@pytest.mark.cpu_only
 def test_pack_unpack_roundtrip() -> None:
     codes = (torch.arange(2 * ref.HIDDEN) % 16).to(torch.uint8).reshape(2, ref.HIDDEN)
     packed = ref.pack_e2m1(codes)
@@ -1462,6 +1486,7 @@ def test_pack_unpack_roundtrip() -> None:
     assert torch.equal(ref.unpack_e2m1(packed), codes)
 
 
+@pytest.mark.cpu_only
 def test_codec_reproduces_exact_cases() -> None:
     x = torch.full((2, ref.HIDDEN), 2688.0, dtype=torch.bfloat16)
     # amax 2688: inv = rs = 1, every block scale 448, every value 6 -> 2688 per rank.
@@ -1499,6 +1524,7 @@ def test_codec_reproduces_exact_cases() -> None:
         )  # the two-shot needs a multiple of 4 rows
 
 
+@pytest.mark.cpu_only
 def test_records_layout_and_static_scale() -> None:
     xs = ref.partials(4, 7, 2, "cpu")
     records, scales = ref.records_of(xs)
@@ -1532,6 +1558,7 @@ def test_records_layout_and_static_scale() -> None:
         ref.sources_records([rec, rec], torch.ones(1))
 
 
+@pytest.mark.cpu_only
 def test_partials_are_deterministic_with_outliers_zero_and_tiny_rows() -> None:
     rows = 200
     xs = ref.partials(rows, 123, 4, "cpu")
@@ -1559,6 +1586,7 @@ def test_partials_are_deterministic_with_outliers_zero_and_tiny_rows() -> None:
     assert float(weight.float().abs().max()) < 4.0
 
 
+@pytest.mark.cpu_only
 def test_swizzled_scale_offsets_match_the_direct_rule() -> None:
     rows, blocks = 200, ref.NVFP4_SCALES_PER_ROW
     assert (
@@ -1604,6 +1632,7 @@ def test_swizzled_scale_offsets_match_the_direct_rule() -> None:
         ref.unswizzle_scales(marks[:-1], rows, blocks)
 
 
+@pytest.mark.cpu_only
 def test_fused_norm_reference_on_cpu() -> None:
     rows = 3
     xs = ref.partials(rows, 321, 2, "cpu")
@@ -1681,6 +1710,7 @@ def test_fused_norm_reference_on_cpu() -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_sum_of_squares_follows_the_lane_order() -> None:
     z = torch.randn((2, ref.HIDDEN), generator=torch.Generator().manual_seed(3))
     ss = ref.sum_of_squares(z)
@@ -1723,6 +1753,7 @@ def test_sum_of_squares_follows_the_lane_order() -> None:
         ref.sum_of_squares(z, order="reversed")
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_quantiser_hand_case_and_tie_mask() -> None:
     rows = 1
     y = torch.zeros((rows, ref.HIDDEN), dtype=torch.bfloat16)
@@ -1768,6 +1799,7 @@ def test_nvfp4_quantiser_hand_case_and_tie_mask() -> None:
     assert int(zero_values.sum()) == 0 and int(zero_scales.sum()) == 0
 
 
+@pytest.mark.cpu_only
 def test_ue8m0_round_up_and_mxfp8_hand_case() -> None:
     x = torch.tensor(
         [0.0, 0.5, 0.75, 1.0, 1.5, 2.0, 2.0**-130, 2.0**100], dtype=torch.float32
@@ -1795,6 +1827,7 @@ def test_ue8m0_round_up_and_mxfp8_hand_case() -> None:
     assert scales.shape == (ref.scale_bytes(rows, ref.MXFP8_SCALES_PER_ROW),)
 
 
+@pytest.mark.cpu_only
 def test_comparison_helpers() -> None:
     a = torch.tensor([1.0, -1.0, 0.0, 2.0], dtype=torch.bfloat16)
     bits = a.view(torch.int16).to(torch.int32)

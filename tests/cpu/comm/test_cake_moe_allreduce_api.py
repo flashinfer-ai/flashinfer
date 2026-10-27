@@ -68,6 +68,7 @@ def _reduction_args() -> dict:
     }
 
 
+@pytest.mark.cpu_only
 def test_public_api_has_exact_22_parameter_contract() -> None:
     parameters = inspect.signature(trtllm_ar.trtllm_moe_allreduce_fusion).parameters
 
@@ -78,6 +79,7 @@ def test_public_api_has_exact_22_parameter_contract() -> None:
     assert comm.trtllm_moe_allreduce_fusion is trtllm_ar.trtllm_moe_allreduce_fusion
 
 
+@pytest.mark.cpu_only
 def test_default_backend_keeps_trtllm_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -95,6 +97,7 @@ def test_default_backend_keeps_trtllm_dispatch(
     assert calls[0]["moe_reduction_token_input"] is args["moe_reduction_token_input"]
 
 
+@pytest.mark.cpu_only
 def test_cake_backend_dispatches_to_the_union(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -143,6 +146,7 @@ def test_cake_backend_dispatches_to_the_union(
     assert set(call) == union_parameters
 
 
+@pytest.mark.cpu_only
 def test_cake_validator_has_no_token_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,6 +193,7 @@ def test_cake_validator_has_no_token_cap(
     assert not hasattr(trtllm_ar, "_CAKE_MOE_ALLREDUCE_MAX_TOKENS")
 
 
+@pytest.mark.cpu_only
 def test_lamport_byte_limit_rejects_before_backend_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,6 +217,7 @@ def test_lamport_byte_limit_rejects_before_backend_load(
         trtllm_ar.trtllm_moe_allreduce_fusion(**args, backend="cake")
 
 
+@pytest.mark.cpu_only
 def test_invalid_backend_fails_before_module_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

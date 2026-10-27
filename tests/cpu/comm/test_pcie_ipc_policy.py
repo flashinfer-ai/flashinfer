@@ -74,6 +74,7 @@ def _config(world_size, numel, max_blocks=MAX_BLOCKS):
     return get_pcie_ipc_launch_config(world_size, numel, _ELEM_SIZE, max_blocks)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_every_returned_config_is_launchable(world_size: int) -> None:
     """A config the kernel would reject must never leave the policy.
@@ -97,6 +98,7 @@ def test_every_returned_config_is_launchable(world_size: int) -> None:
     assert admitted, "the sweep admits nothing, so it checks nothing"
 
 
+@pytest.mark.cpu_only
 def test_the_policy_is_a_pure_function() -> None:
     """Same arguments, same answer -- no hidden state, no rank-local input."""
     keys = [(w, n) for w in _WORLD_SIZES for n in _NUMELS]
@@ -109,6 +111,7 @@ def test_the_policy_is_a_pure_function() -> None:
     assert {k: _config(*k) for k in reversed(keys)} == first
 
 
+@pytest.mark.cpu_only
 def test_flat_staged_is_never_selected_outside_world_size_eight() -> None:
     """It would name the same kernel as ``STAGED`` at 4 ranks, and none at 2."""
     for world_size in (2, 4):
@@ -125,6 +128,7 @@ def test_flat_staged_is_never_selected_outside_world_size_eight() -> None:
     assert _is_launchable(8, bad, MAX_BLOCKS)
 
 
+@pytest.mark.cpu_only
 def test_world_size_eight_staged_always_gets_a_multiple_of_four_blocks() -> None:
     """The block-partitioned TP8 kernel derives its chunk from ``blockIdx.x & 3``.
 
@@ -152,6 +156,7 @@ def test_world_size_eight_staged_always_gets_a_multiple_of_four_blocks() -> None
     assert _is_launchable(8, IpcLaunchConfig(4, 256, IpcVariant.STAGED), MAX_BLOCKS)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_admission_floor_is_one_pack_per_rank(world_size: int) -> None:
     """Below one 16-byte pack per rank the reduce-scatter split degenerates.
@@ -168,6 +173,7 @@ def test_admission_floor_is_one_pack_per_rank(world_size: int) -> None:
     assert _config(world_size, _PACK_ELEMS) is None
 
 
+@pytest.mark.cpu_only
 def test_the_admission_floor_scales_with_the_world_size() -> None:
     """One shape, admitted or not depending only on how many ranks share it."""
     numel = _PACK_ELEMS * 4
@@ -176,6 +182,7 @@ def test_the_admission_floor_scales_with_the_world_size() -> None:
     assert _config(8, numel) is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 def test_numel_that_is_not_whole_packs_is_refused(world_size: int) -> None:
     """The kernels address the payload in 16-byte packs; the launcher agrees."""
@@ -185,12 +192,14 @@ def test_numel_that_is_not_whole_packs_is_refused(world_size: int) -> None:
         assert _config(world_size, whole + remainder) is None, remainder
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", (0, 1, 3, 5, 6, 7, 9, 16))
 def test_world_sizes_the_kernels_do_not_implement_are_refused(world_size: int) -> None:
     for numel in (_PACK_ELEMS * 128, 6144, 65536):
         assert _config(world_size, numel) is None, numel
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "world_size,hidden", [(4, 2048), (4, 8192), (2, 4096), (8, 1024), (8, 2048)]
 )
@@ -209,6 +218,7 @@ def test_admission_does_not_depend_on_the_hidden_size(
         assert _is_launchable(world_size, config, MAX_BLOCKS)
 
 
+@pytest.mark.cpu_only
 def test_the_seed_crosses_to_a_staged_kernel_as_the_payload_grows() -> None:
     """The one crossover that ports between machines, asserted as a shape.
 
@@ -233,6 +243,7 @@ def test_the_seed_crosses_to_a_staged_kernel_as_the_payload_grows() -> None:
     assert len({_config(2, numel).variant for numel in _LADDER}) == 1
 
 
+@pytest.mark.cpu_only
 def test_the_answer_keys_on_the_element_count_not_on_its_factorisation() -> None:
     """A token count does not port between machines; a byte count does.
 
@@ -245,6 +256,7 @@ def test_the_answer_keys_on_the_element_count_not_on_its_factorisation() -> None
     assert not {"batch", "hidden", "profile"} & set(params), params
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_blocks", (1, 2, 3, 4, 7, 16, MAX_BLOCKS))
 def test_a_small_max_blocks_is_never_exceeded(max_blocks: int) -> None:
     """The workspace is sized for its own ``max_blocks``, not for the default.
@@ -284,6 +296,7 @@ def _ce_variants(world_size):
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_blocks", (1, 2, 3))
 def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) -> None:
     """Copy-engine depths past ``max_blocks`` are neither admitted nor offered.
@@ -316,6 +329,7 @@ def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) ->
         assert offered, f"ws={world_size} max_blocks={max_blocks} checks nothing"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_blocks", (1, 2, 3, CE_MAX_PIECES, MAX_BLOCKS))
 def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
     max_blocks: int,
@@ -347,6 +361,7 @@ def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
             assert offered == depths, (world_size, variant.name, offered)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", (4, 8))
 def test_the_pipelined_ring_needs_room_for_its_pieces_not_even_shares(
     world_size: int,
@@ -380,6 +395,7 @@ def test_the_pipelined_ring_needs_room_for_its_pieces_not_even_shares(
     )
 
 
+@pytest.mark.cpu_only
 def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
     """A variant the dispatch can launch but nothing can select is invisible.
 
@@ -430,7 +446,7 @@ def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
 def _load_benchmark_module():
     """Import the benchmark as a module so its pure helpers can be tested."""
     path = (
-        pathlib.Path(__file__).resolve().parents[2]
+        pathlib.Path(__file__).resolve().parents[3]
         / "benchmarks"
         / "comm"
         / "bench_pcie_ipc_all_reduce.py"
@@ -463,6 +479,7 @@ def _expected_switch(world_size, config):
     return "no-block-epoch" if topo_staged_tp8 else "per-block-epoch"
 
 
+@pytest.mark.cpu_only
 def test_protocol_ab_picks_the_right_history_per_kernel() -> None:
     """The A/B baseline must match what each kernel actually used to run.
 
@@ -505,6 +522,7 @@ def _shape_config(world_size, hidden, batches):
     return out
 
 
+@pytest.mark.cpu_only
 def test_protocol_ab_plan_partitions_shapes_by_history() -> None:
     """The history split must drive execution, not just labelling.
 
@@ -558,6 +576,7 @@ def test_protocol_ab_plan_partitions_shapes_by_history() -> None:
     assert plan_of(8, {}, "auto") == {}
 
 
+@pytest.mark.cpu_only
 def test_protocol_ab_legs_execute_only_their_own_shapes() -> None:
     """The plan must drive execution, not sit beside it.
 
@@ -607,6 +626,7 @@ def test_protocol_ab_legs_execute_only_their_own_shapes() -> None:
         assert calls.count((None, tuple(leg_batches))) == 1  # the shipping leg
 
 
+@pytest.mark.cpu_only
 def test_group_correctness_uses_a_min_reduction() -> None:
     """Correctness must be an AND across ranks, which means ReduceOp.MIN.
 
@@ -688,25 +708,30 @@ def _evidence(
     ]
 
 
+@pytest.mark.cpu_only
 def test_two_sockets_mark_the_two_crossings() -> None:
     # Ranks 0-3 on one socket and 4-7 on the other: the ring crosses at 3 -> 4
     # and at 7 -> 0.
     assert decide_ring_slow_hops(_evidence(8, lambda r: r // 4)) == (1 << 3) | (1 << 7)
 
 
+@pytest.mark.cpu_only
 def test_one_socket_has_no_slow_hop() -> None:
     assert decide_ring_slow_hops(_evidence(4, lambda r: 0)) == 0
 
 
+@pytest.mark.cpu_only
 def test_alternating_sockets_mark_every_hop() -> None:
     assert decide_ring_slow_hops(_evidence(4, lambda r: r % 2)) == 0b1111
 
 
+@pytest.mark.cpu_only
 def test_the_mask_follows_rank_order_not_list_order() -> None:
     evidence = _evidence(8, lambda r: r // 4)
     assert decide_ring_slow_hops(list(reversed(evidence))) == (1 << 3) | (1 << 7)
 
 
+@pytest.mark.cpu_only
 def test_unknown_evidence_counts_as_fast() -> None:
     """A wrong mask costs speed only, so anything unproven is a fast hop."""
     evidence = _evidence(8, lambda r: r // 4)
@@ -719,6 +744,7 @@ def test_unknown_evidence_counts_as_fast() -> None:
     assert decide_ring_slow_hops(evidence) == 1 << 7
 
 
+@pytest.mark.cpu_only
 def test_an_incomplete_group_gets_an_even_split() -> None:
     # A rank missing from the gathered evidence leaves the ring order unknown.
     evidence = [e for e in _evidence(8, lambda r: r // 4) if e.rank != 3]

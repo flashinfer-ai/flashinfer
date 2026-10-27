@@ -44,6 +44,7 @@ def _fake_workspace() -> TRTLLMAllReduceFusionWorkspace:
     return workspace
 
 
+@pytest.mark.cpu_only
 def test_cake_backend_routes_to_the_cake_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -70,6 +71,7 @@ def test_cake_backend_routes_to_the_cake_loader(
             assert calls[0][name] == expected
 
 
+@pytest.mark.cpu_only
 def test_unknown_backend_fails_before_loading_a_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -84,6 +86,7 @@ def test_unknown_backend_fails_before_loading_a_module(
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("backend_kwargs", "expected_backend"),
     [({}, "trtllm"), ({"moe_finalize_backend": "cake"}, "cake")],
@@ -120,6 +123,7 @@ def test_unified_finalize_forwards_selected_backend(
     assert calls[0]["backend"] == expected_backend
 
 
+@pytest.mark.cpu_only
 def test_unified_selector_is_not_forwarded_to_other_patterns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,6 +149,7 @@ def test_unified_selector_is_not_forwarded_to_other_patterns(
     assert "backend" not in calls[0]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_small_token_max_reaches_the_binding(
     monkeypatch: pytest.MonkeyPatch, world_size: int
@@ -176,6 +181,7 @@ def test_small_token_max_reaches_the_binding(
     assert calls[0][11:14] == (0, world_size, cake_moe_finalize_comm.SMALL_TOKEN_MAX)
 
 
+@pytest.mark.cpu_only
 def test_module_records_match_the_binding() -> None:
     source_dir = cake_moe_finalize_comm._source_dir()
     binding = (
