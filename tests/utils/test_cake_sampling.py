@@ -1363,7 +1363,8 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     CTA-local-select top-k class only (top-k 10 changes, top-k 50 keeps its plan).  R200 and RTX PRO 6000 keep every
     plan."""
     if not torch.cuda.is_available():
-        pytest.skip("CUDA required")  # without CUDA every k > 64 launch plans the two-launch chain
+        # without CUDA every k > 64 launch plans the two-launch chain
+        pytest.skip("CUDA required")
     new = _emulated_plans(monkeypatch)
     with monkeypatch.context() as m:
         m.setattr(cs, "_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY", _R14_BLOCK_TAIL_MAX_VOCAB)
@@ -2591,7 +2592,7 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         (10, 0): 128256,
         (10, 3): 128256,
     }
-    assert cs._BLOCK_TAIL_ABOVE_VOCAB_CELLS == {(10, 0): frozenset({(151936, 1)})}
+    assert {(10, 0): frozenset({(151936, 1)})} == cs._BLOCK_TAIL_ABOVE_VOCAB_CELLS
     for cap in ((9, 0), (10, 0), (10, 3)):
         for batch in (1, 2, 4, 8):
             for vocab in (96193, 128256, 128257, 151936, 262144):
