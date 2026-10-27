@@ -64,6 +64,52 @@ def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
         assert torch.equal(actual[3][:live], expected[3][:live])
 
 
+def _mx_buffers(capacity, hidden, topk, data_dtype, dtype):
+    return (
+        torch.empty(capacity, hidden, device="cuda", dtype=data_dtype),
+        torch.empty(capacity, hidden // 32, device="cuda", dtype=torch.float8_e8m0fnu),
+        torch.empty(capacity, topk, device="cuda", dtype=dtype),
+        torch.empty(capacity, topk, device="cuda"),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_mxfp8_fused_staging_matches_torch(monkeypatch, dtype, kind):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        _data_dtype,
+        stage_mega_moe_inputs,
+    )
+
+    hidden, capacity, topk = 512, 64, 8
+    actual = _mx_buffers(capacity, hidden, topk, _data_dtype(kind), dtype)
+    expected = _mx_buffers(capacity, hidden, topk, _data_dtype(kind), dtype)
+    for live in (64, 8, 0, 32):
+        x = torch.randn(live, hidden, device="cuda", dtype=torch.bfloat16)
+        if live:
+            x[0, :64] = 0
+            x[0, 64:128] = 1e-6
+            x[0, 128:192] = 1000
+        ids = torch.arange(topk, device="cuda", dtype=dtype).repeat(live, 1)
+        scores = torch.rand(live, topk, device="cuda")
+        for enabled, out in (("0", expected), ("1", actual)):
+            monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", enabled)
+            stage_mega_moe_inputs(x, scores, ids, *out, kind=kind)
+        torch.cuda.synchronize()
+        assert torch.equal(
+            actual[0][:live].view(torch.uint8), expected[0][:live].view(torch.uint8)
+        )
+        # An all-zero block's scale multiplies zero data and the two paths
+        # encode it differently (torch clamps the exponent to 2^-126).
+        live_blocks = x.float().view(live, hidden // 32, 32).abs().amax(-1) > 0
+        assert torch.equal(
+            actual[1][:live].view(torch.uint8)[live_blocks],
+            expected[1][:live].view(torch.uint8)[live_blocks],
+        )
+        assert torch.equal(actual[2], expected[2])
+        assert torch.equal(actual[3][:live], expected[3][:live])
+
+
 @pytest.mark.parametrize("layout", ["contiguous", "unaligned", "strided"])
 def test_staging_graph_restores_shared_workspace_tail(monkeypatch, layout):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
