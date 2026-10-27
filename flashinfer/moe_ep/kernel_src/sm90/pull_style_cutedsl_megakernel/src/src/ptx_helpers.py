@@ -548,6 +548,30 @@ def ldg_b128_raw(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ldg_b128_pred(addr: Int64, pred, *, loc=None, ip=None):
+    """``ld.global.v4.u32`` under a predicate; four zero words when it is false.
+
+    Lets a loop issue every candidate load up front without touching memory
+    for the lanes / slots that do not need it.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [addr.ir_value(), Int32(pred).ir_value()],
+        "{ .reg .pred p; setp.ne.s32 p, $5, 0; "
+        "mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
+        "@p ld.global.v4.u32 {$0, $1, $2, $3}, [$4]; }",
+        "=&r,=&r,=&r,=&r,l,r",
+        has_side_effects=False,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
 def stg_b128_raw(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None) -> None:
     """``st.global.v4.u32`` of four 32-bit words to a raw 16-byte-aligned address."""
     llvm.inline_asm(

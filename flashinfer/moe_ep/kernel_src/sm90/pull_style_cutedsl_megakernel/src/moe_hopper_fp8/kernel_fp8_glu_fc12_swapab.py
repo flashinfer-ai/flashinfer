@@ -675,6 +675,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # MegaMoE subclass passes a zero-copy ``i32 stride=(2,)`` view onto
         # ``expert_recv_count_sum`` filled by the dispatch warps.
         expert_token_sizes: Optional[cute.Tensor] = None,
+        # Internode segment-major schedule: ``(world_size, experts)`` int64
+        # per-source receive counts; None keeps the single expert-major walk.
+        expert_source_counts: Optional[cute.Tensor] = None,
         # ── MegaMoE token-comm bundle (None on the lean path) ────────────
         # All MegaMoE-specific device branches are gated by
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
@@ -1122,6 +1125,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
             tail_split_pairs=self.tail_split_pairs,
+            expert_source_counts=expert_source_counts,
+            local_source_begin=self.sched_local_source_begin,
+            local_source_count=self.sched_local_source_count,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
 

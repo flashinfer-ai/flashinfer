@@ -389,7 +389,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             enable_nccl_gin=self.enable_nccl_gin,
             global_rank=self.local_rank,
             max_tokens_per_rank=self.max_tokens_per_rank,
+            num_tail_reduce_warps=(
+                len(self.epilogue_warp_id) if self.enable_nccl_gin else 0
+            ),
         )
+        if self.enable_nccl_gin:
+            # Node-local sources fill the first rows of every expert; their
+            # full token blocks are scheduled before any block that needs
+            # remote rows (those land after the RDMA payload).
+            self.sched_local_source_begin = self.token_comm.node_rank_base
+            self.sched_local_source_count = self.token_comm.ranks_per_node
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -1141,6 +1150,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             stream=stream,
             load_balance_counter=load_balance_counter,
             expert_token_sizes=expert_token_sizes,
+            expert_source_counts=(
+                expert_recv_count if self.sched_local_source_count > 0 else None
+            ),
             token_comm_args=token_comm_args,
             fc1_c=fc1_c,
         )

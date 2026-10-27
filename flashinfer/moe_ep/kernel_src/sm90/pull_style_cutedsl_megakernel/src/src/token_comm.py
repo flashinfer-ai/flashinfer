@@ -35,6 +35,7 @@ from .ptx_helpers import (
     cp_reduce_async_bulk_add_noftz_bf16_s2g,
     f32x2_to_bf16x2,
     fns_b32,
+    ldg_b128_pred,
     ldg_b128_raw,
     ldg_b32_raw,
     ldg_f32_raw,
@@ -452,8 +453,12 @@ class TokenInPullTokenBackPush:
         enable_nccl_gin: bool = False,
         global_rank: int = 0,
         max_tokens_per_rank: int = 0,
+        # Internode tail: warps [0, n) (the epilogue warps, idle once the
+        # GEMM drains) run the node reduce; 0 keeps it on the dispatch group.
+        num_tail_reduce_warps: int = 0,
     ) -> None:
         self.world_size = world_size
+        self.num_tail_reduce_warps = int(num_tail_reduce_warps)
         self._init_internode(
             ranks_per_node=ranks_per_node,
             enable_nccl_gin=enable_nccl_gin,
@@ -2589,14 +2594,20 @@ class TokenInPullTokenBackPush:
             i = i + stride
 
     @cute.jit
-    def _gin_node_reduce(self, token_comm_args, cta_linear_id, local_warp_idx, lane_idx):
+    def _gin_node_reduce(
+        self, token_comm_args, cta_linear_id, local_warp_idx, lane_idx,
+        warps_per_cta: cutlass.Constexpr[int],
+    ):
         """Rail-peer node reduce (design C3).
 
         For every remote origin this rank proxies (slot ``s``) and every valid
         token ``t`` that hits this node, sum the landing rows
         ``combine[T + s*T + t][k]`` of the hitting top-k slots in ascending ``k``
         in FP32, round to BF16 once and store the node partial in
-        ``gin_reduce_buf[s][t]``.  Grid-strided over all dispatch-group warps.
+        ``gin_reduce_buf[s][t]``.  Grid-strided over ``warps_per_cta`` warps of
+        every CTA.  On the epilogue warps each lane keeps four 16-byte columns
+        of every hitting slot in flight; slots that miss this node load zeros,
+        which leave the +0-started FP32 sums bit-identical.
         """
         args = token_comm_args
         num_slots: cutlass.Constexpr[int] = self.num_remote_slots
@@ -2605,8 +2616,15 @@ class TokenInPullTokenBackPush:
         num_topk: cutlass.Constexpr[int] = self.num_topk
         chunks_per_row: cutlass.Constexpr[int] = hidden // 8
         row_bytes: cutlass.Constexpr[int] = hidden * 2
-        global_warp = cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx
-        num_global_warps = Int32(args.sm_count * self.num_dispatch_warps)
+        # Columns per lane per pass; the 48-register dispatch group keeps one.
+        cols: cutlass.Constexpr[int] = (
+            4
+            if self.num_tail_reduce_warps > 0
+            and chunks_per_row % (4 * self.warp_threads) == 0
+            else 1
+        )
+        global_warp = cta_linear_id * Int32(warps_per_cta) + local_warp_idx
+        num_global_warps = Int32(args.sm_count * warps_per_cta)
         combine_base = args.combine_output.iterator.toint()
         reduce_base = args.gin_reduce_buf.iterator.toint()
         for s in cutlass.range_constexpr(num_slots):
@@ -2630,34 +2648,35 @@ class TokenInPullTokenBackPush:
                     out_base = reduce_base + (Int64(s * t_max) + Int64(t)) * Int64(row_bytes)
                     c = lane_idx
                     while c < Int32(chunks_per_row):
-                        # Issue every slot's 16-byte load up front (independent
-                        # addresses -> overlapping latencies); cells of slots
-                        # that miss this node are stale but harmless to read
-                        # and are never accumulated.
+                        # Issue every load of the pass before the first use.
                         words = []
-                        for k in cutlass.range_constexpr(num_topk):
-                            words.append(
-                                ldg_b128_raw(
-                                    cell_base
-                                    + Int64(k * row_bytes)
-                                    + Int64(c) * Int64(16)
+                        for u in cutlass.range_constexpr(cols):
+                            col = c + Int32(u * self.warp_threads)
+                            for k in cutlass.range_constexpr(num_topk):
+                                words.append(
+                                    ldg_b128_pred(
+                                        cell_base
+                                        + Int64(k * row_bytes)
+                                        + Int64(col) * Int64(16),
+                                        (mask >> Int32(k)) & Int32(1),
+                                    )
                                 )
-                            )
-                        acc = [Float32(0.0) for _ in range(8)]
-                        for k in cutlass.range_constexpr(num_topk):
-                            if ((mask >> Int32(k)) & Int32(1)) != Int32(0):
+                        for u in cutlass.range_constexpr(cols):
+                            acc = [Float32(0.0) for _ in range(8)]
+                            for k in cutlass.range_constexpr(num_topk):
                                 for q in cutlass.range_constexpr(4):
-                                    lo, hi = bf16x2_to_f32x2(words[k][q])
+                                    lo, hi = bf16x2_to_f32x2(words[u * num_topk + k][q])
                                     acc[2 * q] = acc[2 * q] + lo
                                     acc[2 * q + 1] = acc[2 * q + 1] + hi
-                        stg_b128_raw(
-                            out_base + Int64(c) * Int64(16),
-                            f32x2_to_bf16x2(acc[0], acc[1]),
-                            f32x2_to_bf16x2(acc[2], acc[3]),
-                            f32x2_to_bf16x2(acc[4], acc[5]),
-                            f32x2_to_bf16x2(acc[6], acc[7]),
-                        )
-                        c = c + Int32(self.warp_threads)
+                            stg_b128_raw(
+                                out_base
+                                + Int64(c + Int32(u * self.warp_threads)) * Int64(16),
+                                f32x2_to_bf16x2(acc[0], acc[1]),
+                                f32x2_to_bf16x2(acc[2], acc[3]),
+                                f32x2_to_bf16x2(acc[4], acc[5]),
+                                f32x2_to_bf16x2(acc[6], acc[7]),
+                            )
+                        c = c + Int32(cols * self.warp_threads)
                 t = t + num_global_warps
         # Partials are read by the local NIC (the return put source).
         cute.arch.fence_acq_rel_sys()
@@ -2778,9 +2797,28 @@ class TokenInPullTokenBackPush:
                 self._dbg(cta_linear_id, 21, local_warp_idx, lane_idx)
                 # B1 above made every node-local FC2 write visible, including
                 # the landing rows of the remote origins this rank proxies.
+                if cutlass.const_expr(self.num_tail_reduce_warps == 0):
+                    self._gin_node_reduce(
+                        token_comm_args, cta_linear_id, local_warp_idx, lane_idx,
+                        self.num_dispatch_warps,
+                    )
+        if cutlass.const_expr(self.enable_nccl_gin and self.num_tail_reduce_warps > 0):
+            # The epilogue warps reduce: B1 (ordered here by the CTA barrier)
+            # made the landing rows visible, and their register file keeps
+            # far more loads in flight than the 48-register dispatch group.
+            nb_kernel_tail.arrive_and_wait()
+            if warp_idx < Int32(self.num_tail_reduce_warps):
                 self._gin_node_reduce(
-                    token_comm_args, cta_linear_id, local_warp_idx, lane_idx,
+                    token_comm_args, self._cta_linear_id(), Int32(warp_idx),
+                    lane_idx, self.num_tail_reduce_warps,
                 )
+            nb_kernel_tail.arrive_and_wait()
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            cta_linear_id = self._cta_linear_id()
+            local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            if cutlass.const_expr(self.enable_nccl_gin):
                 self._dbg(cta_linear_id, 22, local_warp_idx, lane_idx)
                 software_grid_sync(
                     token_comm_args.grid_sync_counter,

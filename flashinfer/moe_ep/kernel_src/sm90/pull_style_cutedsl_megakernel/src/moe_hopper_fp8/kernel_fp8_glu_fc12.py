@@ -47,6 +47,10 @@ from common.megamoe_constants import (
 )
 from moe_nvfp4_swapab.moe_utils import spin_wait
 
+# Per-K-tile IKET events (operand waits, WGMMA issue/wait, TMA issue) fire
+# every K tile and swamp the trace; task-level ranges are always emitted.
+_IKET_PER_K_BLOCK = os.environ.get("MEGA_IKET_PER_K_BLOCK", "0") == "1"
+
 
 # =============================================================================
 # Sm90SwigluFp8Fc12Kernel
@@ -55,6 +59,10 @@ from moe_nvfp4_swapab.moe_utils import spin_wait
 class Sm90SwigluFp8Fc12Kernel:
 
     _setmaxnreg_min = 24
+    # Source ranks whose pool rows open each expert (segment-major schedule,
+    # set by the internode MegaMoE subclass); 0 = expert-major walk.
+    sched_local_source_begin = 0
+    sched_local_source_count = 0
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
     _sm90_cta_register_budget = 65536
@@ -1004,6 +1012,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Accumulate every K tile directly into one long-lived fragment."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         if local_warp_idx < self.epilogue_warps_per_warpgroup:
             k_pipe_mmas = 1
             assert 0 < k_pipe_mmas < self.num_ab_stage
@@ -1116,6 +1126,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Promote one K tile at a time into a long-lived accumulator."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         if local_warp_idx < self.epilogue_warps_per_warpgroup:
             accumulators.fill(0.0)
             num_k_blocks = cute.size(tCrA, mode=[2])
@@ -1291,6 +1303,8 @@ class Sm90SwigluFp8Fc12Kernel:
         iket_active,
     ):
         """Run one blockwise WGMMA task tile and promote each scaled partial."""
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            iket_active = False
         accumulators.fill(0.0)
         activation_scale_layout = self._activation_scale_rmem_layout()
         activation_scales = cute.make_rmem_tensor(
@@ -1674,6 +1688,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1754,6 +1770,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gB_nkl = cute.local_tile(
             real_b,
             cute.slice_(self.mma_tiler, (0, None, None)),
@@ -1828,6 +1846,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1886,6 +1906,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gA_mkl = cute.local_tile(
             real_a,
             cute.slice_(self.mma_tiler, (None, 0, None)),
@@ -1971,6 +1993,8 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         gB_nkl = cute.local_tile(
             real_b,
             cute.slice_(self.mma_tiler, (0, None, None)),
@@ -2032,6 +2056,8 @@ class Sm90SwigluFp8Fc12Kernel:
         sf_tma_cta_layout,
         sf_mcast_mask,
     ):
+        if cutlass.const_expr(not _IKET_PER_K_BLOCK):
+            _iket_active = False
         # The activation-scale box may use a different (non-)multicast split than
         # B: a (n / cluster_m) x 16 B sub-box is misaligned for TMA when n=8, so
         # the caller passes the sf box's own CTA coord / layout / mask (equal to
@@ -2145,6 +2171,9 @@ class Sm90SwigluFp8Fc12Kernel:
         # MegaMoE subclass passes a zero-copy ``i32 stride=(2,)`` view onto
         # ``expert_recv_count_sum`` filled by the dispatch warps.
         expert_token_sizes: Optional[cute.Tensor] = None,
+        # Internode segment-major schedule: ``(world_size, experts)`` int64
+        # per-source receive counts; None keeps the single expert-major walk.
+        expert_source_counts: Optional[cute.Tensor] = None,
         # ── MegaMoE token-comm bundle (None on the lean path) ────────────
         # All MegaMoE-specific device branches are gated by
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
@@ -2599,6 +2628,9 @@ class Sm90SwigluFp8Fc12Kernel:
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
             tail_split_pairs=self.tail_split_pairs,
+            expert_source_counts=expert_source_counts,
+            local_source_begin=self.sched_local_source_begin,
+            local_source_count=self.sched_local_source_count,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
         epilogue_fc2_output = (
