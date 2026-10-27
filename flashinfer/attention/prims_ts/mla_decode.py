@@ -1254,7 +1254,7 @@ def _get_compiled_mla_decode(
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
 
-    # The 1CTA kernel also serves token-sparse DSA decode (``dsa.py``), which
+    # The 1CTA kernel also serves token-sparse DSA decode (``_dsa.py``), which
     # passes its raw Gather4 descriptors after ``output_scale``; dense and
     # native-sparse MLA leave that operand unset.
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -2389,10 +2389,80 @@ def _resolve_sparse_mla_plan(
     return device, profile, spec, sections, byte_end, capacity, output_quant
 
 
+def _resolve_dsa_plan(
+    device,
+    batch_size,
+    num_heads,
+    *,
+    max_topk,
+    max_extra_topk=0,
+    max_seq_len_q=1,
+    q_data_type=torch.float8_e4m3fn,
+    kv_layout="NHD",
+    has_sinks=False,
+    output_quant_block_size=None,
+    tuning=None,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+):
+    """Resolve a DSA plan's split and scratch sizing without allocation/compilation."""
+    from . import _dsa
+
+    if (kv_lora_rank, qk_rope_head_dim) != (_dsa.KV_LORA_RANK, _dsa.QK_ROPE_HEAD_DIM):
+        raise ValueError(
+            "sparse MLA supports (kv_lora_rank, qk_rope_head_dim) = (512, 0) "
+            "(D512 pools) or (512, 64) (DSA)"
+        )
+    device, _ = _resolve_cuda_device(device)
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        raise NotImplementedError("sparse TS MLA requires SM100 or SM103")
+    for name, value in (
+        ("batch_size", batch_size),
+        ("num_heads", num_heads),
+        ("max_seq_len_q", max_seq_len_q),
+        ("max_topk", max_topk),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if kv_layout not in ("NHD", "HND"):
+        raise ValueError("kv_layout must be NHD or HND")
+    _dsa.check_plan(
+        num_heads=num_heads,
+        max_topk=max_topk,
+        max_extra_topk=max_extra_topk,
+        q_data_type=q_data_type,
+        has_sinks=has_sinks,
+        output_quant_block_size=output_quant_block_size,
+    )
+    threshold = _tuning_rescale_threshold(tuning)
+    if threshold is not None:
+        threshold = _check_softmax_rescale_threshold_log2_range(
+            threshold, q_dtype=q_data_type
+        )
+    max_rows = batch_size * max_seq_len_q
+    if max_rows * num_heads >= 2**31:
+        raise ValueError("query extent exceeds the int32 kernel domain")
+    split_kv, head_dim_split = _dsa.resolve_split(
+        device.index, max_rows, num_heads, max_topk
+    )
+    sections = {}
+    byte_end = 0
+    for name, shape, dtype in (
+        ("core", (_dsa.workspace_bytes(max_rows, num_heads, split_kv),), torch.int8),
+        ("public_lse", (max_rows, num_heads), torch.float32),
+    ):
+        sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
+    return device, split_kv, head_dim_split, threshold, sections, byte_end
+
+
 class BatchSparseMLADecodePagedTSWrapper:
     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
-    Q is [B,Sq,H,512] or packed [total_q,H,512]. Each source supplies int32
+    Q is [B,Sq,H,512] or packed [total_q,H,512] (DSV4-style D512 pools).
+    ``plan(kv_lora_rank=512, qk_rope_head_dim=64)`` instead selects DSA
+    (GLM-5.3 / DeepSeek-V3.2): E4M3 Q [..,H,576] over one E4M3 pool of
+    [..,576] rows (512 latent + 64 RoPE; V is the latent), H in {64, 128},
+    no extra pool, sinks or output quantization. Each source supplies int32
     [rows, capacity] storage-row indices and int32 [rows] live lengths directly
     to run(). Indices include physical page strides; -1 is masked. Both source
     lists participate in one attention distribution. The caller folds the
@@ -2443,8 +2513,15 @@ class BatchSparseMLADecodePagedTSWrapper:
         out_scale_format="ue8m0",
         num_output_groups=None,
         tuning=None,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
     ):
         """Plan D512 attention over one primary and an optional extra pool.
+
+        ``kv_lora_rank=512, qk_rope_head_dim=64`` plans DSA instead (D576 Q /
+        KV, E4M3, one pool; see the class docstring). Its split of each token's
+        top-k list is chosen here from ``batch_size * max_seq_len_q`` query
+        rows, so every run of the plan uses one compiled kernel.
 
         ``max_topk`` describes arbitrary selected primary entries, not an SWA
         window. Prepared indices already include the physical page stride, so
@@ -2468,6 +2545,24 @@ class BatchSparseMLADecodePagedTSWrapper:
         ``448 * 2**-T`` instead of 448, with the precision cost described
         there.
         """
+        if (kv_lora_rank, qk_rope_head_dim) != (512, 0):
+            return self._plan_dsa(
+                device,
+                batch_size,
+                num_heads,
+                max_topk=max_topk,
+                max_extra_topk=max_extra_topk,
+                max_seq_len_q=max_seq_len_q,
+                packed_query=packed_query,
+                q_data_type=q_data_type,
+                kv_layout=kv_layout,
+                has_sinks=has_sinks,
+                return_lse=return_lse,
+                output_quant_block_size=output_quant_block_size,
+                tuning=tuning,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
                 device,
@@ -2557,6 +2652,231 @@ class BatchSparseMLADecodePagedTSWrapper:
 
         self.workspace_size_bytes = byte_end
         self._scalar_cache.clear()
+
+    def _plan_dsa(
+        self,
+        device,
+        batch_size,
+        num_heads,
+        *,
+        max_topk,
+        max_extra_topk,
+        max_seq_len_q,
+        packed_query,
+        q_data_type,
+        kv_layout,
+        has_sinks,
+        return_lse,
+        output_quant_block_size,
+        tuning,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ):
+        """Plan the DSA (D576, one E4M3 pool) schedule; see :mod:`._dsa`."""
+        from . import _dsa
+
+        (device, split_kv, head_dim_split, threshold, sections, byte_end) = (
+            _resolve_dsa_plan(
+                device,
+                batch_size,
+                num_heads,
+                max_topk=max_topk,
+                max_extra_topk=max_extra_topk,
+                max_seq_len_q=max_seq_len_q,
+                q_data_type=q_data_type,
+                kv_layout=kv_layout,
+                has_sinks=has_sinks,
+                output_quant_block_size=output_quant_block_size,
+                tuning=tuning,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
+        )
+        workspace = self._workspace_buffer
+        if workspace is None:
+            workspace = torch.empty(byte_end, device=device, dtype=torch.uint8)
+        _validate_workspace_buffer(workspace, device=device, required_bytes=byte_end)
+        compiled = _dsa.compile_plan(
+            device.index,
+            num_heads=num_heads,
+            max_topk=max_topk,
+            softmax_rescale_threshold_log2=threshold,
+            split_kv=split_kv,
+            head_dim_split=head_dim_split,
+        )
+        self._state = dict(
+            dsa=True,
+            device=device,
+            batch=batch_size,
+            heads=num_heads,
+            max_q=max_seq_len_q,
+            max_rows=batch_size * max_seq_len_q,
+            packed=packed_query,
+            dtype=q_data_type,
+            ks=max_topk,
+            kc=0,
+            kv_layout=kv_layout,
+            return_lse=return_lse,
+            assume_valid_prefix=False,
+            buffers={
+                name: _workspace_section_view(workspace, section)
+                for name, section in sections.items()
+            },
+            workspace=workspace,
+            compiled=compiled,
+            splits=split_kv,
+        )
+        self.workspace_size_bytes = byte_end
+        self._scalar_cache.clear()
+
+    def _run_dsa(
+        self,
+        query,
+        kv_cache,
+        indices,
+        lengths,
+        extra_kv_cache,
+        *,
+        extra_indices,
+        extra_lengths,
+        qo_indptr,
+        softmax_scale,
+        output_scale,
+        sinks,
+        out,
+        lse,
+        token_positions,
+        cos_sin_cache,
+        out_scale,
+        validate,
+    ):
+        """Run a DSA plan: Q [..,H,576] over one E4M3 [..,576] pool."""
+        from . import _dsa
+
+        state = self._state
+        if any(
+            v is not None
+            for v in (
+                extra_kv_cache,
+                extra_indices,
+                extra_lengths,
+                sinks,
+                token_positions,
+                cos_sin_cache,
+                out_scale,
+            )
+        ):
+            raise ValueError(
+                "a DSA plan takes no extra pool, sinks, RoPE or output-scale tensors"
+            )
+        _validate_query(
+            query,
+            packed_query=state["packed"],
+            device=state["device"],
+            batch_size=state["batch"],
+            num_heads=state["heads"],
+            max_seq_len_q=state["max_q"],
+            q_dtype=state["dtype"],
+            query_dim=_dsa.HEAD_DIM,
+        )
+        prefix = tuple(query.shape[:-2])
+        rows = math.prod(prefix)
+        if state["packed"]:
+            _validate_qo_indptr(
+                qo_indptr, device=state["device"], batch_size=state["batch"]
+            )
+            if validate:
+                maximum, total, _ = _derive_max_seq_len_q(
+                    qo_indptr, batch_size=state["batch"]
+                )
+                if total != rows or maximum > state["max_q"]:
+                    raise ValueError("invalid packed query offsets")
+        elif qo_indptr is not None:
+            raise ValueError("fixed queries do not accept qo_indptr")
+        kv = _dsa.kv_rows(
+            kv_cache,
+            device=state["device"],
+            kv_layout=state["kv_layout"],
+            name="kv_cache",
+        )
+        si, sl = self._source_metadata(
+            indices,
+            lengths,
+            state["ks"],
+            kv.shape[0],
+            "primary",
+            rows=rows,
+            validate=validate,
+        )
+        scales = []
+        for value, name in (
+            (softmax_scale, "softmax_scale"),
+            (output_scale, "output_scale"),
+        ):
+            # The DSA kernel takes the scales as launch arguments; a captured
+            # graph keeps the values of capture time.
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"a DSA plan takes {name} as a positive finite Python number"
+                )
+            scales.append(float(value))
+        if out is None:
+            out = torch.empty(
+                (*prefix, state["heads"], _dsa.V_DIM),
+                device=state["device"],
+                dtype=torch.bfloat16,
+            )
+        _validate_out(
+            out,
+            device=state["device"],
+            batch_size=state["batch"],
+            num_heads=state["heads"],
+            max_seq_len_q=state["max_q"],
+            packed_query=state["packed"],
+            total_q=rows if state["packed"] else None,
+            output_dtype=torch.bfloat16,
+        )
+        if lse is None:
+            lse = (
+                torch.empty(
+                    (*prefix, state["heads"]),
+                    device=state["device"],
+                    dtype=torch.float32,
+                )
+                if state["return_lse"]
+                else state["buffers"]["public_lse"][:rows].view(*prefix, state["heads"])
+            )
+        if (
+            lse.shape != (*prefix, state["heads"])
+            or lse.dtype != torch.float32
+            or lse.device != state["device"]
+            or not lse.is_contiguous()
+            or lse.data_ptr() % 16
+        ):
+            raise ValueError(
+                "lse must be contiguous, 16-byte-aligned FP32 with one value per query/head"
+            )
+        if rows:
+            split_ws = state["buffers"]["core"]
+            _dsa.launch(
+                state["compiled"],
+                query=query.view(rows, state["heads"], _dsa.HEAD_DIM),
+                kv=kv,
+                indices=si,
+                lengths=sl,
+                out=out.view(rows, state["heads"], _dsa.V_DIM),
+                lse=lse.view(rows, state["heads"]),
+                softmax_scale=scales[0],
+                output_scale=scales[1],
+                workspace=split_ws if split_ws.numel() else None,
+                split_kv=state["splits"],
+            )
+        return (out, lse) if state["return_lse"] else out
 
     def _scalar(self, value, name, validate):
         state = self._state
@@ -2703,7 +3023,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         execution spans internally and bounds all source reads.
 
         ``softmax_scale`` and ``output_scale`` are positive finite Python
-        scalars or scalar CUDA FP32 tensors. They are already combined:
+        scalars or scalar CUDA FP32 tensors (a DSA plan takes Python scalars
+        only). They are already combined:
         softmax_scale = attention_scale * q_descale * kv_descale;
         output_scale = output_multiplier * kv_descale. Both pools share that
         KV descale. These multiply QK scores and the weighted stored V values,
@@ -2718,7 +3039,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         or workspace storage. Q and native KV are used directly; flattening
         padded pages only creates a tensor view. Required attention reductions
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
-        aligned, including with validate=False.
+        aligned, including with validate=False. LSE is the natural-log
+        log-sum-exp for every plan (D512 and DSA).
 
         With output quantization enabled, ``token_positions`` is contiguous
         INT32 with the query's batch/token prefix; ``cos_sin_cache`` is aligned
@@ -2747,6 +3069,26 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        if state.get("dsa"):
+            return self._run_dsa(
+                query,
+                kv_cache,
+                indices,
+                lengths,
+                extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_lengths=extra_lengths,
+                qo_indptr=qo_indptr,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
+                sinks=sinks,
+                out=out,
+                lse=lse,
+                token_positions=token_positions,
+                cos_sin_cache=cos_sin_cache,
+                out_scale=out_scale,
+                validate=validate,
+            )
         _validate_query(
             query,
             packed_query=state["packed"],
@@ -2932,6 +3274,23 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
     compiling a kernel. Bind the resulting byte buffer to the wrapper constructor
     and call plan() before graph capture; run() is the prepared standalone launch.
     """
+    kv_lora_rank = plan_kwargs.pop("kv_lora_rank", 512)
+    qk_rope_head_dim = plan_kwargs.pop("qk_rope_head_dim", 0)
+    if (kv_lora_rank, qk_rope_head_dim) != (512, 0):
+        for unused in (
+            "packed_query",
+            "return_lse",
+            "assume_valid_prefix",
+            "out_scale_format",
+            "num_output_groups",
+        ):
+            plan_kwargs.pop(unused, None)
+        return _resolve_dsa_plan(
+            *plan_args,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            **plan_kwargs,
+        )[5]
     _, _, _, _, size_bytes, _, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
     return size_bytes
 
@@ -2967,8 +3326,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
-    Use a planned wrapper for CUDA Graph replay. Index conversion and scale
-    composition remain external. softmax_scale includes attention/Q/K descales;
+    Use a planned wrapper for CUDA Graph replay. A query of width 576 plans
+    the DSA schedule (``qk_rope_head_dim=64``); width 512 the D512 one. Index
+    conversion and scale composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
     Source contracts, output quantization arguments, ``tuning`` and return
     layouts follow
@@ -2988,6 +3348,8 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     else:
         batch = query.shape[0]
         max_seq_len_q = query.shape[1] if max_seq_len_q is None else max_seq_len_q
+    # A 576-wide query (512 latent + 64 RoPE) selects the DSA schedule.
+    qk_rope_head_dim = query.shape[-1] - 512
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace_buffer)
     wrapper.plan(
         query.device,
@@ -3006,6 +3368,8 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
         tuning=tuning,
+        kv_lora_rank=512,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
     return wrapper.run(
         query,

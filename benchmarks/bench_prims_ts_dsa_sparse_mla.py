@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the PrimTS 1CTA DSA (token-sparse) MLA decode kernel (E4M3 KV cache).
+"""Benchmark the DSA schedule of the PrimTS sparse MLA wrapper (E4M3 KV cache).
 
 GLM-5.3 / DeepSeek-V3.2 decode shapes: ``T = batch * q_len`` packed query
 tokens, 64 (or 128) heads, QK dim 576 / V dim 512, each token attending to
@@ -45,7 +45,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_helpers import dsa_sparse_mla_reference as ref  # noqa: E402
 
 import flashinfer  # noqa: E402
-from flashinfer.attention.prims_ts import prims_ts_dsa_sparse_mla  # noqa: E402
+from flashinfer.attention.prims_ts import (  # noqa: E402
+    BatchSparseMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
+)
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 HEAD_DIM, V_DIM = 576, 512
@@ -169,20 +172,11 @@ def main() -> None:
         else None
     )
 
-    def run_ours(q, idx, lens, out, top_k):
-        prims_ts_dsa_sparse_mla(
-            q,
-            kv,
-            idx,
-            None,
-            None,
-            sparse_mla_top_k=top_k,
-            sparse_mla_top_k_lens=lens,
-            bmm1_scale=sm_scale,
-            bmm2_scale=1.0,
-            skip_corr_threshold=args.skip_corr,
-            out=out,
-        )
+    tuning = (
+        MLAAttentionTuning(softmax_rescale_threshold_log2=args.skip_corr)
+        if args.skip_corr
+        else None
+    )
 
     fields = [
         "tag", "kernel", "heads", "top_k", "q_len", "batch", "total_q",
@@ -216,8 +210,33 @@ def main() -> None:
                         total_q, heads, V_DIM, dtype=torch.bfloat16, device=device
                     )
 
+                    # One plan per shape (the split is fixed at plan time),
+                    # outside the timed region; the timed call is run().
+                    wrapper = BatchSparseMLADecodePagedTSWrapper()
+                    wrapper.plan(
+                        device,
+                        total_q,
+                        heads,
+                        max_topk=top_k,
+                        q_data_type=torch.float8_e4m3fn,
+                        tuning=tuning,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                    )
+                    q4 = q.view(total_q, 1, heads, HEAD_DIM)
+                    out4 = out.view(total_q, 1, heads, V_DIM)
+
                     def ours():
-                        run_ours(q, idx, lens, out, top_k)
+                        wrapper.run(
+                            q4,
+                            kv,
+                            idx,
+                            lens,
+                            softmax_scale=sm_scale,
+                            output_scale=1.0,
+                            out=out4,
+                            validate=False,
+                        )
 
                     def trtllm():
                         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(

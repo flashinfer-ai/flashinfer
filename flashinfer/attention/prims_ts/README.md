@@ -53,7 +53,6 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
-| DSA sparse MLA (GLM-5.3 / DeepSeek-V3.2 token routing, 1CTA) | [below](#dsa-sparse-mla) | `prims_ts_dsa_sparse_mla` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
@@ -106,34 +105,42 @@ graph.replay()
 
 ### DSA sparse MLA
 
-`prims_ts_dsa_sparse_mla` is the single DSA entry; the KV-cache format is
-selected by `kv_cache.dtype` (E4M3 today).  It runs GLM-5.3 / DeepSeek-V3.2
-decode over token-level routing: every packed E4M3 query token (`[T, H, 576]`, H in
-{64, 128}) attends to the `sparse_mla_top_k` rows of an E4M3 `[.., 576]` KV
-cache its indexer selected, given as flat row indices in `block_tables`
-(`[T, top_k]` INT32, `-1` = empty slot anywhere in the row;
-`sparse_mla_top_k_lens` limits the scanned prefix per token).  The argument
-names and the `seq_lens` / `cum_seq_lens_q` / `max_q_len` placeholders follow
-`trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k > 0)`; the kernel does
-not read the placeholders.  The entry returns BF16 `[T, H, 512]` (optional
-caller-owned `out` and base-2 `lse`), accepts `skip_corr_threshold` in
-`[0, 8]`, and runs one CTA per query token and 64 heads (128 heads run as two
-row tiles of the same token).  Below 96 such CTAs it splits every token's
-top-k list into S in {16, 8, 4, 2} contiguous ranges of at least two 128-key
-tiles (trtllm-gen's MLA generation rule; a top-k of one tile pair splits per
-tile while the V split below applies), the largest S that keeps the grid
-within one wave of SMs.  While a split grid still fills at most a half or a
-quarter of the SMs, it also splits the 512 V columns over 2 or 4 CTAs that
-repeat QK / softmax (B200, top-k 2048: one token runs 8 x 4 CTAs).  The CTAs
-write BF16 partial O / LSE to a per-call workspace and a reducer kernel merges
-them, so a split launch is not bitwise equal to the unsplit one.  It needs
-SM100 / SM103.  The kernel trusts the routing values: the active
-`block_tables` entries (the first `sparse_mla_top_k_lens[t]` of each row) must
-be `-1` or address a pool row and `sparse_mla_top_k_lens` must lie in
-`[0, top_k]`; `FLASHINFER_VALIDATE_INPUTS=1` checks both (synchronizing, not
-under CUDA-graph capture).  Pool rows are addressed with 32-bit indices; the
-first call on a pool buffer encodes its Gather4 descriptors on the host, so
-run each pool once eagerly before CUDA-graph capture.
+GLM-5.3 / DeepSeek-V3.2 decode runs through the sparse MLA entry points,
+`BatchSparseMLADecodePagedTSWrapper` and
+`batch_sparse_mla_decode_with_paged_kv_cache`, with the same indices /
+lengths contract as the D512 pools. Plan it with
+`kv_lora_rank=512, qk_rope_head_dim=64`; the one-shot helper infers this from
+a 576-wide query.
+- **Inputs:** E4M3 queries `[.., H, 576]` with H in {64, 128}. One E4M3 pool
+  of `[.., 576]` rows: 512 latent + 64 RoPE, and V is the latent.
+- **Routes:** per-token `indices` / `lengths`, with `-1` holes anywhere in a
+  row.
+- **Not supported:** an extra pool, sinks and output quantization.
+- **Skip correction:** `tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=T)`
+  with T in [0, 8]. It is compiled into the kernel, and E4M3 P uses
+  `448 * 2**-T`.
+
+The kernel is the 1CTA keeps-MMA-AB q64 schedule in a token-sparse
+configuration: one CTA per (token, 64 heads), with Gather4 loads of the
+routed rows.
+
+**Split-KV below 96 CTAs.** The plan chooses the split from
+`batch_size * max_seq_len_q`, so every run of a plan, and a CUDA graph
+captured from it, uses one compiled kernel.
+- Each token's top-k list is split into S ∈ {16, 8, 4, 2} ranges of at least
+  two 128-key tiles (trtllm-gen's rule).
+- While the split grid fills at most a half or a quarter of the SMs, the 512
+  V columns are split as well.
+- A reducer merges the BF16 partials, so a split launch is not bitwise equal
+  to an unsplit one.
+
+**Run-time requirements.** `lse` is the natural-log log-sum-exp, as for the
+D512 plans. `softmax_scale` / `output_scale` are Python numbers, and a
+captured graph keeps their capture-time values. The KV pool must be
+contiguous. Encoding a pool's
+Gather4 descriptors requires one eager run of that pool before CUDA-graph
+capture. Compiled kernels are cached on disk with the other PrimTS MLA
+kernels.
 
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static

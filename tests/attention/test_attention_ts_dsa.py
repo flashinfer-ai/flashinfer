@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness coverage for the PrimTS 1CTA DSA (token-sparse) MLA decode kernel.
+"""Correctness coverage for the DSA schedule of the PrimTS sparse MLA wrapper.
 
-GLM-5.3 / DeepSeek-V3.2 decode: every packed query token attends to the
-``sparse_mla_top_k`` rows of an E4M3 ``[N, 576]`` KV pool its indexer routed
-to it.  The reference (``tests/test_helpers/dsa_sparse_mla_reference.py``) is
-an FP32 softmax over the same E4M3 rows.
+GLM-5.3 / DeepSeek-V3.2 decode (``qk_rope_head_dim=64``): every query token
+attends to the top-k rows of an E4M3 ``[N, 576]`` KV pool its indexer routed
+to it, through ``BatchSparseMLADecodePagedTSWrapper`` /
+``batch_sparse_mla_decode_with_paged_kv_cache``.  The reference
+(``tests/test_helpers/dsa_sparse_mla_reference.py``) is an FP32 softmax over
+the same E4M3 rows.
 """
 
 from __future__ import annotations
@@ -30,8 +32,10 @@ import torch
 cutlass = pytest.importorskip("cutlass", minversion="4.7.0")
 
 from flashinfer.attention.prims_ts import (
-    dsa as dsa_module,
-    prims_ts_dsa_sparse_mla,
+    BatchSparseMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
+    _dsa as dsa_module,
+    batch_sparse_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.token_sparse_launch import (
     compile_dsa_sparse_kernel,
@@ -50,8 +54,8 @@ _SM_SCALE = 1.0 / 16.0
 # The kernel's E4M3 P / FP32-accumulated output against the FP32 reference over
 # the same E4M3 rows (2.2e-2 .. 2.8e-2 on B200).
 _REL_L2_TOL = 4e-2
-# Base-2 LSE: the kernel's E4M3 P and FP32 accumulation order against the FP32
-# reference; observed differences stay below 0.03.
+# Natural-log LSE: the kernel's E4M3 P and FP32 accumulation order against the
+# FP32 reference.
 _LSE_ATOL = 0.1
 
 
@@ -62,11 +66,11 @@ class Case:
     heads: int = 64
     top_k: int = 2048
     rows: int = 1 << 15
-    ragged: bool = False  # random active prefix per token (sparse_mla_top_k_lens)
+    ragged: bool = False  # random active prefix per token (lengths)
     neg: float = 0.0  # fraction of -1 slots inside the active width
     sequential: bool = False  # token t uses rows t*K .. t*K+K-1 (no gather scatter)
     q_zero: bool = False  # Q = 0: the output is the mean of the V rows (V path only)
-    zero_len_token: bool = False  # token 1 gets sparse_mla_top_k_lens == 0
+    zero_len_token: bool = False  # token 1 gets lengths == 0
     duplicates: bool = False  # every token routes to each of its rows twice
     masked_first_tile: bool = False  # slots 0..127 are -1, later tiles are valid
     seed: int = 0
@@ -102,8 +106,7 @@ _FP8_CASES = [
 class Fixture:
     query: torch.Tensor  # [T, H, 576] e4m3
     block_tables: torch.Tensor  # [T, K] int32
-    top_k_lens: torch.Tensor  # [T] int32 (always materialized)
-    top_k_lens_arg: torch.Tensor | None  # what the API receives
+    top_k_lens: torch.Tensor  # [T] int32
     fp8_pool: torch.Tensor  # [N, 576] e4m3
 
 
@@ -126,7 +129,6 @@ def build_fixture(case: Case, device: torch.device) -> Fixture:
     if case.duplicates:
         idx[:, 1::2] = idx[:, 0::2]
     lens = torch.full((T,), K, dtype=torch.int32, device=device)
-    lens_arg = None
     if case.ragged:
         lens = torch.randint(1, K + 1, (T,), device=device, generator=gen).to(
             torch.int32
@@ -134,7 +136,6 @@ def build_fixture(case: Case, device: torch.device) -> Fixture:
         lens[0] = K
         if case.zero_len_token:
             lens[1] = 0
-        lens_arg = lens
     if case.neg > 0:
         idx[torch.rand(T, K, device=device, generator=gen) < case.neg] = -1
     if case.masked_first_tile:
@@ -143,7 +144,6 @@ def build_fixture(case: Case, device: torch.device) -> Fixture:
         query=q,
         block_tables=idx,
         top_k_lens=lens,
-        top_k_lens_arg=lens_arg,
         fp8_pool=x.to(_FP8),
     )
 
@@ -171,20 +171,36 @@ def _check_against(
     assert torch.allclose(lse[finite], expected_lse[finite], atol=_LSE_ATOL, rtol=0)
 
 
-def _run_fp8(fx: Fixture, *, skip_corr_threshold: float = 0.0, **kwargs):
-    return prims_ts_dsa_sparse_mla(
-        fx.query,
-        fx.fp8_pool,
+def _tuning(threshold: float):
+    if threshold == 0.0:
+        return None
+    return MLAAttentionTuning(softmax_rescale_threshold_log2=threshold)
+
+
+def _run_fp8(
+    fx: Fixture,
+    *,
+    skip_corr_threshold: float = 0.0,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    kv_layout: str = "NHD",
+) -> torch.Tensor:
+    """One-shot DSA call with one query token per request: returns ``[T, H, 512]``."""
+    T, H, _ = fx.query.shape
+    result = batch_sparse_mla_decode_with_paged_kv_cache(
+        fx.query.view(T, 1, H, _HEAD_DIM),
+        fx.fp8_pool if kv_cache is None else kv_cache,
         fx.block_tables,
-        None,
-        None,
-        sparse_mla_top_k=fx.block_tables.shape[1],
-        sparse_mla_top_k_lens=fx.top_k_lens_arg,
-        bmm1_scale=_SM_SCALE,
-        bmm2_scale=1.0,
-        skip_corr_threshold=skip_corr_threshold,
-        **kwargs,
+        fx.top_k_lens,
+        kv_layout=kv_layout,
+        softmax_scale=_SM_SCALE,
+        output_scale=1.0,
+        out=None if out is None else out.view(T, 1, H, _V_DIM),
+        lse=None if lse is None else lse.view(T, 1, H),
+        tuning=_tuning(skip_corr_threshold),
     )
+    return result.view(T, H, _V_DIM)
 
 
 def _fp8_reference(fx: Fixture):
@@ -259,17 +275,42 @@ def test_prims_ts_dsa_cuda_graph_replay() -> None:
     device = torch.device("cuda")
     case = Case("graph", total_q=5, ragged=True, neg=0.1)
     fx = build_fixture(case, device)
-    run, reference = _run_fp8, _fp8_reference
-    out = torch.empty((case.total_q, 64, _V_DIM), dtype=torch.bfloat16, device=device)
-    lse = torch.empty((case.total_q, 64), dtype=torch.float32, device=device)
-    # The first eager call compiles and caches the Gather4 descriptors of these
-    # pool buffers; capture must not allocate or encode on the host.
-    run(fx, out=out, lse=lse)
+    reference = _fp8_reference
+    T, H = case.total_q, 64
+    out = torch.empty((T, H, _V_DIM), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((T, H), dtype=torch.float32, device=device)
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        device,
+        T,
+        H,
+        max_topk=case.top_k,
+        q_data_type=_FP8,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+
+    def run():
+        wrapper.run(
+            fx.query.view(T, 1, H, _HEAD_DIM),
+            fx.fp8_pool,
+            fx.block_tables,
+            fx.top_k_lens,
+            softmax_scale=_SM_SCALE,
+            output_scale=1.0,
+            out=out.view(T, 1, H, _V_DIM),
+            lse=lse.view(T, 1, H),
+            validate=False,
+        )
+
+    # The first eager run encodes the Gather4 descriptors of this pool buffer;
+    # capture must not allocate or encode on the host.
+    run()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream), torch.cuda.graph(graph):
-        run(fx, out=out, lse=lse)
+        run()
     torch.cuda.synchronize()
     for seed in (1, 2):
         fresh = build_fixture(dataclasses.replace(case, seed=seed), device)
@@ -282,7 +323,7 @@ def test_prims_ts_dsa_cuda_graph_replay() -> None:
         graph.replay()
         torch.cuda.synchronize()
         replayed, replayed_lse = out.clone(), lse.clone()
-        eager = run(fresh)
+        eager = _run_fp8(fresh)
         torch.cuda.synchronize()
         assert torch.equal(replayed, eager)
         expected, expected_lse = reference(fresh)
@@ -291,9 +332,9 @@ def test_prims_ts_dsa_cuda_graph_replay() -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-def test_prims_ts_dsa_validate_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``FLASHINFER_VALIDATE_INPUTS=1`` rejects routes outside the pool and bad active widths."""
-    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+def test_prims_ts_dsa_validate_inputs() -> None:
+    """``run(validate=True)`` (the one-shot default) rejects routes outside the
+    pool and lengths beyond the capacity, and ignores slots past each length."""
     device = torch.device("cuda")
     fx = build_fixture(Case("validate", total_q=3, ragged=True, neg=0.2), device)
     run = _run_fp8
@@ -304,12 +345,12 @@ def test_prims_ts_dsa_validate_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
     for bad_value in (rows, -2):
         fx.block_tables.copy_(good)
         fx.block_tables[0, 3] = bad_value
-        with pytest.raises(ValueError, match="block_tables entries"):
+        with pytest.raises(ValueError, match="active index outside pool"):
             run(fx)
     fx.block_tables.copy_(good)
     good_lens = fx.top_k_lens.clone()
     fx.top_k_lens[2] = fx.block_tables.shape[1] + 1
-    with pytest.raises(ValueError, match="sparse_mla_top_k_lens"):
+    with pytest.raises(ValueError, match="length exceeds capacity"):
         run(fx)
     fx.top_k_lens.copy_(good_lens)
     assert torch.equal(run(fx), baseline)
@@ -325,158 +366,190 @@ def test_prims_ts_dsa_validate_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _valid_args(device: torch.device) -> dict:
     T, K = 2, 64
-    q = torch.zeros((T, 64, _HEAD_DIM), dtype=_FP8, device=device)
-    idx = torch.zeros((T, K), dtype=torch.int32, device=device)
-    args = dict(
-        query=q,
-        block_tables=idx,
-        seq_lens=None,
-        cum_seq_lens_q=None,
-        sparse_mla_top_k=K,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
+    return dict(
+        query=torch.zeros((T, 1, 64, _HEAD_DIM), dtype=_FP8, device=device),
         kv_cache=torch.zeros((128, _HEAD_DIM), dtype=_FP8, device=device),
+        indices=torch.zeros((T, K), dtype=torch.int32, device=device),
+        lengths=torch.full((T,), K, dtype=torch.int32, device=device),
+        softmax_scale=1.0,
+        output_scale=1.0,
     )
-    return args
 
 
-_COMMON_INVALID = [
-    ("query-dtype", lambda a, d: a.update(query=a["query"].to(torch.bfloat16))),
-    ("query-rank", lambda a, d: a.update(query=a["query"][:, 0])),
-    ("query-heads", lambda a, d: a.update(query=a["query"][:, :48].contiguous())),
-    ("query-head-dim", lambda a, d: a.update(query=a["query"][..., :512].contiguous())),
+def _misaligned(shape, dtype, device):
+    numel = 1
+    for extent in shape:
+        numel *= extent
+    return torch.zeros(numel + 1, dtype=dtype, device=device)[1:].view(*shape)
+
+
+# (name, mutation, re.search pattern of the ValueError it must raise)
+_INVALID = [
     (
-        "query-strided",
-        lambda a, d: a.update(
-            query=torch.zeros((2, 64, 2 * _HEAD_DIM), dtype=_FP8, device=d)[
-                ..., :_HEAD_DIM
-            ]
-        ),
+        "query-bf16",
+        lambda a, d: a.update(query=a["query"].to(torch.bfloat16)),
+        "requires E4M3",
+    ),
+    (
+        "query-heads",
+        lambda a, d: a.update(query=a["query"][:, :, :32].contiguous()),
+        "64 or 128 query heads",
     ),
     (
         "query-misaligned",
-        lambda a, d: a.update(
-            query=torch.zeros(2 * 64 * _HEAD_DIM + 1, dtype=_FP8, device=d)[1:].view(
-                2, 64, _HEAD_DIM
-            )
-        ),
-    ),
-    ("tables-dtype", lambda a, d: a.update(block_tables=a["block_tables"].long())),
-    ("tables-shape", lambda a, d: a.update(block_tables=a["block_tables"][:, :32])),
-    ("tables-rank", lambda a, d: a.update(block_tables=a["block_tables"][0])),
-    ("topk-not-multiple-of-4", lambda a, d: a.update(sparse_mla_top_k=66)),
-    ("topk-zero", lambda a, d: a.update(sparse_mla_top_k=0)),
-    (
-        "lens-shape",
-        lambda a, d: a.update(
-            sparse_mla_top_k_lens=torch.ones(3, dtype=torch.int32, device=d)
-        ),
+        lambda a, d: a.update(query=_misaligned((2, 1, 64, _HEAD_DIM), _FP8, d)),
+        "query data pointer must be 16-byte aligned",
     ),
     (
-        "lens-dtype",
+        "topk-not-multiple-of-4",
         lambda a, d: a.update(
-            sparse_mla_top_k_lens=torch.ones(2, dtype=torch.int64, device=d)
+            indices=torch.zeros((2, 66), dtype=torch.int32, device=d)
         ),
+        "multiple of 4",
     ),
     (
-        "seq-lens-dtype",
-        lambda a, d: a.update(seq_lens=torch.ones(2, dtype=torch.int64, device=d)),
+        "extra-pool",
+        lambda a, d: a.update(
+            extra_kv_cache=a["kv_cache"],
+            extra_indices=a["indices"],
+            extra_lengths=a["lengths"],
+        ),
+        "one KV pool",
     ),
-    ("scale-nan", lambda a, d: a.update(bmm1_scale=float("nan"))),
-    ("scale-bool", lambda a, d: a.update(bmm2_scale=True)),
-    ("skip-corr-too-large", lambda a, d: a.update(skip_corr_threshold=8.5)),
-    ("skip-corr-negative", lambda a, d: a.update(skip_corr_threshold=-1.0)),
+    (
+        "sinks",
+        lambda a, d: a.update(sinks=torch.zeros(64, dtype=torch.float32, device=d)),
+        "attention sinks",
+    ),
+    (
+        "output-quant",
+        lambda a, d: a.update(output_quant_block_size=32, num_output_groups=1),
+        "output quantization",
+    ),
+    (
+        "threshold-too-large",
+        lambda a, d: a.update(
+            tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=8.5)
+        ),
+        "softmax_rescale_threshold_log2",
+    ),
+    (
+        "tensor-scale",
+        lambda a, d: a.update(
+            softmax_scale=torch.ones(1, dtype=torch.float32, device=d)
+        ),
+        "positive finite Python number",
+    ),
+    (
+        "scale-nan",
+        lambda a, d: a.update(softmax_scale=float("nan")),
+        "positive finite Python number",
+    ),
+    (
+        "indices-dtype",
+        lambda a, d: a.update(indices=a["indices"].long()),
+        "invalid primary indices",
+    ),
+    (
+        "lengths-shape",
+        lambda a, d: a.update(lengths=a["lengths"][:1]),
+        "invalid primary lengths",
+    ),
     (
         "out-dtype",
         lambda a, d: a.update(
-            out=torch.empty((2, 64, _V_DIM), dtype=torch.float16, device=d)
+            out=torch.empty((2, 1, 64, _V_DIM), dtype=torch.float16, device=d)
         ),
-    ),
-    (
-        "out-shape",
-        lambda a, d: a.update(
-            out=torch.empty((2, 64, 576), dtype=torch.bfloat16, device=d)
-        ),
+        "out must have dtype",
     ),
     (
         "lse-shape",
-        lambda a, d: a.update(lse=torch.empty((2, 32), dtype=torch.float32, device=d)),
+        lambda a, d: a.update(
+            lse=torch.empty((2, 1, 32), dtype=torch.float32, device=d)
+        ),
+        "lse must be contiguous",
     ),
-]
-_FP8_INVALID = [
-    ("cache-dtype", lambda a, d: a.update(kv_cache=a["kv_cache"].to(torch.bfloat16))),
-    ("cache-row", lambda a, d: a.update(kv_cache=a["kv_cache"][:, :512].contiguous())),
+    (
+        "cache-dtype",
+        lambda a, d: a.update(kv_cache=a["kv_cache"].to(torch.bfloat16)),
+        "E4M3 tensor on the planned device",
+    ),
+    (
+        "cache-row",
+        lambda a, d: a.update(kv_cache=a["kv_cache"][:, :512].contiguous()),
+        r"must have shape \[N,576\]",
+    ),
     (
         "cache-misaligned",
-        lambda a, d: a.update(
-            kv_cache=torch.zeros(128 * _HEAD_DIM + 1, dtype=_FP8, device=d)[1:].view(
-                128, _HEAD_DIM
-            )
-        ),
+        lambda a, d: a.update(kv_cache=_misaligned((128, _HEAD_DIM), _FP8, d)),
+        "16-byte-aligned address",
     ),
 ]
-# The validation message each case must raise (re.search patterns).
-_INVALID_MATCH = {
-    "query-dtype": "query must be a CUDA E4M3 tensor",
-    "query-rank": "query must be a CUDA E4M3 tensor",
-    "query-heads": r"query must be \[T, 64\|128",
-    "query-head-dim": r"query must be \[T, 64\|128",
-    "query-strided": "query must be contiguous",
-    "query-misaligned": "query must start at a 16-byte-aligned address",
-    "tables-dtype": "block_tables must be contiguous INT32",
-    "tables-shape": "block_tables must be contiguous INT32",
-    "tables-rank": "block_tables must be contiguous INT32",
-    "topk-not-multiple-of-4": "sparse_mla_top_k must be a positive multiple of 4",
-    "topk-zero": "sparse_mla_top_k must be a positive multiple of 4",
-    "lens-shape": "sparse_mla_top_k_lens must be contiguous INT32",
-    "lens-dtype": "sparse_mla_top_k_lens must be contiguous INT32",
-    "seq-lens-dtype": "seq_lens must be a 1-D CUDA INT32",
-    "scale-nan": "bmm1_scale must be a finite number",
-    "scale-bool": "bmm2_scale must be a finite number",
-    "skip-corr-too-large": r"skip_corr_threshold must be in \[0, 8\]",
-    "skip-corr-negative": r"skip_corr_threshold must be in \[0, 8\]",
-    "out-dtype": "out must be contiguous BF16",
-    "out-shape": "out must be contiguous BF16",
-    "lse-shape": "lse must be contiguous FP32",
-    "cache-dtype": "kv_cache dtype .* is not supported",
-    "cache-row": "kv_cache must be a contiguous CUDA E4M3 tensor",
-    "cache-misaligned": "kv_cache must start at a 16-byte-aligned address",
-}
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "name,mutate",
-    _COMMON_INVALID + _FP8_INVALID,
-    ids=lambda v: v if isinstance(v, str) else "",
+    "name,mutate,match", _INVALID, ids=[case[0] for case in _INVALID]
 )
-def test_prims_ts_dsa_rejects_invalid_arguments(name: str, mutate) -> None:
+def test_prims_ts_dsa_rejects_invalid_arguments(name: str, mutate, match) -> None:
     device = torch.device("cuda")
     args = _valid_args(device)
     mutate(args, device)
-    with pytest.raises(ValueError, match=_INVALID_MATCH[name]):
-        prims_ts_dsa_sparse_mla(**args)
+    with pytest.raises(ValueError, match=match):
+        batch_sparse_mla_decode_with_paged_kv_cache(**args)
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 def test_prims_ts_dsa_zero_tokens() -> None:
-    """A step without query tokens returns the empty output without a launch."""
+    """A packed step without query tokens returns the empty output without a launch."""
     device = torch.device("cuda")
-    args = _valid_args(device)
-    args["query"] = args["query"][:0]
-    args["block_tables"] = args["block_tables"][:0]
-    out = prims_ts_dsa_sparse_mla(**args)
+    out = batch_sparse_mla_decode_with_paged_kv_cache(
+        torch.zeros((0, 64, _HEAD_DIM), dtype=_FP8, device=device),
+        torch.zeros((128, _HEAD_DIM), dtype=_FP8, device=device),
+        torch.zeros((0, 64), dtype=torch.int32, device=device),
+        torch.zeros((0,), dtype=torch.int32, device=device),
+        qo_indptr=torch.zeros(2, dtype=torch.int32, device=device),
+    )
     assert tuple(out.shape) == (0, 64, _V_DIM) and out.dtype == torch.bfloat16
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
+def test_prims_ts_dsa_packed_mtp_query() -> None:
+    """Packed queries (``qo_indptr``, four MTP tokens per request) match the
+    fixed ``[B, 4, H, 576]`` layout bitwise."""
+    device = torch.device("cuda")
+    fx = build_fixture(Case("mtp", total_q=12, ragged=True, neg=0.1), device)
+    T, H = 12, 64
+    fixed = batch_sparse_mla_decode_with_paged_kv_cache(
+        fx.query.view(3, 4, H, _HEAD_DIM),
+        fx.fp8_pool,
+        fx.block_tables,
+        fx.top_k_lens,
+        softmax_scale=_SM_SCALE,
+    ).view(T, H, _V_DIM)
+    packed = batch_sparse_mla_decode_with_paged_kv_cache(
+        fx.query,
+        fx.fp8_pool,
+        fx.block_tables,
+        fx.top_k_lens,
+        qo_indptr=torch.arange(0, T + 1, 4, dtype=torch.int32, device=device),
+        softmax_scale=_SM_SCALE,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(packed, fixed)
+    expected, _ = _fp8_reference(fx)
+    assert _rel_l2(packed, expected) < _REL_L2_TOL
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
 def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
-    """The JIT key is (heads, top-k, skip-correction, split-KV count, V head-dim
-    split); T is a runtime extent, so token counts that select the same split
-    share one kernel."""
+    """The JIT key is (heads, top-k rounded up to one tile, skip-correction,
+    split-KV count, V head-dim split); T is a runtime extent, so token counts
+    whose plans select the same split share one kernel."""
     device = torch.device("cuda")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     top_k = 256
@@ -526,6 +599,33 @@ def test_prims_ts_dsa_fp8_split_policy() -> None:
     assert select(48, 2048, 148) == (2, 1)  # e.g. 24 tokens with 128 heads
 
 
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+def test_prims_ts_dsa_lse_units_match_across_splits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsplit and split plans publish the same natural-log LSE (the split
+    reducer and the direct store must agree on units)."""
+    device = torch.device("cuda")
+    fx = build_fixture(Case("lse-units", total_q=4, ragged=True, neg=0.1), device)
+    results = []
+    for split, head_dim_split in ((1, 1), (4, 2)):
+        monkeypatch.setattr(
+            dsa_module,
+            "_select_fp8_split",
+            lambda num_ctas, top_k, sm_count, s=split, h=head_dim_split: (s, h),
+        )
+        lse = torch.empty((4, 64), dtype=torch.float32, device=device)
+        _run_fp8(fx, lse=lse)
+        torch.cuda.synchronize()
+        results.append(lse)
+    _, expected_lse = _fp8_reference(fx)
+    finite = torch.isfinite(expected_lse)
+    for lse in results:
+        assert torch.allclose(lse[finite], expected_lse[finite], atol=_LSE_ATOL, rtol=0)
+    assert torch.allclose(results[0], results[1], atol=_LSE_ATOL, rtol=0)
+
+
 _SPLIT_CASES = [
     Case("ragged-neg30", total_q=6, ragged=True, neg=0.3),
     Case("lens-zero", total_q=4, ragged=True, zero_len_token=True),
@@ -564,23 +664,20 @@ def test_prims_ts_dsa_split_kv_matches_reference(
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("shape", [(-1, 64, _HEAD_DIM), (-1, 1, 64, _HEAD_DIM)])
-def test_prims_ts_dsa_paged_cache_layout(shape) -> None:
-    """``[num_pages, page_size, 576]`` / ``[num_pages, 1, page_size, 576]`` caches
-    are addressed as flat rows: entry ``page * page_size + offset``."""
+@pytest.mark.parametrize(
+    ("shape", "kv_layout"),
+    [
+        ((-1, 64, _HEAD_DIM), "NHD"),
+        ((-1, 64, 1, _HEAD_DIM), "NHD"),
+        ((-1, 1, 64, _HEAD_DIM), "HND"),
+    ],
+)
+def test_prims_ts_dsa_paged_cache_layout(shape, kv_layout) -> None:
+    """Paged ``[pages, page_size, 576]`` caches (and their one-KV-head 4-D
+    forms) are addressed as flat rows: entry ``page * page_size + offset``."""
     device = torch.device("cuda")
     fx = build_fixture(Case("paged", total_q=4, ragged=True, neg=0.1), device)
     flat = _run_fp8(fx).clone()
-    paged = prims_ts_dsa_sparse_mla(
-        fx.query,
-        fx.fp8_pool.view(*shape),
-        fx.block_tables,
-        None,
-        None,
-        sparse_mla_top_k=fx.block_tables.shape[1],
-        sparse_mla_top_k_lens=fx.top_k_lens_arg,
-        bmm1_scale=_SM_SCALE,
-        bmm2_scale=1.0,
-    )
+    paged = _run_fp8(fx, kv_cache=fx.fp8_pool.view(*shape), kv_layout=kv_layout)
     torch.cuda.synchronize()
     assert torch.equal(paged, flat)

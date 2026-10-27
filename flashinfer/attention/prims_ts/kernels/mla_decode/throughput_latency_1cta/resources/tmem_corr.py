@@ -594,6 +594,11 @@ class TmemCorrResource(MlaResource):
                             lse_val
                         )
                 else:
+                    if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+                        # The sparse MLA wrapper publishes natural-log LSE (the
+                        # D512 path finalizes the same way); split partials
+                        # above stay base 2 for the reducer.
+                        lse_val = lse_val * Float32(LN_2)
                     if valid_output_row:
                         elem_offset = public_query_flat_row(
                             self.cfg,

@@ -25,6 +25,7 @@ and a RoPE 64 B / SWIZZLE_64B box over the ``[N, 576]`` E4M3 pool.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import functools
 
 import torch
@@ -50,8 +51,9 @@ def _encode_pool_gather4_descriptor_host(
 
     Row coordinates outside ``[0, rows)`` are zero-filled by the TMA unit.
     ``-1`` slots are additionally masked out of the softmax; any other
-    out-of-range index would count as a key with score 0, so the entry point
-    requires routes to address the pool (``FLASHINFER_VALIDATE_INPUTS``).
+    out-of-range index would count as a key with score 0, so the sparse MLA
+    wrapper requires active routes to address the pool (``run(validate=True)``
+    checks it).
     """
 
     from cuda.bindings import driver as cuda_drv
@@ -106,16 +108,16 @@ def gather4_descriptors(kv_pool: torch.Tensor) -> torch.Tensor:
     return device_tensor
 
 
-@functools.lru_cache(maxsize=None)
-def max_active_clusters_1cta(device_index: int) -> int:
-    import cutlass.utils as cutlass_utils
-    from cuda.bindings import driver as cuda_drv
+@dataclasses.dataclass(frozen=True)
+class _DsaCompileSpec:
+    """Compile identity of one token-sparse specialization (persistent-cache key)."""
 
-    with torch.cuda.device(device_index):
-        stream = cuda_drv.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
-        return int(
-            cutlass_utils.HardwareInfo(device_index).get_max_active_clusters(1, stream)
-        )
+    num_heads: int
+    sparse_mla_top_k: int
+    softmax_rescale_threshold_log2: float
+    split_kv: int
+    head_dim_split: int
+    max_active_clusters: int
 
 
 @functools.lru_cache(maxsize=None)
@@ -128,7 +130,11 @@ def compile_dsa_sparse_kernel(
     split_kv: int = 1,
     head_dim_split: int = 1,
 ):
-    """Compile one token-sparse 1CTA specialization (JIT key = the argument list).
+    """Compile (or load from the PrimTS disk cache) one token-sparse 1CTA specialization.
+
+    Kept in process by ``lru_cache`` on the argument list and on disk by
+    :func:`build_and_load_attention_kernel` (same cache as the dense MLA path),
+    so a new process does not recompile a specialization it has built before.
 
     ``softmax_rescale_threshold_log2`` is the compile-time skip-correction
     threshold of the 1CTA kernel (0 = exact rescale; see ``MlaConfig``).
@@ -145,8 +151,13 @@ def compile_dsa_sparse_kernel(
     import cutlass
     import cutlass.cute as cute
 
+    from ...._compile_cache import build_and_load_attention_kernel
+    from ...._hardware import get_max_active_clusters
     from .config import MlaProfile
     from .kernel import ThroughputLatencyMlaDecodeTs
+
+    with torch.cuda.device(device_index):
+        max_active_clusters = get_max_active_clusters(1)
 
     # The q64 keeps-MMA-AB schedule tiles 64 flat query rows per CTA; H=128
     # runs as two physical "query positions" of 64 heads over the same token.
@@ -177,12 +188,12 @@ def compile_dsa_sparse_kernel(
         seq_len_q=phys_sq,
         # The 1CTA profiles start at one 128-key tile; a smaller top-k still
         # runs one tile, and each token's active width comes from top_k_lens.
-        # (``dsa.py`` already rounds small top-k up so they share one entry.)
+        # (``_dsa.py`` already rounds small top-k up so they share one entry.)
         seq_len_k=max(sparse_mla_top_k, 128),
         latent_dim=LATENT_DIM,
         rope_dim=ROPE_DIM,
         page_size=1,
-        max_active_clusters=max_active_clusters_1cta(device_index),
+        max_active_clusters=max_active_clusters,
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
         qkv_dtype="e4m3",
@@ -273,8 +284,9 @@ def compile_dsa_sparse_kernel(
             cutlass.Int8, (cute.sym_int(),), stride_order=(0,), assumed_align=32
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             kernel,
             q_latent_fake,
             q_rope_fake,
@@ -294,7 +306,19 @@ def compile_dsa_sparse_kernel(
             stream_fake,
             options=_COMPILE_OPTIONS,
         )
-    return compiled
+
+    spec = _DsaCompileSpec(
+        num_heads=num_heads,
+        sparse_mla_top_k=sparse_mla_top_k,
+        softmax_rescale_threshold_log2=float(softmax_rescale_threshold_log2),
+        split_kv=split_kv,
+        head_dim_split=head_dim_split,
+        max_active_clusters=max_active_clusters,
+    )
+    with torch.cuda.device(device_index):
+        return build_and_load_attention_kernel(
+            "mla_decode", "dsa", spec, _COMPILE_OPTIONS, compile_kernel
+        )
 
 
 def dsa_split_workspace_bytes(total_q: int, num_heads: int, split_kv: int) -> int:
@@ -353,4 +377,7 @@ def launch_dsa_sparse_kernel(
             float(bmm1_scale),
             float(bmm2_scale),
             descriptors,
+            # output_quant_args: a kernel reloaded from the disk cache takes
+            # every parameter positionally, including this defaulted one.
+            None,
         )

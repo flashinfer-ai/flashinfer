@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import math
 
 import torch
 
@@ -38,7 +37,7 @@ def sparse_mla_reference(
 
     ``query`` ``[T, H, 576]`` (any float dtype; e4m3 is upcast), ``kv_rows`` fp32 ``[N, 576]``,
     ``indices`` ``[T, K]`` with ``-1`` = masked anywhere. Returns
-    ``(out bf16 [T, H, 512], lse fp32 base-2 [T, H])``; fully masked rows give 0 / -inf.
+    ``(out bf16 [T, H, 512], lse fp32 natural-log [T, H])``; fully masked rows give 0 / -inf.
     """
     T, H, _ = query.shape
     K = indices.shape[1]
@@ -60,6 +59,6 @@ def sparse_mla_reference(
         * bmm2_scale
     )
     o = torch.where(l > 0, o, torch.zeros_like(o))
-    lse = (m_safe.squeeze(-1) + torch.log(l.squeeze(-1))) / math.log(2.0)
+    lse = m_safe.squeeze(-1) + torch.log(l.squeeze(-1))
     lse = torch.where(l.squeeze(-1) > 0, lse, torch.full_like(lse, float("-inf")))
     return o.to(torch.bfloat16), lse
