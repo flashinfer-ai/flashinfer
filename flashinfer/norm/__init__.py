@@ -1305,7 +1305,7 @@ def fused_add_rmsnorm_quant(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = ((residual[i] / RMS(residual)) * weight[i]).to(fp8)``
+    ``out[i] = (((residual[i] / RMS(residual)) * weight[i]) / scale).to(fp8)``
 
     Parameters
     ----------

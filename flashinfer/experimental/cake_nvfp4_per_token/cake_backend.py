@@ -535,6 +535,53 @@ _TWO_CTA_TILE_WAVE_COST_K96 = {128: 0.575, 192: 0.82, 256: 1.0}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
+# Entry L2 prefetch of the weight tiles in the quantize + GEMM chain (``ep_stages`` programs,
+# ``_ep4`` keys): the GEMM's idle prefetch warp streams the weight operand and its block scales
+# of the CTA's first tile, for its first CHAIN_EP_STAGES K tiles, into L2 before the grid
+# dependency wait, so they load while the quantizer still runs.  Per architecture, the program
+# families (kernel key without the output dtype) and the token-count range where the chain
+# (:func:`prepare_nvfp4_per_token_chain`) takes them; the GEMM alone takes them only on the
+# cells of GEMM_ALONE_EP_RULES.
+CHAIN_EP_STAGES = 4
+CHAIN_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {
+        "m128_bF": (128, 128),
+        "m64_bF_l2256b_ro": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_o2": (1, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 32),
+        "n8_sk2_l2256b": (1, 32),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+    "sm_103a": {
+        "m128_bF": (128, 128),
+        "m64_bF_l2256b_ro": (128, 128),
+        "n16_sk3_l2256b": (17, 32),
+        "n32_aF_l2256b": (17, 32),
+        "n32_aF_l2256b_o2": (17, 17),
+        "n32_k512_aF_l2256b_s3": (17, 32),
+        "n32_sk2_aF_l2256b": (17, 17),
+        "n8_aF_l2256b": (1, 8),
+        "n8_aF_l2256b_w64": (1, 8),
+        "n8_k512_aF_l2256b_s3": (8, 8),
+        "n8_sk2_aF_l2256b": (1, 8),
+        "n8_sk3_l2256b": (17, 17),
+        "n8_sk4_l2256b": (1, 8),
+    },
+}
+# The GEMM alone (``mm_fp4``, and :func:`prepare_mm_fp4_per_token` without a tactic) takes
+# the entry L2 prefetch program on these cells too: per architecture, the program families
+# and the token-count range, each inside a CHAIN_EP_RULES cell, so the chain and the GEMM
+# alone run one program there.
+GEMM_ALONE_EP_RULES: dict[str, dict[str, tuple[int, int]]] = {
+    "sm_100a": {"m64_bF_l2256b_ro": (128, 128)},
+}
 
 
 def _two_cta_wave_time(
@@ -878,6 +925,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append(f"w{int(tactic['w_rows'])}")
     if tactic.get("ring_overlay"):
         parts.append("ro")
+    if int(tactic.get("ep_stages", 0)):
+        parts.append(f"ep{int(tactic['ep_stages'])}")
     return "gemm:" + "_".join(parts)
 
 
@@ -980,6 +1029,7 @@ KNOWN_TACTIC_KEYS = frozenset(
         "b_hint",
         "blocks_per_sm",
         "deep_k",
+        "ep_stages",
         "half_m",
         "l2_promo",
         "num_stages",
@@ -1100,6 +1150,10 @@ def _gemm_plan(
         alpha_n or two_cta or split_k > 1 or blocks_per_sm != 1
     ):
         raise ValueError("ring_overlay is a knob of the 1-CTA m orientation")
+    if int(tactic.get("ep_stages", 0)) and (two_cta or (split_k > 1 and not alpha_n)):
+        raise ValueError(
+            "ep_stages is a knob of the 1-CTA program and the swapped-orientation split-K program"
+        )
     half_m = bool(tactic.get("half_m", False))
     if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
         raise ValueError(
@@ -1574,8 +1628,9 @@ def prepare_mm_fp4_per_token(
     ``a_sf`` / ``b_sf`` their swizzled 128x4 E4M3 block scales
     (``padded_rows(M | N) x padded_sf_cols(K)`` bytes, uint8 or float8_e4m3fn),
     ``alpha [M]`` the FP32 per-token scale and ``out [M, N]`` a contiguous bf16 /
-    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`.  The JIT module is
-    built and loaded here, so prepare outside CUDA Graph capture."""
+    fp16 tensor.  ``tactic`` overrides :func:`default_tactic`; without it the GEMM runs the
+    program of :func:`gemm_alone_tactic` on the cells of :data:`GEMM_ALONE_EP_RULES`.  The
+    JIT module is built and loaded here, so prepare outside CUDA Graph capture."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():
@@ -1605,9 +1660,10 @@ def prepare_mm_fp4_per_token(
     a_flat = _flat_u8_scales(a_sf, "a_sf", pm, cols)
     b_flat = _flat_u8_scales(b_sf, "b_sf", pn, cols)
     arch = _device_arch(device)
-    plan = gemm_plan(
-        m, n, k, out.dtype == torch.float16, arch, _sm_count(device), tactic=tactic
-    )
+    out_f16 = out.dtype == torch.float16
+    plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=tactic)
+    if tactic is None and (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     kwargs = _gemm_kwargs(plan, a_fp4, a_flat, b_fp4, b_flat, alpha, out)
     with torch.cuda.device(_device_index(device)):
         launch = _bind(arch, plan.kernel_key, kwargs)
@@ -1679,6 +1735,8 @@ def _gemm_prepared(
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
     plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device))
+    if (alone := gemm_alone_tactic(plan)) is not None:
+        plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device), tactic=alone)
     with torch.cuda.device(device_index):
         entry, arg_plan = _entry(arch, plan.kernel_key)
     return plan, entry, arg_plan
@@ -1749,6 +1807,40 @@ def mm_fp4_per_token(
 # ---------------------------------------------------------------------------
 
 
+def _entry_prefetch_tactic(
+    plan: GemmPlan, rules: dict[str, dict[str, tuple[int, int]]]
+) -> Optional[dict[str, Any]]:
+    """``plan``'s tactic with the entry L2 prefetch (``ep_stages`` = :data:`CHAIN_EP_STAGES`)
+    when its program family (kernel key without the output dtype) and token count lie in a
+    cell of ``rules`` on its architecture and that program is registered, else ``None``."""
+    family = "_".join(
+        part
+        for part in plan.kernel_key.removeprefix("gemm:").split("_")
+        if part not in ("bf16", "f16")
+    )
+    cell = rules.get(plan.arch, {}).get(family)
+    if cell is None or not cell[0] <= plan.M <= cell[1]:
+        return None
+    tactic = {**plan.tactic, "ep_stages": CHAIN_EP_STAGES}
+    if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
+        return None
+    return tactic
+
+
+def gemm_alone_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The tactic the GEMM alone takes when no tactic is passed and the default-tactic plan
+    is ``plan``: the entry L2 prefetch program on the cells of :data:`GEMM_ALONE_EP_RULES`,
+    else ``None`` (the plan's own program)."""
+    return _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES)
+
+
+def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
+    """The GEMM tactic of the quantize + GEMM chain whose default-tactic GEMM plan is
+    ``plan``: the entry L2 prefetch program on the cells of :data:`CHAIN_EP_RULES`, else
+    ``None`` (the program the GEMM alone runs)."""
+    return _entry_prefetch_tactic(plan, CHAIN_EP_RULES)
+
+
 @dataclass(frozen=True)
 class NVFP4PerTokenChainRunner:
     """Quantizer followed by the GEMM: one ``launch()`` runs both generated programs
@@ -1792,11 +1884,28 @@ def prepare_nvfp4_per_token_chain(
 ) -> NVFP4PerTokenChainRunner:
     """Bind ``out = mm_fp4(quantize(x), b, ...)`` with the per-token scale (times
     ``out_scale`` when given) as the GEMM alpha; ``workspace`` holds the quantized
-    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``)."""
+    activation (:func:`allocate_nvfp4_per_token_quantize_outputs` for ``x``).  The GEMM
+    runs the program of :func:`chain_gemm_tactic` (the entry L2 prefetch of the weight
+    tiles on the cells of :data:`CHAIN_EP_RULES`), else the one ``mm_fp4`` runs."""
     quantize = prepare_nvfp4_per_token_quantize(
         x, global_scale_inv, workspace, out_scale=out_scale
     )
+    device = workspace.fp4.device
+    plan = gemm_plan(
+        int(workspace.fp4.shape[0]),
+        int(b_fp4.shape[0]),
+        2 * int(workspace.fp4.shape[1]),
+        out.dtype == torch.float16,
+        _device_arch(device),
+        _sm_count(device),
+    )
     gemm = prepare_mm_fp4_per_token(
-        workspace.fp4, workspace.sf, b_fp4, b_sf, workspace.scale, out
+        workspace.fp4,
+        workspace.sf,
+        b_fp4,
+        b_sf,
+        workspace.scale,
+        out,
+        tactic=chain_gemm_tactic(plan),
     )
     return NVFP4PerTokenChainRunner(quantize, gemm)

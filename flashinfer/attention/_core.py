@@ -426,6 +426,45 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         head_dim_vo: int = 128,
         window_left: int = -1,
     ) -> None:
+        r"""Create an attention-sink wrapper with a sink-specific JIT variant.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            Workspace buffer for split-K intermediate results.
+        kv_layout : str
+            KV-cache layout, either ``"NHD"`` or ``"HND"``.
+        use_cuda_graph : bool
+            Whether the wrapper will be used with CUDA Graph capture.
+        qo_indptr_buf : torch.Tensor, optional
+            CUDA Graph buffer for the query/output indptr array.
+        paged_kv_indptr_buf : torch.Tensor, optional
+            CUDA Graph buffer for the paged-KV indptr array.
+        paged_kv_indices_buf : torch.Tensor, optional
+            CUDA Graph buffer for the paged-KV indices array.
+        paged_kv_last_page_len_buf : torch.Tensor, optional
+            CUDA Graph buffer for last-page lengths.
+        custom_mask_buf : torch.Tensor, optional
+            CUDA Graph buffer for a packed custom mask.
+        mask_indptr_buf : torch.Tensor, optional
+            CUDA Graph buffer for the custom-mask indptr array.
+        backend : str
+            Attention backend. ``"auto"`` selects a supported backend.
+        pos_encoding_mode : str
+            Positional-encoding mode for the sink attention variant.
+        use_fp16_qk_reduction : bool
+            Whether to use FP16 QK accumulation.
+        q_data_type : torch.dtype
+            Query data type used to specialize the sink attention variant.
+        kv_data_type : torch.dtype
+            KV-cache data type used to specialize the sink attention variant.
+        head_dim_qk : int
+            Query/key head dimension.
+        head_dim_vo : int
+            Value/output head dimension.
+        window_left : int
+            Left sliding-window size. ``-1`` disables sliding-window masking.
+        """
         backend, jit_args, jit_kwargs = self._sink_jit_args(
             float_workspace_buffer.device,
             backend,

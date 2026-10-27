@@ -43,6 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
@@ -362,8 +363,23 @@ def _fp8_request_reference(
     num_insts_kv: int,
     tile_size_kv: int,
     splits_kv: int,
+    softmax_rescale_threshold_log2: float = 0.0,
+    freeze: bool = True,
 ) -> torch.Tensor:
-    """Model P448 probabilities across split-local KV instruction streams."""
+    """Model E4M3 P across split-local KV instruction streams.
+
+    A positive ``softmax_rescale_threshold_log2`` T uses the P scale
+    ``448 * 2**-T`` and freezes each stream's running max while a tile raises
+    it by at most T. ``freeze=False`` keeps that scale but re-anchors on every
+    new maximum, which lets tests tell a working freeze from an ignored
+    threshold.
+    """
+    p_scale = _FP8_PROBABILITY_SCALE * 2.0**-softmax_rescale_threshold_log2
+    raw_freeze_threshold = (
+        softmax_rescale_threshold_log2 / (bmm1_scale * math.log2(math.e))
+        if softmax_rescale_threshold_log2 > 0.0
+        else 0.0
+    )
 
     if num_insts_kv <= 0 or tile_size_kv <= 0 or splits_kv <= 0:
         raise ValueError("KV instruction, tile, and split counts must be positive")
@@ -406,9 +422,15 @@ def _fp8_request_reference(
                 if stream_valid[stream_idx]
                 else local_max
             )
+            if (
+                stream_valid[stream_idx]
+                and softmax_rescale_threshold_log2 > 0.0
+                and freeze
+            ):
+                frozen = (new_max - stream_max[stream_idx]) <= raw_freeze_threshold
+                new_max = torch.where(frozen, stream_max[stream_idx], new_max)
             probabilities = (
-                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale)
-                * _FP8_PROBABILITY_SCALE
+                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale) * p_scale
             )
             quantized_probabilities = probabilities.to(_FP8).float()
             tile_sum = probabilities.sum(dim=-1)
@@ -457,6 +479,8 @@ def _mla_reference(
     splits_kv: int = 1,
     batch_indices: Sequence[int] | None = None,
     qo_indptr: torch.Tensor | None = None,
+    softmax_rescale_threshold_log2: float = 0.0,
+    fp8_freeze: bool = True,
 ) -> torch.Tensor:
     """Return the selected policy's independent FP32 MLA output oracle."""
 
@@ -490,6 +514,8 @@ def _mla_reference(
                     num_insts_kv=num_insts_kv,
                     tile_size_kv=tile_size_kv,
                     splits_kv=splits_kv,
+                    softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+                    freeze=fp8_freeze,
                 )
             else:
                 scores = (
@@ -722,6 +748,7 @@ def _plan_case(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     wrapper = BatchMLADecodePagedTSWrapper()
     num_heads = int(
@@ -748,6 +775,9 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
+        tuning=MLAAttentionTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
     )
     return wrapper
 
@@ -892,7 +922,9 @@ def _assert_auto_policy(
             assert policy[key] == expected, (key, policy, expected_b200)
 
 
-def _assert_case_correct(output, case, policy, *, qo_indptr=None):
+def _assert_case_correct(
+    output, case, policy, *, qo_indptr=None, softmax_rescale_threshold_log2=0.0
+):
     expected_shape = (
         (case.query.shape[0], case.query.shape[1], _LATENT_DIM)
         if qo_indptr is not None
@@ -919,6 +951,7 @@ def _assert_case_correct(output, case, policy, *, qo_indptr=None):
         splits_kv=int(policy["split_kv"]),
         batch_indices=batch_indices,
         qo_indptr=qo_indptr,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     actual = (
         output.float() if qo_indptr is not None else output[list(batch_indices)].float()
@@ -1220,6 +1253,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "mask_type",
         "workspace_buffer",
         "validate",
+        "tuning",
     )
     for name in (
         "device",
@@ -1378,6 +1412,42 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
             workspace_buffer=workspace,
         )
     assert wrapper._plan_state is state
+
+
+def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():
+    """A nonzero plan-time rescale threshold gets its own trace definition."""
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    kwargs = {
+        "query": torch.empty((2, 1, 8, 576), dtype=torch.bfloat16),
+        "kv_cache": torch.empty((9, 32, 576), dtype=torch.bfloat16),
+        "block_tables": torch.empty((2, 1), dtype=torch.int32),
+        "seq_lens": torch.empty((2,), dtype=torch.int32),
+    }
+    state = dict(
+        packed_query=False,
+        mask_type="causal",
+        max_seq_len_q=1,
+        max_kv_len=64,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+    )
+    wrapper._plan_state = SimpleNamespace(**state, softmax_rescale_threshold_log2=0.0)
+    exact = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state = SimpleNamespace(**state, softmax_rescale_threshold_log2=2.5)
+    skipped = fi_trace(wrapper.run, **kwargs)
+    assert "_rescale_thr" not in exact["name"]
+    assert "_rescale_thr2p5" in skipped["name"]
+    assert "softmax_rescale_threshold_log2:2.5" in skipped["tags"]
+    wrapper._plan_state = SimpleNamespace(
+        **state, softmax_rescale_threshold_log2=2.5001
+    )
+    nearby = fi_trace(wrapper.run, **kwargs)
+    assert nearby["name"] != skipped["name"]
+    assert not any(
+        tag.startswith("softmax_rescale_threshold_log2") for tag in exact["tags"]
+    )
 
 
 def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
@@ -2996,3 +3066,257 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
         case,
         expected_b200={"kernel": expected_kernel},
     )
+
+
+@pytest.mark.parametrize(
+    ("shape", "qkv_dtype", "softmax_rescale_threshold_log2", "expected_kernel"),
+    (
+        ((8, 128, 2049), torch.bfloat16, 8.0, "throughput_2cta"),
+        ((8, 128, 2049), torch.float8_e4m3fn, 8.0, "throughput_2cta"),
+        ((2, 8, 2048), torch.bfloat16, 8.0, "throughput_latency_1cta"),
+        ((4, 16, 4097), torch.float8_e4m3fn, 8.0, "throughput_latency_1cta"),
+        ((128, 16, 4096), torch.float8_e4m3fn, 8.0, "throughput_latency_1cta"),
+    ),
+    ids=(
+        "2cta-bf16-t8",
+        "2cta-fp8-t8",
+        "1cta-bf16-t8",
+        "1cta-fp8-t8",
+        "1cta-fp8-t8-unsplit",
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_softmax_rescale_threshold(
+    shape: tuple[int, int, int],
+    qkv_dtype: torch.dtype,
+    softmax_rescale_threshold_log2: float,
+    expected_kernel: str,
+) -> None:
+    """A rescale threshold matches the protocol oracle on the 1CTA and 2CTA kernels.
+
+    BF16 P is unscaled, so the exact softmax oracle applies; E4M3 P uses the
+    scale ``448 * 2**-T``, which the FP8 oracle models per KV stream.
+    """
+
+    batch_size, num_qo_heads, max_seq_len = shape
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=36000
+        + int(softmax_rescale_threshold_log2)
+        + (1 if qkv_dtype == _FP8 else 0)
+        + 7 * batch_size,
+    )
+    wrapper = _plan_case(
+        case, softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+    )
+    policy = _policy_dict(wrapper)
+    expected_policy: dict[str, object] = {"kernel": expected_kernel}
+    if shape == (128, 16, 4096):
+        # The unsplit case is what makes the freeze check mandatory on 1CTA.
+        expected_policy["split_kv"] = 1
+    _assert_auto_policy(policy, expected_policy, device=case.query.device)
+    assert wrapper._plan_state is not None
+    assert (
+        wrapper._plan_state.softmax_rescale_threshold_log2
+        == softmax_rescale_threshold_log2
+    )
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(
+        output,
+        case,
+        policy,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+    )
+
+    # The exact-rescale plan on identical inputs agrees to output rounding.
+    baseline = _run_case(_plan_case(case), case)
+    rtol, atol = _mla_tolerances(qkv_dtype)
+    torch.testing.assert_close(output.float(), baseline.float(), rtol=rtol, atol=atol)
+    if qkv_dtype == _FP8:
+        # Positive control: the threshold kernel quantizes P at 448 * 2**-T, so
+        # reusing the T = 0 kernel by mistake would match the baseline bitwise.
+        assert not torch.equal(output, baseline)
+        # The freeze itself: with P quantized against the held anchor, the
+        # output sits closer to the freezing oracle than to one that keeps the
+        # same scale but re-anchors on every new maximum.
+        checked = tuple(range(batch_size)) if batch_size <= 8 else (0, batch_size - 1)
+        oracle_args = dict(
+            num_insts_kv=int(policy["num_insts_kv"]),
+            tile_size_kv=int(policy["tile_size_kv"]),
+            splits_kv=int(policy["split_kv"]),
+            batch_indices=checked,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        )
+        frozen = _mla_reference(case, **oracle_args)
+        reanchored = _mla_reference(case, fp8_freeze=False, **oracle_args)
+        # Heavy split-KV can leave one tile per KV stream, where nothing can
+        # freeze. The 2CTA case and unsplit plans keep multi-tile streams and
+        # must discriminate.
+        if expected_kernel == "throughput_2cta" or int(policy["split_kv"]) == 1:
+            assert not torch.equal(frozen, reanchored)
+        if not torch.equal(frozen, reanchored):
+            actual = output[list(checked)].float()
+            assert torch.linalg.vector_norm(
+                actual - frozen
+            ) < 0.5 * torch.linalg.vector_norm(actual - reanchored)
+
+    one_shot = batch_mla_decode_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        mask_type=case.mask_type,
+        tuning=MLAAttentionTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
+    )
+    torch.testing.assert_close(one_shot, output, rtol=0, atol=0)
+
+
+def _spike_late_keys(case: _MLACase, factor: float) -> _MLACase:
+    """Scale the RoPE part of one key in each of two consecutive late K tiles.
+
+    Only the RoPE channels change, so the logits jump while V (the latent
+    channels) and the output magnitude stay as generated.
+    """
+
+    kv_cache = case.kv_cache.clone()
+    pages = kv_cache.view(kv_cache.shape[0], case.page_size, kv_cache.shape[-1])
+    for batch_idx, seq_len in enumerate(case.seq_lens.tolist()):
+        for token in (seq_len - 2, seq_len - 2 - 128):
+            page = int(case.block_tables[batch_idx, token // case.page_size])
+            rope = pages[page, token % case.page_size, _LATENT_DIM:]
+            pages[page, token % case.page_size, _LATENT_DIM:] = (
+                rope.float() * factor
+            ).to(rope.dtype)
+    return replace(case, kv_cache=kv_cache)
+
+
+def _max_tile_increase_log2(case: _MLACase) -> float:
+    """Return the largest per-tile row-max increase (log2 units) in the case."""
+
+    pages = case.kv_cache.view(
+        case.kv_cache.shape[0], case.page_size, case.kv_cache.shape[-1]
+    )
+    largest = 0.0
+    for batch_idx, seq_len in enumerate(case.seq_lens.tolist()):
+        page_ids = case.block_tables[batch_idx, : -(-seq_len // case.page_size)]
+        keys = pages[page_ids.long()].reshape(-1, pages.shape[-1])[:seq_len].float()
+        logits = case.query[batch_idx, 0].float() @ keys.T * case.bmm1_scale
+        tile_max = torch.stack(
+            [tile.amax(dim=-1) for tile in logits.split(128, dim=-1)], dim=-1
+        )
+        running = torch.cummax(tile_max, dim=-1).values
+        increase = (tile_max[:, 1:] - running[:, :-1]) * math.log2(math.e)
+        largest = max(largest, float(increase.max()))
+    return largest
+
+
+@pytest.mark.parametrize(
+    ("shape", "qkv_dtype", "softmax_rescale_threshold_log2", "expected_policy"),
+    (
+        (
+            (64, 128, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_2cta", "split_kv": 1},
+        ),
+        (
+            (64, 128, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_2cta", "split_kv": 1},
+        ),
+        (
+            (128, 16, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_latency_1cta", "split_kv": 1},
+        ),
+        (
+            (128, 16, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_latency_1cta"},
+        ),
+        # A 64-row Q tile is only legal for keeps-MMA-AB 1CTA profiles, which
+        # keep the anchor and row sum in a separate scratch path.
+        (
+            (16, 64, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_latency_1cta", "tile_size_q": 64},
+        ),
+        (
+            (16, 64, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_latency_1cta", "tile_size_q": 64},
+        ),
+    ),
+    ids=(
+        "2cta-bf16-t0.5",
+        "2cta-fp8-t1",
+        "1cta-bf16-t0.5",
+        "1cta-fp8-t1",
+        "1cta-keeps-ab-bf16-t0.5",
+        "1cta-keeps-ab-fp8-t1",
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_softmax_rescale_threshold_reanchors_when_max_jumps(
+    shape: tuple[int, int, int],
+    qkv_dtype: torch.dtype,
+    softmax_rescale_threshold_log2: float,
+    expected_policy: dict[str, object],
+) -> None:
+    """A late tile raising the max by more than T re-anchors and rescales O.
+
+    Random inputs almost never raise a row max by more than T after the first
+    tiles, so the other threshold test only takes the frozen-anchor path. This
+    test forces the correction path (new anchor, O and the row sum rescaled)
+    after earlier tiles froze, and compares against the exact T=0 kernel.
+
+    Spiked RoPE keys in two consecutive late K tiles (so both FP8 2CTA softmax
+    groups) raise row maxima by more than the small threshold after earlier
+    tiles froze the anchor. The 2CTA and swap cases run unsplit, so every spike
+    lands behind frozen tiles.
+    """
+
+    batch_size, num_qo_heads, max_seq_len = shape
+    case = _spike_late_keys(
+        _make_mla_case(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=max_seq_len,
+            qkv_dtype=qkv_dtype,
+            device="cuda",
+            seed=36500 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+        ),
+        factor=40.0,
+    )
+    assert _max_tile_increase_log2(case) > softmax_rescale_threshold_log2
+
+    wrapper = _plan_case(
+        case, softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(policy, expected_policy, device=case.query.device)
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(
+        output,
+        case,
+        policy,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+    )
+    baseline = _run_case(_plan_case(case), case)
+    rtol, atol = _mla_tolerances(qkv_dtype)
+    torch.testing.assert_close(output.float(), baseline.float(), rtol=rtol, atol=atol)

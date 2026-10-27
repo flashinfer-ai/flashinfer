@@ -3,9 +3,10 @@
 """GPU tests of the Cake gated residual RMSNorm (``flashinfer.cake_muse_spark_norm_backend``) behind
 ``gated_residual_rmsnorm(..., backend="cake")``: every routed program against the reference on both sides of its
 window edges in both modes and both launch forms (a PDL route's windows name a PDL build, the plain build launched
-without the attribute, or no program: the CuTe DSL kernel under PDL), the Cake result against the CuTe DSL kernel's,
-the output aliasing the residual, the empty batch, CUDA graph replay, the fall-back at a gap of the windows and the
-input checks."""
+without the attribute, or no program: the CuTe DSL kernel under PDL; a plain route's windows may leave a row count
+to the CuTe DSL kernel too where the kernel lane measured it ahead, as the sm_107a routes do), the Cake result
+against the CuTe DSL kernel's, the output aliasing the residual, the empty batch, CUDA graph replay, the fall-back
+at a gap of the windows and the input checks."""
 
 import pytest
 import torch
@@ -120,6 +121,10 @@ def _edge_rows(route: str) -> list[int]:
     for name in loader.route_modules(_arch(), route):
         for above, at_most in _windows(name, route):
             rows.add(int(above) + 1)
+            if int(above) > 0:
+                rows.add(
+                    int(above)
+                )  # the last row below the window: the top of a gap, if there is one
             if at_most is not None:
                 rows.update((int(at_most), int(at_most) + 1))
     return sorted(rows)
@@ -174,8 +179,16 @@ def test_every_window_matches_the_reference(form):
                 backend="cake",
             )
             if not _admits(weight_before_norm, enable_pdl, rows):
-                # a gap of the PDL route: the package refuses the call and ``auto`` runs the CuTe DSL kernel
-                assert enable_pdl
+                # a declared gap of the route (a PDL route's, or on this device the plain route's where the kernel
+                # lane left the row count to the CuTe DSL kernel): the package refuses the call and ``auto`` runs
+                # that kernel.  A plain route's gap is a gap of its PDL route too (the PDL route borrows the plain
+                # programs where it has none of its own).
+                assert enable_pdl or not _admits(weight_before_norm, True, rows), (
+                    route,
+                    rows,
+                )
+                with pytest.raises(NotImplementedError, match=f"admits {rows} rows"):
+                    loader.selected_module(_arch(), route, rows)
                 with pytest.raises(ValueError, match=f"admits {rows} rows"):
                     _call(inputs, weight_before_norm, enable_pdl, backend="cake")
                 if _cute_available(inputs):
@@ -206,7 +219,7 @@ def test_matches_the_cute_kernel(form):
     compared = 0
     for rows in (1, 17, 128, 1024, 2437):
         if not _admits(weight_before_norm, enable_pdl, rows):
-            continue  # a gap of the PDL route: no Cake program to compare
+            continue  # a declared gap of the route: no Cake program to compare
         inputs = _inputs(rows, seed=2000 + rows)
         cake = _call(inputs, weight_before_norm, enable_pdl, backend="cake")
         cute = _call(inputs, weight_before_norm, enable_pdl, backend="cute")

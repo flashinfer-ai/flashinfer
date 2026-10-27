@@ -101,6 +101,7 @@ from .cake_jit import (
 )
 from .cake_policy import (
     MERGE_KEY,
+    SAMPLE_SHIFT_PERMILLE_BOUNDS,
     DispatchPolicy,
     ProgramChoice,
     finalize_grid,
@@ -562,7 +563,11 @@ def plan_dsa_indexer_topk(
     if sample_tiles_max is not None:
         _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
     if sample_shift_permille is not None:
-        _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
+        _check_int(
+            "sample_shift_permille",
+            sample_shift_permille,
+            *SAMPLE_SHIFT_PERMILLE_BOUNDS,
+        )
     if far_sample is not None:
         _check_int("far_sample", far_sample, 0, 1)
     if check_period is not None:
@@ -815,10 +820,12 @@ def prepare_dsa_indexer_topk(
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
     threshold; ``0`` disables sampling and sizes the candidate buffers by the
-    record's unsampled capacity values), ``far_sample`` (``1``: the sampled first
-    threshold of the ascending-tile-order scan programs ranks the far sample
-    tiles only, leaving out the sample tile nearest the diagonal; ``0``: every
-    sample tile; the descending-order and wide programs ignore it) and
+    record's unsampled capacity values; the shift defaults to the record's
+    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
+    one), ``far_sample`` (``1``: the sampled first threshold of the
+    ascending-tile-order scan programs ranks the far sample tiles only,
+    leaving out the sample tile nearest the diagonal; ``0``: every sample
+    tile; the descending-order and wide programs ignore it) and
     ``finalize_threads`` (an admissible registered finalize program) change
     only the internal partition and scheduling of the work: results are
     bitwise identical for every admissible value.  ``T == 0`` returns a runner

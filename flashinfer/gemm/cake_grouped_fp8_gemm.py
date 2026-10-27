@@ -199,7 +199,10 @@ def _route(
     unless the single-CTA route shortens the launch's critical path, counted
     from ``tile_starts`` and ``sm_count`` (:func:`_max_load`).  ``sm_count``
     also lets K=384 problems of at most ``K384_KG1_MAX_TILES`` 128x128 tiles
-    run the K-loop route instead of the static-K route.  K=512 problems of at
+    run the K-loop route instead of the static-K route, and K=128 problems of
+    at most ``sm_count`` 128x128 tiles (one wave) run the K-loop K-group 1
+    route, whose accumulator starts from -0.0 at K=128 so that its output
+    has the bits of the static-K route's.  K=512 problems of at
     least ``K512_C2_MIN_TILES`` 128x128 tiles keep the K-multiple-of-512 route
     except at N=256 or M=4096.
     """
@@ -219,6 +222,8 @@ def _route(
         }:
             return _CG2_ALIGNED_ROUTE[(n, k)]
     if k == 128:
+        if sm_count is not None and math.ceil(m / 128) * math.ceil(n / 128) <= sm_count:
+            return DEEPK_C2_KG1_ROUTE
         return K128_ROUTE
     if k == 384:
         if (
@@ -383,6 +388,7 @@ BS_SWAP_CARRY_ROUTE = "bs_ue8m0_swap_carry"
 BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
 BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
 BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
+BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
 BS_SWAP_ROUTES = frozenset(
     {
         BS_SWAP_ROUTE,
@@ -390,12 +396,27 @@ BS_SWAP_ROUTES = frozenset(
         BS_SWAP_CARRY_ROUTE,
         BS_SWAP_S16_ROUTE,
         BS_SWAP_CARRY_S16_ROUTE,
+        BS_SWAP_RP32_ROUTE,
     }
 )
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
 # sm_100a swaps a long-K problem of at least 100 rows per group when the
 # non-swapped BLOCK_N 128 grid has at most this many tiles (half of 148 SMs).
 BS_SWAP_SM100_MAX_TILES = 74
+# The 32-row-block swap-AB program (each 32-row M block holds one group's
+# rows) serves the 32- and 64-row-aligned layouts of at most 1536 rows on
+# these architectures, in place of BS_SWAP_RUN32_ROUTE, while its launch
+# balances better than the run32 program's: it spreads 32-row blocks over
+# every SM but streams a group's weight tile once per block, so it pays only
+# while a run32 launch would leave SMs idle.  Per architecture
+# ``(rows, factor)`` bounds the tiles, ``factor * ceil(m / rows) * (n / 256)
+# <= sm_count``: sm_100a at most one 32 x 256 tile per SM, sm_103a at most a
+# third of ``sm_count`` 128 x 256 run32 tiles (a run32 launch on at most two
+# thirds of the SMs).  Without ``sm_count`` both keep BS_SWAP_RUN32_ROUTE.
+BS_SWAP_RP32_TILE_BOUND = {"sm_100a": (BS_SUB_ROWS, 1), "sm_103a": (BS_BLOCK_M, 3)}
+BS_SWAP_RP32_ARCHS = frozenset(BS_SWAP_RP32_TILE_BOUND)
+BS_SWAP_RP32_MAX_ALIGNMENT = 64
+BS_SWAP_RP32_MAX_ROWS = 1536
 
 
 def bs_swap_route_for_shape(
@@ -406,6 +427,7 @@ def bs_swap_route_for_shape(
     alignment: int,
     num_groups: int | None,
     arch: str,
+    sm_count: int | None = None,
 ) -> str | None:
     """Select the swap-AB route for packed UE8M0 scales, or ``None`` for :func:`bs_route_for_shape`.
 
@@ -416,7 +438,13 @@ def bs_swap_route_for_shape(
     - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
       tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
-      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``.
+      multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
+      ``BS_SWAP_RP32_ARCHS``, an alignment of at most
+      ``BS_SWAP_RP32_MAX_ALIGNMENT`` with ``m`` at most
+      ``BS_SWAP_RP32_MAX_ROWS`` takes ``BS_SWAP_RP32_ROUTE`` instead when its
+      tiles meet the architecture's ``BS_SWAP_RP32_TILE_BOUND``
+      (``factor * ceil(m / rows) * n / 256 <= sm_count``); with ``sm_count``
+      ``None`` it keeps ``BS_SWAP_RUN32_ROUTE``.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
       rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
@@ -436,6 +464,15 @@ def bs_swap_route_for_shape(
         return None
     single_run = alignment % BS_BLOCK_M == 0
     if not single_run:
+        if (
+            arch in BS_SWAP_RP32_ARCHS
+            and alignment <= BS_SWAP_RP32_MAX_ALIGNMENT
+            and m <= BS_SWAP_RP32_MAX_ROWS
+            and sm_count is not None
+        ):
+            block_rows, factor = BS_SWAP_RP32_TILE_BOUND[arch]
+            if factor * math.ceil(m / block_rows) * (n // 256) <= sm_count:
+                return BS_SWAP_RP32_ROUTE
         return BS_SWAP_RUN32_ROUTE
     if not num_groups or num_groups <= 0:
         return None
@@ -583,7 +620,13 @@ def _launch_plan(
         if arch is not None:
             route = (
                 bs_swap_route_for_shape(
-                    m, n, k, alignment=alignment, num_groups=num_groups, arch=arch
+                    m,
+                    n,
+                    k,
+                    alignment=alignment,
+                    num_groups=num_groups,
+                    arch=arch,
+                    sm_count=sm_count,
                 )
                 or route
             )

@@ -862,6 +862,20 @@ class TmemSResource(MlaResource):
                     if increase_log2 <= limit:
                         new_max_vals[scale_idx] = old_anchor
                 self.new_max_state[scale_idx] = new_max_vals[scale_idx]
+            elif cutlass.const_expr(cfg.softmax_rescale_threshold_log2 > 0.0):
+                # Threshold skip correction: keep the previous row max while
+                # this K tile raises it by at most the compile-time threshold
+                # (log2 units, like the sparse bound above). P grows by at most
+                # 2**threshold and the unchanged max lets correction skip the
+                # O rescale. The first tile always adopts the new max.
+                old_anchor = old_max_vals[scale_idx]
+                if old_anchor != neg_max_f32():
+                    increase_log2 = (
+                        new_max_vals[scale_idx] - old_anchor
+                    ) * self.scale_softmax_log2
+                    if increase_log2 <= Float32(cfg.softmax_rescale_threshold_log2):
+                        new_max_vals[scale_idx] = old_anchor
+                self.new_max_state[scale_idx] = new_max_vals[scale_idx]
             old_max_arr[scale_idx] = old_max_vals[scale_idx]
             sum_arr[scale_idx] = sum_vals[scale_idx]
             new_max_arr[scale_idx] = new_max_vals[scale_idx]

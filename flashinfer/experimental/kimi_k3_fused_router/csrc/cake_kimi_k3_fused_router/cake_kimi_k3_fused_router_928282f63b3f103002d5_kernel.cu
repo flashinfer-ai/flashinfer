@@ -953,15 +953,9 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
             } else {
                 asm volatile("cp.async.wait_group 0;");
             }
-#if __CUDA_ARCH__ == 1030
             int own_stage_bytes = stream_stage * STAGE_BYTES;
             unsigned int own_ids[16];
-#else
-            __syncthreads();
-            int stage_base = stream_stage * STAGE_PAIRS;
-#endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1030
             for (int own_copy = 0; own_copy < COPIES_PER_THREAD; own_copy++) {
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&own_ids[own_copy * 4])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 3]))
@@ -980,38 +974,9 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
                         if (copy_slot >= 0 && copy_slot < CLUSTER_EXPERTS) {
                             hit_mask |= (unsigned int)1 << (unsigned int)(own_copy_1 * 4 + copy_lane);
                         }
-#else
-            for (int store_slot = 0; store_slot < GATHER_LOADS; store_slot++) {
-                int stage_slot = store_slot * THREADS + tid;
-                int store_pair = gather_base + stage_slot;
-                if (store_pair < slice_end) {
-                    int store_id = stream_ring[stage_base + stage_slot];
-                    atomicAdd(&plan_counts[store_id], 1);
-                    int cluster_slot = store_id - cluster_expert_base;
-                    if (cluster_slot >= 0 && cluster_slot < CLUSTER_EXPERTS) {
-                        int hit_peer = cluster_slot / NUM_WARPS;
-                        int own_slot = cluster_slot - hit_peer * NUM_WARPS;
-                        int store_token = store_pair >> 4;
-                        int store_route = store_pair & 15;
-                        uint32_t peer_bitmap;
-                        asm volatile(
-                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(peer_bitmap) : "r"(own_bitmap_addr), "r"(hit_peer));
-                        asm volatile(
-                            "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                            :: "r"(peer_bitmap + (unsigned int)((own_slot * BITMAP_STRIDE + (store_token >> 5)) * 4)), "r"((unsigned int)1 << (unsigned int)(store_token & 31)) : "memory");
-                        uint32_t peer_routes;
-                        asm volatile(
-                            "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(peer_routes) : "r"(own_routes_addr), "r"(hit_peer));
-                        asm volatile(
-                            "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                            :: "r"(peer_routes + (unsigned int)((own_slot * ROUTE_STRIDE + (store_token >> 3)) * 4)), "r"((unsigned int)store_route << (unsigned int)((store_token & 7) * 4)) : "memory");
-#endif
                     }
                 }
             }
-#if __CUDA_ARCH__ == 1030
             int hit_count = (int)(unsigned int)__popc(hit_mask);
             #pragma unroll 1
             for (int hit = 0; hit < hit_count; hit++) {
@@ -1041,9 +1006,6 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
                     :: "r"(hit_routes + (unsigned int)((hit_own_slot * ROUTE_STRIDE + (hit_token >> 3)) * 4)), "r"((unsigned int)hit_route << (unsigned int)((hit_token & 7) * 4)) : "memory");
                 hit_mask = hit_mask & hit_mask - (unsigned int)1;
             }
-#else
-            __syncthreads();
-#endif
             stream_stage = 1 - stream_stage;
         }
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
@@ -1051,25 +1013,15 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
         unsigned int peer_counts_base[4];
         #pragma unroll
         for (int count_peer_map = 0; count_peer_map < CLUSTER; count_peer_map++) {
-#if __CUDA_ARCH__ == 1030
             uint32_t _cluster_mapa_7;
-#else
-            uint32_t _cluster_mapa_6;
-#endif
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-#if __CUDA_ARCH__ == 1030
                 : "=r"(_cluster_mapa_7) : "r"(plan_counts_addr), "r"(count_peer_map));
             peer_counts_base[count_peer_map] = _cluster_mapa_7;
-#else
-                : "=r"(_cluster_mapa_6) : "r"(plan_counts_addr), "r"(count_peer_map));
-            peer_counts_base[count_peer_map] = _cluster_mapa_6;
-#endif
         }
         int expert_vec_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
         unsigned int peer_count_words[16];
         #pragma unroll
-#if __CUDA_ARCH__ == 1030
         for (int zero_word = 0; zero_word < 16; zero_word++) {
             peer_count_words[zero_word] = (unsigned int)0;
         }
@@ -1080,12 +1032,6 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
                     : "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[count_peer_vec * ITEMS_PER_THREAD])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 3]))
                     : "r"(peer_counts_base[count_peer_vec] + (unsigned int)(expert_vec_base * 4)));
             }
-#else
-        for (int count_peer_vec = 0; count_peer_vec < CLUSTER; count_peer_vec++) {
-            asm volatile("ld.shared::cluster.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[count_peer_vec * ITEMS_PER_THREAD])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&peer_count_words[(count_peer_vec * ITEMS_PER_THREAD) + 3]))
-                : "r"(peer_counts_base[count_peer_vec] + (unsigned int)(expert_vec_base * 4)));
-#endif
         }
         int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
         int lane_prefixes[4];
@@ -1128,10 +1074,7 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
             phase2_warp_sums[warp] = warp_inclusive;
         }
         __syncthreads();
-#if __CUDA_ARCH__ == 1030
         asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-#else
-#endif
         int phase2_warp_prefix_lane0 = 0;
         if (lane == 0) {
             #pragma unroll
@@ -1149,25 +1092,15 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
             int offset_store = lane_prefix + lane_prefixes[expert_slot_store];
             plan_offsets[expert_store] = offset_store;
         }
-#if __CUDA_ARCH__ == 1030
         if (bid == OWNER_CTAS - CLUSTER) {
-#else
-        if (bid == 0) {
-#endif
             if (tid == THREADS - 1) {
                 int padded_total = phase2_warp_prefix + warp_inclusive;
                 expert_offsets[NUM_EXPERTS] = padded_total;
                 num_tokens_post_padded[0] = padded_total;
             }
         }
-#if __CUDA_ARCH__ == 1030
         __syncthreads();
         if (bid >= OWNER_CTAS - CLUSTER) {
-#else
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        if (bid < CLUSTER) {
-#endif
             int slice_global = cta_rank * SLICE_EXPERTS + tid;
             int slice_count = plan_totals[slice_global];
             expert_counts[slice_global] = slice_count;
@@ -1188,15 +1121,12 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
                 unsigned int pass_bits = 0;
                 if (pass_word < bitmap_words) {
                     pass_bits = own_bitmap[own_bitmap_base + pass_word];
-#if __CUDA_ARCH__ == 1030
                 }
                 unsigned int pass_routes[4];
                 if (pass_word < bitmap_words) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 3]))
                         : "r"(own_routes_addr + (unsigned int)((own_route_base + pass_word * 4) * 4)));
-#else
-#endif
                 }
                 int pass_count = (int)(unsigned int)__popc(pass_bits);
                 int pass_inclusive = pass_count;
@@ -1223,30 +1153,16 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
                 int lane_rank = own_base + emitted + pass_inclusive - pass_count;
                 #pragma unroll 1
                 for (int emit_bit = 0; emit_bit < pass_count; emit_bit++) {
-#if __CUDA_ARCH__ == 1030
                     int _find_first_set_8 = __ffs(pass_bits);
                     int emit_offset = _find_first_set_8 - 1;
-#else
-                    int _find_first_set_7 = __ffs(pass_bits);
-                    int emit_offset = _find_first_set_7 - 1;
-#endif
                     int emit_token = (pass_word << 5) + emit_offset;
-#if __CUDA_ARCH__ == 1030
                     unsigned int route_word = (((emit_offset & 16) != 0) ? (((emit_offset & 8) != 0) ? pass_routes[3] : pass_routes[2]) : (((emit_offset & 8) != 0) ? pass_routes[1] : pass_routes[0]));
-#else
-                    unsigned int route_word = own_routes[own_route_base + (emit_token >> 3)];
-#endif
                     unsigned int emit_route = route_word >> (unsigned int)((emit_token & 7) * 4) & (unsigned int)15;
                     sorted_token_ids[lane_rank + emit_bit] = emit_token * TOP_K + (int)emit_route;
                     pass_bits = pass_bits & pass_bits - (unsigned int)1;
                 }
-#if __CUDA_ARCH__ == 1030
                 int _shfl_sync_9 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
                 emitted += _shfl_sync_9;
-#else
-                int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
-                emitted += _shfl_sync_8;
-#endif
             }
         }
         #pragma unroll 1
@@ -1257,10 +1173,7 @@ kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits
         for (int block_slot = lane; block_slot < own_padded >> BLOCK_SHIFT; block_slot += 32) {
             expert_ids[(own_base >> BLOCK_SHIFT) + block_slot] = own_expert;
         }
-#if __CUDA_ARCH__ == 1030
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-#else
-#endif
     }
 }
 
