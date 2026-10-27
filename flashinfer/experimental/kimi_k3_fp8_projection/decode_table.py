@@ -41,7 +41,8 @@ limitations under the License.
 # cells of at most N rows; ``_cv100`` the quantization launch with a preferred
 # shared-memory carveout of 100 percent, which the decode launch starting beside
 # it under PDL uses; ``_csrt`` a 4-way cluster split-K decode program's closing
-# cluster barrier arriving relaxed after a tcgen05 fence), measured faster on that
+# cluster barrier arriving relaxed after a tcgen05 fence; ``_gsb`` the gs-branch
+# form of a 128-K grid-stride GEMM program), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
@@ -1516,6 +1517,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "56,48,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "96,1,2048": {
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_gsb",
         },
         "96,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
