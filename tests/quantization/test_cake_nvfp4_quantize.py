@@ -310,7 +310,10 @@ def test_quantizer_alone_cluster_split_rows():
                         (c for lo, hi, c in table.get(k, ()) if lo <= m <= hi), None
                     )
                     if want is None:
-                        assert alone == chain, (arch, k, m, fold)
+                        if not cb.quant_alone_pad_chunked(
+                            m, k, True, chain.k_static, arch, sm_count
+                        ):
+                            assert alone == chain, (arch, k, m, fold)
                         continue
                     served.add((k, m))
                     assert alone.cluster_split == want, (arch, k, m, fold)
@@ -800,6 +803,82 @@ def test_quantize_matches_reference_and_cute_dsl(m, k, dtype, fold):
         assert torch.equal(p_fp4, fp4)
         assert torch.equal(p_sf.reshape(-1), sf.reshape(-1))
         assert torch.equal(p_scale, scale)
+
+
+def test_quantizer_alone_pad_chunked_rows():
+    """The quantizer alone takes the one-CTA-per-row instance with the chunked padding of
+    the scale tile (``_pc``: launch bounds 1, grid M plus the padding-chunk CTAs) on the
+    cells of QUANT_ALONE_PAD_CHUNKED at the measured SM count of each architecture, with a
+    generated program; the other SM count, fp16 activations and the chain keep the chain's
+    plan."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, table in cb.QUANT_ALONE_PAD_CHUNKED.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for k, ranges in table.items():
+            for lo, hi in ranges:
+                assert cb.ROW_TILE < lo <= hi <= cb.SINGLE_WAVE_MAX_ROWS, (
+                    arch,
+                    k,
+                    lo,
+                    hi,
+                )
+                for m in range(lo, hi + 1):
+                    for fold in (False, True):
+                        chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
+                        alone = _registered(
+                            cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True),
+                            arch,
+                        )
+                        assert alone.pad_chunked and alone.cluster_split == 1
+                        assert alone.min_blocks == 1 and alone.threads == chain.threads
+                        assert alone.kernel_key == (
+                            chain.kernel_key.replace(f"_mb{chain.min_blocks}_", "_mb1_")
+                            + "_pc"
+                        ), (alone.kernel_key, chain.kernel_key)
+                        pad = -(-8 * alone.padded_cols // cb.CLUSTER_SPLIT_PAD_CHUNKS)
+                        assert alone.grid == m + (pad if m % cb.ROW_TILE else 0)
+                        assert cb.quant_plan(
+                            m, k, True, fold, arch, other[arch], alone=True
+                        ) == cb.quant_plan(m, k, True, fold, arch, other[arch])
+                        assert cb.quant_plan(
+                            m, k, False, fold, arch, sm_count, alone=True
+                        ) == cb.quant_plan(m, k, False, fold, arch, sm_count)
+
+
+_ALONE_PAD_CHUNKED_CASES = sorted(
+    {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_PAD_CHUNKED.values()
+        for k, ranges in table.items()
+        for lo, hi in ranges
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _ALONE_PAD_CHUNKED_CASES)
+def test_quantizer_alone_pad_chunked_matches_the_chain_quantizer(k, m, fold):
+    """The chunked padding of the public quantizer writes the same codes, block scales
+    (padding included) and per-token scales as the quantize + GEMM chain's quantizer, bit
+    for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(4000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
 
 
 # The quantizer alone's cluster-split cells (QUANT_ALONE_CLUSTER_SPLIT) of every architecture,

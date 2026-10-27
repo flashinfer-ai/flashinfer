@@ -283,6 +283,21 @@ QUANT_ALONE_CLUSTER_SPLIT: dict[str, dict[int, tuple[tuple[int, int, int], ...]]
 }
 # 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
 CLUSTER_SPLIT_PAD_CHUNKS = 1024
+# The quantizer alone (the quantize + GEMM chain keeps one CTA per padded row): per
+# architecture and row width, the token-count ranges ``(low, high)`` (within ROW_TILE <
+# M <= SINGLE_WAVE_MAX_ROWS) whose bf16 rows take the one-CTA-per-row instance at launch
+# bounds 1 that zeroes the last scale tile's padding rows the way the padding clusters do
+# (``_pc``: CLUSTER_SPLIT_PAD_CHUNKS 16-byte chunks per CTA), so the grid is M plus a few
+# CTAs instead of one CTA per padded row.  At the SM counts of :data:`MEASURED_SM_COUNT`.
+QUANT_ALONE_PAD_CHUNKED: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {
+        18432: ((130, 130),),
+    },
+    "sm_103a": {
+        16384: ((130, 130),),
+        18432: ((130, 130),),
+    },
+}
 
 
 def blocks_per_thread_for(k: int, threads: int) -> int:
@@ -319,12 +334,13 @@ def quant_kernel_key(
     store_hint: str = STORE_HINT_DEFAULT,
     k_static: Optional[int] = None,
     cluster_split: int = 1,
+    pad_chunked: bool = False,
 ) -> str:
     """Logical kernel key of one quantizer instance: CTA width, register capacity (blocks per
     thread), launch-bounds occupancy, input dtype, folded scale, the large-row store policy
-    (``_sl``), the cluster row split (``_cs<C>``) and, for the small-row tier, the compiled-in
-    row width (``_k<K>``).  ``K`` and the row stride are otherwise kernel arguments, not part
-    of the key."""
+    (``_sl``), the cluster row split (``_cs<C>``), for the small-row tier the compiled-in
+    row width (``_k<K>``) and the chunked padding of the scale tile (``_pc``).  ``K`` and
+    the row stride are otherwise kernel arguments, not part of the key."""
     dtype = "bf16" if is_bf16 else "f16"
     return (
         f"quant:t{threads}_b{blocks_per_thread}_mb{min_blocks}_{dtype}"
@@ -332,6 +348,7 @@ def quant_kernel_key(
         + ("_sl" if store_hint == STORE_HINT_LARGE_ROW else "")
         + (f"_cs{cluster_split}" if cluster_split > 1 else "")
         + (f"_k{k_static}" if k_static is not None else "")
+        + ("_pc" if pad_chunked else "")
     )
 
 
@@ -359,6 +376,7 @@ class QuantizePlan:
     padded_cols: int
     kernel_key: str
     cluster_split: int = 1  # CTAs per token row (one cluster of that many CTAs)
+    pad_chunked: bool = False  # padding rows zeroed by chunk CTAs past the M row CTAs
     # The key the planner selected when ``arch`` does not register it and the plan runs
     # the nearest registered program instead (None: the plan runs its own program).
     unregistered_key: Optional[str] = None
@@ -403,6 +421,24 @@ def quant_alone_cluster_split(
             if low <= int(m) <= high:
                 return split
     return quant_cluster_split(m, k, is_bf16, fold, arch)
+
+
+def quant_alone_pad_chunked(
+    m: int, k: int, is_bf16: bool, k_static: Optional[int], arch: str, sm_count: int
+) -> bool:
+    """True when the quantizer alone runs ``(M, K)`` on ``arch`` as the one-CTA-per-row
+    instance with the chunked padding of the scale tile: bf16 rows of runtime geometry,
+    ``M`` in a range :data:`QUANT_ALONE_PAD_CHUNKED` gives ``K`` on ``arch``, at its
+    measured SM count."""
+    return (
+        is_bf16
+        and k_static is None
+        and MEASURED_SM_COUNT.get(arch) == int(sm_count)
+        and any(
+            low <= int(m) <= high
+            for low, high in QUANT_ALONE_PAD_CHUNKED.get(arch, {}).get(int(k), ())
+        )
+    )
 
 
 def quant_plan(
@@ -457,6 +493,16 @@ def quant_plan(
             -(-8 * cols // (CLUSTER_SPLIT_PAD_CHUNKS * split)) if m % ROW_TILE else 0
         )
         grid = (m + pad_clusters) * split
+    pad_chunked = (
+        alone
+        and split == 1
+        and threads == 512
+        and quant_alone_pad_chunked(m, k, is_bf16, k_static, arch, sm_count)
+    )
+    if pad_chunked:
+        min_blocks = 1
+        store_hint = default_store_hint(k, threads, min_blocks)
+        grid = m + (-(-8 * cols // CLUSTER_SPLIT_PAD_CHUNKS) if m % ROW_TILE else 0)
     plan = QuantizePlan(
         arch=arch,
         sm_count=int(sm_count),
@@ -481,8 +527,10 @@ def quant_plan(
             store_hint,
             k_static,
             split,
+            pad_chunked,
         ),
         cluster_split=split,
+        pad_chunked=pad_chunked,
     )
     if plan.kernel_key in KERNELS.get(arch, {}):
         return plan
