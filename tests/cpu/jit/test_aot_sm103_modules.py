@@ -233,8 +233,31 @@ def test_selective_native_aot_target_gate(monkeypatch, target, cuda_version):
         add_misc=True,
         add_xqa=False,
     )
-    supported = target in {"sm100", "sm100f", "sm103", "sm107"}
+    supported = target in {"sm100", "sm100f", "sm103"}
     assert aot.gen_selective_sample_ladder_module.call_count == int(supported)
     assert aot.gen_selective_repair_if_module.call_count == int(
         supported and Version(cuda_version) >= Version("12.4")
+    )
+
+
+@pytest.mark.parametrize("name", ["selective_sample_ladder", "selective_repair_if"])
+def test_selective_native_jit_target_gate(monkeypatch, name):
+    import importlib
+
+    module = importlib.import_module(f"flashinfer.jit.{name}")
+    spec = Mock()
+    monkeypatch.setattr(module, "gen_jit_spec", spec)
+    flags = Mock(return_value=["-gencode=arch=compute_100a,code=sm_100a"])
+    monkeypatch.setattr(
+        module,
+        "current_compilation_context",
+        SimpleNamespace(get_nvcc_flags_list=flags),
+    )
+    if name == "selective_repair_if":
+        monkeypatch.setattr(module, "get_cuda_version", lambda: Version("13.4"))
+    getattr(module, f"gen_{name}_module")()
+    flags.assert_called_once_with(supported_major_versions=[10])
+    assert (
+        "-gencode=arch=compute_100a,code=sm_100a"
+        in spec.call_args.kwargs["extra_cuda_cflags"]
     )

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+import weakref
 
 import torch
 
@@ -24,6 +25,20 @@ from ._selective_contract import _SAMPLE_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
     from .selective_logits import _FP8PagedMQASelectiveTopKEngine
+
+
+def _bind_metadata_module_lifetime(compiled):
+    """Unload private metadata libraries when their callable owner is released.
+
+    CuTe 4.7 can leave the JIT module in a reference cycle after its compiled
+    callable is gone. Letting cyclic GC unload that library during an unrelated
+    caller capture invalidates the capture. The finalizer owns only the module,
+    not the callable or plan, and module.unload() is idempotent.
+    """
+    module = getattr(compiled, "jit_module", None)
+    if module is not None:
+        weakref.finalize(compiled, module.unload)
+    return compiled
 
 
 @dataclass(frozen=True)
@@ -361,19 +376,23 @@ class _CapacityStepInputs:
                 raise RuntimeError("metadata must be prepared outside capture")
             compiled = self._compiled
             if compiled is None:
-                compiled = _compile_for_device(
-                    self.device,
-                    self._refresh_kernel,
-                    *self._args,
-                    _current_stream(self.device),
+                compiled = _bind_metadata_module_lifetime(
+                    _compile_for_device(
+                        self.device,
+                        self._refresh_kernel,
+                        *self._args,
+                        _current_stream(self.device),
+                    )
                 )
             sample_compiled = getattr(self, "_sample_compiled", None)
             if hasattr(self, "_sample_kernel") and sample_compiled is None:
-                sample_compiled = _compile_for_device(
-                    self.device,
-                    self._sample_kernel,
-                    *self._sample_args,
-                    _current_stream(self.device),
+                sample_compiled = _bind_metadata_module_lifetime(
+                    _compile_for_device(
+                        self.device,
+                        self._sample_kernel,
+                        *self._sample_args,
+                        _current_stream(self.device),
+                    )
                 )
         # Publish only after every required compilation succeeds, so a failed
         # first preparation can be retried with the same staging addresses.
@@ -646,6 +665,35 @@ class _CapacitySelectiveTopKPlan:
             engine._compile_compact_repair_launches(self._q, self._weights)
         engine._precompile_score_launches(self._q, kv_fused, self._weights, block_table)
         engine._prepare_repair_if(state.device)
+        # Materialize the remaining FFI and PyTorch kernels before the first
+        # capture. Empty radix rows read no score payloads; in particular this
+        # must not score the uninitialized query/weight staging buffers.
+        empty_lengths = torch.zeros_like(engine._repair_lengths)
+        empty_active = torch.zeros_like(
+            engine._repair_active_count
+            if engine._compact_repair
+            else engine._repair_flags
+        )
+        engine._repair_topk_compiled(
+            engine._repair_scores,
+            engine._topk_row_states,
+            empty_lengths,
+            engine._repair_topk_positions_i32,
+            None,
+            empty_active,
+        )
+        torch._foreach_zero_(
+            [
+                engine._candidate_counts,
+                engine._repair_counts,
+                engine._repair_flags,
+                engine._second_repair_flags,
+                engine._repair_starts,
+                engine._repair_ends,
+                engine._exact_error,
+            ]
+        )
+        self._repair_error.bitwise_or_(engine._exact_error)
 
     @property
     def _needs_sampling(self) -> bool:
@@ -694,7 +742,8 @@ class _CapacitySelectiveTopKPlan:
         if num_query_rows is None:
             num_query_rows = self._capacity.max_chunk_size
         with torch.cuda.device(self._state.device):
-            if torch.cuda.is_current_stream_capturing() and (
+            capturing = torch.cuda.is_current_stream_capturing()
+            if capturing and (
                 self._layout_needs_engine() or not self._state.is_prepared
             ):
                 raise RuntimeError(
@@ -704,20 +753,33 @@ class _CapacitySelectiveTopKPlan:
             self._state.stage_step(
                 qo_indptr, kv_indptr, block_table, num_query_rows=num_query_rows
             )
+            self._check_caller_capture(capturing, "plan input copies")
             self._repair_error.zero_()
+            self._check_caller_capture(capturing, "plan repair-status reset")
             # Before the first pool is prepared, planning only stages inputs.
             # Pool preparation validates this staged step before any scoring.
             if self._state.is_prepared:
                 self._state.refresh()
+                self._check_caller_capture(capturing, "plan metadata refresh")
                 if self._needs_sampling:
                     self._state.refresh_sampling()
+                    self._check_caller_capture(capturing, "plan sampling refresh")
                 self._refresh_schedules()
+                self._check_caller_capture(capturing, "plan schedule refresh")
         self._supplied_rows = num_query_rows
         self._supplied_batch = qo_indptr.numel() - 1
         self._step_prepared = True
 
+    def _check_caller_capture(self, capturing, step):
+        """Name the first invalid host boundary without synchronizing the GPU."""
+        if capturing:
+            from .selective_logits import _check_capture_status
+
+            _check_capture_status(torch.cuda.current_stream(self._state.device), step)
+
     def _execute_layer(self, kv_fused) -> None:
         """Score one pool using the shared step metadata and tensor workspace."""
+        capturing = torch.cuda.is_current_stream_capturing()
         engine = self._engine
         if engine is None:
             self._selected.fill_(-1)
@@ -741,6 +803,7 @@ class _CapacitySelectiveTopKPlan:
                 engine._exact_error,
             ]
         )
+        self._check_caller_capture(capturing, "layer scratch resets")
         engine._run_impl(
             self._q,
             kv_fused,
@@ -750,6 +813,7 @@ class _CapacitySelectiveTopKPlan:
             _sampling_policy_initialized=not engine._needs_sampling,
         )
         self._repair_error.bitwise_or_(engine._exact_error)
+        self._check_caller_capture(capturing, "layer repair-status merge")
 
     def _layout_needs_engine(self) -> bool:
         """Whether scoring this layout still needs its first engine build."""
@@ -950,10 +1014,13 @@ class _CapacitySelectiveTopKPlan:
             if self._engine is not None:
                 self._engine._sample_fused = kv_fused
             self._state.stage_payload(q, weights)
+            self._check_caller_capture(capturing, "layer payload copies")
             if capturing:
                 self._execute_layer(kv_fused)
+                self._check_caller_capture(capturing, "layer execution")
             else:
                 graph.replay()
             if out is not None and out.data_ptr() != selected.data_ptr():
                 out.copy_(selected)
+                self._check_caller_capture(capturing, "layer output copy")
         return selected if out is None else out

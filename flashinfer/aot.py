@@ -1156,7 +1156,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm100f or has_sm103 or has_sm107:
+        if has_sm100 or has_sm100f or has_sm103:
             jit_specs.append(gen_selective_sample_ladder_module())
             if get_cuda_version() >= Version("12.4"):
                 jit_specs.append(gen_selective_repair_if_module())

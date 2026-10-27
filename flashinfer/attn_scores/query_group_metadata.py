@@ -61,7 +61,7 @@ def validate_query_group_rows(rows, group_ends, query_tile, output_rows):
 
 
 @dataclass(frozen=True)
-class FP8QueryGroups:
+class _FP8QueryGroups:
     """Immutable host metadata for request-local full-score query grouping.
 
     Use :meth:`build` to validate prefixes and construct the fields. Query
@@ -104,7 +104,7 @@ class FP8QueryGroups:
 
         ``query_tile`` is a positive integer number of queries per group.
         The last group of a request may contain padded slots, but output
-        bases and valid counts cover only real rows. Return an FP8QueryGroups
+        bases and valid counts cover only real rows. Return an _FP8QueryGroups
         containing tuples independent of the input sequences; raise ValueError
         for invalid prefix, ratio, grouping or row-encoding contracts.
         """

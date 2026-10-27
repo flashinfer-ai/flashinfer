@@ -378,6 +378,11 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
 
     _engine_relu_f32 = staticmethod(relu_f32)
 
+    @cute.jit
+    def _wait_for_tmem(self, tmem):
+        """Ordinary roles retain the allocator's synchronization policy."""
+        tmem.wait_for_alloc()
+
     @property
     def math_mode(self) -> _MathMode:
         """Constructor-fixed FP32 epilogue policy; FP16 arithmetic is unchanged."""
@@ -583,7 +588,7 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
         stage. Register budgeting and initial state placement remain in the
         entry wrapper; all states die at the end of this complete role.
         """
-        tmem.wait_for_alloc()
+        self._wait_for_tmem(tmem)
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         tCtAcc_base_0 = cute.make_tensor(
             tmem_ptr + group_0_offset, tCtAcc_fake_staged.layout
@@ -1774,7 +1779,7 @@ class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
     ):
         """One TMEM allocation/consumer/permit/free owner with static sinks."""
         tmem.allocate(num_tmem_alloc_cols_total)
-        tmem.wait_for_alloc()
+        self._wait_for_tmem(tmem)
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         if cutlass.const_expr(request_tiled):
             math_tmem_ptr = tmem_ptr + warpgroup_idx * group_offset

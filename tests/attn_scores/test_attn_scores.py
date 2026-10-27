@@ -194,13 +194,14 @@ def test_fp8_math_mode_rejects_before_cuda_work():
             )
         with pytest.raises(ValueError, match="math_mode"):
             precompile_paged_mqa_logits(math_mode=invalid)
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
+    wrapper = object.__new__(FP8PagedMQATopKWrapper)
+    wrapper._math_mode = wrapper._math_mode_at_construction = "relu_strict"
     assert wrapper.math_mode == "relu_strict"
     with pytest.raises(AttributeError):
         wrapper.math_mode = "relu_fast"
     wrapper._math_mode = "relu_fast"
     with pytest.raises(RuntimeError, match="math_mode"):
-        wrapper.run(q=None, kv_fused=None, weights=None, block_table=None)
+        wrapper.run(q=None, kv_fused=None, weights=None)
 
 
 @pytest.mark.parametrize("case", ["negative_infinity", "nan_weight", "tiny_scale"])
@@ -4244,56 +4245,25 @@ def test_topk_plan_explicit_signature_and_strategy_binding(monkeypatch):
     """Strategy-specific logging uses true names for both planning contracts."""
     import inspect
 
-    for method, names in (
-        (
-            FP8PagedMQATopKWrapper._plan_selective,
-            ("self", "qo_indptr", "kv_indptr", "block_table", "num_query_rows"),
-        ),
-        (
-            FP8PagedMQATopKWrapper._plan_full,
-            (
-                "self",
-                "q",
-                "kv_fused",
-                "weights",
-                "qo_indptr",
-                "kv_indptr",
-                "block_table",
-                "top_k",
-                "num_heads",
-                "head_dim",
-            ),
-        ),
-    ):
-        signature = inspect.signature(method)
-        assert tuple(signature.parameters) == names
-        assert all(
-            parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
-            for parameter in signature.parameters.values()
-        )
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
-    tensors = [object() for _ in range(6)]
-    full_calls = []
-    monkeypatch.setattr(
-        wrapper,
-        "_plan_full_payload",
-        lambda *args, **kwargs: full_calls.append((args, kwargs)),
+    signature = inspect.signature(FP8PagedMQATopKWrapper.plan)
+    assert tuple(signature.parameters) == (
+        "self",
+        "qo_indptr",
+        "kv_indptr",
+        "block_table",
+        "num_query_rows",
     )
-    wrapper.plan(*tensors, top_k=2048, num_heads=64)
-    wrapper.plan(
-        **dict(
-            zip(
-                ("q", "kv_fused", "weights", "qo_indptr", "kv_indptr", "block_table"),
-                tensors,
-                strict=True,
-            )
-        )
+    assert tuple(inspect.signature(FP8PagedMQATopKWrapper.run).parameters) == (
+        "self",
+        "q",
+        "weights",
+        "kv_fused",
+        "out",
     )
-    assert [call[0] for call in full_calls] == [tuple(tensors)] * 2
-    assert full_calls[0][1] == dict(top_k=2048, num_heads=64, head_dim=128)
-    with pytest.raises(TypeError):
-        wrapper.plan(qo_indptr=tensors[0])
-
+    wrapper = object.__new__(FP8PagedMQATopKWrapper)
+    wrapper._math_mode = wrapper._math_mode_at_construction = "relu_strict"
+    wrapper._compression_ratio = wrapper._compression_ratio_at_construction = 1
+    tensors = [object() for _ in range(3)]
     step_calls = []
     wrapper._capacity_plan = SimpleNamespace(
         plan=lambda *args, **kwargs: step_calls.append((args, kwargs))
@@ -4371,12 +4341,17 @@ def test_compression_ratio_one_keeps_original_plan_and_schema(strategy):
         )
     from flashinfer.trace.templates.attn_scores import (
         fp8_paged_mqa_selective_topk_trace,
+        fp8_paged_mqa_topk_trace,
         fp8_paged_mqa_topk_trace_dispatch,
     )
 
     assert all(
         fp8_paged_mqa_topk_trace_dispatch(self=wrapper)
-        is fp8_paged_mqa_selective_topk_trace
+        is (
+            fp8_paged_mqa_selective_topk_trace
+            if strategy == "selective"
+            else fp8_paged_mqa_topk_trace
+        )
         for wrapper in wrappers
     )
     assert "compression_ratio" not in fp8_paged_mqa_selective_topk_trace.inputs
@@ -4386,7 +4361,7 @@ def test_compression_ratio_one_keeps_original_plan_and_schema(strategy):
                 strategy=strategy, compression_ratio=ratio, **capacities
             )
     with pytest.raises(ValueError, match="only supported by selective"):
-        FP8PagedMQATopKWrapper(strategy="full", compression_ratio=4)
+        FP8PagedMQATopKWrapper(strategy="full", compression_ratio=4, **capacities)
 
 
 def _check_compressed_wrapper(output, payload, top_k):
@@ -4631,7 +4606,8 @@ def test_candidate_publication_rejects_layout_from_another_split():
 def test_unified_wrapper_requires_explicit_supported_strategy():
     from flashinfer import FP8PagedMQATopKWrapper
 
-    assert FP8PagedMQATopKWrapper(strategy="full").strategy == "full"
+    with pytest.raises(ValueError, match="both strategies require"):
+        FP8PagedMQATopKWrapper(strategy="full")
     with pytest.raises(ValueError, match="strategy must be 'full' or 'selective'"):
         FP8PagedMQATopKWrapper(strategy="auto")
 
@@ -4763,12 +4739,10 @@ def _paged_inputs(inputs, block_size: int = 128):
 @pytest.mark.parametrize("heads,query_tile", [(8, 16), (64, 4)])
 @pytest.mark.parametrize("ratio", [1, 4])
 def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypatch):
-    """Public grouped scoring preserves request bounds and live graph inputs."""
-    from flashinfer.attn_scores import (
-        FP8MQAKernelConfig,
-        FP8QueryGroups,
-        fp8_paged_mqa_logits,
-    )
+    """Private grouped scoring preserves request bounds and live graph inputs."""
+    from flashinfer.attn_scores.attn_scores import _fp8_paged_mqa_logits
+    from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
+    from flashinfer.attn_scores.query_group_metadata import _FP8QueryGroups
 
     if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("grouped FP8 scorer requires SM100 or SM103")
@@ -4781,7 +4755,7 @@ def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypat
     token_prefix = [0]
     for length in token_lengths:
         token_prefix.append(token_prefix[-1] + length)
-    groups = FP8QueryGroups.build(cu_q.cpu().tolist(), token_prefix, ratio, query_tile)
+    groups = _FP8QueryGroups.build(cu_q.cpu().tolist(), token_prefix, ratio, query_tile)
     fused, table = _paged_inputs(inputs)
     # Neither an empty-query request nor a zero-key row may dereference its map.
     table[1].fill_(2**30)
@@ -4801,7 +4775,7 @@ def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypat
     )
     metadata = torch.tensor(groups.rows, device=q.device, dtype=torch.int32)
     ends = torch.tensor(groups.group_ends, device=q.device, dtype=torch.int32)
-    config = FP8MQAKernelConfig(128, 1, 160, query_tile, 3, 3)
+    config = _FP8MQAKernelConfig(128, 1, 160, query_tile, 3, 3)
     output = torch.full(
         (q.shape[0], config.padded_columns(max(physical_lengths))),
         float("nan"),
@@ -4821,7 +4795,7 @@ def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypat
         )
         grouped_weights.masked_fill_(invalid[:, None], 0)
         torch.index_select(table, 0, requests, out=grouped_table)
-        return fp8_paged_mqa_logits(
+        return _fp8_paged_mqa_logits(
             grouped_q,
             fused,
             grouped_weights,
@@ -4872,7 +4846,7 @@ def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypat
     run()
     check()
     if heads == 8 and ratio == 4:
-        config = FP8MQAKernelConfig(128, 1, 160, query_tile, 2, 2)
+        config = _FP8MQAKernelConfig(128, 1, 160, query_tile, 2, 2)
         run()
         check()
 
@@ -5153,6 +5127,149 @@ def test_unified_wrapper_matches_ordinary_logits_topk():
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+def test_topk_common_serving_contract(strategy):
+    """Both strategies stage metadata once, accept layer out, and fail closed."""
+    inputs = _request_inputs([2, 0, 1], [1024, 0, 2048])
+    q, _, _, weights, qo, kv = inputs
+    pool, table = _paged_inputs(inputs)
+    q = torch.cat((q, torch.zeros_like(q[:2])))
+    weights = torch.cat((weights, torch.zeros_like(weights[:2])))
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy=strategy,
+        max_context_length=2048,
+        max_chunk_size=5,
+        max_batch_size=3,
+        kv_layout=pool,
+    )
+    buffers = wrapper.input_buffers()
+    buffers["q"].copy_(q)
+    buffers["weights"].copy_(weights)
+    wrapper.plan(qo, kv, table)
+    wrapper.prepare_pool(pool)
+    other_pool = pool.clone()
+    wrapper.prepare_pool(other_pool)
+    out = torch.empty((5, 512), device=q.device, dtype=torch.int32)
+    expected = _oracle_rows(inputs)
+    for layer_pool in (pool, other_pool):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = wrapper.run(buffers["q"], buffers["weights"], layer_pool, out=out)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert result.data_ptr() == out.data_ptr()
+        _check_selection(out[:3], expected, 512)
+        assert (out[3:] == -1).all()
+        assert wrapper.error.item() == wrapper.repair_error.item() == 0
+        del graph
+    wrapper.clear_pools()
+    bad_table = torch.full_like(table, -1)
+    wrapper.plan(qo, kv, bad_table)
+    wrapper.run(q, weights, pool, out=out)
+    torch.cuda.synchronize()
+    assert wrapper.error.item() == 8
+    assert (out == -1).all()
+
+
+@_requires_selective_sm100
+def test_full_capacity_bucket_accepts_smaller_step(monkeypatch):
+    """Full plans and trace axes follow the live batch, not reserved capacity."""
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.template import TraceTemplate
+
+    inputs = _request_inputs([2, 1], [1024, 2048])
+    q, _, _, weights, qo, kv = inputs
+    pool, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        max_context_length=2048,
+        max_chunk_size=5,
+        max_batch_size=4,
+        kv_layout=pool,
+    )
+    wrapper.plan(qo, kv, table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(pool)
+    expected = _oracle_rows(inputs)
+    result = wrapper.run(q, weights, pool)
+    torch.cuda.synchronize()
+    _check_selection(result, expected, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q, weights, pool)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_selection(captured, expected, 512)
+    observed = []
+    build = TraceTemplate.build_fi_trace_fn
+
+    def observe_build(template, api):
+        trace = build(template, api)
+
+        def observe_inputs(*args, **kwargs):
+            observed.append(
+                (kwargs["block_table"].shape[0], kwargs["qo_indptr"].numel())
+            )
+            return trace(*args, **kwargs)
+
+        return observe_inputs
+
+    monkeypatch.setattr(TraceTemplate, "build_fi_trace_fn", observe_build)
+    definition = fi_trace(wrapper.run, q=q, weights=weights, kv_fused=pool)
+    assert observed == [(2, 3)]
+    assert definition["inputs"]["block_table"]["shape"][0] == "batch_size"
+
+
+@_requires_selective_sm100
+def test_capacity_retired_metadata_modules_do_not_unload_during_capture(monkeypatch):
+    """A predecessor's cyclic CuTe modules must be retired before another capture."""
+    import weakref
+
+    from flashinfer.attn_scores.selective_capacity import (
+        _CapacityStepInputs,
+        _SelectiveCapacity,
+    )
+    from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitModule
+
+    capacity = _SelectiveCapacity(8, 128, 128, 1, 8192, 1, 1)
+    state = _CapacityStepInputs(capacity, device="cuda", num_pages=64)
+    state.prepare_sampling(512)
+    module_type = CudaDialectJitModule
+    original_unload = module_type.unload
+    unloads = []
+
+    def observe_unload(module):
+        if module.cuda_library:
+            unloads.append(torch.cuda.is_current_stream_capturing())
+        return original_unload(module)
+
+    monkeypatch.setattr(module_type, "unload", observe_unload)
+    state.prepare()
+    state_ref = weakref.ref(state)
+    compiled_refs = [weakref.ref(state._compiled), weakref.ref(state._sample_compiled)]
+    output = torch.empty(1, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del state
+        # Refcount release remains strict: collecting while the owner is alive
+        # would hide a product-owned cycle and its deferred CUDA destruction.
+        assert state_ref() is None
+        assert all(reference() is None for reference in compiled_refs)
+        assert unloads == [False, False]
+        with torch.cuda.graph(graph):
+            gc.collect()
+            output.fill_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert output.item() == 1
+        assert unloads == [False, False]
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
     """Full and selective strategies share the exact public result contract."""
@@ -5172,21 +5289,21 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
 
     monkeypatch.setattr(torch, "topk", reject_dense_topk)
 
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
-    wrapper.plan(
-        q,
-        kv_fused,
-        weights,
-        cu_q,
-        cu_kv,
-        block_table,
-        top_k=top_k,
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
         num_heads=q.shape[1],
         head_dim=q.shape[2],
+        page_size=kv_fused.shape[1],
+        top_k=top_k,
+        max_context_length=int((cu_kv[1:] - cu_kv[:-1]).max().item()),
+        max_chunk_size=q.shape[0],
+        max_batch_size=cu_q.numel() - 1,
+        kv_layout=kv_fused,
     )
-    first = wrapper.run(
-        q=q, kv_fused=kv_fused, weights=weights, block_table=block_table
-    )
+    wrapper.plan(cu_q, cu_kv, block_table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(kv_fused)
+    wrapper.run(q, weights, kv_fused)
+    first = wrapper.run(q=q, kv_fused=kv_fused, weights=weights)
     # Unwritten causal tails are not part of the selector's input domain.
     # Poison them to catch accidental dense selection after future refactors.
     invalid = (
@@ -5194,14 +5311,10 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
         >= wrapper._full_row_ends[:, None]
     )
     wrapper._full_scores.masked_fill_(invalid, float("inf"))
-    second = wrapper.run(
-        q=q, kv_fused=kv_fused, weights=weights, block_table=block_table
-    )
+    second = wrapper.run(q=q, kv_fused=kv_fused, weights=weights)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = wrapper.run(
-            q=q, kv_fused=kv_fused, weights=weights, block_table=block_table
-        )
+        captured = wrapper.run(q=q, kv_fused=kv_fused, weights=weights)
     graph.replay()
     torch.cuda.synchronize()
     monkeypatch.setattr(torch, "topk", torch_topk)
@@ -5231,8 +5344,20 @@ def test_full_wrapper_plan_rejects_capture_without_invalidating_plan():
     inputs = _request_inputs((2,), (1024,))
     q, _, _, weights, qo_indptr, kv_indptr = inputs
     fused, table = _paged_inputs(inputs)
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
-    wrapper.plan(q, fused, weights, qo_indptr, kv_indptr, table)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        page_size=fused.shape[1],
+        top_k=512,
+        max_context_length=int((kv_indptr[1:] - kv_indptr[:-1]).max().item()),
+        max_chunk_size=q.shape[0],
+        max_batch_size=qo_indptr.numel() - 1,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo_indptr, kv_indptr, table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(fused)
+    wrapper.run(q, weights, fused)
     oracle = _oracle_rows(inputs)
     graph = torch.cuda.CUDAGraph()
     with (
@@ -5242,8 +5367,10 @@ def test_full_wrapper_plan_rejects_capture_without_invalidating_plan():
             match="full strategy plan must be called outside CUDA graph capture",
         ),
     ):
-        wrapper.plan(q, fused, weights, qo_indptr, kv_indptr, table)
-    selected = wrapper.run(q, weights, fused, block_table=table)
+        wrapper.plan(qo_indptr, kv_indptr, table, num_query_rows=q.shape[0])
+        wrapper.prepare_pool(fused)
+        wrapper.run(q, weights, fused)
+    selected = wrapper.run(q, weights, fused)
     torch.cuda.synchronize()
     _check_selection(selected, oracle, 512)
 
@@ -5269,8 +5396,20 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
         return real_run(*args, **kwargs)
 
     monkeypatch.setattr(gvr2_topk_host, "run_varlen", observe_gvr2)
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
-    wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        page_size=fused.shape[1],
+        top_k=512,
+        max_context_length=int((cu_kv[1:] - cu_kv[:-1]).max().item()),
+        max_chunk_size=q.shape[0],
+        max_batch_size=cu_q.numel() - 1,
+        kv_layout=fused,
+    )
+    wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(fused)
+    wrapper.run(q, weights, fused)
     # Capture records operations without executing them. Preserve the eager
     # plan result before any public run can overwrite it by graph replay.
     planned_output = wrapper._selected.clone()
@@ -5303,17 +5442,16 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
             )
 
     check_rows(planned_output, kv, scale)
-    with pytest.raises(ValueError, match="address-stable plan"):
-        wrapper.run(q=q.view_as(q), kv_fused=fused, weights=weights, block_table=table)
+    wrapper.run(q=q.view_as(q), kv_fused=fused, weights=weights)
     stream = torch.cuda.Stream(device=q.device)
     stream.wait_stream(torch.cuda.current_stream(q.device))
     with torch.cuda.stream(stream):
-        first = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+        first = wrapper.run(q=q, kv_fused=fused, weights=weights)
     stream.synchronize()
     check_rows(first, kv, scale)
     outer = torch.cuda.CUDAGraph()
     with torch.cuda.graph(outer, stream=stream):
-        captured = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+        captured = wrapper.run(q=q, kv_fused=fused, weights=weights)
     outer.replay()
     torch.cuda.synchronize()
     assert captured.data_ptr() == first.data_ptr()
@@ -5325,6 +5463,16 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     scale.copy_(scale.roll(1))
     fused.copy_(_fuse_paged_kv(kv, scale).flip(0))
     table.copy_(table.flip(1))
+    # Maps are step inputs for both strategies; full replanning retires its
+    # old pool graphs, so discard and rebuild the caller graph as well.
+    del outer
+    calls.clear()
+    wrapper.plan(cu_q, cu_kv, table)
+    wrapper.prepare_pool(fused)
+    slab = wrapper._full_gvr2_workspace
+    outer = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(outer, stream=stream):
+        captured = wrapper.run(q, weights, fused)
     outer.replay()
     torch.cuda.synchronize()
     reversed_kv = kv.float().view(-1, 128, kv.shape[1]).flip(0).reshape_as(kv)
@@ -5337,16 +5485,33 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     one_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     one_query = q[:1]
     one_weights = weights[:1]
-    other = FP8PagedMQATopKWrapper(strategy="full")
-    other.plan(one_query, fused, one_weights, one_q, cu_kv, table)
+    other = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=one_query.shape[1],
+        head_dim=one_query.shape[2],
+        page_size=fused.shape[1],
+        top_k=512,
+        max_context_length=int((cu_kv[1:] - cu_kv[:-1]).max().item()),
+        max_chunk_size=one_query.shape[0],
+        max_batch_size=one_q.numel() - 1,
+        kv_layout=fused,
+    )
+    other.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
+    other.prepare_pool(fused)
+    other.run(one_query, one_weights, fused)
     assert other._full_gvr2_workspace.data_ptr() != slab.data_ptr()
     other_slab = other._full_gvr2_workspace
     with pytest.raises(ValueError, match="requires top_k in"):
-        other.plan(one_query, fused, one_weights, one_q, cu_kv, table, top_k=8)
+        FP8PagedMQATopKWrapper(
+            strategy="full",
+            top_k=8,
+            max_context_length=1,
+            max_chunk_size=1,
+            max_batch_size=1,
+            kv_layout=fused,
+        )
     assert other._full_gvr2_workspace is other_slab
-    assert other.run(
-        q=one_query, kv_fused=fused, weights=one_weights, block_table=table
-    ).shape == (1, 512)
+    assert other.run(q=one_query, kv_fused=fused, weights=one_weights).shape == (1, 512)
 
     def fail_capture():
         raise RuntimeError("injected full GVR capture failure")
@@ -5354,15 +5519,17 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda, "CUDAGraph", fail_capture)
         with pytest.raises(RuntimeError, match="injected full GVR capture failure"):
-            wrapper.plan(one_query, fused, one_weights, one_q, cu_kv, table)
+            wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
+            wrapper.prepare_pool(fused)
+            wrapper.run(one_query, one_weights, fused)
     assert wrapper._full_gvr2_workspace is None
     with pytest.raises(RuntimeError, match="plan must be called"):
-        wrapper.run(q=one_query, kv_fused=fused, weights=one_weights, block_table=table)
-    wrapper.plan(one_query, fused, one_weights, one_q, cu_kv, table)
+        wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
+    wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
+    wrapper.prepare_pool(fused)
+    wrapper.run(one_query, one_weights, fused)
     assert wrapper._full_gvr2_workspace is not None
-    recovered = wrapper.run(
-        q=one_query, kv_fused=fused, weights=one_weights, block_table=table
-    )
+    recovered = wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
     torch.cuda.synchronize()
     assert recovered.shape == (1, 512)
 
@@ -5424,9 +5591,18 @@ def test_unified_wrapper_underfilled_causal_rows(strategy, top_k):
             top_k=top_k,
         )
     else:
-        wrapper = FP8PagedMQATopKWrapper(strategy=strategy)
-        wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=top_k)
-        selected = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+        wrapper = FP8PagedMQATopKWrapper(
+            strategy=strategy,
+            top_k=top_k,
+            max_context_length=4,
+            max_chunk_size=5,
+            max_batch_size=2,
+            kv_layout=fused,
+        )
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        wrapper.prepare_pool(fused)
+        wrapper.run(q, weights, fused)
+        selected = wrapper.run(q=q, kv_fused=fused, weights=weights)
         template = fp8_paged_mqa_topk_trace
         trace_args = dict(
             q=q,
@@ -5457,11 +5633,21 @@ def test_engine_compact_repair_queue_changes_cuda_graph():
     cu_kv = torch.tensor([0, kv_rows], device="cuda", dtype=torch.int32)
     fused, table = _paged_inputs((q, kv, scale, weights, cu_q, cu_kv))
     payload = q, fused, weights, table
-    full = FP8PagedMQATopKWrapper(strategy="full")
-    full.plan(q, fused, weights, cu_q, cu_kv, table)
-    reference = full.run(
-        payload[0], payload[2], payload[1], block_table=payload[3]
-    ).long()
+    full = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        page_size=fused.shape[1],
+        top_k=512,
+        max_context_length=int((cu_kv[1:] - cu_kv[:-1]).max().item()),
+        max_chunk_size=q.shape[0],
+        max_batch_size=cu_q.numel() - 1,
+        kv_layout=fused,
+    )
+    full.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+    full.prepare_pool(fused)
+    full.run(q, weights, fused)
+    reference = full.run(payload[0], payload[2], payload[1]).long()
     scores = full._full_scores[:, :kv_rows]
     expected = scores.gather(1, reference).sort(1).values
     wrapper = SelectiveEngineCase()
@@ -7372,11 +7558,11 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
         max_batch_size=1,
         kv_layout=fused,
     )
-    wrapper = FP8PagedMQATopKWrapper(
-        strategy=strategy, **(selective if strategy == "selective" else {})
-    )
+    wrapper = FP8PagedMQATopKWrapper(strategy=strategy, **selective)
     if strategy == "full":
-        wrapper.plan(q, fused, weights, cu_q, cu_kv, table, top_k=top_k)
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        wrapper.prepare_pool(fused)
+        wrapper.run(q, weights, fused)
     else:
         wrapper.prepare_pool(fused)
     graph = torch.cuda.CUDAGraph()
@@ -7384,7 +7570,7 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
         if strategy == "selective":
             wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
         output = (
-            wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+            wrapper.run(q=q, kv_fused=fused, weights=weights)
             if strategy == "full"
             else wrapper.run(q, weights, fused)
         )
@@ -7400,13 +7586,18 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
         mapped_kv = kv.reshape(-1, 128, 128)[order].reshape_as(kv)
         mapped_scale = scale.reshape(-1, 128)[order].reshape_as(scale)
         oracle = _oracle_rows((q, mapped_kv, mapped_scale, weights, cu_q, cu_kv))
-        if strategy == "selective":
-            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        if strategy == "full":
+            del graph
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
         eager = (
-            wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+            wrapper.run(q=q, kv_fused=fused, weights=weights)
             if strategy == "full"
             else wrapper.run(q, weights, fused)
         ).clone()
+        if strategy == "full":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = wrapper.run(q, weights, fused)
         graph.replay()
         torch.cuda.synchronize()
         for actual in (eager, output):
@@ -7423,8 +7614,20 @@ def test_full_wrapper_failed_capture_rejects_run_and_retries(monkeypatch, q_rows
     cu_kv = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
     fused = _fuse_paged_kv(kv, scale)
     table = torch.arange(fused.shape[0], device="cuda", dtype=torch.int32)[None, :]
-    wrapper = FP8PagedMQATopKWrapper(strategy="full")
-    wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        page_size=fused.shape[1],
+        top_k=512,
+        max_context_length=int((cu_kv[1:] - cu_kv[:-1]).max().item()),
+        max_chunk_size=q.shape[0],
+        max_batch_size=cu_q.numel() - 1,
+        kv_layout=fused,
+    )
+    wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(fused)
+    wrapper.run(q, weights, fused)
 
     def fail_capture():
         raise RuntimeError("injected capture failure")
@@ -7432,12 +7635,16 @@ def test_full_wrapper_failed_capture_rejects_run_and_retries(monkeypatch, q_rows
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda, "CUDAGraph", fail_capture)
         with pytest.raises(RuntimeError, match="injected capture failure"):
-            wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
+            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+            wrapper.prepare_pool(fused)
+            wrapper.run(q, weights, fused)
     with pytest.raises(RuntimeError, match="plan must be called"):
-        wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+        wrapper.run(q=q, kv_fused=fused, weights=weights)
 
-    wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
-    output = wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+    wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+    wrapper.prepare_pool(fused)
+    wrapper.run(q, weights, fused)
+    output = wrapper.run(q=q, kv_fused=fused, weights=weights)
     torch.cuda.synchronize()
     assert output.shape == (q_rows, 512)
     for row, scores in enumerate(_oracle_rows((q, kv, scale, weights, cu_q, cu_kv))):
@@ -7611,10 +7818,12 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
             )
             wrapper = FP8PagedMQATopKWrapper(
                 strategy="full" if route == "full" else "selective",
-                **(selective if route == "selective" else {}),
+                **selective,
             )
             if route == "full":
-                wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
+                wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+                wrapper.prepare_pool(fused)
+                wrapper.run(q, weights, fused)
             else:
                 wrapper.prepare_pool(fused)
             assert torch.cuda.current_device() == 0
@@ -7630,7 +7839,7 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
                 if route == "selective":
                     wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
                 output = (
-                    wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
+                    wrapper.run(q=q, kv_fused=fused, weights=weights)
                     if route == "full"
                     else wrapper.run(q, weights, fused)
                 )
@@ -7643,9 +7852,7 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
                         if route == "selective":
                             wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
                         captured = (
-                            wrapper.run(
-                                q=q, kv_fused=fused, weights=weights, block_table=table
-                            )
+                            wrapper.run(q=q, kv_fused=fused, weights=weights)
                             if route == "full"
                             else wrapper.run(q, weights, fused)
                         )
@@ -7692,18 +7899,12 @@ def test_natural_page_table_replay_and_replan(page_size, heads, route, monkeypat
     strategy = "full" if route == "full" else "selective"
     wrapper = FP8PagedMQATopKWrapper(
         strategy=strategy,
-        **(
-            {
-                "num_heads": heads,
-                "page_size": page_size,
-                "max_context_length": 9001,
-                "max_chunk_size": 5,
-                "max_batch_size": 2,
-                "kv_layout": fused,
-            }
-            if strategy == "selective"
-            else {}
-        ),
+        num_heads=heads,
+        page_size=page_size,
+        max_context_length=9001,
+        max_chunk_size=5,
+        max_batch_size=2,
+        kv_layout=fused,
     )
 
     def check(indices, lengths):
@@ -7733,35 +7934,30 @@ def test_natural_page_table_replay_and_replan(page_size, heads, route, monkeypat
         if generation:
             weights.zero_()
         cu_kv[-1] = 257 + length
-        if strategy == "full":
-            wrapper.plan(q, fused, weights, cu_q, cu_kv, table, num_heads=heads)
-        else:
-            wrapper.prepare_pool(fused)
-        if strategy == "selective":
-            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
-        check(
-            (
-                wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
-                if strategy == "full"
-                else wrapper.run(q, weights, fused)
-            ),
-            (257, length),
-        )
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        wrapper.prepare_pool(fused)
+        check(wrapper.run(q, weights, fused), (257, length))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             if strategy == "selective":
                 wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
-            output = (
-                wrapper.run(q=q, kv_fused=fused, weights=weights, block_table=table)
-                if strategy == "full"
-                else wrapper.run(q, weights, fused)
-            )
+            output = wrapper.run(q, weights, fused)
         for _ in range(2):
             for request, request_length in enumerate((257, length)):
                 pages = math.ceil(request_length / page_size)
                 table[request, :pages].copy_(table[request, :pages].flip(0))
+            if strategy == "full":
+                # Full plans bind the map once per step outside capture.
+                # Rebuild caller captures when publishing a different step.
+                del graph
+                wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+                wrapper.prepare_pool(fused)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = wrapper.run(q, weights, fused)
             graph.replay()
             check(output, (257, length))
+        del graph
         if generation and strategy == "selective":
             assert (
                 wrapper._capacity_plan._engine._second_repair_flags[3:5]
@@ -8595,6 +8791,123 @@ def test_exact_radix_consume_reset_matches_histogram_reference(rows):
 
 
 @_requires_selective_sm100
+@pytest.mark.parametrize("participants,threads", [(288, 384), (544, 640)])
+def test_selective_tmem_warp_role_barrier(participants, threads):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.utils import SmemAllocator
+
+    from flashinfer.attn_scores.kernels._fp8_mqa_selective import sync_warp_roles
+    from flashinfer.attn_scores.selective_logits import _current_stream
+
+    class RoleBarrier:
+        @cute.kernel
+        def kernel(self, output):
+            tid, _, _ = cute.arch.thread_idx()
+            shared = SmemAllocator().allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_layout((1,)),
+                byte_alignment=4,
+            )
+            if tid == 0:
+                shared[0] = cutlass.Int32(17)
+            if tid < participants - 32:
+                sync_warp_roles(1, participants)
+                output[tid] = shared[0]
+                sync_warp_roles(2, participants - 32)
+            elif (tid >= participants + 32) & (tid < participants + 64):
+                sync_warp_roles(1, participants)
+                output[tid] = shared[0]
+
+        @cute.jit
+        def __call__(self, output, stream):
+            self.kernel(output).launch(
+                grid=(1, 1, 1), block=(threads, 1, 1), stream=stream
+            )
+
+    output = torch.zeros(threads, dtype=torch.int32, device="cuda")
+    args = (from_dlpack(output),)
+    compiled = cute.compile(RoleBarrier(), *args, _current_stream(output.device))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(*args, _current_stream(output.device))
+    expected = torch.zeros_like(output)
+    expected[: participants - 32] = 17
+    expected[participants + 32 : participants + 64] = 17
+    for _ in range(2):
+        output.zero_()
+        graph.replay()
+        torch.testing.assert_close(output, expected)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("query_tile", [4, 16])
+def test_compact_metadata_partial_tiles_bound_flag_reads(query_tile):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.attn_scores.kernels.selective_logits_metadata import (
+        SelectiveLogitsCompactMetadataScheduleKernel,
+    )
+    from flashinfer.attn_scores.selective_logits import _current_stream
+
+    qo = torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda")
+    starts = torch.zeros(3, dtype=torch.int32, device="cuda")
+    ends = torch.tensor([11, 22, 33], dtype=torch.int32, device="cuda")
+    # Leave the backing tail uninitialized so initcheck also detects a flag
+    # load evaluated outside a partial request tile, even if its result is masked.
+    flag_storage = torch.empty(3 + query_tile, dtype=torch.int32, device="cuda")
+    flags = flag_storage[:3]
+    flags.zero_()
+    contexts = torch.empty(2, dtype=torch.int32, device="cuda")
+    metadata = torch.empty((2, 4 + 2 * query_tile), dtype=torch.int32, device="cuda")
+    schedule = torch.empty((5, 2), dtype=torch.int32, device="cuda")
+    prefix = torch.empty(2, dtype=torch.int32, device="cuda")
+    args = (
+        *(
+            from_dlpack(t)
+            for t in (qo, starts, ends, flags, contexts, metadata, schedule, prefix)
+        ),
+        cutlass.Int32(2),
+        cutlass.Int32(3),
+    )
+    stream = _current_stream(qo.device)
+    compiled = cute.compile(
+        SelectiveLogitsCompactMetadataScheduleKernel(4, query_tile, 256, paged=True),
+        *args,
+        stream,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(*args, _current_stream(qo.device))
+    for pattern in ([0, 0, 0], [1, 0, 1], [1, 1, 1], [0, 1, 0]):
+        flags.copy_(torch.tensor(pattern, device=qo.device, dtype=torch.int32))
+        graph.replay()
+        expected = []
+        for request, (begin, end) in enumerate(((0, 1), (1, 3))):
+            if any(pattern[begin:end]):
+                bounds = [
+                    ends[i].item() if pattern[i] else 0 for i in range(begin, end)
+                ]
+                expected.append(
+                    [begin, request, end - begin, 0]
+                    + [0] * query_tile
+                    + bounds
+                    + [0] * (query_tile - len(bounds))
+                )
+        count = len(expected)
+        assert (contexts[count:] == 0).all()
+        if count:
+            actual = metadata[:count]
+            actual = actual[actual[:, 0].argsort()]
+            torch.testing.assert_close(
+                actual, torch.tensor(expected, device=qo.device, dtype=torch.int32)
+            )
+
+
+@_requires_selective_sm100
 @pytest.mark.parametrize("query_tile", [1, 2, 4, 16])
 @pytest.mark.parametrize("use_active_count", [False, True])
 def test_active_metadata_graph_replay_and_prefix_bounds(query_tile, use_active_count):
@@ -8874,8 +9187,8 @@ def test_engine_page_correlated_sampling(page_size, top_k, high_on_sampled):
 @pytest.mark.parametrize("query_tile", [1, 16])
 def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio, query_tile):
     """The separated layer consumes the last device-planned lengths and map."""
-    from flashinfer.attn_scores.fp8_kernel_config import FP8MQAKernelConfig
-    from flashinfer.attn_scores.query_group_metadata import FP8QueryGroups
+    from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
+    from flashinfer.attn_scores.query_group_metadata import _FP8QueryGroups
 
     spec = importlib.util.spec_from_file_location(
         "bench_fp8_mqa_selective_logits",
@@ -8892,7 +9205,7 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio, query_tile):
     q, keys, scales, weights, qo_indptr, physical_kv = inputs
     pool, table = _paged_inputs(inputs)
     kv_indptr = physical_kv * ratio
-    groups = FP8QueryGroups.build(
+    groups = _FP8QueryGroups.build(
         qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist(), ratio, query_tile
     )
     full = benchmark._FullGVR(
@@ -8901,7 +9214,7 @@ def test_benchmark_full_step_refreshes_lengths_and_page_maps(ratio, query_tile):
         weights,
         table,
         groups,
-        FP8MQAKernelConfig(128, 1, 160, query_tile, num_q_stages=3, num_kv_stages=3),
+        _FP8MQAKernelConfig(128, 1, 160, query_tile, num_q_stages=3, num_kv_stages=3),
         512,
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
@@ -9044,16 +9357,22 @@ def test_capacity_step_shape_writes_skip_repeats_until_outer_capture():
 
 @_requires_selective_sm100
 def test_capacity_constructor_contract(monkeypatch):
-    """Selective construction owns capacities and one pool layout; full takes none."""
+    """Both strategies reserve capacities and inspect an unretained pool layout."""
     inputs = _request_inputs([2], [1024])
     q, _, _, weights, qo, kv = inputs
     pool, table = _paged_inputs(inputs)
     capacities = dict(max_context_length=1024, max_chunk_size=2, max_batch_size=1)
-    with pytest.raises(ValueError, match="only supported by selective"):
-        FP8PagedMQATopKWrapper(strategy="full", **capacities)
-    with pytest.raises(ValueError, match="only supported by selective"):
+    full = FP8PagedMQATopKWrapper(strategy="full", **capacities, kv_layout=pool)
+    assert set(full.input_buffers()) == {
+        "q",
+        "weights",
+        "qo_indptr",
+        "kv_indptr",
+        "block_table",
+    }
+    with pytest.raises(ValueError, match="both strategies require"):
         FP8PagedMQATopKWrapper(strategy="full", kv_layout=pool)
-    with pytest.raises(ValueError, match="requires max_context_length"):
+    with pytest.raises(ValueError, match="both strategies require"):
         FP8PagedMQATopKWrapper(strategy="selective", kv_layout=pool)
     with pytest.raises(ValueError, match="kv_layout or num_pages and device"):
         FP8PagedMQATopKWrapper(strategy="selective", **capacities)
@@ -9214,6 +9533,38 @@ def test_capacity_capture_binds_unprepared_pool(ratio):
     _check_selection(w.run(q, weights, pool_b), _oracle_rows(inputs_b), 512)
     torch.cuda.synchronize()
     assert len(w._capacity_plan._pool_graphs) == 2
+
+
+def test_selective_compile_materializes_before_publication(monkeypatch):
+    cute_module = pytest.importorskip("cutlass.cute")
+    events = []
+    compiled = SimpleNamespace(to=lambda device: events.append(("load", device)))
+
+    def compile_kernel(*args, **kwargs):
+        events.append(("compile", kwargs["options"]))
+        return compiled
+
+    monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(cute_module, "compile", compile_kernel)
+    assert sl._compile_for_device(torch.device("cuda:2"), object()) is compiled
+    assert events == [("compile", "--gpu-arch sm_100a"), ("load", 2)]
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("heads,ratio", [(64, 4), (64, 1), (8, 4)])
+def test_capacity_materializes_kernels_before_capture(monkeypatch, heads, ratio):
+    """First-use CuTe libraries must load before owned or caller capture."""
+    from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitCompiledFunction
+
+    original = CudaDialectJitCompiledFunction._load_cuda_library
+
+    def load(compiled):
+        assert not torch.cuda.is_current_stream_capturing(), compiled.function_name
+        return original(compiled)
+
+    monkeypatch.setattr(CudaDialectJitCompiledFunction, "_load_cuda_library", load)
+    test_capacity_shared_layer_workspace(heads, ratio)
 
 
 @_requires_selective_sm100
@@ -10214,6 +10565,7 @@ def test_capture_restores_gc_state(monkeypatch, enabled, fail):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 7)
     monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    monkeypatch.setattr(sl, "_check_capture_status", lambda stream, step: None)
     original = gc.isenabled()
     try:
         (gc.enable if enabled else gc.disable)()
@@ -10233,6 +10585,143 @@ def test_capture_restores_gc_state(monkeypatch, enabled, fail):
         assert caller_stream.waits == ([] if fail else [capture_stream])
     finally:
         (gc.enable if original else gc.disable)()
+
+
+@pytest.mark.parametrize("error,status", [(0, 0), (0, 1), (0, 2), (901, 2)])
+def test_capture_status_names_invalid_boundary(monkeypatch, error, status):
+    runtime = SimpleNamespace(
+        cudaError_t=SimpleNamespace(cudaSuccess=0),
+        cudaStreamCaptureStatus=SimpleNamespace(cudaStreamCaptureStatusInvalidated=2),
+        cudaStreamGetCaptureInfo=lambda stream: (error, status, 123),
+    )
+    monkeypatch.setattr(sl, "_capture_runtime", lambda: runtime)
+    stream = SimpleNamespace(cuda_stream=17)
+    if error or status == 2:
+        with pytest.raises(RuntimeError, match="after predicate launch"):
+            sl._check_capture_status(stream, "predicate launch")
+    else:
+        sl._check_capture_status(stream, "predicate launch")
+
+
+@pytest.mark.parametrize("fail_at", ["capture_begin", "capture body", "capture_end"])
+def test_capture_status_failure_ends_capture_and_restores_gc(monkeypatch, fail_at):
+    events = []
+    stream = SimpleNamespace(cuda_stream=17, wait_stream=lambda other: None)
+
+    def check(stream, step):
+        events.append(step)
+        if step == fail_at:
+            raise sl._CaptureStatusError(f"invalid after {step}")
+
+    monkeypatch.setattr(sl, "_check_capture_status", check)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    graph = SimpleNamespace(
+        capture_begin=lambda: events.append("begin"),
+        capture_end=lambda: events.append("end"),
+    )
+    original = gc.isenabled()
+    with (
+        pytest.raises(sl._CaptureStatusError, match=f"after {fail_at}"),
+        sl._capture_cuda_graph(graph),
+    ):
+        events.append("body")
+    assert events.count("end") == 1
+    assert gc.isenabled() == original
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("query_error", [sl._CaptureStatusError, ValueError])
+def test_capture_status_query_failure_preserves_body_and_cleans_up(
+    monkeypatch, cleanup_fails, query_error
+):
+    events = []
+    stream = SimpleNamespace(cuda_stream=17, wait_stream=lambda other: None)
+
+    def check(stream, step):
+        if step.endswith("exception"):
+            raise query_error("query failure")
+
+    def end():
+        events.append("end")
+        if cleanup_fails:
+            raise RuntimeError("cleanup failure")
+
+    monkeypatch.setattr(sl, "_check_capture_status", check)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    graph = SimpleNamespace(capture_begin=lambda: None, capture_end=end)
+    original = gc.isenabled()
+    with (
+        pytest.raises(sl._CaptureStatusError, match="query failure") as caught,
+        sl._capture_cuda_graph(graph),
+    ):
+        raise RuntimeError("original body failure")
+    assert str(caught.value.__cause__) == "original body failure"
+    assert ("cleanup failure" in str(caught.value)) == cleanup_fails
+    assert events == ["end"]
+    assert gc.isenabled() == original
+
+
+@pytest.mark.parametrize(
+    "fail_at",
+    [
+        None,
+        "plan input copies",
+        "plan repair-status reset",
+        "plan metadata refresh",
+        "plan sampling refresh",
+        "plan schedule refresh",
+    ],
+)
+def test_capacity_caller_capture_names_plan_boundary(monkeypatch, fail_at):
+    from flashinfer.attn_scores.selective_capacity import _CapacitySelectiveTopKPlan
+
+    checks = []
+    stream = SimpleNamespace(cuda_stream=17)
+
+    def check(actual_stream, step):
+        assert actual_stream is stream
+        checks.append(step)
+        if step == fail_at:
+            raise sl._CaptureStatusError(f"invalid after {step}")
+
+    monkeypatch.setattr(sl, "_check_capture_status", check)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    plan = SimpleNamespace(
+        _capacity=SimpleNamespace(max_chunk_size=4),
+        _state=SimpleNamespace(
+            device="cuda:0",
+            is_prepared=True,
+            stage_step=lambda *args, **kwargs: None,
+            refresh=lambda: None,
+            refresh_sampling=lambda: None,
+        ),
+        _layout_needs_engine=lambda: False,
+        _repair_error=SimpleNamespace(zero_=lambda: None),
+        _needs_sampling=True,
+        _refresh_schedules=lambda: None,
+        _step_prepared=True,
+    )
+    plan._check_caller_capture = lambda capturing, step: (
+        _CapacitySelectiveTopKPlan._check_caller_capture(plan, capturing, step)
+    )
+    prefix = SimpleNamespace(numel=lambda: 2)
+    if fail_at is not None:
+        with pytest.raises(sl._CaptureStatusError, match=fail_at):
+            _CapacitySelectiveTopKPlan.plan(plan, prefix, prefix, object())
+        assert not plan._step_prepared
+        assert checks[-1] == fail_at
+    else:
+        _CapacitySelectiveTopKPlan.plan(plan, prefix, prefix, object())
+        assert plan._step_prepared
+        assert len(checks) == 5
 
 
 def _case():

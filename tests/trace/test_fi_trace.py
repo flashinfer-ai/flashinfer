@@ -265,18 +265,28 @@ def test_fp8_paged_mqa_topk_bound_trace(math_mode, monkeypatch):
 def test_fp8_paged_mqa_full_positional_trace():
     import inspect
 
-    wrapper = flashinfer.FP8PagedMQATopKWrapper(strategy="full")
-    wrapper._full_graph_identity = object()
-    wrapper._cu_q = torch.tensor([0, 2], dtype=torch.int32)
-    wrapper._cu_kv = torch.tensor([0, 64], dtype=torch.int32)
-    wrapper._top_k = 512
+    from types import SimpleNamespace
+
+    wrapper = object.__new__(flashinfer.FP8PagedMQATopKWrapper)
+    wrapper._strategy = "full"
+    wrapper._capacity_plan = None
+    wrapper._math_mode = wrapper._math_mode_at_construction = "relu_strict"
+    wrapper._compression_ratio = wrapper._compression_ratio_at_construction = 1
+    wrapper._full_top_k = 512
+    wrapper._full_batches = 1
+    wrapper._full_step_is_prepared = True
     q = torch.empty(2, 8, 128, dtype=torch.float8_e4m3fn)
     kv = torch.empty(1, 64, 1, 132, dtype=torch.uint8)
     weights = torch.empty(2, 8)
     table = torch.zeros(1, 1, dtype=torch.int32)
-    bound = inspect.signature(wrapper.run).bind(q, weights, kv, block_table=table)
+    wrapper._full_state = SimpleNamespace(
+        qo_indptr=torch.tensor([0, 2], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 64], dtype=torch.int32),
+        block_table=table,
+    )
+    bound = inspect.signature(wrapper.run).bind(q, weights, kv)
     positional = fi_trace(wrapper.run, **bound.arguments)
-    named = fi_trace(wrapper.run, q=q, weights=weights, kv_fused=kv, block_table=table)
+    named = fi_trace(wrapper.run, q=q, weights=weights, kv_fused=kv)
     assert positional == named
     assert positional["axes"]["num_heads"]["value"] == 8
     assert positional["axes"]["page_size"]["value"] == 64

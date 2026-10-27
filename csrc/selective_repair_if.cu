@@ -27,8 +27,8 @@ using tvm::ffi::Optional;
 
 namespace {
 
-void CheckCuda(cudaError_t status) {
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
+void CheckCuda(cudaError_t status, const char* step = "selective repair CUDA call") {
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << step << ": " << cudaGetErrorString(status);
 }
 
 // PyTorch's round-robin stream pool can alias the active parent capture stream;
@@ -41,6 +41,10 @@ struct RepairBodyStream {
 
   explicit RepairBodyStream(int device) : device(device) {
     ffi::CUDADeviceGuard guard(device);
+    cudaFuncAttributes attributes;
+    CheckCuda(
+        cudaFuncGetAttributes(&attributes, flashinfer::attention::SetSelectiveRepairCondition),
+        "materialize selective repair predicate");
     CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   }
 
@@ -95,12 +99,28 @@ void AbortSelectiveRepairBody(TensorView anchor, int64_t stream_handle) {
 }
 
 void CaptureInfo(cudaStream_t stream, cudaStreamCaptureStatus* status, unsigned long long* id,
-                 cudaGraph_t* graph, const cudaGraphNode_t** dependencies, size_t* count) {
+                 cudaGraph_t* graph, const cudaGraphNode_t** dependencies, size_t* count,
+                 const char* step) {
 #if CUDART_VERSION >= 13000
-  CheckCuda(cudaStreamGetCaptureInfo(stream, status, id, graph, dependencies, nullptr, count));
+  CheckCuda(cudaStreamGetCaptureInfo(stream, status, id, graph, dependencies, nullptr, count),
+            step);
 #else
-  CheckCuda(cudaStreamGetCaptureInfo_v3(stream, status, id, graph, dependencies, nullptr, count));
+  CheckCuda(cudaStreamGetCaptureInfo_v3(stream, status, id, graph, dependencies, nullptr, count),
+            step);
 #endif
+  TVM_FFI_ICHECK_NE(*status, cudaStreamCaptureStatusInvalidated)
+      << "selective repair capture invalidated after " << step;
+}
+
+// These host queries neither synchronize nor add graph nodes. Check each mutation
+// before the next API can obscure its failure with a downstream capture error.
+void CheckCapture(cudaStream_t stream, const char* step) {
+  cudaStreamCaptureStatus status;
+  unsigned long long id;
+  cudaGraph_t graph;
+  const cudaGraphNode_t* dependencies;
+  size_t count;
+  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count, step);
 }
 
 void CheckVector(TensorView tensor, int device, int64_t size) {
@@ -135,15 +155,18 @@ Array<int64_t> BeginSelectiveRepairIf(TensorView flags, TensorView second_flags,
   cudaGraph_t graph;
   const cudaGraphNode_t* dependencies;
   size_t count;
-  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count);
+  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count, "begin_if entry");
   TVM_FFI_ICHECK_EQ(status, cudaStreamCaptureStatusActive);
   cudaGraphConditionalHandle handle;
-  CheckCuda(cudaGraphConditionalHandleCreate(&handle, graph, 0, cudaGraphCondAssignDefault));
+  CheckCuda(cudaGraphConditionalHandleCreate(&handle, graph, 0, cudaGraphCondAssignDefault),
+            "cudaGraphConditionalHandleCreate");
+  CheckCapture(stream, "cudaGraphConditionalHandleCreate");
   flashinfer::attention::SetSelectiveRepairCondition<<<1, 256, 0, stream>>>(
       static_cast<const int32_t*>(flags.data_ptr()), static_cast<int32_t*>(second_flags.data_ptr()),
       static_cast<int32_t*>(exact_error.data_ptr()), first_ptr, second_ptr, flags.numel(), handle);
-  CheckCuda(cudaGetLastError());
-  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count);
+  CheckCuda(cudaGetLastError(), "SetSelectiveRepairCondition launch");
+  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count,
+              "SetSelectiveRepairCondition launch");
   cudaGraphNodeParams params{};
   params.type = cudaGraphNodeTypeConditional;
   params.conditional.handle = handle;
@@ -151,10 +174,13 @@ Array<int64_t> BeginSelectiveRepairIf(TensorView flags, TensorView second_flags,
   params.conditional.size = 1;
   cudaGraphNode_t node;
 #if CUDART_VERSION >= 13000
-  CheckCuda(cudaGraphAddNode(&node, graph, dependencies, nullptr, count, &params));
+  CheckCuda(cudaGraphAddNode(&node, graph, dependencies, nullptr, count, &params),
+            "cudaGraphAddNode conditional IF");
 #else
-  CheckCuda(cudaGraphAddNode_v2(&node, graph, dependencies, nullptr, count, &params));
+  CheckCuda(cudaGraphAddNode_v2(&node, graph, dependencies, nullptr, count, &params),
+            "cudaGraphAddNode conditional IF");
 #endif
+  CheckCapture(stream, "cudaGraphAddNode conditional IF");
   // CUDA owns the body graph and handle for the lifetime of this parent graph.
   return {static_cast<int64_t>(id), reinterpret_cast<int64_t>(node),
           reinterpret_cast<int64_t>(params.conditional.phGraph_out[0])};
@@ -164,13 +190,21 @@ void BeginSelectiveRepairBody(TensorView anchor, int64_t stream_handle, int64_t 
   ffi::CUDADeviceGuard guard(anchor.device().device_id);
   CheckCuda(cudaStreamBeginCaptureToGraph(reinterpret_cast<cudaStream_t>(stream_handle),
                                           reinterpret_cast<cudaGraph_t>(graph_handle), nullptr,
-                                          nullptr, 0, cudaStreamCaptureModeRelaxed));
+                                          nullptr, 0, cudaStreamCaptureModeRelaxed),
+            "cudaStreamBeginCaptureToGraph repair body");
+  CheckCapture(reinterpret_cast<cudaStream_t>(stream_handle),
+               "cudaStreamBeginCaptureToGraph repair body");
+  CheckCapture(get_stream(anchor.device()), "repair body begin parent");
 }
 
 void EndSelectiveRepairBody(TensorView anchor, int64_t stream_handle, int64_t graph_handle) {
   ffi::CUDADeviceGuard guard(anchor.device().device_id);
   cudaGraph_t graph;
-  CheckCuda(cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(stream_handle), &graph));
+  CheckCapture(reinterpret_cast<cudaStream_t>(stream_handle), "repair body operations");
+  CheckCuda(cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(stream_handle), &graph),
+            "cudaStreamEndCapture repair body");
+  CheckCapture(reinterpret_cast<cudaStream_t>(stream_handle), "cudaStreamEndCapture repair body");
+  CheckCapture(get_stream(anchor.device()), "repair body end parent");
   TVM_FFI_ICHECK(graph == reinterpret_cast<cudaGraph_t>(graph_handle));
 }
 
@@ -183,18 +217,21 @@ void FinishSelectiveRepairIf(TensorView anchor, Array<int64_t> state) {
   cudaGraph_t graph;
   const cudaGraphNode_t* dependencies;
   size_t count;
-  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count);
+  CaptureInfo(stream, &status, &id, &graph, &dependencies, &count, "finish_if entry");
   TVM_FFI_ICHECK(status == cudaStreamCaptureStatusActive && id == state[0]);
   auto node = reinterpret_cast<cudaGraphNode_t>(state[1]);
   // Work captured after run() must depend on the whole conditional, including
   // an executed repair body, rather than just the predicate kernel.
 #if CUDART_VERSION >= 13000
   CheckCuda(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1,
-                                                cudaStreamSetCaptureDependencies));
+                                                cudaStreamSetCaptureDependencies),
+            "cudaStreamUpdateCaptureDependencies");
 #else
   CheckCuda(cudaStreamUpdateCaptureDependencies_v2(stream, &node, nullptr, 1,
-                                                   cudaStreamSetCaptureDependencies));
+                                                   cudaStreamSetCaptureDependencies),
+            "cudaStreamUpdateCaptureDependencies");
 #endif
+  CheckCapture(stream, "cudaStreamUpdateCaptureDependencies");
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(begin_if, BeginSelectiveRepairIf);

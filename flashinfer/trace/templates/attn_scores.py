@@ -316,14 +316,9 @@ class _FP8LogitsTraceTemplate(TraceTemplate):
         base_fi_trace = super().build_fi_trace_fn(fi_api)
 
         def fi_trace(save_dir=None, name=None, **kwargs):
-            if (
-                kwargs.get("query_metadata") is not None
-                or kwargs.get("output_rows") is not None
-                or getattr(kwargs.get("kernel_config"), "query_tile", 1) > 1
-            ):
-                raise ValueError(
-                    "fp8_paged_mqa_logits trace export does not support grouped "
-                    "query metadata or output rows"
+            if {"query_metadata", "output_rows", "kernel_config"} & kwargs.keys():
+                raise TypeError(
+                    "grouped scorer options are private and cannot be traced"
                 )
             _validate_fp8_logits_trace_precision(
                 kwargs.get("output_dtype", torch.float32),
@@ -605,22 +600,27 @@ def _fp8_paged_mqa_selective_topk_init(
     kv_fused = _pack_fused_kv_fp8(kv, scales, page_size, head_dim)
     weights = torch.randn(total_q, num_heads, dtype=torch.float32, device=device)
     return {
+        "constructor": {
+            "strategy": "full",
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "page_size": page_size,
+            "top_k": top_k,
+            "max_context_length": max_kv_len,
+            "max_chunk_size": total_q,
+            "max_batch_size": batch_size,
+            "kv_layout": kv_fused,
+        },
         "plan": {
-            "q": q,
-            "kv_fused": kv_fused,
-            "weights": weights,
             "qo_indptr": qo_indptr,
             "kv_indptr": kv_indptr,
             "block_table": block_table,
-            "top_k": top_k,
-            "num_heads": num_heads,
-            "head_dim": head_dim,
+            "num_query_rows": total_q,
         },
         "run": {
             "q": q,
             "kv_fused": kv_fused,
             "weights": weights,
-            "block_table": block_table,
         },
     }
 
@@ -635,7 +635,7 @@ _fp8_paged_mqa_selective_topk_init._trace_init_dependencies = (  # type: ignore[
 
 
 class _SelectiveTopKTraceTemplate(TraceTemplate):
-    """Inject plan-owned metadata when tracing a live selective wrapper."""
+    """Inject plan-owned metadata when tracing a live full-strategy wrapper."""
 
     def build_fi_trace_fn(self, fi_api):
         base_fi_trace = super().build_fi_trace_fn(fi_api)
@@ -643,9 +643,12 @@ class _SelectiveTopKTraceTemplate(TraceTemplate):
         def fi_trace(save_dir=None, name=None, **kwargs):
             wrapper = kwargs.get("self")
             if wrapper is not None:
-                kwargs.setdefault("qo_indptr", getattr(wrapper, "_cu_q", None))
-                kwargs.setdefault("kv_indptr", getattr(wrapper, "_cu_kv", None))
-                kwargs.setdefault("top_k", getattr(wrapper, "_top_k", 512))
+                state = wrapper._full_state
+                batches = wrapper._full_batches
+                kwargs.setdefault("qo_indptr", state.qo_indptr[: batches + 1])
+                kwargs.setdefault("kv_indptr", state.kv_indptr[: batches + 1])
+                kwargs.setdefault("block_table", state.block_table[:batches])
+                kwargs.setdefault("top_k", wrapper._full_top_k)
                 kwargs["math_mode"] = wrapper.math_mode
                 if getattr(wrapper, "compression_ratio", 1) != 1:
                     kwargs["compression_ratio"] = wrapper.compression_ratio
@@ -700,6 +703,7 @@ fp8_paged_mqa_topk_trace = _SelectiveTopKTraceTemplate(
         "block_table": Tensor(
             ["batch_size", "max_pages_per_request"],
             dtype="int32",
+            optional=True,
             description="Logical-to-physical KV page mapping.",
         ),
         "qo_indptr": Tensor(
@@ -1094,7 +1098,8 @@ def _capacity_topk_init(
         top_k=top_k,
         device=device,
         seed=seed,
-    )["plan"]
+    )
+    initial = {**initial["plan"], **initial["run"]}
     table = initial["block_table"]
     if max_batch_size > batch_size:
         table = torch.cat(
@@ -1341,7 +1346,7 @@ def fp8_paged_mqa_topk_trace_dispatch(**kwargs):
             if wrapper.compression_ratio == 4
             else fp8_paged_mqa_selective_topk_trace
         )
-    if getattr(wrapper, "_full_graph_identity", None) is None:
+    if not getattr(wrapper, "_full_step_is_prepared", False):
         raise RuntimeError("plan() must be called before tracing run()")
     return fp8_paged_mqa_topk_trace
 

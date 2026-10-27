@@ -23,14 +23,14 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class FP8MQAKernelConfig:
+class _FP8MQAKernelConfig:
     """Explicit configuration for strict-FP32 paged MQA scoring.
 
     Parameters
     ----------
     compute_block_kv : int
         KV tokens per MMA tile (the M extent). Executable dispatch currently
-        supports 128; geometric validation also recognizes 64 and 256.
+        supports only 128.
     num_epi_subtiles : int
         Number of head subdivisions used to reduce and store each score tile.
     w_cache_regs : int
@@ -81,6 +81,8 @@ class FP8MQAKernelConfig:
             <= 0
         ):
             raise ValueError("FP8 configuration fields must be positive")
+        if self.compute_block_kv != 128:
+            raise ValueError("compute_block_kv must be 128 for the single-CTA scorer")
         for stages in (self.num_q_stages, self.num_kv_stages):
             if stages is not None and (type(stages) is not int or stages not in (2, 3)):
                 raise ValueError("explicit Q/KV stages must be 2 or 3")
@@ -163,7 +165,7 @@ class FP8MQAKernelConfig:
             raise ValueError("geometry fields must be positive")
         if dimension % 32:
             raise ValueError("head dimension must be a multiple of the MMA K32")
-        if self.compute_block_kv not in (64, 128, 256):
+        if self.compute_block_kv != 128:
             raise ValueError("unsupported FP8 MMA M extent")
         n = heads * next_n
         if self.query_tile > 1 and next_n != self.query_tile:
@@ -181,9 +183,5 @@ class FP8MQAKernelConfig:
         Raises ValueError for a tile lacking supported schedule/store and TMEM
         ownership. This check does not compile a kernel or query a device.
         """
-        if self.compute_block_kv == 256:
-            raise ValueError(
-                "compute_block_kv=256 is unsupported; the scorer requires 128"
-            )
         if self.compute_block_kv != 128:
             raise ValueError("compute_block_kv must be 128 for the single-CTA scorer")

@@ -17,6 +17,13 @@
 
 #include "tvm_ffi_utils.h"
 
+void prepare_selective_sample_ladder(int64_t device) {
+  ffi::CUDADeviceGuard guard(static_cast<int>(device));
+  cudaFuncAttributes attributes;
+  auto status = cudaFuncGetAttributes(&attributes, flashinfer::attention::SelectiveSampleLadder);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
+}
+
 void selective_sample_ladder(TensorView samples, TensorView valid, TensorView ranks,
                              TensorView ends, TensorView thresholds, TensorView selected_bins,
                              TensorView ladder, TensorView populations, int64_t top_k,
@@ -63,3 +70,4 @@ void selective_sample_ladder(TensorView samples, TensorView valid, TensorView ra
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, selective_sample_ladder);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(prepare, prepare_selective_sample_ladder);

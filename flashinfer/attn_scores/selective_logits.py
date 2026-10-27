@@ -30,7 +30,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Tuple, overload
+from typing import Any, Literal, Tuple
 
 import torch
 
@@ -107,6 +107,34 @@ _WARP_STRIPED_PUBLICATION: Literal["warp_striped"] = "warp_striped"
 _WARP_POOLED_PUBLICATION: Literal["warp_pooled"] = "warp_pooled"
 
 
+class _CaptureStatusError(RuntimeError):
+    """A host boundary observed an invalidated CUDA capture."""
+
+
+@functools.cache
+def _capture_runtime():
+    # Resolve bindings before capture, without compiling a native helper.
+    try:
+        from cuda.bindings import runtime
+    except ImportError:  # CUDA Python before the bindings namespace split
+        from cuda import cudart as runtime
+
+    return runtime
+
+
+def _check_capture_status(stream, step):
+    runtime = _capture_runtime()
+    result = runtime.cudaStreamGetCaptureInfo(stream.cuda_stream)
+    error, status = result[:2]
+    if error != runtime.cudaError_t.cudaSuccess or (
+        status == runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusInvalidated
+    ):
+        raise _CaptureStatusError(
+            f"CUDA graph capture invalid after {step}: "
+            f"cudaStreamGetCaptureInfo returned {error}, capture status {status}"
+        )
+
+
 @contextmanager
 def _capture_cuda_graph(graph):
     """Capture on the input device without collecting or flushing allocators."""
@@ -119,17 +147,41 @@ def _capture_cuda_graph(graph):
         gc.disable()
     try:
         with torch.cuda.stream(capture_stream):
-            graph.capture_begin()
+            _check_capture_status(capture_stream, "owned capture entry")
+            step = "capture_begin"
             try:
+                graph.capture_begin()
+                _check_capture_status(capture_stream, "capture_begin")
+                step = "capture body"
                 yield
+                _check_capture_status(capture_stream, "capture body")
             except BaseException as error:
+                diagnostic = None
+                if not isinstance(error, _CaptureStatusError):
+                    try:
+                        _check_capture_status(capture_stream, f"{step} exception")
+                    except BaseException as status_error:
+                        diagnostic = status_error
                 try:
                     graph.capture_end()
                 except BaseException as cleanup_error:
+                    if diagnostic is not None:
+                        raise _CaptureStatusError(
+                            f"{step} exception capture-state check: {diagnostic}; "
+                            f"capture_end cleanup also failed: {cleanup_error}"
+                        ) from error
                     raise error from cleanup_error
+                if diagnostic is not None:
+                    raise _CaptureStatusError(
+                        f"{step} exception capture-state check: {diagnostic}"
+                    ) from error
                 raise
             else:
-                graph.capture_end()
+                try:
+                    graph.capture_end()
+                except BaseException as error:
+                    raise RuntimeError("CUDA graph capture_end failed") from error
+                _check_capture_status(capture_stream, "capture_end")
         caller_stream.wait_stream(capture_stream)
     finally:
         if gc_enabled:
@@ -720,7 +772,11 @@ def _compile_for_device(device: torch.device, kernel, *args):
         max_registers = getattr(kernel, "ptxas_max_registers", None)
         if max_registers is not None:
             options += f" --ptxas-options=--maxrregcount={max_registers}"
-        return cute.compile(kernel, *args, options=options)
+        compiled = cute.compile(kernel, *args, options=options)
+        # Compilation alone leaves CuTe's CUDA library/function resolution lazy.
+        # Resolve it before publishing the launch into a graph-capture cache.
+        compiled.to(_device_ordinal(device))
+        return compiled
 
 
 def _require_cute() -> None:
@@ -3372,9 +3428,11 @@ class _FP8PagedMQASelectiveTopKEngine:
             launch_selective_sample_ladder,
         )
 
+        sample_threshold_module = get_selective_sample_ladder_module()
+        sample_threshold_module.prepare(_device_ordinal(self._thresholds.device))
         sample_threshold_compiled = launch_selective_sample_ladder
         sample_threshold_args = (
-            get_selective_sample_ladder_module(),
+            sample_threshold_module,
             self._sample_scores,
             self._sample_ends,
             self._sample_ranks,
@@ -3788,6 +3846,8 @@ class _FP8PagedMQASelectiveTopKEngine:
             )
 
         stream = _current_stream(q.device)
+        capturing = torch.cuda.is_current_stream_capturing()
+        capture_stream = torch.cuda.current_stream(q.device) if capturing else None
         if self._needs_sampling:
             # The direct sampler writes every eligible score. Threshold kernels
             # read only _sample_ends, so the unused suffix needs no per-run clear.
@@ -3803,10 +3863,14 @@ class _FP8PagedMQASelectiveTopKEngine:
                 index_counts=self._sample_scratch,
                 sample_page_indices=self._sample_page_indices,
             )
+            if capturing:
+                _check_capture_status(capture_stream, "sample scorer")
             sample_threshold_compiled, sample_threshold_args = (
                 self._sample_threshold_launch
             )
             sample_threshold_compiled(*sample_threshold_args, stream)
+            if capturing:
+                _check_capture_status(capture_stream, "sample threshold ladder")
         elif not _sampling_policy_initialized:
             self._thresholds.fill_(float("-inf"))
             self._sample_ladder.fill_(float("-inf"))
@@ -3826,6 +3890,8 @@ class _FP8PagedMQASelectiveTopKEngine:
             _candidate_counts_precleared=_candidate_counts_precleared,
             _h64_candidate=self._candidate_schedule.h64_candidate,
         )
+        if capturing:
+            _check_capture_status(capture_stream, "candidate scorer")
         if not ((self._rows > 1) and self._candidate_counts.shape[1] > 1):
             _finalize_fp8_mqa_packed_candidates(
                 self._candidate_counts,
@@ -3838,11 +3904,18 @@ class _FP8PagedMQASelectiveTopKEngine:
                 _candidate_prepared=self._candidate_prepared,
                 row_ends=self._row_ends,
             )
+            if capturing:
+                _check_capture_status(capture_stream, "candidate finalizer")
         packed_topk_compiled, packed_topk_args = self._packed_topk_launch
         packed_topk_compiled(*packed_topk_args, stream)
+        if capturing:
+            _check_capture_status(capture_stream, "packed TopK")
 
         # Every final-output writer pads short rows with -1 for every ratio.
-        return self._enqueue_repair(q, kv_fused, weights, block_table)
+        selected = self._enqueue_repair(q, kv_fused, weights, block_table)
+        if capturing:
+            _check_capture_status(capture_stream, "repair enqueue")
+        return selected
 
     def _run_repair(
         self,
@@ -4032,8 +4105,8 @@ class FP8PagedMQATopKWrapper:
     an unretained ``kv_layout`` exemplar or from ``num_pages`` and ``device``.
     ``plan(qo_indptr, kv_indptr, block_table)`` binds step metadata;
     ``run(q, weights, kv_fused, *, out=None)`` shares the workspace across layers.
-    Full retains its payload/prefix ``plan`` and address-bound pool/table
-    contract. Both return stable
+    Full uses the same constructor, step-plan and layer-run signatures;
+    its host-planned groups require plan outside capture. Both return stable
     request-local int32 indices with shape ``[supplied_q_rows, top_k]``.
 
     Full always uses GVR-v2 and owns independent per-plan scratch. Selective
@@ -4079,9 +4152,9 @@ class FP8PagedMQATopKWrapper:
         num_pages: int | None = None,
         device: torch.device | str | int | None = None,
     ) -> None:
-        """Specialize the strategy; selective also reserves its fixed capacities.
+        """Specialize either strategy and reserve its fixed input capacities.
 
-        Selective requires ``max_context_length``, ``max_chunk_size`` and
+        Both strategies require ``max_context_length``, ``max_chunk_size`` and
         ``max_batch_size`` plus the KV pool layout: either ``kv_layout``, a
         contiguous CUDA uint8 ``[num_pages, page_size, 1, head_dim + 4]``
         exemplar whose shape, strides, dtype and device are read without
@@ -4091,14 +4164,17 @@ class FP8PagedMQATopKWrapper:
         ``max_batch_size`` rows and enough columns for the maximum per-request
         physical extent. Construction allocates the step workspace outside
         CUDA graph capture without compiling kernels. The first ``prepare_pool``
-        or eager ``run`` compiles metadata kernels and allocates/compiles the
-        shared scoring chain when physical capacity is nonempty. Unsupported
+        or eager ``run`` compiles scoring kernels and reserves score scratch.
+        Full requires ``plan`` before preparation and reads prefixes on the host;
+        each new full plan invalidates the previous pool graphs. Selective can
+        prepare the layout before its first step and refresh metadata in capture.
+        Unsupported
         scoring specializations are rejected when that chain is first built;
         an empty physical capacity returns -1 results without building it.
         Construction validates capacities, layout and device, but does not
         validate the scoring kernel specialization. Construction requires CUDA.
         Capacities and layout are immutable:
-        construct another wrapper to change them. Full takes none of these.
+        construct another wrapper to change them. Both strategies use these bounds.
 
         In a serving engine, construct the selective wrapper after allocating
         the indexer KV cache and before graph capture. Recreate it when the
@@ -4110,17 +4186,16 @@ class FP8PagedMQATopKWrapper:
         Args:
             strategy: ``"full"`` for public logits plus GVR-v2, or
                 ``"selective"`` for bounded candidates with exact repair.
-            num_heads: Number of query heads for selective scoring.
+            num_heads: Number of query heads for scoring.
             head_dim: Query/key dimension, divisible by 32.
             page_size: KV tokens per physical page: 32, 64 or 128.
-            top_k: Selective output width, an integer from 1 through 2048.
+            top_k: Output width: selective 1..2048; full 512, 1024 or 2048.
             math_mode: Immutable ``"relu_strict"`` or ``"relu_fast"`` policy.
             compression_ratio: Original tokens per stored key, 1 or 4.
                 Full supports only 1.
-            max_context_length: Selective maximum original-token context per
-                request. Required for selective.
-            max_chunk_size: Selective maximum total supplied query rows.
-            max_batch_size: Selective maximum number of requests per step.
+            max_context_length: Maximum original-token context per request.
+            max_chunk_size: Maximum total supplied query rows.
+            max_batch_size: Maximum number of requests per step.
             kv_layout: Optional contiguous CUDA uint8 KV layout exemplar of
                 shape ``[num_pages, page_size, 1, head_dim + 4]``. Not retained.
             num_pages: Physical page capacity, instead of an exemplar.
@@ -4144,16 +4219,12 @@ class FP8PagedMQATopKWrapper:
         if strategy == "full" and compression_ratio != 1:
             raise ValueError("compression_ratio is only supported by selective")
         capacities = (max_context_length, max_chunk_size, max_batch_size)
-        bindings = (kv_layout, num_pages, device)
-        if strategy == "full" and any(
-            value is not None for value in (*capacities, *bindings)
-        ):
-            raise ValueError("capacities and KV layout are only supported by selective")
-        if strategy == "selective" and any(value is None for value in capacities):
+        if any(value is None for value in capacities):
             raise ValueError(
-                "selective requires max_context_length, max_chunk_size and "
-                "max_batch_size"
+                "both strategies require max_context_length, max_chunk_size and max_batch_size"
             )
+        if strategy == "full" and top_k not in (512, 1024, 2048):
+            raise ValueError("full strategy requires top_k in (512, 1024, 2048)")
         self._math_mode = math_mode
         self._math_mode_at_construction = math_mode
         self._strategy = strategy
@@ -4177,13 +4248,44 @@ class FP8PagedMQATopKWrapper:
                 compression_ratio=compression_ratio,
                 math_mode=math_mode,
             )
-        elif (num_heads, head_dim, page_size, top_k) != (
-            8,
-            128,
-            128,
-            512,
-        ):
-            raise ValueError("full strategy specialization belongs to plan()")
+        else:
+            from .selective_capacity import (
+                _CapacitySelectiveTopKPlan,
+                _CapacityStepInputs,
+                _SelectiveCapacity,
+            )
+
+            capacity = _SelectiveCapacity(
+                num_heads,
+                head_dim,
+                page_size,
+                compression_ratio,
+                max_context_length,
+                max_chunk_size,
+                max_batch_size,
+            )
+            layout, device, pages = _CapacitySelectiveTopKPlan._resolve_layout(
+                capacity, kv_layout, num_pages, device
+            )
+            self._full_state = _CapacityStepInputs(
+                capacity, device=device, num_pages=pages
+            )
+            self._full_state.q.zero_()
+            self._full_state.weights.zero_()
+            self._full_pool_layout = layout
+            self._full_pool_plans: dict[tuple[Any, ...], dict[str, Any]] = {}
+            self._full_step_is_prepared = False
+            self._full_num_heads, self._full_head_dim, self._full_top_k = (
+                num_heads,
+                head_dim,
+                top_k,
+            )
+            self._full_supplied_rows = max_chunk_size
+            self._full_batches = max_batch_size
+            self._full_q_payload = self._full_state.q
+            self._full_weight_payload = self._full_state.weights
+            self._full_block_table = self._full_state.block_table
+            self._full_repair_error = torch.zeros(1, dtype=torch.int32, device=device)
         self._full_groups: list[
             tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
@@ -4269,8 +4371,8 @@ class FP8PagedMQATopKWrapper:
         kv_prefix = cu_kv.tolist()
         if q_prefix[0] != 0 or kv_prefix[0] != 0:
             raise ValueError("cu_q and cu_kv must start at zero")
-        if q_prefix[-1] != q.shape[0]:
-            raise ValueError("cu_q[-1] must equal q.shape[0]")
+        if q_prefix[-1] > q.shape[0]:
+            raise ValueError("qo_indptr[-1] must not exceed supplied Q rows")
         if any(a > b for a, b in zip(q_prefix, q_prefix[1:], strict=False)):
             raise ValueError("cu_q must be monotonically nondecreasing")
         if any(a > b for a, b in zip(kv_prefix, kv_prefix[1:], strict=False)):
@@ -4292,7 +4394,9 @@ class FP8PagedMQATopKWrapper:
         ):
             q_len = q_end - q_begin
             kv_len = kv_end - kv_begin
-            if q_len <= 0 or kv_len < q_len:
+            if q_len == 0:
+                continue
+            if kv_len < q_len:
                 raise ValueError(
                     "full causal TopK requires nonempty Q and every KV length >= Q"
                 )
@@ -4318,7 +4422,8 @@ class FP8PagedMQATopKWrapper:
         self._kv_rows = kv_prefix[-1]
         self._cu_q = cu_q
         self._cu_kv = cu_kv
-        self._full_max_context_len = max(row_ends)
+        row_ends.extend([0] * (q.shape[0] - len(row_ends)))
+        self._full_max_context_len = max(row_ends, default=0)
         self._full_row_ends = torch.tensor(row_ends, dtype=torch.int32, device=q.device)
         score_columns = max(padded_seq_len(self._full_max_context_len), self._top_k)
         # Keep GVR2 on its streaming, spill-free path. Logical
@@ -4399,6 +4504,9 @@ class FP8PagedMQATopKWrapper:
         ).to(torch.int32)
 
         def full_impl() -> torch.Tensor:
+            if not full_groups:
+                selected.fill_(-1)
+                return selected
             for (
                 q_begin,
                 q_end,
@@ -4434,6 +4542,7 @@ class FP8PagedMQATopKWrapper:
                 backend="gvr_2",
             )
             # GVR-v2 keeps every key of a short row and pads its suffix with -1.
+            selected[q_prefix[-1] :].fill_(-1)
             return selected
 
         new_identity = _selective_logits_launch_identity(
@@ -4575,7 +4684,7 @@ class FP8PagedMQATopKWrapper:
             assert self._selected is not None
             return self._selected
 
-    @overload
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -4583,147 +4692,76 @@ class FP8PagedMQATopKWrapper:
         block_table: torch.Tensor,
         *,
         num_query_rows: int | None = None,
-    ) -> None: ...
-
-    @overload
-    def plan(
-        self,
-        q: torch.Tensor,
-        kv_fused: torch.Tensor,
-        weights: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        block_table: torch.Tensor,
-        *,
-        top_k: int = _DEFAULT_TOP_K,
-        num_heads: int = 8,
-        head_dim: int = 128,
-    ) -> None: ...
-
-    def plan(self, *args, **kwargs) -> None:
-        """Prepare metadata reused by all layers in the current step.
-
-        Selective: ``plan(qo_indptr, kv_indptr, block_table,
-        *, num_query_rows=None)`` binds device prefixes and the page map. It
-        clears status and refreshes metadata/schedules once per step.
-        Before the first pool preparation it only stages inputs; that first
-        ``prepare_pool`` or eager ``run`` validates them before scoring.
-        Prepare a pool before reading the initial step's status or capturing plan.
-        Unlike host-reading FlashInfer planners, this operation reads no device
-        values on the host and can run inside a caller's CUDA graph.
-        num_query_rows defaults to max_chunk_size and bounds supplied Q storage,
-        not the final device query prefix. KV prefixes count original tokens.
-
-        Full retains ``plan(q, kv_fused, weights, qo_indptr, kv_indptr, block_table,
-        *, top_k=512, num_heads=8, head_dim=128)`` outside capture. It reads
-        prefixes on the host and returns None; ratio1 and K512/1024/2048 apply.
+    ) -> None:
+        """Bind the current step's prefixes and page map for every layer.
 
         Args:
-            *args: Strategy-specific tensors, also accepted by keyword.
-                Selective takes CUDA int32 ``qo_indptr[B + 1]``, original-token
-                ``kv_indptr[B + 1]`` and ``block_table[B, pages_per_request]``.
-                Selective requires at least
-                ``ceil((max_context_length // compression_ratio) / page_size)``
-                columns in ``block_table``.
-                Full takes FP8 ``q[R, H, D]``, uint8 ``kv_fused``, FP32
-                ``weights[R, H]``, CUDA int32 ``qo_indptr[B + 1]``, ``kv_indptr[B + 1]``
-                and ``block_table[B, pages_per_request]``.
-            **kwargs: Selective accepts ``num_query_rows`` (default: constructed
-                ``max_chunk_size``), bounding supplied Q storage without reading
-                a device value. Full accepts ``top_k`` (512, 1024 or 2048,
-                default 512), ``num_heads`` (default 8) and ``head_dim`` (default
-                128). Selective specialization belongs to construction.
+            qo_indptr: Contiguous CUDA int32 query prefix sums ``[B + 1]``.
+            kv_indptr: Contiguous CUDA int32 original-token KV prefix sums ``[B + 1]``.
+            block_table: Contiguous CUDA int32 page map, with at least
+                ``ceil((max_context_length // compression_ratio) / page_size)`` columns.
+            num_query_rows: Supplied Q extent, default ``max_chunk_size``.
+                Active query prefixes may end below this extent.
 
         Returns:
-            None. Prepared storage and selective status belong to the wrapper.
+            None. The wrapper owns staged metadata and reset status buffers.
 
         Raises:
-            TypeError: Required inputs are missing, binding forms are mixed,
-                or arguments belong to the other strategy.
-            ValueError: Tensor metadata or specialization is unsupported.
-            RuntimeError: Capture requires an unprepared selective engine, or
-                full planning is attempted during capture.
+            ValueError: A prefix, map layout or supplied extent is invalid.
+            RuntimeError: Full planning occurs during capture, or selective
+                capture requires a scoring layout that has not been prepared.
+
+        Selective refreshes device metadata without host value reads and can
+        be captured after the layout is prepared. Full uses host prefix values
+        to build its scorer groups, so call its plan outside capture and warm
+        each pool before capturing run. Full planning synchronizes previous
+        work before replacing its per-pool score buffers and graphs. Discard
+        caller graphs from the previous full plan before replanning; they must
+        be recaptured. Both share step metadata across layers.
         """
         self._check_math_mode()
         self._check_compression_ratio()
         if self._capacity_plan is not None:
-            return self._plan_selective(*args, **kwargs)
-        return self._plan_full(*args, **kwargs)
+            return self._capacity_plan.plan(
+                qo_indptr, kv_indptr, block_table, num_query_rows=num_query_rows
+            )
+        state = self._full_state
+        with torch.cuda.device(state.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "full strategy plan must be called outside CUDA graph capture"
+                )
+            if self._full_pool_plans:
+                torch.cuda.synchronize(state.device)
+            rows = (
+                state.capacity.max_chunk_size
+                if num_query_rows is None
+                else num_query_rows
+            )
+            state.stage_step(qo_indptr, kv_indptr, block_table, num_query_rows=rows)
+            if not state.is_prepared:
+                state.prepare()
+            state.refresh()
+            self._full_repair_error.zero_()
+            self._full_pool_plans.clear()
+            self._full_supplied_rows = rows
+            self._full_batches = qo_indptr.numel() - 1
+            self._full_block_table = state.block_table[: self._full_batches]
+            self._full_q_payload = state.q[:rows]
+            self._full_weight_payload = state.weights[:rows]
+            self._full_step_is_prepared = True
 
-    @flashinfer_api
-    def _plan_selective(
-        self,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        block_table: torch.Tensor,
-        *,
-        num_query_rows: int | None = None,
-    ) -> None:
-        """Bind selective step metadata with strategy-specific API logging.
+    def _full_pool_key(self, kv_fused):
+        from .selective_capacity import _CapacitySelectiveTopKPlan
 
-        Args:
-            qo_indptr: CUDA int32 query prefix ``[B + 1]``.
-            kv_indptr: CUDA int32 original-token KV prefix ``[B + 1]``.
-            block_table: CUDA int32 physical-page map ``[B, pages_per_request]``.
-            num_query_rows: Supplied query extent, defaulting to the constructed
-                maximum rather than reading the final query prefix.
+        layout = _CapacitySelectiveTopKPlan._layout(kv_fused)
+        if layout != self._full_pool_layout or not kv_fused.is_contiguous():
+            raise ValueError("KV pool layout must match the constructed layout")
+        return kv_fused.data_ptr(), layout
 
-        Returns:
-            None. Shared step metadata and status are updated in place.
-
-        Raises:
-            ValueError: Tensor metadata or supplied extents are invalid.
-            RuntimeError: Capture requires an unprepared scoring engine.
-        """
-        return self._capacity_plan.plan(
-            qo_indptr, kv_indptr, block_table, num_query_rows=num_query_rows
-        )
-
-    @flashinfer_api
-    def _plan_full(
-        self,
-        q: torch.Tensor,
-        kv_fused: torch.Tensor,
-        weights: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        block_table: torch.Tensor,
-        *,
-        top_k: int = _DEFAULT_TOP_K,
-        num_heads: int = 8,
-        head_dim: int = 128,
-    ) -> None:
-        """Bind full payloads with their public scorer parameter names.
-
-        Args:
-            q: CUDA FP8 E4M3 queries ``[R, H, D]``.
-            kv_fused: CUDA uint8 pool ``[pages, page_size, 1, D + 4]``.
-            weights: CUDA FP32 per-head weights ``[R, H]``.
-            qo_indptr: CUDA int32 query prefix ``[B + 1]``.
-            kv_indptr: CUDA int32 KV prefix ``[B + 1]``.
-            block_table: CUDA int32 physical-page map ``[B, pages_per_request]``.
-            top_k: Output width, one of 512, 1024 or 2048.
-            num_heads: Query head count.
-            head_dim: Query/key dimension, divisible by 32.
-
-        Returns:
-            None. Full scores, GVR workspace and owned graph are prepared.
-
-        Raises:
-            ValueError: A payload, prefix or specialization is invalid.
-            RuntimeError: Planning occurs during graph capture.
-        """
-        return self._plan_full_payload(
-            q,
-            kv_fused,
-            weights,
-            qo_indptr,
-            kv_indptr,
-            block_table,
-            top_k=top_k,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )
+    def _restore_full_pool(self, binding):
+        for name, value in binding.items():
+            setattr(self, name, value)
 
     @flashinfer_api(trace=fp8_paged_mqa_topk_trace_dispatch)
     def run(
@@ -4733,7 +4771,6 @@ class FP8PagedMQATopKWrapper:
         kv_fused: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
-        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Enqueue the complete selected route and return stable int32 TopK.
 
@@ -4754,13 +4791,16 @@ class FP8PagedMQATopKWrapper:
         errors also fail closed. Inspect status after an appropriate dependency
         or synchronization; run does not synchronously raise device-value errors.
 
-        Full uses ``run(q, weights, kv_fused, *, block_table=...)`` and requires
-        its planned tensor objects, addresses and layouts. Both strategies replay
+        Full uses the same layer-call signature and stages Q/weights into
+        owned buffers. Bind the page map through plan for both strategies. Both strategies replay
         an owned graph outside capture and emit operations inside caller capture.
         Captured copy addresses and supplied extents are fixed in that graph;
         change device prefix contents in place or recapture for new bindings.
         The graph addresses this wrapper's workspace: keep the wrapper (and
         its captured pools) alive while that graph may replay.
+        Release wrappers and their plans outside all CUDA graph capture,
+        including captures owned by other wrappers: retirement unloads private
+        CUDA libraries immediately.
         Selective caller capture needs one earlier ``prepare_pool`` or eager run
         to compile the layout; it then binds any equal-layout pool in place.
         Use one wrapper per concurrent stream; calls must not overlap.
@@ -4770,17 +4810,14 @@ class FP8PagedMQATopKWrapper:
             weights: Contiguous CUDA FP32 per-head weights ``[R, H]``.
             kv_fused: Contiguous CUDA uint8 paged KV pool
                 ``[num_pages, page_size, 1, D + 4]`` with the constructed layout.
-            out: Optional selective CUDA int32 destination ``[R, top_k]``;
+            out: Optional CUDA int32 destination ``[R, top_k]``;
                 must not overlap inputs or workspace.
-            block_table: Full-strategy planned page map. Selective binds its
-                page map once per step through :meth:`plan` instead.
 
         Returns:
             CUDA int32 request-local indices ``[R, top_k]`` with ``-1`` suffix
             padding. Without ``out``, subsequent calls overwrite the storage.
 
         Raises:
-            TypeError: A strategy-specific argument is supplied incorrectly.
             ValueError: A tensor layout, supplied extent or output is invalid.
             RuntimeError: No step is planned, nothing was prepared before
                 capture, or a planned full-strategy binding has changed.
@@ -4788,19 +4825,60 @@ class FP8PagedMQATopKWrapper:
         self._check_math_mode()
         self._check_compression_ratio()
         if self._capacity_plan is not None:
-            if block_table is not None:
-                raise TypeError("selective page-table binding belongs to plan()")
             return self._capacity_plan.run(q, weights, kv_fused, out=out)
+        if not self._full_step_is_prepared:
+            raise RuntimeError("plan must be called before run")
+        state = self._full_state
+        state._payload_copies(q, weights)
+        if q.shape[0] != self._full_supplied_rows:
+            raise ValueError("Q rows must match plan num_query_rows")
+        key = self._full_pool_key(kv_fused)
         if out is not None:
-            raise TypeError("out is only supported by selective")
-        if block_table is None:
-            raise TypeError("full run requires block_table")
-        return self._run_full_payload(q, kv_fused, weights, block_table)
+            if (
+                not isinstance(out, torch.Tensor)
+                or out.device != state.device
+                or out.dtype != torch.int32
+                or out.shape != (q.shape[0], self._full_top_k)
+                or not out.is_contiguous()
+            ):
+                raise ValueError("out must be contiguous CUDA int32 [Q, top_k]")
+            for tensor in (q, weights, kv_fused, *state.__dict__.values()):
+                if isinstance(tensor, torch.Tensor) and _overlap(
+                    _byte_range(out), _byte_range(tensor)
+                ):
+                    raise ValueError(
+                        "out must not overlap inputs or plan-owned storage"
+                    )
+        with torch.cuda.device(state.device):
+            if key not in self._full_pool_plans:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "prepare_pool or one eager run must precede caller capture for this full pool"
+                    )
+                self.prepare_pool(kv_fused)
+            self._restore_full_pool(self._full_pool_plans[key])
+            if (
+                out is not None
+                and self._full_scores is not None
+                and _overlap(_byte_range(out), _byte_range(self._full_scores))
+            ):
+                raise ValueError("out must not overlap plan-owned scores")
+            state.stage_payload(q, weights)
+            selected = self._run_full_payload(
+                self._full_q_payload,
+                kv_fused,
+                self._full_weight_payload,
+                self._full_block_table,
+            )
+            if out is not None and out.data_ptr() != selected.data_ptr():
+                out.copy_(selected)
+            return selected if out is None else out
 
     def prepare_pool(self, kv_fused):
-        """Optionally warm one layer pool outside capture, sharing tensor scratch.
+        """Warm a layer pool outside capture for the selected strategy.
 
-        The first preparation, or the first eager run, compiles metadata and
+        Selective shares tensor scratch across pools. The first preparation,
+        or the first eager run, compiles metadata and
         scoring kernels for the layout and validates any step staged by an
         earlier plan call; one of them is required before the first caller
         capture. Later pools need no preparation: caller capture binds them in
@@ -4808,62 +4886,118 @@ class FP8PagedMQATopKWrapper:
         otherwise builds on first use. That cache keys on address and full
         layout and keeps pool owners alive; the constructor's ``kv_layout``
         exemplar is not bound.
+
+        Full requires plan first and owns a separate score buffer, GVR-v2
+        workspace and graph per prepared pool. Each full plan replaces these
+        bindings, so prepare every pool again before caller capture in that
+        step; eager run may prepare it on demand. Full pools share staged
+        inputs and step metadata, not scoring scratch.
         """
-        if self._capacity_plan is None:
-            raise ValueError("prepare_pool is only supported by selective")
-        self._capacity_plan.prepare_pool(kv_fused)
+        if self._capacity_plan is not None:
+            return self._capacity_plan.prepare_pool(kv_fused)
+        key = self._full_pool_key(kv_fused)
+        state = self._full_state
+        with torch.cuda.device(state.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("prepare_pool must run outside CUDA graph capture")
+            if not self._full_step_is_prepared:
+                raise RuntimeError("full plan must precede prepare_pool")
+            if key in self._full_pool_plans:
+                return
+            try:
+                self._plan_full_payload(
+                    self._full_q_payload,
+                    kv_fused,
+                    self._full_weight_payload,
+                    state.safe_qo_indptr[: self._full_batches + 1],
+                    state.physical_kv_indptr[: self._full_batches + 1],
+                    self._full_block_table,
+                    top_k=self._full_top_k,
+                    num_heads=self._full_num_heads,
+                    head_dim=self._full_head_dim,
+                )
+            except BaseException:
+                self._full_step_is_prepared = False
+                raise
+            fields = (
+                "_full_groups",
+                "_full_scores",
+                "_full_row_ends",
+                "_full_cuda_graph",
+                "_full_graph_identity",
+                "_full_max_context_len",
+                "_full_impl",
+                "_full_gvr2_workspace",
+                "_selected",
+            )
+            self._full_pool_plans[key] = {name: getattr(self, name) for name in fields}
 
     def clear_pools(self):
-        """Synchronize and release selective pool graphs while keeping workspace.
+        """Synchronize and release cached pool graphs and bindings.
 
         Call outside capture after discarding caller graphs using these pools.
         Their captures must be rebuilt before reuse. Pool tensors and launch
-        owners are released; capacities, compiled kernels, step status and
-        tensor scratch remain. Eager run and caller capture bind pools again.
+        owners are released; capacities, compiled kernels and step status
+        remain. Selective retains its shared tensor scratch and can bind later
+        pools during capture after layout warmup. Full retains staging but
+        requires fresh pool preparation outside capture.
         """
-        if self._capacity_plan is None:
-            raise ValueError("clear_pools is only supported by selective")
-        self._capacity_plan.clear_pools()
+        if self._capacity_plan is not None:
+            return self._capacity_plan.clear_pools()
+        with torch.cuda.device(self._full_state.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("clear_pools must run outside CUDA graph capture")
+            torch.cuda.synchronize(self._full_state.device)
+            self._full_pool_plans.clear()
+            self._full_impl = self._full_cuda_graph = self._full_graph_identity = None
 
     def input_buffers(self) -> dict[str, torch.Tensor]:
-        """Return selective Q/weight/prefix staging tensors owned by the wrapper.
+        """Return Q/weight/prefix staging tensors owned by either strategy.
 
         Pass prefix/map views to plan to publish row/batch extents;
         pass Q/weight views to run to skip their staging copies.
         Contents change with subsequent calls; the views stay valid for the
         wrapper's lifetime.
         """
-        if self._capacity_plan is None:
-            raise ValueError("input_buffers is only supported by selective")
-        return self._capacity_plan.input_buffers()
+        return (
+            self._capacity_plan.input_buffers()
+            if self._capacity_plan is not None
+            else self._full_state.input_buffers()
+        )
 
     @property
     def error(self) -> torch.Tensor:
-        """Selective int32[1] device validation status: bits 1/2/4/8.
+        """Int32[1] device validation status for either strategy: bits 1/2/4/8.
 
         Bits mean extents/prefixes/capacity/page IDs. Extent errors suppress
         other checks; prefix/capacity errors suppress page-map reads.
         """
-        if self._capacity_plan is None:
-            raise ValueError("error is only supported by selective")
-        return self._capacity_plan.error
+        return (
+            self._capacity_plan.error
+            if self._capacity_plan is not None
+            else self._full_state.error
+        )
 
     @property
     def repair_error(self) -> torch.Tensor:
-        """Selective int32[1] OR-accumulated repair flag; zero means no error.
+        """Int32[1] OR-accumulated repair flag; full always returns zero.
 
         This is not a row count. It resets only at the next per-step plan.
         """
-        if self._capacity_plan is None:
-            raise ValueError("repair_error is only supported by selective")
-        return self._capacity_plan.repair_error
+        return (
+            self._capacity_plan.repair_error
+            if self._capacity_plan is not None
+            else self._full_repair_error
+        )
 
     @property
     def active_shape(self) -> torch.Tensor:
-        """Selective int32[2] active row/request counts; zeros on validation error."""
-        if self._capacity_plan is None:
-            raise ValueError("active_shape is only supported by selective")
-        return self._capacity_plan.active_shape
+        """Int32[2] active row/request counts; zeros on validation error."""
+        return (
+            self._capacity_plan.active_shape
+            if self._capacity_plan is not None
+            else self._full_state.active_shape
+        )
 
 
 __all__ = ["FP8PagedMQATopKWrapper"]

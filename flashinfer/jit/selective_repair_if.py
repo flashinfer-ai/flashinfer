@@ -18,7 +18,7 @@ import functools
 from packaging.version import Version
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 from .cpp_ext import get_cuda_version
 
 
@@ -30,6 +30,9 @@ def gen_selective_repair_if_module() -> JitSpec:
     return gen_jit_spec(
         "selective_repair_if",
         [jit_env.FLASHINFER_CSRC_DIR / "selective_repair_if.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10]
+        ),
     )
 
 

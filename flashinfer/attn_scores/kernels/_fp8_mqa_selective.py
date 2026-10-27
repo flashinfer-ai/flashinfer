@@ -93,6 +93,27 @@ _MAX_W_CACHE_REGS = 160
 
 
 @dsl_user_op
+def sync_warp_roles(barrier_id: int, threads: int, *, loc=None, ip=None) -> None:
+    """Join a warp-role subset without asserting whole-CTA convergence."""
+    # Legacy bar.sync is implicitly aligned: distinct warp-role call sites do
+    # not satisfy its whole-CTA convergence contract. Keep the same barrier ID
+    # and participant count, but use the explicitly unaligned PTX form.
+    # The memory clobber also keeps the compiler from moving the shared TMEM
+    # pointer load ahead of the allocation handoff.
+    llvm.inline_asm(
+        None,
+        [],
+        f"barrier.cta.sync {barrier_id}, {threads};",
+        "~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def store_global_u64_if(predicate, address, value, *, loc=None, ip=None) -> None:
     """Issue one predicated 64-bit store through a raw byte address."""
     llvm.inline_asm(
@@ -276,6 +297,10 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
     _engine_relu_f32 = staticmethod(relu_f32)
 
     @cute.jit
+    def _wait_for_tmem(self, tmem):
+        sync_warp_roles(1, self.tmem_retrieve_threads)
+
+    @cute.jit
     def _release_kv_after_scale_use(self, kv_pipeline, kv_cons_state):
         """Defensively order late scale reads before selective KV-stage reuse."""
         cute.arch.fence_view_async_shared()
@@ -452,6 +477,7 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
             output_dtype=cutlass.Float32,
             tiling=tiling,
         )
+        self.tmem_retrieve_threads = 288 if self.uses_single_umma_producer else 320
         self.mode = mode
         self.sample_internal = sample_internal
         self.capacity = capacity
@@ -1507,9 +1533,8 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         # allocation.  A single UMMA producer reserves warp 11, reducing the
         # participant set from ten to nine warps.
         # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
-        tmem_alloc_num_threads = 288 if self.uses_single_umma_producer else 320
         tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=1, num_threads=tmem_alloc_num_threads
+            barrier_id=1, num_threads=self.tmem_retrieve_threads
         )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -2443,6 +2468,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         self.num_groups = 1
         self.has_store_warp = False
         self.threads_per_cta = 640
+        self.tmem_retrieve_threads = 544
 
     @cute.jit
     def _launch(
@@ -2732,7 +2758,9 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         # Math warp 0 allocates; all 16 math warps and the UMMA warp retrieve.
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
-            barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=544),
+            barrier_for_retrieve=pipeline.NamedBarrier(
+                barrier_id=1, num_threads=self.tmem_retrieve_threads
+            ),
             allocator_warp_id=0,
             is_two_cta=False,
         )
@@ -2884,7 +2912,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                     chunk_base = chunk_base + _H64_CANDIDATE_PAGE_CACHE
                 tile = tile - grid
         elif is_umma_warp:
-            tmem.wait_for_alloc()
+            sync_warp_roles(1, self.tmem_retrieve_threads)
             tCtAcc_base = cute.make_tensor(
                 tmem.retrieve_ptr(self.acc_dtype), tCtAcc_fake.layout
             )
@@ -2924,7 +2952,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                 tile = tile - grid
         elif is_math_warp:
             tmem.allocate(self.num_tmem_alloc_cols_total)
-            tmem.wait_for_alloc()
+            sync_warp_roles(1, self.tmem_retrieve_threads)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             local_tidx = tidx % 128

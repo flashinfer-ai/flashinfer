@@ -35,26 +35,22 @@ a standalone single call costs per-step setup + layer.
 
 This benchmark generates seeded inputs and measures separate per-step setup
 and layer CUDA graph pairs in an AxN-5s-BxN-5s sequence.
-Successful clean-source runs also print a validated Markdown report; --output
-remains raw JSON. The --summarize mode regenerates that report without importing
-Torch or using CUDA. Inputs must share one source, environment, GPU and schema;
-partial successful prefixes are labeled and duplicate cells are rejected.
+Successful runs print Markdown latency/workspace tables; --output keeps raw
+timing samples and correctness results. --summarize regenerates the tables
+without importing Torch or using CUDA. Incomplete runs and duplicate cells
+are rejected.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import gc
-import hashlib
 import importlib
 import importlib.metadata
 import json
 import math
 import os
-import resource
 import statistics
-import subprocess
 import sys
 import time
 import tempfile
@@ -65,35 +61,6 @@ if __name__ != "__main__":
     import torch
 
 ROWS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
-EXECUTION_SOURCE_PATHS = (
-    "benchmarks/bench_fp8_mqa_selective_logits.py",
-    "flashinfer/attn_scores/attn_scores.py",
-    "flashinfer/attn_scores/fp8_kernel_config.py",
-    "flashinfer/attn_scores/query_group_metadata.py",
-    "flashinfer/attn_scores/kernels/schedule_kernel.py",
-    "flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py",
-    "flashinfer/attn_scores/kernels/_fp8_mqa_selective.py",
-    "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
-    "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
-    "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
-    "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
-    "flashinfer/topk_varlen/kernels/block_scan.py",
-    "flashinfer/attn_scores/kernels/selective_logits_metadata.py",
-    "flashinfer/attn_scores/selective_logits.py",
-    "flashinfer/attn_scores/selective_capacity.py",
-    "flashinfer/attn_scores/_math_policy.py",
-    "flashinfer/attn_scores/_selective_contract.py",
-    "flashinfer/attn_scores/_fp8_mqa_constants.py",
-    "flashinfer/jit/selective_sample_ladder.py",
-    "flashinfer/jit/selective_repair_if.py",
-    "csrc/selective_sample_ladder.cu",
-    "csrc/selective_repair_if.cu",
-    "csrc/tvm_ffi_utils.h",
-    "include/flashinfer/attention/selective_sample_ladder.cuh",
-    "include/flashinfer/attention/selective_repair_if.cuh",
-    "flashinfer/topk_varlen/kernels/radix_topk.py",
-    "flashinfer/topk_varlen/topk_varlen.py",
-)
 
 
 def _percentile(samples: list[float], fraction: float) -> float:
@@ -129,119 +96,36 @@ def _validated_summary(values, repeats):
     return tuple(summary[field] for field in ("median_us", "p10_us", "p90_us"))
 
 
-def _validate_pauses(pauses, repeats):
-    if len(pauses) != 2 or any(
-        pause["after"] != label
-        or pause["samples"] != repeats
-        or not math.isfinite(pause["elapsed_s"])
-        or pause["elapsed_s"] < 5.0
-        for label, pause in zip(("a", "b"), pauses, strict=True)
-    ):
-        raise ValueError("expected two synchronized arm pauses")
-
-
-def _validated_routes(component, repeats):
-    summaries = []
-    for route in ("full_gvr2", "selective"):
-        summary = _validated_summary(component[route]["raw_us"], repeats)
-        for field, value in zip(
-            ("median_us", "p10_us", "p90_us"), summary, strict=True
-        ):
-            if not math.isclose(
-                component[route][field], value, rel_tol=1e-12, abs_tol=1e-9
-            ):
-                raise ValueError(f"raw/summary mismatch: {route}, {field}")
-        summaries.append(summary)
-    return summaries
-
-
 def render_summary(paths):
-    """Render one source/environment/GPU's block-paired JSON without CUDA work."""
+    """Render latency/workspace tables from result JSON without CUDA work."""
     return _render_results((str(path), json.loads(path.read_text())) for path in paths)
 
 
 def _render_results(results):
-    rows, identities, seen, partial = [], set(), set(), []
+    rows, seen = [], set()
     for path, result in results:
-        schema = result["schema_version"]
-        if schema not in (11, 12, 13, 14, 15, 16):
-            raise ValueError(f"expected block-paired schema 11 through 16: {path}")
-        source = result["source"]
-        if not source["tracked_worktree_clean"]:
-            raise ValueError(f"dirty execution source: {path}")
-        identities.add(
-            (
-                source["git_commit"],
-                json.dumps(source["source_sha256"], sort_keys=True),
-                result["device"]["uuid"],
-                json.dumps(result["environment"], sort_keys=True),
-                schema,
-            )
-        )
-        if result["status"] != "complete":
-            partial.append(str(path))
+        if result.get("status", "complete") != "complete":
+            raise ValueError(f"incomplete benchmark: {path}")
         for row in result["rows"]:
             key = tuple(
-                row[field]
-                for field in (
-                    "bs",
-                    "q",
-                    "num_heads",
-                    "top_k",
-                    "compression_ratio",
-                    "kv",
-                )
+                row[k]
+                for k in ("bs", "q", "num_heads", "top_k", "compression_ratio", "kv")
             )
             if key in seen:
                 raise ValueError(f"duplicate comparison: {key}")
             seen.add(key)
-            protocol = row["protocol"]
-            if (
-                protocol["order"] != "AxN-5s-BxN-5s"
-                or type(protocol["samples_per_route"]) is not int
-                or protocol["samples_per_route"] <= 0
-                or protocol["samples_per_block"] != protocol["samples_per_route"]
-                or protocol["sleep_between_samples"] is not False
-                or protocol["a"] != "full_gvr2"
-                or protocol["b"] != "selective"
-            ):
-                raise ValueError(f"unexpected timing protocol: {key}")
-            repeats = protocol["samples_per_route"]
-            _validate_pauses(protocol["post_component_pauses"], repeats)
-            if row["correctness"]["exact_error"] != 0:
+            if row["correctness"]["exact_error"]:
                 raise ValueError(f"exact repair failed: {key}")
-            summaries = _validated_routes(row, repeats)
-            step_summaries = None
-            if schema in (11, 13, 15):
-                if not row.get("step"):
-                    raise ValueError(
-                        "setup/layer schema requires per-step setup samples"
-                    )
-                _validate_pauses(row["step"]["post_component_pauses"], repeats)
-                step_summaries = _validated_routes(row["step"], repeats)
-            elif row.get("step") is not None:
-                raise ValueError(
-                    "layer-only schema must omit per-step setup measurements"
-                )
-            rows.append((row, summaries, step_summaries))
-    if len(identities) != 1 or not rows:
-        raise ValueError("expected nonempty results from one source/environment/GPU")
-    identity = next(iter(identities))
-    sample_counts = {row["protocol"]["samples_per_route"] for row, _, _ in rows}
-    median_scope = (
-        f"median of {next(iter(sample_counts))} consecutive replays"
-        if len(sample_counts) == 1
-        else "medians of the configured consecutive replay blocks"
-    )
+            raw = [row[route]["raw_us"] for route in ("full_gvr2", "selective")]
+            if len(raw[0]) != len(raw[1]):
+                raise ValueError(f"unmatched timing samples: {key}")
+            summaries = [_validated_summary(values, len(raw[0])) for values in raw]
+            rows.append((row, summaries))
+    if not rows:
+        raise ValueError("expected nonempty benchmark results")
     lines = [
-        f"Source `{identity[0]}`; GPU `{identity[2]}`. {len(rows)} comparisons.",
-        "",
-        f"Latency in ms: {median_scope}.",
+        "Latency in ms: medians of consecutive graph replays.",
         "Workspace in MiB: reachable PyTorch tensors owned by each route, excluding inputs/outputs; not a device peak.",
-        "",
-        "Per-step setup runs once per forward pass and is shared across indexer layers: full builds row/group metadata and request IDs, gathers the page table and computes the scorer schedule; selective calls plan() for table copy, validation, metadata, schedules and sampling-metadata refresh.",
-        "Layer is one indexer TopK operation: full calls fp8_paged_mqa_logits + top_k_varlen(gvr_2); selective calls run().",
-        "For L indexer layers, model cost per forward pass is per-step setup + L * layer; a standalone single call costs per-step setup + layer.",
     ]
     rows.sort(
         key=lambda item: (
@@ -263,7 +147,7 @@ def _render_results(results):
         profiles = sorted(
             {
                 (row["num_heads"], row["top_k"], row["compression_ratio"])
-                for row, _, _ in group
+                for row, _ in group
             }
         )
         show_top_k = len({(heads, ratio) for heads, _, ratio in profiles}) != len(
@@ -284,7 +168,7 @@ def _render_results(results):
                 "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
-        for row, summaries, _ in group:
+        for row, summaries in group:
             memory = [
                 row["memory"][route]["owned_reachable_tensor_bytes"] / 2**20
                 for route in ("full_gvr2", "selective")
@@ -305,34 +189,6 @@ def _render_results(results):
                 f"{summaries[0][0] / 1000:.6f} | {summaries[1][0] / 1000:.6f} | "
                 f"{summaries[0][0] / summaries[1][0]:.4f}x | {memory[0]:.1f} | {memory[1]:.1f} |"
             )
-    lines.extend(
-        [
-            "",
-            "Fixed full-first AxN-5s-BxN-5s; one event-timed replay per sample, no deliberate intra-arm sleep. Host event/enqueue gaps remain. Device snapshots do not establish power isolation.",
-        ]
-    )
-    if identity[4] in (11, 13):
-        lines.extend(
-            [
-                "",
-                "### Per-step setup (ms)",
-                "",
-                "Selective includes device validation and table copy; full does not provide equivalent validation.",
-                "",
-                "| B / Q / H / K / ratio / KV | Full indexer + GVRv2 per-step setup | Indexer-throwaway + TopK per-step setup |",
-                "| --- | --- | --- |",
-            ]
-        )
-        for row, _, steps in rows:
-            label = " / ".join(
-                str(row[k])
-                for k in ("bs", "q", "num_heads", "top_k", "compression_ratio", "kv")
-            )
-            lines.append(
-                f"| {label} | {steps[0][0] / 1000:.6f} | {steps[1][0] / 1000:.6f} |"
-            )
-    if partial:
-        lines.extend(["", "Partial successful prefixes only: " + ", ".join(partial)])
     return "\n".join(lines)
 
 
@@ -346,36 +202,12 @@ def _record_event(call) -> float:
     return start.elapsed_time(end) * 1000.0
 
 
-def _source_provenance(repository: Path) -> dict:
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=no"],
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-    ).stdout.splitlines()
-    source_sha256 = {
-        relative_path: hashlib.sha256(
-            (repository / relative_path).read_bytes()
-        ).hexdigest()
-        for relative_path in EXECUTION_SOURCE_PATHS
-    }
-    return {
-        "git_status_porcelain": status,
-        "tracked_worktree_clean": not status,
-        "source_sha256": source_sha256,
-    }
-
-
 def _paired_events(call_a, call_b, warmups: int, repeats: int):
     """After warmup, run A×N, sleep 5s, B×N, sleep 5s on identical inputs.
 
     Each sample times one graph replay with its own completed CUDA end event.
     There is no deliberate sleep between samples in an arm. Synchronize before
-    each arm's pause, including the final B pause, and return both durations
-    separately from GPU latency. Host event/enqueue overhead remains between replays.
+    each arm's pause, including the final B pause, without including the pauses in GPU latency. Host event/enqueue overhead remains between replays.
     """
     if repeats <= 0:
         raise ValueError("paired measurement requires a positive repeat count")
@@ -387,27 +219,14 @@ def _paired_events(call_a, call_b, warmups: int, repeats: int):
 
     samples_a: list[float] = []
     samples_b: list[float] = []
-    pauses: list[dict] = []
     order = (("a", call_a), ("b", call_b))
     for label, call in order:
-        block_start_ns = time.time_ns()
         for _ in range(repeats):
             sample = _record_event(call)
             (samples_a if label == "a" else samples_b).append(sample)
         torch.cuda.synchronize()
-        block_end_ns = time.time_ns()
-        sleep_start = time.perf_counter()
         time.sleep(5.0)
-        pauses.append(
-            {
-                "after": label,
-                "samples": repeats,
-                "elapsed_s": time.perf_counter() - sleep_start,
-                "block_start_utc_ns": block_start_ns,
-                "block_end_utc_ns": block_end_ns,
-            }
-        )
-    return samples_a, samples_b, pauses
+    return samples_a, samples_b
 
 
 def _tensor_storage(tensor):
@@ -422,77 +241,32 @@ def _workspace_inventory(owner, excluded):
     is neither an allocator delta nor a device-memory peak.
     """
     excluded_storage = {_tensor_storage(tensor) for tensor in excluded}
-    visited, allocations = set(), {}
+    visited, allocations = set(), set()
 
-    def visit(value, path):
+    def visit(value):
         if id(value) in visited:
             return
         visited.add(id(value))
         if isinstance(value, torch.Tensor):
             key = _tensor_storage(value)
             if key not in excluded_storage and key[2]:
-                allocations.setdefault(key, []).append(path)
+                allocations.add(key)
         elif isinstance(value, dict):
-            for name, item in value.items():
-                visit(item, f"{path}.{name}")
+            for item in value.values():
+                visit(item)
         elif isinstance(value, (list, tuple)):
-            for index, item in enumerate(value):
-                visit(item, f"{path}[{index}]")
+            for item in value:
+                visit(item)
         elif type(value).__module__.startswith("flashinfer.attn_scores") and hasattr(
             value, "__dict__"
         ):
-            for name, item in vars(value).items():
-                visit(item, f"{path}.{name}")
+            for item in vars(value).values():
+                visit(item)
 
-    visit(owner, "workspace")
+    visit(owner)
     return {
         "owned_reachable_tensor_bytes": sum(key[2] for key in allocations),
-        "storage_count": len(allocations),
-        "allocations": [
-            {"device": key[0], "bytes": key[2], "paths": paths}
-            for key, paths in allocations.items()
-        ],
-        "scope": "deduplicated reachable PyTorch storage; input/output excluded; "
-        "opaque native and graph-only storage unknown; not a device peak",
     }
-
-
-def _device_observation():
-    """Untimed device snapshot; not route-specific telemetry or power isolation."""
-    fields = (
-        "name",
-        "driver_version",
-        "pstate",
-        "temperature.gpu",
-        "power.draw",
-        "power.limit",
-        "clocks.sm",
-        "clocks.mem",
-    )
-    try:
-        observation = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=" + ",".join(fields),
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        return {
-            "returncode": observation.returncode,
-            "gpus": [
-                dict(zip(fields, (value.strip() for value in row), strict=True))
-                for row in csv.reader(observation.stdout.splitlines())
-                if len(row) == len(fields)
-            ]
-            if observation.returncode == 0
-            else [],
-        }
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return {"unavailable": str(error)}
 
 
 def _save_result(path, result):
@@ -557,7 +331,7 @@ def _fuse_paged_kv(
 
 
 class _FullGVR:
-    """Public scorer/GVR composition with separate step and layer callables.
+    """Scorer/GVR composition with separate setup and layer callables.
 
     Uniform requests must divide evenly into the configured query tile. Q and
     weights then use address-stable views, without cross-request grouping.
@@ -584,11 +358,11 @@ class _FullGVR:
         qo_indptr,
         kv_indptr,
     ):
-        from flashinfer import top_k_varlen
+        from flashinfer import fp8_paged_mqa_logits, top_k_varlen
         from flashinfer.attn_scores import (
             compute_paged_mqa_logits_schedule,
-            fp8_paged_mqa_logits,
         )
+        from flashinfer.attn_scores.attn_scores import _fp8_paged_mqa_logits
         from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
 
         device = q.device
@@ -673,6 +447,7 @@ class _FullGVR:
             if explicit_bounds
             else {}
         )
+        scorer = _fp8_paged_mqa_logits if scorer_options else fp8_paged_mqa_logits
         self.workspace_owners = (
             scores,
             logical_scores,
@@ -717,7 +492,7 @@ class _FullGVR:
             )
 
         def layer():
-            fp8_paged_mqa_logits(
+            scorer(
                 grouped_q,
                 kv_fused,
                 weights,
@@ -805,12 +580,10 @@ def _check_reference(outputs, q, kv, scales, weights, groups, top_k, *, atol, rt
 
 def run_row(kv_len: int, args) -> dict:
     """Benchmark equivalent full/GVR and selective routes on original-token bounds."""
+    from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
+    from flashinfer.attn_scores.query_group_metadata import _FP8QueryGroups
     from flashinfer import FP8PagedMQATopKWrapper
-    from flashinfer.attn_scores.fp8_kernel_config import FP8MQAKernelConfig
-    from flashinfer.attn_scores.query_group_metadata import FP8QueryGroups
 
-    observation_before = _device_observation()
-    torch.cuda.reset_peak_memory_stats()
     if kv_len < args.q:
         raise ValueError("original KV length must be at least Q per request")
     total_rows = args.batch_size * args.q
@@ -821,7 +594,7 @@ def run_row(kv_len: int, args) -> dict:
         tile = family_tile if args.q % family_tile == 0 else 1
     if args.q % tile:
         raise ValueError("uniform request Q must be divisible by full-query-tile")
-    groups = FP8QueryGroups.build(
+    groups = _FP8QueryGroups.build(
         [i * args.q for i in range(args.batch_size + 1)],
         [i * kv_len for i in range(args.batch_size + 1)],
         args.compression_ratio,
@@ -866,7 +639,7 @@ def run_row(kv_len: int, args) -> dict:
     )
     cu_q = torch.tensor(groups.q_prefix, device="cuda", dtype=torch.int32)
     cu_tokens = torch.tensor(groups.token_prefix, device="cuda", dtype=torch.int32)
-    config = FP8MQAKernelConfig(
+    config = _FP8MQAKernelConfig(
         128,
         args.full_epi_subtiles,
         args.full_w_cache_regs,
@@ -905,7 +678,6 @@ def run_row(kv_len: int, args) -> dict:
         qo_indptr=staged["qo_indptr"],
         kv_indptr=staged["kv_indptr"],
     )
-    engine = selective._capacity_plan._engine
     # Compile both step and layer paths before capturing their independent pairs.
     full.step()
     full.layer()
@@ -921,11 +693,8 @@ def run_row(kv_len: int, args) -> dict:
     with torch.cuda.graph(full_step_graph):
         full.step()
     step_graph = torch.cuda.CUDAGraph()
-    copy_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(step_graph):
         selective.plan(staged["qo_indptr"], staged["kv_indptr"], block_table)
-    with torch.cuda.graph(copy_graph):
-        staged["block_table"].copy_(block_table)
     full_graph.replay()
     selective_graph.replay()
     torch.cuda.synchronize()
@@ -946,17 +715,16 @@ def run_row(kv_len: int, args) -> dict:
     layer_only = getattr(args, "layer_only", False)
     step = None
     if not layer_only:
-        step_full_us, step_selective_us, step_pauses = _paired_events(
+        step_full_us, step_selective_us = _paired_events(
             full_step_graph.replay, step_graph.replay, args.warmups, args.repeats
         )
         step = {
             "full_gvr2": {**_summarize(step_full_us), "raw_us": step_full_us},
             "selective": {**_summarize(step_selective_us), "raw_us": step_selective_us},
-            "post_component_pauses": step_pauses,
         }
     if int(selective.error.item()) or int(selective.repair_error.item()):
         raise AssertionError("selective step validation failed")
-    full_us, selective_us, pauses = _paired_events(
+    full_us, selective_us = _paired_events(
         full_graph.replay, selective_graph.replay, args.warmups, args.repeats
     )
     # Check outputs from the measured replay, not only the pre-timing warmup.
@@ -976,32 +744,12 @@ def run_row(kv_len: int, args) -> dict:
         raise AssertionError("selective device capacity validation failed")
     if exact_error:
         raise AssertionError(f"selective exact completion failed: {exact_error}")
-    # These warm component diagnostics follow both measured-output checks.
-    # They are independently timed replays, not an additive decomposition of
-    # the block-paired A/B medians, and never run between measured components.
-    component_diagnostics = {}
-    for name, graph in (("block_table_copy", copy_graph),):
-        for _ in range(args.warmups):
-            graph.replay()
-        torch.cuda.synchronize()
-        samples = [_record_event(graph.replay) for _ in range(args.repeats)]
-        component_diagnostics[name] = {**_summarize(samples), "raw_us": samples}
-    if int(selective.error.item()) or int(selective.repair_error.item()):
-        raise AssertionError("selective component diagnostic failed")
     excluded = (q, kv_fused, weights, block_table, cu_q, cu_tokens)
     memory = {
         "full_gvr2": _workspace_inventory(
             full.workspace_owners, (*excluded, full.output)
         ),
         "selective": _workspace_inventory(selective, (*excluded, selective_output)),
-        "whole_cell_cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-        "whole_cell_cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-        "process_high_water_rss_bytes": resource.getrusage(
-            resource.RUSAGE_SELF
-        ).ru_maxrss
-        * 1024,
-        "peak_scope": "whole cell includes inputs, both routes, graphs and oracle; "
-        "RSS is cumulative process high-water, not incremental workspace",
     }
     return {
         "bs": args.batch_size,
@@ -1013,55 +761,12 @@ def run_row(kv_len: int, args) -> dict:
         "num_heads": args.num_heads,
         "head_dim": args.head_dim,
         "page_size": args.page_size,
-        "route_label": "public-fp8-scorer-gvr2-vs-public-selective-topk",
-        "execution_mode": "cuda-graph-replay",
-        "full_config": {
-            "launch_identity": config.launch_identity,
-            "scorer_mode": full.scorer_mode,
-            "config_scope": "explicit"
-            if full.scorer_mode == "explicit-physical-bounds"
-            else "geometry descriptor; ordinary scorer defaults selected",
-            "logical_score_width": physical_length,
-            "scorer_max_seq_len": full.scorer_width,
-            "score_pitch": 0 if full.scores is None else full.scores.stride(0),
-            "score_arena_bytes": 0 if full.scores is None else full.scores.numel() * 4,
-            "page_table_gathers_per_layer": 0,
-            "page_table_gathers_per_step": int(physical_length > 0),
-            "query_materialization": "uniform request-local views",
-            "step_metadata": "device prefix-derived row/group ends and request IDs; "
-            "live table gather and capturable public schedule builder",
-            "gvr_mode": "per-row physical ends; next_n=1, compress_ratio=1",
-        },
-        "candidate_split_kv": engine._candidate_prepared.split_kv
-        if engine is not None
-        else None,
-        "selective_policy": {
-            "needs_sampling": engine._needs_sampling if engine is not None else False,
-            "candidate_schedule": vars(engine._candidate_schedule).copy()
-            if engine is not None
-            else None,
-            "sample_threshold_policy": "native_ladder",
-            "candidate_num_umma_stages": engine._candidate_prepared.num_umma_stages
-            if engine is not None
-            else None,
-        },
         "full_gvr2": {**_summarize(full_us), "raw_us": full_us},
         "selective": {**_summarize(selective_us), "raw_us": selective_us},
         "full_over_selective": statistics.median(full_us)
         / statistics.median(selective_us),
         "step": step,
-        "selective_components": {
-            **component_diagnostics,
-            "block_table_copy_bytes": block_table.numel() * block_table.element_size(),
-            "scope": "warm graph diagnostics after paired timing and both row checks; "
-            "copy diagnostic is not an additive decomposition of paired step latency",
-        },
         "memory": memory,
-        "device_observations": {
-            "before": observation_before,
-            "after": _device_observation(),
-            "scope": "untimed device snapshots, not per-route activity or power isolation",
-        },
         "correctness": {
             "reference": "all-row independent FP32; TF32 disabled; outside timing",
             "atol": atol,
@@ -1069,45 +774,6 @@ def run_row(kv_len: int, args) -> dict:
             "max_topk_value_error_before": errors,
             "max_topk_value_error_after": errors_after,
             "exact_error": exact_error,
-            "first_repair_rows": int(torch.count_nonzero(engine._repair_flags))
-            if engine is not None
-            else 0,
-            "terminal_repair_rows": int(
-                torch.count_nonzero(engine._second_repair_flags)
-            )
-            if engine is not None
-            else 0,
-            "physical_page_mapping": "global reverse permutation; independent requests",
-        },
-        "protocol": {
-            "warmups_per_route": args.warmups,
-            "samples_per_route": args.repeats,
-            "order": "AxN-5s-BxN-5s",
-            "samples_per_block": args.repeats,
-            "sleep_between_samples": False,
-            "a": "full_gvr2",
-            "b": "selective",
-            "component": "one layer graph replay; per-step setup pair omitted"
-            if layer_only
-            else "one layer graph replay; separate per-step setup graph pair",
-            "selective_inputs": "Q/weights/indptr staging outside timing; "
-            "caller block-table copy outside layer timing",
-            "layer_work": "full logits+GVR2; selective run including resets, "
-            "publication, selection, repair and output",
-            "step_work": "per-step setup: full row/group metadata and request IDs, "
-            "table gather and scorer schedule; selective plan with table copy, "
-            "validation, metadata, schedules and sampling-metadata refresh",
-            "step_order": "prepared once outside timing; no per-step setup measurements"
-            if layer_only
-            else "per-step setup pair before layer pair; each pair AxN-5s-BxN-5s",
-            "capacity_scope": "exact-fit uniform query-topology bucket; "
-            "no measured multi-layer amortization or oversized-bucket claim",
-            "post_component_sleep_requested_s": 5.0,
-            "post_component_pauses": pauses,
-            "inner": 1,
-            "seed": args.seed,
-            "cache_flush": False,
-            "percentiles": "inclusive linear interpolation",
         },
     }
 
@@ -1166,23 +832,8 @@ def main() -> None:
     if args.kv != ROWS:
         print("warning: production KV subset requested")
     importlib.import_module("flashinfer.attn_scores.kernels.fp8_paged_mqa_logits")
-    repository = Path(__file__).resolve().parents[1]
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repository,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    ).stdout.strip()
     result = {
-        "schema_version": 16 if args.layer_only else 15,
         "status": "running",
-        "source": {
-            "git_commit": commit or None,
-            "command": sys.argv,
-            **_source_provenance(repository),
-        },
         "device": {
             "name": torch.cuda.get_device_name(),
             "capability": list(torch.cuda.get_device_capability()),
@@ -1202,9 +853,6 @@ def main() -> None:
     try:
         for kv_len in args.kv:
             row = run_row(kv_len, args)
-            current_source = _source_provenance(repository)
-            if current_source["source_sha256"] != result["source"]["source_sha256"]:
-                raise RuntimeError("execution source changed during comparison")
             result["rows"].append(row)
             if args.output is not None:
                 _save_result(args.output, result)
@@ -1225,10 +873,7 @@ def main() -> None:
     print(rendered)
     if args.output is not None:
         _save_result(args.output, result)
-    if result["source"]["tracked_worktree_clean"]:
-        print(_render_results([("benchmark", result)]))
-    else:
-        print("Markdown summary omitted: execution source has tracked changes.")
+    print(_render_results([("benchmark", result)]))
 
 
 if __name__ == "__main__":

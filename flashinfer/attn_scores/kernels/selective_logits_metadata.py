@@ -2191,8 +2191,11 @@ class SelectiveLogitsCompactMetadataScheduleKernel(
                 q_valid = min(q_end - q_start, query_tile)
                 context_len = cutlass.Int32(0)
                 for tile_row in cutlass.range_constexpr(query_tile):
-                    if (tile_row < q_valid) & (row_flags[q_start + tile_row] != 0):
-                        context_len = max(context_len, row_ends[q_start + tile_row])
+                    # A partial request tile has no flag beyond q_valid. A
+                    # bitwise conjunction would still evaluate that load.
+                    if tile_row < q_valid:
+                        if row_flags[q_start + tile_row] != 0:
+                            context_len = max(context_len, row_ends[q_start + tile_row])
                 if context_len != 0:
                     compact_idx = cute.arch.atomic_add(
                         schedule_prefix.iterator,
@@ -2208,9 +2211,10 @@ class SelectiveLogitsCompactMetadataScheduleKernel(
                     for tile_row in cutlass.range_constexpr(query_tile):
                         start = cutlass.Int32(0)
                         end = cutlass.Int32(0)
-                        if (tile_row < q_valid) & (row_flags[q_start + tile_row] != 0):
-                            start = row_starts[q_start + tile_row]
-                            end = row_ends[q_start + tile_row]
+                        if tile_row < q_valid:
+                            if row_flags[q_start + tile_row] != 0:
+                                start = row_starts[q_start + tile_row]
+                                end = row_ends[q_start + tile_row]
                         tile_meta[(compact_idx, 4 + tile_row)] = start
                         tile_meta[(compact_idx, 4 + query_tile + tile_row)] = end
             tile_idx = tile_idx + 256

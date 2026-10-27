@@ -22,7 +22,7 @@ def test_grouped_trace_rejects_before_export_and_ordinary_remains_supported(
 ):
     import flashinfer
     from flashinfer.api_logging import flashinfer_api
-    from flashinfer.attn_scores.fp8_kernel_config import FP8MQAKernelConfig
+    from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
     from flashinfer.trace.templates.attn_scores import fp8_paged_mqa_logits_trace
 
     inputs = dict(
@@ -36,23 +36,18 @@ def test_grouped_trace_rejects_before_export_and_ordinary_remains_supported(
     for grouped in (
         dict(query_metadata=torch.zeros((1, 3), dtype=torch.int32)),
         dict(output_rows=1),
-        dict(kernel_config=FP8MQAKernelConfig(128, 1, 160, 16)),
+        dict(kernel_config=_FP8MQAKernelConfig(128, 1, 160, 16)),
     ):
-        with pytest.raises(ValueError, match="does not support grouped"):
+        with pytest.raises(TypeError, match="grouped scorer options are private"):
             flashinfer.fp8_paged_mqa_logits.fi_trace(
                 save_dir=tmp_path / "rejected", **inputs, **grouped
             )
     assert not list((tmp_path / "rejected").rglob("*.json"))
 
-    for config in (None, FP8MQAKernelConfig(128, 1, 160, 1, 3, 3)):
-        result = flashinfer.fp8_paged_mqa_logits.fi_trace(
-            save_dir=tmp_path / "ordinary",
-            **inputs,
-            kernel_config=config,
-            query_metadata=None,
-            output_rows=None,
-        )
-        assert result
+    result = flashinfer.fp8_paged_mqa_logits.fi_trace(
+        save_dir=tmp_path / "ordinary", **inputs
+    )
+    assert result
     assert list((tmp_path / "ordinary").rglob("*.json"))
 
     # Exercise the actual pre-call auto-dump wrapper without a numerical kernel.
@@ -69,3 +64,17 @@ def test_grouped_trace_rejects_before_export_and_ordinary_remains_supported(
         assert numerical_body(query_metadata=object()) == "executed"
     assert calls == [True]
     assert not list((tmp_path / "automatic").rglob("*.json"))
+
+
+def test_fp8_grouped_options_remain_private():
+    import inspect
+    import flashinfer.attn_scores as api
+    from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
+
+    assert not hasattr(api, "FP8MQAKernelConfig")
+    assert not hasattr(api, "FP8QueryGroups")
+    parameters = inspect.signature(api.fp8_paged_mqa_logits).parameters
+    assert not {"kernel_config", "query_metadata", "output_rows"} & parameters.keys()
+    for tile in (64, 256):
+        with pytest.raises(ValueError, match="compute_block_kv must be 128"):
+            _FP8MQAKernelConfig(tile, 1, 160)

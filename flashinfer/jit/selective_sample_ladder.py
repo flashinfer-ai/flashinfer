@@ -16,7 +16,7 @@
 import functools
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_selective_sample_ladder_module() -> JitSpec:
@@ -26,6 +26,9 @@ def gen_selective_sample_ladder_module() -> JitSpec:
         # Match the ladder's FP32 policy arithmetic; its one fused margin is
         # explicit in the kernel instead of contracting other expressions.
         extra_cuda_cflags=[
+            *current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=[10]
+            ),
             "--fmad=false",
             "--ftz=false",
             "--prec-div=true",

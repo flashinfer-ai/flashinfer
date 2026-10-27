@@ -86,7 +86,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from .fp8_kernel_config import FP8MQAKernelConfig
+from .fp8_kernel_config import _FP8MQAKernelConfig
 
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_available
@@ -1141,7 +1141,7 @@ def _cached_compile_fp8_kernel(
 # (num_epi_subtiles, w_cache_regs) for the FP8 kernel's epilogue, by shape.
 # None for w_cache_regs keeps the kernel's default register budget
 # (_MAX_W_CACHE_REGS = 160). This table selects defaults when kernel_config is
-# omitted; explicit FP8MQAKernelConfig values override it. Defaults come from
+# omitted; explicit _FP8MQAKernelConfig values override it. Defaults come from
 # measurements on these kernels (graph-replay methodology of
 # benchmarks/bench_paged_mqa_logits.py, same node per arch), and neither knob
 # changes the head accumulation order, so every entry is bit-identical to the
@@ -1242,8 +1242,8 @@ def _resolve_explicit_fp8_config(
     """Validate explicit scorer configurations without changing default dispatch."""
     if config is None:
         return None
-    if not isinstance(config, FP8MQAKernelConfig):
-        raise TypeError("kernel_config must be FP8MQAKernelConfig or None")
+    if not isinstance(config, _FP8MQAKernelConfig):
+        raise TypeError("kernel_config must be _FP8MQAKernelConfig or None")
     config.validate_geometry(heads=H, dimension=D, page=page, next_n=next_n)
     config.require_dispatchable()
     if (output_dtype, epi_dtype, acc_dtype, math_mode) != (
@@ -1612,7 +1612,7 @@ def _check_fp8_paged_mqa_logits_supported(
     math_mode: str = "relu_strict",
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    kernel_config: Optional[FP8MQAKernelConfig] = None,
+    kernel_config: Optional[_FP8MQAKernelConfig] = None,
     query_metadata: Optional[torch.Tensor] = None,
     output_rows: Optional[int] = None,
 ) -> bool:
@@ -1626,8 +1626,8 @@ def _check_fp8_paged_mqa_logits_supported(
     head_dim vs the MMA instruction K, the UMMA N-mode range, and the per-CTA
     SMEM budget.
 
-    Signature mirrors :func:`fp8_paged_mqa_logits` (``backend_requirement`` binds
-    the public arguments and forwards them all by keyword); ``schedule_meta`` and
+    Signature mirrors the private grouped-capable scorer (``backend_requirement``
+    binds its arguments and forwards them by keyword); ``schedule_meta`` and
     ``out`` are accepted but validated in the API body instead — they describe
     caller-supplied output storage rather than problem supportedness, and must
     stay enforced even under ``skip_check=True`` because a too-small buffer is a
@@ -1774,9 +1774,6 @@ def fp8_paged_mqa_logits(
     math_mode: str = "relu_strict",
     schedule_meta: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    kernel_config: Optional[FP8MQAKernelConfig] = None,
-    query_metadata: Optional[torch.Tensor] = None,
-    output_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
 
@@ -1956,20 +1953,6 @@ def fp8_paged_mqa_logits(
                          unchanged in both modes. Output dtype alone does
                          not select epilogue precision. Each mode has its
                          own compiled specialization.
-        query_metadata: request-local Int32 [B,2+next_n] full-score metadata.
-                         Each row is real-output base, valid count, exact physical
-                         ends. seq_lens contains group maxima, never causal decrements.
-                         Immutable during captured replay; changing metadata requires
-                         revalidation and schedule rebuild. Requires explicit config
-                         and output_rows. Padded Q/weights must be allocated safe lanes.
-        output_rows:     real flattened output rows covered exactly by group metadata.
-        kernel_config:   optional immutable FP8MQAKernelConfig specifying tile,
-                         epilogue, query grouping and Q/KV pipeline depths.
-                         None preserves the existing
-                         per-shape epilogue policy. Explicit configs retain the
-                         kernel's geometry guards and require strict FP32 math.
-                         The prospective M256 definition rejects before compile;
-                         it is unsupported by the current single-CTA MMA path.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA
                          schedule, contiguous, on q's device.  Omit it (None,
                          recommended) unless profiling shows the per-call
@@ -2048,6 +2031,45 @@ def fp8_paged_mqa_logits(
                          retaining Int32. The padded physical byte span must
                          fit signed Int64, including a wider out= row pitch.
     """
+    return _fp8_paged_mqa_logits(
+        q,
+        kv_fused,
+        weights,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        output_dtype=output_dtype,
+        epi_dtype=epi_dtype,
+        acc_dtype=acc_dtype,
+        math_mode=math_mode,
+        schedule_meta=schedule_meta,
+        out=out,
+        # The public decorator has already applied (or explicitly skipped)
+        # backend validation. Do not repeat it in the private entry point.
+        skip_check=True,
+    )
+
+
+@backend_requirement({}, common_check=_check_fp8_paged_mqa_logits_supported)
+def _fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    output_dtype: torch.dtype = torch.float32,
+    epi_dtype: torch.dtype = torch.float32,
+    acc_dtype: torch.dtype = torch.float32,
+    math_mode: str = "relu_strict",
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    kernel_config: Optional[_FP8MQAKernelConfig] = None,
+    query_metadata: Optional[torch.Tensor] = None,
+    output_rows: Optional[int] = None,
+) -> torch.Tensor:
+    """Internal scorer with explicit tile and request-group metadata support."""
     math_mode = _validate_math_mode(math_mode)
     _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
 

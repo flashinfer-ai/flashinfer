@@ -3518,7 +3518,7 @@ with contextlib.suppress(Exception):
         top_k=512,
         device=device,
     )
-    _selective_topk = flashinfer.FP8PagedMQATopKWrapper(strategy="full")
+    _selective_topk = flashinfer.FP8PagedMQATopKWrapper(**_selective_in["constructor"])
     _selective_topk.plan(**_selective_in["plan"])
     _selective_topk.run(**_selective_in["run"])
 
