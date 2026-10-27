@@ -127,6 +127,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           # Check if this SHA already has a passing or active run.
           PASSED=$(gh run list \
@@ -147,11 +148,10 @@ jobs:
           # previous HEAD. The new commit supersedes the old one, so letting
           # those runs finish wastes GPU time and blocks runners.
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            PR_NUMBER="${{ steps.pr.outputs.number }}"
             STALE_RUNS=$(gh run list \
               --repo "${{ github.repository }}" \
               --workflow "pr-test.yml" \
-              --branch "${{ github.event.pull_request.head.ref }}" \
+              --branch "$HEAD_REF" \
               --json databaseId,status,headSha \
               --jq "[.[] | select(.headSha != \"${HEAD_SHA}\" and (.status == \"in_progress\" or .status == \"queued\"))] | .[].databaseId" \
               2>/dev/null) || STALE_RUNS=""
