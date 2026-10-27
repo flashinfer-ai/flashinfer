@@ -767,6 +767,41 @@ def test_cake_fmha_context_fp8_split_plan(
     assert whole - split >= cake_api._CONTEXT_FP8_SPLIT_ABS_MARGIN
 
 
+# (target, batch, max_q_len, max_kv_len, num_q_heads, pack, splits): launches
+# near the margins (2 % and 0.5 us) whose plan differs between the targets.
+_SPLIT_MARGIN_ROWS = [
+    # B200: 0.58 us (2.1 %) predicted; GB300: no split predicted faster
+    ("sm100a", 2, 300, 1500, 32, 8, True),
+    ("sm103a", 2, 300, 1500, 32, 8, False),
+    # GB300: 0.84 us (3.0 % and 2.2 %) predicted
+    ("sm103a", 2, 300, 2000, 32, 8, True),
+    ("sm103a", 2, 300, 3000, 32, 8, True),
+    # 16 requests of 256 query tokens over 2048 keys, one head per tile: B200
+    # 2.7 % predicted; GB300 1.5 %, below the margin
+    ("sm100a", 16, 256, 2048, 32, 1, True),
+    ("sm103a", 16, 256, 2048, 32, 1, False),
+]
+
+
+@pytest.mark.parametrize(
+    ("target", "batch", "max_q", "max_kv", "num_q_heads", "pack", "splits"),
+    _SPLIT_MARGIN_ROWS,
+)
+def test_cake_fmha_context_fp8_split_plan_margins(
+    target, batch, max_q, max_kv, num_q_heads, pack, splits
+) -> None:
+    """Launches whose best split the cost model predicts faster by about the
+    margins split exactly where it beats both (2 % and 0.5 us)."""
+
+    sm_count = _SM_COUNT[target]
+    assert cake_api._CONTEXT_FP8_SPLIT_REL_MARGIN == 0.02
+    assert cake_api._CONTEXT_FP8_SPLIT_ABS_MARGIN == 0.5
+    plan = cake_api._context_fp8_split_plan(
+        target, batch, max_q, max_kv, num_q_heads, pack, sm_count
+    )
+    assert (plan is not None) is splits
+
+
 def test_cake_fmha_context_fp8_split_makespan_one_stage_share() -> None:
     """The one-stage share scales only the partial store and the merge: the
     whole-tile schedule keeps its time, a split plan's time falls by at most

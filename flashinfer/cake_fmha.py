@@ -2478,10 +2478,12 @@ _CONTEXT_FP8_SPLIT_ONE_STAGE: dict[str, float] = {
     "sm103a": 0.734,
 }
 # A split must be predicted faster than the whole-tile schedule by both
-# margins; a launch of more tiles than this many waves keeps whole tiles (its
-# last partial wave is a small share of it).
-_CONTEXT_FP8_SPLIT_REL_MARGIN = 0.03
-_CONTEXT_FP8_SPLIT_ABS_MARGIN = 1.0
+# margins (2 % and 0.5 us: the smallest that timed plans of B200 and GB300
+# support; at 1 % some predicted gains measure as losses); a launch of more
+# tiles than this many waves keeps whole tiles (its last partial wave is a
+# small share of it).
+_CONTEXT_FP8_SPLIT_REL_MARGIN = 0.02
+_CONTEXT_FP8_SPLIT_ABS_MARGIN = 0.5
 _CONTEXT_FP8_SPLIT_MAX_WAVES = 4
 
 
