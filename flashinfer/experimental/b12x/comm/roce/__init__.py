@@ -1,4 +1,4 @@
-"""``b12x.comm.roce`` (RoCEnante): one-shot all-reduce and all-gather over RoCE for multi-node TP.
+"""``b12x.comm.roce`` (RoCEnante): one-shot and pipelined two-shot all-reduce and all-gather over RoCE for multi-node TP.
 
 Target: clusters of DGX Spark nodes joined by their ConnectX-7 200 GbE ports,
 one GPU per node.  The GB10's unified memory lets the NIC RDMA-write straight
@@ -8,8 +8,10 @@ GPUDirect RDMA (dmabuf/peermem) support is required.
 ``AllReduce`` mirrors the ``comm.pcie.AllReduce`` surface (``from_exchange_group``,
 ``should_allreduce``, ``all_reduce``, ``for_stream``, ``capture``, ``close``) plus
 ``should_all_gather``/``all_gather`` for dim-0 and last-dim concatenation, so
-integrations can dispatch to it behind the same adapter.  See
-``roce_oneshot.py`` for the protocol and constraints.
+integrations can dispatch to it behind the same adapter, and
+``all_gather_varlen`` for contributions whose byte counts the device supplies
+when a captured graph replays.  See ``roce_oneshot.py`` for the protocol and
+constraints.
 """
 
 from __future__ import annotations
