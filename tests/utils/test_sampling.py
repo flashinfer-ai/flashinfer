@@ -405,7 +405,7 @@ def test_blackwell_persistent_softmax_every_launch_reads_its_own_rows(rows, voca
     bad = torch.zeros((), dtype=torch.int64, device="cuda")
     for _ in range(launches):
         probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
-        bad += ((probs - probs_ref).abs() > 1e-8).any()
+        bad += ~((probs - probs_ref).abs() <= 1e-8).all()
     assert bad.item() == 0, f"{bad.item()} of {launches} launches differ"
 
 
