@@ -35,12 +35,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 264
+#define TMEM_NCOLS 392
 #define TMEM_ACCUM_OFFSET 0
-#define TMEM_SCALE_A_OFFSET 256
-#define TMEM_SCALE_B_OFFSET 260
+#define TMEM_SCALE_A_OFFSET 384
+#define TMEM_SCALE_B_OFFSET 388
 #define NUM_PIPE_STAGES 7
-#define NUM_ACCUM_PIPE_STAGES 2
+#define NUM_ACCUM_PIPE_STAGES 3
 #define NUM_TASK_PIPE_STAGES 4
 #define SMEM_COMBINE_SMEM_OFF 0
 #define SMEM_COMBINE_SMEM_STAGE_BYTES 215040
@@ -324,11 +324,11 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     #define full_addr (mbar_base + 0)
     #define empty_addr (mbar_base + 56)
     #define tmem_full_addr (mbar_base + 112)
-    #define tmem_empty_addr (mbar_base + 128)
-    #define task_full_addr (mbar_base + 144)
-    #define task_empty_addr (mbar_base + 176)
-    #define combine_barriers_addr (mbar_base + 208)
-    #define pull_barriers_addr (mbar_base + 784)
+    #define tmem_empty_addr (mbar_base + 136)
+    #define task_full_addr (mbar_base + 160)
+    #define task_empty_addr (mbar_base + 192)
+    #define combine_barriers_addr (mbar_base + 224)
+    #define pull_barriers_addr (mbar_base + 800)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -377,8 +377,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 102 barriers)
-    // Mbarriers at smem_raw[219264..220080)
+    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 104 barriers)
+    // Mbarriers at smem_raw[219264..220096)
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
@@ -401,26 +401,26 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
             mbarrier_init(smem + 219360, 1);
             mbarrier_init(smem + 219368, 1);
             // --- pipeline 'accum_pipe' ---
-            // tmem_full: 2 barriers, init_count=1
+            // tmem_full: 3 barriers, init_count=1
             mbarrier_init(smem + 219376, 1);
             mbarrier_init(smem + 219384, 1);
-            // tmem_empty: 2 barriers, init_count=512
-            mbarrier_init(smem + 219392, 512);
+            mbarrier_init(smem + 219392, 1);
+            // tmem_empty: 3 barriers, init_count=512
             mbarrier_init(smem + 219400, 512);
+            mbarrier_init(smem + 219408, 512);
+            mbarrier_init(smem + 219416, 512);
             // --- pipeline 'task_pipe' ---
             // task_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 219408, 1);
-            mbarrier_init(smem + 219416, 1);
             mbarrier_init(smem + 219424, 1);
             mbarrier_init(smem + 219432, 1);
+            mbarrier_init(smem + 219440, 1);
+            mbarrier_init(smem + 219448, 1);
             // task_empty: 4 barriers, init_count=512
-            mbarrier_init(smem + 219440, 512);
-            mbarrier_init(smem + 219448, 512);
             mbarrier_init(smem + 219456, 512);
             mbarrier_init(smem + 219464, 512);
+            mbarrier_init(smem + 219472, 512);
+            mbarrier_init(smem + 219480, 512);
             // combine_barriers: 72 barriers, init_count=1
-            mbarrier_init(smem + 219472, 1);
-            mbarrier_init(smem + 219480, 1);
             mbarrier_init(smem + 219488, 1);
             mbarrier_init(smem + 219496, 1);
             mbarrier_init(smem + 219504, 1);
@@ -491,6 +491,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
             mbarrier_init(smem + 220024, 1);
             mbarrier_init(smem + 220032, 1);
             mbarrier_init(smem + 220040, 1);
+            mbarrier_init(smem + 220048, 1);
+            mbarrier_init(smem + 220056, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -498,20 +500,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
         uint32_t leader = elect_sync();
         if (leader) {
             // pull_barriers: 4 barriers, init_count=1
-            mbarrier_init(smem + 220048, 1);
-            mbarrier_init(smem + 220056, 1);
             mbarrier_init(smem + 220064, 1);
             mbarrier_init(smem + 220072, 1);
+            mbarrier_init(smem + 220080, 1);
+            mbarrier_init(smem + 220088, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
     __syncwarp();
 
-    // TMEM alloc (512 columns, 264 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 220080);
+    // TMEM alloc (512 columns, 392 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 220096);
     if (warp == 3) {
-        int _tmem_hold = smem + 220080;
+        int _tmem_hold = smem + 220096;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
     }
@@ -525,8 +527,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
-    const int tmem_scale_a = taddr + 256;
-    const int tmem_scale_b = taddr + 260;
+    const int tmem_scale_a = taddr + 384;
+    const int tmem_scale_b = taddr + 388;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -974,6 +976,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                 unsigned int aligned_m = (task[5] + 15) / 16 * 16;
                 unsigned int token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
                 unsigned long long pending = 1023;
+                unsigned int a_rows32 = 0;
+                if (task[0] == 1) {
+                    if (aligned_m <= 64) {
+                        a_rows32 = 1;
+                    }
+                }
                 if (task[0] == 1) {
                     {
                     unsigned int _acquire_observed;
@@ -999,13 +1007,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                     if (elect_sync()) {
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            if (a_rows32 == 0) {
+                                tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192 + 4096, (&A), k * 128, token_offset + 32, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            }
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF1), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         } else {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A2), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF2), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         }
                         if (cta_rank == 0) {
-                            mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 17408);
+                            if (a_rows32 != 0) {
+                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 9216);
+                            } else {
+                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 17408);
+                            }
                         } else {
                             asm volatile(
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
@@ -1099,10 +1114,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                     if (task_2[0] == 0) {
                         break;
                     }
-                    unsigned int accum_stage = task_iteration_2 % 2;
+                    unsigned int accum_stage = task_iteration_2 % 3;
                     unsigned int aligned_m_1 = (task_2[5] + 15) / 16 * 16;
-                    int _stage_tmem_empty = (int)((unsigned int)task_iteration_2 % 2);
-                    int _parity_tmem_empty = (int)((unsigned int)task_iteration_2 / 2 % 2) ^ 1;
+                    int _stage_tmem_empty = (int)((unsigned int)task_iteration_2 % 3);
+                    int _parity_tmem_empty = (int)((unsigned int)task_iteration_2 / 3 % 2) ^ 1;
                     mbarrier_wait(tmem_empty_addr + (_stage_tmem_empty) * 8, _parity_tmem_empty);
                     #pragma unroll 2
                     for (int k_2 = 0; k_2 < task_2[7] / 128; k_2++) {
@@ -1139,10 +1154,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                     }
                     completed_tasks += 1;
                     accum_cursor += 1;
-                    if (accum_cursor == 2) { accum_cursor = 0; _phase_tmem_empty ^= 1; }
+                    if (accum_cursor == 3) { accum_cursor = 0; _phase_tmem_empty ^= 1; }
                 }
                 if (completed_tasks > 0) {
-                    mbarrier_wait(tmem_empty_addr + (((accum_cursor + 1 < 2) ? accum_cursor + 1 : (unsigned int)0)) * 8, ((accum_cursor + 1 < 2) ? _phase_tmem_empty : _phase_tmem_empty ^ 1));
+                    mbarrier_wait(tmem_empty_addr + (((accum_cursor + 2 >= 3) ? accum_cursor + 2 - 3 : accum_cursor + 2)) * 8, _phase_tmem_empty ^ (unsigned int)(accum_cursor + 2 >= 3));
                 }
             }
         }
@@ -1799,9 +1814,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                 if (task_4[0] == 0) {
                     break;
                 }
-                unsigned int accum_stage_1 = task_iteration_3 % 2;
-                int _stage_tmem_full = (int)((unsigned int)task_iteration_3 % 2);
-                int _parity_tmem_full = (int)((unsigned int)task_iteration_3 / 2 % 2);
+                unsigned int accum_stage_1 = task_iteration_3 % 3;
+                int _stage_tmem_full = (int)((unsigned int)task_iteration_3 % 3);
+                int _parity_tmem_full = (int)((unsigned int)task_iteration_3 / 3 % 2);
                 mbarrier_wait(tmem_full_addr + (_stage_tmem_full) * 8, _parity_tmem_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile(

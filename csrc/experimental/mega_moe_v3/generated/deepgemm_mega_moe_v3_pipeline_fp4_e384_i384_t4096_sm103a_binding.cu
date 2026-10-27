@@ -74,7 +74,7 @@ inline CUtensorMap EncodeTma_A(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'A' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {128u, 64u};
+  uint32_t box_dim[2] = {128u, 32u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'A'";
   int64_t carrier_stride_0 = s2;
