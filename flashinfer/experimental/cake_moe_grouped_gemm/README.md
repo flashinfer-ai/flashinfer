@@ -163,7 +163,10 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   (stage `main_halves`, or `main_wave_halves` for the wave-synchronized build),
   so the next tile's MMAs start on the first half while the epilogue drains the
   second. Its output is bitwise that of the build that drains the whole
-  accumulator at once.
+  accumulator at once. On `sm_107a` the `main_halves` program also keeps each
+  A tile in the tensor core's A collector; on `sm_100a` and `sm_103a` the
+  `main_wave_halves` program does so and synchronizes the waves every eight
+  waves. Neither changes the output bits.
 - Workspaces (allocated at preparation, retained by the launch object): the
   per-CTA TMA descriptor slots of the weight gradient (a ring of nine
   descriptor pairs per CTA: a group switch edits the next pair and warms the
@@ -207,9 +210,10 @@ folded under `__CUDA_ARCH__`):
 - the wave-synchronized weight-gradient main kernel with a 256- or 512-wide
   k tile, for `sm_100a`, `sm_103a` and `sm_107a` (the routes' `main_wave`
   stage).
-- the 512-wide k tile's main kernel and wave-synchronized main kernel that
-  release the accumulator in two halves, for `sm_100a` and `sm_103a`
-  (`main_halves`, `main_wave_halves`).
+- the 512-wide k tile's main kernel that releases the accumulator in two
+  halves (`main_halves`), for `sm_100a` and `sm_103a`, and its A-collector
+  build for `sm_107a`; the wave-synchronized A-collector kernel that releases
+  it in two halves (`main_wave_halves`), for `sm_100a` and `sm_103a`.
 - the 512-wide k tile's main kernel for `sm_107a`, a second `main` stage
   beside the one built for `sm_100a` and `sm_103a`.
 - the weight-gradient main kernel with a 256- or 512-wide k tile and the
