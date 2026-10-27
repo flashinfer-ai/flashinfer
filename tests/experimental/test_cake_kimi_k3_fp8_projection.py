@@ -2363,8 +2363,9 @@ def test_route_twins_are_registered_hint_instances(arch):
     # one twin suffix: an L2 hint (decode ``_wef`` / ``_xef``, GEMM ``_bef``, quantization ``_xef_qel``), the decode
     # half-stage form ``_k128`` (with its rows' hint, ``_k128_wef``), the decode bounded exchange ``_sko<n>``, which
     # carries the first ``n`` rows only and so serves a cell whose M bucket is at most ``n``, the decode relaxed
-    # closing cluster barrier ``_csrt``, the quantization carveout instance ``_cv100`` or (round 12 batch 4) the gs-branch
-    # form ``_gsb`` of a GEMM grid-stride program -- on the architecture
+    # closing cluster barrier ``_csrt``, the quantization carveout instance ``_cv100``, (round 12 batch 4) the gs-branch
+    # form ``_gsb`` of a GEMM grid-stride program or (round 12 D) the three-slot early-TMEM-free form ``_ts3_tde`` of a
+    # 192-wide 128-K TMA-store GEMM program (cluster launch control or grid-stride) -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2382,6 +2383,10 @@ def test_route_twins_are_registered_hint_instances(arch):
                 or (suffix == "_cv100" and key.startswith("quant:"))
                 or (
                     suffix == "_gsb" and key.startswith("gemm_") and key.endswith("_gs")
+                )
+                or (
+                    suffix == "_ts3_tde"
+                    and key in ("gemm_tstore_n192_k128", "gemm_tstore_n192_k128_gs")
                 )
             ), (cell, key, twin)
             if sko:
