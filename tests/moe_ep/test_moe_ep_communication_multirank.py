@@ -293,31 +293,42 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         layer.destroy()
 
 
+def _split_candidate(quant_pair, prims_ts):
+    from flashinfer.fused_moe.api import (
+        CuteDslConfig,
+        PrimsTsConfig,
+        QuantFormat,
+        TrtllmFp4Config,
+        TrtllmFp8BlockConfig,
+    )
+
+    weight = QuantFormat[quant_pair[0]]
+    if prims_ts:
+        return PrimsTsConfig()
+    if weight is QuantFormat.NVFP4:
+        return TrtllmFp4Config()
+    if weight is QuantFormat.DeepSeekFp8:
+        return TrtllmFp8BlockConfig()
+    return CuteDslConfig()
+
+
 def _fused_moe_split_config(
     comm, quant_pair, *, rank, world_size, num_experts, prims_ts=False
 ):
     from flashinfer.fused_moe.api import (
         BackendOptions,
-        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
-        PrimsTsConfig,
         QuantConfig,
         QuantFormat,
         RoutingConfig,
-        TrtllmFp4Config,
     )
     from flashinfer.moe_ep import FusedMoeKernelConfig, SplitConfig
 
     weight, activation = (QuantFormat[name] for name in quant_pair)
     local_num_experts = num_experts // world_size
-    if prims_ts:
-        candidate = PrimsTsConfig()
-    elif weight is QuantFormat.NVFP4:
-        candidate = TrtllmFp4Config()
-    else:
-        candidate = CuteDslConfig()
+    candidate = _split_candidate(quant_pair, prims_ts)
     moe_config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=2),
         quant=QuantConfig(weight=weight, activation=activation),
@@ -338,6 +349,7 @@ def _fused_moe_split_config(
     [
         (("NVFP4", "NVFP4"), False),
         (("MXFP4", "MXFP8"), False),
+        (("DeepSeekFp8", "DeepSeekFp8"), False),
         (("NVFP4", "NVFP4"), True),
         (("MXFP4", "MXFP8"), True),
         (("MXFP8", "MXFP8"), True),
@@ -346,6 +358,7 @@ def _fused_moe_split_config(
     ids=[
         "nvfp4",
         "mxfp4_mxfp8",
+        "deepseek_fp8",
         "prims_ts-nvfp4",
         "prims_ts-mxfp4_mxfp8",
         "prims_ts-mxfp8",
@@ -380,6 +393,10 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
 
         if not is_prims_ts_available():
             pytest.skip("Prims-TS needs nvidia-cutlass-dsl with cutlass.experimental")
+    candidate = _split_candidate(quant_pair, prims_ts)
+    major, minor = torch.cuda.get_device_capability()
+    if not candidate.supported(major * 10 + minor):
+        pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
     rank, world_size = _init_dist()
     _backend_config(backend)
     num_tokens, hidden, intermediate = 16, 1024, 512
