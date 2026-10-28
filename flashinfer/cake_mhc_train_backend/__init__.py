@@ -264,13 +264,14 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
     The forward routes (``forward_prepare`` and the ``forward_stats`` replay) hold
-    the BF16 pieces of ``fn`` in the mapping operand layout, the FP32 per-K-unit
-    partials of the mapping pass and one 256-byte ticket region.  The size is
-    the maximum over every token count up to ``T``, so a buffer sized for the
-    largest token count serves every smaller one (and CUDA Graph replays at a
-    smaller ``T``).  The ticket words must be zero on first use (allocate with
-    ``torch.zeros`` or :func:`cake_mhc_train_forward_workspace`); the kernels
-    leave them zero.  ``T == 0`` needs no workspace (nothing is launched).
+    one 256-byte ticket region (first, at the same offset for every token count),
+    the BF16 pieces of ``fn`` in the mapping operand layout and the FP32
+    per-K-unit partials of the mapping pass.  The size is the maximum over every
+    token count up to ``T``, so a buffer sized for the largest token count
+    serves every smaller one (and CUDA Graph replays at a smaller ``T``).  The
+    ticket words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
+    ``T == 0`` needs no workspace (nothing is launched).
     """
 
     return _workspace_bytes("fwd", T, device)
@@ -279,11 +280,12 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
 def cake_mhc_train_backward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
-    The ``backward_finish`` route holds the transposed BF16 pieces of ``fn``, the
-    per-token records of the token-owner pass (``dz'`` pieces and the per-token
-    scalars, padded to a multiple of 128 rows), the per-CTA parameter partials,
-    the per-chunk FP32 partials of ``dfn`` and one 256-byte ticket region.  The
-    size is the maximum over every token count up to ``T`` (see
+    The ``backward_finish`` route holds one 256-byte ticket region (first, at
+    the same offset for every token count), the transposed BF16 pieces of
+    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and the
+    per-token scalars, padded to a multiple of 128 rows), the per-CTA parameter
+    partials and the per-chunk FP32 partials of ``dfn``.  The size is the
+    maximum over every token count up to ``T`` (see
     :func:`cake_mhc_train_forward_workspace_bytes`).
     """
 
