@@ -28,6 +28,7 @@ import json
 import os
 import socket
 import tempfile
+import traceback
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
                 ]
             )
         torch.cuda.synchronize(device)
+    except BaseException as exc:
+        # the failed call's frames still reference its cache entry and graph: release them before the cleanup
+        traceback.clear_frames(exc.__traceback__)
+        raise
     finally:
         # a cached graph holding a NCCL collective blocks the process group's destruction
         cake_kcp.graph_cache_clear()
