@@ -1602,15 +1602,24 @@ def test_walk_record(program: str, form: str) -> tuple[str, dict[str, Any]]:
     raise ValueError(f"no test-only record of {program!r} carries the knobs {wanted}")
 
 
-@functools.cache
-def test_manifest() -> dict[str, Any]:
-    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
-    only after :func:`cake_kcp_plan.enable_test_knobs`: the shipped route never opens it."""
+def _require_test_knobs() -> None:
     if not test_knobs_enabled():
         raise RuntimeError(
             f"the test-only KCP programs are loaded only after {cake_kcp_plan.ENABLE_TEST_KNOBS}; the shipped "
             "route (precision_mode 0) uses build.json alone"
         )
+
+
+def test_manifest() -> dict[str, Any]:
+    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
+    only after :func:`cake_kcp_plan.enable_test_knobs`: the shipped route never opens it.  The opt-in is checked on
+    every call, the parse is cached (an opt-out after a load closes it again)."""
+    _require_test_knobs()
+    return _test_manifest()
+
+
+@functools.cache
+def _test_manifest() -> dict[str, Any]:
     try:
         text = _TEST_MANIFEST_PATH.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1685,10 +1694,16 @@ def test_jit_spec(library: str) -> Any:
     )
 
 
-@functools.cache
 def load_test(name: str, arch: str) -> Any:
     """The loaded tvm-ffi module of test-only record ``name`` (a key of ``TEST_MODULES``) built for ``arch``,
-    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``)."""
+    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``); the opt-in is checked on every
+    call, the loaded module is cached."""
+    _require_test_knobs()
+    return _load_test(name, arch)
+
+
+@functools.cache
+def _load_test(name: str, arch: str) -> Any:
     return test_jit_spec(test_library_name(name, arch)).build_and_load()
 
 

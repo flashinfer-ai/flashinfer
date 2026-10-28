@@ -415,13 +415,13 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     path = PACKAGE_DIR / kcp_jit.TEST_MANIFEST
     if not path.is_file():
         pytest.skip(f"{kcp_jit.TEST_MANIFEST} is not shipped here")
-    kcp_jit.test_manifest.cache_clear()
+    kcp_jit._test_manifest.cache_clear()
     monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", False)
     assert kcp_jit.test_knobs_enabled() is False
     with pytest.raises(RuntimeError, match="enable_test_knobs"):
         kcp_jit.test_manifest()
     monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", True)
-    kcp_jit.test_manifest.cache_clear()
+    kcp_jit._test_manifest.cache_clear()
     assert kcp_jit.test_knobs_enabled() is True
     document = kcp_jit.test_manifest()
     shipped = cake_build.manifest()
@@ -456,6 +456,13 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     for name in kcp_jit.TEST_MODULES:
         for arch in ARCHES:
             assert kcp_jit.test_library_name(name, arch) in names
+    # an opt-out after the parse is cached closes the test-only programs again (the gate is outside the caches)
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
+        kcp_jit.test_manifest()
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
+        kcp_jit.load_test(next(iter(kcp_jit.TEST_MODULES)), ARCHES[0])
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", True)
     with pytest.raises(RuntimeError):
         kcp_jit.test_library_name("kcp_transfer_walk_three_mma", "sm_90a")
-    kcp_jit.test_manifest.cache_clear()
+    kcp_jit._test_manifest.cache_clear()
