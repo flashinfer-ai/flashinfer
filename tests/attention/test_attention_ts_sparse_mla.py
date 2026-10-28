@@ -20,10 +20,8 @@ from flashinfer.attention.prims_ts import (
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
 
+from flashinfer.attention.prims_ts import mla_decode as mla_decode_module
 from flashinfer.attention.prims_ts.kernels.mla_decode import sparse_policy
-from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
-    sparse_mla_d576_launch,
-)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -1473,9 +1471,9 @@ def test_sparse_d576_compile_capacity_bucket(monkeypatch):
     """Capacities in one 128-key tile bucket compile one kernel."""
     seen = []
     monkeypatch.setattr(
-        sparse_mla_d576_launch,
-        "compile_sparse_mla_d576_kernel",
-        lambda *args, **kwargs: seen.append(kwargs["sparse_mla_top_k"]),
+        mla_decode_module,
+        "_compile_sparse_d576",
+        lambda *args, **kwargs: seen.append(kwargs["capacity"]),
     )
     for topk in (132, 136, 256):
         _d576_plan(150, 64, topk)
