@@ -229,6 +229,16 @@ private natural-log, sink-exclusive FP32 LSE and the K0 dummy main storage.
 Sinks contain finite logits or -inf and affect output normalization exactly once;
 empty rows produce exact zero output and -inf LSE. Effective Q/K/V must be finite.
 
+Loaders gather with `cp.async`; masked rows zero-fill without reading the cache.
+The SWA tile issues all four D128 stages at once into the initially empty KV ring.
+Each main tile stages its raw FP4 payload/scales into 36 KiB of SMEM, one commit
+group per D128 stage, and converts each stage from SMEM. These copies issue
+before the tile's first KV slot is acquired: reused slots are released only after
+the previous tile's PV, which the in-order MMA issues after the next QK. With
+bundled CUDA >= 13.2 the exact E2M1 * E4M3 product is formed in F16. Final BF16
+rows pass through 16 KiB of SMEM so global stores write whole lines. Two
+metadata stages let the next tile's row IDs load during the current tile.
+
 Capture requires caller output/workspace and eager warmup for the same declaration.
 Keep addresses alive/fixed and update values in place. Changing Python scales
 requires recapture, not recompilation. Concurrent calls need separate writable

@@ -57,7 +57,9 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4):
             reuse_kv=True,
             reuse_kv_stages=8,
             kv_tile_size=128,
-            page_pipeline_stages=1,
+            # Two index stages let the next tile's row IDs load while the
+            # loaders still stage the current tile.
+            page_pipeline_stages=2,
         ),
         finalize_output=True,
         kv_producer=MixedFp8KvProducer(native_fp4=native_fp4),
@@ -69,6 +71,8 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4):
     # binaries.
     attention.direct_sparse = True
     attention.direct_sparse_capacities = (128, compressed_k)
+    # Stage final BF16 rows through SMEM so global stores write whole lines.
+    attention.coalesce_keeps_output = True
     return attention
 
 
