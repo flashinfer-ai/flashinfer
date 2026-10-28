@@ -57,6 +57,7 @@ FUSED_QLE2048_MAX_Q = 2048
 
 @functools.cache
 def _catalog():
+    """Load the generated route catalog and require its supported schema version."""
     catalog = json.loads(Path(__file__).with_name("dense_mqa_catalog.json").read_text())
     if catalog.get("schema") != CATALOG_SCHEMA:
         raise RuntimeError(
@@ -215,6 +216,7 @@ def block_q(num_heads=NUM_HEADS):
 
 
 def _route_prefix(precision, num_heads):
+    """Build the route-key prefix, qualifying nondefault head counts explicitly."""
     return precision if num_heads == NUM_HEADS else f"{precision}:h{num_heads}"
 
 
