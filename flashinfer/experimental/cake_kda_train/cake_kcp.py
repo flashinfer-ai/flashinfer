@@ -555,10 +555,10 @@ _SPEC3_ROWS = (
     "w",
     "u",
 )  # the prep rows SPEC-3 compares (the design note §6.4)
-# the entry points' spec3_probe keyword: "off" skips the probe; "record" (the default) records it; "warn" warns on a
+# the entry points' spec3_probe keyword: "off" (the default) skips the probe; "record" records it; "warn" warns on a
 # difference; "assert" raises KcpPreconditionError
 SPEC3_PROBES = ("off", "record", "warn", "assert")
-SPEC3_PROBE_DEFAULT = "record"
+SPEC3_PROBE_DEFAULT = "off"
 _PROGRAM_OF = {
     "kcp_fwdh_offset": "fwdh_offset",
     "kcp_fwdh_tape": "fwdh_tape",
@@ -649,12 +649,13 @@ class KernelBackend(Backend):
     ``equal`` is ``False`` by construction: the forward's intra program writes ``gk`` at row 63 of every chunk alone
     (the chunk-final gate row, the only ``gk`` row the K1 / K2 / K3 walks read), the backward's prep program writes
     every row's prefix with the same row 63, so ``rows["gk"]["real_rows_differ"]`` is the real rows minus the full
-    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default
-    (``spec3_probe="record"``).  ``spec3_probe="off"`` skips it on that call, ``"warn"`` warns on a difference,
-    ``"assert"`` raises :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and
-    :attr:`spec3`.  The keyword travels with the call's options (:class:`KcpOptions`); no environment variable is
-    read.  Under ``graph="replay"`` the probing backward runs eagerly; a rank without tokens has nothing to probe
-    and does not hold back the capture of its backward.
+    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0.  The kept rows (``gk`` FP32, the other four BF16: about
+    ``R * H * 1536`` bytes) stay allocated through the backward's prep and WY programs and raise that backward's
+    peak by up to their size, so the probe is off by default (``spec3_probe="off"``): ``"record"`` runs it and
+    keeps the comparison, ``"warn"`` warns on a difference, ``"assert"`` raises :class:`KcpPreconditionError`; the
+    result is in ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.  The keyword travels with the call's options
+    (:class:`KcpOptions`); no environment variable is read.  Under ``graph="replay"`` the probing backward runs
+    eagerly; a rank without tokens has nothing to probe and does not hold back the capture of its backward.
     """
 
     name = "kernels"
@@ -3009,9 +3010,11 @@ class KcpWorkspace:
     ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them.  The
     saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
     ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
-    reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it.  ``bytes`` counts
-    every pool storage once plus the local arena (:func:`kcp_workspace_bytes` is the plan module's prediction of the
-    same quantity for an a2a workspace, CONSISTENCY-6)."""
+    reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it, releasing each
+    superseded pool and local arena (and the graph-cache entries pinning that arena) before allocating its successor
+    (the old and the new storage never coexist, so a backward on a forward workspace peaks at the grown workspace plus
+    the call's own peak).  ``bytes`` counts every pool storage once plus the local arena (:func:`kcp_workspace_bytes`
+    is the plan module's prediction of the same quantity for an a2a workspace, CONSISTENCY-6)."""
 
     def __init__(
         self,
@@ -3083,6 +3086,9 @@ class KcpWorkspace:
             last = self._last_ensure
             if last is not None and last[0] is ctx and last[1] == sig:
                 return last[2]
+        # set again only once this ensure succeeds: a failed one (an allocation error after a release) must not
+        # leave the fast path approving a workspace it has already taken apart
+        self._last_ensure = None
         if self.device is None:
             self.device = device
         elif self.device != device:
@@ -3113,6 +3119,13 @@ class KcpWorkspace:
                 or (ctx.T_r, ctx.n_frag, int(H)) != (p.S, p.N, p.H)
                 or (backward and not self.local.backward)
             ):
+                if self.local is not None:
+                    # no contents carry over: release the superseded arena (and the graph-cache entries pinning it)
+                    # before its successor is allocated, so the two never coexist -- the first training step then
+                    # peaks at the retained workspace plus the call's own peak, as every later step does (with the
+                    # SPEC-3 probe off, the default)
+                    _graph_release(self.local)
+                    self.local = None
                 self.local = cake_backend.KdaWorkspace.for_problem(
                     ctx.T_r,
                     ctx.n_frag,
@@ -3145,8 +3158,16 @@ class KcpWorkspace:
         if mt is not None and mt.numel() >= n:
             self._pools[name] = mt  # the pair's storage is already large enough
             return True
+        # the pools carry no contents across calls: release the superseded storage (these locals, the dict entries and
+        # the cached views) before the successor is allocated, so the two never coexist
+        shared = mt is not None
+        del cur, mt
+        for m in (name, mate):
+            if m is not None and self._pools.pop(m, None) is not None:
+                for key in [k for k in self._slices if k[0] == m]:
+                    del self._slices[key]
         t = self._pools[name] = _alloc((n,), self.state_dtype, device)
-        if mt is not None:
+        if shared:
             self._pools[mate] = t
         if name == "eye":
             t.view(D, D).copy_(torch.eye(D, dtype=self.state_dtype, device=device))
@@ -3304,7 +3325,7 @@ class KcpOptions:
     today), ``head_groups`` (``G``; Phase 1 ships ``1``),
     ``offset_class`` (``fla``: K1 / K2 offsets; ``fp32`` is a Phase-2 knob), ``debug_sequence`` (R7: all-gather the
     collective issue order and assert it), ``spec3_probe`` (the SPEC-3 debug probe of the first saved-mode backward,
-    :class:`KernelBackend`: ``"record"`` default, ``"off"``, ``"warn"``, ``"assert"``; pass the same value on every
+    :class:`KernelBackend`: ``"off"`` default, ``"record"``, ``"warn"``, ``"assert"``; pass the same value on every
     rank: the probe is a rank-local host check (a rank without tokens skips it), and ``"assert"`` raises on a rank
     whose rows differ while the other ranks enter the backward's collectives -- it serves single-process debugging;
     the backward reads its own call's value, the forward's is not kept in :class:`KcpSaved`),
@@ -4711,6 +4732,18 @@ def graph_cache_clear() -> int:
     n = len(_GRAPHS)
     _GRAPHS.clear()
     return n
+
+
+def _graph_release(arena: Any) -> int:
+    """Drop the cached graphs whose key pins ``arena``, a local arena that :meth:`KcpWorkspace.ensure` supersedes: no
+    later call can match their keys, and their pins would keep its storage alive.  The dropped entries also let go of
+    their pins (the entry of the call doing the upgrade, created before its ``ensure``, is still referenced by that
+    call): once the arena is freed its id may be reused, and a later call that builds an equal key finds no entry and
+    starts a new one.  Returns the number dropped."""
+    stale = [key for key, e in _GRAPHS.items() if any(p is arena for p in e.pins)]
+    for key in stale:
+        _GRAPHS.pop(key).pins = ()
+    return len(stale)
 
 
 # ----------------------------------------------------------------------------------------------------------------

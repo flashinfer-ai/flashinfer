@@ -3631,7 +3631,11 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
         )
 
     cake_kcp.graph_cache_clear()
-    ref, ev0, recs0 = run(graph="off", **knobs)
+    # the eager reference requests the SPEC-3 probe (off by default): the first saved-mode backward of the process
+    # runs it, and the replay-mode calls below (probe off) must still match the reference bitwise
+    probing = backend._spec3_pending and backend.local_stages and T > 0
+    ref, ev0, recs0 = run(graph="off", spec3_probe="record", **knobs)
+    assert not probing or (recs0[1]["spec3"] or {}).get("checked"), recs0[1]["spec3"]
     ref = tuple(
         x.clone() for x in ref
     )  # copies taken before any other call: the comparison stays explicit
@@ -3921,10 +3925,10 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
 def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
     monkeypatch,
 ) -> None:
-    """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"record"`` by default, ``"off"``,
+    """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"off"`` by default, ``"record"``,
     ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read no environment
     variable: the private ``_kcp_test_knobs`` hook opens only after :func:`cake_kcp_plan.enable_test_knobs`."""
-    assert cake_kcp._options({}).spec3_probe == "record"
+    assert cake_kcp._options({}).spec3_probe == "off"
     for mode in cake_kcp.SPEC3_PROBES:
         assert cake_kcp._options({"spec3_probe": mode}).spec3_probe == mode
     for bad in ("0", "1", "", None):
@@ -4980,3 +4984,154 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
         )
         now = torch.cuda.memory_allocated(device)
         assert now == base, (i, now - base)
+
+
+def test_gpu_workspace_upgrade_releases_superseded_storage_first(device) -> None:
+    """A backward ``ensure`` on a forward workspace releases the forward-only local arena and every pool it outgrows
+    before allocating their successors: the old and the new storage never coexist, so the upgrade's allocation
+    high-water equals its final growth.  A pool growth alone (the shared c1 / b1 send storage outgrown, no arena
+    change, a cached view of the old storage present) frees the old storage and peaks at exactly its final allocation.
+    Rows: the contiguous and the per-document zigzag partitions at W = 2 / 4, every rank with tokens, H = 4 / 64.  (The
+    weakref checks are leak checks; the high-water assertions are the ones a late release fails.)"""
+    seen = pooled = 0
+    for W, lengths, layout in (
+        (2, (3000,), "contiguous"),
+        (4, (700, 1, 1300, 999), "zigzag_per_document"),
+    ):
+        part = _small_partition(W, lengths=lengths, layout=layout)
+        for r in range(W):
+            ctx = kp.build_kcp_context(part, None, r, device)
+            if ctx.T_r == 0:
+                continue
+            for H in (4, 64):
+                ws = cake_kcp.KcpWorkspace()
+                ws.ensure(ctx, H, backward=False)
+                fwd_arena = weakref.ref(ws.local)
+                torch.cuda.synchronize(device)
+                base = torch.cuda.memory_allocated(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                ws.ensure(ctx, H, backward=True)
+                torch.cuda.synchronize(device)
+                grown = torch.cuda.memory_allocated(device) - base
+                peak = torch.cuda.max_memory_allocated(device) - base
+                assert ws.local.backward and fwd_arena() is None, (W, layout, r, H)
+                assert grown > 0 and peak <= grown + (1 << 20), (
+                    W,
+                    layout,
+                    r,
+                    H,
+                    peak,
+                    grown,
+                )
+                seen += 1
+                n = ws._pools["b1_send"].numel()
+                if n > 0:
+                    ws.pool(
+                        "c1_send", n, cached=True
+                    )  # a cached view of the old storage
+                    old = weakref.ref(ws._pools["b1_send"])
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                    assert ws._grow("b1_send", 2 * n, ws.device)
+                    torch.cuda.synchronize(device)
+                    assert ws._pools["c1_send"] is ws._pools["b1_send"]
+                    assert old() is None and not ws._slices, (W, layout, r, H)
+                    now = torch.cuda.memory_allocated(device)
+                    assert torch.cuda.max_memory_allocated(device) == now, (
+                        W,
+                        layout,
+                        r,
+                        H,
+                        torch.cuda.max_memory_allocated(device) - now,
+                    )
+                    pooled += 1
+                del ws
+    assert seen > 0 and pooled > 0, (seen, pooled)
+
+
+@pytest.mark.parametrize("graph", ["off", "replay"])
+def test_gpu_first_training_step_releases_the_forward_arena(device, graph) -> None:
+    """First training step on an empty workspace (KDA module, one rank): the forward sizes the workspace for the
+    forward only and the backward upgrades it.  Under both ``graph`` settings the first step's allocation high-water
+    is no higher than the second step's (the retained workspace plus the step's own peak; both steps run eagerly, as
+    no key of the second step was seen before), and the forward-only local arena is collected by the end of the step
+    (under ``"replay"`` the upgrade drops the cache entries that pin it, the upgrading call's own entry included).
+    Both steps run the shipped defaults, so the SPEC-3 probe stays off (when requested it runs once per backend, on
+    the first saved-mode backward, and adds its row copies to that backward's peak)."""
+    backend = cake_kcp.get_backend()
+    dt = backend.dtypes
+    H = 2
+    cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
+    part = kp.kcp_partition(cu, 1)
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    T = int(ctx.T_r)
+    gen = torch.Generator(device=device).manual_seed(0x3837)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=device, generator=gen, dtype=torch.float32)
+
+    def unit(x):  # the delta rule's operand contract: q / k L2-normalized per head
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
+    k = unit(randn(T, H, cake_kcp.D)).to(dt["k"])
+    v = (0.5 * randn(T, H, cake_kcp.D)).to(dt["v"])
+    g = (-5.0 * torch.sigmoid(randn(T, H, cake_kcp.D))).to(dt["g"])
+    beta = torch.sigmoid(randn(T, H)).to(dt["beta"])
+    dout = (0.5 * randn(T, H, cake_kcp.D)).to(dt["dout"])
+    ws = cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=backend.local_stages)
+
+    def step() -> tuple:
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, ctx, workspace=ws, graph=graph
+        )
+        arena = weakref.ref(ws.local) if ws.local is not None else None
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=saved,
+            workspace=ws,
+            graph=graph,
+        )
+        assert cake_kcp.LAST_CALL["bwd"].get("spec3") is None, (
+            "the default backward ran the SPEC-3 probe"
+        )
+        return tuple(x.detach().clone() for x in (out, *grads)), arena
+
+    cake_kcp.graph_cache_clear()
+    gc.collect()
+    torch.cuda.synchronize(device)
+    try:
+        base0 = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        first, fwd_arena = step()
+        torch.cuda.synchronize(device)
+        hw_first = torch.cuda.max_memory_allocated(device) - base0
+        assert all(torch.isfinite(x.float()).all().item() for x in first)
+        gc.collect()
+        assert fwd_arena is not None and fwd_arena() is None, (
+            graph,
+            "the forward-only arena outlives the first step",
+        )
+        assert ws.local is not None and ws.local.backward
+        del first
+        gc.collect()
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        eager = cake_kcp.GRAPH_STATS["eager"]
+        second, _ = step()
+        torch.cuda.synchronize(device)
+        hw_second = torch.cuda.max_memory_allocated(device) - base0
+        if graph != "off":
+            assert cake_kcp.GRAPH_STATS["eager"] == eager + 2, (
+                "the second step did not run eagerly"
+            )
+        assert hw_first <= hw_second + (1 << 20), (graph, hw_first, hw_second)
+        del second
+    finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()
