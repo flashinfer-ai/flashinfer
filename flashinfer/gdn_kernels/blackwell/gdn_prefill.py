@@ -326,11 +326,14 @@ def chunk_gated_delta_rule_sm100(
     enable_checkpoints = checkpoint_every_n_tokens > 0
     io_dtype = _cutlass_io_dtype(q.dtype)
 
-    # Auto-detect state dtype from initial_state, default to float32
+    # State dtype: from initial_state, else output_state, else the checkpoint
+    # buffer of a checkpoint-only call; float32 by default.
     if initial_state is not None:
         state_torch_dtype = initial_state.dtype
     elif output_state is not None:
         state_torch_dtype = output_state.dtype
+    elif enable_checkpoints and output_checkpoints is not None:
+        state_torch_dtype = output_checkpoints.dtype
     else:
         state_torch_dtype = torch.float32
     state_dtype = _cutlass_state_dtype(state_torch_dtype)
