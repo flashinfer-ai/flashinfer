@@ -140,6 +140,14 @@ class FrostLowLatencyRunner(MoERunner):
         if not self._supports_tc and self.config.routing.top_k > 32:
             raise NotImplementedError("Frost FMA requires top_k <= 32")
         if (
+            self.config.quant.activation is QuantFormat.MXFP8
+            and self.config.routing.top_k > self.config.routing.num_experts
+            and self.config.routing.top_k > 32
+        ):
+            raise NotImplementedError(
+                "Frost MX with top_k > num_experts requires top_k <= 32"
+            )
+        if (
             arch == (9, 0)
             and not self._fp4_weight_only
             and self.config.quant.weight
@@ -198,6 +206,15 @@ class FrostLowLatencyRunner(MoERunner):
                 "frost_low_latency requires intermediate_size divisible by 32"
             )
 
+    @property
+    def _supports_mx_tc(self):
+        # MX Tensor Core Geometry requires top_k <= E; repeated routes remain
+        # valid through FMA (up to 32 slots), including when top_k exceeds E.
+        return (
+            self._supports_tc
+            and self.config.routing.top_k <= self.config.routing.num_experts
+        )
+
     def _build(self):
         pass
 
@@ -248,7 +265,11 @@ class FrostLowLatencyRunner(MoERunner):
                         else (
                             "fp16-grouped-tc-w8-batch-v13"
                             if self.config.quant.weight is QuantFormat.FP16
-                            else "unified-fma-tc-standard-timing-v5"
+                            else (
+                                "mx-tc-contracts-v6"
+                                if self.config.quant.activation is QuantFormat.MXFP8
+                                else "unified-fma-tc-standard-timing-v5"
+                            )
                         )
                     )
                 )
@@ -584,7 +605,7 @@ class FrostLowLatencyRunner(MoERunner):
             return tactics
         tactics = (
             [k for k in (128, 256) if inputs[0].shape[1] % k == 0]
-            if self._supports_tc
+            if self._supports_mx_tc
             else []
         )
         if self.config.routing.top_k <= 32:
@@ -675,8 +696,11 @@ class FrostLowLatencyRunner(MoERunner):
                 raise ValueError(
                     f"{name} must have shape {shape}, dtype {dtype}, and contiguous storage on {q.device}"
                 )
-            if value.data_ptr() % 16:
-                raise ValueError(f"{name} must be 16-byte aligned")
+            # Packed E2M1 TMA copies require a 32-byte base. MXFP8 values and
+            # the byte-encoded scale tensors retain their 16-byte contract.
+            alignment = 32 if wd is torch.uint8 and name.endswith("_weight") else 16
+            if value.data_ptr() % alignment:
+                raise ValueError(f"{name} must be {alignment}-byte aligned")
         if q.data_ptr() % 16:
             raise ValueError("hidden_states_q must be 16-byte aligned")
 
@@ -793,9 +817,12 @@ class FrostLowLatencyRunner(MoERunner):
                         QuantFormat.FP8PerTensor,
                         QuantFormat.DeepSeekFp8,
                     )
-                    or not self._supports_tc
+                    or not self._supports_mx_tc
                     else 128
                 )
-        if not self._supports_tc and not isinstance(tactic, tuple):
-            raise ValueError("Frost Tensor Core tactics require SM100, SM103 or SM107")
+        if not self._supports_mx_tc and not isinstance(tactic, tuple):
+            raise ValueError(
+                "Frost MX Tensor Core tactics require SM100, SM103 or SM107 "
+                "and top_k <= num_experts"
+            )
         return execute(inputs, self.config, tactic)
