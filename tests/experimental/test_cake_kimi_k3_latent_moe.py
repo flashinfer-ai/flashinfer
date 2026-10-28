@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import gc
+import math
 import re
 import threading
 from pathlib import Path
@@ -995,14 +996,15 @@ def tail_reference(routed, shared_act, w, tp, rank):
     acc = routed[0].float()
     for p in range(1, routed.shape[0]):
         acc = acc + routed[p].float()
-    y = rmsnorm(acc.to(torch.bfloat16), w["norm_weight"])
+    x = acc.to(torch.bfloat16)
+    y = rmsnorm(x, w["norm_weight"])
     k_up = LATENT // tp
     cols = slice(rank * k_up, (rank + 1) * k_up)
     up = torch.nn.functional.linear(y[:, cols].float(), w["up_weight"][:, cols].float())
     shared = torch.nn.functional.linear(
         shared_act.float(), w["shared_down_weight"].float()
     )
-    return dict(y=y, out=(up + shared).to(torch.bfloat16))
+    return dict(x=x, y=y, out=(up + shared).to(torch.bfloat16))
 
 
 def _gpu_arch():
@@ -1058,6 +1060,143 @@ def _assert_close(name, actual, expected, atol, rtol):
     bad = int((err > tol).sum())
     assert bad == 0, (
         f"{name}: {bad} elements outside atol={atol} rtol={rtol} (max abs err {float(err.max()):.4g})"
+    )
+
+
+# Error bounds of the decode norm's FP32 row statistic (``_decode_norm_window``).
+_F32_U = 2.0**-24  # FP32 unit roundoff
+# Roundings a square meets on its way into the decode programs' row sum: 111 in its lane's chain
+# of LATENT / 32 = 112 squares, 5 in the warp's XOR butterfly.
+_DECODE_SUM_ROUNDINGS = LATENT // 32 - 1 + 5
+_MEAN_REL_ERR = 4 * _F32_U
+_RSQRT_REL_ERR = 2.0**-21
+_BOUND_SLACK = 2.0**-40
+
+
+def _f32_bits(t):
+    """FP32 bit patterns (int64) of ``t`` rounded to FP32."""
+    return t.float().view(torch.int32).long()
+
+
+def _decode_norm_window(x, eps=RMS_EPS):
+    """Per row of ``x`` ([rows, LATENT]): the FP32 rstd values the decode norm can compute.
+
+    The window follows the reduction structure that every decode program shares: one warp reduces
+    a row, lane l adds the exact squares of columns (l + 32 i) * 8 + j (i = 0..13, j = 0..7) one
+    after another in FP32 (112 terms), and an XOR butterfly over lane offsets 16, 8, 4, 2, 1 adds
+    the 32 lane sums.  A square meets at most k = 111 + 5 = 116 roundings (117 when x is not
+    BF16 and its square rounds too), and every addend is non-negative, so the computed sum s
+    satisfies |s - S| <= gamma_k S (u = 2^-24, gamma_k = k u / (1 - k u)).  S is the FP64
+    ``math.fsum`` of the exact squares (correctly rounded); every nonzero square is normal
+    (|x| >= 2^-63), so flush-to-zero never acts.  A decode program with a different reduction
+    structure must update this bound (``_DECODE_SUM_ROUNDINGS``).
+
+    The mean s / n carries a relative error of at most 4u: s * fl(1 / n) is within 2u + u^2, and
+    a division is within 2 ulp (the CUDA Programming Guide gives "x / y -> __fdividef(x, y) :
+    2 ULP" under -prec-div=false).  Adding e = fl32(eps) rounds once more (u; an FFMA folds the
+    product's rounding into it).  The rsqrt is taken at 2^-21 relative error, a margin over its
+    documented bounds: the CUDA Programming Guide lists "rsqrtf(x) 2 ULP" (2^-22 relative), and
+    the PTX ISA states "The maximum relative error for rsqrt.f32 over the entire positive finite
+    floating-point range is 2^-22.9".  So
+
+        m_lo = (S (1 - gamma_k) (1 - 4u) / n + e) (1 - u)
+        m_hi = (S (1 + gamma_k) (1 + 4u) / n + e) (1 + u)
+        rstd in [(1 - 2^-21) / sqrt(m_hi), (1 + 2^-21) / sqrt(m_lo)],
+
+    evaluated in FP64 and widened by 2^-40 relative.  With gamma_116 = 6.914e-6 the window is
+    +-4.083e-6 of the exact rstd (+-34 to +-69 FP32 ulps) where the mean square dominates eps,
+    and narrower where they are comparable: +-2.04e-6 (+-17 to +-34 ulps) at a mean square of
+    0.75 eps.
+
+    Returns the FP32 bit patterns (int64, CPU) of the anchor fl32((S / n + e)^-1/2) and of the
+    lowest and highest FP32 value in the window, and S.
+    """
+    n = x.shape[-1]
+    assert n == LATENT, "the bound is for the decode programs' LATENT columns"
+    x64 = x.double()
+    assert bool((x64.abs() >= 2.0**-63)[x64 != 0].all()), (
+        "x has a nonzero element below 2^-63 (its FP32 square is not normal)"
+    )
+    squares = (x64 * x64).cpu().tolist()
+    exact = torch.tensor([math.fsum(row) for row in squares], dtype=torch.float64)
+    assert bool((exact > 0).all()), "a zero row matches every rstd"
+    assert bool((exact < 2.0**100).all()), "the sum of squares leaves the FP32 range"
+    u = _F32_U
+    k = _DECODE_SUM_ROUNDINGS + (x.dtype != torch.bfloat16)
+    gamma = k * u / (1 - k * u)
+    e = float(torch.tensor(eps, dtype=torch.float32))
+    m_lo = (exact * (1 - gamma) * (1 - _MEAN_REL_ERR) / n + e) * (1 - u)
+    m_hi = (exact * (1 + gamma) * (1 + _MEAN_REL_ERR) / n + e) * (1 + u)
+    r_lo = (1 - _RSQRT_REL_ERR) * (1 - _BOUND_SLACK) / m_hi.sqrt()
+    r_hi = (1 + _RSQRT_REL_ERR) * (1 + _BOUND_SLACK) / m_lo.sqrt()
+    lo = _f32_bits(r_lo) + (r_lo.float().double() < r_lo).long()
+    hi = _f32_bits(r_hi) - (r_hi.float().double() > r_hi).long()
+    anchor = _f32_bits((exact / n + e).rsqrt())
+    return dict(anchor=anchor, lo=lo, hi=hi, exact=exact)
+
+
+def _decode_norm_y(x, weight, rstd):
+    """The decode norm's y for FP32 rstd candidates ``rstd`` ([rows, k]): weight *
+    bf16(fp32(x) * rstd), the product of the two BF16 values rounded to BF16 once."""
+    return weight * (x.float()[:, None, :] * rstd[:, :, None]).to(torch.bfloat16)
+
+
+def _decode_norm_matches(y, x, weight, eps=RMS_EPS, window=None, y_model=None):
+    """The FP32 values r of each row's window (``_decode_norm_window``, enumerated by bit
+    pattern) for which ``y_model(x, weight, r)`` (``_decode_norm_y``) is the row of ``y``
+    bit for bit.  Per row (int64, CPU): ``count`` of such r, the lowest and highest of
+    them as FP32 ulp offsets from the anchor (``lo`` / ``hi``, 0 without a match) and the
+    window ``size``."""
+    window = _decode_norm_window(x, eps) if window is None else window
+    y_model = _decode_norm_y if y_model is None else y_model
+    device = y.device
+    lo, hi, anchor = (window[key].to(device) for key in ("lo", "hi", "anchor"))
+    r_lo, r_hi = (b.to(torch.int32).view(torch.float32).double() for b in (lo, hi))
+    # Every nonzero x * r and weight * bf16(x * r) normal and every value finite, so the
+    # kernel's flush-to-zero arithmetic and torch's round alike.
+    xa = x.double().abs()
+    wa = weight.double().abs().expand_as(xa)
+    low = xa * torch.where(wa > 0, wa.clamp(max=1.0), torch.ones_like(wa))
+    high = xa * wa.clamp(min=1.0)
+    assert bool((low * r_lo[:, None] >= 2.0**-125)[xa > 0].all()), (
+        "x * rstd or weight * bf16(x * rstd) is not a normal FP32 value"
+    )
+    assert bool((high * r_hi[:, None] < 2.0**126).all()), "y leaves the BF16 range"
+    rows, n = y.shape
+    y_bits = y.view(torch.int16)[:, None, :]
+    count = torch.zeros(rows, dtype=torch.int64, device=device)
+    first = torch.full((rows,), 2**31, dtype=torch.int64, device=device)
+    last = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    step = max(1, (1 << 24) // (rows * n))
+    for k0 in range(0, int((hi - lo).max()) + 1, step):
+        cand = lo[:, None] + torch.arange(k0, k0 + step, device=device)
+        valid = cand <= hi[:, None]
+        r = torch.minimum(cand, hi[:, None]).to(torch.int32).view(torch.float32)
+        ok = (y_model(x, weight, r).view(torch.int16) == y_bits).all(-1) & valid
+        count += ok.sum(-1)
+        first = torch.minimum(first, torch.where(ok, cand, 2**31).amin(-1))
+        last = torch.maximum(last, torch.where(ok, cand, -1).amax(-1))
+    hit = count > 0
+    return dict(
+        count=count.cpu(),
+        lo=torch.where(hit, first - anchor, 0).cpu(),
+        hi=torch.where(hit, last - anchor, 0).cpu(),
+        size=(hi - lo + 1).cpu(),
+    )
+
+
+def _assert_decode_norm_rows(y, x, weight, eps=RMS_EPS):
+    """Every row of the decode norm's ``y`` is weight * bf16(fp32(x) * r) for an FP32 r in
+    the row's error window of the exact statistic (``_decode_norm_window``): the reference's
+    rounding points exactly, its FP32 sum of squares in the decode programs' reduction order.
+    ``x`` is the reference's BF16 row (the FP32 sum of the routed partials in partial order,
+    rounded once)."""
+    assert y.shape == x.shape and y.dtype == torch.bfloat16
+    found = _decode_norm_matches(y, x, weight, eps)
+    bad = (found["count"] == 0).nonzero().flatten().tolist()
+    assert not bad, (
+        f"y rows {bad[:8]} ({len(bad)} of {y.shape[0]}) are weight * bf16(x * r) "
+        "for no FP32 r in the error window of the exact statistic"
     )
 
 
@@ -1309,16 +1448,19 @@ def test_tail_matches_reference(tp, tokens):
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
-    # Decode route: the fused norm reproduces the reference rounding exactly (FP32 statistics, BF16
-    # round, BF16 weight product).  Prefill route: the one-pass RMSNorm kernel reduces the row in a
+    # Decode route: the fused norm keeps the reference's rounding points exactly (BF16 of the FP32
+    # partial sum, BF16 of x * rstd, one BF16 rounding of the weight product).  Its FP32 statistic
+    # sums the squares in the decode programs' fixed order (a chain of 112 squares per lane, then a
+    # warp butterfly) and takes an approximate rsqrt, so each row must equal weight * bf16(x * r)
+    # bit for bit for an FP32 r in the error window of that order around the exact statistic
+    # (``_assert_decode_norm_rows``).  At these inputs the window spans +-4.08e-6 of the exact rstd,
+    # +-34 to +-69 FP32 ulps.  Prefill route: the one-pass RMSNorm kernel reduces the row in a
     # different FP32 order and lands within one BF16 ulp on a few elements (the Cake contract
     # receipts record the same for the production kernel), so it is held to the BF16 tolerance.
     # Both routes are bit-identical across re-launch and CUDA-graph replay below.
     _assert_close("y", y, expected["y"], ATOL, RTOL)
     if tokens <= DECODE_MAX_T:
-        assert torch.equal(y, expected["y"]), (
-            f"y differs from the reference in {int((y != expected['y']).sum())} elements"
-        )
+        _assert_decode_norm_rows(y, expected["x"], w["norm_weight"])
     _assert_close("out", out, expected["out"], ATOL, RTOL)
     first = (y.clone(), out.clone())
     runner()
@@ -1381,7 +1523,7 @@ def test_tail_rank_slice_tp8():
     )
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
-    assert torch.equal(y, expected["y"])
+    _assert_decode_norm_rows(y, expected["x"], w["norm_weight"])
     _assert_close("out", out, expected["out"], ATOL, RTOL)
 
 
@@ -1556,14 +1698,110 @@ def test_tail_decode_sums_routed_partials(tokens, num_partials):
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
-    assert torch.equal(y, expected["y"]), (
-        f"y differs from the reference in {int((y != expected['y']).sum())} elements"
-    )
+    _assert_decode_norm_rows(y, expected["x"], w["norm_weight"])
     _assert_close("out", out, expected["out"], ATOL, RTOL)
     first = (y.clone(), out.clone())
     runner()
     torch.cuda.synchronize()
     assert torch.equal(first[0], y) and torch.equal(first[1], out)
+
+
+# (tp, rank, tokens, num_partials) of the eps-scale decode cases: TP1 and TP8, P = 1 to 5, T 1 to
+# 128.  On every qualified part each decode tail program the package routes is served by at least
+# one row (``test_eps_scale_rows_reach_every_decode_tail_program``).  The resident-B routes of more
+# than four tokens appear at their largest token count, so the norm code of the rows past the first
+# row of each of the four epilogue warps runs too.
+_EPS_SCALE_ROWS = (
+    (1, 0, 1, 1),
+    (1, 0, 8, 2),
+    (1, 0, 6, 3),
+    (1, 0, 12, 2),
+    (1, 0, 20, 1),
+    (1, 0, 24, 2),
+    (1, 0, 33, 1),
+    (1, 0, 48, 3),
+    (1, 0, 128, 1),
+    (1, 0, 100, 2),
+    (8, 0, 8, 1),
+    (8, 1, 16, 1),
+    (8, 1, 3, 2),
+    (8, 1, 6, 2),
+    (8, 1, 4, 4),
+    (8, 5, 2, 5),
+    (8, 1, 12, 3),
+    (8, 1, 24, 1),
+    (8, 1, 24, 3),
+    (8, 1, 33, 1),
+    (8, 1, 64, 3),
+    (8, 1, 100, 1),
+    (8, 5, 128, 2),
+)
+
+
+def test_eps_scale_rows_reach_every_decode_tail_program():
+    """On every qualified SM count and architecture the eps-scale rows reach exactly the decode
+    tail programs the package routes for T <= DECODE_MAX_T, TP1 and TP8 and P = 1 to 16 (the
+    decode tail plan depends on P only through P = 1 and the partial counts of
+    ``TAIL_SB_NORM_ROUTES``), so the near-eps check runs on every decode tail program."""
+    partials = range(1, 17)
+    for _, cells in cb.TAIL_SB_NORM_ROUTES.values():
+        assert max(cells.values()) < max(partials)
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            routed = {
+                key
+                for tp in SUPPORTED_TP
+                for tokens in range(1, DECODE_MAX_T + 1)
+                for num_partials in partials
+                for key in route_kernel_keys(
+                    "tail", tp, tokens, sm_count, num_partials, arch=arch
+                )
+            }
+            reached = {
+                key
+                for tp, _, tokens, num_partials in _EPS_SCALE_ROWS
+                for key in route_kernel_keys(
+                    "tail", tp, tokens, sm_count, num_partials, arch=arch
+                )
+            }
+            assert all(key.startswith("decode:") for key in routed)
+            assert reached == routed, (
+                f"{sm_count} SMs, {arch}: no eps-scale row reaches {sorted(routed - reached)}; "
+                f"{sorted(reached - routed)} are not decode tail routes"
+            )
+
+
+@pytest.mark.parametrize(("tp", "rank", "tokens", "num_partials"), _EPS_SCALE_ROWS)
+def test_tail_decode_norm_near_eps(tp, rank, tokens, num_partials):
+    """Routed partials scaled by 2^-8 put each row's mean square near eps (about 0.75 eps per
+    partial), where the eps term moves rstd by 13 % (P = 5) to 53 % (P = 1): the decode norm
+    rows still equal weight * bf16(x * r) bit for bit for an FP32 r in the error window of the
+    exact statistic (``_assert_decode_norm_rows``)."""
+    device = _require_program("tail", tp, tokens, num_partials)
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, 2000 + tokens * 10 + num_partials
+    )
+    routed.mul_(2.0**-8)  # exact: a power-of-two scale of normal BF16 values
+    runner = prepare_kimi_k3_latent_moe_tail(
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y,
+    )
+    assert runner.route == "decode" and runner.launch_count == 1
+    runner()
+    torch.cuda.synchronize()
+    expected = tail_reference(routed, shared_act, w, tp, rank)
+    mean_square = expected["x"].float().pow(2).mean(-1)
+    assert bool(((mean_square > RMS_EPS / 2) & (mean_square < 8 * RMS_EPS)).all())
+    _assert_decode_norm_rows(y, expected["x"], w["norm_weight"])
+    _assert_close("y", y, expected["y"], ATOL, RTOL)
+    _assert_close("out", out, expected["out"], ATOL, RTOL)
 
 
 def _sb_norm_rows():
