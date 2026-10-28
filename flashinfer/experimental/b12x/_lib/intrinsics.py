@@ -3380,10 +3380,19 @@ def packed_dequant_e8m0x4_to_bfloat2x2(
 ) -> Tuple[Uint32, Uint32]:
     """E8M0 compute-scale dequant for one packed 4-value BF16 fragment.
 
-    The W4A16 FP4 unpack path represents E2M1 values scaled by 2^-126.  Match
-    the existing NVFP4 split by materializing E8M0 scales multiplied by 2^7 in
-    the MMA input and applying the remaining compensation in the kernel
-    epilogue.
+    The W4A16 FP4 unpack path represents E2M1 values scaled by 2^-126.  The
+    scale byte ``e`` is materialized as the BF16 value ``2^(e + 71 - 127)``
+    (exponent field ``e + 71``), so the MMA weight is
+    ``v * 2^(e - 182) = true_weight * 2^-55`` and the kernel epilogue applies
+    the remaining ``2^55`` (``_E8M0_K32_BF16_GLOBAL_COMPENSATION``).
+
+    The bias 71 centres the BF16-normal window on real checkpoints: every
+    nonzero weight is a normal BF16 for ``57 <= e <= 183`` (prepare clamps the
+    bytes to 183), and FP32 MMA products/accumulators stay ~2^64 further from
+    the subnormal range than before.  A bias of 7 put the window at
+    ``121 <= e <= 247``, so MXFP4 checkpoints whose scale bytes sit around
+    111-120 produced BF16-subnormal weights, flushed small FP4 values to zero
+    below e = 114, and pushed the FP32 products toward the subnormal range.
     """
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -3401,10 +3410,10 @@ def packed_dequant_e8m0x4_to_bfloat2x2(
             and.b32 b2, b2, 0x000000ff;
             shr.u32 b3, $2, 24;
 
-            add.u32 h0, b0, 7;
-            add.u32 h1, b1, 7;
-            add.u32 h2, b2, 7;
-            add.u32 h3, b3, 7;
+            add.u32 h0, b0, 71;
+            add.u32 h1, b1, 71;
+            add.u32 h2, b2, 71;
+            add.u32 h3, b3, 71;
             shl.b32 h0, h0, 7;
             shl.b32 h1, h1, 7;
             shl.b32 h2, h2, 7;
