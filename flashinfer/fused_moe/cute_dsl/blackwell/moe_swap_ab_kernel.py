@@ -2371,8 +2371,18 @@ class Sm100BlockScaledGroupedGemmKernel:
         ):
             raise ValueError("SharedStorage exceeds SM100 shared memory capacity")
         sched_params = None
+        work_clusters = (
+            cute.ceil_div(weights.shape[0], self.mma_m * self.channel_tiles)
+            * expert_idx.shape[0]
+        )
         launch_grid = (
-            self.max_active_clusters // self.cta_group_size * self.cta_group_size,
+            cutlass.max(
+                1,
+                cutlass.min(
+                    self.max_active_clusters // self.cta_group_size, work_clusters
+                ),
+            )
+            * self.cta_group_size,
             1,
             1,
         )
