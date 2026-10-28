@@ -286,9 +286,15 @@ def test_quantizer_alone_cluster_split_rows():
     other = {"sm_100a": 152, "sm_103a": 148}
     for arch, table in cb.QUANT_ALONE_CLUSTER_SPLIT.items():
         sm_count = cb.MEASURED_SM_COUNT[arch]
+        # REACHABLE_M steps by 4 and misses some range endpoints (M = 130): plan
+        # every endpoint of the table too.
+        ms = sorted(
+            set(REACHABLE_M)
+            | {v for ranges in table.values() for lo, hi, _ in ranges for v in (lo, hi)}
+        )
         served = set()
         for k in sorted(set(REACHABLE_K) | set(table)):
-            for m in REACHABLE_M:
+            for m in ms:
                 for fold in (False, True):
                     chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
                     alone = _registered(
@@ -316,7 +322,7 @@ def test_quantizer_alone_cluster_split_rows():
             (k, m)
             for k, ranges in table.items()
             for lo, hi, _ in ranges
-            for m in REACHABLE_M
+            for m in ms
             if lo <= m <= hi
         }
         assert served == listed, (arch, sorted(listed - served))

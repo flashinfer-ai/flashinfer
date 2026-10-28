@@ -570,6 +570,38 @@ K96_KERNEL_KEYS = frozenset(
     )
 )
 _TWO_CTA_TILE_WAVE_COST_K96 = {128: 0.575, 192: 0.82, 256: 1.0}
+# The scale-factor ring of the K = 96 2-CTA pair programs with 256-wide weight tiles
+# (``sf_ring`` tactics, ``_sfr`` keys): the A / B ring holds six K256 stages of one
+# weight panel, the block scales ride a separate five-stage ring with its own producer
+# warp, and the epilogue stores each thread's row straight from registers.  The MMA
+# sequence, the accumulation order and the per-token epilogue are those of the program
+# without the knob, so are its outputs.  On SF_RING_ARCH at its measured SM count, the
+# GEMM takes it on every row of the CLC programs (SF_RING_CLC_KEYS) and on the
+# token-count ranges of SF_RING_G8_CELLS of the static programs (SF_RING_G8_KEYS): per
+# kind, the GEMM alone (``"gemm"``) and the quantize + GEMM chain (``"chain"``), keyed
+# by ``(K, N)``; the chain keeps the plan's program on a cell of the GEMM alone only.
+SF_RING_ARCH = "sm_103a"
+SF_RING_CLC_KEYS = frozenset(
+    f"gemm:m256_2cta_{out}_aL_bL_l2256b_g16_clc" for out in ("bf16", "f16")
+)
+SF_RING_G8_KEYS = frozenset(
+    f"gemm:m256_2cta_{out}_aL_bL_l2256b_g8" for out in ("bf16", "f16")
+)
+SF_RING_G8_CELLS: dict[str, dict[tuple[int, int], tuple[int, int]]] = {
+    "gemm": {
+        (16384, 7168): (1537, 2048),
+        (18432, 7168): (1537, 2048),
+        (8192, 8192): (1281, 2048),
+        (28672, 8192): (1281, 2304),
+        (7168, 1536): (7937, 9728),
+    },
+    "chain": {
+        (16384, 7168): (1537, 2048),
+        (18432, 7168): (1537, 2048),
+        (8192, 8192): (1281, 2048),
+        (28672, 8192): (1281, 2304),
+    },
+}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
@@ -979,6 +1011,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("fold")
     if tactic.get("b2"):
         parts.append("b2" + str(tactic["b2"]))
+    if tactic.get("sf_ring"):
+        parts.append("sfr")
     return "gemm:" + "_".join(parts)
 
 
@@ -1090,6 +1124,7 @@ KNOWN_TACTIC_KEYS = frozenset(
         "raster_group",
         "ring_overlay",
         "sched",
+        "sf_ring",
         "sk_split",
         "split_k",
         "stream_k",
@@ -1266,6 +1301,28 @@ def _gemm_plan(
     if stream_k and (not two_cta or half_m or sched_is_clc(tactic)):
         raise ValueError(
             "stream_k is a knob of the static 2-CTA schedule (no half_m, no CLC scheduler)"
+        )
+    if tactic.get("sf_ring") and (
+        arch != SF_RING_ARCH
+        or alpha_n
+        or not two_cta
+        or tile_n != 256
+        or deep_k
+        or half_m
+        or stream_k
+        or split_k > 1
+        or tactic.get("a_hint") != "evict_last"
+        or tactic.get("b_hint") != "evict_last"
+        or tactic.get("l2_promo") != "l2_256b"
+        or tactic.get("num_stages") is not None
+        or int(tactic.get("ep_stages", 0))
+        or (int(tactic.get("raster_group") or 0), sched_is_clc(tactic))
+        not in ((8, False), (16, True))
+    ):
+        raise ValueError(
+            "sf_ring is a knob of the sm_103a K = 96 2-CTA pair programs with 256-wide"
+            " weight tiles and evict-last operands: the static schedule with raster"
+            " groups of 8 or the CLC schedule with groups of 16"
         )
     # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
     tok_tile = (
@@ -2004,18 +2061,52 @@ def _entry_prefetch_tactic(
     return tactic
 
 
+def _sf_ring_tactic(plan: GemmPlan, kind: str) -> Optional[dict[str, Any]]:
+    """``plan``'s tactic with the scale-factor ring (``sf_ring``) when ``plan`` runs on
+    :data:`SF_RING_ARCH` at its measured SM count and its program is a
+    :data:`SF_RING_CLC_KEYS` program, or a :data:`SF_RING_G8_KEYS` program on a cell of
+    ``SF_RING_G8_CELLS[kind]``, and the ring program is registered, else ``None``."""
+    if plan.arch != SF_RING_ARCH or MEASURED_SM_COUNT.get(plan.arch) != plan.sm_count:
+        return None
+    if plan.kernel_key not in SF_RING_CLC_KEYS:
+        cell = SF_RING_G8_CELLS[kind].get((plan.K, plan.N))
+        if (
+            plan.kernel_key not in SF_RING_G8_KEYS
+            or cell is None
+            or not cell[0] <= plan.M <= cell[1]
+        ):
+            return None
+    tactic = {**plan.tactic, "sf_ring": True}
+    if gemm_kernel_key(tactic, plan.out_f16) not in KERNELS.get(plan.arch, {}):
+        return None
+    return tactic
+
+
 def gemm_alone_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
     """The tactic the GEMM alone takes when no tactic is passed and the default-tactic plan
     is ``plan``: the entry L2 prefetch program on the cells of :data:`GEMM_ALONE_EP_RULES`,
-    else ``None`` (the plan's own program)."""
-    return _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES)
+    the scale-factor ring program (:func:`_sf_ring_tactic`, kind ``"gemm"``), else
+    ``None`` (the plan's own program)."""
+    tactic = _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES)
+    return tactic if tactic is not None else _sf_ring_tactic(plan, "gemm")
 
 
 def chain_gemm_tactic(plan: GemmPlan) -> Optional[dict[str, Any]]:
     """The GEMM tactic of the quantize + GEMM chain whose default-tactic GEMM plan is
-    ``plan``: the entry L2 prefetch program on the cells of :data:`CHAIN_EP_RULES`, else
-    ``None`` (the program the GEMM alone runs)."""
-    return _entry_prefetch_tactic(plan, CHAIN_EP_RULES)
+    ``plan``: the entry L2 prefetch program on the cells of :data:`CHAIN_EP_RULES`, the
+    scale-factor ring program (:func:`_sf_ring_tactic`, kind ``"chain"``), the plan's own
+    tactic on a scale-factor ring cell of the GEMM alone only, else ``None`` (the program
+    the GEMM alone runs)."""
+    tactic = _entry_prefetch_tactic(plan, CHAIN_EP_RULES)
+    if tactic is None:
+        tactic = _sf_ring_tactic(plan, "chain")
+    if (
+        tactic is None
+        and _entry_prefetch_tactic(plan, GEMM_ALONE_EP_RULES) is None
+        and _sf_ring_tactic(plan, "gemm") is not None
+    ):
+        tactic = dict(plan.tactic)
+    return tactic
 
 
 @dataclass(frozen=True)
