@@ -487,12 +487,14 @@ jobs:
             echo "CI_COMPILE_CACHE_S3_URL=https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/compile-cache/main" >> "${GITHUB_ENV}"
             echo "CI_COMPILE_CACHE_S3_LANE=${CI_GPU_NAME}/${LANE}" >> "${GITHUB_ENV}"
             # Only scheduled runs on main write, and only once an admin has
-            # created the upload role. A writer compiles in a fresh directory
-            # rather than in the per-runner cache, which this runner's earlier
-            # jobs (any of them a pull request) could have modified.
+            # created the upload role. A writer compiles in a directory no
+            # earlier job on this runner (any of them a pull request) can have
+            # touched: a new path per job, and no shared pip cache, which PR
+            # containers write as root.
             if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${GITHUB_REF}" = "refs/heads/main" ] \
                 && [ -n "${UPLOAD_ROLE}" ]; then
-              echo "CI_COMPILE_CACHE_WRITER_DIR=${RUNNER_TEMP}/compile-cache-writer" >> "${GITHUB_ENV}"
+              echo "CI_COMPILE_CACHE_WRITER_DIR=$(mktemp -u "${RUNNER_TEMP}/compile-cache-writer.XXXXXXXX")" >> "${GITHUB_ENV}"
+              echo "CI_PIP_CACHE_DIR=" >> "${GITHUB_ENV}"
             fi
           fi
 

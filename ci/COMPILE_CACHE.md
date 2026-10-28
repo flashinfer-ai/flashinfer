@@ -57,18 +57,33 @@ are read anonymously over HTTPS.
   only when missing. Mirrors of images unused for a week are evicted.
 - Writers are `read-write` jobs with `CI_COMPILE_CACHE_WRITER_DIR` set: scheduled
   runs on main once the `COMPILE_CACHE_S3_ROLE_ARN` repository variable names the
-  upload role. They skip the seed, which shares a host with pull request jobs,
-  and compile in that fresh directory on top of the S3 tarball alone. After the
-  tests, an `always()` step assumes the role through OIDC (its trust policy
-  accepts only `repo:flashinfer-ai/flashinfer:ref:refs/heads/main`) and uploads
-  the directory's content-keyed artifacts as one object. A single PUT is
-  atomic, so concurrent writers never interleave a module's `meta.json` and
-  objects. Nothing is uploaded when the job built nothing new; a tarball over
-  `CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to the job's own
-  builds.
+  upload role. Each compiles in a new directory (a fresh path per job) on top of
+  the S3 tarball alone, without the shared pip cache: PR jobs on the same host
+  can write both the seed and that cache. After the tests, an `always()` step
+  assumes the role through OIDC (its trust policy accepts only
+  `repo:flashinfer-ai/flashinfer:ref:refs/heads/main`) and uploads the
+  directory's content-keyed artifacts as one object. A single PUT is atomic, so
+  concurrent writers never interleave a module's `meta.json` and objects.
+  Nothing is uploaded when the job built nothing new (a content hash of the
+  artifacts taken after the restore), or when the restore failed: a writer that
+  started cold by accident would otherwise replace the lane's tarball with only
+  its own builds.
+- A tarball over `CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to the
+  files the job compiled. That bounds growth, since kernels of earlier FlashInfer
+  versions otherwise stay until the image changes, but it also drops kernels the
+  job reused from the tarball; later writers recompile and add them back. A lane
+  whose working set exceeds the cap alternates between full and cut tarballs,
+  so raise the cap rather than relying on the cut.
+- Once writers exist, seeds stop growing: a writer job removes its runner's
+  seeds (all images), and PR jobs then start from the S3 mirror alone. Until
+  then, scheduled `read-write` jobs keep updating seeds as described above.
 
-Every S3 failure only warns. As above, this protects the shared layer from
-ordinary pull request jobs, not from code that takes over a self-hosted host.
+Every S3 failure only warns. Only the upload role may write under
+`compile-cache/`: the sccache IAM user's static keys reach branch-PR containers
+and write to the same bucket, so its policy (or a bucket policy) must deny
+`s3:PutObject` and `s3:DeleteObject` on `compile-cache/*` for every principal
+but that role. As above, this protects the shared layer from ordinary pull
+request jobs, not from code that takes over a self-hosted host.
 
 ## Compatibility after dependency installation
 

@@ -182,6 +182,30 @@ class CompileCacheS3ScriptTest(S3LayerTestBase):
         out = self.s3("restore", self.url, IMAGE, LANE, writer)
         self.assertIn("is not empty", out)
         self.assertFalse((writer / ".s3-manifest").exists())
+        self.assertIn("did not complete", self.upload(writer))
+        self.assertFalse(self.aws_log.exists())
+
+    def test_failed_restore_blocks_upload(self):
+        # A writer that starts cold because the download failed must not
+        # replace the lane's tarball with only its own builds.
+        self.publish(lambda root: cute_module(root, "gemm", ["k1", "k2"]))
+        published = self.tarball().read_bytes()
+        writer = self.root / "writer"
+        out = self.s3("restore", "http://127.0.0.1:9", IMAGE, LANE, writer)
+        self.assertIn("will not upload", out)
+        cute_module(writer, "norm", ["k1"])
+        self.assertIn("did not complete", self.upload(writer))
+        self.assertEqual(self.tarball().read_bytes(), published)
+
+    def test_same_size_rebuild_is_uploaded(self):
+        self.publish(lambda root: cute_module(root, "gemm", ["k1"]))
+        writer = self.root / "writer"
+        self.s3("restore", self.url, IMAGE, LANE, writer)
+        # A module rebuilt for a new source hash: same sizes, new contents.
+        module = writer / JIT / "gemm_sm90a_cute_dsl"
+        write(module / "meta.json", json.dumps({**META, "source_sha256": "d" * 64}))
+        write(module / "k1.o", "gemm/k9")
+        self.assertIn("Uploaded", self.upload(writer))
 
     def test_oversized_upload_keeps_only_this_jobs_builds(self):
         def populate(root):
@@ -322,7 +346,7 @@ class CompileCacheS3IntegrationTest(S3LayerTestBase):
         key = hashlib.sha256(b"runner-a").hexdigest()
         return self.cache / f"runner-{key}"
 
-    def test_writer_bypasses_the_seed(self):
+    def test_writer_bypasses_and_retires_the_seeds(self):
         self.publish(lambda root: cute_module(root, "gemm", ["k1"]))
         seed = write(self.runner_dir() / "images" / IMAGE / "triton/planted")
         writer = self.root / "writer"
@@ -337,7 +361,8 @@ class CompileCacheS3IntegrationTest(S3LayerTestBase):
         self.assertFalse((writer / "leftover").exists())
         self.assertTrue((writer / JIT / "gemm_sm90a_cute_dsl/k1.o").exists())
         self.assertFalse((writer / "triton/planted").exists())
-        self.assertTrue(seed.exists())
+        # Seeds stop growing once writers exist; the S3 mirror replaces them.
+        self.assertFalse(seed.exists())
 
     def test_pull_request_jobs_mount_the_mirror(self):
         out, run = self.run_job()

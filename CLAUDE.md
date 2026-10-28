@@ -151,10 +151,12 @@ CuTe-DSL module whole when absent and adding objects only when its `meta.json` i
 identical. Only scheduled runs on `main` write, through the OIDC role in the
 `COMPILE_CACHE_S3_ROLE_ARN` repository variable, whose IAM trust policy accepts
 only `refs/heads/main`; until it is set they update seeds as before. A writer
-bypasses the seed and compiles in a fresh `runner.temp` directory on top of the S3
-tarball alone, then uploads it as one object, so concurrent writers never
-interleave a module. A tarball over `CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is
-cut down to that job's own builds. Restore and upload failures only warn.
+retires its runner's seeds, compiles in a new `runner.temp` directory on top of
+the S3 tarball alone (without the shared pip cache), then uploads it as one
+object, so concurrent writers never interleave a module. It skips the upload when
+it built nothing new or its restore failed. A tarball over
+`CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to that job's own builds,
+dropping kernels it reused. Restore and upload failures only warn.
 
 ## cuDNN linear attention
 

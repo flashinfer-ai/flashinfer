@@ -29,10 +29,14 @@
 # the object atomically, so two concurrent writers cannot interleave one
 # module's meta.json and objects: the later upload wins, and what it lacks is
 # compiled and uploaded again by a later run. Nothing is uploaded when the job
-# added nothing. When the tarball exceeds CI_COMPILE_CACHE_S3_MAX_MB (default
-# 4096), only what this job compiled is uploaded, which resets the cache to
-# the current working set: kernels of earlier FlashInfer versions and changed
-# sources otherwise stay in it until the CI image changes.
+# added nothing, or when its restore failed: a writer that started cold by
+# accident would replace the lane's tarball with only its own builds. When the
+# tarball exceeds CI_COMPILE_CACHE_S3_MAX_MB (default 4096), only what this job
+# compiled is uploaded. That bounds growth (kernels of earlier FlashInfer
+# versions and changed sources otherwise stay until the CI image changes), but
+# also drops what the job reused from the tarball; the next writers recompile
+# and add those back. A lane whose working set exceeds the cap alternates
+# between full and cut tarballs: raise the cap instead.
 #
 # Only content-keyed artifacts are packed: CuTe-DSL modules (*_cute_dsl),
 # TIRx (kda_tirx_*), KDA PTX (kda_ptx), downloaded cubins and the Triton
@@ -76,11 +80,12 @@ list_files() {
 }
 
 # Fingerprint of the unit files of <dir>, to skip uploads that add nothing.
+# Contents, not sizes: a rebuilt module's meta.json keeps its size.
 manifest() {
     (
         cd "$1" || exit 0
         mapfile -d '' -t units < <(list_units)
-        NEWER="" list_files "${units[@]}" | xargs -0r stat -c '%n %s' | LC_ALL=C sort | sha256sum
+        NEWER="" list_files "${units[@]}" | xargs -0r sha256sum | LC_ALL=C sort -k2 | sha256sum
     ) | cut -d' ' -f1
 }
 
@@ -132,11 +137,11 @@ restore() {
     local tmp code
     mkdir -p "${dest}" && dest=$(cd "${dest}" && pwd) || { warn "cannot create ${dest}"; return 0; }
     if [ -n "$(ls -A "${dest}")" ]; then
-        warn "writer cache ${dest} is not empty; not restoring"
+        warn "writer cache ${dest} is not empty; not restoring or uploading"
         return 0
     fi
-    # Marks the start of the job for upload, also when nothing is restored.
-    manifest "${dest}" > "${dest}/${MANIFEST}"
+    # The manifest marks the start of the job for upload, and its absence a
+    # restore that did not complete: upload then skips.
     tmp=$(mktemp -d "${dest%/}.s3-restore.XXXXXX") || { warn "no scratch space"; return 0; }
     code=$(download "${url}" "${tmp}/cache.tar.gz" | head -n1)
     case "${code}" in
@@ -145,12 +150,15 @@ restore() {
                 manifest "${dest}" > "${dest}/${MANIFEST}"
                 echo "Restored shared compile cache ${url} ($(du -sm "${tmp}/cache.tar.gz" | cut -f1) MB)"
             else
-                warn "cannot unpack ${url}; starting cold"
-                find "${dest}" -mindepth 1 ! -name "${MANIFEST}" -delete
+                warn "cannot unpack ${url}; starting cold, and this job will not upload"
+                find "${dest}" -mindepth 1 -delete
             fi
             ;;
-        403 | 404) echo "No shared compile cache at ${url}" ;;
-        *) warn "download of ${url} failed (HTTP ${code:-none}); starting cold" ;;
+        403 | 404)
+            echo "No shared compile cache at ${url}"
+            manifest "${dest}" > "${dest}/${MANIFEST}"
+            ;;
+        *) warn "download of ${url} failed (HTTP ${code:-none}); starting cold, and this job will not upload" ;;
     esac
     rm -rf "${tmp}"
 }
@@ -224,14 +232,18 @@ upload() {
         echo "No cacheable artifacts in ${src}; nothing to upload"
         return 0
     fi
-    if [ -f "${src}/${MANIFEST}" ] && [ "$(manifest "${src}")" = "$(cat "${src}/${MANIFEST}")" ]; then
+    if ! [ -f "${src}/${MANIFEST}" ]; then
+        warn "the writer's restore did not complete; not uploading ${uri}"
+        return 0
+    fi
+    if [ "$(manifest "${src}")" = "$(cat "${src}/${MANIFEST}")" ]; then
         echo "This job compiled nothing new; ${uri} is current"
         return 0
     fi
     tmp=$(mktemp -d "${src%/}.s3-upload.XXXXXX") || { warn "no scratch space"; return 0; }
     pack "${src}" "${tmp}/cache.tar.gz" "${units[@]}" || { rm -rf "${tmp}"; return 0; }
     size_mb=$(( $(stat -c %s "${tmp}/cache.tar.gz") / 1048576 ))
-    if [ "${size_mb}" -gt "${max_mb}" ] && [ -f "${src}/${MANIFEST}" ]; then
+    if [ "${size_mb}" -gt "${max_mb}" ]; then
         echo "Compile cache tarball is ${size_mb} MB, over ${max_mb} MB; uploading only this job's builds"
         NEWER="${MANIFEST}" pack "${src}" "${tmp}/cache.tar.gz" "${units[@]}" \
             || { rm -rf "${tmp}"; return 0; }

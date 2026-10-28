@@ -83,7 +83,10 @@ prepare_compile_cache() {
     if [[ ${mode} == read-write && -n "${CI_COMPILE_CACHE_WRITER_DIR:-}" ]]; then
         # An S3 writer bypasses the seed, which shares a host with pull request
         # jobs: it compiles on top of the trusted tarball alone, in a fresh
-        # directory the workflow uploads after the job.
+        # directory the workflow uploads after the job. Seeds stop growing
+        # once writers exist, so a frozen seed would only shadow newer modules
+        # and keep retired images on disk; the S3 mirror replaces them.
+        remove_cache_trees "${images}" || return 1
         remove_cache_trees "${CI_COMPILE_CACHE_WRITER_DIR}" || return 1
         mkdir -p "${CI_COMPILE_CACHE_WRITER_DIR}" || return 1
         if [ -n "${s3_mirror}" ]; then
