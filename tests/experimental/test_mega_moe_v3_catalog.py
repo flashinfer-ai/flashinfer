@@ -17,9 +17,12 @@ ROOT = Path(__file__).resolve().parents[2]
 # every token count, routed FP4, activation clamp 10.
 TP_EP_SHAPES = ((384, 640), (384, 384), (96, 2304), (48, 2304))
 TP_EP_TOKENS = (1, 4, 16, 32, 128, 512, 1024, 4096)
-# The token counts of the TP/EP rows whose sm_103a programs may read the FC1
-# ``A`` map straight from the activations (route metadata ``a_source`` "x").
+# The TP/EP routes whose sm_103a programs may read the FC1 ``A`` map straight
+# from the activations (route metadata ``a_source`` "x"): every shape at one
+# and four tokens, and the EP shapes (48 and 96 local experts) at 16 tokens.
 DIRECT_A_TOKENS = (1, 4)
+DIRECT_A_EP_TOKENS = (16,)
+DIRECT_A_EP_EXPERTS = (48, 96)
 
 # The launch form of the TP/EP programs: the generated binding's Run() launches
 # through cudaLaunchKernelExC with three counted attribute slots, the cluster
@@ -176,14 +179,22 @@ def test_only_the_short_sm103a_rank_routes_read_a_from_the_activations():
     map describes: ``"pool"`` (the dispatch pool rows; also what an absent key
     means) or ``"x"`` (the ``[num_tokens, hidden]`` activation bytes; such a
     program copies no pool row). Only the sm_103a TP/EP routes of one and four
-    tokens may state ``"x"``, and they state it together: a catalog rendered
-    before the key existed states it nowhere, one rendered after states it on
-    all eight. No other route of either architecture states ``"x"``."""
+    tokens, and the EP routes of sixteen tokens, may state ``"x"``, and they
+    state it together: a catalog rendered before the key existed states it
+    nowhere, one rendered at the first key set states it on the eight short
+    routes, one rendered at the current set on those and the two sixteen-token
+    EP routes. No other route of either architecture states ``"x"``."""
     catalog = _catalog()
-    direct = {
+    direct_short = {
         tp_ep_route_key(num_experts, intermediate, num_tokens)
         for num_experts, intermediate in TP_EP_SHAPES
         for num_tokens in DIRECT_A_TOKENS
+    }
+    direct = direct_short | {
+        tp_ep_route_key(num_experts, intermediate, num_tokens)
+        for num_experts, intermediate in TP_EP_SHAPES
+        if num_experts in DIRECT_A_EP_EXPERTS
+        for num_tokens in DIRECT_A_EP_TOKENS
     }
     stated = set()
     for arch in catalog.arches:
@@ -193,7 +204,7 @@ def test_only_the_short_sm103a_rank_routes_read_a_from_the_activations():
             if a_source == "x":
                 assert arch == "sm_103a" and key in direct, (arch, key)
                 stated.add(key)
-    assert stated in (set(), direct), sorted(direct ^ stated)
+    assert stated in (set(), direct_short, direct), sorted(direct ^ stated)
 
 
 def test_tp_ep_programs_launch_as_programmatic_dependents():
