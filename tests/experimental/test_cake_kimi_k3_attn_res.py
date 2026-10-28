@@ -986,10 +986,23 @@ def test_native_ports_route_on_the_qualified_sm_counts():
 
 
 _CSRC = pathlib.Path(cake_build.__file__).resolve().parent / "csrc"
+_LIBRARIES_BY_NAME = cake_build.libraries_by_name() if MODULES else {}
+
+
+def _record_kernel_source(name):
+    """The kernel ``.cu`` of a registry record, resolved through ``build.json``.  After
+    the fast-math and per-architecture folds a record's device source is one shared file
+    named for another record, so a record's kernel is the first source of any of its
+    ``build.json`` entries."""
+    arch = next(iter(MODULES[name]["arches"]))
+    library = _LIBRARIES_BY_NAME[cake_jit.library_name(name, arch)]
+    return _CSRC.parent / library["sources"][0]
+
+
 _TMEM_PROGRAMS = sorted(
     name
     for name in MODULES
-    if "tcgen05.dealloc" in (_CSRC / f"{name}_kernel.cu").read_text()
+    if "tcgen05.dealloc" in _record_kernel_source(name).read_text()
 )
 
 
@@ -999,7 +1012,7 @@ def test_tmem_programs_drain_loads_before_the_dealloc(name):
     # with tcgen05.dealloc after the cleanup barrier. A register dependency on a tcgen05.ld
     # result does not complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory
     # consistency model), so a wait::ld must come before the barrier that precedes the dealloc.
-    text = (_CSRC / f"{name}_kernel.cu").read_text()
+    text = _record_kernel_source(name).read_text()
     dealloc = text.index("tcgen05.dealloc")
     cleanup = text.rindex("barrier.sync", 0, dealloc)
     assert "tcgen05.ld." in text[:cleanup]
@@ -1223,7 +1236,13 @@ def test_registry_records_reference_the_build_manifest():
             assert entry["arch"] == arch
             assert entry["entry"] == "run"
             binding = _launch_binding(record)
-            assert entry["sources"] == [f"csrc/{name}_kernel.cu", f"csrc/{binding}"]
+            assert entry["sources"][1] == f"csrc/{binding}", name
+            shared = re.fullmatch(
+                r"csrc/(cake_kimi_k3_attn_res_[0-9a-f]{20})_kernel\.cu",
+                entry["sources"][0],
+            )
+            assert shared is not None, entry["sources"][0]
+            assert MODULES[shared.group(1)]["kind"] == record["kind"], name
             defines = _compile_defines(entry)
             assert defines.get("CAKE_PROGRAM_KERNEL") == f"kernel_{name}", name
             assert _binding_required(binding) <= set(defines), (name, arch)
