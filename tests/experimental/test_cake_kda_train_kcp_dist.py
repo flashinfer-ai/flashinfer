@@ -208,10 +208,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
             },
         }
 
-    # the probe runs once per backend: a row after an earlier saved-mode backward in this process (the Slurm
-    # per-task form runs every row in one process) finds it spent
+    # the probe runs once per backend, on request (spec3_probe="record"; "off" is the default): a row after an
+    # earlier probing backward in this process (the Slurm per-task form runs every row in one process) finds it
+    # spent; the later passes run the default and must match this one bitwise
     pending = bool(getattr(cake_kcp.get_backend(), "_spec3_pending", False))
-    res = saved_pass()
+    res = saved_pass(spec3_probe="record")
     spec3 = (cake_kcp.LAST_CALL.get("bwd") or {}).get(
         "spec3"
     )  # SPEC-3 debug assertion of the first saved-mode backward
@@ -259,8 +260,8 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "ring_eq_a2a": ring_ok,
         "graph_replay": events == GRAPH_EVENTS
         and all(torch.equal(res[n], res_graph[n]) for n in TENSORS),
-        # a backend with local stages whose probe was pending must have run it (spec3_probe="record", the
-        # default); a rank without tokens launches no local stage, so it has nothing to probe.  The probe's row
+        # a backend with local stages whose probe was pending must have run it (spec3_probe="record" on the
+        # first pass); a rank without tokens launches no local stage, so it has nothing to probe.  The probe's row
         # comparison (the forward's intra prep against the backward's prep program) is reported in spec3_by_rank,
         # not gated: the requirement of record is saved_eq_replay (both backward modes run the same local programs)
         "spec3": (not backend.local_stages)

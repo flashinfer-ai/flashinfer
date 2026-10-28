@@ -674,10 +674,14 @@ receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
 `spec3_probe` sets the debug probe of the backend's first saved-mode backward,
-which compares the backward's prep and WY rows with the forward's: `"record"`
-(the default) stores the comparison in `LAST_CALL["bwd"]["spec3"]`, `"warn"`
-warns on a difference, `"assert"` raises `KcpPreconditionError`, `"off"` skips
-it for that call.  The backward reads the value of its own call (pass it to
+which compares the backward's prep and WY rows with the forward's: `"off"` (the
+default) skips it, `"record"` stores the comparison in
+`LAST_CALL["bwd"]["spec3"]`, `"warn"` warns on a difference, `"assert"` raises
+`KcpPreconditionError`.  A probing backward keeps five token-row planes (about
+`ctx.R * H * 1536` bytes: 1.5 KiB per head for every row of the rank's
+chunk-padded token layout) allocated through its prep and WY programs, so its
+peak memory is higher by up to that amount.
+The backward reads the value of its own call (pass it to
 `chunk_kda_kcp_bwd`; the forward's is not kept in `KcpSaved`).  Pass the
 same value on every rank: the probe is a rank-local check, so `"assert"`
 serves single-process debugging.  Under `graph="replay"` the probing
