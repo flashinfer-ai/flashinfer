@@ -48,7 +48,7 @@ from flashinfer.fused_moe import prepare_kimi_k3_fused_router
 from flashinfer.testing import bench_gpu_time
 
 # Token counts between the measured cells, one per arm range.
-ARBITRARY_NUM_TOKENS = (3, 28, 29, 100, 300, 1000, 3000, 8000)
+ARBITRARY_NUM_TOKENS = (3, 28, 29, 100, 300, 700, 1000, 1100, 3000, 8000)
 ROWS = {
     f"m{rows}_bm{bm}": (rows, bm)
     for bm in BLOCK_M_VALUES

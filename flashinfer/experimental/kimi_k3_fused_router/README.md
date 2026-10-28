@@ -53,27 +53,30 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   a one-join
   bitmap builder for the 256-token cell (129 to 256 tokens; its owner scratch
   holds 256 rows on SM100 and 2048 on SM103), a 4-CTA-cluster variant at four
-  CTAs per SM for 257 to 2048 tokens (on SM100 the 512-token cell uses a
-  kernel of that family whose plan emit gives each lane of an expert's warp
-  16 tokens instead of 32; the 2048-token cell uses a second kernel of that
+  CTAs per SM for 257 to 2048 tokens (the 512-token cells use a kernel of
+  that family whose plan emit gives each lane of an expert's warp 16 tokens
+  instead of 32; the 2048-token cell uses a second kernel of that
   family which prefetches the next row's logits into registers) and a
   warp-per-row two-join persistent kernel launched as CTA pairs from 2049
   tokens up. The two architectures' tables differ only in four small-batch
-  cells and the two 512-token cells.
+  cells.
 - The 4-CTA-cluster cells follow the batch against the device's capacity
   `C`, four times the co-resident clusters the driver reports for the
   next-row-prefetch kernel (568 on a 148-SM B200, 592 on a 152-SM GB300): up
   to `C` tokens keep the cell's arm (every CTA selects at most one row). Above
   `C` a CTA selects a second row, which a next-row prefetch covers: SM100 runs
-  the next-row-prefetch kernel, at `block_m` 8 up to 1024 tokens its variant
-  that skips the emit word pass such a batch leaves without a bitmap word;
-  SM103 runs the first kernel of the family with the same prefetch up to 1024
-  tokens and the next-row-prefetch kernel above. From `2C + 64` up a kernel of
+  a kernel of the family whose owner CTAs rank the route pairs in their own
+  shared memory up to 832 tokens and from 1056 tokens, and the
+  next-row-prefetch kernel between them (at `block_m` 8 up to 1024 tokens its
+  variant that skips the emit word pass such a batch leaves without a bitmap
+  word); SM103 runs the first kernel of the family with the same prefetch up
+  to 1024 tokens, the next-row-prefetch kernel up to 1039 tokens and the
+  owner-rank kernel from 1040 tokens. From `2C + 64` up a kernel of
   the family that selects one row per warp runs (1200 tokens on a B200, 1248
   on a GB300), on SM103 at `block_m` 8 from `2C` (1184 tokens on a GB300).
-  That kernel ranks the route pairs of its owner CTAs in their own shared
-  memory; on SM100 its candidate ranks also read the warp's composites in
-  16-byte shared blocks and its rank scans sum ballot bit planes. `C` is
+  That kernel also ranks the route pairs of its owner CTAs in their own
+  shared memory; its candidate ranks read the warp's composites in 16-byte
+  shared blocks and its rank scans sum ballot bit planes. `C` is
   queried once per device and `block_m`, so the rule follows smaller devices
   and MIG slices
   (`cake_backend.CAPACITY_ROUTES`, keyed by architecture and `block_m`).
@@ -100,10 +103,9 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   maps the per-architecture dispatch keys to it; a program built alike for
   both architectures is one source whose architecture-specific lines sit
   behind `__CUDA_ARCH__` guards, while the bitmap builder and the
-  largest-batch arm keep one program per architecture, as does the 4-CTA
-  kernel selecting one row per warp, the prefetching builder ships for SM103
-  alone, and its explicit-cluster launch, the 16-token-lane emit kernel and
-  the emit-pass-guard kernel ship for SM100 alone.
+  largest-batch arm keep one program per architecture, the prefetching
+  builder ships for SM103 alone, and its explicit-cluster launch and the
+  emit-pass-guard kernel ship for SM100 alone.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.

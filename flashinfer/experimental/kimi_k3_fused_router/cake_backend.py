@@ -33,14 +33,14 @@ count (arms L, LP and LPC -- the same one-join plan-builder kernel family for
 up to 128 tokens, LP being the variant that loads the bias and the first row's
 logits into registers before its prologue barrier and LPC the LP kernel
 launched with an explicit cluster of one CTA -- launch at least their 128
-plan-owner CTAs; arms Q4S, Q4S_E16, Q4SB, Q4SP, Q4SP_PG and Q4SPW_LR -- the
-same 4-CTA-cluster kernel family at four CTAs per SM, Q4SP being the variant
-that prefetches the next row's logits into registers, Q4S_E16 the Q4S kernel
-whose plan emit gives each lane 16 tokens instead of 32, Q4SB the Q4S kernel
-with the next-row prefetch, Q4SP_PG the Q4SP kernel skipping the emit word pass
-a batch of at most 1024 tokens leaves without a bitmap word and Q4SPW_LR the
-Q4SP kernel selecting one row per warp whose owner CTAs rank the route pairs in
-their own shared memory -- are
+plan-owner CTAs; arms Q4S, Q4S_E16, Q4SB, Q4SP, Q4SP_PG, Q4SP_LR and Q4SPW_LR
+-- the same 4-CTA-cluster kernel family at four CTAs per SM, Q4SP being the
+variant that prefetches the next row's logits into registers, Q4S_E16 the Q4S
+kernel whose plan emit gives each lane 16 tokens instead of 32, Q4SB the Q4S
+kernel with the next-row prefetch, Q4SP_PG the Q4SP kernel skipping the emit
+word pass a batch of at most 1024 tokens leaves without a bitmap word, Q4SP_LR
+the Q4SP kernel whose owner CTAs rank the route pairs in their own shared
+memory and Q4SPW_LR the Q4SP_LR kernel selecting one row per warp -- are
 bounded by the driver's co-resident cluster capacity; arm GW, the
 warp-per-row two-join kernel for the largest batches, launches CTA pairs under
 a per-architecture CTAs-per-SM bound and the co-resident pair capacity); arms
@@ -143,17 +143,18 @@ ARM_Q4S_CLUSTER = 4
 ARM_Q4S_CTAS_PER_SM = 4
 # Arm Q4SP: the Q4S body with a register prefetch of the next row's logits, a
 # second kernel of the same family; arm Q4S_E16: the Q4S kernel whose plan emit
-# gives each lane of an expert's warp 16 tokens instead of 32 (SM100, the
-# 512-token cell); arm Q4SB: the Q4S kernel with the same next-row prefetch; arm
-# Q4SP_PG: the Q4SP kernel skipping the emit word pass that a batch of at most
-# 1024 tokens leaves without a bitmap word (SM100 at block_m 8, C < num_tokens
-# <= 1024); arm Q4SPW_LR: the Q4SP kernel selecting one row per warp (all of a
-# CTA's rows side by side) whose owner CTAs rank the route pairs of their own
-# quarter of the tokens in their own shared memory (on SM100 its candidate
-# ranks read the warp's composites in 16-byte shared blocks and its rank scans
-# sum ballot bit planes).  Identical cluster shape, launch bounds, admission
-# guards and grid rule.
-ARM_Q4S_FAMILY = ("Q4S", "Q4S_E16", "Q4SB", "Q4SP", "Q4SP_PG", "Q4SPW_LR")
+# gives each lane of an expert's warp 16 tokens instead of 32 (the 512-token
+# cells); arm Q4SB: the Q4S kernel with the same next-row prefetch; arm Q4SP_PG:
+# the Q4SP kernel skipping the emit word pass that a batch of at most 1024
+# tokens leaves without a bitmap word (SM100 at block_m 8, 832 < num_tokens <=
+# 1024); arm Q4SP_LR: the Q4SP kernel whose owner CTAs rank the route pairs of
+# their own quarter of the tokens in their own shared memory (SM100, C <
+# num_tokens <= 832 and 1056 <= num_tokens < 2C + 64; SM103, 1040 <= num_tokens
+# < 2C + W); arm Q4SPW_LR: the Q4SP_LR kernel selecting one row per warp (all of
+# a CTA's rows side by side), whose candidate ranks read the warp's composites
+# in 16-byte shared blocks and whose rank scans sum ballot bit planes.
+# Identical cluster shape, launch bounds, admission guards and grid rule.
+ARM_Q4S_FAMILY = ("Q4S", "Q4S_E16", "Q4SB", "Q4SP", "Q4SP_PG", "Q4SP_LR", "Q4SPW_LR")
 
 
 class CapacityRule(NamedTuple):
@@ -181,14 +182,21 @@ class CapacityRule(NamedTuple):
 # the first ``above`` band holding num_tokens (a CTA then selects a second row,
 # which the next-row prefetch covers); num_tokens >= 2C + W runs the wide arm
 # Q4SPW_LR (two or more rows per CTA, one row per warp).  Above C, SM103 runs
-# the Q4S kernel with the prefetch (Q4SB) up to 1024 tokens and Q4SP beyond;
-# SM100 runs Q4SP, at block_m 8 the Q4SP kernel with the emit pass guard
-# (Q4SP_PG) up to 1024 tokens.  W is 64 (from 1200 tokens on a B200, from 1248
-# on a GB300 at block_m 16), except 0 on SM103 at block_m 8 (from 1184 tokens
-# on a GB300).
-_SM100_ABOVE_C = ((ARM_Q4S_MAX_TOKENS, "Q4SP"),)
-_SM100_ABOVE_C_BM8 = ((1024, "Q4SP_PG"), (ARM_Q4S_MAX_TOKENS, "Q4SP"))
-_SM103_ABOVE_C = ((1024, "Q4SB"), (ARM_Q4S_MAX_TOKENS, "Q4SP"))
+# the Q4S kernel with the prefetch (Q4SB) up to 1024 tokens, Q4SP up to 1039
+# tokens and Q4SP_LR from 1040 tokens; SM100 runs the Q4SP kernel with the owner
+# CTAs' local rank (Q4SP_LR) up to 832 tokens, Q4SP up to 1055 tokens (at
+# block_m 8 the Q4SP kernel with the emit pass guard, Q4SP_PG, up to 1024
+# tokens) and Q4SP_LR again from 1056 tokens.  W is 64 (from 1200 tokens on a
+# B200, from 1248 on a GB300 at block_m 16), except 0 on SM103 at block_m 8
+# (from 1184 tokens on a GB300).
+_SM100_ABOVE_C = ((832, "Q4SP_LR"), (1055, "Q4SP"), (ARM_Q4S_MAX_TOKENS, "Q4SP_LR"))
+_SM100_ABOVE_C_BM8 = (
+    (832, "Q4SP_LR"),
+    (1024, "Q4SP_PG"),
+    (1055, "Q4SP"),
+    (ARM_Q4S_MAX_TOKENS, "Q4SP_LR"),
+)
+_SM103_ABOVE_C = ((1024, "Q4SB"), (1039, "Q4SP"), (ARM_Q4S_MAX_TOKENS, "Q4SP_LR"))
 CAPACITY_ROUTES: dict[tuple[str, int], CapacityRule] = {
     ("sm_100a", 8): CapacityRule(_SM100_ABOVE_C_BM8, "Q4SPW_LR", 64),
     ("sm_100a", 16): CapacityRule(_SM100_ABOVE_C, "Q4SPW_LR", 64),
@@ -217,9 +225,9 @@ MAIN_KWARGS = (
 # Measured dispatch cells, keyed by (num_tokens, block_m): the 28 shapes the
 # generated program was benchmarked at on each architecture.  Both tables cover
 # the same cells; they differ in exactly three cells of the L family
-# (ARM_L_FAMILY), in one 32-token cell (ARM_LCG_FAMILY) and in the two 512-token
-# cells (see _SM103_SHAPE_ROUTE below).  On both architectures the capacity
-# rule (CAPACITY_ROUTES) refines the arms of the 512- to 2048-token cells, and
+# (ARM_L_FAMILY) and in one 32-token cell (ARM_LCG_FAMILY; see
+# _SM103_SHAPE_ROUTE below).  On both architectures the capacity rule
+# (CAPACITY_ROUTES) refines the arms of the 512- to 2048-token cells, and
 # CELL32_LOW_ROUTES the arm of the smaller counts of a 32-token cell.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "LC",
@@ -240,8 +248,8 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (128, 16): "L",
     (256, 8): "M",
     (256, 16): "M",
-    (512, 8): "Q4S_E16",  # sm_103a: Q4S
-    (512, 16): "Q4S_E16",  # sm_103a: Q4S
+    (512, 8): "Q4S_E16",
+    (512, 16): "Q4S_E16",
     (1024, 8): "Q4S",
     (1024, 16): "Q4S",
     (2048, 8): "Q4SP",
@@ -254,17 +262,14 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
 # sm_103a: the sm_100a table with the three cells of the L family that differ
 # between the architectures -- sm_100a routes both 64-token cells to LPC (the
 # LP kernel launched with an explicit cluster of one CTA) and keeps L at
-# (128, 8); sm_103a routes (64, 8) and (128, 8) to LP and (64, 16) to L --, the
-# 32-token cell at block_m 8 (sm_100a LCG_LW, sm_103a LCG) and the two 512-token
-# cells (sm_100a Q4S_E16, sm_103a Q4S).
+# (128, 8); sm_103a routes (64, 8) and (128, 8) to LP and (64, 16) to L -- and
+# the 32-token cell at block_m 8 (sm_100a LCG_LW, sm_103a LCG).
 _SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     **_SM100_SHAPE_ROUTE,
     (32, 8): "LCG",
     (64, 8): "LP",
     (64, 16): "L",
     (128, 8): "LP",
-    (512, 8): "Q4S",
-    (512, 16): "Q4S",
 }
 SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
 MEASURED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))

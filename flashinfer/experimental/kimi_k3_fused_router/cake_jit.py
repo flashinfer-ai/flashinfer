@@ -891,8 +891,8 @@ BLOCK_M_VALUES = (8, 16)
 #   Q4S  : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster
 #          launch) at four CTAs per SM, 128 <= num_tokens <= 2048
 #   Q4S_E16: the Q4S kernel whose plan emit gives each lane 16 tokens instead
-#          of 32 (SM100, the 512-token cell), same cluster / launch bounds /
-#          grid rule
+#          of 32 (the 512-token cells), same cluster / launch bounds / grid
+#          rule
 #   Q4SB : the Q4S kernel with a register prefetch of the next row's logits
 #          (SM103), same cluster / launch bounds / grid rule
 #   Q4SP : the Q4S kernel with a register prefetch of the next row's logits,
@@ -900,9 +900,10 @@ BLOCK_M_VALUES = (8, 16)
 #   Q4SP_PG: the Q4SP kernel skipping the emit word pass a batch of at most
 #          1024 tokens leaves without a bitmap word (SM100 at block_m 8), same
 #          cluster / launch bounds / grid rule
-#   Q4SPW_LR: the Q4SP kernel selecting one row per warp whose owner CTAs rank
-#          the route pairs in their own shared memory, same cluster / launch
-#          bounds / grid rule
+#   Q4SP_LR: the Q4SP kernel whose owner CTAs rank the route pairs in their
+#          own shared memory, same cluster / launch bounds / grid rule
+#   Q4SPW_LR: the Q4SP_LR kernel selecting one row per warp, same cluster /
+#          launch bounds / grid rule
 #   GW   : two-join persistent warp-per-row kernel for the largest batches; a
 #          cooperative grid of 2-CTA clusters
 ARMS = (
@@ -919,6 +920,7 @@ ARMS = (
     "Q4SB",
     "Q4SP",
     "Q4SP_PG",
+    "Q4SP_LR",
     "Q4SPW_LR",
     "GW",
 )
