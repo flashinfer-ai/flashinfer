@@ -303,3 +303,50 @@ def test_pipeline_bindings_refuse_an_unknown_a_source():
         metadata = dict(SHORT_ROW_METADATA, a_source=bad)
         with pytest.raises(ValueError, match="a_source"):
             preparation.prepare_pipeline_bindings(inputs, 4, route_metadata=metadata)
+
+
+def test_pipeline_bindings_align_the_scale_words_for_an_activation_route():
+    """A route that reads A from the activations stages the scale words with
+    16-byte loads: an ``x_sf_packed`` view that starts four bytes into a larger
+    buffer is copied to a view that starts on a 16-byte boundary (the same
+    words); a pool route binds the caller's view as before."""
+    torch = cuda_torch()
+    inputs = small_pipeline_inputs(torch)
+    T, H = inputs["num_tokens"], inputs["hidden"]
+    words = T * H // SF_GRAN // 4
+    buffer = torch.randint(0, 2**31 - 1, (words + 1,), dtype=torch.int32, device="cuda")
+    inputs["x_sf_packed"] = buffer[1:]
+    assert inputs["x_sf_packed"].data_ptr() % 16 == 4
+    for a_source in ("x", "pool"):
+        metadata = dict(SHORT_ROW_METADATA, a_source=a_source)
+        data = preparation.prepare_pipeline_bindings(inputs, 4, route_metadata=metadata)
+        x_sf = data["bindings"]["x_sf"]
+        assert torch.equal(x_sf.view(torch.int32).reshape(-1), buffer[1:])
+        if a_source == "x":
+            assert x_sf.data_ptr() % 16 == 0
+            assert x_sf.data_ptr() != inputs["x_sf_packed"].data_ptr()
+        else:
+            assert x_sf.data_ptr() == inputs["x_sf_packed"].data_ptr()
+
+
+def test_pipeline_bindings_refuse_a_token_routed_twice_to_one_expert_on_an_activation_route():
+    """The in-place A read ranks tokens within an expert, not slots: a token
+    that routes to one local expert through two slots is refused on an ``"x"``
+    route (a pool route places both slots, as before). Masked slots (``-1``)
+    take no row and may repeat."""
+    torch = cuda_torch()
+    inputs = small_pipeline_inputs(torch)
+    T = inputs["num_tokens"]
+    inputs["top_k"] = 2
+    inputs["topk_weights"] = torch.ones(T, 2, dtype=torch.float32, device="cuda")
+
+    def prepare(topk_idx, a_source):
+        routed = dict(inputs, topk_idx=torch.tensor(topk_idx, device="cuda"))
+        metadata = dict(SHORT_ROW_METADATA, a_source=a_source)
+        return preparation.prepare_pipeline_bindings(routed, 4, route_metadata=metadata)
+
+    twice = [[0, 0], [0, 1], [1, 0], [1, 1]]
+    with pytest.raises(ValueError, match="distinct experts per token"):
+        prepare(twice, "x")
+    prepare(twice, "pool")
+    prepare([[0, -1], [-1, -1], [1, 0], [-1, 1]], "x")

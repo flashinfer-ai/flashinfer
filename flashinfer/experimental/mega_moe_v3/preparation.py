@@ -400,8 +400,11 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     rows, ``"x"`` the activations themselves, the contiguous
     ``[num_tokens, hidden]`` bytes of ``x_fp8_packed`` (a program that reads
     every routed row straight from the activations and copies no pool row).
-    Without metadata (the original routes) the host uses the original
-    heuristics.
+    Such a program ranks tokens within an expert, not slots, so a token that
+    routes to one local expert through two slots is refused, and it stages the
+    scale words with 16-byte loads, so an ``x_sf_packed`` view that does not
+    start on a 16-byte boundary is copied to one that does. Without metadata
+    (the original routes) the host uses the original heuristics.
     """
     import torch
 
@@ -532,6 +535,26 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
                 f"[{T}, {H}] byte view for a route that reads A from the "
                 f"activations; got shape {tuple(A.shape)}, strides {A.stride()}"
             )
+        # The program ranks tokens within an expert, not slots: a token that
+        # routes to one local expert through two slots would take one row and
+        # the weight of one slot. A top-k router hands distinct experts per
+        # token; refuse the input rather than return a different sum. Masked
+        # (negative) ids and ids another rank holds take no row and may repeat.
+        local = ids.to(torch.int64).reshape(T, TK) - offset
+        unrouted = -1 - torch.arange(TK, dtype=torch.int64).reshape(1, TK)
+        local = torch.where((local >= 0) & (local < E), local, unrouted)
+        ordered = local.sort(dim=1).values
+        if bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()):
+            raise ValueError(
+                "MegaMoE input 'topk_idx' routes a token to one local expert "
+                "through two slots; a route that reads A from the activations "
+                "needs distinct experts per token"
+            )
+        # The program stages the scale words with 16-byte loads: hand it a
+        # word view that starts on a 16-byte boundary (a fresh allocation
+        # does; a slice of a larger buffer may not).
+        if x_sf.data_ptr() % 16:
+            x_sf = x_sf.clone()
     else:
         A = pool_fp8.view(torch.uint8)
     pool_sf = torch.zeros(M_total, H // 128, dtype=torch.int32, device="cuda")
