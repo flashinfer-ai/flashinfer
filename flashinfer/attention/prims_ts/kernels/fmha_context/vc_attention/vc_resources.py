@@ -24,7 +24,7 @@ The resources in ``fmha_resources`` own the row-sum operand (behind the
 SMEM P tile), the exp2 and store paths and the mean UMMA issue.
 """
 
-from ...vc_attention import VC_MEAN_GROUP_TILES, VC_MEAN_OPERANDS
+from ....vc_attention import VC_MEAN_GROUP_TILES, VC_MEAN_OPERANDS
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -44,7 +44,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..placeholder_helpers import _placeholder_smem_array
+from ...placeholder_helpers import _placeholder_smem_array
 
 # VC-Attention mean-restore operands of the bf16 K=16 UMMA step that adds
 # ``rowsum(P_tile) * mean_tile`` into O. Unswizzled K-major 32-byte rows with
