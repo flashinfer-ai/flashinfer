@@ -51,7 +51,7 @@
     "tests/moe/__init__.py": "6b1eee7d1e997500dae50bf0a8b671c6ad03350ea91bdb3686efff997251f7c4",
     "tests/moe/test_cudnn_frost_kernels.py": "0a6c97085df8aacc608fbcd92657df80f0b7617c262abb3c4f04cd56b09ed3f4",
     "tests/moe/test_frost_low_latency.py": "4bd2cadafc1401ba98118602e3e6048dcc9ba164e1aeaf5d5fb968916138f67d",
-    "tests/moe/test_unified_moe_activation_matrix.py": "3217caf669bda95f8bd01b065e240d7a47478deaee7f664d27a341235f48e94c",
+    "tests/cpu/moe/test_unified_moe_activation_matrix.py": "3217caf669bda95f8bd01b065e240d7a47478deaee7f664d27a341235f48e94c",
     "tests/moe/test_unified_moe_pack_contract.py": "74c3fa8ae14efba90f2583984be49aef2e20f792a0453c18d6e1c44273bfd6b7",
     "tests/moe/utils.py": "7bf009863a870c5d630160c6c29555d20f815e7c2860c61ce78df61249b77760"
   },

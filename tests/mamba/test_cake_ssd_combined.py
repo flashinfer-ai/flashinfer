@@ -7179,6 +7179,80 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
     assert prepared.program_name == expected
 
 
+def test_source_sm107_fp32_one_chunk_items_above_the_bound_take_exactpre():
+    """On SM107 one-chunk ring calls with an fp32 state take the two-kernel
+    ``exactpre`` program above the 2048-item bound too; 16-bit states, the
+    start schedule and other architectures keep the retained ``exact``
+    program there."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+
+    def family(capability, state_dtype, num_sequences=160, variant=""):
+        # 128-token sequences x 128 heads: one chunk per item
+        return module.two_kernel_family(
+            mode_varlen=True,
+            num_sequences=num_sequences,
+            seqlen=num_sequences * 128,
+            nheads=128,
+            sm_count=148,
+            capability=capability,
+            variant=variant,
+            state_dtype=state_dtype,
+        )
+
+    # 160 x 128 = 20480 items, above the bound
+    assert family((10, 7), torch.float32) == "exactpre"
+    assert family((10, 7), torch.bfloat16) == "exact"
+    assert family((10, 7), torch.float16) == "exact"
+    assert family((10, 7), torch.float32, variant="noring") == "exact"
+    assert family((10, 3), torch.float32) == "exact"
+    assert family((10, 0), torch.float32) == "exact"
+    # 8 x 128 = 1024 items, inside the bound: every state dtype
+    assert family((10, 7), torch.bfloat16, num_sequences=8) == "exactpre"
+    # 1 x 128 = 128 items, not above the SM count
+    assert family((10, 7), torch.float32, num_sequences=1) == "exact"
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+def test_source_sm107_retained_noring_call_takes_the_fused_program(monkeypatch, arch):
+    """On SM107 a call the retained ``exact_*_noring`` program would serve
+    (8 packed 64-token sequences x 128 heads with z: one-chunk items outside
+    the fused varlen window, on the start schedule) runs the fused program
+    of the same variant instead; SM103 keeps the retained program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=128,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=True,
+        arch=arch,
+    )
+    num_seqs, tokens = 8, 64
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 128, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 128), dtype=torch.float32)
+    A = torch.empty((128,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "initial_states": torch.empty((num_seqs, 128, 64, 128), dtype=torch.bfloat16),
+        "z": torch.empty_like(x),
+        "cu_seqlens": torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        ),
+    }
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    expected = "exactfused" if arch == "sm_107a" else "exact"
+    assert name == f"{expected}_bf16_varlen_noring"
+
+
 def test_source_fused_route_mirrors_the_seed_rule():
     """``fused_selected`` reads the seed module's ``fused_route`` constants on
     host-known quantities: batched calls with at most 1024 (sequence, head)

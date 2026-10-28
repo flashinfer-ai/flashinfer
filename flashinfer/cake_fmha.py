@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import heapq
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -50,7 +51,7 @@ from .cake_fmha_request_ordered import (
 from .cake_fmha_request_ordered import (
     _run_cake_fmha_request_ordered_paged_decode as _run_cake_fmha_request_ordered_paged_decode,
 )
-from .utils import get_compute_capability, log2e
+from .utils import get_compute_capability, get_device_sm_count, log2e
 
 
 @dataclass(frozen=True)
@@ -405,6 +406,47 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
+    ("context_fp8", "RUNTIME_SK_PACK8"): (
+        "cake_fmha_context_fp8_ee373474e6d16691cab7",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK4"): (
+        "cake_fmha_context_fp8_074b1da06353ee6d95c6",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK2"): (
+        "cake_fmha_context_fp8_2208354a624a713e3455",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK1"): (
+        "cake_fmha_context_fp8_a93f4040f2fe5b5a85bb",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK8_PAGE64"): (
+        "cake_fmha_context_fp8_617e3a6b50380cf6e0a5",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK4_PAGE64"): (
+        "cake_fmha_context_fp8_1ea3c441ffa379d0978f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK2_PAGE64"): (
+        "cake_fmha_context_fp8_c76354901ca9c86f4fec",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_SK_PACK1_PAGE64"): (
+        "cake_fmha_context_fp8_9697d1fcd36a1f4a023e",
+        None,
+        False,
+    ),
 }
 # The FP8 runtime-size context programs: every length, head count, m-block
 # count and page size is a launch argument, so one program serves every causal
@@ -440,6 +482,29 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
 # it divides.
 _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
+# The FP8 split-KV context programs: the runtime-size schedule and arguments,
+# with the key range of the first ``split_tiles`` tiles split over work units
+# of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
+# partials the tile's last unit merges.  Per target, ``(pack_g, page_size)``
+# names the program as for the runtime-size programs.  The host routes an FP8
+# call to one only where its split plan
+# (:func:`_context_fp8_split_plan`) predicts a gain over the whole-tile
+# program; other calls keep their route.
+_CONTEXT_FP8_SPLIT_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    target: {
+        key: "RUNTIME_SK" + name.removeprefix("RUNTIME") for key, name in routes.items()
+    }
+    for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
+}
+_CONTEXT_FP8_SPLIT_PROGRAMS = frozenset(
+    name for routes in _CONTEXT_FP8_SPLIT_ROUTES.values() for name in routes.values()
+)
+# Units of one split tile at most (the kernel's MAX_SPLITS), and the FP32
+# partial bytes of one split unit: O of both 128-row stages, then the row max
+# and row sum (16 bytes per row and stage).
+_CONTEXT_FP8_SPLIT_MAX = 16
+_CONTEXT_FP8_SPLIT_O_BYTES = 2 * 128 * 128 * 4
+_CONTEXT_FP8_SPLIT_ML_BYTES = 2 * 128 * 4 * 4
 # The binding's host parameters per component, in the kernel's order (then the
 # grid).  The quantized programs take the device-scale parameters in every
 # build; a host-scalar program never reads them.
@@ -514,12 +579,27 @@ _CONTEXT_FP8_RUNTIME_PARAMS = (
 )
 
 
+# A split-KV FP8 program takes the runtime-size parameters, then the split
+# plan, the FP32 partials and the per-tile arrival counters.
+_CONTEXT_FP8_SPLIT_PARAMS = (
+    *_CONTEXT_FP8_RUNTIME_PARAMS,
+    "split_tiles",
+    "split_blocks",
+    "num_splits",
+    "partial_o",
+    "partial_ml",
+    "tile_counters",
+)
+
+
 def _context_program_params(
-    component: str, num_m_blocks: int | None
+    component: str, num_m_blocks: int | None, program: str | None = None
 ) -> tuple[str, ...]:
     """The host parameters of a pinned program's binding, in the kernel's order
     (then the grid)."""
 
+    if program in _CONTEXT_FP8_SPLIT_PROGRAMS:
+        return _CONTEXT_FP8_SPLIT_PARAMS
     if num_m_blocks is None:
         return _CONTEXT_FP8_RUNTIME_PARAMS
     return _CONTEXT_HOST_PARAMS[component]
@@ -533,14 +613,21 @@ def _context_program_facts(program_name: str) -> tuple[str, int | None, bool]:
 
 
 def cake_fmha_context_launch_grid(
-    program, total_bh: int, sm_count: int, num_m_blocks: int | None = None
+    program,
+    total_bh: int,
+    sm_count: int,
+    num_m_blocks: int | None = None,
+    split_tiles: int = 0,
+    num_splits: int = 1,
 ) -> tuple[int, int, int]:
     """The launch grid of one generated context program: a one-tile program
     launches one CTA per tile (``num_m_blocks x total_bh`` tiles, ``total_bh``
     the work units ``batch_size x num_q_heads / pack_g``), a persistent program
-    ``min(sm_count, tiles)`` CTAs.  ``program`` is the generated loader's
-    ``CakeProgram`` record; ``num_m_blocks`` is the launch's m-block count,
-    required for a runtime-size program and else, when given, its pinned one."""
+    ``min(sm_count, tiles)`` CTAs, a split-KV program ``min(sm_count, tiles +
+    (num_splits - 1) x split_tiles)`` (its work units).  ``program`` is the
+    generated loader's ``CakeProgram`` record; ``num_m_blocks`` is the launch's
+    m-block count, required for a runtime-size program and else, when given,
+    its pinned one."""
 
     _, pinned, one_tile = _context_program_facts(program.name)
     if pinned is None:
@@ -551,7 +638,8 @@ def cake_fmha_context_launch_grid(
     elif int(num_m_blocks) != pinned:
         raise RuntimeError(f"{program.name} runs {pinned} m-blocks, not {num_m_blocks}")
     tiles = int(num_m_blocks) * int(total_bh)
-    return (tiles if one_tile else min(int(sm_count), tiles)), 1, 1
+    units = tiles + (int(num_splits) - 1) * int(split_tiles)
+    return (tiles if one_tile else min(int(sm_count), units)), 1, 1
 
 
 def _aligned_program_id(cluster_size: int, dtype: str) -> str:
@@ -2371,6 +2459,296 @@ def _context_fp8_runtime_serves(
     )
 
 
+# The split planner's cost model per target, in microseconds: the launch's
+# fixed cost, one KV block of a unit, the fixed cost of a unit, the partial
+# store of a split unit, the merge of a tile of k units (MERGE0 + MERGE1 x k)
+# by its last unit, and each extra work unit's share of the memory system
+# (the per-CTA schedule does not see it).  Fitted to timed split plans of
+# B200 (sm100a) and of GB300 (sm103a).
+_CONTEXT_FP8_SPLIT_COSTS: dict[str, tuple[float, ...]] = {
+    "sm100a": (5.294, 1.529, 3.327, 3.425, 1.383, 1.661, 0.014),
+    "sm103a": (5.703, 1.247, 2.046, 0.256, 3.705, 1.648, 0.023),
+}
+# The share of the partial store and the merge that a split tile holding one
+# 128-row query stage costs, against a tile of two stages (the program stores
+# and merges the rows of the stages its queries reach), per target.  Fitted to
+# timed split launches of the same plan over two packs (B200, GB300).
+_CONTEXT_FP8_SPLIT_ONE_STAGE: dict[str, float] = {
+    "sm100a": 0.750,
+    "sm103a": 0.734,
+}
+# A split must be predicted faster than the whole-tile schedule by both
+# margins (2 % and 0.5 us: the smallest that timed plans of B200 and GB300
+# support; at 1 % some predicted gains measure as losses); a launch of more
+# tiles than this many waves keeps whole tiles (its last partial wave is a
+# small share of it).
+_CONTEXT_FP8_SPLIT_REL_MARGIN = 0.02
+_CONTEXT_FP8_SPLIT_ABS_MARGIN = 0.5
+_CONTEXT_FP8_SPLIT_MAX_WAVES = 4
+
+
+def _context_fp8_tile_blocks(
+    batch_size: int, max_q_len: int, max_kv_len: int, num_q_heads: int, pack: int
+) -> list[int]:
+    """KV blocks of every tile of a runtime-size launch, in the program's tile
+    order (sections of 8 work units x every m-block, the largest m-block
+    first; bottom-right causal), every request at the planned maxima."""
+
+    tok = 128 // pack
+    m_blocks = max((max_q_len + 2 * tok - 1) // (2 * tok), 1)
+    total_bh = batch_size * (num_q_heads // pack)
+    full_n = max((max_kv_len + 127) // 128, 1)
+    shift = max_kv_len - max_q_len
+    per_m = []
+    for m_block in range(m_blocks):
+        top = (m_block * 2 + 2) * tok + shift
+        per_m.append(max((top + 127) // 128 if top < max_kv_len else full_n, 1))
+    full_sections = total_bh // 8
+    blocks = []
+    for tile in range(m_blocks * total_bh):
+        section, m = divmod(tile >> 3, m_blocks)
+        if section >= full_sections:
+            m = (tile - section * 8 * m_blocks) % m_blocks
+        blocks.append(per_m[m_blocks - 1 - m])
+    return blocks
+
+
+def _context_fp8_split_makespan(
+    blocks: list[int],
+    sm_count: int,
+    split_tiles: int,
+    split_blocks: int,
+    num_splits: int,
+    costs: tuple[float, ...],
+    one_stage: float = 1.0,
+) -> float:
+    """The predicted time of a plan: the persistent CTAs draw the work units in
+    ticket order (the split units split-major, then the other tiles whole), a
+    unit costs ``unit + blocks x block`` (plus the partial store when its tile
+    has more than one unit), the tile's last finisher merges, and the launch
+    adds its fixed cost and the extra units' share.  ``one_stage`` scales the
+    partial store and the merge (a launch whose tiles hold one query stage
+    stores and merges the rows of one stage:
+    :data:`_CONTEXT_FP8_SPLIT_ONE_STAGE`)."""
+
+    fixed, block, unit, store, merge0, merge1, extra = costs
+    store, merge0, merge1 = store * one_stage, merge0 * one_stage, merge1 * one_stage
+    tiles = len(blocks)
+    split_tiles = min(split_tiles, tiles) if num_splits > 1 else 0
+    ctas = min(sm_count, tiles + (num_splits - 1) * split_tiles)
+    free = [0.0] * ctas
+    ready = [(0.0, cta) for cta in range(ctas)]
+    finished: dict[int, list[tuple[float, int]]] = {}
+
+    def draw(cost: float) -> tuple[float, int]:
+        # the CTA free first draws the next ticket (entries a merge made stale
+        # are skipped)
+        while True:
+            start, cta = heapq.heappop(ready)
+            if start == free[cta]:
+                break
+        free[cta] = start + cost
+        heapq.heappush(ready, (free[cta], cta))
+        return free[cta], cta
+
+    for split in range(num_splits if split_tiles else 0):
+        for tile in range(split_tiles):
+            n = blocks[tile]
+            count = min((n + split_blocks - 1) // split_blocks, num_splits)
+            if split >= count:
+                continue
+            nb = split_blocks if split + 1 < count else n - split * split_blocks
+            end, cta = draw(unit + nb * block + (store if count > 1 else 0.0))
+            finished.setdefault(tile, []).append((end, cta))
+            if count > 1 and split + 1 == count:
+                merger = max(finished[tile])[1]
+                free[merger] += merge0 + merge1 * count
+                heapq.heappush(ready, (free[merger], merger))
+    for tile in range(split_tiles, tiles):
+        draw(unit + blocks[tile] * block)
+    return fixed + max(free) + extra * (num_splits - 1) * split_tiles
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_split_plan(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, int, int] | None:
+    """``(split_tiles, split_blocks, num_splits)`` of the split-KV launch the
+    cost model predicts fastest, or ``None`` when no split beats the
+    whole-tile schedule by the margins (a pure function of its integers,
+    cached).  The candidates split the tiles the idle CTAs of the last wave
+    can take, ``num_splits`` from 2 up, ``split_blocks`` the even split of the
+    longest tile; at most ``sm_count - 1`` tiles split, so the per-tile
+    counters fit in the counter buffer after its first word."""
+
+    costs = _CONTEXT_FP8_SPLIT_COSTS.get(target)
+    blocks = _context_fp8_tile_blocks(
+        batch_size, max_q_len, max_kv_len, num_q_heads, pack
+    )
+    tiles = len(blocks)
+    if costs is None or not tiles or tiles > _CONTEXT_FP8_SPLIT_MAX_WAVES * sm_count:
+        return None
+    whole = _context_fp8_split_makespan(blocks, sm_count, 0, 1, 1, costs)
+    tail = tiles % sm_count or sm_count
+    idle = sm_count - tail
+    split_counts = {tiles if tiles <= sm_count else tail, tail}
+    split_counts.update(idle // d for d in (1, 2, 3, 4))
+    longest = max(blocks)
+    best, best_time = None, whole
+    for split_tiles in sorted(split_counts):
+        split_tiles = min(split_tiles, tiles, sm_count - 1)
+        if split_tiles <= 0:
+            continue
+        for num_splits in range(2, _CONTEXT_FP8_SPLIT_MAX + 1):
+            split_blocks = (longest + num_splits - 1) // num_splits
+            if (longest + split_blocks - 1) // split_blocks < num_splits:
+                continue
+            time = _context_fp8_split_makespan(
+                blocks, sm_count, split_tiles, split_blocks, num_splits, costs
+            )
+            if time < best_time:
+                best, best_time = (split_tiles, split_blocks, num_splits), time
+    if (
+        best is None
+        or best_time > whole * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
+        or whole - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+    ):
+        return None
+    return best
+
+
+@functools.lru_cache(maxsize=1024)
+def _context_fp8_split_choice(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, tuple[int, int, int]] | None:
+    """The pack and the plan of the split-KV launch of a call whose runtime
+    pack is ``pack``, or ``None`` when it does not split (a pure function of
+    its integers, cached).
+
+    The plan is ``pack``'s (:func:`_context_fp8_split_plan`), except for a
+    launch of one m-block of two query stages whose plan splits every tile: a
+    smaller shipped pack whose tiles hold every query token in one stage runs
+    the same split (``split_blocks`` and ``num_splits``) over its tiles, where
+    the cost model predicts it faster by the margins.  Every query row meets
+    the same KV units, merged in the same order, so the output is the same;
+    the launch only has more, cheaper units (one stage stored and merged)."""
+
+    plan = _context_fp8_split_plan(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+    )
+    if plan is None:
+        return None
+    share = _CONTEXT_FP8_SPLIT_ONE_STAGE.get(target, 1.0)
+    tokens = 128 // pack
+    if share >= 1.0 or not tokens < max_q_len <= 2 * tokens:
+        return pack, plan
+    costs = _CONTEXT_FP8_SPLIT_COSTS[target]
+    blocks = _context_fp8_tile_blocks(
+        batch_size, max_q_len, max_kv_len, num_q_heads, pack
+    )
+    if plan[0] < len(blocks):
+        return pack, plan
+    _, split_blocks, num_splits = plan
+    time = _context_fp8_split_makespan(blocks, sm_count, *plan, costs)
+    best, best_time = (pack, plan), time
+    for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1):
+        if smaller >= pack or pack % smaller or max_q_len > 128 // smaller:
+            continue
+        blocks = _context_fp8_tile_blocks(
+            batch_size, max_q_len, max_kv_len, num_q_heads, smaller
+        )
+        if len(blocks) > sm_count - 1:
+            continue
+        candidate = (len(blocks), split_blocks, num_splits)
+        candidate_time = _context_fp8_split_makespan(
+            blocks, sm_count, *candidate, costs, share
+        )
+        if candidate_time < best_time:
+            best, best_time = (smaller, candidate), candidate_time
+    if (
+        best[0] == pack
+        or best_time > time * (1 - _CONTEXT_FP8_SPLIT_REL_MARGIN)
+        or time - best_time < _CONTEXT_FP8_SPLIT_ABS_MARGIN
+    ):
+        return pack, plan
+    return best
+
+
+def _context_fp8_launch_split_plan(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack: int,
+    sm_count: int,
+) -> tuple[int, int, int] | None:
+    """The split plan of a launch of the split-KV program of ``pack``: the
+    plan :func:`_context_fp8_split_choice` gives the call where it chose this
+    pack, else ``pack``'s own plan (the route kept ``pack`` where the
+    workspace could not hold the chosen plan's partials)."""
+
+    runtime_pack = _context_fp8_runtime_pack(
+        _context_pack_g(max_q_len, max_kv_len, num_q_heads, num_kv_heads)
+    )
+    choice = _context_fp8_split_choice(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, runtime_pack, sm_count
+    )
+    if choice is not None and choice[0] == pack:
+        return choice[1]
+    return _context_fp8_split_plan(
+        target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+    )
+
+
+def _context_split_sm_count(device: torch.device) -> int | None:
+    """The SM count a launch's split plan assumes, or ``None`` off a CUDA
+    device (no split)."""
+
+    return get_device_sm_count(device) if device.type == "cuda" else None
+
+
+def _context_fp8_split_workspace_bytes(split_tiles: int, num_splits: int) -> int:
+    """Workspace bytes of a split plan: the partial O of every split unit, then
+    their row maxima and sums."""
+
+    return (
+        split_tiles
+        * num_splits
+        * (_CONTEXT_FP8_SPLIT_O_BYTES + _CONTEXT_FP8_SPLIT_ML_BYTES)
+    )
+
+
+def _context_fp8_split_workspace_supported(
+    workspace_buffer: torch.Tensor | None,
+    query: torch.Tensor,
+    plan: tuple[int, int, int],
+) -> bool:
+    """Whether the caller's workspace holds the plan's FP32 partials."""
+
+    return (
+        workspace_buffer is not None
+        and workspace_buffer.is_contiguous()
+        and workspace_buffer.device == query.device
+        and workspace_buffer.data_ptr() % 16 == 0
+        and workspace_buffer.numel() * workspace_buffer.element_size()
+        >= _context_fp8_split_workspace_bytes(plan[0], plan[2])
+    )
+
+
 def _context_hd256_workspace_supported(
     workspace_buffer: torch.Tensor | None,
     query: torch.Tensor,
@@ -2814,6 +3192,46 @@ def select_cake_fmha_context_route(
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # An FP8 call an exact or runtime-size program serves, whose tiles
+        # leave SMs idle: the split-KV program of the pack the split choice
+        # names (:func:`_context_fp8_split_choice`) and the page size, where the
+        # split plan predicts a gain and the workspace holds its partials; the
+        # runtime pack's own plan where the workspace cannot hold the chosen
+        # pack's.
+        split = _CONTEXT_FP8_SPLIT_ROUTES.get(target)
+        sm_count = _context_split_sm_count(device)
+        if program is not None and component == "context_fp8" and split and sm_count:
+            pack = _context_fp8_runtime_pack(pack_g)
+            choice = _context_fp8_split_choice(
+                target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
+            )
+            candidates = [] if choice is None else [choice]
+            if choice is not None and choice[0] != pack:
+                own = _context_fp8_split_plan(
+                    target,
+                    batch_size,
+                    max_q_len,
+                    max_kv_len,
+                    num_q_heads,
+                    pack,
+                    sm_count,
+                )
+                candidates.append((pack, own))
+            for pack, plan in candidates:
+                split_program = split.get((pack, page_size)) or split.get((pack, None))
+                if split_program is None or not _context_fp8_split_workspace_supported(
+                    workspace_buffer, query, plan
+                ):
+                    continue
+                program = split_program
+                pack_g = pack
+                tok_per_stage = 128 // pack
+                num_m_blocks = (max_q_len + 2 * tok_per_stage - 1) // (
+                    2 * tok_per_stage
+                )
+                total_bh = batch_size * (num_q_heads // pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
+                break
     return CakeFmhaContextRoute(
         target=target,
         component=component,
@@ -2852,6 +3270,10 @@ class CakeFmhaContextProgramModule:
         self.runtime = self.num_m_blocks is None
         self.pack_g = route.pack_g
         self.m_block_tokens = 2 * (128 // route.pack_g)
+        # A split-KV program also takes the split plan of each launch
+        # (:func:`_context_fp8_launch_split_plan`), its partials in the caller's
+        # workspace and its tile counters after the counter buffer's first word.
+        self.split = route.program in _CONTEXT_FP8_SPLIT_PROGRAMS
 
     def cake_paged_attention_context(
         self,
@@ -2895,7 +3317,7 @@ class CakeFmhaContextProgramModule:
         The kernel reads every request's KV length (``seq_lens``) and query
         offsets (``cum_seq_lens_q``) itself; ``total_bh`` is the work-unit
         count ``batch_size x num_q_heads / pack_g``.  A device-scale program
-        reads the log2-domain bmm1 scale and the bmm2 scale through device
+        reads the raw bmm1 scale and the bmm2 scale through device
         pointers; a host-scalar program takes them as scalars and never reads
         the pointers.  The LSE, sink and Q-length pointers are unread (the
         programs write no LSE, take no sink and derive the query lengths from
@@ -2934,6 +3356,45 @@ class CakeFmhaContextProgramModule:
         tiles = num_m_blocks * total_bh
         num_ctas = tiles if self.one_tile else min(int(sm_count), tiles)
         device = query.device
+        counter = multi_ctas_kv_counter_buffer
+        if counter.dim() != 1:
+            counter = counter.view(-1)
+        if counter.dtype != torch.uint32:
+            counter = counter.view(torch.uint32)
+        if self.split:
+            # The plan of this launch; one that the workspace or the counter
+            # buffer cannot hold runs as one unit per tile (the whole-tile
+            # schedule, which reads neither).
+            plan = _context_fp8_launch_split_plan(
+                route.target,
+                int(batch_size),
+                int(max_q_len),
+                int(max_kv_len),
+                num_q_heads,
+                int(key_cache.shape[1]),
+                self.pack_g,
+                int(sm_count),
+            )
+            if (
+                plan is None
+                or counter.numel() < 1 + plan[0]
+                or not _context_fp8_split_workspace_supported(
+                    workspace_buffer, query, plan
+                )
+            ):
+                plan = (1, 1, 1)
+            split_tiles, split_blocks, num_splits = plan
+            num_ctas = min(int(sm_count), tiles + (num_splits - 1) * split_tiles)
+            if num_splits > 1:
+                partials = workspace_buffer.view(-1).view(torch.uint8)
+                o_bytes = split_tiles * num_splits * _CONTEXT_FP8_SPLIT_O_BYTES
+                ml_bytes = split_tiles * num_splits * _CONTEXT_FP8_SPLIT_ML_BYTES
+                partial_o = partials[:o_bytes].view(torch.float32)
+                partial_ml = partials[o_bytes : o_bytes + ml_bytes].view(torch.float32)
+                tile_counters = counter[1 : 1 + split_tiles]
+            else:
+                partial_o = partial_ml = _unread_pointers(device)[0]
+                tile_counters = counter[:1]
         unread_f32, unread_i32 = _unread_pointers(device)
         # The kernel reads page ``p`` of request ``b`` at ``page_table[b x
         # page_row_stride + p]``: pass 1-D views over the caller's own table
@@ -2963,21 +3424,17 @@ class CakeFmhaContextProgramModule:
                 if uses_shared_paged_kv_idx
                 else tables.as_strided((span,), (1,), offset + strides[1])
             )
-        counter = multi_ctas_kv_counter_buffer
-        if counter.dim() != 1:
-            counter = counter.view(-1)
-        if counter.dtype != torch.uint32:
-            counter = counter.view(torch.uint32)
         if device_scales:
-            # bmm1 arrives in log2 units (trtllm_batch_context_with_kv_cache
-            # multiplies a device bmm1 scale by log2e).
+            # bmm1 arrives as the caller's device scale (not in log2 form):
+            # with bmm1_is_log2 = 0 the program forms the FP32 product
+            # bmm1 * log2e itself, the value the host multiply gave.
             if not isinstance(bmm1_scale, torch.Tensor) or not isinstance(
                 bmm2_scale, torch.Tensor
             ):
                 raise RuntimeError(
                     "a device-scale Cake FMHA context program takes tensor scales"
                 )
-            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 1
+            softmax_scale_log2, output_scale, bmm1_is_log2 = 1.0, 1.0, 0
             bmm1_ptr = bmm1_scale if bmm1_scale.dim() == 1 else bmm1_scale.reshape(1)
             bmm2_ptr = bmm2_scale if bmm2_scale.dim() == 1 else bmm2_scale.reshape(1)
         else:
@@ -3067,10 +3524,18 @@ class CakeFmhaContextProgramModule:
                 num_q_heads,
                 num_q_heads // key_cache.shape[1],
                 key_cache.shape[2].bit_length() - 1,
-                num_ctas,
-                1,
-                1,
             )
+            if self.split:
+                arguments = (
+                    *arguments,
+                    split_tiles,
+                    split_blocks,
+                    num_splits,
+                    partial_o,
+                    partial_ml,
+                    tile_counters,
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
         else:
             arguments = (
                 query.view(torch.uint8),
@@ -3224,7 +3689,7 @@ def _load_cake_fmha_context_program(
         raise RuntimeError(
             f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
         )
-    params = _context_program_params(route.component, pinned[1])
+    params = _context_program_params(route.component, pinned[1], route.program)
     if tuple(program.args) != (*params, *GRID_ARGS):
         raise RuntimeError(
             f"the generated {program.name} binding takes {list(program.args)}; "

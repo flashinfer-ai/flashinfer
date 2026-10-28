@@ -126,6 +126,12 @@ MERGE_KEY = "merge"
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
 SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
+# Dynamic unit tickets (the sm_103a gate-warpgroup wide scan programs): the CTAs
+# draw their next work unit from the low u32 word of the first int64 behind the
+# candidate buffers (and behind the split staging), a 128-byte tail every plan's
+# workspace carries.  The host zeroes it right before the scan launch of those
+# programs (``cake_backend``); the other programs leave it unused.
+TICKET_TAIL_BYTES = 128
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
         "candidate_multiplier_unsampled", "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
@@ -1272,7 +1278,8 @@ def select_program(
         ),
         scan_entries=scan_entries,
         staging_entries=staging,
-        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes,
+        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
+        + TICKET_TAIL_BYTES,
     )
 
 

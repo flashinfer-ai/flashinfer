@@ -52,10 +52,12 @@ pointer as a trailing ``out_ptr`` parameter beside the ``out`` tensor map; the
 host passes ``out`` for both.
 
 Routing is data: :data:`ROUTE_TABLE` is an ordered tuple of predicate rows
-over the host scalars ``(M, N, K, rank, has_bias)`` and the device's exported
-architecture (a row's optional ``arches``; absent applies everywhere), resolved
-once per call by :func:`select_record`; the last row is the unconditional
-fallback.  The named
+over the host scalars ``(M, N, K, rank, has_bias)``, the device's exported
+architecture (a row's optional ``arches``; absent applies everywhere) and the
+device's SM count (a ``wide_tail`` row admits only the problems whose
+:func:`tailsplit_wide_units` schedule on that SM count is the wide one),
+resolved once per call by :func:`select_record`; the last row is the
+unconditional fallback.  The named
 shape violations (``M >= 128``, ``N`` a multiple of 128, ``K`` a multiple of
 the selected program's K tile, ``rank`` a multiple of 32 up to 128) raise
 ``ValueError`` after routing, so the K-tile message names the program that
@@ -112,6 +114,7 @@ GRID_RULES = (
     "cluster_n2",
     "pair_persistent",
     "pair_tailsplit",
+    "pair_tailsplit_wide",
     "splitk_cluster",
 )
 SCALE_ELEMS = ("uint8", "uint16", "uint32")
@@ -122,8 +125,9 @@ SCALE_ELEMS = ("uint8", "uint16", "uint32")
 # is the bias tensor, or ``out`` as a carrier when ``has_bias`` is 0 (the
 # kernel never reads it then, but the binding needs a valid CUDA tensor).
 # The ``D_tail`` / ``L1_tail`` descriptors of the rank-96 tail programs and
-# the ``B_half`` descriptor of the tail-split pair program are second tensor
-# maps over the same ``d`` / ``l1`` / ``b`` tensors; the ``out_ptr`` parameter
+# the ``B_half`` descriptor of the tail-split pair program (and the ``B_wide``
+# descriptor of its wide-tail build) are second tensor maps over the same
+# ``d`` / ``l1`` / ``b`` tensors; the ``out_ptr`` parameter
 # of the register-direct store programs (``out_store`` ``v8`` / ``v8hint``) is
 # the raw pointer of the same ``out`` tensor the ``out`` tensor map views.
 LOGICAL_TENSORS = (
@@ -160,6 +164,7 @@ PARAMETER_LOGICAL: dict[str, str] = {
     "A": "a",
     "B": "b",
     "B_half": "b",
+    "B_wide": "b",
     "SFA": "a_sf",
     "SFB": "b_sf",
     "D": "d",
@@ -3478,7 +3483,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``"l2_promotion": "l2_256b"`` form of ``2270204930b79b8caef7`` ({"bias": True,
     # "epi": "fused64", "prologue": "overlap", "stages": 15}), whose host plan it
     # shares, for the sm_100a exact-dispatch rows below that measured faster with it; it
-    # ships for sm_100a only (flour builds it there only).
+    # ships for sm_100a only (its source builds it there only).
     "cake_nvfp4_svdquant_gemm_05bda082a73c0c1a68b0": {
         "arches": ["sm_100a"],
         # derived; rewritten by the exporter
@@ -3555,7 +3560,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``"l2_promotion": "l2_256b"`` form of the {"bias": False, "epi": "fused64",
     # "prologue": "overlap", "stages": 15} build, whose host plan it shares, for the
     # sm_100a exact-dispatch rows below that measured faster with it; it ships for
-    # sm_100a only (flour builds it there only).
+    # sm_100a only (its source builds it there only).
     "cake_nvfp4_svdquant_gemm_5852ad0db045e502e10a": {
         "arches": ["sm_100a"],
         # derived; rewritten by the exporter
@@ -3783,6 +3788,100 @@ MODULES: dict[str, dict[str, Any]] = {
             "variant": "bias",
         },
     },
+    # The 2cta_tailsplit program built with {"out_store": "v8hint", "rank": 32,
+    # "wide_tail": 192}: the build of ``e4f1cd01b65bed25c4f1`` whose last partial
+    # wave, when it holds more than half and at most three quarters of the CTA
+    # pairs, runs as one wave of 192-wide and 128-wide units (``B_wide``: a
+    # 96-row box over the same ``b`` tensor), scheduled by
+    # :func:`tailsplit_wide_units` (grid rule ``pair_tailsplit_wide``);
+    # otherwise the schedule of :func:`tailsplit_units`.  Every output element
+    # is still produced by exactly one unit in the whole tile's accumulation
+    # order.  It ships for sm_100a only, for the exact-dispatch row below.
+    "cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96": {
+        "arches": ["sm_100a"],
+        # derived; rewritten by the exporter
+        "arg_plan": [
+            ["buffer", "D"],
+            ["buffer", "alpha"],
+            ["buffer", "bias"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "K_tiles"],
+            ["parameter", "tok_tiles"],
+            ["parameter", "w_tiles"],
+            ["parameter", "num_tiles"],
+            ["parameter", "raster_group"],
+            ["parameter", "has_bias"],
+            ["parameter", "rank"],
+            ["parameter", "num_units"],
+            ["parameter", "full_units"],
+            ["parameter", "tail_split"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "B_half"],
+            ["buffer", "B_wide"],
+            ["buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["buffer", "L1"],
+            ["buffer", "L1_tail"],
+            ["buffer", "out_ptr"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"out_store": "v8hint", "rank": 32, "wide_tail": 192},
+        "ffi_entry": "run",
+        "kernel": "cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96",  # derived; rewritten by the exporter
+        "launch": {  # derived; rewritten by the exporter
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228992,
+            "use_pdl": True,
+        },
+        "library": "cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96",
+        # derived; rewritten by the exporter
+        "logical": {
+            "A": "a",
+            "B": "b",
+            "B_half": "b",
+            "B_wide": "b",
+            "D": "d",
+            "K_tiles": "K_tiles",
+            "L1": "l1",
+            "L1_tail": "l1",
+            "M": "M",
+            "N": "N",
+            "SFA": "a_sf",
+            "SFB": "b_sf",
+            "alpha": "alpha",
+            "bias": "bias",
+            "full_units": "full_units",
+            "has_bias": "has_bias",
+            "num_tiles": "num_tiles",
+            "num_units": "num_units",
+            "out": "out",
+            "out_ptr": "out",
+            "rank": "rank",
+            "raster_group": "raster_group",
+            "tail_split": "tail_split",
+            "tok_tiles": "tok_tiles",
+            "w_tiles": "w_tiles",
+        },
+        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "plan": {
+            "block_m": 256,
+            "block_n": 256,
+            "block_k": 256,
+            "grid_rule": "pair_tailsplit_wide",
+            "pdl": True,
+            "rank_storage": 32,
+            "scale_elems": "uint32",
+            "variant": "bias",
+        },
+    },
 }
 
 # The routing table: ordered predicate rows over the host scalars, the first
@@ -3790,9 +3889,12 @@ MODULES: dict[str, dict[str, Any]] = {
 # keys: ``m_min`` / ``m_max``, ``n_min`` / ``n_max``, ``k_min`` / ``k_max``
 # (inclusive bounds), ``k_multiple`` (``K`` divisible by it), ``ranks`` (the
 # admitted ranks), ``bias`` (``True`` / ``False``; absent or ``None`` admits
-# both) and ``arches`` (the exported architectures the row applies to; absent
+# both), ``arches`` (the exported architectures the row applies to; absent
 # applies to every architecture, so one problem may dispatch to different
-# programs on ``sm_100a`` and ``sm_103a``); the target is ``record`` or
+# programs on ``sm_100a`` and ``sm_103a``) and ``wide_tail`` (``True``: the row
+# admits a problem only where :func:`tailsplit_wide_units` on the device's SM
+# count at the problem's :func:`raster_group` is the wide schedule, else the
+# problem continues with the next rows); the target is ``record`` or
 # ``records_by_rank`` (rank -> record).
 # A row never widens the named shape violations: :func:`select_record`
 # validates ``M``, ``N``, ``K`` against the selected program and ``rank`` after
@@ -3803,8 +3905,9 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     # Exact-dispatch rows: the sm_103a rows of the M 129 / N 3072 / K 3072
     # problems (the L2-promoted 64-row builds), the split-K rows, the
-    # convergence finals' rows and the sm_103a rows of the K=96 builds of the
-    # two-CTA programs, so that each names the
+    # convergence finals' rows, the sm_103a rows of the K=96 builds of the
+    # two-CTA programs and the sm_100a row of the wide-tail build of the
+    # tail-split program, so that each names the
     # program of exactly one (M, N, K, rank, bias), per architecture where the two
     # architectures measured different winners (``arches``; absent = both):
     #   (129, 3072, 3072, {32, 64}, True) on sm_103a -> 99bdf6e03d704178faf9 (L2-promoted form A)
@@ -3827,6 +3930,9 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     #   (129, 3072, 12288, 128, True) on sm_103a -> 36c42441c9d625e03c54
     #   (4096, 3072, 3072, 32, True) on sm_100a -> 1d78f2bd5722fb02b75a
     #   (4096, 3072, 3072, 32, True) on sm_103a -> 5a1a17e73ef429cf8805 (K=96 MMA)
+    #   (4096, 3072, 12288, 32, True) on sm_100a -> d758d9efa72998dbcf96 (wide tail;
+    #       ``wide_tail``: on an SM count without the wide schedule, e.g. 148,
+    #       the rows below route it)
     #   (4096, 3072, 12288, 32, True) on sm_103a -> 3d47f26879e192ef655a (K=96 MMA)
     #   (4096, 12288, 3072, 32, True) on sm_100a -> 2ca0cf40f7bbfca9df92
     #   (4096, 12288, 3072, 32, True) on sm_103a -> 151d20658188ea0e9651 (K=96 MMA)
@@ -3997,6 +4103,19 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "ranks": (32,),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_3d47f26879e192ef655a",
+    },
+    {
+        "arches": ("sm_100a",),
+        "m_min": 4096,
+        "m_max": 4096,
+        "n_min": 3072,
+        "n_max": 3072,
+        "k_min": 12288,
+        "k_max": 12288,
+        "ranks": (32,),
+        "bias": True,
+        "wide_tail": True,
+        "record": "cake_nvfp4_svdquant_gemm_d758d9efa72998dbcf96",
     },
     {
         "arches": ("sm_100a",),
@@ -4596,7 +4715,14 @@ def raster_group(*, m: int, n: int, k: int, rank: int, arch: str | None = None) 
 
 
 def _route(
-    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+    *,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    has_bias: bool,
+    arch: str | None = None,
+    sm_count: int | None = None,
 ) -> str:
     for row in ROUTE_TABLE:
         if not _admits(row, m=m, n=n, k=k, rank=rank, has_bias=has_bias):
@@ -4611,6 +4737,19 @@ def _route(
                 )
             if arch not in tuple(arches):
                 continue
+        if row.get("wide_tail"):
+            if sm_count is None:
+                raise TypeError(
+                    "the Cake NVFP4 SVDQuant route table routes "
+                    f"(M={m}, N={n}, K={k}, rank={rank}, bias={has_bias}) by the "
+                    "device's SM count; select_record() needs sm_count=sm_count(index)"
+                )
+            group = raster_group(m=m, n=n, k=k, rank=rank, arch=arch)
+            _, _, _, split = tailsplit_wide_units(
+                m=m, n=n, sm_count=sm_count, raster_group=group
+            )
+            if split != WIDE_TAIL_SPLIT:
+                continue
         by_rank = row.get("records_by_rank")
         if by_rank is not None:
             name = by_rank.get(rank)
@@ -4622,21 +4761,33 @@ def _route(
 
 
 def select_record(
-    *, m: int, n: int, k: int, rank: int, has_bias: bool, arch: str | None = None
+    *,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    has_bias: bool,
+    arch: str | None = None,
+    sm_count: int | None = None,
 ) -> str:
     """The record name of the program that serves ``(M, N, K, rank, has_bias)``
-    on ``arch``, or ``ValueError`` naming the violated shape rule.
+    on ``arch`` with ``sm_count`` SMs, or ``ValueError`` naming the violated
+    shape rule.
 
     Routing is the first admitting row of :data:`ROUTE_TABLE` on ``arch`` (the
     device's exported architecture, :func:`device_arch`; a row that names
-    ``arches`` applies on those architectures only); the shape rules are
+    ``arches`` applies on those architectures only) and ``sm_count`` (the
+    device's SM count, :func:`sm_count`; a ``wide_tail`` row applies only where
+    :func:`tailsplit_wide_units` on that SM count at the problem's
+    :func:`raster_group` is the wide schedule); the shape rules are
     checked afterwards against the selected program (``M >= 128``, ``N`` a
     positive multiple of 128, ``K`` a positive multiple of the program's K
     tile, ``rank`` a multiple of 32 in ``[32, 128]``).  A problem with a bias
     is never routed to a bias-free program.  Without ``arch`` only the
     architecture-blind rows resolve: a per-architecture row that admits the
-    problem is a ``TypeError``, so no caller reads a route the device would
-    not take.
+    problem is a ``TypeError``; without ``sm_count`` a ``wide_tail`` row that
+    admits the problem on ``arch`` is a ``TypeError`` too, so no caller reads
+    a route the device would not take.
     """
     m, n, k, rank, has_bias = int(m), int(n), int(k), int(rank), bool(has_bias)
     if arch is not None and arch not in ARCHES:
@@ -4644,7 +4795,15 @@ def select_record(
             f"{arch!r} is not an exported Cake NVFP4 SVDQuant GEMM target; the "
             f"exported architectures are {ARCHES}"
         )
-    name = _route(m=m, n=n, k=k, rank=rank, has_bias=has_bias, arch=arch)
+    name = _route(
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        has_bias=has_bias,
+        arch=arch,
+        sm_count=None if sm_count is None else int(sm_count),
+    )
     record = MODULES[name]
     if arch is not None and arch not in tuple(record["arches"]):
         raise RuntimeError(
@@ -4728,6 +4887,89 @@ def tailsplit_units(
     return num_tiles, full_units + 2 * tail_tiles, full_units, 2
 
 
+# The wide-tail build of the tail-split pair program (``pair_tailsplit_wide``):
+# a last partial wave of more than half and at most three quarters of the CTA
+# pairs runs as one wave of ``pairs`` units under ``tail_split =
+# WIDE_TAIL_SPLIT``: groups of ``WIDE_GROUP_TILES`` column-adjacent tail tiles
+# of one token tile as four 192-wide units each, the other tail tiles as half
+# units.  ``WIDE_TAIL_SPLIT`` (256 + 192) is outside :data:`TAIL_SPLITS`, so no
+# other program ever receives it.
+WIDE_TAIL_SPLIT = 448
+WIDE_GROUP_TILES = 3
+
+
+def tailsplit_wide_units(
+    *,
+    m: int,
+    n: int,
+    sm_count: int,
+    raster_group: int,
+    tail_split: int | None = None,
+) -> tuple[int, int, int, int]:
+    """``(num_tiles, num_units, full_units, tail_split)`` of the wide-tail
+    build of the tail-split pair program for an ``(M, N)`` problem on
+    ``sm_count`` SMs at the problem's ``raster_group``.
+
+    The :func:`tailsplit_units` schedule, except that with ``pairs = sm_count
+    // 2`` even, ``tail_tiles`` the tiles of the last partial wave,
+    ``pairs < 2 * tail_tiles <= 3 * pairs / 2`` and ``N`` a multiple of 128,
+    the tail runs as one wave of ``pairs`` units (``num_units = full_units +
+    pairs``, ``tail_split = WIDE_TAIL_SPLIT``): ``groups = tail_tiles - pairs /
+    2`` groups of three column-adjacent tail tiles as four 192-wide units each,
+    the other ``tail_tiles - 3 * groups`` tail tiles as half units.  The groups
+    fill blocks of three tile columns by the token tiles of one raster group,
+    from the first column the tail starts or reaches whole in its raster group
+    (else column 0 of the next raster group); when those blocks do not fit in
+    the ``N // 256`` full 256-column tiles there, the tail keeps the
+    :func:`tailsplit_units` schedule.  ``tail_split`` given forces a schedule:
+    1 or 2 that of :func:`tailsplit_units`, ``WIDE_TAIL_SPLIT`` the wide one
+    (``ValueError`` where it does not exist).
+    """
+    m, n, sm_count = int(m), int(n), int(sm_count)
+    if tail_split in TAIL_SPLITS:
+        return tailsplit_units(m=m, n=n, sm_count=sm_count, tail_split=tail_split)
+    if tail_split not in (None, WIDE_TAIL_SPLIT):
+        raise ValueError(
+            f"tail_split must be one of {TAIL_SPLITS + (WIDE_TAIL_SPLIT,)}, "
+            f"got {tail_split!r}"
+        )
+    tok_tiles = _ceil_div(m, PAIR_M)
+    w_tiles = _ceil_div(n, PAIR_N)
+    num_tiles = tok_tiles * w_tiles
+    pairs = max(1, sm_count // 2)
+    full_units = num_tiles // pairs * pairs
+    tail_tiles = num_tiles - full_units
+    wide = (
+        pairs % 2 == 0
+        and pairs < 2 * tail_tiles
+        and 4 * tail_tiles <= 3 * pairs
+        and n % 128 == 0
+    )
+    if wide:
+        groups = tail_tiles - pairs // 2
+        group_rows = int(raster_group) or tok_tiles
+        size = group_rows * w_tiles
+        first = full_units // size
+        rows = min(group_rows, tok_tiles - first * group_rows)
+        column, partial = divmod(full_units - first * size, rows)
+        if partial != 0:
+            if column + 1 < w_tiles:
+                column += 1
+            else:
+                column = 0
+                rows = min(group_rows, tok_tiles - (first + 1) * group_rows)
+        blocks = _ceil_div(groups, rows) if rows >= 1 else 0
+        wide = rows >= 1 and column + WIDE_GROUP_TILES * blocks <= n // PAIR_N
+    if wide:
+        return num_tiles, full_units + pairs, full_units, WIDE_TAIL_SPLIT
+    if tail_split == WIDE_TAIL_SPLIT:
+        raise ValueError(
+            f"no wide tail schedule for (M={m}, N={n}) at raster group "
+            f"{raster_group} on {sm_count} SMs"
+        )
+    return tailsplit_units(m=m, n=n, sm_count=sm_count)
+
+
 def launch_grid(
     record: dict[str, Any],
     *,
@@ -4735,6 +4977,7 @@ def launch_grid(
     n: int,
     k: int,
     sm_count: int | None = None,
+    raster_group: int | None = None,
 ) -> tuple[int, int, int]:
     """Launch grid of one record for an ``(M, N, K)`` problem under its grid rule.
 
@@ -4746,7 +4989,9 @@ def launch_grid(
     ``tok_tiles = ceil(M / block_m)`` and ``w_tiles = ceil(N / block_n)``, two
     CTAs per scheduled tile; ``pair_tailsplit`` ``(2 * num_units, 1, 1)`` with
     the ``num_units`` of :func:`tailsplit_units` (``sm_count`` required);
-    ``splitk_cluster`` ``(split_k * grid_n, 1, 1)``: one cluster of the plan's
+    ``pair_tailsplit_wide`` the same with the ``num_units`` of
+    :func:`tailsplit_wide_units` (``sm_count`` and the problem's
+    ``raster_group`` required); ``splitk_cluster`` ``(split_k * grid_n, 1, 1)``: one cluster of the plan's
     ``split_k`` CTAs per 128-column weight tile, every CTA of a cluster walking
     ``K / split_k`` (the route rows pin ``K``, so ``K`` enters no grid
     arithmetic).
@@ -4770,6 +5015,16 @@ def launch_grid(
                 "the pair_tailsplit grid rule needs the device's SM count (sm_count)"
             )
         _, num_units, _, _ = tailsplit_units(m=m, n=n, sm_count=sm_count)
+        return (2 * num_units, 1, 1)
+    if rule == "pair_tailsplit_wide":
+        if sm_count is None or raster_group is None:
+            raise ValueError(
+                "the pair_tailsplit_wide grid rule needs the device's SM count "
+                "(sm_count) and the problem's raster group (raster_group)"
+            )
+        _, num_units, _, _ = tailsplit_wide_units(
+            m=m, n=n, sm_count=sm_count, raster_group=raster_group
+        )
         return (2 * num_units, 1, 1)
     if rule == "splitk_cluster":
         return (int(plan["split_k"]) * grid_n, 1, 1)
@@ -4807,7 +5062,9 @@ def plan_values(
     :func:`raster_group` of the problem on the device's architecture, and for
     the tail-split pair program
     also ``num_units`` / ``full_units`` / ``tail_split`` of
-    :func:`tailsplit_units` on the device's SM count.  ``bias`` is ``out``
+    :func:`tailsplit_units` on the device's SM count (of
+    :func:`tailsplit_wide_units` at that raster group for its wide-tail
+    build).  ``bias`` is ``out``
     when the problem has no bias (a valid carrier the kernel never reads).
     """
     import torch
@@ -4855,7 +5112,14 @@ def plan_values(
     tok_tiles = _ceil_div(m, block_m)
     w_tiles = _ceil_div(n, block_n)
     rule = plan["grid_rule"]
-    device_sms = sm_count(a.device.index) if rule == "pair_tailsplit" else None
+    tailsplit = rule in ("pair_tailsplit", "pair_tailsplit_wide")
+    device_sms = sm_count(a.device.index) if tailsplit else None
+    pair = tailsplit or rule == "pair_persistent"
+    group = (
+        raster_group(m=m, n=n, k=k, rank=rank, arch=device_arch(a.device.index))
+        if pair
+        else None
+    )
     values: dict[str, Any] = {
         "a": a,
         "b": b,
@@ -4878,16 +5142,21 @@ def plan_values(
         "tok_tiles": tok_tiles,
         "w_tiles": w_tiles,
         "num_tiles": tok_tiles * w_tiles,
-        "grid": launch_grid(record, m=m, n=n, k=k, sm_count=device_sms),
+        "grid": launch_grid(
+            record, m=m, n=n, k=k, sm_count=device_sms, raster_group=group
+        ),
     }
-    if rule in ("pair_persistent", "pair_tailsplit"):
-        values["raster_group"] = raster_group(
-            m=m, n=n, k=k, rank=rank, arch=device_arch(a.device.index)
-        )
-    if rule == "pair_tailsplit":
-        _, num_units, full_units, tail_split = tailsplit_units(
-            m=m, n=n, sm_count=device_sms
-        )
+    if pair:
+        values["raster_group"] = group
+    if tailsplit:
+        if rule == "pair_tailsplit_wide":
+            _, num_units, full_units, tail_split = tailsplit_wide_units(
+                m=m, n=n, sm_count=device_sms, raster_group=group
+            )
+        else:
+            _, num_units, full_units, tail_split = tailsplit_units(
+                m=m, n=n, sm_count=device_sms
+            )
         values["num_units"] = num_units
         values["full_units"] = full_units
         values["tail_split"] = tail_split
@@ -5031,4 +5300,5 @@ __all__ = [
     "sm_count",
     "specs_for_arch",
     "tailsplit_units",
+    "tailsplit_wide_units",
 ]

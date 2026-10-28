@@ -141,8 +141,10 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
             // umma_empty: 2 barriers, init_count=384
             mbarrier_init(smem + 96, 384);
             mbarrier_init(smem + 104, 384);
+            // --- pipeline 'verdict_pipe' ---
             // verdict_bar: 1 barriers, init_count=12
             mbarrier_init(smem + 112, 12);
+            // --- pipeline 'peer_pipe' ---
             // peer_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 120, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -177,6 +179,7 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // load_q_main
             unsigned int _phase_q_empty = 1;
+            unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
@@ -207,8 +210,8 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                 mbarrier_arrive_expect_tx(q_full_addr, 49920);
                                 _phase_q_empty ^= 1;
                                 if (attempt == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_q);
-                                    vphase_q ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
+                                    _phase_verdict_bar ^= 1;
                                     if (s_pfail[1] == 0) {
                                         break;
                                     }
@@ -226,11 +229,8 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // load_k_main
             unsigned int load_k_stage = 0;
-#if __CUDA_ARCH__ == 1000
-            unsigned int umma_full_lk = umma_full_addr;
-            unsigned int k_empty_lk = k_empty_addr;
-#endif
             unsigned int _phase_k_empty = 1;
+            unsigned int _phase_verdict_bar_1 = 0;
             if (elect_sync()) {
                 int unit_base_k = 0;
                 unsigned int vphase_k = 0;
@@ -297,10 +297,8 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                     int tile = d_k;
 #if __CUDA_ARCH__ == 1000
                                     tile = n_tiles_3 - 1 - d_k;
-                                    mbarrier_wait(k_empty_lk + (load_k_stage) * 8, _phase_k_empty);
-#else
-                                    mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
 #endif
+                                    mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -328,8 +326,8 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                     }
                                 }
                                 if (attempt_1 == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_k);
-                                    vphase_k ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
+                                    _phase_verdict_bar_1 ^= 1;
                                     if (s_pfail[1] == 0) {
                                         break;
                                     }
@@ -341,11 +339,7 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                 }
                 #pragma unroll
                 for (int _d = 0; _d < 4; _d++) {
-#if __CUDA_ARCH__ == 1000
-                    mbarrier_wait(k_empty_lk + (load_k_stage) * 8, _phase_k_empty);
-#else
                     mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
-#endif
                     load_k_stage += 1;
                     if (load_k_stage == 4) { load_k_stage = 0; _phase_k_empty ^= 1; }
                 }
@@ -356,10 +350,6 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
     } else if (warp == 14) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // mma_main
-#if __CUDA_ARCH__ == 1000
-            unsigned int k_full_m = k_full_addr;
-            unsigned int umma_empty_m = umma_empty_addr;
-#endif
             unsigned int mma_k_stage = 0;
             unsigned int mma_tmem_stage = 0;
             int unit_base_m = 0;
@@ -368,6 +358,7 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_umma_empty = 1;
+            unsigned int _phase_verdict_bar_2 = 0;
             #pragma unroll 1
             for (int seg_2 = 0; seg_2 < num_segments; seg_2++) {
                 int q0_2 = cu_seqlens_q[seg_2];
@@ -410,17 +401,9 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                             mbarrier_wait(q_full_addr, _phase_q_full);
                             #pragma unroll 1
                             for (int ti_1 = 0; ti_1 < n_tiles_3_1; ti_1++) {
-#if __CUDA_ARCH__ == 1000
-                                mbarrier_wait(k_full_m + (mma_k_stage) * 8, _phase_k_full);
-#else
                                 mbarrier_wait(k_full_addr + (mma_k_stage) * 8, _phase_k_full);
-#endif
                                 if (elect_sync()) {
-#if __CUDA_ARCH__ == 1000
-                                    mbarrier_wait(umma_empty_m + (mma_tmem_stage) * 8, _phase_umma_empty);
-#else
                                     mbarrier_wait(umma_empty_addr + (mma_tmem_stage) * 8, _phase_umma_empty);
-#endif
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     int _smem_desc_lo_1 = (((smem_k_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                                     int _smem_desc_lo_2 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 3072;
@@ -491,8 +474,8 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                             mbarrier_arrive(q_empty_addr);
                             _phase_q_full ^= 1;
                             if (attempt_2 == 0) {
-                                mbarrier_wait(verdict_bar_addr, vphase_m);
-                                vphase_m ^= 1;
+                                mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
+                                _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
                                 if (lane == 0) {
                                     uint32_t _shared_weak_0;
@@ -520,9 +503,6 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
     } else if (warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 152;");
         { // math_main
-#if __CUDA_ARCH__ == 1000
-            unsigned int umma_full_w = umma_full_addr;
-#endif
             int warp_in_wg = warp % 4;
             int lane_0 = lane;
             int local_thread_idx = warp_in_wg * 32 + lane_0;
@@ -542,10 +522,12 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
             unsigned int math_tmem_phase = 0;
             int unit_base = 0;
             int rank_u = bid_i_3 & 1;
-            unsigned int pphase = 0;
+            int verdict_unit = 0;
             int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
             int trigger_room = 128 * check_period;
             unsigned int _phase_q_full_1 = 0;
+            unsigned int _phase_umma_full = 0;
+            unsigned int _phase_peer_bar = 0;
             #pragma unroll 1
             for (int seg_3 = 0; seg_3 < num_segments; seg_3++) {
                 int q0_3 = cu_seqlens_q[seg_3];
@@ -702,10 +684,10 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                 r_pos = ((n_s > 0) ? r_new_w : r_pos);
 #if __CUDA_ARCH__ == 1000
                                 if (acc_tok == 0) {
-                                    mbarrier_wait(umma_full_w + (math_tmem_stage) * 8, math_tmem_phase);
+                                    mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                 }
 #else
-                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
 #endif
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float _tmem_load_0[64];
@@ -805,12 +787,9 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                     Cand[slot_1] = (long long)entry_1;
                                 }
                                 math_tmem_stage += 1;
-                                if (math_tmem_stage >= 2) {
-                                    math_tmem_stage -= 2;
-                                    math_tmem_phase ^= 1;
-                                }
+                                if (math_tmem_stage == 2) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
 #if __CUDA_ARCH__ == 1000
-                                uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                 acc_tok = _mbar_token_0;
 #endif
                                 int sample_now = ((ti_2 + 1 == n_s) ? 1 : 0);
@@ -1289,13 +1268,13 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                         asm volatile(
                                             "mapa.shared::cluster.u32 %0, %1, %2;"
                                             : "=r"(_cluster_mapa_12) : "r"(s_pfail_addr), "r"(peer_u));
-                                        uint32_t _cluster_mapa_13;
-                                        asm volatile(
+                                        uint32_t _mbar_peer_13;
+                                        asm(
                                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                                            : "=r"(_cluster_mapa_13) : "r"(peer_bar_addr), "r"(peer_u));
+                                            : "=r"(_mbar_peer_13) : "r"(peer_bar_addr), "r"(peer_u));
                                         asm volatile(
                                             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                            :: "r"(_cluster_mapa_12), "r"(verdict), "r"(_cluster_mapa_13) : "memory");
+                                            :: "r"(_cluster_mapa_12), "r"(verdict), "r"(_mbar_peer_13) : "memory");
 #else
                                     int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, vread, 0);
                                     verdict = _shfl_sync_13;
@@ -1307,25 +1286,25 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                             asm volatile(
                                                 "mapa.shared::cluster.u32 %0, %1, %2;"
                                                 : "=r"(_cluster_mapa_14) : "r"(s_pfail_addr), "r"(peer_u));
-                                            uint32_t _cluster_mapa_15;
-                                            asm volatile(
+                                            uint32_t _mbar_peer_15;
+                                            asm(
                                                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                                                : "=r"(_cluster_mapa_15) : "r"(peer_bar_addr), "r"(peer_u));
+                                                : "=r"(_mbar_peer_15) : "r"(peer_bar_addr), "r"(peer_u));
                                             asm volatile(
                                                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                                :: "r"(_cluster_mapa_14), "r"(verdict), "r"(_cluster_mapa_15) : "memory");
+                                                :: "r"(_cluster_mapa_14), "r"(verdict), "r"(_mbar_peer_15) : "memory");
                                         }
 #endif
                                     }
 #if __CUDA_ARCH__ == 1000
                                 }
-                                mbarrier_wait_cluster_hint(peer_bar_addr, pphase, 10000000);
-                                pphase ^= 1;
+                                mbarrier_wait_cluster_hint(peer_bar_addr, _phase_peer_bar, 10000000);
+                                _phase_peer_bar ^= 1;
                                 verdict = verdict | s_pfail[0];
                                 if (warp == 0) {
 #else
-                                    mbarrier_wait_cluster_hint(peer_bar_addr, pphase, 10000000);
-                                    pphase ^= 1;
+                                    mbarrier_wait_cluster_hint(peer_bar_addr, _phase_peer_bar, 10000000);
+                                    _phase_peer_bar ^= 1;
                                     verdict = verdict | s_pfail[0];
                                     if (warp == 0) {
                                         if (elect_sync()) {
@@ -1355,6 +1334,7 @@ kernel_cake_dsa_indexer_topk_90c88df0fd82d4908fca(const __grid_constant__ CUtens
                                     }
 #endif
                                 }
+                                verdict_unit += 1;
                             }
                             int n_sel = ((top_k) < (c_final) ? (top_k) : (c_final));
                             asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");

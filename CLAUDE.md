@@ -432,6 +432,14 @@ its purpose is to make review easier for reviewers and contributors alike by cat
 issues before a human looks. Changes made only to test something locally, with no PR intended,
 do not need one.
 
+**Triggering CI: targeted tests are the default.** Public CI: `@flashinfer-bot run tests/<dir-or-file> [tests/...]`;
+internal CI: `/bot run tests/<dir-or-file> [tests/...]`. Targets are whitespace-separated paths under
+`tests/` (files or directories, no `::` selectors), written as real paths relative to the repo
+root, e.g. `tests/gemm/test_mm_fp4.py tests/utils/`; name the test files or directories the
+change touches. A bare `run` with no target starts the **full** suite, which
+is expensive. That is appropriate in select cases — a cross-cutting change, or a final
+pre-merge check — and the PR template has a checkbox to declare and justify it.
+
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
 ## Code Review
@@ -913,7 +921,8 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
-| `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. Both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
+| `FLASHINFER_SM107_MEGA_CHECK_ROUTES` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` skips routing value checks for caller-validated inputs. Metadata checks and masked-score zeroing remain active. Set before warmup and graph capture; changing it requires recapturing graphs. |
+| `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. When routing checks are enabled, both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
 | `FLASHINFER_SM107_PREP_TVM_FFI` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/routing_validation.py` | `0` launches the fused routing checker through CuTe's DLPack bindings instead of TVM-FFI. Set before warmup; each mode needs its own compiled kernel. |
 | `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
 | `FLASHINFER_MEGAMOE_SPIN_DEBUG` | `0` | `flashinfer/jit/megamoe.py` | Exactly `1` passes `spin_debug=True` to the SM90 NVFP4 fused MegaMoE JIT template; other values leave it false. |
@@ -949,7 +958,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90` | `0` | `flashinfer/prefill.py` | `1` keeps `BatchPrefillWithPagedKVCacheWrapper.run` on the FA2 kernel for the speculative-decoding target-verify problems that the specialized SM90 fp8-KV split-KV kernel (`csrc/eagle_verify_fp8kv_sm90.cu`) would otherwise serve: `plan(..., uniform_q_len=4)` with a custom mask, 4 query heads per KV head, head_dim 256, page size 1, NHD, bf16 q/o, e4m3 KV, compute capability 9.0. Read at plan and run time. The `uniform_q_len` plan hint itself is unaffected. |
-| `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel. Read at call time; the kill switch for A/B testing the fused path. |
+| `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py`, `flashinfer/experimental/mhc_pre_big_fuse_with_norm/backend.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel, and makes the experimental `mhc_pre_big_fuse_with_norm` skip its SM100/SM103 cluster kernel and run its composable PyTorch implementation. Read at call time; the kill switch for A/B testing the fused paths. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
 | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `1` forces the SM12x MoE dispatcher onto the W4A16 path with BF16 activations. Internal/experimental — used to reproduce W4A16-specific issues. |

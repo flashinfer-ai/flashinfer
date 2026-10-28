@@ -610,6 +610,16 @@ _SEEN_ONCE_MAX = 16
 _seen_once: dict[int, weakref.ReferenceType[torch.Tensor]] = {}
 # "No entry" in a plan's views (``None`` there is a single-split shape).
 _UNCARVED: Any = object()
+# Threads may share a workspace (and one may call :func:`reset_workspace` meanwhile): every change to these two
+# tables is one dictionary operation that tolerates an entry another thread removed, and the hit path only reads.
+
+
+def _evict_oldest(table: dict[int, Any]) -> None:
+    """Drop the oldest entry of ``table`` (first in, first out), or nothing when another thread emptied it first."""
+    try:  # noqa: SIM105 - no context manager on the per-call path; a try block is free here
+        del table[next(iter(table))]
+    except (StopIteration, KeyError, RuntimeError):
+        pass
 
 
 def _drop_workspace_plan(ident: int) -> Callable[[Any], None]:
@@ -618,7 +628,7 @@ def _drop_workspace_plan(ident: int) -> Callable[[Any], None]:
     def drop(ref: Any) -> None:
         plan = _workspace_plans.get(ident)
         if plan is not None and plan.ref is ref:
-            del _workspace_plans[ident]
+            _workspace_plans.pop(ident, None)
 
     return drop
 
@@ -655,7 +665,7 @@ def _workspace_views(
             if views is not _UNCARVED:
                 return views
         else:
-            del _workspace_plans[ident]
+            _workspace_plans.pop(ident, None)
             plan = None
     layout = _check_workspace(
         workspace, device, num_rows, num_qo_heads, num_kv_heads, splits
@@ -664,7 +674,7 @@ def _workspace_views(
         seen = _seen_once.get(ident)
         if seen is None or seen() is not workspace:
             if seen is None and len(_seen_once) >= _SEEN_ONCE_MAX:
-                del _seen_once[next(iter(_seen_once))]
+                _evict_oldest(_seen_once)
             _seen_once[ident] = weakref.ref(workspace)
             if splits == 1:
                 return None
@@ -678,9 +688,9 @@ def _workspace_views(
                 splits,
                 counters=counters,
             )
-        del _seen_once[ident]
+        _seen_once.pop(ident, None)
         if len(_workspace_plans) >= _WORKSPACE_PLANS_MAX:
-            del _workspace_plans[next(iter(_workspace_plans))]
+            _evict_oldest(_workspace_plans)
         numel = workspace.numel()
         raw = torch.empty(0, dtype=torch.uint8, device=workspace.device).set_(
             workspace.untyped_storage(), workspace.storage_offset(), (numel,)

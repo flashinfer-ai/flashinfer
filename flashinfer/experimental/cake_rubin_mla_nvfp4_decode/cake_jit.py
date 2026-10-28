@@ -15,7 +15,7 @@ limitations under the License.
 
 Registry and loader glue of the Cake dense NVFP4 MLA decode on Rubin (SM107):
 the query quantizer, the mixed-cluster decode (its three builds) and the
-split-KV merge (its four warps-per-row instantiations).
+split-KV merge (its five routed forms).
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for ``sm_107a``.  A
@@ -28,7 +28,8 @@ plan scalars, the ``grid_rule`` that shapes its launch, the kernel-parameter
 decode and merge records launch under ``launch.use_pdl = "runtime"``: their
 plans carry the ``launch`` argument ``enable_pdl`` (0 or 1) right before the
 grid, and the host sets it per plan (``cake_backend.pdl_for``: on when a split
-merge exists and the decode is one wave of clusters, off otherwise; the
+merge exists and the decode is one hardware wave of clusters and pairs, off
+otherwise; the
 quantizer launches without the attribute and triggers its dependents).  What to
 compile -- sources, digests, nvcc flags -- is recorded once in ``build.json``
 next to this file; :mod:`.cake_build` serves the library from a prebuilt
@@ -48,10 +49,12 @@ skips the double-item test at each item's end; ``decode_full_pairpipe``
 taking the plans whose scalars lie in its ``plan_within`` boxes (inclusive
 ``[rows_lo, rows_hi, n_full_lo, n_full_hi, items_lo, items_hi, splits_lo,
 splits_hi]``, a ``hi`` of 0 unbounded), which the ``all_full`` rule of
-``decode_full`` excepts.  The ``merge`` stage has three instantiations of one kernel,
-chosen by the row count (four warps per row up to 1024 rows, two up to 2048,
-one beyond); the host launches it only when the plan has more than one
-split.  The ``quantize`` stage has one program.
+``decode_full`` excepts.  The ``merge`` stage has five forms of one kernel, chosen
+by the row count and the partials per row (the ``rows_splits_within`` boxes
+of the records: one warp per row above 2048 rows or four up to 2048 rows at
+17-32 partials, the two- and eight-warp forms and the four-warp column form
+that issue their loads ahead of the merged-row probe elsewhere); the host
+launches it only when the plan has more than one split.  The ``quantize`` stage has one program.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -254,7 +257,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "ctas_per_item", "ctas": 4},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_211b49b794a7df09262e",
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_a91f9079af0188f9b47c",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -262,7 +265,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 332800,
             "use_pdl": "runtime",
         },
-        "library": "cake_rubin_mla_nvfp4_decode_211b49b794a7df09262e",
+        "library": "cake_rubin_mla_nvfp4_decode_a91f9079af0188f9b47c",
         "logical": {
             "CKS": "CKS",
             "CKV": "CKV",
@@ -341,7 +344,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "ctas_per_item", "ctas": 4},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_8d0e1f24232434e74d49",
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_06e6c38c07d47bffc22e",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -349,7 +352,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 332800,
             "use_pdl": "runtime",
         },
-        "library": "cake_rubin_mla_nvfp4_decode_8d0e1f24232434e74d49",
+        "library": "cake_rubin_mla_nvfp4_decode_06e6c38c07d47bffc22e",
         "logical": {
             "CKS": "CKS",
             "CKV": "CKV",
@@ -523,48 +526,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "merge",
         "variant": "w1",
     },
-    "merge_w2": {
-        "arches": ["sm_107a"],
-        "arg_plan": [
-            ["buffer", "partial_o"],
-            ["buffer", "partial_lse"],
-            ["buffer", "O"],
-            ["buffer", "lse"],
-            ["parameter", "rows"],
-            ["parameter", "num_split"],
-            ["parameter", "has_lse"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {"kind": "rows_per_cta", "rows": 4},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_6fd468e4645fbef52b7e",
-        "launch": {
-            "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 2048,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_rubin_mla_nvfp4_decode_6fd468e4645fbef52b7e",
-        "logical": {
-            "O": "O",
-            "has_lse": "has_lse",
-            "lse": "lse",
-            "num_split": "num_split",
-            "partial_lse": "partial_lse",
-            "partial_o": "partial_o",
-            "rows": "rows",
-        },
-        "select_rule": {
-            "kind": "rows_splits_within",
-            "boxes": [[385, 1664, 1, 16], [1665, 2048, 9, 16]],
-        },
-        "stage": "merge",
-        "variant": "w2",
-    },
     "merge_w4": {
         "arches": ["sm_107a"],
         "arg_plan": [
@@ -602,12 +563,54 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "select_rule": {
             "kind": "rows_splits_within",
-            "boxes": [[385, 2048, 17, 32]],
+            "boxes": [[449, 2048, 17, 32]],
         },
         "stage": "merge",
         "variant": "w4",
     },
-    "merge_w8": {
+    "merge_w2_pal": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "O"],
+            ["buffer", "lse"],
+            ["parameter", "rows"],
+            ["parameter", "num_split"],
+            ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_per_cta", "rows": 4},
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_24df5b75726c0c32ca0e",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2048,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_rubin_mla_nvfp4_decode_24df5b75726c0c32ca0e",
+        "logical": {
+            "O": "O",
+            "has_lse": "has_lse",
+            "lse": "lse",
+            "num_split": "num_split",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "rows": "rows",
+        },
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[385, 1664, 1, 16], [1665, 2048, 9, 16]],
+        },
+        "stage": "merge",
+        "variant": "w2_pal",
+    },
+    "merge_w8_pal": {
         "arches": ["sm_107a"],
         "arg_plan": [
             ["buffer", "partial_o"],
@@ -624,7 +627,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "rows_per_cta", "rows": 1},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_0a9908735a1572f06f58",
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_b0f5ae1afdea3c25afbf",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -632,7 +635,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 2048,
             "use_pdl": "runtime",
         },
-        "library": "cake_rubin_mla_nvfp4_decode_0a9908735a1572f06f58",
+        "library": "cake_rubin_mla_nvfp4_decode_b0f5ae1afdea3c25afbf",
         "logical": {
             "O": "O",
             "has_lse": "has_lse",
@@ -647,7 +650,49 @@ MODULES: dict[str, dict[str, Any]] = {
             "boxes": [[1, 384, 1, 64], [385, 2048, 33, 64]],
         },
         "stage": "merge",
-        "variant": "w8",
+        "variant": "w8_pal",
+    },
+    "merge_w4_c4_col_pal": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "O"],
+            ["buffer", "lse"],
+            ["parameter", "rows"],
+            ["parameter", "num_split"],
+            ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_per_cta", "rows": 1},
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_2fcc8b55756c2d3bb4ed",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_rubin_mla_nvfp4_decode_2fcc8b55756c2d3bb4ed",
+        "logical": {
+            "O": "O",
+            "has_lse": "has_lse",
+            "lse": "lse",
+            "num_split": "num_split",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "rows": "rows",
+        },
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[385, 448, 17, 32]],
+        },
+        "stage": "merge",
+        "variant": "w4_c4_col_pal",
     },
     "quantize": {
         "arches": ["sm_107a"],
