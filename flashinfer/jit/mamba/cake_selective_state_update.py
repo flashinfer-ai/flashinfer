@@ -3066,13 +3066,14 @@ PROGRAMS: dict[str, str] = {
     "mtp_cache_groups8_heads64": "cake_selective_state_update_03e316d2e39f9165ae23",
     "mtp_horizontal_direct": "cake_selective_state_update_8135210c44963374bccd",
     "mtp_horizontal_early": "cake_selective_state_update_2daf8a1c27be3854989c",
-    "mtp_short_prefetch": "cake_selective_state_update_a70e8dc68aabd722a74b",
-    "mtp_short_prefetch_heads64_groups8": "cake_selective_state_update_16abb5cc19ddcb018fe9",
-    "mtp_short_ring_heads64_groups8_t1": "cake_selective_state_update_fffcc8e98fa784c189ff",
-    "mtp_short_ring_heads64_groups8_t1_stp": "cake_selective_state_update_e459e2b0bd3726248707",
-    "mtp_short_ring_heads64_groups8_t2": "cake_selective_state_update_48a347bb1a0e177124fb",
-    "mtp_short_ring_heads64_groups8_t2_jr": "cake_selective_state_update_1620c93b881020ba8397",
-    "mtp_short_ring_heads64_groups8_t2_jr_hb": "cake_selective_state_update_c8d4a1d9d1f10d2bfef5",
+    "mtp_short_prefetch": "cake_selective_state_update_d640bc795863da1c5fb4",
+    "mtp_short_prefetch_heads64_groups8": "cake_selective_state_update_c250f06894e17ae7105f",
+    "mtp_short_ring_heads64_groups8_t1": "cake_selective_state_update_d83be0f311b5f9806ebe",
+    "mtp_short_ring_heads64_groups8_t1_stp": "cake_selective_state_update_9264ca07d890e146617b",
+    "mtp_short_ring_heads64_groups8_t1_stp_z": "cake_selective_state_update_690e2f567f0c6c4be78d",
+    "mtp_short_ring_heads64_groups8_t2": "cake_selective_state_update_3f3150aae42f892f1c84",
+    "mtp_short_ring_heads64_groups8_t2_jr": "cake_selective_state_update_7e148cb3204c6ae7b537",
+    "mtp_short_ring_heads64_groups8_t2_jr_hb": "cake_selective_state_update_df2ae3087dbfec1d66dd",
     "stp_dim128_fp32": "cake_selective_state_update_0c4d07dba49698124934",
     "stp_dim128_fp32_l2_prefetch": "cake_selective_state_update_eb7ec508e23e9f9cc884",
     "stp_dim128_hpc1_mb4": "cake_selective_state_update_1620e61f3308698efb02",
@@ -3795,18 +3796,46 @@ _DIM128_STP_RING_BATCHES: dict[tuple[str, int], tuple[tuple[int, int], ...]] = {
     ("sm_100a", 148): ((16, 18), (28, 29), (31, 37), (56, 67), (70, 71)),
 }
 _DIM128_STP_RING_PROGRAM = "mtp_short_ring_heads64_groups8_t1_stp"
+# The same ring with the gate ``z`` (64 heads in 8 groups): per (architecture, SM count) the batches at which a BF16
+# single-token call of that shape with ``z`` runs it.
+_DIM128_STP_RING_Z_BATCHES: dict[tuple[str, int], tuple[int, ...]] = {
+    ("sm_100a", 148): (64,),
+}
+_DIM128_STP_RING_Z_PROGRAM = "mtp_short_ring_heads64_groups8_t1_stp_z"
 
 
 def dim128_stp_ring(
     batch_size: int, nheads: int, ngroups: int, sm_count: int, arch: str
 ) -> bool:
-    """Whether a headdim-128 / dstate-128 BF16 single-token launch of ``batch_size`` rows runs the one-token ring:
-    64 heads in 8 groups, and a batch inside the intervals ``_DIM128_STP_RING_BATCHES`` lists for the architecture at
-    its SM count (none for another architecture or SM count)."""
+    """Whether a headdim-128 / dstate-128 BF16 single-token launch of ``batch_size`` rows without ``z`` runs the
+    one-token ring of 64 heads: 64 heads in 8 groups, and a batch inside the intervals ``_DIM128_STP_RING_BATCHES``
+    lists for the architecture at its SM count (none for another architecture or SM count)."""
     if (nheads, ngroups) != (64, 8):
         return False
     intervals = _DIM128_STP_RING_BATCHES.get((arch, sm_count), ())
     return any(low <= batch_size <= high for low, high in intervals)
+
+
+def dim128_stp_ring_program(
+    batch_size: int,
+    nheads: int,
+    ngroups: int,
+    sm_count: int,
+    arch: str,
+    gated: bool,
+) -> Optional[str]:
+    """The one-token ring a headdim-128 / dstate-128 BF16 single-token launch of ``batch_size`` rows runs, or
+    ``None``: without ``z`` (``gated`` false), the ring of 64 heads (:func:`dim128_stp_ring`); with ``z``, for 64
+    heads in 8 groups, the z-gated ring at a batch ``_DIM128_STP_RING_Z_BATCHES`` lists for the architecture at its
+    SM count (none for another architecture or SM count)."""
+    if gated:
+        gated_batches = _DIM128_STP_RING_Z_BATCHES.get((arch, sm_count), ())
+        if (nheads, ngroups) == (64, 8) and batch_size in gated_batches:
+            return _DIM128_STP_RING_Z_PROGRAM
+        return None
+    if dim128_stp_ring(batch_size, nheads, ngroups, sm_count, arch):
+        return _DIM128_STP_RING_PROGRAM
+    return None
 
 
 def dim128_stp_ring_view(
@@ -3836,15 +3865,18 @@ def dim128_stp_ring_view(
     """The one-token ring launch of a canonical BF16 single-token call, or ``None`` when the call keeps the
     single-token programs.
 
-    The ring runs a call :func:`dim128_stp_ring` admits without ``z``, destination table, cached states or a
-    disabled update, on the call's dense one-token view: ``x`` / ``B`` / ``C`` / ``output`` contiguous, ``dt`` the
-    broadcast of a contiguous ``[batch, nheads]`` block, ``A`` / ``D`` / ``dt_bias`` one contiguous value per head, a
-    contiguous state pool and slot table.  Its output and state are bitwise the single-token programs'.
+    The ring runs a call :func:`dim128_stp_ring_program` admits without destination table, cached states or a
+    disabled update, on the call's dense one-token view: ``x`` / ``B`` / ``C`` / ``output`` (and ``z`` of a gated
+    call) contiguous, ``dt`` the broadcast of a contiguous ``[batch, nheads]`` block, ``A`` / ``D`` / ``dt_bias`` one
+    contiguous value per head, a contiguous state pool and slot table.  Its output and state are bitwise the
+    single-token programs'.
     """
     batch_size = x.shape[0]
+    program = dim128_stp_ring_program(
+        batch_size, nheads, ngroups, sms, arch, z is not None
+    )
     if (
-        not dim128_stp_ring(batch_size, nheads, ngroups, sms, arch)
-        or z is not None
+        program is None
         or dst_state_batch_indices is not None
         or intermediate_states_buffer is not None
         or disable_state_update
@@ -3876,9 +3908,16 @@ def dim128_stp_ring_view(
             and state.is_contiguous()
             and source.is_contiguous()
         )
+        or (
+            z is not None
+            and (
+                z.shape != x_shape or z.dtype != torch.bfloat16 or not z.is_contiguous()
+            )
+        )
     ):
         return None
     head_tiles = -(-(nheads // ngroups) // _MTP_SHORT_RING_HEADS_PER_CTA)
+    gate = {} if z is None else {"z": z.view(batch_size, 1, nheads, dim)}
     bindings = dict(
         state_tma=state,
         x=x.view(batch_size, 1, nheads, dim),
@@ -3887,6 +3926,7 @@ def dim128_stp_ring_view(
         B=B.view(batch_size, 1, ngroups, dim),
         C=C.view(batch_size, 1, ngroups, dim),
         D=D.as_strided((nheads,), (1,)),
+        **gate,
         dt_bias=dt_bias.as_strided((nheads,), (1,)),
         output=output.view(batch_size, 1, nheads, dim),
         state_batch_indices=source,
@@ -3902,7 +3942,7 @@ def dim128_stp_ring_view(
     )
     # The TMA ring: a CTA per (batch row, group, tile of heads), the state a tensor map of the slot table.
     return RoutePlan(
-        _DIM128_STP_RING_PROGRAM,
+        program,
         (),
         (batch_size * ngroups * head_tiles, 1, 1),
         bindings,
@@ -5062,6 +5102,7 @@ __all__ = [
     "dim128_program",
     "dim128_split_program",
     "dim128_stp_ring",
+    "dim128_stp_ring_program",
     "dynamic_program",
     "hd64_paired_program",
     "hd64_rows_plan",
