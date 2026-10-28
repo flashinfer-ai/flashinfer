@@ -9,7 +9,6 @@ and swizzles them. Pass pre-quantized MXFP8 weights via ``w13``/``w2`` plus
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -18,6 +17,8 @@ from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import mxfp8_cutedsl_runtime_requirements
+from ..genphase_config import GenphaseConfigMixin
+
 from ......core.validation.common import (
     MoEEpArchError,
     MoEEpConfigError,
@@ -53,7 +54,7 @@ def _resolve_gate_up_clamp(
 @register_mega_kernel(
     "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
 )
-class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
     _config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     supports_output_view = True
 
@@ -63,7 +64,10 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         if (
             config.activation != "swiglu"
             or config.swiglu_alpha is not None
-            or not config.apply_routing_weights_before_fc2
+            or (
+                config.kernel_variant != "genphase"
+                and not config.apply_routing_weights_before_fc2
+            )
         ):
             raise MoEEpConfigError(
                 "Activation controls and late routing weights require "
@@ -75,40 +79,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 f"unsupported kernel_variant {config.kernel_variant!r}"
             )
         if config.kernel_variant == "genphase":
-            if (
-                config.knobs is not None
-                and config.knobs != "auto"
-                and not isinstance(config.knobs, dict)
-            ):
-                raise MoEEpConfigError(
-                    "GenPhase knobs must be None, 'auto', or a knob dictionary"
-                )
-            self._genphase_configs: dict[tuple, Any] = {}
-            self._genphase_constraints()
-            if config.enable_in_kernel_fc2_reduce:
-                raise MoEEpConfigError(
-                    "Blackwell GenPhase requires separate reduction."
-                )
-            if config.resolved_finalize_mode is not FinalizeMode.DEFAULT:
-                raise MoEEpConfigError(
-                    "Blackwell GenPhase supports only the default finalize "
-                    "kernel; persistent or unfinalized output requires "
-                    "kernel_variant='inference'."
-                )
-            policy = config.schedule_policy
-            if policy is not None and (
-                not isinstance(policy, tuple)
-                or len(policy) != 2
-                or policy[0] != "grouped"
-                or (
-                    policy[1] is not None
-                    and (type(policy[1]) is not int or policy[1] <= 0)
-                )
-            ):
-                raise MoEEpConfigError(
-                    "GenPhase schedule_policy must be ('grouped', None) "
-                    "or ('grouped', a positive integer)."
-                )
+            self._init_genphase_config()
         elif (
             config.mma_tiler_mnk is not None
             or config.cluster_shape_mn is not None
@@ -160,77 +131,6 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return mxfp8_cutedsl_runtime_requirements(bootstrap)
 
-    def _genphase_constraints(self):
-        """Merge explicit fields and knob overrides, rejecting conflicting values."""
-        k = self._kernel_config
-        names = ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
-        knobs = dict(k.knobs) if isinstance(k.knobs, dict) else {}
-        unknown = set(knobs) - set(names)
-        if unknown:
-            raise MoEEpConfigError(
-                f"unknown Blackwell GenPhase knobs: {sorted(unknown)}"
-            )
-        for name in names:
-            explicit = getattr(k, name)
-            if explicit is not None:
-                if name in knobs and knobs[name] != explicit:
-                    raise MoEEpConfigError(f"conflicting explicit GenPhase {name}")
-                knobs[name] = explicit
-        return knobs
-
-    def _genphase_base_config(self, fleet_params):
-        """Describe the EP workload before selecting performance knobs."""
-        from ......kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
-
-        k = self._kernel_config
-        return Sm100GenphaseMoeConfig(
-            num_total_experts=fleet_params.num_experts,
-            max_tokens_per_rank=fleet_params.max_tokens_per_rank,
-            num_topk=k.top_k,
-            hidden=fleet_params.token_hidden_size,
-            intermediate=k.intermediate_size,
-            rank=self.ep_rank,
-            world_size=self.ep_world_size,
-            quant_kind=k.kind,
-            gate_up_clamp=_resolve_gate_up_clamp(k),
-        )
-
-    def _genphase_config(self, fleet_params: FleetParams):
-        """Memoize cache or heuristic selection for one workload and device.
-
-        Automatic workspaces start from the capacity heuristic. Their v2
-        selection uses the actual staged batch size during warmup or forward.
-        """
-        from ......kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
-
-        try:
-            base = self._genphase_base_config(fleet_params)
-            constraints = self._genphase_constraints()
-            gpu = torch.cuda.is_available()
-            device = torch.cuda.current_device() if gpu else None
-            props = torch.cuda.get_device_properties(device) if gpu else None
-            sms = props.multi_processor_count if props is not None else 4
-            hardware = (
-                (device, props.major, props.minor, props.name, sms)
-                if props is not None
-                else None
-            )
-            automatic = self._kernel_config.knobs == "auto"
-            live_tokens = None if automatic else fleet_params.tuning_live_tokens
-            key = (base, repr(constraints), live_tokens, hardware)
-            if key not in self._genphase_configs:
-                knobs, _ = resolve_genphase_knobs(
-                    base,
-                    sm_count=sms,
-                    live_tokens=live_tokens,
-                    constraints=constraints,
-                    use_cache=gpu and not automatic,
-                )
-                self._genphase_configs[key] = dataclasses.replace(base, **knobs)
-            return self._genphase_configs[key]
-        except (TypeError, ValueError) as exc:
-            raise MoEEpConfigError(str(exc)) from exc
-
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
         """List cached GenPhase profiles when no explicit knob constraints apply."""
         if self._kernel_config.kernel_variant != "genphase":
@@ -246,21 +146,6 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
-
-    def _check_genphase_selection(self, config):
-        """Require identical configuration selection across EP ranks at allocation."""
-        # Selection is construction-time work; never inspect live routing on forward.
-        if self.ep_world_size > 1:
-            import torch.distributed as dist
-
-            proposal = dataclasses.asdict(config)
-            proposal.pop("rank")
-            proposals = [None] * self.ep_world_size
-            dist.all_gather_object(proposals, proposal, group=self.ep_comm_group)
-            if any(p != proposal for p in proposals):
-                raise MoEEpConfigError(
-                    "GenPhase configuration/cache selection differs across EP ranks"
-                )
 
     def _workspace_pool_request(self, fleet_params):
         """Return a pool key and allocator; mutable auto workspaces stay unpooled."""
@@ -439,6 +324,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 fleet_params,
                 top_k=self._kernel_config.top_k,
                 quantize_input=quantize_input,
+                kind=self._kernel_config.kind,
             )
             return
         validate_mxfp8_forward_inputs(

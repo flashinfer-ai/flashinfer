@@ -29,6 +29,7 @@ from .genphase import (
 from .kernel_helpers import (
     preprocess_block_scaled_weights,
     preprocess_prequantized_block_scaled_weights,
+    quantize_mxfp4_block32,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "preprocess_genphase_weights",
     "preprocess_prequantized_block_scaled_weights",
     "quantize_genphase_mxfp8",
+    "quantize_mxfp4_block32",
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "resolve_genphase_knobs",

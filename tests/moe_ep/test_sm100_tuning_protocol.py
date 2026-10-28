@@ -287,7 +287,7 @@ def test_genphase_grid_retains_geometries_hints_and_constraints():
     )
     candidates = tuning.sm100_genphase_candidates(cfg, sm_count=148, live_tokens=4)
     assert len(candidates) == 12
-    for tile, cluster in tuning._GEOMETRIES:
+    for tile, cluster in cfg.admitted_geometries:
         hints = {
             c["schedule_policy"][1]
             for c in candidates

@@ -357,7 +357,7 @@ class BlockScaledMoeConfig:
                 self.cluster_shape_mn in ((2, 1), (4, 1))
                 and tiler == (256, 64, 128)
                 and (
-                    self.quant_kind == "mxfp8_e4m3"
+                    self.quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2")
                     or (
                         self.quant_kind == "mxfp4_mxfp8"
                         and self.cluster_shape_mn == (4, 1)

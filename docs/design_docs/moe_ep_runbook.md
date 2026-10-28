@@ -698,10 +698,23 @@ layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
 output = layer.forward(tensors)
 ```
 
-GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
-capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
-intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
-CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
+GenPhase supports NVFP4, MXFP8 E4M3/E5M2 and mixed MXFP4 weights with MXFP8
+E4M3 activations (`kind="mxfp4_mxfp8"`). It uses standard SwiGLU and separate
+BF16 reduction, with physical capacity at most 1024 tokens per rank.
+
+| Format | Hidden alignment | Intermediate alignment | Gather4 geometries |
+| --- | --- | --- | --- |
+| MXFP8 E4M3/E5M2 | 128 | 64 | K128, N128/CGA4 or N64/CGA2/CGA4 |
+| NVFP4 | 64 | 32 | K256, N128/CGA4 |
+| MXFP4/MXFP8 | 128 | 128 | K128, N128/CGA4 or N64/CGA4 |
+
+NVFP4 uses `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` with
+`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"` and
+`kernel_variant="genphase"`. E4M3/E5M2 and mixed MXFP4/MXFP8 use the MXFP8
+config with either its existing selector or `_cutedsl_next`. For example,
+set `kind="mxfp8_e5m2"` or `kind="mxfp4_mxfp8"` in the example above.
+Early and late routing weights are supported. In-kernel FC2 reduction,
+per-token FC1 scales, SiTU and custom finalization remain unsupported.
 
 With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
 host-side estimate based on EP size, expert count, top-k, intermediate width,
@@ -787,25 +800,29 @@ retains the original grouped hint; a positive integer supplies a fixed hint.
 Legacy inference knob names are not accepted by GenPhase. The low-level
 `Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
 
-`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
-`False` accepts E4M3 activations and per-32 typed E8M0 scales in
-`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`quantize_input=True` stages BF16 inputs with the matching fused quantizer.
+`False` accepts the selected FP8 dtype with per-32 E8M0 scales, or packed
+NVFP4 with per-16 E4M3 scales in `MoEEpTensors.scales`. Mixed MXFP4/MXFP8
+uses E4M3 activations and per-32 E8M0 scales. NVFP4 retains the three
+per-expert global scales (`fc1_alpha`, `fc2_alpha`, `fc1_norm_const`). Routing accepts int32/int64 global expert IDs, with
 `-1` for masked slots, unique valid IDs per token and finite valid scores.
 As on the legacy SM100 path, callers provide valid routing; the backend checks
 metadata without scanning routing values on every forward.
 
 With `preprocess_weights=True`, canonical BF16 weights or canonical
-prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
-16-row gate/up stripes and physical K-major layout. Weight scales may use
-typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+prequantized weights in the selected format are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. NVFP4 weight scales
+use E4M3; MXFP8 and MXFP4 weight scales use E8M0. The backend also accepts
+raw `torch.uint8` scale storage. The exported
 `preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
 the same payload for `preprocess_weights=False` callers. Legacy transformed
 weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
 and resolved configuration. Rubin source and frontend are independent.
 
-Native layer coverage is in the existing
-`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
-test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+Native dtype and layer coverage is in `test_sm100_genphase_dtypes.py`.
+Distributed route changes and graph replay are covered by
+`test_mega_cuda_graph_multirank.py::test_blackwell_genphase_dtype_graph`,
+runnable with `torchrun --nproc_per_node=<2|4> -m pytest`.
 
 ## Adding a new mega-kernel backend
 
