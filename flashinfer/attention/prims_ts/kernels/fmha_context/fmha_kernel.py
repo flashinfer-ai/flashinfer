@@ -3004,10 +3004,12 @@ class FmhaTs:
                 "variable-window masking is not supported for paged context"
             )
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
-        if use_paged_kv:
+        if use_paged_kv or sage_scale_layout is not None:
             # Import before task bodies enter staged GPU control flow. The
             # helper module imports FmhaConfig, so it cannot load in resources.
+            # Contiguous Sage also uses its tile-index helper for SMEM scales.
             importlib.import_module(f"{__package__}.helpers_paged")
+        if use_paged_kv:
             if num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
                 raise ValueError(
                     "paged context requires num_tokens_per_page in "
