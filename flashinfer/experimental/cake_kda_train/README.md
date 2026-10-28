@@ -666,9 +666,12 @@ automatically; an explicit `save_transfer=True` together with the ring is a
 which compares the backward's prep and WY rows with the forward's: `"record"`
 (the default) stores the comparison in `LAST_CALL["bwd"]["spec3"]`, `"warn"`
 warns on a difference, `"assert"` raises `KcpPreconditionError`, `"off"` skips
-it for that call.  Pass the same value on every rank: the probe is a
-rank-local check, so `"assert"` serves single-process debugging.  No
-environment variable selects it.
+it for that call.  The backward reads the value of its own call (pass it to
+`chunk_kda_kcp_bwd`; the forward's is not kept in `KcpSaved`).  Pass the
+same value on every rank: the probe is a rank-local check, so `"assert"`
+serves single-process debugging.  Under `graph="replay"` the probing
+backward runs eagerly; a rank without tokens does not hold back its capture.
+No environment variable selects it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,

@@ -655,7 +655,8 @@ class KernelBackend(Backend):
     (``spec3_probe="record"``).  ``spec3_probe="off"`` skips it on that call, ``"warn"`` warns on a difference,
     ``"assert"`` raises :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and
     :attr:`spec3`.  The keyword travels with the call's options (:class:`KcpOptions`); no environment variable is
-    read.
+    read.  Under ``graph="replay"`` the probing backward runs eagerly; a rank without tokens has nothing to probe
+    and does not hold back the capture of its backward.
     """
 
     name = "kernels"
@@ -3286,7 +3287,8 @@ class KcpOptions:
     collective issue order and assert it), ``spec3_probe`` (the SPEC-3 debug probe of the first saved-mode backward,
     :class:`KernelBackend`: ``"record"`` default, ``"off"``, ``"warn"``, ``"assert"``; pass the same value on every
     rank: the probe is a rank-local host check (a rank without tokens skips it), and ``"assert"`` raises on a rank
-    whose rows differ while the other ranks enter the backward's collectives -- it serves single-process debugging),
+    whose rows differ while the other ranks enter the backward's collectives -- it serves single-process debugging;
+    the backward reads its own call's value, the forward's is not kept in :class:`KcpSaved`),
     ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
     per-rank call -- see "CUDA-graph replay of a call" below for the validity key, the
     pointer-stability requirement, the private pools' memory, the eager fallback and :func:`graph_cache_clear`),
@@ -4988,9 +4990,12 @@ def chunk_kda_kcp_bwd(
         and not (
             saved is not None
             and opts.spec3_probe != "off"
+            and call.local is not None
+            and call.T_r != 0
             and getattr(call.backend, "_spec3_pending", False)
         )
-    ):  # SPEC-3's host compare stays eager
+    ):  # SPEC-3's host compare stays eager; a rank without tokens runs no local stage (KcpCall.stage), so it has
+        # nothing to probe and captures with the other ranks
         res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
         if res is not None:
             entry.result = (res, batched)

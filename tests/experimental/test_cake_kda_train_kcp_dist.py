@@ -13,7 +13,8 @@ limitations under the License.
 Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_train.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
 recurrence of the same operands (``tests/test_helpers/cake_kda_train_reference``) and with one another (saved ==
-replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice).
+replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
+every rank capturing the same calls).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest``: skipped when fewer than ``W`` CUDA devices are
 visible or the KCP programs are not exported yet) and one process per Slurm task (``SLURM_PROCID`` /
@@ -48,6 +49,14 @@ cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 TENSORS = ("out",) + GRAD_NAMES
+# graph="replay" over four forward + backward calls of one key: the backward's key sees the saved tensors, which
+# change once (the eager forward's -> the captured forward's static ones), so it captures one call after the forward
+GRAPH_EVENTS = [
+    ["eager", "eager"],
+    ["capture", "eager"],
+    ["replay", "capture"],
+    ["replay", "replay"],
+]
 ATOL = RTOL = 1e-2
 SCALE = cake_kcp.SCALE
 
@@ -219,6 +228,20 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     ):  # gate 5: the ring path is bitwise the a2a path; the ring receives no c1 tensor, so recompute form only
         res_ring = saved_pass(exchange="ring", save_transfer=False)
         ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
+    # every rank (a rank without tokens included) captures and replays the same calls: a rank that stayed eager
+    # while the others captured would run its collectives outside the graphs of its peers
+    cake_kcp.graph_cache_clear()
+    events = []
+    for _ in range(len(GRAPH_EVENTS)):
+        res_graph = {n: t.clone() for n, t in saved_pass(graph="replay").items()}
+        events.append(
+            [
+                str(cake_kcp.LAST_CALL["fwd"].get("graph_event")),
+                str(cake_kcp.LAST_CALL["bwd"].get("graph_event")),
+            ]
+        )
+    torch.cuda.synchronize(device)
+    cake_kcp.graph_cache_clear()
     flags = {
         "saved_eq_replay": all(torch.equal(res[n], res_replay[n]) for n in TENSORS),
         "repeat": all(torch.equal(res[n], res_repeat[n]) for n in TENSORS),
@@ -226,6 +249,8 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
+        "graph_replay": events == GRAPH_EVENTS
+        and all(torch.equal(res[n], res_graph[n]) for n in TENSORS),
         # a backend with local stages whose probe was pending must have run it (spec3_probe="record", the
         # default); a rank without tokens launches no local stage, so it has nothing to probe.  The probe's row
         # comparison (the forward's intra prep against the backward's prep program) is reported in spec3_by_rank,
@@ -245,12 +270,15 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         gathered[n] = objs
     flag_list = [None] * W
     spec3_list = [None] * W
+    events_list = [None] * W
     if W > 1:
         dist.all_gather_object(flag_list, flags)
         dist.all_gather_object(spec3_list, spec3)
+        dist.all_gather_object(events_list, events)
     else:
         flag_list = [flags]
         spec3_list = [spec3]
+        events_list = [events]
     report = {
         "rank": rank,
         "world": W,
@@ -260,6 +288,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "backend": backend.name,
         "backend_path": getattr(backend, "path", None),
         "spec3_by_rank": spec3_list,
+        "graph_events_by_rank": events_list,
     }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)
