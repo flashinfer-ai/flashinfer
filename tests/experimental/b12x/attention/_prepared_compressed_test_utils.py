@@ -15,6 +15,7 @@ from b12x.preparation import PreparationSession, PreparedCall
 def prepare_compressed_binding(
     *, caps, q, swa_k_cache, swa_indices, swa_lengths, sm_scale, attn_sink=None
 ):
+    """Prepare one SWA binding while retaining split capacity and replay owners."""
     # The original cases have one SWA cache. Retain their numerical inputs and
     # declared capacities while explicitly describing that storage ABI.
     caps = replace(

@@ -358,13 +358,14 @@ def test_declared_capacity_preserves_legacy_plans_through_256_rows(
 
 
 @pytest.mark.parametrize("rows", [384, 512, 768])
+@pytest.mark.parametrize("width", [384, 704])
 @torch.inference_mode()
 def test_declared_decode_capacity_matches_reference_under_graph_replay(
     rows: int,
+    width: int,
 ) -> None:
     device = require_b12x()
     clear_mla_caches()
-    width = 384
     live_width = 32
     q = _make_q(rows=rows, seed=6130 + rows, device=device)
     swa_cache_bytes = _make_cache(
@@ -445,9 +446,10 @@ def test_declared_decode_capacity_matches_reference_under_graph_replay(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    assert captured_out is not None
+    captured_out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize(device)
-    assert captured_out is not None
 
     expected = compressed_sparse_mla_reference(
         q,
