@@ -55,6 +55,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    get_autotune_batch_invariant,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -6941,6 +6942,14 @@ def _cute_dsl_gemm_mxfp8_runner(
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
+        def is_batch_invariant_tactic(self, tactic) -> bool:
+            # Every split_k == 1 tactic accumulates K in one pass per output
+            # tile, in the same order as the fallback; split-K sums K slices
+            # across CTAs and rounds differently.
+            if tactic is None or tactic == -1:
+                return True
+            return int(tactic[4]) == 1
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -7364,6 +7373,10 @@ def _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl: bool):
             _, _, _, _, _, out, _ = inputs
             return (str(out.dtype), enable_pdl)
 
+        def is_batch_invariant_tactic(self, tactic) -> bool:
+            # Every tactic, including the default, splits K across warps.
+            return False
+
         def supports_inputs(
             self, inputs: List[torch.Tensor], check_m: bool = True
         ) -> bool:
@@ -7459,8 +7472,11 @@ def _cute_dsl_mxfp8_runners(
     # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
     # one wave. On wider N the cluster split-K default is faster in back-to-back
     # PDL calls, where its prologue overlaps the previous kernel (#6839).
-    if warp.supports_inputs(inputs) and b.shape[1] // 16 <= get_device_sm_count(
-        a.device
+    # Batch-invariant autotuning needs a fallback that does not split K.
+    if (
+        not get_autotune_batch_invariant()
+        and warp.supports_inputs(inputs)
+        and b.shape[1] // 16 <= get_device_sm_count(a.device)
     ):
         return [warp, cluster_splitk]
     return [cluster_splitk, warp]
