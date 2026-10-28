@@ -78,7 +78,9 @@ def fp8_paged_mqa_logits(
     buffer from :func:`get_paged_mqa_logits_metadata` (its first dimension
     fixes the CTA budget; ``None`` = the device's SM count). ONE FFI
     submission, TWO kernel launches: the scheduler is rebuilt into
-    ``schedule_meta`` and the persistent logits program consumes it.
+    ``schedule_meta`` and the persistent logits program consumes it (on a
+    ``dyn`` device route ``schedule_meta`` is checked but not written: the
+    scheduler writes a private buffer instead).
 
     Returns the FP32 ``[B * next_n, max_context_len]`` view of a row-padded
     buffer with DeepGEMM's ``clean_logits=False`` semantics (positions at or
@@ -134,9 +136,12 @@ def prepare_sm120_paged_mqa_logits(
     ``(metadata, logits)`` prepared sequence on the current PyTorch stream
     without allocating (CUDA Graph replay with changed tensor contents is
     supported) and returns ``plan.logical_output``, the ``[B * next_n,
-    max_context_len]`` view. ``schedule_meta`` is rebuilt by every run;
-    ``sm_count`` overrides the CTA budget; ``max_context_hint`` selects the
-    Q-atom program as in :func:`fp8_paged_mqa_logits`.
+    max_context_len]`` view. Every run rebuilds the schedule: into
+    ``schedule_meta`` on a static route, into the plan's own
+    ``plan.dyn_schedule`` on a ``dyn`` device route (``schedule_meta`` is then
+    left unwritten); ``sm_count`` overrides the CTA budget;
+    ``max_context_hint`` selects the Q-atom program as in
+    :func:`fp8_paged_mqa_logits`.
     """
     from .experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa import (
         Sm120PagedIndexerPlan,
