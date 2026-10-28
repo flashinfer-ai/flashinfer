@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Union
 
@@ -24,6 +25,8 @@ TRANSPORT_TABLE_NAMES = ("all_gin", "all_lsa", "lsa_where_reachable")
 TRANSPORT_TABLE_AUTO = "auto"
 TRANSPORT_TABLE_TUNED = "tuned"
 CODEC_OVERFLOW_BLOCKS_RANGE = (16, 256)
+# ``return_codec`` names -> the device build's MOE_RETURN_CODEC value.
+RETURN_CODECS = {"bf16": 0, "int8": 1}
 
 TransportTableSpec = Union[str, tuple]
 
@@ -83,7 +86,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     same guards the source enforces at compile time): EP world size 2..32,
     ``num_experts % world_size == 0``
     with at most 128 experts per rank and 1024 in total, ``hidden_size`` a multiple of
-    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 9; the
+    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 16; the
     kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 32640).
     Above 16 EP ranks ``validate_init`` also compiles the device instances and rejects
     parameter sets whose build spills registers.
@@ -99,7 +102,21 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     Default 16 (25 % of a row at ``hidden_size=4096``, 14 % at 7168;
     real DeepSeek-V4 activations need ~0.3 %); 16..256.  Each extra block costs
     ``128 * max_tokens_per_rank * top_k`` bytes per peer and ring slot of
-    symmetric memory.
+    symmetric memory.  Used by ``return_codec="bf16"`` only.
+
+    ``return_codec`` (compile-time) selects the wire format of the expert results:
+
+    * ``"bf16"`` (default): the lossless BF16 codec above; the output is the
+      slot-ordered fp32 sum of the exact BF16 expert results.
+    * ``"int8"``: every 64-value block of an expert result travels as 64 int8
+      codes plus one BF16 scale ``s = bf16(amax / 127)``; the receiver sums
+      ``q * s`` in fp32 (the same order and rounding as ``"bf16"``).  A route
+      costs ``hidden_size * 66 / 64`` bytes (5280 B at ``hidden_size=5120``, against
+      ``hidden_size * 98 / 64`` plus overflow for ``"bf16"``), there is no overflow
+      area and no overflow failure mode, and the result windows shrink accordingly.
+      Each returned value carries an absolute error of at most ``s / 2`` (about
+      0.4 % of its block's largest magnitude).  Use it where the return wire is
+      the bottleneck (PCIe-only hosts, GIN across hosts).
 
     Numerics: MXFP8 E4M3 activations (UE8M0 K32 scales) x MXFP4 E2M1 routed weights,
     SwiGLU ``silu(gate) * up``, FP8 requant of the intermediate, BF16 output; no expert
@@ -107,6 +124,21 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     SwiGLU inputs to ``gate <= L`` and ``-L <= up <= L`` before the activation:
     ``10`` (default) is the DeepSeek-V4 clamp, ``0`` is standard unclamped SwiGLU
     (DeepSeek-V3, Qwen3).
+
+    ``activation`` (compile-time) selects the gated activation applied after the clamp,
+    with the parameter names of the other moe_ep MegaMoE backends:
+
+    * ``"swiglu"`` (default): ``silu(gate) * up``; with ``swiglu_alpha`` and
+      ``swiglu_beta`` set (together) ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)``
+      (GPT-OSS / MiniMax-M3: ``swiglu_alpha=1.702, swiglu_beta=1.0``, with ``swiglu_limit``
+      as the clamp, e.g. 7).
+    * ``"situ"``: ``situ_beta * tanh(gate / situ_beta) * sigmoid(gate)`` times ``up``, or
+      with ``situ_linear_beta`` times ``situ_linear_beta * tanh(up / situ_linear_beta)``
+      (Kimi-K3).  SiTU takes no clamp: pass ``swiglu_limit=0``.
+
+    The float parameters are compiled in 1/1000 steps: exact multiples of 0.001 up to
+    1000, positive except ``swiglu_beta`` (>= 0).  The in-kernel shared expert uses the
+    same activation.
 
     EPLB: pass ``num_experts`` = physical experts (logical experts plus redundant
     replicas, divisible by the EP world size) and physical expert ids in ``topk_ids``;
@@ -124,6 +156,67 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     transport_table: TransportTableSpec = "all_gin"
     fast_math: bool = True
     knobs: dict | None = None
+    # Appended after the existing fields to keep positional construction working.
+    activation: str = "swiglu"
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
+    situ_beta: float | None = None
+    situ_linear_beta: float | None = None
+    return_codec: str = "bf16"
+
+    def activation_parameters(self) -> tuple[int, int, int]:
+        """``(MOE_ACTIVATION, MOE_ACT_P0, MOE_ACT_P1)`` of the device build; validates the activation fields."""
+
+        def milli(name: str, value: float | None, low: int = 1) -> int:
+            if (
+                value is None
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"activation {self.activation!r} needs {name} (a finite number)"
+                )
+            scaled = round(float(value) * 1000)
+            if (
+                scaled < low
+                or scaled > 1_000_000
+                or abs(scaled - float(value) * 1000) > 1e-6
+            ):
+                bound = "positive" if low else "non-negative"
+                raise ValueError(
+                    f"{name} must be a {bound} multiple of 0.001 up to 1000, got {value!r}"
+                )
+            return scaled
+
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'situ', got {self.activation!r}"
+            )
+        if self.activation == "situ":
+            if self.swiglu_alpha is not None or self.swiglu_beta is not None:
+                raise ValueError("SwiGLU parameters are not supported with SiTU")
+            if self.swiglu_limit != 0:
+                raise ValueError(
+                    "activation clamps are not supported with SiTU; pass swiglu_limit=0"
+                )
+            linear_beta = (
+                0
+                if self.situ_linear_beta is None
+                else milli("situ_linear_beta", self.situ_linear_beta)
+            )
+            return 2, milli("situ_beta", self.situ_beta), linear_beta
+        if self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU parameters require activation='situ'")
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together")
+        if self.swiglu_alpha is not None:
+            return (
+                1,
+                milli("swiglu_alpha", self.swiglu_alpha),
+                milli("swiglu_beta", self.swiglu_beta, low=0),
+            )
+        return 0, 0, 0
 
     def __post_init__(self) -> None:
         if (
@@ -134,6 +227,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
             raise ValueError(
                 f"swiglu_limit must be a non-negative int (0 = unclamped SwiGLU), got {self.swiglu_limit!r}"
             )
+        self.activation_parameters()
         lo, hi = CODEC_OVERFLOW_BLOCKS_RANGE
         if (
             not isinstance(self.codec_overflow_blocks, int)
@@ -142,6 +236,10 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
         ):
             raise ValueError(
                 f"codec_overflow_blocks must be an int in [{lo}, {hi}], got {self.codec_overflow_blocks!r}"
+            )
+        if self.return_codec not in RETURN_CODECS:
+            raise ValueError(
+                f"return_codec must be one of {sorted(RETURN_CODECS)}, got {self.return_codec!r}"
             )
         if self.shared_expert not in (None, SHARED_EXPERT_FP8_IN_KERNEL):
             raise ValueError(
@@ -175,6 +273,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
 
 __all__ = [
     "CODEC_OVERFLOW_BLOCKS_RANGE",
+    "RETURN_CODECS",
     "SHARED_EXPERT_FP8_IN_KERNEL",
     "TRANSPORT_TABLE_AUTO",
     "TRANSPORT_TABLE_TUNED",

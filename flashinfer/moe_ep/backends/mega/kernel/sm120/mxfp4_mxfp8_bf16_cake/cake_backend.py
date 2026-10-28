@@ -93,6 +93,7 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from .cake_config import (
+    RETURN_CODECS,
     TRANSPORT_TABLE_AUTO,
     TRANSPORT_TABLE_TUNED,
     Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
@@ -754,12 +755,14 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         EP world size, global (physical) expert count, hidden size and the per-rank token
         capacity come from the fleet; intermediate size, top-k, the shared-expert
-        variant, the SwiGLU clamp and the codec overflow capacity from the kernel config;
+        variant, the SwiGLU clamp, the codec overflow capacity and the return codec from the
+        kernel config;
         ``lsa_copiers`` (copier instances only) from the transport table.  The kernel's
         row capacity is ``max_tokens_per_rank`` rounded up to a multiple of 128.
         """
 
         config = self._kernel_config
+        activation, act_p0, act_p1 = config.activation_parameters()
         return KernelParams(
             ranks=world_size,
             experts=fleet_params.num_experts,
@@ -771,6 +774,10 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             swiglu_limit=config.swiglu_limit,
             codec_ovf_blocks=config.codec_overflow_blocks,
             lsa_copiers=lsa_copiers,
+            activation=activation,
+            act_p0=act_p0,
+            act_p1=act_p1,
+            return_codec=RETURN_CODECS[config.return_codec],
         )
 
     def _describe(
@@ -786,7 +793,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"num_experts={fleet_params.num_experts}, hidden={fleet_params.token_hidden_size}, "
                 f"intermediate={self._kernel_config.intermediate_size}, top_k={self._kernel_config.top_k}, "
                 f"swiglu_limit={self._kernel_config.swiglu_limit}, "
+                f"activation={self._kernel_config.activation}, "
                 f"codec_overflow_blocks={self._kernel_config.codec_overflow_blocks}, "
+                f"return_codec={self._kernel_config.return_codec}, "
                 f"lsa_copiers={lsa_copiers}, "
                 f"max_tokens_per_rank={fleet_params.max_tokens_per_rank}): {error}"
             ) from error
@@ -881,7 +890,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.swiglu_limit,
+            config.activation_parameters(),
             config.codec_overflow_blocks,
+            config.return_codec,
             config.variant,
             config.transport_table,
             knobs_pool_key(config.knobs),
@@ -937,11 +948,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         import torch.distributed as dist
 
-        from .cake_knob_cache import lookup_knobs, topology_digest
+        from .cake_knob_cache import lookup_knobs, topology_digest, variant_key
 
         world = session.world_size
         key = {
-            "variant": self._kernel_config.variant,
+            "variant": variant_key(
+                self._kernel_config.variant, self._kernel_config.return_codec
+            ),
             "world_size": world,
             "hidden": int(kernel["hidden"]),
             "intermediate": int(kernel["intermediate"]),

@@ -43,6 +43,7 @@ def test_config_defaults_and_variant() -> None:
     assert config.top_k == 6
     assert config.swiglu_limit == 10
     assert config.codec_overflow_blocks == 16
+    assert config.return_codec == "bf16"
     assert config.transport_table == "all_gin"
     assert config.kernel_name == "sm120_mxfp4_mxfp8_bf16_cake"
     assert config.variant == "noshared"
@@ -64,6 +65,74 @@ def test_config_swiglu_limit_validation() -> None:
             Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(swiglu_limit=bad)
 
 
+def test_config_keeps_the_positional_field_order() -> None:
+    from dataclasses import fields
+
+    names = [f.name for f in fields(Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig)]
+    assert names[:9] == [
+        "intermediate_size",
+        "top_k",
+        "swiglu_limit",
+        "codec_overflow_blocks",
+        "kernel_name",
+        "shared_expert",
+        "transport_table",
+        "fast_math",
+        "knobs",
+    ]
+
+
+def test_config_activation_parameters() -> None:
+    config = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
+    assert config().activation_parameters() == (0, 0, 0)
+    assert config(
+        swiglu_alpha=1.702, swiglu_beta=1.0, swiglu_limit=7
+    ).activation_parameters() == (1, 1702, 1000)
+    assert config(
+        activation="situ", situ_beta=4.0, situ_linear_beta=25.0, swiglu_limit=0
+    ).activation_parameters() == (2, 4000, 25000)
+    assert config(swiglu_alpha=1.702, swiglu_beta=0.5).activation_parameters() == (
+        1,
+        1702,
+        500,
+    )
+    assert config(swiglu_alpha=1.702, swiglu_beta=0.0).activation_parameters() == (
+        1,
+        1702,
+        0,
+    )
+    assert config(
+        activation="situ", situ_beta=4.0, swiglu_limit=0
+    ).activation_parameters() == (
+        2,
+        4000,
+        0,
+    )
+    for bad in (
+        {"activation": "gelu"},
+        {"activation": "swigluoai", "swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+        {"swiglu_alpha": 1.702},
+        {"swiglu_beta": 1.0},
+        {"swiglu_alpha": 1.7025, "swiglu_beta": 1.0},
+        {"swiglu_alpha": 0.0, "swiglu_beta": 1.0},
+        {"swiglu_alpha": 1.702, "swiglu_beta": -1.0},
+        {"activation": "situ", "situ_linear_beta": 25.0},
+        {"activation": "situ", "situ_beta": 4.0},  # default clamp L = 10
+        {"activation": "situ", "situ_beta": 4.0, "swiglu_limit": 7},
+        {"swiglu_alpha": float("inf"), "swiglu_beta": 1.0},
+        {"swiglu_alpha": 1.702, "swiglu_beta": float("nan")},
+        {"situ_beta": 4.0, "situ_linear_beta": 25.0},
+        {
+            "activation": "situ",
+            "situ_beta": 4.0,
+            "situ_linear_beta": 25.0,
+            "swiglu_alpha": 1.0,
+        },
+    ):
+        with pytest.raises(ValueError):
+            config(**bad)
+
+
 def test_config_codec_overflow_blocks_validation() -> None:
     for good in (16, 28, 256):
         assert (
@@ -75,6 +144,17 @@ def test_config_codec_overflow_blocks_validation() -> None:
     for bad in (0, 15, 257, 16.0, True, "16"):
         with pytest.raises(ValueError):
             Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(codec_overflow_blocks=bad)
+
+
+def test_config_return_codec_validation() -> None:
+    for good in ("bf16", "int8"):
+        assert (
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(return_codec=good).return_codec
+            == good
+        )
+    for bad in ("fp8", "INT8", 1, None):
+        with pytest.raises(ValueError):
+            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(return_codec=bad)
 
 
 def test_gate_up_interleave_is_grouped_in_eight_rows() -> None:
@@ -400,7 +480,7 @@ def test_geometry_guards_reject_unsupported_shapes() -> None:
         G.KernelParams(8, 256, 6, 2048, 4000, 2048, False),  # hidden % 512
         G.KernelParams(8, 256, 6, 2048, 8192, 2048, False),  # staging > 99 KB
         G.KernelParams(8, 256, 6, 2048, 4096, 2000, False),  # intermediate % 128
-        G.KernelParams(8, 256, 10, 2048, 4096, 2048, False),  # top-k > 9
+        G.KernelParams(8, 256, 17, 2048, 4096, 2048, False),  # top-k > 16
         G.KernelParams(8, 256, 6, 2000, 4096, 2048, False),  # rows % 128
     ):
         with pytest.raises(G.GeometryError):
@@ -460,6 +540,72 @@ def test_geometry_codec_overflow_capacity_is_a_window_parameter() -> None:
                     4, 256, 6, 4096, 4096, 2048, True, codec_ovf_blocks=blocks
                 )
             )
+
+
+def test_geometry_int8_return_codec_shrinks_only_the_result_rows() -> None:
+    """MOE_RETURN_CODEC=1 selects the int8 return rows (64 codes + a 2-byte BF16 scale per 64
+    values, no raw-overflow area): the row pitch drops to hidden * 66 / 64 bytes and the result
+    windows shrink by exactly the old pitch difference; SMEM, ABI, schedule and the dispatch
+    side are unchanged, and the overflow capacity no longer sizes anything."""
+
+    G = _geometry()
+    for ep, hidden, top_k, shared in (
+        (4, 4096, 6, True),
+        (8, 5120, 6, False),
+        (8, 7168, 8, True),
+        (16, 2048, 8, False),
+    ):
+        experts = 384 if hidden == 5120 else 256
+        lossless = G.describe_kernel(
+            G.KernelParams(ep, experts, top_k, 4096, hidden, 2048, shared)
+        )
+        int8 = G.describe_kernel(
+            G.KernelParams(
+                ep, experts, top_k, 4096, hidden, 2048, shared, return_codec=1
+            )
+        )
+        row = hidden // 64 * 66
+        assert int8["transport"]["codec_row_bytes"] == row
+        for name, inst in int8["instances"].items():
+            ref = lossless["instances"][name]
+            assert inst["switches"]["MOE_SW_RETURN_INT8"] == 1
+            assert ref["switches"]["MOE_SW_RETURN_INT8"] == 0
+            assert inst["constants"]["CODEC_ROUTE_PITCH_BYTES"] == row
+            assert inst["smem_bytes"] == ref["smem_bytes"]
+            assert inst["task_m"] == ref["task_m"]
+        assert int8["abi"] == lossless["abi"]
+        windows, ref_windows = dict(int8["windows"]), dict(lossless["windows"])
+        routes = lossless["instances"]["m128_copier"]["constants"][
+            "MAX_ROUTES_PER_PEER"
+        ]
+        old_pitch = lossless["instances"]["m128_copier"]["constants"][
+            "CODEC_ROUTE_PITCH_BYTES"
+        ]
+        for name in ("result_out", "result_inbox"):
+            assert ref_windows[name] - windows[name] == (
+                (old_pitch - row) * routes * ep * 2
+            )
+        for name in windows:
+            if name not in ("result_out", "result_inbox"):
+                assert windows[name] == ref_windows[name]
+        wide = G.describe_kernel(
+            G.KernelParams(
+                ep,
+                experts,
+                top_k,
+                4096,
+                hidden,
+                2048,
+                shared,
+                codec_ovf_blocks=64,
+                return_codec=1,
+            )
+        )
+        assert wide["windows"] == int8["windows"]
+    with pytest.raises(G.GeometryError):
+        G.describe_kernel(
+            G.KernelParams(4, 256, 6, 4096, 4096, 2048, True, return_codec=2)
+        )
 
 
 def test_geometry_pool_rows_keep_sfa_tensor_maps_aligned() -> None:
@@ -667,9 +813,16 @@ def test_manifest_seals_the_parametric_closure() -> None:
     device = read_manifest()["device"]
     assert [w["name"] for w in device["instances"]] == list(INSTANCE_NAMES)
     assert set(device["parameters"]) == {*DEVICE_PARAMETERS, "MOE_INSTANCE"}
-    defines = device_defines((4, 256, 6, 8192, 4096, 2048, 1, 0, 32, 3))
+    defines = device_defines((4, 256, 6, 8192, 4096, 2048, 1, 0, 32, 3, 1, 1702, 0, 1))
     assert defines[0] == "-DMOE_RANKS=4" and "-DMOE_SWIGLU_LIMIT=0" in defines
-    assert defines[-2:] == ["-DMOE_CODEC_OVF_BLOCKS=32", "-DMOE_LSA_COPIERS=3"]
+    assert defines[-6:] == [
+        "-DMOE_CODEC_OVF_BLOCKS=32",
+        "-DMOE_LSA_COPIERS=3",
+        "-DMOE_ACTIVATION=1",
+        "-DMOE_ACT_P0=1702",
+        "-DMOE_ACT_P1=0",
+        "-DMOE_RETURN_CODEC=1",
+    ]
     with pytest.raises(ValueError):
         device_defines((4, 256, 6, 8192, 4096, 2048, 1, 0))
 
@@ -1157,6 +1310,11 @@ def test_knob_cache_round_trip_and_bucket_choice(tmp_path, monkeypatch) -> None:
     assert K.lookup_knobs(max_tokens=8192, **key)["table_name"] == "lsa_pairs"
     other_topology = dict(key, topology=K.topology_digest(reach, False))
     assert K.lookup_knobs(max_tokens=512, **other_topology) is None
+    # bf16 entries never serve an int8 build (and keep their key).
+    assert K.variant_key("fp8shared") == "fp8shared"
+    int8 = dict(key, variant=K.variant_key("fp8shared", "int8"))
+    assert int8["variant"] == "fp8shared+int8"
+    assert K.lookup_knobs(max_tokens=512, **int8) is None
     entries = json.loads(path.read_text())["entries"]
     assert other in entries and len(entries) == 3
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
