@@ -58,7 +58,10 @@ constexpr uintptr_t kCachedAlignmentBytes = 32;
 //     trips and whose fifth tile is more than 1/4 (sm_100) or at least 3/8
 //     (sm_103) full, from three persistent trips on when the fifth tile is
 //     at least 3/8 full and from 2.5 rows per persistent cluster on
-//     otherwise, below 7 rows per shared-tile cluster;
+//     otherwise, below 7 rows per shared-tile cluster; on sm_100 also at
+//     three persistent trips from 10/9 rows per shared-tile cluster on, and,
+//     when the fifth tile is at most 279/1024 full, below 15/2 rows per
+//     shared-tile cluster;
 //   - a 16-CTA chunk whose rows fill at least 9/10 of three persistent trips;
 // - a full 8-tile chunk takes the persistent kernel, unless the rows fit one
 //   wave of shared-tile clusters while filling less than a fraction N / D of
@@ -69,7 +72,8 @@ constexpr uintptr_t kCachedAlignmentBytes = 32;
 // - a 6- or 7-tile chunk takes the persistent kernel below 4 rows per
 //   shared-tile cluster unless the same trip rule holds; a 6-tile chunk or a
 //   16-CTA chunk on sm_103 takes it from 2.5 rows per persistent cluster on
-//   instead.
+//   instead; on sm_100 a 16-CTA chunk keeps it past 4 rows per shared-tile
+//   cluster up to 20 (6 tiles) or 22 (7 tiles) persistent trips.
 constexpr int kSharedTilesAnyRowsMaxTiles = 5;
 constexpr uint64_t kPersistentTripFillNumC16 = 4;
 constexpr uint64_t kPersistentTripFillDenC16 = 5;
@@ -88,6 +92,21 @@ constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
+// sm_100, 5-tile 8-CTA chunks whose fifth tile is more than 2/8 full: three
+// persistent trips take the persistent kernel from 10/9 rows per shared-tile
+// cluster on, and a fifth tile at most 279/1024 full keeps it below 15/2 rows
+// per shared-tile cluster.
+constexpr uint64_t kFiveTileThreeTrips = 3;
+constexpr uint64_t kFiveTileThreeTripRowsNumSm100 = 10;
+constexpr uint64_t kFiveTileThreeTripRowsDenSm100 = 9;
+constexpr uint64_t kFifthTileLateMaxNumSm100 = 279;
+constexpr uint64_t kFifthTileLateMaxDenSm100 = 1024;
+constexpr uint64_t kFiveTileLateRowsNumSm100 = 15;
+constexpr uint64_t kFiveTileLateRowsDenSm100 = 2;
+// sm_100, 6- and 7-tile 16-CTA chunks: the persistent kernel's trip cap past 4
+// rows per shared-tile cluster.
+constexpr uint64_t kSixTileC16MaxTripsSm100 = 20;
+constexpr uint64_t kSevenTileC16MaxTripsSm100 = 22;
 constexpr int kMaxDevices = 64;
 
 enum class ParameterKind : int {
@@ -705,10 +724,22 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
       const bool early_persistent =
           device_minor != 0 ||
           last_tile_x8 >= kFifthTileEarlyPersistentEighthsSm100 * kCachedTileElements;
-      const bool few_rows =
-          early_persistent ? trips <= kFiveTileSharedTilesMaxTrips : under_persistent;
-      const bool many_rows = rows64 >= kSharedTilesRowsPerClusterFullChunkC8 * shared_clusters;
-      use_shared_tiles = few_rows || short_trips || thin_last_tile || many_rows;
+      bool few_rows = early_persistent ? trips <= kFiveTileSharedTilesMaxTrips : under_persistent;
+      bool short_rows = short_trips;
+      bool many_rows = rows64 >= kSharedTilesRowsPerClusterFullChunkC8 * shared_clusters;
+      if (device_minor == 0 && !thin_last_tile) {
+        if (trips == kFiveTileThreeTrips && rows64 * kFiveTileThreeTripRowsDenSm100 >=
+                                                kFiveTileThreeTripRowsNumSm100 * shared_clusters) {
+          few_rows = false;
+          short_rows = false;
+        }
+        if (last_tile_x8 * kFifthTileLateMaxDenSm100 <=
+                kFifthTileLateMaxNumSm100 * 8 * kCachedTileElements &&
+            rows64 * kFiveTileLateRowsDenSm100 < kFiveTileLateRowsNumSm100 * shared_clusters) {
+          many_rows = false;
+        }
+      }
+      use_shared_tiles = few_rows || short_rows || thin_last_tile || many_rows;
     }
   } else if (chunk_tiles == kCachedMaxTiles) {
     const uint64_t rows_per_cluster = !sixteen ? kSharedTilesRowsPerClusterFullChunkC8
@@ -717,9 +748,13 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
                                           : kSharedTilesRowsPerClusterFullChunkC16Sm103;
     use_shared_tiles = short_last_trip || rows64 >= rows_per_cluster * shared_clusters;
   } else {
+    const uint64_t max_trips =
+        chunk_tiles == 6 ? kSixTileC16MaxTripsSm100 : kSevenTileC16MaxTripsSm100;
+    const bool many_rows = rows64 >= kSharedTilesRowsPerCluster * shared_clusters &&
+                           !(device_minor == 0 && sixteen && trips <= max_trips);
     use_shared_tiles =
         (device_minor == 3 && (chunk_tiles == 6 || sixteen) ? under_persistent : short_last_trip) ||
-        rows64 >= kSharedTilesRowsPerCluster * shared_clusters;
+        many_rows;
   }
   if (shared_resident > 0 && use_shared_tiles) {
     *launch = {variant, shared_tiles, rows, shared_tiles_smem,

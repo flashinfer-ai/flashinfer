@@ -657,6 +657,29 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
         (496, 80000, "persistent", "persistent"),
         (497, 80000, "shared_tiles", "persistent"),
         (544, 80000, "shared_tiles", "shared_tiles"),
+        # On sm_100 also at three persistent trips from 10/9 rows per shared-tile
+        # cluster on, and below 15/2 rows per shared-tile cluster when the fifth
+        # tile is at most 279/1024 full.
+        (78, 70000, "shared_tiles", "shared_tiles"),
+        (79, 70000, "persistent", "shared_tiles"),
+        (82, 70000, "persistent", "shared_tiles"),
+        (78, 76000, "shared_tiles", "shared_tiles"),
+        (79, 76000, "persistent", "shared_tiles"),
+        (496, 70000, "persistent", "shared_tiles"),
+        (497, 70000, "persistent", "shared_tiles"),
+        (532, 70000, "persistent", "shared_tiles"),
+        (533, 70000, "shared_tiles", "shared_tiles"),
+        (497, 70008, "shared_tiles", "shared_tiles"),
+        # 6- and 7-tile 16-CTA chunks on sm_100: the persistent kernel past 4 rows
+        # per shared-tile cluster up to 20 (6 tiles) or 22 (7 tiles) persistent
+        # trips.
+        (123, 180000, "persistent", "persistent"),
+        (124, 180000, "persistent", "persistent"),
+        (280, 180000, "persistent", "shared_tiles"),
+        (281, 180000, "shared_tiles", "shared_tiles"),
+        (124, 210000, "persistent", "persistent"),
+        (308, 210000, "persistent", "shared_tiles"),
+        (309, 210000, "shared_tiles", "shared_tiles"),
         # 5-tile 16-CTA chunks of four persistent trips keep the shared-tile kernel.
         (48, 151936, "shared_tiles", "shared_tiles"),
         (56, 163840, "shared_tiles", "shared_tiles"),
