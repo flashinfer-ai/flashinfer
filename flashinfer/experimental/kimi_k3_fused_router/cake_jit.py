@@ -1005,18 +1005,24 @@ BLOCK_M_VALUES = (8, 16)
 #          num_tokens <= 32 (the 32-token cell: the counts up to 32 that are
 #          not an LC row count); non-cooperative launch
 #   LCG_LW: the LCG kernel waiting for its cluster after the row selection
-#          instead of at entry, same cluster / launch / token range (SM100 at
-#          block_m 16: from 29 tokens)
+#          instead of at entry, same cluster / launch / token range
+#   LCG_LW_OWN: the LCG_LW kernel whose candidate floor comes from the owners
+#          of the published bounds, same cluster / launch / token range
+#          (SM100 at block_m 16: from 29 tokens)
 #   M    : one-join bitmap plan builder, 128 <= num_tokens <= 256 (SM100) /
 #          2048 (SM103); on SM103 the cooperative grid is launched with an
 #          explicit cluster of one CTA
 #   Q4S  : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster
-#          launch) at four CTAs per SM, 128 <= num_tokens <= 2048
+#          launch) at four CTAs per SM, 128 <= num_tokens <= 1024 (each owner
+#          CTA keeps its cluster's slice byte map)
 #   Q4S_E16: the Q4S kernel whose plan emit gives each lane 16 tokens instead
 #          of 32 (the 512-token cells), same cluster / launch bounds / grid
 #          rule
-#   Q4SB : the Q4S kernel with a register prefetch of the next row's logits
-#          (SM103), same cluster / launch bounds / grid rule
+#   Q4SB : the Q4S kernel with a register prefetch of the next row's logits,
+#          same cluster / launch bounds / grid rule
+#   Q4SB_LBW: the Q4SB kernel whose byte map spans a full map row, up to 1150
+#          tokens (SM100 at block_m 16), same cluster / launch bounds / grid
+#          rule
 #   Q4SP : the Q4S kernel with a register prefetch of the next row's logits,
 #          same cluster / launch bounds / grid rule
 #   Q4SP_PG: the Q4SP kernel skipping the emit word pass a batch of at most
@@ -1036,10 +1042,12 @@ ARMS = (
     "LC1_NC",
     "LCG",
     "LCG_LW",
+    "LCG_LW_OWN",
     "M",
     "Q4S",
     "Q4S_E16",
     "Q4SB",
+    "Q4SB_LBW",
     "Q4SP",
     "Q4SP_PG",
     "Q4SP_LR",
