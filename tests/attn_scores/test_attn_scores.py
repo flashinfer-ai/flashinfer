@@ -472,12 +472,15 @@ def test_gpu_schedule_compiles_once(monkeypatch):
 
 
 @pytest.mark.parametrize("over", [0, 1])
-def test_gpu_schedule_smem_cap(over):
+def test_gpu_schedule_smem_cap(over, monkeypatch):
     """The kernel keeps a 4-byte prefix sum per row in dynamic SMEM, so the
     largest batch it can launch is the per-block SMEM opt-in / 4 rows (58112 on
     sm_90a/sm_100a).  At the cap it must run on the GPU; one row over, it must
-    take the CPU fallback instead of failing the launch."""
+    take the CPU fallback instead of failing the launch.  Both paths give the
+    same schedule, so the path taken is asserted directly: a cap that is one row
+    too strict would otherwise pass silently on the CPU."""
     _skip_unless_gpu_schedule()
+    from flashinfer.attn_scores import attn_scores
     from flashinfer.attn_scores.attn_scores import (
         _cached_max_smem_per_block,
         _cached_num_sms,
@@ -492,9 +495,21 @@ def test_gpu_schedule_smem_cap(over):
     seq_lens = torch.randint(0, 65536, (batch_size,), dtype=torch.int32, generator=gen)
     ref = _compute_schedule_metadata(seq_lens, _cached_num_sms(dev)).cuda()
 
+    gpu_calls = []
+    real_gpu_schedule = attn_scores._gpu_schedule
+
+    def spy(*args, **kwargs):
+        gpu_calls.append(args[0].shape[0])
+        return real_gpu_schedule(*args, **kwargs)
+
+    monkeypatch.setattr(attn_scores, "_gpu_schedule", spy)
     got = compute_paged_mqa_logits_schedule(seq_lens.cuda())
     torch.cuda.synchronize()
     assert torch.equal(ref, got), f"B={batch_size}: schedule differs from CPU reference"
+    expected = "GPU kernel" if over == 0 else "CPU fallback"
+    assert bool(gpu_calls) == (over == 0), (
+        f"B={batch_size} (cap {batch_size - over}): expected the {expected}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
