@@ -49,9 +49,14 @@ jobs:
     # For review events, only fire on approval. For synchronize, always fire
     # (the job itself checks whether an approval exists).
     if: >-
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+      (github.event_name == 'pull_request_review'
+       && github.event.pull_request.base.ref == 'main'
+       && github.event.review.state == 'approved')
       || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    concurrency:
+      group: pr-auto-ci-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
@@ -138,12 +143,15 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           # Check if this SHA already has a passing or active run.
+          # Only count runs triggered by the "labeled" event — synchronize-
+          # triggered pr-test.yml runs skip the gate (authorized=false) and
+          # succeed as no-ops, which would falsely block re-triggering.
           PASSED=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "pr-test.yml" \
             --commit "$HEAD_SHA" \
-            --json databaseId,conclusion \
-            --jq '[.[] | select(.conclusion == "success")] | length' \
+            --json databaseId,conclusion,event \
+            --jq '[.[] | select(.conclusion == "success" and .event == "pull_request")] | length' \
             2>/dev/null) || PASSED=0
 
           if [[ "${PASSED:-0}" -gt 0 ]]; then
@@ -187,12 +195,13 @@ jobs:
 
           # Also check if a run is already active for THIS SHA — no need to
           # re-trigger if one is already queued or in-progress.
+          # Same event filter: only count labeled-event runs (real CI).
           ACTIVE=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "pr-test.yml" \
             --commit "$HEAD_SHA" \
-            --json databaseId,status \
-            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' \
+            --json databaseId,status,event \
+            --jq '[.[] | select((.status == "in_progress" or .status == "queued") and .event == "pull_request")] | length' \
             2>/dev/null) || ACTIVE=0
 
           if [[ "${ACTIVE:-0}" -gt 0 ]]; then
