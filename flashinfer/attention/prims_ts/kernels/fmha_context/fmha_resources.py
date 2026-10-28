@@ -181,7 +181,7 @@ def _mask_score_quad(
     first_bit: cutlass.Constexpr[int] = 0,
 ) -> tuple[Float32, Float32, Float32, Float32]:
     """Expand bits ``first_bit + [0, 4)`` with setp and replace invalid scores."""
-    tests = "".join(
+    compare = "".join(
         f"and.b32 bit, {{$r0}}, {1 << (first_bit + i):#x};\n"
         f"setp.ne.u32 valid{i}, bit, 0;\n"
         for i in range(4)
@@ -195,8 +195,8 @@ def _mask_score_quad(
             mov.b32 {$w1}, {$r2};
             mov.b32 {$w2}, {$r3};
             mov.b32 {$w3}, {$r4};
-"""
-        + tests
+        """
+        + compare
         + """
             @!valid0 mov.b32 {$w0}, 0xff800000;
             @!valid1 mov.b32 {$w1}, 0xff800000;
@@ -5224,10 +5224,7 @@ class TmemSPResource(MemoryResource):
         """Mask scores of keys ``base_k + [0, N)`` outside ``[window_start, window_end)``.
 
         ``None`` leaves that side unbounded. Each 32-column chunk builds one
-        valid-bit word, so a score costs a bit test and a predicated -inf
-        instead of two create_mask compares, an XOR, an AND and a select. A
-        window as wide as the Q tile masks every K/V tile partially, where the
-        per-score masks dominated the softmax warps' ALU work.
+        valid-bit word, so a score costs a bit test and a predicated -inf.
         """
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
