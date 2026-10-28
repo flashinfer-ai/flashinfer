@@ -552,10 +552,12 @@ TAIL_UP_PREFETCH_N_PAD = (32, 64)
 # ``bf16(bf16(sum) x rstd)``, ``bf16(w x normed)`` in FP32), so its ``y`` and ``out`` are bitwise the resident-B
 # instance's for every input, signed zeros and subnormals included.  ``TAIL_SB_NORM_ROUTES`` maps a TP to the N_PAD of
 # that instance and, per token count, the fewest partials it serves: the cells where it measured faster than the
-# resident-B instance on B300, GB300 and GB200 (paired CUDA-graph timing, both passes beyond the A/A band).
+# resident-B instance on B300, GB300 and GB200 (paired CUDA-graph timing, both passes beyond the A/A band).  The TP8
+# instance serves only with the routed partials prefetched (``TAIL_PARTIAL_PREFETCH_ROUTES``), faster on every cell it
+# served, so its entry keeps the N_PAD alone.
 TAIL_SB_NORM_ROUTES: dict[int, tuple[int, dict[int, int]]] = {
     1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
-    8: (8, {1: 5, 2: 5, 3: 4, 4: 4}),
+    8: (8, {}),
 }
 
 
@@ -587,7 +589,24 @@ def tail_sb_norm_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
 # than the route without it on every part measured (paired CUDA-graph timing, both passes beyond the A/A band; 2 to
 # 16 partials).
 _PrefetchCells = dict[int, tuple[tuple[int, Optional[int], bool], ...]]
-TAIL_PARTIAL_PREFETCH_ROUTES: dict[int, _PrefetchCells] = {}
+TAIL_PARTIAL_PREFETCH_ROUTES: dict[int, _PrefetchCells] = {
+    1: {
+        1: ((4, 6, False), (7, None, True)),
+        2: ((4, 6, False), (7, None, True)),
+        3: ((4, 6, False), (7, None, True)),
+        4: ((4, 6, False), (7, None, True)),
+        5: ((3, 3, False), (5, None, True)),
+        6: ((3, 3, False), (5, None, True)),
+        7: ((3, 3, False), (5, None, True)),
+        8: ((3, 3, False), (5, None, True)),
+    },
+    8: {
+        1: ((4, None, True),),
+        2: ((4, None, True),),
+        3: ((4, None, True),),
+        4: ((3, None, True),),
+    },
+}
 
 
 def tail_partial_prefetch(
