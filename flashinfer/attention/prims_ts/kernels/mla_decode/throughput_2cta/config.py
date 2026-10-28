@@ -21,7 +21,11 @@ the same explicit configuration structure and output-reduction contract.
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import (
+    MAX_MLA_SPLITS_KV,
+    SUPPORTED_MLA_PAGE_SIZES,
+    WARP_LANES,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -270,6 +274,14 @@ class MlaDecodeConfig:
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    # Threshold skip correction in log2 units (binades); 0 disables it.  A positive value
+    # freezes the running row max while a K tile raises it by at most this
+    # amount.  It is a compile-time constant: a runtime scalar stays live in
+    # every softmax iteration and costs registers under the 128-register cap.
+    # With E4M3 P it also lowers the P scale from 448 to ``448 * 2**-T``;
+    # BF16 P stays unscaled.  See ``max_softmax_rescale_threshold_log2`` for
+    # the bounds.
+    softmax_rescale_threshold_log2: float = 0.0
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -348,6 +360,7 @@ def make_mla_decode_config(
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
     fuse_output_quant: bool = False,
+    softmax_rescale_threshold_log2: float = 0.0,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     cfg = MlaDecodeConfig()
@@ -362,6 +375,8 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    # Range-checked by MlaDecodeTs and plan().
+    cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""
@@ -569,6 +584,13 @@ def make_mla_decode_config(
             "page_size must partition each CTA's K tile unless both CTAs share "
             "one full-tile page: "
             f"tokens_per_k_cta={cfg.tokens_per_k_cta}, page_size={cfg.page_size}"
+        )
+    if cfg.page_size > 1 and WARP_LANES % cfg.pages_per_k_tile != 0:
+        # The BF16 TMA warp and the FP8 K/V loaders read dense page IDs from a
+        # one-entry-per-lane window that must hold whole K tiles.
+        raise ValueError(
+            f"dense MLA needs pages_per_k_tile to divide {WARP_LANES}: "
+            f"pages_per_k_tile={cfg.pages_per_k_tile}"
         )
     _require_divisible(
         "mma_pv_tiler_mn[0]", cfg.mma_pv_tiler[0], "num_mma_ctas", num_mma_ctas

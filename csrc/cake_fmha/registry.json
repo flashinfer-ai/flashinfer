@@ -547,44 +547,6 @@
             "sm_100a": "cuda/context_bf16/default.cu",
             "sm_103a": "cuda/context_bf16/default.cu"
           }
-        },
-        {
-          "selector": {
-            "ENABLE_SINK": 0,
-            "HEADS_PER_GROUP": 5,
-            "IS_CAUSAL": 1,
-            "L2_SWIZZLE": 1,
-            "NUM_M_BLOCKS": 11,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 32,
-            "RETURN_LSE": 0,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25
-          },
-          "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu"
-          }
-        },
-        {
-          "selector": {
-            "ENABLE_SINK": 0,
-            "HEADS_PER_GROUP": 5,
-            "IS_CAUSAL": 1,
-            "L2_SWIZZLE": 8,
-            "NUM_M_BLOCKS": 6,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 1024,
-            "RETURN_LSE": 0,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25
-          },
-          "sources": {
-            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu",
-            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu"
-          }
         }
       ],
       "threads": 512
@@ -4801,6 +4763,16 @@
           "ctype": "int",
           "kind": "value",
           "name": "blocks_per_split"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "bmm1_scalar"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "bmm2_scalar"
         }
       ],
       "parametric_axes": [
@@ -4836,7 +4808,7 @@
       "source_family": [
         {
           "selector": {
-            "FULL_BLOCKS": 1,
+            "FULL_BLOCKS": 0,
             "PAGE_SIZE": 16
           },
           "sources": {
@@ -4846,7 +4818,33 @@
         },
         {
           "selector": {
-            "FULL_BLOCKS": 1,
+            "FULL_BLOCKS": 0,
+            "PAGE_SIZE": 32
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
+          }
+        },
+        {
+          "selector": {
+            "BLOCKS_PER_SPLIT": 16,
+            "ENABLE_PDL": 1,
+            "FULL_BLOCKS": 0,
+            "NUM_SPLITS": 8,
+            "PAGE_SIZE": 16
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8/default.cu"
+          }
+        },
+        {
+          "selector": {
+            "BLOCKS_PER_SPLIT": 16,
+            "ENABLE_PDL": 1,
+            "FULL_BLOCKS": 0,
+            "NUM_SPLITS": 8,
             "PAGE_SIZE": 32
           },
           "sources": {
@@ -4891,6 +4889,11 @@
           "ctype": "int",
           "kind": "value",
           "name": "num_split"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "bmm2_scalar"
         }
       ],
       "parametric_axes": [],
@@ -4898,6 +4901,16 @@
       "source_family": [
         {
           "selector": {},
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8_reduce/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8_reduce/default.cu"
+          }
+        },
+        {
+          "selector": {
+            "FIXED_NUM_SPLITS": 8,
+            "USE_PDL": 1
+          },
           "sources": {
             "sm_100a": "cuda/decode_quant_fp8_reduce/default.cu",
             "sm_103a": "cuda/decode_quant_fp8_reduce/default.cu"
@@ -5000,6 +5013,16 @@
           "ctype": "int",
           "kind": "value",
           "name": "blocks_per_split"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "bmm1_scalar"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "bmm2_scalar"
         }
       ],
       "parametric_axes": [

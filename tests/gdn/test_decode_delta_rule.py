@@ -4492,6 +4492,71 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     return a, b, A_log, dt_bias
 
 
+def test_decode_pretranspose_accepts_scalar_aligned_views():
+    """Gate/parameter views with only element-size alignment must be accepted.
+
+    Regression test: the scalar-loaded operands (a, b, A_log, dt_bias) were
+    wrapped with from_dlpack(assumed_align=16), rejecting contiguous views
+    whose base pointer is not 16-byte aligned, e.g. the second half of a
+    packed [B, 2*HV] gate buffer when HV % 8 != 0.
+    """
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    B, H, HV, D = 2, 2, 4, 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool = torch.randn(B + 1, HV, D, D, dtype=torch.float32, device=dev)
+    indices = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
+    # Offset by one element: contiguous but only element-size aligned.
+    A_log = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    dt_bias = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    # Packed [B, 2*HV] gate buffer: the second half starts at HV * 2 = 8
+    # bytes into the allocation when HV % 8 != 0.
+    gates = torch.randn(B, 2 * HV, dtype=torch.bfloat16, device=dev)
+    b, a = gates.chunk(2, dim=-1)
+    assert A_log.data_ptr() % 16 == 4 and a.data_ptr() % 16 == 8
+
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state_indices=indices,
+        backend="flashinfer",
+    )
+    out_view = torch.empty(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool_view = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log,
+        a=a.unsqueeze(1),
+        dt_bias=dt_bias,
+        b=b.unsqueeze(1),
+        output=out_view,
+        initial_state=pool_view,
+        **kw,
+    )
+    out_clone = torch.empty_like(out_view)
+    pool_clone = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log.clone(),
+        a=a.contiguous().unsqueeze(1),
+        dt_bias=dt_bias.clone(),
+        b=b.contiguous().unsqueeze(1),
+        output=out_clone,
+        initial_state=pool_clone,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_view, out_clone, atol=0, rtol=0)
+    torch.testing.assert_close(pool_view, pool_clone, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
@@ -4585,9 +4650,11 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
 # ==============================================================================
 # Operand dtype handling and compile-cache ownership
 # ==============================================================================
-# These decode kernels are bf16-only internally: q/k/v/a/b move through fragments
-# declared `cutlass.BFloat16` and results are stored with `cutlass.BFloat16(...)`,
-# while the public API documents fp16 q/k/v. Their compile caches are also
+# Most of these decode kernels are bf16-only internally: q/k/v/a/b move through
+# fragments declared `cutlass.BFloat16` and results are stored with
+# `cutlass.BFloat16(...)`, while the public API documents fp16 q/k/v. The
+# nontranspose kernel is the exception -- it converts every operand on load, so
+# only its output store is bf16-bound. Their compile caches are also
 # process-global and keyed by hand. The tests below pin three contracts that no
 # other test in this file covers, because every other dtype parametrization here is
 # bf16-only:
@@ -4595,18 +4662,20 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
 #   2. one operand dtype must not poison another's cache entry at equal geometry;
 #   3. a default-allocated `output` is owned by the caller, not by the cache.
 
-# case -> (seq_len, state dtype). Batch size is fixed at 4 in the trimmed
-# regressions below (one representative per bug). B*HV still selects ILP4 vs
-# wide-vector at other call sites in this file.
+# case -> (seq_len, state dtype, state layout). Batch size is fixed at 4 in the
+# trimmed regressions below (one representative per bug). B*HV still selects ILP4
+# vs wide-vector at other call sites in this file.
 _DTYPE_CASES = {
-    "fp32_state_mtp": (2, torch.float32),
-    "bf16_state_t1": (1, torch.bfloat16),
-    "bf16_state_mtp": (2, torch.bfloat16),
+    "fp32_state_mtp": (2, torch.float32, "v_major"),
+    "bf16_state_t1": (1, torch.bfloat16, "v_major"),
+    "bf16_state_mtp": (2, torch.bfloat16, "v_major"),
+    "legacy_pretranspose": (1, torch.float32, "v_major"),
+    "nontranspose": (1, torch.float32, "k_major"),
 }
 
 
 def _dtype_case_inputs(case, dtype, batch_size, seed=0, dt_bias_dtype=torch.float32):
-    seq_len, state_dtype = _DTYPE_CASES[case]
+    seq_len, state_dtype, state_layout = _DTYPE_CASES[case]
     device = torch.device("cuda")
     H, HV, D = 16, 32, 128
     torch.manual_seed(seed)
@@ -4623,6 +4692,7 @@ def _dtype_case_inputs(case, dtype, batch_size, seed=0, dt_bias_dtype=torch.floa
         state=(
             torch.randn(batch_size, HV, D, D, dtype=state_dtype, device=device) * 0.01
         ).contiguous(),
+        state_layout=state_layout,
         scale=1.0 / math.sqrt(D),
     )
 
@@ -4662,6 +4732,8 @@ def _dtype_case_run(case, x, output=None):
             disable_state_update=True,
             **common,
         )
+    elif case == "nontranspose":
+        out, _ = gated_delta_rule_decode(state=x["state"].clone(), **common)
     else:
         out, _ = gated_delta_rule_decode_pretranspose(
             state=x["state"].clone(), **common
@@ -4670,12 +4742,16 @@ def _dtype_case_run(case, x, output=None):
 
 
 def _dtype_case_reference(x):
+    # Reference takes a K-major [B, HV, K, V] state; most of these kernels take
+    # V-major, the nontranspose one is already K-major.
+    state = x["state"].float()
+    if x["state_layout"] == "v_major":
+        state = state.transpose(-2, -1)
     out, _, _ = verify_delta_rule(
         q=x["q"],
         k=x["k"],
         v=x["v"],
-        # Reference takes a K-major [B, HV, K, V] state; the kernels take V-major.
-        state=x["state"].float().transpose(-2, -1).contiguous(),
+        state=state.contiguous(),
         A_log=x["A_log"].float(),
         a=x["a"],
         dt_bias=x["dt_bias"].float(),
@@ -4689,13 +4765,16 @@ def _dtype_case_reference(x):
     return out
 
 
-@pytest.mark.parametrize("case", ["fp32_state_mtp", "bf16_state_t1"])
+@pytest.mark.parametrize(
+    "case",
+    ["fp32_state_mtp", "bf16_state_t1", "legacy_pretranspose", "nontranspose"],
+)
 def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size=4):
     """fp16 q/k/v/a/b must be converted to bf16, not bit-reinterpreted.
 
     The kernels declare their staging fragments bf16, so handing them an fp16
     descriptor silently produces garbage (output collapsed to ~0 on the FP32-state
-    MTP path, ~100x too large on the BF16-state path).
+    MTP and legacy pretranspose paths, ~100x too large on the BF16-state path).
     """
     _skip_if_not_sm90_or_later()
     x_bf16 = _dtype_case_inputs(case, torch.bfloat16, batch_size)
@@ -4731,7 +4810,10 @@ def test_gdn_decode_compile_cache_survives_dtype_interleaving(batch_size=4):
     torch.testing.assert_close(again.float(), first.float(), atol=0, rtol=0)
 
 
-def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
+@pytest.mark.parametrize(
+    "case", ["bf16_state_mtp", "legacy_pretranspose", "nontranspose"]
+)
+def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
     """fp32 and bf16 dt_bias are separate specializations of the same geometry.
 
     The public docstring documents dt_bias as bf16 or float32, and the kernels read
@@ -4739,7 +4821,6 @@ def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
     regardless of which compiles first.
     """
     _skip_if_not_sm90_or_later()
-    case = "bf16_state_mtp"
     for dt_bias_dtype in (torch.float32, torch.bfloat16, torch.float32):
         x = _dtype_case_inputs(
             case, torch.bfloat16, batch_size, dt_bias_dtype=dt_bias_dtype
@@ -4748,6 +4829,47 @@ def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
         torch.testing.assert_close(
             out.float(), _dtype_case_reference(x).float(), atol=3e-4, rtol=3e-2
         )
+
+
+@pytest.mark.parametrize("case", ["legacy_pretranspose", "nontranspose"])
+def test_gdn_decode_legacy_compile_key_covers_operand_dtypes(case, batch_size=4):
+    """Every polymorphic operand dtype the legacy keys omitted is its own specialization.
+
+    Both kernels convert a/b on load and convert on the output store, so a
+    caller-supplied fp16 `output=` and activations that do not all share q.dtype are
+    legitimate variants -- but the keys carried only q.dtype, so the first-compiled
+    variant claimed the entry and the next one hit a TVM-FFI signature mismatch.
+    """
+    _skip_if_not_sm90_or_later()
+    x = _dtype_case_inputs(case, torch.bfloat16, batch_size)
+    ref = _dtype_case_reference(x).float()
+    baseline = _dtype_case_run(case, x)
+
+    B, T, _, D = x["q"].shape
+    HV = x["v"].shape[2]
+    fp16_output = torch.zeros(B, T, HV, D, dtype=torch.float16, device=x["q"].device)
+    variants = {
+        "fp16 output buffer": _dtype_case_run(case, x, output=fp16_output),
+        "fp16 a/b with bf16 q": _dtype_case_run(
+            case, dict(x, a=x["a"].half(), b=x["b"].half())
+        ),
+    }
+    for name, out in variants.items():
+        torch.testing.assert_close(
+            out.float(), ref, atol=3e-4, rtol=3e-2, msg=lambda m, n=name: f"{n}: {m}"
+        )
+    assert variants["fp16 output buffer"] is fp16_output, (
+        "a caller-supplied output buffer must be written in place"
+    )
+    # The fp16 store must carry the bf16 result exactly, not a degraded rounding.
+    torch.testing.assert_close(
+        fp16_output, baseline.to(torch.float16), atol=0, rtol=0, check_dtype=False
+    )
+
+    # The extra specializations must not have displaced the original entry.
+    torch.testing.assert_close(
+        _dtype_case_run(case, x).float(), baseline.float(), atol=0, rtol=0
+    )
 
 
 def test_gdn_decode_default_output_is_not_shared(batch_size=4):

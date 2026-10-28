@@ -24,6 +24,147 @@ from flashinfer.cudnn import decode, prefill
 from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
+@pytest.mark.parametrize(
+    "version,backend,native,runtime,expected",
+    [
+        ("1.30.0", 92700, True, True, False),
+        ("1.31.0", 92700, True, True, False),
+        ("1.31.0+local", 92700, True, True, False),
+        ("1.32.0.dev1", 92700, True, True, False),
+        ("1.32.0rc1", 92700, True, True, False),
+        ("1.32.0+local", 92700, True, True, True),
+        ("1.33.0.dev1", 92700, True, True, True),
+        ("unknown", 92700, True, True, False),
+        ("1.32.0", 92600, True, True, False),
+        ("1.32.0", 92700, False, True, False),
+        ("1.32.0", 92700, True, False, False),
+        ("1.32.0", 92700, True, True, True),
+    ],
+)
+def test_paged_auto_requires_qualified_runtime(
+    monkeypatch, version, backend, native, runtime, expected
+):
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(
+            __version__=version,
+            backend_version=lambda: backend,
+            _pybind_module=SimpleNamespace(
+                _SdpaThdBinder=SimpleNamespace(supports_paged_packed_split=native)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        prefill, "cudnn_frontend_frost_runtime_available", lambda: runtime
+    )
+    prefill._cudnn_supports_paged_auto.cache_clear()
+    try:
+        assert prefill._cudnn_supports_paged_auto() is expected
+    finally:
+        prefill._cudnn_supports_paged_auto.cache_clear()
+
+
+def test_attention_handle_binds_current_stream_by_device(monkeypatch):
+    import concurrent.futures
+    import contextlib
+    import itertools
+    import threading
+    from flashinfer.cudnn import utils
+
+    current = threading.local()
+    handles, bound, queries, contexts = itertools.count(1), [], [], []
+
+    def raw_stream(index):
+        queries.append(index)
+        return current.stream
+
+    @contextlib.contextmanager
+    def device_context(device):
+        contexts.append(device)
+        yield
+
+    backend = SimpleNamespace(
+        create_handle=lambda: next(handles),
+        destroy_handle=lambda handle: None,
+        set_stream=lambda handle, stream: bound.append((handle, stream)),
+    )
+    monkeypatch.setattr(utils, "_attention_handles", threading.local())
+    monkeypatch.setattr(utils, "_get_current_raw_stream", raw_stream)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    device = torch.device("cuda", 1)
+    current.stream = 101
+    first = utils.get_cudnn_attention_handle(backend, device=device)
+    assert bound[-1] == (first, 101) and queries[-1] == 1
+    current.stream = 202
+    assert utils.get_cudnn_attention_handle(backend, device=device) == first
+    assert bound[-1] == (first, 202)
+    second = utils.get_cudnn_attention_handle(backend, device=torch.device("cuda", 0))
+    assert second != first and queries[-1] == 0
+    assert contexts == [device, torch.device("cuda", 0)]
+
+    # An explicit Stream remains authoritative, independent of current state.
+    explicit = SimpleNamespace(device=device, cuda_stream=303)
+    assert utils.get_cudnn_attention_handle(backend, explicit) == first
+    assert bound[-1] == (first, 303)
+
+    def other_thread():
+        current.stream = 404
+        return utils.get_cudnn_attention_handle(backend, device=device)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(other_thread).result()
+    assert other not in (first, second) and bound[-1] == (other, 404)
+    assert utils.get_cudnn_attention_handle(backend, device=device) == first
+    assert bound[-1] == (first, 202)
+    with pytest.raises(ValueError, match="either stream or device"):
+        utils.get_cudnn_attention_handle(backend, explicit, device=device)
+
+
+@pytest.mark.parametrize("fallback", ["cold", "missing", "implicit", "default"])
+def test_attention_handle_keeps_torch_stream_fallback(monkeypatch, fallback):
+    import contextlib
+    import threading
+    from flashinfer.cudnn import utils
+
+    calls = []
+    resolved = torch.device("cuda", 1)
+    requested = (
+        None
+        if fallback == "default"
+        else torch.device("cuda")
+        if fallback == "implicit"
+        else resolved
+    )
+
+    def current_stream(device):
+        calls.append(device)
+        return SimpleNamespace(device=resolved, cuda_stream=515)
+
+    def raw_stream(index):
+        raise AssertionError("fallback must retain Torch lazy-init/device resolution")
+
+    bound = []
+    backend = SimpleNamespace(
+        create_handle=lambda: 17,
+        destroy_handle=lambda handle: None,
+        set_stream=lambda handle, stream: bound.append((handle, stream)),
+    )
+    monkeypatch.setattr(utils, "_attention_handles", threading.local())
+    monkeypatch.setattr(
+        utils, "_get_current_raw_stream", None if fallback == "missing" else raw_stream
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: fallback != "cold")
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    assert utils.get_cudnn_attention_handle(backend, device=requested) == 17
+    expected_index = 1 if fallback in ("cold", "missing") else None
+    assert calls == [expected_index] and bound == [(17, 515)]
+    assert set(utils._attention_handles.handles) == {resolved}
+
+
 def test_ordered_execution_feature_detection():
     class Legacy:
         def execute(self, tensor_dict, workspace=None, handle=None):
@@ -37,6 +178,68 @@ def test_ordered_execution_feature_detection():
     assert supports_ordered_cudnn_execution(Ordered)
 
 
+@pytest.mark.parametrize(
+    "version,features,mla,d128",
+    [
+        (
+            "1.30.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            False,
+            False,
+        ),
+        ("1.31.0", {}, False, False),
+        ("1.31.0", {"supports_nonpaged_packed_split": True}, True, False),
+        ("1.31.0", {"supports_nonpaged_d128_packed_split": True}, False, True),
+        (
+            "1.31.0",
+            {
+                "supports_nonpaged_packed_split": True,
+                "supports_nonpaged_d128_packed_split": True,
+            },
+            True,
+            True,
+        ),
+    ],
+)
+def test_bounded_ragged_requires_matching_native_feature(
+    monkeypatch, version, features, mla, d128
+):
+    """A native MLA executor does not establish D128 packed-split support."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(
+            __version__=version,
+            _pybind_module=SimpleNamespace(_SdpaThdBinder=SimpleNamespace(**features)),
+        ),
+    )
+    prefill._cudnn_supports_bounded_ragged.cache_clear()
+    try:
+        assert prefill._cudnn_supports_bounded_ragged() is mla
+        assert prefill._cudnn_supports_bounded_ragged(d128=True) is d128
+        monkeypatch.setattr(
+            prefill, "_cudnn_supports_direct_seqlens", lambda *a, **kw: True
+        )
+        indptr = torch.tensor([0, 16], dtype=torch.int32)
+        for head_dim, supported in ((192, mla), (128, d128)):
+            metadata = prefill._PrefillMetadata(
+                16,
+                2048,
+                True,
+                False,
+                batch_offsets_q=indptr,
+                batch_offsets_k=indptr,
+                max_total_num_rows=64,
+            ).resolve_from_plan(torch.bfloat16, 8, 8, head_dim, 128)
+            assert metadata.max_total_num_rows == (64 if supported else None)
+    finally:
+        prefill._cudnn_supports_bounded_ragged.cache_clear()
+
+
 def test_ordered_execution_errors_are_not_retried(monkeypatch):
     calls = []
 
@@ -45,7 +248,9 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
             calls.append((buffers, kwargs))
             raise RuntimeError("invalid binding")
 
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: 17)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: 17
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     tensor = torch.empty(1)
     with pytest.raises(RuntimeError, match="invalid binding"):
@@ -72,7 +277,9 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
 @pytest.mark.parametrize("ordered", [False, True])
 def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: 23
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     calls = []
 
@@ -169,7 +376,9 @@ def test_decode_public_allocation_and_copy_prepared_boundary(
         lambda **kw: (SimpleNamespace(execute=execute), []),
         raising=False,
     )
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     out, lse = decode.cudnn_batch_decode_with_kv_cache(
         q,
@@ -294,7 +503,9 @@ def test_decode_binding_is_per_call_and_lse_is_base2(
     monkeypatch.setattr(
         decode, "_build_decode_graph", lambda *a, **kw: (graph, []), raising=False
     )
-    monkeypatch.setattr(decode, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        decode, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     plan = decode.prepare_cudnn_batch_decode(
         q, k, v, 0.5, max_sequence_kv=8, window_left=-1, **kwargs
@@ -341,7 +552,10 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     )
 
     monkeypatch.setattr(
-        prefill, "_build_prefill_graph", lambda **kw: (object(), []), raising=False
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
     )
     prepared = prefill.prepare_cudnn_batch_prefill(
         q, kv, kv, 0.5, torch.empty(0), metadata=metadata
@@ -357,6 +571,131 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     )
     assert not matches(replace(metadata, return_lse=True))
     assert not matches(replace(metadata, causal=True))
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_prefill_preparation_history_rebinds_current_plan(
+    monkeypatch, paged, override, return_lse, ordered
+):
+    """Alternating geometries reuse preparations, never previous tensor bindings."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: override)
+    monkeypatch.setattr(prefill, "_cudnn_supports_paged_auto", lambda: True)
+    # CPU tensors cannot satisfy the GPU eligibility predicate. Exercise the
+    # real override-key/binding path using an explicit declared graph shape.
+    monkeypatch.setattr(
+        prefill._PrefillMetadata,
+        "override_shape_from_plan",
+        lambda self, dtype, ragged: (
+            (self.actual_seq_lens_q.shape[0], 2, 4) if override else None
+        ),
+    )
+    monkeypatch.setattr(prefill, "_graph_workspace_size", lambda *args: 0)
+    monkeypatch.setattr(prefill, "supports_native_cudnn_log2", lambda *args: False)
+    monkeypatch.setattr(
+        prefill, "supports_ordered_cudnn_execution", lambda *args: ordered
+    )
+    builds, packs = [], []
+
+    def build(**kwargs):
+        builds.append(kwargs)
+        return SimpleNamespace(get_workspace_size=lambda: 0), []
+
+    def execute(self, q, out, lse, workspace, bindings, kwargs, base, tensor_uids=None):
+        pack = (
+            dict(zip(tensor_uids, bindings, strict=True)) if tensor_uids else bindings
+        )
+        packs.append(pack)
+        assert pack[prefill.UIDs.Q_UID.value] is q
+        assert pack[prefill.UIDs.O_UID.value] is out
+        if return_lse:
+            assert pack[prefill.UIDs.STATS_UID.value] is lse
+        return out, lse
+
+    monkeypatch.setattr(prefill, "_build_prefill_graph", build, raising=False)
+    monkeypatch.setattr(prefill.CudnnPrefillGraph, "_execute", execute)
+    cache, identities = [], {}
+    previous = None
+    workspace = torch.empty(0, dtype=torch.uint8)
+    for batch in [1, 3] * 4:
+        q = torch.empty(batch * 2, 4, 8, dtype=torch.bfloat16)
+        kv = torch.empty((16, 2, 4, 8) if paged else (batch * 4, 2, 8), dtype=q.dtype)
+        lengths = torch.full((batch, 1, 1, 1), 2, dtype=torch.int32)
+        metadata = prefill._PrefillMetadata(
+            2,
+            4,
+            False,
+            return_lse,
+            actual_seq_lens_q=lengths,
+            actual_seq_lens_kv=lengths.clone(),
+            block_tables=torch.zeros(batch, 1, dtype=torch.int32) if paged else None,
+        )
+        plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device, previous)
+        assert (plan.override is not None) == override
+        prepared = prefill._reuse_cudnn_prefill_preparation(
+            cache, q, kv, kv, 0.5, workspace, plan=plan, return_lse=return_lse
+        )
+        assert (prepared.override_cache is not None) == override
+        assert prepared is identities.setdefault(batch, prepared)
+        # New output and metadata storage must be bound even after a cache hit.
+        for _ in range(2):
+            output = torch.empty_like(q)
+            stats = torch.empty(q.shape[:2]) if return_lse else None
+            prepared.run_planned(q, kv, kv, output, stats, workspace, plan=plan)
+            pack = packs[-1]
+            assert (
+                pack[prefill.UIDs.ACTUAL_SEQ_LENS_Q_UID.value].data_ptr()
+                == lengths.data_ptr()
+            )
+            assert pack[prefill.UIDs.K_UID.value] is kv
+        previous = plan
+    assert len(builds) == 2
+    assert len({id(pack) for pack in packs}) == len(packs)
+    assert all(item.__class__ is prefill.CudnnPrefillGraph for item in cache)
+
+    # Scale changes are graph facts. History is bounded and evicts the oldest
+    # preparation; it must not accidentally reuse a graph for a different scale.
+    oldest = cache[-1]
+    for scale in [0.25, 0.125, 0.0625, 0.03125]:
+        prepared = prefill._reuse_cudnn_prefill_preparation(
+            cache, q, kv, kv, scale, workspace, plan=plan, return_lse=return_lse
+        )
+        assert prepared.matches_plan(q, kv, kv, scale, plan, return_lse)
+        assert not prepared.matches_plan(q, kv, kv, 0.5, plan, return_lse)
+        assert len(cache) <= 4
+    assert oldest not in cache
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
+    from flashinfer.prefill import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
+
+    cls = (
+        BatchPrefillWithPagedKVCacheWrapper
+        if paged
+        else BatchPrefillWithRaggedKVCacheWrapper
+    )
+    wrapper = cls.__new__(cls)
+    wrapper._cudnn_prepared = object()
+    wrapper._cudnn_prepared_cache = [object(), object()]
+    empty = torch.empty
+
+    def host_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", host_empty)
+    wrapper.reset_workspace_buffer(
+        torch.empty(1024, dtype=torch.uint8), torch.empty(1024, dtype=torch.uint8)
+    )
+    assert wrapper._cudnn_prepared is None
+    assert wrapper._cudnn_prepared_cache == []
 
 
 @pytest.mark.parametrize(
@@ -380,7 +719,9 @@ def test_prefill_metadata_rebind_and_lse_base(monkeypatch, lse_base, expected):
         seen.append(pack)
         pack[prefill.UIDs.STATS_UID.value].fill_(1)
 
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: None)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: None
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     plan = prefill.CudnnPrefillGraph(
         None, SimpleNamespace(execute=execute), override_cache=None, return_lse=True
@@ -487,10 +828,15 @@ def test_prefill_hn_override_key_ignores_runtime_token_count(monkeypatch, suppor
         assert (keys[1] == keys[2]) == (supported and override is not None)
 
 
-def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
+@pytest.mark.parametrize("backend_lowering", [None, False, True])
+def test_prefill_hn_same_plan_rebinds_current_output_stride(
+    monkeypatch, backend_lowering
+):
     monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: True)
-    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(
+        prefill, "_create_cudnn_handle", lambda stream=None, **kwargs: 23
+    )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
     q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
     kv = torch.empty(7, 2, 8, dtype=q.dtype)
@@ -511,8 +857,38 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
     )
     calls = []
 
+    operand_uids = {
+        getattr(prefill.UIDs, name).value
+        for name in (
+            "Q_UID",
+            "K_UID",
+            "V_UID",
+            "O_UID",
+            "STATS_UID",
+            "ACTUAL_SEQ_LENS_Q_UID",
+            "ACTUAL_SEQ_LENS_KV_UID",
+        )
+    }
+    if backend_lowering is not False:
+        operand_uids.update(
+            getattr(prefill.UIDs, name).value
+            for name in (
+                "RAGGED_Q_UID",
+                "RAGGED_O_UID",
+                "RAGGED_STATS_UID",
+                "RAGGED_K_UID",
+                "RAGGED_V_UID",
+            )
+        )
+    observations = []
+
     class Graph:
+        def _variant_pack_uids(self):
+            observations.append(True)
+            return None if backend_lowering is None else sorted(operand_uids)
+
         def execute(self, buffers, *, tensor_uids=None, **kwargs):
+            assert set(kwargs["override_uids"]) == operand_uids
             calls.append(kwargs)
 
     plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
@@ -543,3 +919,56 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
         at = call["override_uids"].index(prefill.UIDs.STATS_UID.value)
         assert call["override_strides"][at] == [4 * tokens, tokens, 1, 1]
     assert calls[0]["override_strides"] is not calls[1]["override_strides"]
+    assert observations == [True]  # The graph layout is observed once, before reuse.
+
+
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("shape_override", [False, True])
+def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported, shape_override):
+    """A larger lifetime capacity must not reuse a smaller compiled graph."""
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_bounded_ragged", lambda **kw: supported
+    )
+    monkeypatch.setattr(prefill, "_cudnn_supports_direct_seqlens", lambda *a, **k: True)
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_shape_override", lambda: shape_override
+    )
+    monkeypatch.setattr(
+        prefill,
+        "_build_prefill_graph",
+        lambda **kw: (SimpleNamespace(get_workspace_size=lambda: 0), []),
+        raising=False,
+    )
+    indptr = torch.tensor([0, 128, 129, 130], dtype=torch.int32)
+    q = torch.empty(130, 16, 128, dtype=torch.bfloat16)
+    kv = torch.empty(3 * 2048, 4, 128, dtype=q.dtype)
+
+    def metadata(capacity):
+        resolved = prefill._PrefillMetadata(
+            128,
+            2048,
+            False,
+            False,
+            batch_offsets_q=indptr,
+            batch_offsets_k=indptr,
+            max_total_num_rows=capacity,
+        ).resolve_from_plan(q.dtype, 16, 4, 128, 128)
+        resolved._bounded_ragged = supported
+        return resolved
+
+    first = metadata(130)
+    plan = prefill._CudnnPrefillPlan.prepare(first, q.dtype, q.device)
+    prepared = prefill.prepare_cudnn_batch_prefill(
+        q, kv, kv, 0.5, torch.empty(0), metadata=first
+    )
+    same = prefill._CudnnPrefillPlan.prepare(metadata(130), q.dtype, q.device, plan)
+    larger = prefill._CudnnPrefillPlan.prepare(metadata(384), q.dtype, q.device, plan)
+    assert same is plan
+    assert prepared.matches_plan(q, kv, kv, 0.5, same, False)
+    assert prepared.matches_plan(q, kv, kv, 0.5, larger, False) is not supported
+    assert plan.execution_shape == (3, 128, 2048)
+    if supported:
+        assert first.max_total_num_rows == 130
+        assert larger.metadata.max_total_num_rows >= 384
+    else:
+        assert first.max_total_num_rows is None

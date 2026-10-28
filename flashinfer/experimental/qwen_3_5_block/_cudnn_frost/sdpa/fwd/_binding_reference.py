@@ -473,6 +473,31 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
     geo = resolve_thd_geometry(spec, facts)
+    if getattr(spec, "origin_specs", None) is not None:
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.thd_origins import ROLES
+
+        pointers = []
+        for role, origin in zip(ROLES, spec.origin_specs):
+            offset = facts.get(role)
+            if origin is None:
+                if offset is not None:
+                    raise ValueError("unexpected THD physical-offset operand")
+                pointers.append(None)
+                continue
+            if offset is None:
+                raise ValueError("THD physical-offset operand is required")
+            on_plan_device(role, offset)
+            if (
+                offset.dtype != f"int{origin[3]}"
+                or not offset.contiguous
+                or offset.numel != geo.b + 1
+                or 0 <= offset.span < geo.b + 1
+                or not offset.ptr
+                or offset.ptr % (origin[3] // 8)
+            ):
+                raise ValueError("THD physical offsets require contiguous declared-width B+1 storage")
+            pointers.append(offset.ptr)
+        frame[ix["thd_origin_ptrs"]] = tuple(pointers)
     frame[ix["q_ptr"]], frame[ix["k_ptr"]], frame[ix["v_ptr"]], frame[ix["o_ptr"]] = q.ptr, k.ptr, v.ptr, o.ptr
     for name, slot in (("q", "q_strides"), ("o", "o_strides")) + (() if spec.paged else (("k", "k_strides"), ("v", "v_strides"))):
         ts, hs, _es, _row = geo.roles[name]
@@ -562,10 +587,18 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
     # device lengths may change during replay within this captured bound.
     # Keep a persistent kernel's smaller resident-cluster limit as well.
-    units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    wave_geometry = getattr(spec, "wave_geometry", None)
+    unit_rows, unit_heads = (spec.cga_tile_m, spec.qh) if wave_geometry is None else wave_geometry[:2]
+    units = ((t_q - 1) // unit_rows + geo.b) * unit_heads
     if split is not None:
         units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
+    policy = getattr(spec, "wave_policy", None)
+    if policy is not None:
+        envelope, resident, initial_waves = policy
+        bound = min(envelope, units)
+        limit = resident * initial_waves if wave_geometry is None else wave_geometry[2]
+        frame[ix["n_thd_units"]] = bound if bound <= limit else resident
 
     sinks = facts.get("sinks")
     if spec.has_sink:
@@ -956,7 +989,12 @@ class ReferenceThdBinder(_ReferenceBinder):
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.prepared import _NATIVE_THD_ROLES
 
         spec = self.spec
-        facts = self.facts(pack, indices, _NATIVE_THD_ROLES + _native_quant_roles(spec.quant))
+        roles = _NATIVE_THD_ROLES + _native_quant_roles(spec.quant)
+        if getattr(spec, "origin_specs", None) is not None:
+            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.thd_origins import ROLES
+
+            roles += ROLES
+        facts = self.facts(pack, indices, roles)
         if spec.quant is not None:
             return execute_quantized(spec, facts, workspace, stream, int(stream), scale_softmax_log2=scale)
         return execute_thd(spec, facts, workspace, stream, int(stream), scale)

@@ -14,6 +14,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
     unswizzle_expert_scales,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
+    _E8M0_K32_BF16_MAX_SCALE_BYTE,
     prepare_w4a16_compressed_tensors_weights,
     prepare_w4a16_fp4_e8m0_k32_weights,
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
@@ -450,8 +451,12 @@ def test_fp4_e8m0_k32_scales_clamp_high_bytes_and_keep_scale_count(
     w2_scale_bytes = w2_e8m0_scale.view(torch.uint8)
     w13_source_scale_bytes = w13_scale_bytes.clone()
     w2_source_scale_bytes = w2_scale_bytes.clone()
-    w13_clamped_scale_bytes = w13_source_scale_bytes.clamp(max=247)
-    w2_clamped_scale_bytes = w2_source_scale_bytes.clamp(max=247)
+    w13_clamped_scale_bytes = w13_source_scale_bytes.clamp(
+        max=_E8M0_K32_BF16_MAX_SCALE_BYTE
+    )
+    w2_clamped_scale_bytes = w2_source_scale_bytes.clamp(
+        max=_E8M0_K32_BF16_MAX_SCALE_BYTE
+    )
     w13_global_scale = (torch.rand(experts, device="cuda") * 0.5 + 0.25).to(
         torch.float32
     )
@@ -491,8 +496,8 @@ def test_fp4_e8m0_k32_scales_clamp_high_bytes_and_keep_scale_count(
     if reuse_input_storage:
         assert actual.w13_scale.data_ptr() == w13_e8m0_scale.data_ptr()
         assert actual.w2_scale.data_ptr() == w2_e8m0_scale.data_ptr()
-        assert int(w13_scale_bytes.max().item()) <= 247
-        assert int(w2_scale_bytes.max().item()) <= 247
+        assert int(w13_scale_bytes.max().item()) <= _E8M0_K32_BF16_MAX_SCALE_BYTE
+        assert int(w2_scale_bytes.max().item()) <= _E8M0_K32_BF16_MAX_SCALE_BYTE
     else:
         assert actual.w13_scale.data_ptr() != w13_e8m0_scale.data_ptr()
         assert actual.w2_scale.data_ptr() != w2_e8m0_scale.data_ptr()
@@ -502,8 +507,14 @@ def test_fp4_e8m0_k32_scales_clamp_high_bytes_and_keep_scale_count(
     assert actual.w2_scale.view(torch.uint8).shape == expected_w2_packed.shape
     assert torch.equal(actual.w13_scale.view(torch.uint8), expected_w13_packed)
     assert torch.equal(actual.w2_scale.view(torch.uint8), expected_w2_packed)
-    assert int(actual.w13_scale.view(torch.uint8).max().item()) <= 247
-    assert int(actual.w2_scale.view(torch.uint8).max().item()) <= 247
+    assert (
+        int(actual.w13_scale.view(torch.uint8).max().item())
+        <= _E8M0_K32_BF16_MAX_SCALE_BYTE
+    )
+    assert (
+        int(actual.w2_scale.view(torch.uint8).max().item())
+        <= _E8M0_K32_BF16_MAX_SCALE_BYTE
+    )
     assert torch.equal(
         torch.sort(actual.w13_scale.view(torch.uint8).flatten()).values,
         torch.sort(w13_clamped_scale_bytes.flatten()).values,

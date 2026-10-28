@@ -16,6 +16,7 @@ from .quantization import (
     cvt_f32_to_e4m3,
 )
 from .activation import activate
+from .io import pack_scale, combine
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,73 @@ class Pipeline:
         self.down = RoutedBlockscaledGemm(
             tile_k=128, allocation_columns=64, input_route_divisor=1, use_pdl=enable_pdl
         )
+
+    @cute.jit
+    def launch(
+        self,
+        q,
+        sf,
+        ids,
+        weights,
+        w1,
+        s1,
+        w2,
+        s2,
+        packed_sf,
+        partials,
+        midq,
+        midsf,
+        routes,
+        output,
+        problem1: Tuple[
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+        ],
+        problem2: Tuple[
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+        ],
+        weight_dtype: cutlass.Constexpr,
+        narrow_weights: cutlass.Constexpr,
+        finalize: cutlass.Constexpr,
+        stream,
+    ):
+        route_ids = cute.make_tensor(ids.iterator, cute.make_layout(cute.size(ids)))
+        first = (
+            cute.recast_ptr(w1.iterator, dtype=weight_dtype),
+            cute.recast_ptr(s1.iterator, dtype=cutlass.Float8E8M0FNU),
+            q.iterator,
+            cute.recast_ptr(packed_sf.iterator, dtype=cutlass.Float8E8M0FNU),
+            partials.iterator,
+            None,
+            None,
+            problem1,
+            route_ids,
+        )
+        second = (
+            cute.recast_ptr(w2.iterator, dtype=weight_dtype),
+            cute.recast_ptr(s2.iterator, dtype=cutlass.Float8E8M0FNU),
+            midq.iterator,
+            cute.recast_ptr(midsf.iterator, dtype=cutlass.Float8E8M0FNU),
+            routes.iterator,
+            None,
+            None,
+            problem2,
+            route_ids,
+        )
+        pack_scale(sf, packed_sf, midsf, stream)
+        self.gate_up(first, (partials, midq, midsf), stream)
+        self.down_project(second, stream)
+        if cutlass.const_expr(finalize):
+            combine(routes, weights, output, narrow_weights, stream)
 
     @cute.jit
     def gate_up(self, pointers: Tuple, activation: Tuple, stream):

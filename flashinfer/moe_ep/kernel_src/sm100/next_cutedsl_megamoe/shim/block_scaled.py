@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Workspace, descriptor construction, compilation and launch for Blackwell GenPhase.
+"""Workspace, descriptor construction, compilation and launch for Blackwell inference.
 
 The Blackwell frontend supplies native device checks and compiler targets.
 The private source package is imported only inside this shim; DSL imports stay lazy.
@@ -15,6 +15,8 @@ from typing import Any, Literal, Optional, Tuple
 import torch
 
 from flashinfer.moe_ep._compat import deprecated_aliases
+
+from flashinfer.moe_ep.core.tuning_state import AutoTuningState
 
 from . import comm
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
@@ -152,6 +154,8 @@ class BlockScaledMoeConfig:
         if self.activation == "situ":
             for name in ("situ_beta", "situ_linear_beta"):
                 value = getattr(self, name)
+                if name == "situ_linear_beta" and value is None:
+                    continue
                 if value is None or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"SiTU requires positive, finite {name}.")
             if self.gate_up_clamp is not None:
@@ -196,9 +200,9 @@ class BlockScaledMoeConfig:
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
-        if self.hidden % (4 * vec) != 0:
+        if self.hidden % self.hidden_alignment != 0:
             raise ValueError(
-                f"hidden ({self.hidden}) must be a multiple of {4 * vec} "
+                f"hidden ({self.hidden}) must be a multiple of {self.hidden_alignment} "
                 f"for {self.quant_kind}."
             )
         if self.intermediate % (2 * vec) != 0 or self.intermediate % 32 != 0:
@@ -411,6 +415,10 @@ class BlockScaledMoeConfig:
         return _KIND_TABLE[self.quant_kind][2]
 
     @property
+    def hidden_alignment(self) -> int:
+        return 4 * self.sf_vec_size
+
+    @property
     def instruction_k(self) -> int:
         return _KIND_TABLE[self.quant_kind][3]
 
@@ -461,9 +469,13 @@ class BlockScaledSymmBuffer:
         comm.ensure_not_capturing("block-scaled mega workspace allocation")
         self._require_device()
         self._configure_dsl()
-        self.config = config
+        self._tuning_state = AutoTuningState()
+        self.config: BlockScaledMoeConfig = config
         self.device = torch.device("cuda", torch.cuda.current_device())
         cfg = config
+
+        # The driver occupancy query needs a current primary context.
+        torch.cuda.current_stream(self.device)
 
         kernel = self._build_kernel(cfg)
         self.kernel = kernel
@@ -514,6 +526,14 @@ class BlockScaledSymmBuffer:
                 (tokens, cfg.hidden), dtype=torch.bfloat16, device="cuda"
             )
 
+        self.fc1_activation_per_token_scale = (
+            comm.sym_zeros((tokens,), torch.float32)
+            if getattr(cfg, "enable_fc1_activation_per_token_scale", False)
+            else None
+        )
+        if self.fc1_activation_per_token_scale is not None:
+            self.fc1_activation_per_token_scale.fill_(1)
+
         self._allocate_kernel_workspace(kernel)
 
         self._compiled: Optional[Any] = None
@@ -536,7 +556,9 @@ class BlockScaledSymmBuffer:
         self.local_workspace = torch.zeros(
             (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
         )
-        self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
+        self.shared_workspace: torch.Tensor | None = comm.sym_zeros(
+            (max(shared_bytes, 1),), torch.uint8
+        )
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
         if not cfg.reduce_topk_in_kernel:
@@ -574,10 +596,14 @@ class BlockScaledSymmBuffer:
     @classmethod
     def _build_kernel(cls, cfg: BlockScaledMoeConfig):
         import cutlass
-        from blackwell_genphase_sources import BlackwellInferenceGenphaseMegaMoE
-        from blackwell_genphase_sources.api import ImplDesc, ProblemDesc
-        from blackwell_genphase_sources.quant_def import CombineFormat
         from cutlass.cute.nvgpu import OperandMajorMode
+
+        from ..src.sources import (
+            BlackwellInferenceGenphaseMegaMoE,
+            BlackwellInferenceMegaMoE,
+        )
+        from ..src.sources.api import ImplDesc, ProblemDesc
+        from ..src.sources.quant_def import CombineFormat
 
         tiler = cfg.resolved_mma_tiler_mnk
         cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
@@ -664,13 +690,32 @@ class BlockScaledSymmBuffer:
         }
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
+        elif cfg.kernel_variant == "genphase":
+            impl_fields["fc2_tma_stages"] = min(2, tiler[1] // 64)
         if cfg.fallback_cluster_shape_mn is not None:
             impl_fields["fallback_cluster_shape_mn"] = tuple(
                 cfg.fallback_cluster_shape_mn
             )
             impl_fields["preferred_cluster_count"] = preferred_count
             impl_fields["fallback_cluster_count"] = fallback_count
-        return BlackwellInferenceGenphaseMegaMoE(problem_desc, ImplDesc(impl_fields))
+        if cfg.kernel_variant == "inference":
+            fields = dict(problem_desc)
+            fields["fc1_activation_per_token_scale"] = getattr(
+                cfg, "enable_fc1_activation_per_token_scale", False
+            )
+            fields["swiglu_alpha"] = getattr(cfg, "swiglu_alpha", None)
+            fields["swiglu_beta"] = getattr(cfg, "swiglu_beta", None)
+            problem_desc = ProblemDesc(fields)
+            impl_fields["skip_topk_reduce"] = getattr(cfg, "use_custom_finalize", False)
+            impl_fields["topk_reduce_persistent"] = getattr(
+                cfg, "use_persistent_finalize_kernel", False
+            )
+        kernel_cls = (
+            BlackwellInferenceGenphaseMegaMoE
+            if cfg.kernel_variant == "genphase"
+            else BlackwellInferenceMegaMoE
+        )
+        return kernel_cls(problem_desc, ImplDesc(impl_fields))
 
     def note_staged_tokens(self, num_tokens: int) -> None:
         self._staged_tokens = int(num_tokens)
@@ -679,7 +724,7 @@ class BlockScaledSymmBuffer:
         return self._staged_tokens
 
     def _peer_mapper(self):
-        from blackwell_genphase_sources.communication.nvlink_domain.symmetric_buffer import (
+        from ..src.sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
         )
 
@@ -717,12 +762,12 @@ class BlockScaledSymmBuffer:
             },
         }
 
-    def launch(
+    def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile and bind the kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
@@ -753,6 +798,12 @@ class BlockScaledSymmBuffer:
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+
+    def launch(self, transformed_l1, transformed_l2) -> None:
+        """Launch a prepared kernel and retain capture ownership."""
+        if torch.cuda.is_current_stream_capturing():
+            self._tuning_state.graph_captured = True
+        self.prepare(transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -770,6 +821,46 @@ class BlockScaledSymmBuffer:
                     invalid.unsqueeze(-1), sf_byte
                 )
         self._compiled(**self._launch_kwargs)
+
+    def install_tuned_knobs(self, knobs, transformed_l1, transformed_l2) -> None:
+        """Replace execution scratch before capture, keeping staged inputs alive."""
+        from .tuning import is_valid_sm100_knobs
+
+        comm.ensure_not_capturing("Blackwell tuning winner installation")
+        if self._destroyed or self._tuning_state.graph_captured:
+            raise RuntimeError(
+                "cannot tune a destroyed or captured Blackwell workspace"
+            )
+        if not is_valid_sm100_knobs(knobs, self.config):
+            raise ValueError("invalid Blackwell tuning knobs")
+        config = dataclasses.replace(self.config, **knobs)
+        if config != self.config:
+            kernel = self._build_kernel(config)
+            sf_cols = int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if config.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            )
+            if sf_cols != self.sf_cols:
+                raise ValueError("tuning cannot change the staged scale layout")
+            torch.cuda.synchronize()
+            self._compiled = self._launch_key = self._launch_kwargs = None
+            self._launch_weights = None
+            self._pre_reduced_activation = self._pre_reduced_activation_sf = None
+            comm.free_sym_tensor(self.shared_workspace)
+            self.shared_workspace = self.local_workspace = None
+            if config.reduce_topk_in_kernel != self.config.reduce_topk_in_kernel:
+                if self.config.reduce_topk_in_kernel:
+                    comm.free_sym_tensor(self.output_activation)
+                shape = (config.padded_tokens_per_rank, config.hidden)
+                self.output_activation = (
+                    comm.sym_zeros(shape, torch.bfloat16)
+                    if config.reduce_topk_in_kernel
+                    else torch.zeros(shape, dtype=torch.bfloat16, device=self.device)
+                )
+            self.config, self.kernel = config, kernel
+            self._allocate_kernel_workspace(kernel)
+        self.prepare(transformed_l1, transformed_l2)
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -874,10 +965,14 @@ def block_scaled_mega_moe(
         import warnings
 
         warnings.warn(
-            "fast_math=False is a no-op for the block-scaled block-scaled kernel.",
+            "fast_math=False is a no-op for the block-scaled kernel.",
             stacklevel=2,
         )
     cfg = symm_buffer.config
+    if getattr(cfg, "use_custom_finalize", False):
+        raise ValueError(
+            "Custom finalization requires the launch thunk and borrowed partial outputs."
+        )
     if y is not None and (
         y.ndim != 2
         or y.shape[1] != cfg.hidden

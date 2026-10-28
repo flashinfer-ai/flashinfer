@@ -165,7 +165,8 @@ WAVE_FILL_N_FRAG_MAX = {"wave_fill1": 1, "wave_fill": WAVE_N_FRAG_MAX}
 # keeps the occ P = ceil(152 / 128) = 2 (256 CTAs: two waves of ceil(NC / 2) steps) although the wave model scores P = 1
 # (128 CTAs, one wave of NC steps) at the same or fewer walk step-times (111 vs 2 x 56 = 112 on Q2 CP16 Z) and P = 2 adds the
 # segment-composition K4 launches (map before c1, carry_in / carry_start after c2, tmap / dcarry in the backward) plus the
-# backward's offset re-walk.  "wave_fill1_p1tie" = "wave_fill1", then P := 1 on a rank with 2 <= n_frag <= WAVE_N_FRAG_MAX,
+# backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane).  "wave_fill1_p1tie" =
+# "wave_fill1", then P := 1 on a rank with 2 <= n_frag <= WAVE_N_FRAG_MAX,
 # 0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG, P > 1 and n_frag H <= SM (P = 1 runs one wave) when the LPT makespan of the walks
 # at P = 1 over the rank's actual fragment chunk counts is <= the makespan at the base rule's P (p1_tie_steps: the wave
 # model's waves x steps generalised to unequal fragments through lpt_makespan; equal fragments reproduce it exactly).  The
@@ -204,7 +205,7 @@ PRECISION_MODES = (
     0,
     1,
     2,
-)  # 0 shipped TF32 hi/lo, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
+)  # the TF32 hi/lo walk's static knob: 0 the hi/lo form the transfer_walk knob selects, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
 FLAG_CROSSING_IN = 1
 FLAG_CROSSING_OUT = 2
 FLAG_CONTINUING = 4  # the fragment's first outputs read convolution history rows (document offset > 0)
@@ -888,7 +889,8 @@ def kcp_plan(
     with ``nc_frags`` the rank's fragment chunk counts (``None`` = ``n_frag`` equal fragments of ``NC_max_frag`` chunks;
     :func:`_build_head_plan` passes the actual counts) and :func:`p1_tie_steps` the LPT makespan of one equal-segment
     walk at one CTA per SM -- the wave model's ``waves x steps`` for equal fragments.  The segment-composition K4
-    launches and the backward's offset re-walk exist only at ``P > 1``; the one-wave P = 1 walk of 128 CTAs runs at a
+    launches and the backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane) exist
+    only at ``P > 1``; the one-wave P = 1 walk of 128 CTAs runs at a
     higher per-step cost than the two-wave 256-CTA walk, which the GPU A/B measures.
 
     A pure function of ``(fragment table, H, SM count)``.  A rank without fragments has ``P = 1``, ``NSEG = 0``;
@@ -2011,6 +2013,7 @@ def kcp_saved_bytes(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     with_conv: bool = True,
     C: int = 8192,
+    saved_carry: bool = True,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
@@ -2018,11 +2021,15 @@ def kcp_saved_bytes(
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
     + [save_transfer] * N_out * 2 * s * Hg_r / H               # the owner's whole c1 receive tensor
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
+    + [saved_carry] * [P > 1] * (n_frag * (P - 1) + max(n_in, n_out)) * s   # the forward's carry plane (shipped)
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
     the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
+    ``saved_carry`` (default ``True`` = the shipped default: the forward of a ``P > 1`` rank keeps its carry plane in
+    the saved set) counts the whole carry plane of a ``P > 1`` rank under the shipped fused tape walks (one extra slot
+    per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
     recomputes the internal rows in both modes.
@@ -2042,6 +2049,8 @@ def kcp_saved_bytes(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
+    if saved_carry and hp.P > 1:
+        total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
@@ -2140,6 +2149,59 @@ def kcp_comm_bytes(
     }
 
 
+# The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
+# reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
+# a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
+# lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
+SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+# Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
+# a2a exchange never reads.
+LAZY_POOLS = ("ring_out", "ring_in")
+# The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
+FWD_POOLS = (
+    "c1_send",
+    "c1_recv",
+    "c2_send",
+    "stage_b",
+    "stage_m",
+    "carry",
+    "eye",
+) + LAZY_POOLS
+BWD_POOLS = ("b1_send", "b1_recv", "b2_send", "b2_recv")
+
+
+def kcp_pool_numel(
+    ctx: KcpContext, *, H: int = 64, fused_walks: int = 1
+) -> dict[str, int]:
+    """Elements (FP32) of every pool of a rank's KCP workspace and of the call's fresh ``S_in``, by buffer name: the
+    one source of the sizes ``cake_kcp`` gives its pools and fresh tensors.  ``fused_walks`` (shipped ``1``) adds one
+    carry slot per crossing fragment at ``P > 1``; at ``P > 1`` ``c1_send`` also holds one staging tile per head of each
+    crossing-out fragment of this rank (its ``M_f``, transposed into the send layout by the forward)."""
+    H = int(H)
+    hp = ctx.heads(H)
+    n, P, NSEG = hp.numel, int(hp.P), int(hp.NSEG)
+    n_in, n_out = int(ctx.n_in), int(ctx.n_out)
+    n_carry = int(ctx.n_frag) * (P - 1) if P > 1 else 0
+    if fused_walks and P > 1:
+        n_carry += max(n_in, n_out)
+    return {
+        "c1_send": int(n["c1_send"]) + (n_out * H * TILE if P > 1 else 0),
+        "c1_recv": int(n["c1_recv"]),
+        "c2_send": int(n["c2_send"]),
+        "S_in": int(n["c2_recv"]),
+        "b1_send": max(int(n["b1_send_d"]), int(n["b1_send_dm"])),
+        "b1_recv": max(int(n["b1_recv_d"]), int(n["b1_recv_dm"])),
+        "b2_send": int(n["b2_send"]),
+        "b2_recv": int(n["b2_recv"]),
+        "stage_b": NSEG * H * TILE if P > 1 else 0,
+        "stage_m": NSEG * H * TILE if P > 1 else 0,
+        "carry": n_carry * H * TILE,
+        "eye": TILE,
+        "ring_out": max(n_in, n_out) * H * TILE,
+        "ring_in": max(n_in, n_out) * H * TILE,
+    }
+
+
 def kcp_arena_layout(
     ctx: KcpContext,
     *,
@@ -2149,41 +2211,32 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP arena's transient buffers in bytes (``KcpWorkspace``; SPEC-4: the saved-set tensors ``S_in``, the
-    c1 receive tensor with ``save_transfer``, ``M_seg`` with ``save_transfer`` at ``P > 1`` and ``hist`` are NOT
-    here).  ``forward`` / ``backward`` are the two lifetimes' sums; ``arena`` is their maximum (one reusable arena).
-    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each; transient
-    in both lifetimes; the ``stage_m`` plane retained as ``M_seg`` with ``save_transfer`` is counted by :func:`kcp_saved_bytes`)."""
+    """The KCP pools of a rank's workspace (``cake_kcp.KcpWorkspace``) in bytes, as the workspace allocates them.
+
+    ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
+    (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
+    a call with ``exchange="ring"`` adds on first use).  The saved set (``S_in``, the c1 receive tensor kept with
+    ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
+    pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
+    (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
+    so ``save_transfer`` and ``C`` leave the workspace unchanged."""
     _check_save_mode(save_mode)
-    H, C = int(H), int(C)
-    hp = ctx.heads(H)
-    n, halo = hp.numel, ctx.halo
-    staging = n["staging"]
-    fwd = {
-        "c1_send": n["c1_send"] * 4,
-        "c1_recv": 0 if save_transfer else n["c1_recv"] * 4,
-        "c2_send": n["c2_send"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "halo_send": sum(halo.fwd_send_rows) * C * 2,
+    numel = kcp_pool_numel(ctx, H=H)
+    need = {
+        name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    b1_send, b1_recv = hp.b1_splits(not save_transfer)
-    bwd = {
-        "b1_send": sum(b1_send) * 4,
-        "b1_recv": sum(b1_recv) * 4,
-        "b2_send": n["b2_send"] * 4,
-        "b2_recv": n["b2_recv"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "dpre_head": halo.n_head_rows * C * 4,
-        "dpre_tail": halo.n_tail_rows * C * 4,
-    }
-    out = {f"fwd.{k}": v for k, v in fwd.items()}
-    if backward:
-        out.update({f"bwd.{k}": v for k, v in bwd.items()})
-    out["forward"] = sum(fwd.values())
-    out["backward"] = sum(bwd.values()) if backward else 0
-    out["arena"] = max(out["forward"], out["backward"])
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    arena = sum(
+        v for name, v in need.items() if name not in shared and name not in LAZY_POOLS
+    )
+    arena += sum(
+        max((need[name] for name in pair if name in need), default=0)
+        for pair in SHARED_POOLS
+    )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["arena"] = arena
     return out
 
 
@@ -2271,7 +2324,7 @@ def kcp_workspace_bytes(
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
     P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
-    is set, holds only known keys and selects a known ``precision_mode`` (0 shipped TF32 hi/lo; 1 the explicit
+    is set, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
     (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
     wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by
@@ -2322,6 +2375,10 @@ __all__ = [
     "P_RULES",
     "P_RULE_DEFAULT",
     "SAVE_TRANSFER_DEFAULT",
+    "SHARED_POOLS",
+    "LAZY_POOLS",
+    "FWD_POOLS",
+    "BWD_POOLS",
     "STATE_TILE_BYTES",
     "SUMMARY_TILE",
     "TABLE_NAMES",
@@ -2342,6 +2399,7 @@ __all__ = [
     "head_groups",
     "kcp_arena_layout",
     "kcp_comm_bytes",
+    "kcp_pool_numel",
     "kcp_partition",
     "kcp_plan",
     "kcp_saved_bytes",

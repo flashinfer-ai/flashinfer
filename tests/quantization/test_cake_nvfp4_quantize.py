@@ -120,15 +120,17 @@ def test_quantizer_takes_the_static_k_instance_below_the_row_limit():
                     assert KERNELS[arch][runtime_key] not in set(family.values())
             # A strided view cannot take the compiled-in instance (the program assumes
             # contiguous rows); the runtime-geometry sibling it falls back to exists only
-            # where the validated matrix reaches that CTA shape -- see
-            # test_row_strided_activation_at_a_new_width_names_its_missing_program.
+            # where the validated matrix reaches that CTA shape, else the rows run the
+            # nearest registered program -- see
+            # test_row_strided_activation_at_a_new_width_runs_a_registered_program.
             strided = cb.quant_plan(
                 m, k, True, True, "sm_100a", 148, x_row_stride=k + 16
             )
             if m == 1:
                 assert strided == plan
             else:
-                assert strided.kernel_key == runtime_key and strided.k_static is None
+                key = strided.unregistered_key or strided.kernel_key
+                assert key == runtime_key and strided.k_static is None
         # the row counts of the tier span exactly two CTA shapes per width
         shapes = {
             cb.cta_config(k, m) for m in (1, 8, 16, 130, 511, cb.LARGE_ROW_MIN_M, 2048)
@@ -151,28 +153,31 @@ def test_quantizer_takes_the_static_k_instance_below_the_row_limit():
     assert other.k_static is None
 
 
-def test_row_strided_activation_at_a_new_width_names_its_missing_program():
+def test_row_strided_activation_at_a_new_width_runs_a_registered_program():
     """A row-strided activation cannot take the compiled-in instance -- the program assumes
-    contiguous rows -- so it falls back to the runtime-geometry key of the same CTA shape.
-    The CTA shapes that only the new widths reach (K = 2688 / 4096 at or above
-    LARGE_ROW_MIN_M) have no runtime-geometry program in this package, and the dispatcher
-    names the missing key instead of mis-dispatching.  Generating the runtime-geometry
-    sibling of those shapes is a recorded follow-up."""
-    named = 0
+    contiguous rows -- so it takes the runtime-geometry key of the same CTA shape.  The
+    CTA shapes that only the new widths reach (K = 2688 / 4096) have no runtime-geometry
+    program in this package: those rows run the nearest registered runtime-geometry
+    program of the same input dtype and folded scale whose CTA holds the row (one CTA per
+    padded row), and the plan records the key it replaces."""
+    replaced = 0
     for k in (2688, 4096):
-        for m in (cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
-            plan = cb.quant_plan(m, k, True, False, "sm_100a", 148, x_row_stride=k + 16)
-            assert plan.k_static is None
-            if plan.kernel_key in KERNELS["sm_100a"]:
-                continue
-            named += 1
-            with pytest.raises(
-                NotImplementedError, match=r"quant:t\d+_b\d+_mb\d+_bf16"
-            ):
-                kernel_module_name("sm_100a", plan.kernel_key)
-    assert (
-        named > 0
-    )  # recorded follow-up: runtime-geometry sibling of the new CTA shapes
+        for m in (2, 130, cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
+            for fold in (False, True):
+                plan = cb.quant_plan(
+                    m, k, True, fold, "sm_100a", 148, x_row_stride=k + 16
+                )
+                assert plan.k_static is None and plan.kernel_key in KERNELS["sm_100a"]
+                if plan.unregistered_key is None:
+                    continue
+                replaced += 1
+                assert plan.unregistered_key not in KERNELS["sm_100a"]
+                assert not re.search(r"_k\d+$", plan.kernel_key), plan.kernel_key
+                assert ("_fold" in plan.kernel_key) == fold
+                assert "_bf16" in plan.kernel_key
+                assert plan.threads * plan.blocks_per_thread * 16 >= k
+                assert plan.grid == plan.padded_rows and plan.cluster_split == 1
+    assert replaced > 0
 
 
 def test_quant_plan_grid_and_keys():
@@ -193,11 +198,45 @@ def test_quant_plan_grid_and_keys():
     # One CTA per padded row regardless of the SM count.
     assert wide.threads == 128 and wide.min_blocks == 8 and wide.grid == 8192
     assert (
-        _registered(
-            cb.quant_plan(1, 28672, True, False, "sm_100a", 148), "sm_100a"
-        ).grid
+        _registered(cb.quant_plan(1, 2688, True, False, "sm_100a", 148), "sm_100a").grid
         == 128
     )
+    # Short launches of long bf16 rows split every row over a cluster of four CTAs, each
+    # with the CTA shape of a quarter row: one cluster per row, then the padding clusters
+    # (each CTA zeroes 1024 16-byte chunks of the last scale tile's 8 x padded_cols).
+    split = _registered(cb.quant_plan(1, 28672, True, False, "sm_100a", 148), "sm_100a")
+    assert split.cluster_split == 4 and split.kernel_key == "quant:t512_b1_mb1_bf16_cs4"
+    assert split.grid == (1 + 4) * 4 and split.padded_rows == 128
+    split = _registered(cb.quant_plan(32, 18432, True, True, "sm_103a", 152), "sm_103a")
+    assert (split.threads, split.blocks_per_thread, split.min_blocks) == (256, 2, 3)
+    assert split.kernel_key == "quant:t256_b2_mb3_bf16_fold_cs4"
+    assert split.grid == (32 + 3) * 4
+    static = _registered(cb.quant_plan(1, 7168, True, False, "sm_103a", 152), "sm_103a")
+    assert static.kernel_key == "quant:t128_b1_mb1_bf16_cs4_k7168"
+    assert cb.quant_plan(8, 7168, True, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(33, 28672, True, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(8, 28672, False, False, "sm_100a", 148).cluster_split == 1
+    assert cb.quant_plan(8, 12288, True, False, "sm_100a", 148).cluster_split == 1
+    # K = 8192: one CTA per row for 2..32 tokens (sm_100a) and 2..16 tokens (sm_103a),
+    # with or without the folded out_scale.  One token keeps the four-CTA split, and so
+    # does sm_103a from 17 tokens up to its limits (17 with the out_scale folded), except
+    # the chain's one-CTA rows (test_chain_one_cta_quantizer_rows).
+    for arch, sm_count, high in (("sm_100a", 148, 32), ("sm_103a", 152, 16)):
+        for fold in (False, True):
+            splits = [
+                cb.quant_plan(m, 8192, True, fold, arch, sm_count).cluster_split
+                for m in (1, 2, high)
+            ]
+            assert splits == [4, 1, 1], (arch, fold, splits)
+    assert cb.quant_plan(17, 8192, True, True, "sm_103a", 152).cluster_split == 4
+    assert cb.quant_plan(18, 8192, True, True, "sm_103a", 152).cluster_split == 1
+    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 148).cluster_split == 4
+    assert (
+        cb.quant_plan(32, 8192, True, False, "sm_103a", 152, alone=True).cluster_split
+        == 4
+    )
+    assert cb.quant_plan(32, 8192, True, False, "sm_103a", 152).cluster_split == 1
+    assert cb.quant_plan(32, 8192, True, True, "sm_100a", 148).cluster_split == 1
     # One program per CTA shape (threads, register blocks per thread, occupancy):
     # K = 2688 and 4096 resolve to one shape, 7168 and 8192 to another.  The widths of
     # the static tier share that shape's program and differ in K_STATIC; a width outside
@@ -249,12 +288,112 @@ def test_every_reachable_bf16_quantizer_shape_has_a_program(arch, sm_count):
     assert shapes <= set(KERNELS[arch])
 
 
+def test_quantizer_alone_cluster_split_rows():
+    """The quantizer alone (``quant_plan(..., alone=True)``, the public per-token quantize
+    entries) splits bf16 rows over the clusters of QUANT_ALONE_CLUSTER_SPLIT at the measured
+    SM count of each architecture, with a generated program; everywhere else (other token
+    counts and row lengths, the other SM count, fp16 activations) it takes
+    :func:`quant_cluster_split`, the chain's plan outside CHAIN_ONE_CTA_M_K8192."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, table in cb.QUANT_ALONE_CLUSTER_SPLIT.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        # REACHABLE_M steps by 4 and misses some range endpoints (M = 130): plan
+        # every endpoint of the table too.
+        ms = sorted(
+            set(REACHABLE_M)
+            | {v for ranges in table.values() for lo, hi, _ in ranges for v in (lo, hi)}
+        )
+        served = set()
+        for k in sorted(set(REACHABLE_K) | set(table)):
+            for m in ms:
+                for fold in (False, True):
+                    chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
+                    alone = _registered(
+                        cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True),
+                        arch,
+                    )
+                    want = next(
+                        (c for lo, hi, c in table.get(k, ()) if lo <= m <= hi), None
+                    )
+                    if want is None:
+                        split = cb.quant_cluster_split(m, k, True, fold, arch)
+                        if cb.quant_alone_pad_chunked(
+                            m, k, True, chain.k_static, arch, sm_count
+                        ):
+                            pass
+                        elif chain.cluster_split == split:
+                            assert alone == chain, (arch, k, m, fold)
+                        else:
+                            assert alone.cluster_split == split, (arch, k, m, fold)
+                        continue
+                    served.add((k, m))
+                    assert alone.cluster_split == want, (arch, k, m, fold)
+                    assert alone.kernel_key.endswith(f"_cs{want}"), alone.kernel_key
+                    assert alone.grid % want == 0 and alone.grid >= m * want
+                    sms = other[arch]
+                    assert cb.quant_plan(
+                        m, k, True, fold, arch, sms, alone=True
+                    ) == cb.quant_plan(m, k, True, fold, arch, sms), (arch, sms, k, m)
+                    assert cb.quant_plan(
+                        m, k, False, fold, arch, sm_count, alone=True
+                    ) == cb.quant_plan(m, k, False, fold, arch, sm_count)
+        listed = {
+            (k, m)
+            for k, ranges in table.items()
+            for lo, hi, _ in ranges
+            for m in ms
+            if lo <= m <= hi
+        }
+        assert served == listed, (arch, sorted(listed - served))
+
+
+def test_chain_one_cta_quantizer_rows():
+    """The quantize + GEMM chain runs one CTA per bf16 row of K = 8192 on the token counts of
+    CHAIN_ONE_CTA_M_K8192 at the measured SM count of each architecture, with a generated
+    program, where the quantizer alone keeps its cluster split; the other SM count, the other
+    token counts and the other row lengths take :func:`quant_cluster_split`."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, (lo, hi) in cb.CHAIN_ONE_CTA_M_K8192.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        served = set()
+        for k in sorted(set(REACHABLE_K) | {8192}):
+            for m in sorted(set(REACHABLE_M) | {lo - 1, lo, hi, hi + 1}):
+                for fold in (False, True):
+                    split = cb.quant_cluster_split(m, k, True, fold, arch)
+                    chain = _registered(
+                        cb.quant_plan(m, k, True, fold, arch, sm_count), arch
+                    )
+                    if k == 8192 and lo <= m <= hi:
+                        served.add(m)
+                        assert chain.cluster_split == 1, (arch, m, fold)
+                        assert chain.grid == cb.padded_rows(m), (arch, m, fold)
+                        alone = cb.quant_plan(
+                            m, k, True, fold, arch, sm_count, alone=True
+                        )
+                        assert alone.cluster_split == split, (arch, m, fold)
+                    else:
+                        assert chain.cluster_split == split, (arch, k, m, fold)
+                    assert (
+                        cb.chain_cluster_split(m, k, True, fold, arch, other[arch])
+                        == split
+                    ), (arch, k, m, fold)
+        assert served == {m for m in set(REACHABLE_M) | {lo, hi} if lo <= m <= hi}, arch
+
+
 def test_f16_quantizer_shapes_match_the_validated_f16_rows():
     """fp16 activations are generated for the validated fp16 rows (K = 7168 at
-    256 threads, scale not folded); every other fp16 shape names its missing
-    program instead of mis-dispatching."""
+    256 threads, scale not folded).  Contiguous K = 7168 rows of any token count run
+    those programs (a single row and STATIC_M_LIMIT rows or more as the nearest
+    registered program); every other fp16 shape names its missing program instead
+    of mis-dispatching."""
     for m in VALIDATED_F16_INPUT_ROWS:
         _registered(cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a")
+    for m in (1, cb.STATIC_M_LIMIT, 16384):
+        plan = _registered(
+            cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a"
+        )
+        assert plan.unregistered_key is not None and plan.k_static == 7168
+        assert plan.grid == plan.padded_rows and plan.cluster_split == 1
     unregistered = 0
     for k in REACHABLE_K:
         for m in REACHABLE_M:
@@ -472,30 +611,34 @@ def _check_conditions(text):
 
 
 def test_shared_binding_sources_keep_distinct_namespaces():
-    # Programs whose exported binding text differs only in the kernel symbol and
-    # the host-shim namespace (the bf16 quantizer: also in the CTA width) build
-    # one binding translation unit: the record whose source it is selects both
-    # through the file's defaults, every other record names its own on the
-    # compile line.  Every record must still export ``run`` from its own
-    # namespace, declare and launch its own kernel symbol, and give the binding
-    # only knob values its kernel source declares, plus the launch-block knob of
-    # the shared bf16 quantizer binding, which must spell the kernel's thread
-    # count.
+    # Every record exports ``run`` from a host-shim namespace no other record uses,
+    # declares and launches its own kernel symbol, and gives the binding only knob
+    # values its kernel source declares (plus the launch-block knob of the shared
+    # bf16 quantizer binding, which must spell the kernel's thread count).  A
+    # binding is in one of two forms:
+    # - shared form: the text spells the kernel and the namespace through
+    #   ``CAKE_PROGRAM_KERNEL`` / ``CAKE_PROGRAM_SHIM``; the record whose source it
+    #   is selects both through the file's defaults, every other record names its
+    #   own on the compile line.  Every binding a second record compiles is in this
+    #   form.
+    # - own form (a rendered program): the text names the record's kernel and its
+    #   own namespace ``cake_binding_kernel_<record>`` literally, only that record
+    #   compiles it, and its compile line names neither macro.
     csrc = Path(cb.__file__).resolve().parent / "csrc"
+    users = {}
+    for name, record in MODULES.items():
+        users.setdefault(record["sources"][1], []).append(name)
     namespaces = {}
     for name, record in MODULES.items():
         binding_source = record["sources"][1]
         assert binding_source.endswith("_binding.cu"), (name, binding_source)
         text = (csrc / binding_source).read_text()
-        assert _BINDING_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
-        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
-        assert _PROGRAM_EXPORT_LINE in text, name
+        opened = _BINDING_NAMESPACE.findall(text)
+        assert len(opened) == 1, (name, opened)
         # TVM_FFI_CHECK stringizes its condition unexpanded: a kernel symbol in
         # a check condition would be spelt as the macro name in the message.
         for condition in _check_conditions(text):
             assert "CAKE_PROGRAM_" not in condition, (name, condition)
-        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
-        assert len(shim_defaults) == 1, (name, shim_defaults)
         shim_flags = [
             f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
         ]
@@ -503,14 +646,29 @@ def test_shared_binding_sources_keep_distinct_namespaces():
             f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
         ]
         assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
-        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
-        if name in binding_source:
-            assert namespace in (None, shim_defaults[0]), (name, namespace)
-            namespace = shim_defaults[0]
+        if opened == ["CAKE_PROGRAM_SHIM"]:
+            assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+            assert _PROGRAM_EXPORT_LINE in text, name
+            shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+            assert len(shim_defaults) == 1, (name, shim_defaults)
+            namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+            if name in binding_source:
+                assert namespace in (None, shim_defaults[0]), (name, namespace)
+                namespace = shim_defaults[0]
+            else:
+                assert namespace is not None, (name, record["compile_flags"])
+                assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+            assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
         else:
-            assert namespace is not None, (name, record["compile_flags"])
-            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
-        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+            namespace = opened[0]
+            assert users[binding_source] == [name], (name, users[binding_source])
+            assert name in binding_source, (name, binding_source)
+            assert not shim_flags and not kernel_flags, (name, record["compile_flags"])
+            assert namespace == f"cake_binding_kernel_{name}", (name, namespace)
+            assert f'extern "C" __global__ void kernel_{name}(' in text, name
+            export_line = f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, {namespace}::Run);"
+            assert export_line in text, name
+            assert "CAKE_PROGRAM_" not in text, name
         namespaces[name] = namespace
         kernel_text = (csrc / record["sources"][0]).read_text()
         binding_knobs = {
@@ -640,7 +798,8 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
 
 # The validated matrix (validated_problems in tests/test_helpers/
 # cake_nvfp4_per_token.py): bf16 activations on
-# every K x M x fold; fp16 activations on the validated fp16 rows of K=7168 only.
+# every K x M x fold; fp16 activations on the validated fp16 rows of K=7168, and the
+# K=7168 rows outside them that run the nearest registered program (1 and 8192 tokens).
 _QUANT_CASES = (
     [
         (m, k, torch.bfloat16, fold)
@@ -648,7 +807,7 @@ _QUANT_CASES = (
         for k in (7168, 16384)
         for m in (1, 17, 130, 257, 4097)
     ]
-    + [(m, 7168, torch.float16, False) for m in VALIDATED_F16_INPUT_ROWS]
+    + [(m, 7168, torch.float16, False) for m in (*VALIDATED_F16_INPUT_ROWS, 1, 8192)]
     # Row lengths outside the measured families and the token counts between tiles.
     + [
         (m, k, torch.bfloat16, False)
@@ -690,10 +849,158 @@ def test_quantize_matches_reference_and_cute_dsl(m, k, dtype, fold):
         assert torch.equal(p_scale, scale)
 
 
+def test_quantizer_alone_pad_chunked_rows():
+    """The quantizer alone takes the one-CTA-per-row instance with the chunked padding of
+    the scale tile (``_pc``: launch bounds 1, grid M plus the padding-chunk CTAs) on the
+    cells of QUANT_ALONE_PAD_CHUNKED at the measured SM count of each architecture, with a
+    generated program; the other SM count, fp16 activations and the chain keep the chain's
+    plan."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, table in cb.QUANT_ALONE_PAD_CHUNKED.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for k, ranges in table.items():
+            for lo, hi in ranges:
+                assert cb.ROW_TILE < lo <= hi <= cb.SINGLE_WAVE_MAX_ROWS, (
+                    arch,
+                    k,
+                    lo,
+                    hi,
+                )
+                for m in range(lo, hi + 1):
+                    for fold in (False, True):
+                        chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
+                        alone = _registered(
+                            cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True),
+                            arch,
+                        )
+                        assert alone.pad_chunked and alone.cluster_split == 1
+                        assert alone.min_blocks == 1 and alone.threads == chain.threads
+                        assert alone.kernel_key == (
+                            chain.kernel_key.replace(f"_mb{chain.min_blocks}_", "_mb1_")
+                            + "_pc"
+                        ), (alone.kernel_key, chain.kernel_key)
+                        pad = -(-8 * alone.padded_cols // cb.CLUSTER_SPLIT_PAD_CHUNKS)
+                        assert alone.grid == m + (pad if m % cb.ROW_TILE else 0)
+                        assert cb.quant_plan(
+                            m, k, True, fold, arch, other[arch], alone=True
+                        ) == cb.quant_plan(m, k, True, fold, arch, other[arch])
+                        assert cb.quant_plan(
+                            m, k, False, fold, arch, sm_count, alone=True
+                        ) == cb.quant_plan(m, k, False, fold, arch, sm_count)
+
+
+_ALONE_PAD_CHUNKED_CASES = sorted(
+    {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_PAD_CHUNKED.values()
+        for k, ranges in table.items()
+        for lo, hi in ranges
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _ALONE_PAD_CHUNKED_CASES)
+def test_quantizer_alone_pad_chunked_matches_the_chain_quantizer(k, m, fold):
+    """The chunked padding of the public quantizer writes the same codes, block scales
+    (padding included) and per-token scales as the quantize + GEMM chain's quantizer, bit
+    for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(4000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
+# The quantizer alone's cluster-split cells (QUANT_ALONE_CLUSTER_SPLIT) of every architecture,
+# with and without the folded out_scale.
+_ALONE_SPLIT_CASES = sorted(
+    {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_CLUSTER_SPLIT.values()
+        for k, ranges in table.items()
+        for lo, hi, _ in ranges
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _ALONE_SPLIT_CASES)
+def test_quantizer_alone_split_matches_the_chain_quantizer(k, m, fold):
+    """The public quantizer's cluster split writes the same codes, block scales and
+    per-token scales as the quantize + GEMM chain's quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(3000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
+# The chain's one-CTA-per-row cells (CHAIN_ONE_CTA_M_K8192) of every architecture, with and
+# without the folded out_scale.
+_CHAIN_ONE_CTA_CASES = sorted(
+    {
+        (8192, m, fold)
+        for lo, hi in cb.CHAIN_ONE_CTA_M_K8192.values()
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _CHAIN_ONE_CTA_CASES)
+def test_chain_one_cta_quantizer_matches_the_quantizer_alone(k, m, fold):
+    """The quantize + GEMM chain's one-CTA-per-row quantizer writes the same codes, block
+    scales (padding included) and per-token scales as the public quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(5000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb._prepare_quantize(x, gs_inv, got, out_scale=out_scale, alone=False)()
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, want, out_scale=out_scale)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
 # K = 2688 / 4096 are covered at M = 1 only: a single row has no stride, so it keeps the
 # compiled-in instance.  Multi-row strided sets at those widths fall back to a runtime-geometry
-# program the package does not carry -- see
-# test_row_strided_activation_at_a_new_width_names_its_missing_program.
+# program of another CTA shape -- see
+# test_quantize_reads_row_strided_activations_at_a_new_width.
 @pytest.mark.parametrize("k,m", [(7168, 130), (7168, 8), (2688, 1), (4096, 1)])
 def test_quantize_reads_row_strided_activations_in_place(k, m):
     device = _require_program()
@@ -713,6 +1020,18 @@ def test_quantize_reads_row_strided_activations_in_place(k, m):
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a.reshape(-1), b.reshape(-1))
     _check_against_reference(x, gs_inv, None, *got)
+
+
+@pytest.mark.parametrize("k,m", [(2688, 130), (4096, 2048)])
+def test_quantize_reads_row_strided_activations_at_a_new_width(k, m):
+    # Multi-row strided sets at K = 2688 / 4096 run the nearest registered
+    # runtime-geometry program (test_row_strided_activation_at_a_new_width_runs_a_
+    # registered_program); the outputs equal the contiguous copy's bit for bit.
+    device = _require_program()
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    plan = cb.quant_plan(m, k, True, False, arch, sm_count, x_row_stride=k + 64)
+    assert plan.k_static is None and plan.kernel_key in KERNELS[arch]
+    test_quantize_reads_row_strided_activations_in_place(k, m)
 
 
 def test_quantize_repeated_call_allocates_only_its_outputs():

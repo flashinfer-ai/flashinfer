@@ -61,7 +61,6 @@ from flashinfer.api_logging import flashinfer_experimental_api
 from .sage.config import (
     SageAttentionConfig,
     SageAttentionParams,
-    sage_scale_shapes,
     validate_sage_params,
     validate_sage_recipe,
     _validate_int8_qk_device,
@@ -73,6 +72,7 @@ from .sage.layout import (
     _SageScaleLayout,
     _SageVSection,
 )
+from .sage.plan import SagePreparedScales, build_sage_prepared_scales
 
 
 if TYPE_CHECKING:
@@ -174,18 +174,6 @@ class _ContextPlanGeometry:
 
 
 @dataclass(frozen=True)
-class _ContextSageState:
-    """A contiguous context plan's prepared Sage scale buffer."""
-
-    layout: _SageScaleLayout
-    # Expected shape of every scale tensor a run supplies, by field name.
-    scale_shapes: dict[str, tuple[int, ...]]
-    # The buffer the Sage prepare writes before attention (``_SageScaleLayout``).
-    scales: torch.Tensor
-    prepare: Callable[..., None]
-
-
-@dataclass(frozen=True)
 class _ContextPlanState:
     """Atomically published state for one compiled contiguous context plan."""
 
@@ -197,11 +185,10 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
-    # Expected shapes of the VC run operands, checked by a validating run.
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
     vc_output_scale: Optional[torch.Tensor] = None
-    sage: Optional[_ContextSageState] = None
+    sage: Optional[SagePreparedScales] = None
 
 
 @dataclass(frozen=True)
@@ -280,7 +267,6 @@ class _ContextCompileSpec:
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
-    # VC-Attention recipe of the plan. None compiles the plain kernel.
     vc: Optional[VCAttentionConfig] = None
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
@@ -341,19 +327,15 @@ def _make_context_kernel(
     from .kernels.fmha_context.fmha_kernel import FmhaTs
 
     use_paged_kv = page_size is not None
-    if use_paged_kv != (max_kv_len is not None):
+    if use_paged_kv and max_kv_len is None:
         raise ValueError("paged context requires both page geometry values")
     is_persistent = scheduler != "nonpersistent"
     is_clc_dynamic = scheduler == "clc_dynamic_persistent"
     paged_kwargs = (
-        {
-            "use_paged_kv": True,
-            "num_tokens_per_page": page_size,
-            "max_kv_len": max_kv_len,
-        }
-        if use_paged_kv
-        else {}
+        {"use_paged_kv": True, "num_tokens_per_page": page_size} if use_paged_kv else {}
     )
+    if max_kv_len is not None:
+        paged_kwargs["max_kv_len"] = max_kv_len
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
@@ -1681,11 +1663,13 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     The two-CTA launch is non-persistent with heads on grid Y and batch on
     grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
     persistent flattened grid so the valid int32 plans stay launchable."""
-    # VC-Attention always runs two-CTA. With P in SMEM, the bf16 K ring,
+    # VC-Attention-QK16 always runs two-CTA. With P in SMEM, the bf16 K ring,
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
+    # VC-Attention-QK8 keeps the E4M3 K ring and follows the device default.
+    vc_qk16 = geometry.vc is not None and geometry.qk_dtype != torch.float8_e4m3fn
     return (
-        (_default_two_cta_umma(geometry.device_index) or geometry.vc is not None)
+        (_default_two_cta_umma(geometry.device_index) or vc_qk16)
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -1823,67 +1807,11 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
     )
 
 
-@functools.cache
-def _get_compiled_sage_prepare(
-    device_index: int,
-    layout: _SageScaleLayout,
-    num_qo_heads: int,
-    num_kv_heads: int,
-) -> Callable[..., None]:
-    """Compile the launch that writes a context plan's prepared Sage scales.
-
-    The compiled callable takes ``(q_scale, k_scale, v_scale, v_mean, scales)``
-    torch tensors (``v_mean`` is ``None`` for a recipe without one) and runs on
-    the current stream. The batch size is a runtime extent, as for the
-    attention kernel, so plans of one layout share the compilation.
-    """
-
-    import cutlass
-    import cutlass.cute as cute
-    from cuda.bindings import driver as cuda_drv
-
-    from .sage.prepare import _PrepareSageScales
-
-    prepare = _PrepareSageScales(layout=layout, num_kv_heads=num_kv_heads)
-
-    @cute.jit
-    def prepare_adapter(
-        q_scale: cute.Tensor,
-        k_scale: cute.Tensor,
-        v_scale: cute.Tensor,
-        v_mean: cute.Tensor | None,
-        scales: cute.Tensor,
-        stream: cuda_drv.CUstream,
-    ) -> None:
-        prepare(q_scale, k_scale, None, v_scale, v_mean, scales, stream)
-
-    def fake_compact(shape):
-        return cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            shape,
-            stride_order=tuple(reversed(range(len(shape)))),
-            assumed_align=16,
-        )
-
-    v_rows_shape = (cute.sym_int(), num_kv_heads, layout.v_rows.headdim)
-    with torch.cuda.device(device_index):
-        return cute.compile(
-            prepare_adapter,
-            fake_compact((num_qo_heads, cute.sym_int())),
-            fake_compact((num_kv_heads, cute.sym_int())),
-            fake_compact(v_rows_shape),
-            fake_compact(v_rows_shape) if layout.v_rows.has_mean else None,
-            fake_compact((cute.sym_int(),)),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options=_COMPILE_OPTIONS,
-        )
-
-
-def _build_context_sage_state(geometry: _ContextPlanGeometry) -> _ContextSageState:
+def _build_context_sage_state(geometry: _ContextPlanGeometry) -> SagePreparedScales:
     """Allocate a plan's prepared scale buffer and compile its prepare launch."""
 
-    layout = _context_sage_layout(geometry)
-    scale_shapes = sage_scale_shapes(
+    return build_sage_prepared_scales(
+        _context_sage_layout(geometry),
         geometry.sage,
         batch_size=geometry.batch_size,
         seq_len_q=geometry.max_seq_len_q,
@@ -1891,20 +1819,8 @@ def _build_context_sage_state(geometry: _ContextPlanGeometry) -> _ContextSageSta
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-    )
-    scales = torch.empty(
-        layout.total_words(geometry.batch_size * geometry.num_kv_heads),
-        dtype=torch.float32,
         device=geometry.device,
-    )
-    prepare = _get_compiled_sage_prepare(
-        geometry.device_index, layout, geometry.num_qo_heads, geometry.num_kv_heads
-    )
-    return _ContextSageState(
-        layout=layout,
-        scale_shapes=scale_shapes,
-        scales=scales,
-        prepare=prepare,
+        device_index=geometry.device_index,
     )
 
 
@@ -1992,6 +1908,7 @@ def _get_compiled_context(
     two_cta_umma = compile_spec.two_cta_umma
     vc_attention = compile_spec.vc is not None
     sage_scale_layout = compile_spec.sage_scale_layout
+    vc_qk8 = vc_attention and qk_dtype_key == "float8_e4m3fn"
 
     import cutlass
     import cutlass.cute as cute
@@ -2031,9 +1948,16 @@ def _get_compiled_context(
         if vc_attention
         else None,
         sage_scale_layout=sage_scale_layout,
+        # The QK8 K-scale table is sized from the K/V rows of the fixed plan.
+        max_kv_len=_fixed_kv_rows(max_seq_len_k, compile_spec.vc) if vc_qk8 else None,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    if vc_qk8:
+        # The QK8 scale tables are addressed with the fixed plan lengths, the K/V
+        # rows including the repair tiles.
+        fmha.cfg.uniform_seq_len_q = max_seq_len_q
+        fmha.cfg.uniform_seq_len_k = _fixed_kv_rows(max_seq_len_k, compile_spec.vc)
     if uniform_packed_lengths:
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
@@ -2063,6 +1987,8 @@ def _get_compiled_context(
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
         vc_mu: cute.Tensor | None,
+        vc_q_scale: cute.Tensor | None,
+        vc_k_scale: cute.Tensor | None,
         sage_scales: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
@@ -2091,6 +2017,8 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
+                vc_q_scale=vc_q_scale,
+                vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
             )
         else:
@@ -2107,6 +2035,8 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
+                vc_q_scale=vc_q_scale,
+                vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
                 sage_scales=sage_scales,
             )
@@ -2175,19 +2105,35 @@ def _get_compiled_context(
         cutlass.Int32, variable_window_cta_shape, 4
     )
     vc_mu_fake = None
+    vc_q_scale_fake = None
+    vc_k_scale_fake = None
     if vc_attention:
         if packed:
             raise RuntimeError("VC-Attention context requires fixed tensors")
+        # The plan fixes every VC operand shape, so the kernel addresses the
+        # tile means and the Q and K scale tables with compile-time extents.
+        vc_shapes = vc_scale_shapes(
+            compile_spec.vc,
+            batch_size=batch_size,
+            seq_len_kv=max_seq_len_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_vo or head_dim,
+            seq_len_q=max_seq_len_q,
+            num_qo_heads=num_qo_heads,
+            qk_fp8=vc_qk8,
+        )
         if compile_spec.vc.demean:
-            vc_mu_fake = fake_compact(
-                cutlass.BFloat16,
-                vc_scale_shapes(
-                    compile_spec.vc,
-                    batch_size=batch_size,
-                    seq_len_kv=max_seq_len_k,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim_vo or head_dim,
-                )["tile_means"],
+            vc_mu_fake = fake_compact(cutlass.BFloat16, vc_shapes["tile_means"], 16)
+        if vc_qk8:
+            # The kernel reads the Q and K scale tables as one row of blocks per head.
+            vc_q_scale_fake = fake_compact(
+                cutlass.Float32,
+                (num_qo_heads, batch_size * vc_shapes["q_scale"][2]),
+                16,
+            )
+            vc_k_scale_fake = fake_compact(
+                cutlass.Float32,
+                (num_kv_heads, batch_size * vc_shapes["k_scale"][2]),
                 16,
             )
     # The prepared Sage scales span ``batch * Hkv`` sequences, so their length
@@ -2217,6 +2163,8 @@ def _get_compiled_context(
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
             vc_mu_fake,
+            vc_q_scale_fake,
+            vc_k_scale_fake,
             sage_scales_fake,
             stream_fake,
             max_active_clusters,
@@ -2824,8 +2772,11 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        ``vc_config`` selects the VC-Attention recipe. Q and K stay bf16
-        and V is E4M3, stored as per-128-token-tile residuals whose bf16 tile
+        ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
+        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3
+        Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
+        and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
+        E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
         means the kernel restores. Every :meth:`run` then supplies the permuted
         K, the E4M3 V and ``vc=VCAttentionParams(...)``.
 
@@ -2880,8 +2831,9 @@ class BatchPrefillTSWrapper:
         output_scale : float
             Scale applied to the attention output.
         vc_config : VCAttentionConfig, optional
-            The VC-Attention recipe. Requires fixed dense tensors, head_dim
-            128, equal Q and K/V head counts, bf16 Q/K and E4M3 V.
+            A VC-Attention recipe. Requires fixed dense tensors, head_dim 128,
+            equal Q and K/V head counts and E4M3 V. bf16 Q/K selects
+            VC-Attention-QK16, E4M3 Q/K selects VC-Attention-QK8.
         sage : SageAttentionConfig, optional
             Sage attention recipe: 8-bit Q/K with per-block scales, E4M3 V with
             per-channel scales and FP8 P. Requires a dense, fixed-length,
@@ -2989,6 +2941,9 @@ class BatchPrefillTSWrapper:
                 seq_len_kv=geometry.max_seq_len_k,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim_vo or geometry.head_dim,
+                seq_len_q=geometry.max_seq_len_q,
+                num_qo_heads=geometry.num_qo_heads,
+                qk_fp8=geometry.qk_dtype == torch.float8_e4m3fn,
             )
         sage_state = (
             _build_context_sage_state(geometry) if geometry.sage is not None else None
@@ -3095,13 +3050,27 @@ class BatchPrefillTSWrapper:
         if (vc is None) == (geometry.vc is not None):
             raise ValueError(
                 "vc=VCAttentionParams(...) is required by a VC plan and rejected "
-                "by a plan without VC-Attention"
+                "by a plan without vc_config"
             )
         vc_output_scale: Optional[torch.Tensor] = None
         vc_mu: Optional[torch.Tensor] = None
+        vc_q_scale: Optional[torch.Tensor] = None
+        vc_k_scale: Optional[torch.Tensor] = None
         if vc is not None:
             if validate:
                 validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
+            if geometry.qk_dtype == torch.float8_e4m3fn:
+                if vc.q_scale is None or vc.k_scale is None:
+                    raise ValueError(
+                        "VC-Attention-QK8 plans require vc.q_scale and vc.k_scale"
+                    )
+                vc_q_scale = vc.q_scale.view(geometry.num_qo_heads, -1)
+                vc_k_scale = vc.k_scale.view(geometry.num_kv_heads, -1)
+            elif vc.q_scale is not None or vc.k_scale is not None:
+                raise ValueError(
+                    "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "
+                    "E4M3 Q/K"
+                )
             vc_mu = vc.tile_means
             # VC plans have equal Q and K/V head counts, so the per-channel V
             # scale is already in output order.
@@ -3224,6 +3193,8 @@ class BatchPrefillTSWrapper:
             runtime_window_ends,
             runtime_window_cta_starts,
             vc_mu,
+            vc_q_scale,
+            vc_k_scale,
             runtime_sage_scales,
         )
         return out

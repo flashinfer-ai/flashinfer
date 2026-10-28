@@ -453,11 +453,18 @@ def test_head_ownership_rows(H, W) -> None:
         assert (cb["padding"]["B1"]["send"] + cb["padding"]["B1"]["recv"] > 0) == (
             pad_tiles > 0
         )
-        assert (
-            kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
-            == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
-            + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        # saved set: tables + padded S_in + the carry plane of a P > 1 rank (kept
+        # by default; saved_carry=False counts the plane-less re-walk form)
+        tb_bytes = kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+        no_plane = tb_bytes + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        plane_slots = ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)
+        plane = plane_slots * H * kp.STATE_TILE_BYTES if hp.P > 1 else 0
+        got = kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
+        got_no_plane = kp.kcp_saved_bytes(
+            ctx, H=H, with_conv=False, save_transfer=False, saved_carry=False
         )
+        assert got == no_plane + plane
+        assert got_no_plane == no_plane
         if (
             hp.Hg_r == 0
         ):  # a rank owning no heads: empty owner-side splits and chains, still a party to every collective
@@ -2206,6 +2213,12 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     s = 64 * kp.STATE_TILE_BYTES
     assert kp.SAVE_TRANSFER_DEFAULT is True  # shipped default
     assert kp.kcp_saved_bytes(ctx) == kp.kcp_saved_bytes(ctx, save_transfer=True)
+    assert (
+        hp.P > 1
+    )  # 3000 tokens in one fragment at 152 SMs: P_occ = ceil(152 / 64) = 3
+    plane = (
+        (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
+    )  # the whole carry plane of the P > 1 rank (fused walks: one extra slot per crossing fragment)
     base = kp.kcp_saved_bytes(
         ctx, save_transfer=False
     )  # literal form: H = 64, light, no transfer, conv, C = 8192
@@ -2213,12 +2226,25 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
         base
         == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
         + ctx.n_in * s
+        + plane
         + ctx.halo.n_hist_rows * 8192 * 2
-    )  # no token-row Aqk / Akk term: the saved set carries none
+    )  # no token-row Aqk / Akk term: the saved set carries none; the carry plane is part of the shipped set
     assert cake_kcp.KCP_SAVED_VERSION == 2
     fields = cake_kcp.KcpSaved.__dataclass_fields__
     assert "Aqk" not in fields and "Akk" not in fields
-    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg")
+    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg", "carry")
+    assert cake_kcp.KcpSaved.__dataclass_fields__["carry"].default is None
+    assert kp.kcp_saved_bytes(ctx) == kp.kcp_saved_bytes(
+        ctx, saved_carry=True
+    )  # the shipped default counts the carry plane
+    assert (
+        kp.kcp_saved_bytes(ctx) - kp.kcp_saved_bytes(ctx, saved_carry=False) == plane
+    )  # saved_carry=False = the re-walk form of the test knob: no plane term
+    for c in [*contexts(_small_partition(4)), *ctxs]:
+        p_c = c.heads(64).P
+        assert kp.kcp_saved_bytes(c) - kp.kcp_saved_bytes(c, saved_carry=False) == (
+            (c.n_frag * (p_c - 1) + max(c.n_in, c.n_out)) * s if p_c > 1 else 0
+        )  # the plane term exists on P > 1 ranks only
     assert (
         kp.kcp_saved_bytes(ctx, save_transfer=False, with_conv=False)
         == base - ctx.halo.n_hist_rows * 8192 * 2
@@ -2228,9 +2254,6 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     ) - base == ctx.N_out * 2 * hp.Hg_r * kp.STATE_TILE_BYTES + (
         hp.NSEG * s if hp.P > 1 else 0
     )
-    assert (
-        hp.P > 1
-    )  # 3000 tokens in one fragment at 152 SMs: P_occ = ceil(152 / 64) = 3
     assert (
         kp.kcp_saved_bytes(ctx, save_mode="tape", save_transfer=False) - base
         == ctx.NC_pad * 64 * 32768 + ctx.R * 64 * 256
@@ -2275,26 +2298,30 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     local = cake_backend.workspace_bytes(
         ctx.T_r, ctx.n_frag, 64, backward=True, save_mode="light", sm_count=SM_COUNT
     )
-    assert kp.kcp_arena_layout(ctx) == kp.kcp_arena_layout(ctx, save_transfer=True)
-    arena = kp.kcp_arena_layout(ctx, save_transfer=False)
-    assert ws == local + arena["arena"] and arena["arena"] == max(
-        arena["forward"], arena["backward"]
-    )
+    # the pools do not depend on save_transfer / C: the kept c1 tensor and the halo rows are per-call tensors (SPEC-4)
+    arena = kp.kcp_arena_layout(ctx)
     assert (
-        arena["fwd.c1_recv"] == hp.numel["c1_recv"] * 4
-        and kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.c1_recv"] == 0
+        arena
+        == kp.kcp_arena_layout(ctx, save_transfer=False)
+        == kp.kcp_arena_layout(ctx, C=4096)
     )
+    assert ws == ws_t == local + arena["arena"]
+    assert arena["pool.c1_recv"] == hp.numel["c1_recv"] * 4
     assert (
-        arena["fwd.staging"]
-        == arena["bwd.staging"]
+        arena["pool.stage_b"] + arena["pool.stage_m"]
         == hp.NSEG * 64 * kp.SUMMARY_TILE * 4
     )
-    assert (
-        kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.staging"]
-        == arena["fwd.staging"]
+    # one storage per SHARED_POOLS pair (b1_send = c1_send, b2_send = c2_send); the ring pools on first use
+    assert kp.SHARED_POOLS == (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+    assert kp.LAZY_POOLS == ("ring_out", "ring_in")
+    alone = ("c1_recv", "stage_b", "stage_m", "carry", "eye", "b1_recv", "b2_recv")
+    assert arena["arena"] == sum(arena[f"pool.{n}"] for n in alone) + sum(
+        max(arena[f"pool.{a}"], arena[f"pool.{b}"]) for a, b in kp.SHARED_POOLS
     )
-    assert kp.kcp_workspace_bytes(ctx, backward=False, save_transfer=False) <= ws
-    assert ws_t <= ws  # the kept c1 tensor leaves the arena (SPEC-4)
+    assert arena["ring"] == arena["pool.ring_out"] + arena["pool.ring_in"] > 0
+    fwd = kp.kcp_arena_layout(ctx, backward=False)
+    assert "pool.b1_send" not in fwd and fwd["arena"] < arena["arena"]
+    assert kp.kcp_workspace_bytes(ctx, backward=False) < ws
     # knobs
     monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
     assert kp.validate_test_knobs(None) == {
@@ -2465,6 +2492,75 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
             cake_kcp._options({"_kcp_test_knobs": bad})
     with pytest.raises(TypeError):
         cake_kcp._options({"host_trim": 0})
+
+
+def test_saved_carry_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``saved_carry`` is a private test knob: refused without ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword,
+    validated against :data:`SAVED_CARRIES`; the shipped default is 1 (the forward of a ``P > 1`` rank keeps its
+    carry plane in the saved set -- ``KcpSaved.carry``, an optional tensor that travels through ``tensors()`` /
+    ``flags()`` / ``from_tensors`` like the other two -- and the saved-mode backward reads it), 0 selects the re-walk
+    of the forward carries for the A/B record."""
+    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    assert cake_kcp.SAVED_CARRY_DEFAULT == 1 and cake_kcp.SAVED_CARRIES == (0, 1)
+    assert cake_kcp.P2_KNOBS["saved_carry"] == cake_kcp.SAVED_CARRIES
+    assert cake_kcp._options({}).saved_carry == 1
+    assert cake_kcp.KcpOptions().saved_carry == 1
+    assert "saved_carry" not in cake_kcp._OPTION_KEYS
+    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+        cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 0})
+    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 1}}).saved_carry == 1
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}}).saved_carry == 0
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": "0"}}).saved_carry == 0
+    o = cake_kcp._options(
+        {"_kcp_test_knobs": {"saved_carry": 0, "host_trim": 1, "fused_walks": 1}}
+    )
+    assert (o.saved_carry, o.host_trim, o.fused_walks) == (0, 1, 1)
+    for bad in ({"saved_carry": 2}, {"saved_carry": -1}):
+        with pytest.raises(ValueError):
+            cake_kcp._options({"_kcp_test_knobs": bad})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 1})
+    # the saved set with and without the plane: flags / tensors / from_tensors round trip
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION,
+        T_r=8,
+        H=4,
+        n_frag=1,
+        P=2,
+        Hg=4,
+        scale=0.5,
+        save_mode="light",
+        save_transfer=True,
+        offset_class="fla",
+        exchange="a2a",
+        precision_mode=0,
+        transfer_walk="bf16x3_hw64",
+    )
+    s_in, c1, m_seg, plane = (
+        torch.zeros(n, dtype=torch.float32) for n in (3, 5, 7, 11)
+    )
+    with_plane = cake_kcp.KcpSaved(
+        S_in=s_in, c1_recv=c1, M_seg=m_seg, carry=plane, ctx=None, **meta
+    )
+    without = cake_kcp.KcpSaved(S_in=s_in, c1_recv=c1, M_seg=m_seg, ctx=None, **meta)
+    assert without.carry is None and without.flags() == (True, True, False)
+    assert with_plane.flags() == (True, True, True)
+    assert [t.numel() for t in without.tensors()] == [3, 5, 7]
+    assert [t.numel() for t in with_plane.tensors()] == [3, 5, 7, 11]
+    assert with_plane.bytes - without.bytes == 11 * 4
+    for saved in (without, with_plane):
+        back = cake_kcp.KcpSaved.from_tensors(
+            saved.tensors(), saved.flags(), saved.meta(), None
+        )
+        assert back.flags() == saved.flags() and back.meta() == saved.meta()
+        assert (back.carry is None) == (saved.carry is None)
+        assert back.carry is None or back.carry is plane
+    assert (
+        "saved_carry" not in with_plane.meta()
+    )  # the plane's presence travels as a flag, not as metadata
 
 
 def test_ring_exchange_resolves_save_transfer() -> None:
@@ -3454,10 +3550,11 @@ def test_fake_backend_transfer_matches_lane_p(fake) -> None:
     )
 
 
+@pytest.mark.parametrize("walk_form", ["auto", "full"])
 @pytest.mark.parametrize(
     "graph_cap", ["none", "capture_pref", "node_attr", "node_attr_post"]
 )
-def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
+def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) -> None:
     """The graph-replay option, KDA module, one rank (``world == 1``: no collective): under the public keyword
     ``graph="replay"`` the first call of a validity key runs eagerly, the second is captured and replayed once, later
     calls replay the graph; ``out`` and the five gradients are bitwise the eager (``graph="off"``) results on every call.
@@ -3469,14 +3566,29 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
     record the arm (with the set / reset evidence of the capture-wide preference under ``"capture_pref"``).  The kernel-node
     forms ``"node_attr"`` / ``"node_attr_post"`` capture and replay bitwise too: no
     launch is skipped (``capture_skips`` unchanged), every captured tape launch gets the carveout attribute (``node_attrs``
-    grows by the tape launches of the captured calls, recorded as ``cache_config_nodes``)."""
+    grows by the tape launches of the captured calls, recorded as ``cache_config_nodes``).  The cap applies to the
+    full-width launches of the capped programs only (a two-CTA launch runs uncapped), so the expectations follow the
+    forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
+    decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
+    exercised."""
     monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
-    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap}}
+    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
     programs = backend.programs() if hasattr(backend, "programs") else None
-    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(
-        cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT)
-    )
+    cap_programs = cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT, ())
+    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(cap_programs)
+
+    def n_capped(rec) -> int:
+        """The call's launches under the cap: full-width launches of the capped programs (``walk_forms``)."""
+        return sum(
+            1
+            for name, form, _ in rec["walk_forms"]
+            if cake_kcp._PROGRAM_OF[name] in cap_programs and form == "full"
+        )
+
+    def eager_cc(rec) -> str:
+        return "bracket" if capped and n_capped(rec) else "none"
+
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
@@ -3519,7 +3631,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         )
 
     cake_kcp.graph_cache_clear()
-    ref, ev0, recs0 = run(graph="off")
+    ref, ev0, recs0 = run(graph="off", **knobs)
     ref = tuple(
         x.clone() for x in ref
     )  # copies taken before any other call: the comparison stays explicit
@@ -3527,15 +3639,18 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         "the eager reference is not finite: the operands violate the delta rule's contract"
     )
     assert ev0 == ("eager", "eager") and recs0[0]["graph"] == "off"
-    eager_cc = "bracket" if capped else "none"
     assert (recs0[0]["cache_config"], recs0[1]["cache_config"]) == (
-        eager_cc,
-        eager_cc,
+        eager_cc(recs0[0]),
+        eager_cc(recs0[1]),
     ), recs0
+    if (
+        capped and walk_form == "full"
+    ):  # every tape launch full-width: the eager bracket on both calls
+        assert n_capped(recs0[0]) >= 1 and n_capped(recs0[1]) >= 1, recs0
     fallback0 = cake_kcp.GRAPH_STATS["fallback"]
     skips0 = programs.capture_skips if capped else None
     nodes0 = programs.node_attrs if capped else None
-    events, ccs, brackets, nodes, tapes = [], [], [], [], []
+    events, ccs, brackets, nodes, caps, inv = [], [], [], [], [], []
     try:
         for _ in range(4):
             res, ev, recs = run(graph="replay", **knobs)
@@ -3545,17 +3660,13 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
                 (recs[0]["cache_config_bracket"], recs[1]["cache_config_bracket"])
             )
             nodes.append(
-                (recs[0].get("cache_config_nodes"), recs[1].get("cache_config_nodes"))
-            )
-            tapes.append(
-                tuple(
-                    sum(
-                        r["sequence"].count(p)
-                        for p in ("kcp_fwdh_tape", "kcp_dhu_tape")
-                    )
-                    for r in recs
+                (
+                    recs[0].get("cache_config_nodes") or 0,
+                    recs[1].get("cache_config_nodes") or 0,
                 )
             )
+            caps.append((n_capped(recs[0]), n_capped(recs[1])))
+            inv.append(recs)
             assert all(torch.equal(a, b) for a, b in zip(res, ref, strict=True)), events
         assert [e[0] for e in events] == ["eager", "capture", "replay", "replay"], (
             events
@@ -3564,42 +3675,63 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
         assert cake_kcp.LAST_CALL["fwd"]["graph"] == "replay"
         cap_cc = graph_cap if capped else "none"
-        assert [c[0] for c in ccs] == [eager_cc, cap_cc, cap_cc, cap_cc], ccs
-        assert [c[1] for c in ccs] == [eager_cc, eager_cc, cap_cc, cap_cc], ccs
+        assert [c[0] for c in ccs] == [eager_cc(inv[0][0]), cap_cc, cap_cc, cap_cc], ccs
+        # the backward's validity key hashes the workspace pools and the saved tensors: whether the second
+        # replay-mode call repeats the first call's key (capture at the second call, like the forward) or sees a
+        # key the first calls changed (capture at the third) depends on which pools those calls create -- both
+        # were observed (sm_100a two-level-carry rows: second; sm_103a: third) -- so the sequence is pinned by its
+        # structure: eager calls, one capture, replays after it
+        bwd_events = [e[1] for e in events]
+        cap_b = bwd_events.index("capture")
+        assert cap_b in (1, 2), events
+        assert bwd_events == ["eager"] * cap_b + ["capture"] + ["replay"] * (
+            3 - cap_b
+        ), events
+        assert [c[1] for c in ccs] == [eager_cc(inv[i][1]) for i in range(cap_b)] + [
+            cap_cc
+        ] * (4 - cap_b), ccs
+        n_cap_captured = (
+            caps[1][0] + caps[cap_b][1]
+        )  # the capped (full-width tape) launches inside the two captures
+        if capped and walk_form == "full":
+            assert n_cap_captured >= 2, (
+                caps
+            )  # both captures hold full-width tape launches
         if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
-            # kernel-node cap forms: nothing launched bare; every captured tape launch carries the node attribute
+            # kernel-node cap forms: nothing launched bare; every captured capped launch carries the node attribute
             assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
-            assert programs.node_attrs == nodes0 + tapes[1][0] + tapes[2][1], (
+            assert programs.node_attrs == nodes0 + n_cap_captured, (
                 programs.node_attrs,
                 nodes0,
-                tapes,
+                caps,
             )
-            assert (
-                nodes[1][0] == tapes[1][0] >= 1 and nodes[2][1] == tapes[2][1] >= 1
-            ), (
+            assert nodes[1][0] == caps[1][0] and nodes[cap_b][1] == caps[cap_b][1], (
                 nodes,
-                tapes,
+                caps,
             )
-            assert [n[0] for n in nodes[1:]] == [tapes[1][0]] * 3, (
+            assert [n[0] for n in nodes[1:]] == [caps[1][0]] * 3, (
                 nodes
             )  # the replays carry the capture's record
-            assert brackets[1][0] is None and brackets[2][1] is None, brackets
-            evidence = programs.node_attr_log
-            assert evidence and all(
-                e["rc"] == 0
-                and e["node_type"] == 0
-                and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
-                for log in evidence.values()
-                for e in log
-            ), evidence
+            assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
+            if n_cap_captured:
+                evidence = programs.node_attr_log
+                assert evidence and all(
+                    e["rc"] == 0
+                    and e["node_type"] == 0
+                    and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
+                    for log in evidence.values()
+                    for e in log
+                ), evidence
         elif capped:
-            assert (
-                programs.capture_skips > skips0
-            )  # the capped programs launched bare inside the captures
+            assert programs.capture_skips == skips0 + n_cap_captured, (
+                programs.capture_skips,
+                skips0,
+                caps,
+            )  # each capped launch inside a capture launches bare and counts one skip
             if graph_cap == "capture_pref":
                 for b in (
                     brackets[1][0],
-                    brackets[2][1],
+                    brackets[cap_b][1],
                 ):  # the forward's and the backward's capture evidence
                     assert [e["set"] for e in b] == [
                         cake_kcp.WALK_CACHE_CONFIG_CAP,
@@ -3607,7 +3739,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
                     ], b
                     assert all(e["rc"] == 0 and e["readback"] == e["set"] for e in b), b
             else:
-                assert brackets[1][0] is None and brackets[2][1] is None, brackets
+                assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
         out2, _ = cake_kcp.chunk_kda_kcp_fwd(
             q.clone(), k, v, g, beta, ctx, workspace=ws, graph="replay", **knobs
         )
@@ -3618,17 +3750,19 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert n_entries >= 2 and cake_kcp.graph_cache_clear() == 0
     finally:
         cake_kcp.graph_cache_clear()
-    res, ev, _ = run(graph="off")
+    res, ev, _ = run(graph="off", **knobs)
     assert ev == ("eager", "eager") and all(
         torch.equal(a, b) for a, b in zip(res, ref, strict=True)
     )
     _evidence(
-        f"gpu_graph_replay_{graph_cap}",
+        f"gpu_graph_replay_{graph_cap}_{walk_form}",
         {
             "module": "cake_kcp",
             "T": T,
             "H": H,
             "graph_cap": graph_cap,
+            "walk_form": walk_form,
+            "walk_forms_eager": [list(map(list, r["walk_forms"])) for r in recs0],
             "capped_geometry": capped,
             "events": events,
             "cache_config": ccs,
@@ -3638,7 +3772,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
             else None,
             "node_attrs_delta": (programs.node_attrs - nodes0) if capped else None,
             "cache_config_nodes": nodes,
-            "tape_launches": tapes,
+            "capped_launches": caps,
             "node_attr_log": {
                 f"{k[0]}:{k[1]}": v for k, v in programs.node_attr_log.items()
             }
@@ -3687,7 +3821,7 @@ def test_capped_launch_without_cudart_degrades(monkeypatch) -> None:
     assert len(runtime_warnings) == 1 and "unavailable" in str(
         runtime_warnings[0].message
     )
-    assert jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
     assert (
         programs.carveout_log == {}
         and programs.carveout_state == {}
@@ -3743,7 +3877,7 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
     call = _fake_call(cake_kcp.WALK_GEOMETRY_DEFAULT)
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
     assert (
-        jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+        jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
         and sets == []
         and programs.capture_skips == 1
     )
@@ -3782,6 +3916,31 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
         walk_geometry=cake_kcp.WALK_GEOMETRY_DEFAULT,
     )
     assert cake_kcp._graph_cap_bracket(none_) == ("none", None)
+
+
+def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
+    monkeypatch,
+) -> None:
+    """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"record"`` by default, ``"off"``,
+    ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read the environment only
+    in the gate of the private ``_kcp_test_knobs`` hook, which a public call never passes."""
+    assert cake_kcp._options({}).spec3_probe == "record"
+    for mode in cake_kcp.SPEC3_PROBES:
+        assert cake_kcp._options({"spec3_probe": mode}).spec3_probe == mode
+    for bad in ("0", "1", "", None):
+        with pytest.raises(ValueError, match="spec3_probe"):
+            cake_kcp._options({"spec3_probe": bad})
+    assert not hasattr(cake_kcp, "SPEC3_ENV")
+    monkeypatch.setenv("CAKE_KCP_SPEC3", "0")
+    assert cake_kcp.KernelBackend()._spec3_pending
+    package = os.path.dirname(cake_kcp.__file__)
+    for name in sorted(os.listdir(package)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(package, name), encoding="utf-8") as f:
+            for number, line in enumerate(f, 1):
+                if "os.environ" in line or "getenv" in line:
+                    assert "TEST_KNOBS_ENV" in line, f"{name}:{number}: {line.strip()}"
 
 
 def test_host_trim_options_passthrough() -> None:
@@ -3826,6 +3985,56 @@ def test_host_trim_workspace_fast_paths() -> None:
         and v2.data_ptr() == ws._pools["c1_send"].data_ptr()
         and v2.shape == v0.shape
     )
+
+
+def test_workspace_pools_shared_lazy_and_predicted() -> None:
+    """The workspace's KCP pools against the plan module's byte query on the CPU (no local arena): every ``(ctx, H)``
+    of the C / Z / D partitions at W = 2 / 4 / 8 / 16, H = 4 / 64, allocates exactly ``kcp_arena_layout(...)["arena"]``
+    bytes for a forward and a backward workspace; each :data:`SHARED_POOLS` pair is one tensor of the larger need,
+    whichever ensure came first; the ring pools stay unallocated until a call reads them, then hold their size and
+    add ``kcp_arena_layout(...)["ring"]`` bytes; the pool sizes are the plan module's (:func:`kcp_pool_numel`)."""
+    seen_p = seen_ring = 0
+    for W in (2, 4, 8, 16):
+        for lengths, layout in (
+            ((3000,), "contiguous"),
+            ((40, 40), "zigzag"),
+            ((700, 1, 1300, 999), "zigzag_per_document"),
+        ):
+            part = _small_partition(W, lengths=lengths, layout=layout)
+            for r, ctx in enumerate(contexts(part)):
+                for H in (4, 64):
+                    tb = cake_kcp.KcpWorkspace(local=False).tables(ctx, H)
+                    assert tb.sizes == kp.kcp_pool_numel(ctx, H=H)
+                    seen_p += tb.P > 1
+                    full = kp.kcp_arena_layout(ctx, H=H)
+                    fwd = kp.kcp_arena_layout(ctx, H=H, backward=False)
+                    # forward first, then backward (the pair grows in place of both names)
+                    ws = cake_kcp.KcpWorkspace(local=False)
+                    ws.ensure(ctx, H, device="cpu", backward=False)
+                    assert ws.bytes == fwd["arena"], (W, layout, r, H)
+                    assert not ws.has("b1_send") and not ws.has("ring_out")
+                    ws.ensure(ctx, H, device="cpu", backward=True)
+                    assert ws.bytes == full["arena"], (W, layout, r, H)
+                    for a, b in kp.SHARED_POOLS:
+                        assert ws.pool(a) is ws.pool(b)
+                        assert ws.pool(a).numel() == max(tb.sizes[a], tb.sizes[b])
+                    for name in kp.FWD_POOLS + kp.BWD_POOLS:
+                        if name not in kp.LAZY_POOLS:
+                            assert ws.pool(name).numel() >= tb.sizes[name]
+                    assert not ws.has("ring_out") and not ws.has("ring_in")
+                    # a backward workspace from the start: the same storage
+                    ws2 = cake_kcp.KcpWorkspace(ctx, H, device="cpu", local=False)
+                    assert ws2.bytes == full["arena"]
+                    assert ws2.pool("c1_send") is ws2.pool("b1_send")
+                    # a ring call's first read allocates the hop pools (a zero need allocates nothing)
+                    for name in kp.LAZY_POOLS:
+                        v = ws.pool(name, tb.sizes[name])
+                        assert v.numel() == tb.sizes[name]
+                    assert ws.bytes == full["arena"] + full["ring"]
+                    seen_ring += full["ring"] > 0
+    assert (
+        seen_p > 0 and seen_ring > 0
+    )  # the rows cover the P > 1 and the crossing-fragment forms
 
 
 def test_host_trim_backward_walk_sublists_are_table_owned() -> None:
@@ -3952,7 +4161,7 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
             walk_geometry=geometry,
             scratch={},
             precision_mode=0,
-            transfer_walk="tf32_hilo",
+            transfer_walk="bf16x3_hw64",
         )
 
     backend = cake_kcp.KernelBackend(programs=cake_kcp._FiPrograms(FakeJit()))
@@ -3994,6 +4203,82 @@ def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
     c3 = call(1, geometry="shipped")
     backend.run("kcp_fwdh_tape", {"walk": [0, 1], "h0": None, "out": None, "_call": c3})
     assert calls == [("run_program", "kcp_fwdh_tape", None, None)]
+
+
+def test_walk_form_of_decides_once_per_table_set() -> None:
+    """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
+    ``(program, walk list, H, SM count, knob)`` of the call's table set and looks the form up on every later launch:
+    the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``), a fresh equal list finding
+    the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
+    part = kp.kcp_partition((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    evaluated: list[tuple] = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
+        return cake_kcp_jit.walk_form(program, chains, num_heads, sm_count, knob=knob)
+
+    programs = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    lists = {
+        "offset": tb.walk_offset,
+        "in": tb.walk_in,
+        "live": tb.walk_live,
+        "end": tb.walk_end,
+        "first": list(tb.walk_offset[:1]),  # a list unlike the others: its own entry
+    }
+
+    def call(knob: str):
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form=knob
+        )
+
+    forms: dict[
+        tuple, str
+    ] = {}  # (knob, program, walk tuple) -> form: one rule evaluation each
+    for knob in ("auto", "full", "split"):
+        for name in cake_kcp_jit.WALK_FORM_RULES:
+            for tag, lst in lists.items():
+                if not lst:
+                    continue
+                want = cake_kcp_jit.walk_form(
+                    name, [seg[s + 1] - seg[s] for s in lst], 64, 148, knob=knob
+                )
+                forms[(knob, name, tuple(lst))] = want
+                for _ in range(3):  # the first launch evaluates, the others look up
+                    got = cake_kcp._walk_form_of(
+                        call(knob), programs, name, {"walk": lst}
+                    )
+                    assert got == want, (knob, name, tag, got, want)
+                fresh = {
+                    "walk": [int(s) for s in lst]
+                }  # a fresh equal list: the same entry
+                assert cake_kcp._walk_form_of(call(knob), programs, name, fresh) == want
+    # every distinct (knob, program, walk list) evaluated exactly once (equal lists share the entry)
+    assert len(forms) >= 3 * len(cake_kcp_jit.WALK_FORM_RULES) * 2, len(forms)
+    assert sorted(evaluated) == sorted(
+        (name, tuple(seg[s + 1] - seg[s] for s in walk), 64, 148, knob)
+        for (knob, name, walk) in forms
+    ), (len(evaluated), len(forms))
+    assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
+    assert {
+        forms[("auto", name, tuple(tb.walk_offset))]
+        for name in cake_kcp_jit.WALK_FORM_RULES
+    } >= {"split"}  # the tape programs' rule
+    bare = types.SimpleNamespace(jit=types.SimpleNamespace())
+    assert (
+        cake_kcp._walk_form_of(
+            types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
+        )
+        == "full"
+    )
 
 
 class _FakeGraphRt:
@@ -4091,7 +4376,7 @@ def test_capped_launch_sets_the_node_attribute_inside_a_capture(monkeypatch) -> 
     call = _fake_node_call("node_attr")
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
-    assert jit.launched == [(program, 4, 0, 0, "tf32_hilo")] * 2
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")] * 2
     assert programs.capture_skips == 0 and programs.node_attrs == 2
     assert (
         call.scratch["node_attr_launches"] == 2
@@ -4410,7 +4695,7 @@ LOCAL_RECORD_CASES = [
     LOCAL_RECORD_CASES,
     ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
 )
-def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
+def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     """The local stages against the existing backend's registry on the CPU: the kernel backend's value dict of a
     forward (no token-row copies: the saved set carries none), a saved-mode backward and a replay backward binds
     every logical name of every
@@ -4419,7 +4704,6 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
     KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
     grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
     bytes count it) while every other program reads the context's tables."""
-    monkeypatch.setenv(cake_kcp.SPEC3_ENV, "0")
     part = _small_partition(2)
     ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=sm)
     assert ctx.T_r > 0
@@ -4476,6 +4760,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
             out=out,
             grads=grads,
             device=torch.device("cpu"),
+            opts=cake_kcp._options({"spec3_probe": "off"}),
         )
 
     def run(call, stages) -> list:
@@ -4510,6 +4795,8 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
     )
     # the two backward modes: the same records on the same grids
     assert [(k, r, g) for k, r, g, _ in replay] == [(k, r, g) for k, r, g, _ in bwd]
+    # spec3_probe="off": the saved-mode backward ran no probe and left it pending for a later call
+    assert backend._spec3_pending and backend.spec3 is None
     # every launched record of the existing backend's registry finds its logical names in the value dict
     for kind, record, _grid, values in fwd + bwd:
         if kind == "backend":
@@ -4535,8 +4822,15 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
         "kcp_dav",
         expect("dqkg", b),
         expect("glm_intra", b),
-        expect("gate_epilogue", b),
+        # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a: glm_intra;
+        # sm_103a runs glm_intra_v14 and sm_107a glm_intra_v18, and the stage call launches nothing)
+        *([expect("gate_epilogue", b)] if plan.dispatched("gate_epilogue", b) else []),
     ]
+    assert plan.dispatched("gate_epilogue", b) == (arch == "sm_100a")
+    assert expect("glm_intra", b) == {
+        "sm_103a": "glm_intra_v14",
+        "sm_107a": "glm_intra_v18",
+    }.get(arch, "glm_intra")
     if (
         H == 64 and arch != "sm_107a"
     ):  # the plan fuses the WY representation into its recurrences there

@@ -126,6 +126,51 @@ def should_use_cp_host(
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
 
+#: SM80 auto-CP: exact longest sequence at least this, parallel work at most this.
+CP_SM80_MIN_MAX_SEQ_LEN = 8192
+CP_SM80_MAX_PARALLEL_WORK = 16
+
+
+def should_use_cp_sm80_host(
+    max_seq_len: int | None,
+    num_parallel_work: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether SM80 `use_cp="auto"` takes CP; an unknown longest sequence means no."""
+    # Measured on compute capability 8.0 only.
+    if device_capability != (8, 0) or max_seq_len is None:
+        return False
+    return (
+        max_seq_len >= CP_SM80_MIN_MAX_SEQ_LEN
+        and num_parallel_work <= CP_SM80_MAX_PARALLEL_WORK
+    )
+
+
+#: The one shape the V32 fused specialization was measured on.
+V32_SM80_MAX_SEQ_LEN = 8192
+V32_SM80_NUM_SEQS = 1
+V32_SM80_NUM_Q_HEADS = 4
+V32_SM80_NUM_V_HEADS = 16
+
+
+def should_use_v32_sm80_host(
+    max_seq_len: int | None,
+    num_seqs: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether auto takes the V32 fused specialization (exactly its measured shape)."""
+    if device_capability != (8, 0) or max_seq_len is None:
+        return False
+    return (
+        max_seq_len == V32_SM80_MAX_SEQ_LEN
+        and num_seqs == V32_SM80_NUM_SEQS
+        and num_q_heads == V32_SM80_NUM_Q_HEADS
+        and num_v_heads == V32_SM80_NUM_V_HEADS
+    )
+
+
 def choose_cp_chunk_len_host(
     max_seqlen: int,
     num_heads: int,

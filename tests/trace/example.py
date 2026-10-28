@@ -14,6 +14,8 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+qsa_forward_h12_kv1_d256.json
+qsa_indexed_forward_h12_kv1_d256.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -77,6 +79,7 @@ minimax_h3_nvfp4_pre_attention_p8_hdst7_d128.json
 minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
@@ -123,6 +126,10 @@ prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
+prims_ts_bf16_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
@@ -150,6 +157,9 @@ moe_layer_cudnn_frost_bf16.json
 moe_layer_cudnn_frost_mxfp8.json
 moe_layer_cudnn_frost_nvfp4.json
 moe_layer_cudnn_frost_mxfp8_mxfp4.json
+ulysses_exchange_chunks_ws1_c128.json
+ulysses_gather_heads_ws1_d128.json
+ulysses_scatter_heads_ws1_d128.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -178,10 +188,12 @@ os.environ.setdefault("FLASHINFER_TRACE_DUMP", "1")
 SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
 
 import torch
+import torch.distributed as dist
 
 import flashinfer
 import flashinfer.activation
 import flashinfer.cascade
+import flashinfer.comm
 import flashinfer.fused_moe
 import flashinfer.gdn_decode
 import flashinfer.gemm
@@ -205,6 +217,7 @@ from flashinfer.comm import (
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
+from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
@@ -213,6 +226,7 @@ from flashinfer.prefill import (
     fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
+from flashinfer.prims_ts.moe import MoePartitionResources
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
 from tests.utils_fp8 import to_float8
@@ -221,6 +235,25 @@ from tests.utils_fp8 import to_float8
 generate_moe_layer_traces(SAVE_DIR)
 
 device = "cuda"
+
+# Metadata-only SM90 MLA+SWA example, also usable without SM90 hardware.
+from flashinfer.mla import (
+    batch_decode_with_kv_cache_mla_swa,
+    get_mla_swa_workspace_size_bytes,
+)
+
+batch_decode_with_kv_cache_mla_swa.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty((1, 1, 64, 1088), device="meta", dtype=torch.bfloat16),
+    kv_cache=torch.empty((9, 64, 1088), device="meta", dtype=torch.bfloat16),
+    workspace_buffer=torch.empty(
+        get_mla_swa_workspace_size_bytes(1, 1), device="meta", dtype=torch.uint8
+    ),
+    block_tables=torch.empty((1, 9), device="meta", dtype=torch.int32),
+    seq_lens=torch.empty((1,), device="meta", dtype=torch.int32),
+    window_left=512,
+    sm_scale=0.0625,
+)
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
 
 # PCIe traces need only world_size and tensor metadata, not an IPC allocation
@@ -454,6 +487,37 @@ flashinfer.apply_rope_with_cos_sin_cache(
 flashinfer.apply_rope_with_cos_sin_cache_inplace(
     rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
 )
+
+
+def example_qsa():
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        print("Skipping QSA examples: requires SM100/SM103/SM107")
+        return
+    q = torch.randn(8, 12, 256, dtype=torch.bfloat16, device=device)
+    k = torch.randn(8, 1, 256, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    token = torch.arange(8, device=device, dtype=torch.int32)
+    zeros = torch.zeros_like(token)
+    first = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    flashinfer.qsa_forward(
+        q,
+        k,
+        v,
+        torch.ones(8, 2, device=device, dtype=torch.uint8),
+        zeros,
+        token,
+        zeros,
+        zeros,
+        first,
+        first + 3,
+    )
+    if capability in ((10, 0), (10, 3)):
+        indices = torch.where(token[None, :] <= token[:, None], token[None, :], -1)
+        flashinfer.qsa_indexed_forward(q, k, v, indices)
+
+
+example_qsa()
 
 
 def example_dsv41_fp4_cache():
@@ -2102,6 +2166,167 @@ flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
     **_pts_moe_fp4_common,
 )
 
+# Partitioned Prims-TS APIs consume two prepared MajorK shards and caller-owned
+# streams. Use TP-N/TP-K here so FC1 is split by output rows while FC2 is split
+# by reduction K, matching the public two-way partition contract.
+_pts_partition_device = torch.device("cuda", torch.cuda.current_device())
+_pts_properties = torch.cuda.get_device_properties(_pts_partition_device)
+_pts_green_streams, _pts_green_resources = split_device_green_ctx_by_sm_count(
+    _pts_partition_device, [_pts_properties.multi_processor_count // 2]
+)
+_pts_partition_resources = MoePartitionResources(
+    streams=(_pts_green_streams[0], _pts_green_streams[1])
+)
+_pts_partition_common = dict(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    topk_ids=None,
+    hidden_states=_pts_moe_hidden_bf16,
+    num_experts=_pts_moe_E,
+    top_k=_pts_moe_K,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=_pts_moe_I,
+    local_expert_offset=0,
+    local_num_experts=_pts_moe_E,
+    partition_resources=_pts_partition_resources,
+    partition_strategy="tp_n_tp_k",
+    routed_scaling_factor=None,
+    routing_method_type=1,
+)
+_pts_partition_w1_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 2,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_bf16_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_bf16,
+    gemm2_weights=_pts_partition_w2_bf16,
+    **_pts_partition_common,
+)
+
+_pts_partition_w1_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w1_bf16
+)
+_pts_partition_w2_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w2_bf16
+)
+flashinfer.prims_ts_fp8_per_tensor_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_fp8,
+    output1_scales_scalar=_pts_moe_tensor_scales,
+    output1_scales_gate_scalar=_pts_moe_tensor_scales,
+    gemm2_weights=_pts_partition_w2_fp8,
+    output2_scales_scalar=_pts_moe_tensor_scales,
+    use_routing_scales_on_input=False,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
+_pts_partition_w1_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w1_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp4_block_scale_moe_partitioned.fi_trace(
+    topk_weights=None,
+    hidden_states_scale=_pts_moe_hidden_fp4_scale.reshape(-1),
+    gemm1_weights=_pts_partition_w1_fp4,
+    gemm1_weights_scale=_pts_partition_w1_fp4_scale,
+    gemm2_weights=_pts_partition_w2_fp4,
+    gemm2_weights_scale=_pts_partition_w2_fp4_scale,
+    output1_scale_scalar=_pts_moe_tensor_scales,
+    output1_scale_gate_scalar=_pts_moe_tensor_scales,
+    output2_scale_scalar=_pts_moe_tensor_scales,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp4,
+    },
+)
+
+_pts_partition_hidden_mxfp8_scale = torch.empty(
+    _pts_moe_T * (_pts_moe_H // 32),
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_partition_w1_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp8_block_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    hidden_states_scale=_pts_partition_hidden_mxfp8_scale,
+    gemm1_weights=_pts_partition_w1_fp8,
+    gemm1_weights_scale=_pts_partition_w1_fp8_scale,
+    gemm2_weights=_pts_partition_w2_fp8,
+    gemm2_weights_scale=_pts_partition_w2_fp8_scale,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))
 print(f"\nWrote {len(files)} definition files:\n")
@@ -3155,3 +3380,43 @@ if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _tkv_cc[0] * 10 + _tkv_
         absolute_indices=True,
         backend="gvr_2",
     )
+
+# ── Ulysses layout transforms (single-rank trace reference) ──────────────────
+# The trace template intentionally models world_size=1. Multi-rank data movement
+# is covered by tests/comm and cannot be represented by a single-process
+# flashinfer-bench reference function.
+_ulysses_owns_process_group = False
+try:
+    # Only the process-group bring-up is allowed to fail quietly: it is the one
+    # step this script cannot assume (no NCCL, no CUDA). A communicator or
+    # collective that fails after that is a real defect, and suppressing it
+    # would let this script exit 0 having silently skipped the Ulysses traces.
+    if not dist.is_initialized():
+        with contextlib.suppress(Exception):
+            dist.init_process_group(
+                "nccl", store=dist.HashStore(), rank=0, world_size=1
+            )
+            _ulysses_owns_process_group = True
+    if dist.is_initialized() and dist.get_world_size() == 1:
+        _ulysses_x = torch.randn(1, 128, 8, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_x.nbytes,
+            dtype=_ulysses_x.dtype,
+            backend="nccl",
+            device=_ulysses_x.device,
+        ) as _ulysses_comm:
+            _ulysses_comm.scatter_heads(_ulysses_x)
+            _ulysses_comm.gather_heads(_ulysses_x)
+        # Chunk exchange takes [1, 1, world_size, chunk], so it needs its own
+        # operand rather than a view of the head-major one above.
+        _ulysses_chunks = torch.randn(1, 1, 1, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_bytes=_ulysses_chunks.nbytes,
+            dtype=_ulysses_chunks.dtype,
+            backend="nccl",
+            device=_ulysses_chunks.device,
+        ) as _ulysses_chunk_comm:
+            _ulysses_chunk_comm.exchange_chunks(_ulysses_chunks)
+finally:
+    if _ulysses_owns_process_group:
+        dist.destroy_process_group()

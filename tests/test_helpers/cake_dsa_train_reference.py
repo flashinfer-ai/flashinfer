@@ -197,6 +197,9 @@ def last_valid_plus_one(
     return torch.where(valid, pos, 0).amax(dim=-1)
 
 
+derive_topk_length = last_valid_plus_one  # the package's test-only length rule
+
+
 def compact_rows(
     indices: torch.Tensor, num_kv: int, topk_length: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:

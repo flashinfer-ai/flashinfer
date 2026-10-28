@@ -76,7 +76,8 @@ give bitwise the same outputs: the kernels reduce in a fixed order.
 
 Programmatic dependent launch is a per-plan switch (:func:`pdl_for`, reported
 as ``route_metadata["pdl"]``): when the plan has a split merge and its decode
-is one wave of clusters (``items <= units``), the decode and the merge launch
+is one hardware wave (``items <= units + pairs``: the clusters of four plus
+the pairs the device holds resident), the decode and the merge launch
 with the programmatic attribute, so the decode's prologue overlaps the
 quantizer's tail and the merge's the decode's (the quantizer triggers its
 dependents once its rows are stored, the decode once a role runs out of
@@ -127,7 +128,7 @@ WORKSPACE_SLOTS = ("partial_o", "partial_lse", "lse_scratch", "plan_block")
 
 # The decode cost model's constants (:func:`mla2_plan`).
 MLA2_ITEM_COST = 7  # the mixed-cluster kernel's ramp and epilogue per item in 128-key tile times (fitted on sweeps)
-MERGE_BATCH_COST = 1.5  # the merge's second load batch, in tile times, when a row has more than 32 partial slots
+MLA2_SHAVE_TILES = 48  # a shaved one-wave plan's short range per full tile, in 128-key tiles (:func:`mla2_plan`)
 
 # Clusters of four the GPU holds at once and pair clusters on the SMs the fours leave, by SM count, for devices
 # whose occupancy cannot be queried (:func:`device_units_pairs`): R200 boards measured 50 fours and 4 pairs at 208 SMs
@@ -156,6 +157,7 @@ def mla2_plan(
     slack=0.03,
     pair_cost=1.4,
     split=0,
+    shave=MLA2_SHAVE_TILES,
 ):
     """The work items of the mixed-cluster decode (128-key tiles). A (request, row tile) whose
     rows past the first 128 are padding (H96 x 4 = 384 rows: the second tile) is a half tile; its items are double
@@ -172,11 +174,14 @@ def mla2_plan(
     those stay equal). ``split`` is given (an int for both counts, a pair ``(s_f, s_h)``) or the pair of counts
     whose cost is least: the makespan of the items over the clusters and the couples taking items in order as they
     free, each item its tiles plus ``item_cost`` (ramp and epilogue), plus the partials written and merged (``2 n +
-    1`` rows of 1 KB per query row with ``n`` partials, at ``merge_rows_per_tile`` rows per tile-time, and
-    ``MERGE_BATCH_COST`` more when a row has over 32 slots: the merge then loads its outputs in two batches, Q4 B1
-    KV64K measured 4.3-4.5 us at 38 slots against 3.1-3.2 at 32); the
+    1`` rows of 1 KB per query row with ``n`` partials, at ``merge_rows_per_tile`` rows per tile-time; the merge
+    variant is chosen to load every row in one round, so no second-batch term); the
     plan within ``slack`` of the least cost with equal lengths, else two, then the smallest counts, and at those counts
-    the couples' scale the model puts at least 1 % under equal lengths.
+    the couples' scale the model puts at least 1 % under equal lengths. One wave of at least ``0.8 units`` full tiles
+    of 1024 key tiles or more also prices the shaved plan: every tile in a long range and a short one of ``shave``
+    tiles, the long ranges emitted first (the clusters' wave) and the short ones after them, which the clusters the
+    wave leaves and the couples take as they free (48 tiles on 50 clusters and 2 couples otherwise leave 16 of 208
+    SMs idle for the whole decode); it replaces the choice when the model puts it under that by more than ``slack``.
     Returns the items (page ranges ``(request, row tile, first page, end page, split, split count, flags, 0)``,
     ``flags & 1`` a direct item that writes ``O`` / ``LSE``), the kernel's ``item_table`` rows ``(request, row tile,
     first 128-key tile, tiles, z, split count)``, ``max_splits`` (a row of a full tile has ``s_f`` partials, of a
@@ -201,6 +206,9 @@ def mla2_plan(
     )
     k_max = max(tiles_of, default=0)
     couples = pairs // 2 if pairs > 1 else 0
+    # A one-wave plan: full tiles only, no more of them than clusters (every item starts at once).
+    one_wave = not half_tiles and 0 < len(full_tiles) <= units
+    one_tile = one_wave and len(full_tiles) == 1
 
     def makespan(costs):
         """Greedy list scheduling of ``costs`` (cluster time, double flag) in order over the clusters of four and
@@ -212,7 +220,16 @@ def mla2_plan(
         span = 0.0
         for c, dbl in costs:
             t, kind, r = heapq.heappop(free)
-            t += c if (kind == 0 or dbl) else pair_cost * c
+            if kind == 0 or dbl:
+                t += c
+            elif one_tile:
+                # A one-tile request's couple ranges are short (at most 20 tiles at 128K): the couple takes pair_cost
+                # of a cluster's time over the range and the ramp and epilogue are the item's own (52 items beat 43 by
+                # 3.5 % on a one-tile 64K row, which pair_cost on the whole item priced 6 % slower); longer ranges
+                # keep the whole-item costing (a 4-tile row at 13 splits measured 0.9 % slower than at 12).
+                t += pair_cost * (c - item_cost) + item_cost
+            else:
+                t += pair_cost * c
             span = max(span, t)
             heapq.heappush(free, (t, kind, r))
         return span
@@ -282,8 +299,27 @@ def mla2_plan(
         ]
         return ranges, order
 
-    def cost(s_f, s_h, scale, s_t=0):
-        ranges, order = full_ranges(s_f, scale) if not s_t else mixed_ranges(s_t)
+    def shaved_ranges(x):
+        """Each full tile in a long range and a short one of ``x`` tiles, the long ranges emitted first (the
+        clusters' wave) and the short ones after them, for the clusters the wave leaves and the couples to take as
+        they free."""
+        ranges = [
+            [(0, tiles_of[b] - x, False), (tiles_of[b] - x, x, False)]
+            for b, _m, _h in full_tiles
+        ]
+        n_tiles = len(full_tiles)
+        return ranges, [(t, 0) for t in range(n_tiles)] + [
+            (t, 1) for t in range(n_tiles)
+        ]
+
+    def cost(s_f, s_h, scale, s_t=0, x=0):
+        ranges, order = (
+            shaved_ranges(x)
+            if x
+            else full_ranges(s_f, scale)
+            if not s_t
+            else mixed_ranges(s_t)
+        )
         tps_h = -(-k_max // s_h) if half_tiles else 0
         costs = [(ranges[t][i][1] + item_cost, False) for t, i in order]
         costs += [(0.6 * tps_h + item_cost, True)] * (len(half_tiles) * s_h)
@@ -298,12 +334,11 @@ def mla2_plan(
             merge += (2 * s_f + 1) * rows_full / merge_rows_per_tile
         if half_tiles:
             merge += (4 * s_h + 1) * rows_half / merge_rows_per_tile
-        if max(s_t or (s_f if full_tiles else 0), 2 * s_h if half_tiles else 0) > 32:
-            merge += MERGE_BATCH_COST
         return makespan(costs) + merge
 
     scales = (1.0, 1.0 / pair_cost, pair_cost)
     s_t = 0  # a mixed plan's tail split (0: every full tile cut alike)
+    x_s = 0  # a shaved plan's short range (0: none)
     if isinstance(split, tuple) and split and split[0] == "mixed":
         s_f, s_h, s_t, scale = 1, 1, int(split[1]), 1.0
     elif split:
@@ -331,11 +366,19 @@ def mla2_plan(
             cands = {c for c in cands if c[0] >= 2}
         costs = {(c, sc): cost(*c, sc) for c in cands for sc in scales}
         best = min(costs.values())
-        # Within the slack (the model's accuracy across split counts): equal lengths first, then fewer splits; then,
-        # at those counts, a couple scale the model puts at least 1 % under equal lengths.
+        # Within the slack (the model's accuracy across split counts): a one-tile request fills the wave first
+        # (up to the clusters and couples: 52 items on 208 SMs; two-tile rows at 25 splits measured +0.9 % on one
+        # board and -1.0 % on another, so more tiles keep the old order), then equal lengths, then fewer splits;
+        # then, at those counts, a couple scale the model puts at least 1 % under equal lengths.
+        fill_cap = units + couples
+
+        def wave_fill(k):
+            n = k[0][0]
+            return n if one_tile and n <= fill_cap else 0
+
         (s_f, s_h), scale = min(
             (k for k, v in costs.items() if v <= (1 + slack) * best),
-            key=lambda k: (k[1] != 1.0, k[0][0] + k[0][1], k[0]),
+            key=lambda k: (-wave_fill(k), k[1] != 1.0, k[0][0] + k[0][1], k[0]),
         )
         if scale == 1.0:
             alt = min(
@@ -352,7 +395,26 @@ def mla2_plan(
             st_best = min(mixed, key=lambda st: (mixed[st], st))
             if mixed[st_best] < costs[((s_f, s_h), scale)] / (1 + slack):
                 s_f, s_h, s_t, scale = 1, s_h_m, st_best, 1.0
-    ranges, order = full_ranges(s_f, scale) if not s_t else mixed_ranges(s_t)
+        # One wave of nearly as many full tiles as clusters at long key counts (1024 key tiles, 128K, and up: the rows
+        # the family was measured on): the shaved plan, each tile a long range and a short one of ``shave`` tiles for
+        # the clusters the wave leaves and the couples, when the model puts it under the chosen plan by more than the
+        # slack (it is not held to the equal-lengths order above).
+        if (
+            one_wave
+            and shave
+            and len(full_tiles) >= 0.8 * units
+            and min(tiles_of[b] for b, _m, _h in full_tiles) >= max(1024, 2 * shave)
+        ):
+            shaved = cost(2, 1, 1.0, x=shave)
+            if shaved < costs[((s_f, s_h), scale)] / (1 + slack):
+                s_f, s_h, scale, x_s = 2, 1, 1.0, shave
+    ranges, order = (
+        shaved_ranges(x_s)
+        if x_s
+        else full_ranges(s_f, scale)
+        if not s_t
+        else mixed_ranges(s_t)
+    )
     tps_h = -(-k_max // s_h)
     n_f = (s_t or s_f) if full_tiles else 0
     n_h = 2 * s_h if half_tiles else 0
@@ -474,8 +536,9 @@ class Plan:
     ``item_table`` is the flat int32 ``[items * 6]`` the decode walks (full-tile items first, ``n_full`` of them),
     ``q_indptr`` the ``[B + 1]`` query prefix sums, ``row_limit`` the ``[rows_total]`` per-row key limits;
     together they are the plan block uploaded once per runner.  ``max_splits`` is the partial-slot count per row
-    (1: every item direct, no merge).  ``decode_record`` is ``decode_full`` when ``n_full == items`` else
-    ``decode``; ``merge_record`` the row-count instantiation of the merge, ``None`` when ``max_splits == 1``.
+    (1: every item direct, no merge).  ``decode_record`` is ``decode_full_pairpipe`` when the plan scalars lie in
+    its registry boxes, else ``decode_full`` when ``n_full == items``, else ``decode``; ``merge_record`` the merge
+    variant for the row count and partials per row, ``None`` when ``max_splits == 1``.
     """
 
     batch: int
@@ -522,14 +585,15 @@ class Plan:
 def pdl_for(plan: Plan) -> bool:
     """Whether the plan's decode and merge launch with programmatic dependent launch.
 
-    On when the plan has a split merge (``max_splits > 1``) and the decode is one wave of clusters (``items <=
-    units``): the merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off
-    otherwise: without a merge there is nothing behind the decode to overlap, and a decode of more items than
-    resident clusters would lose SMs of its second wave to the early-launched merge.  Off launches every program
-    plain, the merge included (a merge under the attribute behind a decode that never triggers starts later than a
-    plain launch).
+    On when the plan has a split merge (``max_splits > 1``) and the decode is one hardware wave (``items <= units +
+    pairs``: the clusters of four and the pairs the device holds resident at once, 50 + 4 on a 208-SM board): the
+    merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off otherwise: without a
+    merge there is nothing behind the decode to overlap, and a decode of more items than the device holds resident
+    would lose SMs of its second wave to the early-launched merge.  Off launches every program plain, the merge
+    included (a merge under the attribute behind a decode that never triggers starts later than a plain launch).
+    The plans of 51-52 items (204-208 CTAs, still one hardware wave) run 1-2 % faster with the attribute on R200.
     """
-    return plan.max_splits > 1 and plan.items <= plan.units
+    return plan.max_splits > 1 and plan.items <= plan.units + plan.pairs
 
 
 def _round_up(n: int, m: int) -> int:
@@ -620,10 +684,12 @@ def _plan_cached(
         kv_lens, q_lens, num_heads, kv_lens_global, cp_world, cp_rank, cp_interleave
     )
     decode_record = cake_jit.select_record(
-        "decode", rows=rows_total, n_full=n_full, items=items
+        "decode", rows=rows_total, n_full=n_full, items=items, splits=max_splits
     )
     merge_record = (
-        cake_jit.select_record("merge", rows=rows_total, n_full=n_full, items=items)
+        cake_jit.select_record(
+            "merge", rows=rows_total, n_full=n_full, items=items, splits=max_splits
+        )
         if max_splits > 1
         else None
     )
@@ -1559,7 +1625,6 @@ __all__ = [
     "LOG2E",
     "Launcher",
     "MAX_SPLITS",
-    "MERGE_BATCH_COST",
     "MLA2_ITEM_COST",
     "PAGE",
     "Plan",

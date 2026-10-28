@@ -66,6 +66,7 @@ from .fp4_common import (
     quantize_and_pack_16,
     # Reduction utilities
     row_reduce,
+    zero_swizzled_sf_padding,
     # Predicate utility
     predicate_k,
 )
@@ -295,7 +296,16 @@ class RMSNormFP4QuantKernel:
         self.kernel(
             mX, mW, mY, mS, mGlobalScale, M, eps, enable_pdl, tv_layout, tiler_mn
         ).launch(
-            grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
+            grid=[
+                cute.ceil_div(
+                    # A swizzled scale buffer is padded to 128 rows; the CTAs past M
+                    # only zero their rows of that padding (zero_swizzled_sf_padding).
+                    (M + 127) // 128 * 128 if self.output_swizzled else M,
+                    self.rows_per_block,
+                ),
+                self.cluster_n,
+                1,
+            ],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
             if cutlass.const_expr(self.cluster_n > 1)
@@ -652,6 +662,17 @@ class RMSNormFP4QuantKernel:
                         )
                         st_global_u64(out_ptr, packed64_c1)
 
+        if cutlass.const_expr(self.output_swizzled):
+            zero_swizzled_sf_padding(
+                mS,
+                M,
+                actual_row_idx,
+                lane_in_row,
+                num_sf_blocks_per_row,
+                self.num_k_tiles,
+                self.threads_per_row,
+            )
+
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -887,6 +908,13 @@ def rmsnorm_fp4quant(
 
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
+
+    # Caller-provided outputs are written in place with row-major addressing; a
+    # strided view would be written through a temporary copy and left unchanged.
+    if y_fp4 is not None:
+        assert y_fp4.is_contiguous(), "y_fp4 must be contiguous"
+    if block_scale is not None:
+        assert block_scale.is_contiguous(), "block_scale must be contiguous"
 
     # Allocate output tensors if not provided
     if y_fp4 is None:
