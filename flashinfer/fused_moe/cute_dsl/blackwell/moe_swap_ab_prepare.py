@@ -198,10 +198,10 @@ class PrepareRouted:
                     block = tidx + iteration * self.threads
                     if block < self.sf_blocks:
                         offset = (
-                            cutlass.Int64(sf_row // 128) * self.sf_blocks * 128
+                            cutlass.Int64(sf_row >> 7) * self.sf_blocks * 128
                             + block * 128
-                            + (sf_row % 32) * 4
-                            + (sf_row % 128) // 32
+                            + (sf_row & 31) * 4
+                            + ((sf_row >> 5) & 3)
                         )
                         target = cute.make_tensor(
                             routed_sf_ptr + offset, cute.make_layout((1,))
