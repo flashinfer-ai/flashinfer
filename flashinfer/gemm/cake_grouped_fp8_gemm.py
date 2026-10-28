@@ -518,6 +518,7 @@ BS_SWAP_SM100_SMALL_KEEP = frozenset(
 BS_SWAP_SM103_SMALL_ADMIT = frozenset(
     {
         (640, 1024, 256, 32),
+        (1024, 1024, 512, 32),
         (1664, 384, 128, 128),
     }
 )
