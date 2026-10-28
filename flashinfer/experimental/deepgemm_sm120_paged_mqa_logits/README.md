@@ -97,10 +97,11 @@ route binding (see "Layout").
 
 ## Device routes
 
-The catalog may also carry routes tuned for one device, chosen by the
-device's physical SM count (170: RTX 5090, 188: RTX PRO 6000; the RTX PRO
-6000 Max-Q also has 188 SMs and takes that table without having been
-measured). A prepared call takes a device route only when all of these hold:
+The catalog also carries routes tuned for two devices, chosen by the
+device's physical SM count (170: RTX 5090, 188: RTX PRO 6000). The SM count
+is the only key: another part with the same SM count (the RTX PRO 6000 Max-Q,
+or a board with a lower power limit) takes the same table without having been
+measured on it. A prepared call takes a device route only when all of these hold:
 the device's SM count keys a table of `policy.device_rule`, the CTA budget
 equals that SM count (no `sm_count` override; for the one-shot entry,
 `schedule_meta` has `num_sms + 1` rows), and `max_context_hint` lies in one
@@ -109,10 +110,18 @@ of the rule's context windows (half-open, in KV tokens). The table key is
 selects; its value lists `[batch, route]` pairs by batch. A listed batch takes
 its route; a batch strictly between two listed batches takes their route only
 when both list the same one; any other batch, and a `null` entry, runs the
-default route. Every other call runs the default route above, so outputs are
-bitwise the same on every route and only the timing depends on the device.
+default route. Every other call runs the default route above.
 `resolve_route(...)` gives the route a call runs; `plan.route_name`,
 `plan.atom_variant` and `plan.num_next_n_atoms` follow it.
+
+The device routes are built without fast math. Their logits are bitwise
+equal to DeepGEMM's on all inputs, including tiny-magnitude ones whose
+partial results reach the FP32 denormal range. The default routes were built with
+`--use_fast_math`, which flushes denormals to zero: on tiny-magnitude inputs
+their logits can differ from DeepGEMM's and from a device route's, and on
+normal-magnitude inputs every route is bitwise equal to DeepGEMM. A call that
+no device table selects keeps its default route, so its bits and its timing
+are unchanged.
 
 A device route named `sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:<tag>` may
 run a different Q atom than the default rule, and its schedule is `static`

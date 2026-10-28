@@ -1,4 +1,15 @@
-"""Experimental SM120 paged FP8 MQA lightning-indexer logits (DeepGEMM signatures)."""
+"""Experimental SM120 paged FP8 MQA lightning-indexer logits (DeepGEMM signatures).
+
+A call runs the default route of its ``(H, page_kv, next_n)`` geometry and
+Q-atom variant unless its device has a route table: on an RTX 5090 (170 SMs)
+or an RTX PRO 6000 (188 SMs), a call with the device's full CTA budget and a
+``max_context_hint`` inside one of the catalog's context windows runs the
+device route the table lists for its batch, if any.  The table is keyed by
+the SM count alone, so a part with the same SM count (the RTX PRO 6000 Max-Q,
+a power-limited board) takes the same table.  Device routes are built without
+fast math and their logits are bitwise equal to DeepGEMM's; the default routes
+flush denormals, so on tiny-magnitude inputs their logits can differ.
+"""
 
 from .api_logging import flashinfer_experimental_api
 
@@ -90,7 +101,9 @@ def fp8_paged_mqa_logits(
     the optional ``max_context_hint`` (an upper bound of the batch's context
     lengths; from 16384 up batches 2..8 take the native-atom programs; it must
     equal the hint ``schedule_meta`` was built with, and ``max_context_len``
-    never selects the program);
+    never selects the program); with the device's full CTA budget the hint
+    also selects a device route tuned for the RTX 5090 or the RTX PRO 6000
+    where the device's table lists one (module docstring);
     ``route_available(H, page_kv, next_n[, B])`` in
     ``flashinfer.experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa``
     reports the shipped routes; no fallback is selected for an unsupported
