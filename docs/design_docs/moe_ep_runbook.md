@@ -715,6 +715,9 @@ config with either its existing selector or `_cutedsl_next`. For example,
 set `kind="mxfp8_e5m2"` or `kind="mxfp4_mxfp8"` in the example above.
 Early and late routing weights are supported. In-kernel FC2 reduction,
 per-token FC1 scales, SiTU and custom finalization remain unsupported.
+`finalize_mode=AUTO` with `num_valid_tokens_tensor` requires persistent
+finalization and is rejected. Explicit `finalize_mode=DEFAULT` remains a
+static-capacity path, even when a live-token count tensor is supplied.
 
 With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
 host-side estimate based on EP size, expert count, top-k, intermediate width,

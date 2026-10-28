@@ -194,6 +194,7 @@ def test_blackwell_standard_global_scales(kind, scalar, monkeypatch):
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("persistent", [False, True])
 def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
+    """Compile a padded NVFP4 workspace with default or persistent finalization."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),

@@ -48,6 +48,7 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
 
     @property
     def instruction_k(self) -> int:
+        """Return the native block-scaled MMA K extent for the quantization kind."""
         return 64 if self.quant_kind == "nvfp4" else 32
 
     @property
@@ -57,6 +58,7 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
 
     @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
+        """Use explicit geometry or the dtype's N128 Gather4 default."""
         return self.mma_tiler_mnk or (256, 128, self.gather_tile_k)
 
     @property
@@ -70,6 +72,7 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
         return geometries
 
     def __post_init__(self) -> None:
+        """Restrict GenPhase to admitted Gather4 geometries and BF16 reduction."""
         super().__post_init__()
         geometry = (self.resolved_mma_tiler_mnk, self.cluster_shape_mn)
         if (

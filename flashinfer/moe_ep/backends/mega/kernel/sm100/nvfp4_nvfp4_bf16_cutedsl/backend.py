@@ -68,6 +68,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Initialize legacy inference state and reject next-only GenPhase."""
         super().__init__(config)
         if config.kernel_variant != "inference":
             raise MoEEpConfigError(

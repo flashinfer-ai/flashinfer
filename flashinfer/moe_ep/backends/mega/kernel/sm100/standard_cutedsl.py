@@ -40,6 +40,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     quant_kind: str | None = None
 
     def __init__(self, config):
+        """Validate selector constraints and initialize output capabilities."""
         super().__init__(config)
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
@@ -67,6 +68,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return get_tuned_knobs(workspace)
 
     def _finalize_mode(self, fleet):
+        """Resolve AUTO for inference; GenPhase requires default finalization."""
         if self._config.kernel_variant == "genphase":
             return FinalizeMode.DEFAULT
         mode = self._config.finalize_mode
@@ -107,6 +109,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         self._workspace_config(fleet_params)
 
     def _workspace_config(self, fleet):
+        """Resolve GenPhase geometry or translate inference knobs to native options."""
         if self._config.kernel_variant == "genphase":
             config = self._genphase_config(fleet)
             self._check_genphase_selection(config)
@@ -271,6 +274,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params):
+        """Allocate variant-specific buffers and initialize expert scale tensors."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             Sm100BlockScaledSymmBuffer,
             Sm100GenphaseSymmBuffer,
@@ -305,6 +309,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return workspace
 
     def _workspace_pool_key(self, fleet_params):
+        """Key fixed workspaces by geometry, finalization and borrowed tensors."""
         if self._config.knobs == "auto":
             return None
         from .....core.kernel.workspace_pool import epilogue_pool_key
@@ -382,6 +387,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 )
 
     def stage_inputs(self, t, workspace, *, quantize_input):
+        """Stage quantized activations, mask padded routes and refresh live scales."""
         n = t.hidden_states.shape[0]
         cfg = workspace.config
         if self._kind() == "nvfp4":
@@ -450,6 +456,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 target.copy_(value)
 
     def validate_capture_ready(self, workspace, transformed_weights):
+        """Require the workspace and any terminal reducer to be warmed up."""
         if workspace._compiled is None:
             raise RuntimeError("Warm up the standard workspace before graph capture.")
         if (
@@ -464,6 +471,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 raise RuntimeError("Warm up the terminal reducer before graph capture.")
 
     def compute(self, workspace, transformed_weights, *, output):
+        """Launch the prepared MoE and its selected BF16 finalization path."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,

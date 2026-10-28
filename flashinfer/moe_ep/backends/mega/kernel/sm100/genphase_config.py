@@ -28,6 +28,7 @@ class GenphaseConfigMixin:
     )
 
     def _init_genphase_config(self):
+        """Validate GenPhase features before selecting or allocating a workspace."""
         k = self._config
         if k.knobs not in (None, "auto") and not isinstance(k.knobs, dict):
             raise MoEEpConfigError(
@@ -43,6 +44,14 @@ class GenphaseConfigMixin:
         if k.finalize_mode not in (FinalizeMode.AUTO, FinalizeMode.DEFAULT):
             raise MoEEpConfigError(
                 "Blackwell GenPhase supports only the default finalize kernel."
+            )
+        if (
+            k.finalize_mode is FinalizeMode.AUTO
+            and k.num_valid_tokens_tensor is not None
+        ):
+            raise MoEEpConfigError(
+                "Blackwell GenPhase does not support AUTO finalize with "
+                "num_valid_tokens_tensor; persistent finalization is unsupported."
             )
         if k.activation != "swiglu" or k.swiglu_alpha is not None:
             raise MoEEpConfigError("Blackwell GenPhase supports standard SwiGLU.")

@@ -90,6 +90,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        """Reject incompatible dtype, activation and finalization options."""
         if self.kind == "mxfp4_mxfp8" and self.kernel_variant != "genphase":
             raise ValueError("Mixed MXFP4/MXFP8 requires kernel_variant='genphase'.")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):

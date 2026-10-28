@@ -11,7 +11,53 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4", "mxfp4_mxfp8")
 
 
+@pytest.mark.parametrize(
+    "kind,selector",
+    [
+        (kind, selector)
+        for kind in KINDS
+        for selector in ("legacy", "next")
+        if kind != "nvfp4" or selector == "next"
+    ],
+)
+@pytest.mark.parametrize(
+    "finalize_mode", [moe_ep.FinalizeMode.AUTO, moe_ep.FinalizeMode.DEFAULT]
+)
+@pytest.mark.parametrize("with_live_count", [False, True])
+def test_genphase_finalize_live_count_admission(
+    kind, selector, finalize_mode, with_live_count
+):
+    """AUTO must not silently discard a requested persistent live-token count."""
+    count = torch.zeros(1, dtype=torch.int32) if with_live_count else None
+    options = dict(
+        intermediate_size=256,
+        top_k=3,
+        kernel_variant="genphase",
+        finalize_mode=finalize_mode,
+        num_valid_tokens_tensor=count,
+    )
+    if kind == "nvfp4":
+        config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **options
+        )
+    else:
+        config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            kind=kind,
+            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"
+            + ("_next" if selector == "next" else ""),
+            **options,
+        )
+    if finalize_mode is moe_ep.FinalizeMode.AUTO and with_live_count:
+        with pytest.raises(moe_ep.MoEEpConfigError, match="finalize"):
+            create_mega_kernel(config)
+    else:
+        backend = create_mega_kernel(config)
+        if selector == "next":
+            assert backend._finalize_mode(None) is moe_ep.FinalizeMode.DEFAULT
+
+
 def _config(kind, **kwargs):
+    """Build a small GenPhase workload with dtype-compatible intermediate width."""
     return pkg.Sm100GenphaseMoeConfig(
         num_total_experts=8,
         max_tokens_per_rank=129,

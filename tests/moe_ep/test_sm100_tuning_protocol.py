@@ -276,6 +276,7 @@ def test_standard_grid_is_complete_unique_and_fixed_numerics(kind):
 
 
 def test_genphase_grid_retains_geometries_hints_and_constraints():
+    """Keep each admitted geometry and scheduling hint under knob constraints."""
     cfg = Sm100GenphaseMoeConfig(
         num_total_experts=8,
         max_tokens_per_rank=128,

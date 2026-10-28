@@ -275,6 +275,11 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
 
         k = self._kernel_config
+        kind = k.kind
+        if kind == "mxfp4_mxfp8":
+            raise MoEEpConfigError(
+                "Mixed MXFP4/MXFP8 requires kernel_variant='genphase'."
+            )
         fp = fleet_params
         workspace = get_symm_buffer_for_mxfp8_mega_moe(
             fp.num_experts,
@@ -284,7 +289,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
-            kind=k.kind,
+            kind=kind,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
@@ -318,6 +323,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        """Check activation and routing layouts for the selected kernel variant."""
         if self._kernel_config.kernel_variant == "genphase":
             validate_genphase_forward_inputs(
                 t,
