@@ -25,6 +25,7 @@ The suite imports only the package, ``flashinfer.experimental.cake_rubin_mla_nvf
 """
 
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -779,16 +780,17 @@ def test_split_merge_up_to_and_past_32_splits():
     device = _device_or_skip()
     # A 1-token H96 request (a half tile, 96 rows: the eight-warp merge) at KV64K: the planner's own split count,
     # then 20 double ranges = 40 partial slots per row (the 64-slot round's upper half), a 3072-row problem at two
-    # partials (the one-warp merge above 2048 rows) and a 1536-row one at three (two warps: that grid is one wave
-    # up to 1664 rows).
+    # partials (the one-warp merge above 2048 rows), a 1536-row one at three (two warps: that grid is one wave
+    # up to 1664 rows), 28 one-token H16 requests (448 rows) at 24 partials (the four-warp column merge of the
+    # 385-448-row box) and a 768-row problem at 24 partials (the four-warp, two-rows-per-CTA merge above it).
     case = _make_case([65536], 1, 96, seed=625030, device=device, return_lse=True)
     out, lse, runner = _run(case, dense=True)
-    assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w8"
+    assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w8_pal"
     ref, ref_lse = _reference(case)
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     out, lse, runner = _run(case, dense=True, split=(1, 20))
-    assert runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w8"
+    assert runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w8_pal"
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     wide = _make_case(
@@ -803,8 +805,23 @@ def test_split_merge_up_to_and_past_32_splits():
         [9000, 4096], 8, 96, seed=625032, device=device, return_lse=True
     )  # 1536 rows
     out, lse, runner = _run(mid, dense=True, split=3)
-    assert runner.plan.max_splits == 3 and runner.plan.merge_record == "merge_w2"
+    assert runner.plan.max_splits == 3 and runner.plan.merge_record == "merge_w2_pal"
     ref, ref_lse = _reference(mid)
+    _check_out(out, ref)
+    _check_lse(lse, ref_lse)
+    col = _make_case([8192] * 28, 1, 16, seed=625033, device=device, return_lse=True)
+    out, lse, runner = _run(col, dense=True, split=(1, 12))  # 448 rows
+    assert (
+        runner.plan.max_splits == 24
+        and runner.plan.merge_record == "merge_w4_c4_col_pal"
+    )
+    ref, ref_lse = _reference(col)
+    _check_out(out, ref)
+    _check_lse(lse, ref_lse)
+    four = _make_case([65536], 8, 96, seed=625034, device=device, return_lse=True)
+    out, lse, runner = _run(four, dense=True, split=24)  # 768 rows
+    assert runner.plan.max_splits == 24 and runner.plan.merge_record == "merge_w4"
+    ref, ref_lse = _reference(four)
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
 
@@ -1154,9 +1171,10 @@ def test_registry_records_follow_the_plan_vocabulary():
     )
     assert cake_jit.records_of_stage("merge") == (
         "merge_w1",
-        "merge_w2",
         "merge_w4",
-        "merge_w8",
+        "merge_w2_pal",
+        "merge_w8_pal",
+        "merge_w4_c4_col_pal",
     )
     assert cake_jit.records_of_stage("quantize") == ("quantize",)
     assert len({r["library"] for r in cake_jit.MODULES.values()}) == len(
@@ -1186,33 +1204,45 @@ def test_select_rules_and_grids():
         cake_jit.select_record("decode", rows=49152, n_full=617, items=618, splits=4)
         == "decode"
     )
+    # (rows, partials per row, record, rows per merge CTA): eight warps per row up to 384 rows or over 32
+    # partials (``merge_w8_pal``); two warps up to 16 partials up to 1664 rows, and over 8 up to 2048 rows
+    # (``merge_w2_pal``); four warps over 17-32 partials (the four-warp column form up to 448 rows, ``merge_w4``
+    # above); one warp above 2048 rows or up to 8 partials above 1664 rows.
     cases = (
-        (96, 24, "merge_w8"),
-        (192, 52, "merge_w8"),
-        (384, 24, "merge_w8"),
-        (385, 24, "merge_w4"),
-        (448, 25, "merge_w4"),
-        (768, 12, "merge_w2"),
-        (768, 16, "merge_w2"),
-        (768, 20, "merge_w4"),
-        (768, 33, "merge_w8"),
-        (1536, 8, "merge_w2"),
-        (1664, 8, "merge_w2"),
-        (1665, 8, "merge_w1"),
-        (1792, 6, "merge_w1"),
-        (1792, 12, "merge_w2"),
-        (2048, 33, "merge_w8"),
-        (2049, 33, "merge_w1"),
-        (3072, 10, "merge_w1"),
-        (24576, 4, "merge_w1"),
+        (96, 24, "merge_w8_pal", 1),
+        (192, 52, "merge_w8_pal", 1),
+        (384, 24, "merge_w8_pal", 1),
+        (385, 16, "merge_w2_pal", 4),
+        (385, 17, "merge_w4_c4_col_pal", 1),
+        (385, 24, "merge_w4_c4_col_pal", 1),
+        (448, 25, "merge_w4_c4_col_pal", 1),
+        (448, 32, "merge_w4_c4_col_pal", 1),
+        (448, 33, "merge_w8_pal", 1),
+        (449, 24, "merge_w4", 2),
+        (768, 12, "merge_w2_pal", 4),
+        (768, 16, "merge_w2_pal", 4),
+        (768, 20, "merge_w4", 2),
+        (768, 33, "merge_w8_pal", 1),
+        (1536, 8, "merge_w2_pal", 4),
+        (1664, 8, "merge_w2_pal", 4),
+        (1665, 8, "merge_w1", 8),
+        (1792, 6, "merge_w1", 8),
+        (1792, 12, "merge_w2_pal", 4),
+        (2048, 33, "merge_w8_pal", 1),
+        (2049, 33, "merge_w1", 8),
+        (3072, 10, "merge_w1", 8),
+        (24576, 4, "merge_w1", 8),
     )
-    for r, splits, w in cases:
+    for r, splits, w, rows_per_cta in cases:
         assert (
             cake_jit.select_record("merge", rows=r, n_full=0, items=1, splits=splits)
             == w
         )
-        assert cake_jit.merge_warps_per_row(r, splits) == int(w[-1])
-        rows_per_cta = 8 // int(w[-1])
+        assert cake_jit.merge_warps_per_row(r, splits) == _merge_warps(w)
+        assert cake_jit.MODULES[w]["grid_rule"] == {
+            "kind": "rows_per_cta",
+            "rows": rows_per_cta,
+        }
         assert cake_jit.launch_grid(w, items=1, rows=r) == (-(-r // rows_per_cta), 1, 1)
     assert cake_jit.select_record("quantize", rows=1, n_full=0, items=0) == "quantize"
     assert cake_jit.launch_grid("decode", items=7, rows=96) == (28, 1, 1)
@@ -1277,6 +1307,11 @@ def test_units_pairs_table_and_fallback():
         cake_backend.plan(seq_lens_host=[64], num_heads=16, q_len=1, units=0, pairs=0)
 
 
+def _merge_warps(record):
+    """Warps per row of a merge record, from its name (``merge_w<warps>...``)."""
+    return int(re.match(r"merge_w(\d)", record).group(1))
+
+
 def _check_plan(p, kv_lens, q_lens, heads):
     """The plan's invariants against its problem: every (request, row tile) covered by items whose key ranges
     partition its tiles, split indices unique, the full-tile items first, the records and grids of the rules."""
@@ -1292,9 +1327,15 @@ def _check_plan(p, kv_lens, q_lens, heads):
     if p.max_splits == 1:
         assert p.merge_record is None and p.grid_merge is None
     else:
-        assert (
-            p.merge_record
-            == f"merge_w{cake_jit.merge_warps_per_row(rows_total, p.max_splits)}"
+        assert p.merge_record == cake_jit.select_record(
+            "merge",
+            rows=rows_total,
+            n_full=p.n_full,
+            items=p.items,
+            splits=p.max_splits,
+        )
+        assert _merge_warps(p.merge_record) == cake_jit.merge_warps_per_row(
+            rows_total, p.max_splits
         )
         assert p.grid_merge == cake_jit.launch_grid(
             p.merge_record, items=p.items, rows=rows_total
@@ -1417,7 +1458,7 @@ def test_plan_invariants(sm_count):
         pairs=pairs,
         split=(1, 20),
     )
-    assert forced.max_splits == 40 and forced.merge_record == "merge_w8"
+    assert forced.max_splits == 40 and forced.merge_record == "merge_w8_pal"
     _check_plan(forced, [65536], [1], 96)
     with pytest.raises(ValueError, match="at most 64"):
         cake_backend.plan(
@@ -1432,25 +1473,35 @@ def test_plan_invariants(sm_count):
 
 def test_pdl_follows_the_plan():
     """The decode and the merge launch with programmatic dependent launch when the plan has a split merge and its
-    decode is one wave of clusters (``items <= units``); the switch is a pure function of the plan."""
+    decode is one hardware wave (``items <= units + pairs``: the clusters of four plus the pairs the device holds
+    resident); the switch is a pure function of the plan."""
     import dataclasses
 
     units, pairs = cake_backend.units_pairs_for_sm_count(208)
     p = cake_backend.plan(
         seq_lens_host=[65536], num_heads=96, q_len=1, units=units, pairs=pairs
     )
-    assert cake_backend.pdl_for(p) is (p.max_splits > 1 and p.items <= p.units)
+    assert cake_backend.pdl_for(p) is (
+        p.max_splits > 1 and p.items <= p.units + p.pairs
+    )
     one_wave = dataclasses.replace(p, max_splits=2, items=units)
     assert cake_backend.pdl_for(one_wave) is True
-    # A second wave of clusters: the early-launched merge would take its SMs.
-    assert cake_backend.pdl_for(dataclasses.replace(one_wave, items=units + 1)) is False
+    # The pairs still fit the hardware wave (204-208 CTAs on a 208-SM board).
+    assert (
+        cake_backend.pdl_for(dataclasses.replace(one_wave, items=units + pairs)) is True
+    )
+    # A second wave: the early-launched merge would take its SMs.
+    assert (
+        cake_backend.pdl_for(dataclasses.replace(one_wave, items=units + pairs + 1))
+        is False
+    )
     # No merge: nothing behind the decode to overlap.
     assert cake_backend.pdl_for(dataclasses.replace(one_wave, max_splits=1)) is False
     # The owner's largest row (Q8, B64) has more items than clusters on every board: plain launches.
     wide = cake_backend.plan(
         seq_lens_host=[65536] * 64, num_heads=96, q_len=8, units=units, pairs=pairs
     )
-    assert wide.items > wide.units and cake_backend.pdl_for(wide) is False
+    assert wide.items > wide.units + wide.pairs and cake_backend.pdl_for(wide) is False
 
 
 def test_plan_shaves_one_wave_of_long_full_tiles():

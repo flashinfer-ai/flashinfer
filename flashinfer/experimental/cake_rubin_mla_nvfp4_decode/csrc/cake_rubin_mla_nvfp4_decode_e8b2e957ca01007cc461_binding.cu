@@ -105,8 +105,20 @@ CUtensorMap EncodeTma_QN(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "QN")};
   cuuint32_t box_dim[2] = {128u, 128u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'QN' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, true};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'QN' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'QN' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -133,8 +145,20 @@ CUtensorMap EncodeTma_QS(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "QS")};
   cuuint32_t box_dim[2] = {32u, 128u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'QS' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, true};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'QS' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'QS' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -161,8 +185,20 @@ CUtensorMap EncodeTma_QR(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "QR")};
   cuuint32_t box_dim[2] = {64u, 128u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'QR' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, true};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'QR' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'QR' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -189,8 +225,20 @@ CUtensorMap EncodeTma_CKV(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "CKV")};
   cuuint32_t box_dim[2] = {128u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'CKV' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, false};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'CKV' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'CKV' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -217,8 +265,20 @@ CUtensorMap EncodeTma_CKS(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "CKS")};
   cuuint32_t box_dim[2] = {32u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'CKS' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, false};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'CKS' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'CKS' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -245,8 +305,20 @@ CUtensorMap EncodeTma_KPE(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "KPE")};
   cuuint32_t box_dim[2] = {64u, 64u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'KPE' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, false};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'KPE' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'KPE' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -273,8 +345,20 @@ CUtensorMap EncodeTma_O_T(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "O_T")};
   cuuint32_t box_dim[2] = {64u, 32u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'O_T' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, false};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'O_T' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'O_T' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -303,10 +387,20 @@ CUtensorMap EncodeTma_PO_T(const TensorView& t) {
   cuuint64_t global_strides[2] = {Stride(s2, "PO_T"), Stride(s3, "PO_T")};
   cuuint32_t box_dim[3] = {64u, 1u, 32u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
-  TVM_FFI_CHECK(
-      box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2],
-      ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'PO_T' exceeds its source extents";
+  const bool allow_oob_box[3] = {false, false, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'PO_T' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'PO_T' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -333,8 +427,20 @@ CUtensorMap EncodeTma_O_T16(const TensorView& t) {
   cuuint64_t global_strides[1] = {Stride(s2, "O_T16")};
   cuuint32_t box_dim[2] = {64u, 16u};
   cuuint32_t elem_strides[2] = {1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'O_T16' exceeds its source extents";
+  const bool allow_oob_box[2] = {false, false};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'O_T16' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'O_T16' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -363,10 +469,20 @@ CUtensorMap EncodeTma_PO_T16(const TensorView& t) {
   cuuint64_t global_strides[2] = {Stride(s2, "PO_T16"), Stride(s3, "PO_T16")};
   cuuint32_t box_dim[3] = {64u, 1u, 16u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
-  TVM_FFI_CHECK(
-      box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2],
-      ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'PO_T16' exceeds its source extents";
+  const bool allow_oob_box[3] = {false, false, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'PO_T16' axis " << axis
+        << " (0 is the innermost) has a TMA box of " << box_dim[axis]
+        << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's "
+           "allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a "
+           "tile that may run past the end of the axis, a tail tile: a load fills the part past "
+           "the extent with zeros (its bytes still count toward the barrier's transaction) and a "
+           "store or reduce skips it, so that is safe when the kernel ignores or masks those rows "
+           "and columns. If the box was meant to fit, box_dim or the extent is wrong: check "
+           "box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'PO_T16' must be multiples of 16 bytes";
   void* address = DataPtr(t);
