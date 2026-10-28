@@ -374,15 +374,20 @@ def _device_index(device) -> int:
     return int(index) if index is not None else torch.cuda.current_device()
 
 
+def _tensor_index(t) -> int:
+    """``_device_index(t.device)`` from ``Tensor.get_device()``, without a ``torch.device`` object: a host or meta
+    tensor (``-1``) maps to the current device too, so its launch reaches the binding's device checks."""
+    index = t.get_device()
+    return index if index >= 0 else torch.cuda.current_device()
+
+
 def _launch(stage, gx, gy, gz, *values):
     """Launch ``stage`` on ``(gx, gy, gz)``; ``values`` in call-site order, the first a tensor on the device."""
-    device_index = _device_index(values[0].device)
+    device_index = _tensor_index(values[0])
     order = _order(stage, cake_backend.device_arch(device_index))
     if order is not None:
         values = tuple(values[i] for i in order)
-    cake_backend.launch_stage(
-        stage, (int(gx), int(gy), int(gz)), values, device_index=device_index
-    )
+    cake_backend.launch_stage(stage, (gx, gy, gz), values, device_index=device_index)
 
 
 # --------------------------------------------------------------------------- #
@@ -1181,9 +1186,7 @@ def _prep_stage(
         return "prep"
     if any(t.data_ptr() % TMA_ALIGN_BYTES for t in (q, k)):
         return "prep"
-    if options.prep == "tma" or use_prep_tma(
-        num_chunks, num_heads, _device_index(q.device)
-    ):
+    if options.prep == "tma" or use_prep_tma(num_chunks, num_heads, _tensor_index(q)):
         return "prep_tma"
     return "prep"
 
@@ -1465,7 +1468,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
                 meta.seq_chunk_start, walk[s0:s1], num_heads, num_v_heads, use_init, 1 if store_final_state else 0,
                 use_seg, float(scale))  # fmt: skip
 
-    index = _device_index(device)
+    index = _tensor_index(kn)
     main = torch.cuda.current_stream(index)
     side = _side_stream(index, main)
     fork = torch.cuda.Event()
@@ -1541,7 +1544,7 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
         w, u = _wy_outputs(kn, v, total_tokens, num_v_heads)
         wy = (v, beta32, A)
     workspaces = _workspaces(options)
-    table = workspaces.table(_device_index(kn.device))
+    table = workspaces.table(_tensor_index(kn))
     h, v_new, final_state, o = _launch_fwd_ho(arch, qn, kn, w, u, g_cs, _table_rows(initial_state, meta), meta,
                                               num_heads, num_v_heads, store_final_state=output_final_state,
                                               table=table, workspaces=workspaces, options=options, scale=scale,
@@ -1575,7 +1578,8 @@ def gdn_chunk_backward(
     num_heads, num_v_heads = qn.shape[-2], v.shape[-2]
     total_tokens = qn.numel() // (num_heads * qn.shape[-1])
     device = qn.device
-    table = workspaces.table(_device_index(device))
+    index = _tensor_index(qn)
+    table = workspaces.table(index)
     do = do.contiguous()
     if initial_state is None:
         initial_state = forward.get("initial_state")
@@ -1606,9 +1610,7 @@ def gdn_chunk_backward(
     token_hv = (total_tokens, num_v_heads, HEAD_DIM)
     segs = meta.bwd_segments
     serial = not (segs.segment_len > 0 and segs.num_segments > meta.num_seqs)
-    use_tc = serial and _dhu_tc_selected(
-        meta, num_v_heads, _device_index(device), options
-    )
+    use_tc = serial and _dhu_tc_selected(meta, num_v_heads, index, options)
     # two sequence groups: the tcgen05 serial scan feeding the fused tail of a value-head group of two
     groups = meta.bwd_groups if use_tc and num_v_heads == 2 * num_heads else None
     if not use_tc:
@@ -1705,7 +1707,6 @@ def gdn_chunk_backward(
                         dv2, h[c0:c1], dh[c0:c1], g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start[c0:c1],
                         meta.chunk_len[c0:c1], num_heads, num_v_heads, scale, normalize)  # fmt: skip
 
-            index = _device_index(device)
             main = torch.cuda.current_stream(index)
             side = _side_stream(index, main)
             dhu_tc2(0, na)
@@ -1745,7 +1746,7 @@ def gdn_chunk_backward(
         dtype=torch.float32,
         device=device,
     )
-    sm_count, _smem, _major = _device_props(_device_index(device))
+    sm_count, _smem, _major = _device_props(index)
     fin = forward.get("finalize_stage") or finalize_stage(meta.num_chunks, num_heads, num_v_heads, sm_count,
                                                           options.finalize)  # fmt: skip
     _launch(fin, meta.num_chunks, num_heads, 1, qn, kn,
@@ -1869,16 +1870,15 @@ def _chunk_meta(
     cu_seqlens_cpu,
     batch,
     seq_len,
-    device,
+    index: int,
     num_v_heads,
     options: ChainOptions,
 ) -> ChunkMeta:
-    device = torch.device(device)
-    index = _device_index(device)
+    """The chunk and segment tables of one call on device ``index``: a ``host_cache`` hit on the layout's key, else
+    planned (the layout's sequence lengths are derived only then)."""
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
         layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
-        seq_lens = (int(seq_len),) * int(batch)
     elif batch != 1:
         raise ValueError("cu_seqlens requires a leading batch dimension of 1")
     elif cu_seqlens_cpu is None:
@@ -1891,7 +1891,6 @@ def _chunk_meta(
         )  # fmt: skip
     else:
         layout = _host_offsets(cu_seqlens_cpu)
-        seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
     key = (
         layout,
         int(num_v_heads),
@@ -1905,9 +1904,12 @@ def _chunk_meta(
         meta = _META_FRONT.get(key)
         if meta is not None:
             return meta
-    if cu_seqlens is not None:
+    if cu_seqlens is None:
+        seq_lens = (int(seq_len),) * int(batch)
+    else:
         # a layout reaches the table cache only after this check, so a cache hit is a checked layout
         _check_offsets(layout, total_tokens)
+        seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
     plans = scan_plans(total_tokens, len(seq_lens), int(num_v_heads), int(index), seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
@@ -1930,9 +1932,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 use_qk_l2norm_in_kernel, options):  # fmt: skip
         batch, seq_len, num_heads, key_dim = q.shape
         num_v_heads = v.shape[2]
-        arch = cake_backend.device_arch(_device_index(q.device))
+        index = _tensor_index(q)
+        arch = cake_backend.device_arch(index)
         meta = _chunk_meta(
-            cu_seqlens, cu_seqlens_cpu, batch, seq_len, q.device, num_v_heads, options
+            cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options
         )
         fwd = gdn_chunk_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                                 output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,
