@@ -113,7 +113,7 @@ constexpr uint64_t kSevenTileC16MaxTripsSm100 = 22;
 // GB300).
 constexpr uint64_t kSixTileC8PersistentRowsNumSm103 = 20;
 constexpr uint64_t kSixTileC8PersistentRowsDenSm103 = 9;
-// The balanced chunk (sm_100, see select_cached_launch): rounding, the minimum
+// The balanced chunk (see select_cached_launch): rounding, the minimum
 // cut of the whole-tile chunk (1/32; 1/16 past one wave, and for a one-wave
 // 4-tile 16-CTA row kernel), the waves it covers, and the minimum cut (1/10)
 // of a 16-CTA 8-tile chunk.
@@ -789,13 +789,13 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
 }
 
 // The launch: select_cached_route's kernel and the chunk each CTA covers. A CTA
-// covers whole tiles, except on sm_100, where the chunk is ceil(V / C) rounded
-// up to 32 elements (CTA starts 128-byte aligned within the row; the same tile
-// count) when that balanced chunk is more than 1/32 shorter than the
-// whole-tile chunk and the rows fit one wave of the launched kernel's resident
-// clusters, or it is more than 1/16 shorter and the rows fit five waves, for
-// these kernels (measured on B200): the 8-CTA shared-tile and persistent
-// kernels; the 4-tile 16-CTA row kernel past one wave or with a cut of more
+// covers whole tiles, except that the chunk is ceil(V / C) rounded up to 32
+// elements (CTA starts 128-byte aligned within the row; the same tile count)
+// when that balanced chunk is more than 1/32 shorter than the whole-tile chunk
+// and the rows fit one wave of the launched kernel's resident clusters, or it
+// is more than 1/16 shorter and the rows fit five waves, for these kernels
+// (measured on B200 and GB300): the 8-CTA shared-tile and persistent kernels
+// on sm_100; the 4-tile 16-CTA row kernel past one wave or with a cut of more
 // than 1/16; the 16-CTA shared-tile and persistent kernels with a cut of at
 // least 1/10. The other kernels keep whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
@@ -820,7 +820,7 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
   }
   int device_minor = 0;
   status = cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor, device);
-  if (status != cudaSuccess || device_minor != 0) {
+  if (status != cudaSuccess || (eight_cta_chunk && device_minor != 0)) {
     return status;
   }
   const uint32_t balanced =

@@ -751,36 +751,36 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
 
 
 @pytest.mark.parametrize(
-    "rows,vocab_size,temperature_kind,sm100_chunk",
+    "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
     [
         # 4-tile 16-CTA row kernel past one wave or with a cut of more than 1/16.
-        (8, 100000, "none", 6272),
-        (8, 100000, "scalar", 6272),
-        (28, 48000, "none", 3008),
-        (55, 120000, "none", 7520),
-        # 8-CTA shared-tile and persistent kernels.
-        (45, 81928, "none", 10272),
-        (320, 69632, "none", 8704),
-        (82, 70000, "none", 8768),
+        (8, 100000, "none", 6272, 6272),
+        (8, 100000, "scalar", 6272, 6272),
+        (28, 48000, "none", 3008, 3008),
+        (55, 120000, "none", 7520, 7520),
+        # 8-CTA shared-tile and persistent kernels (sm_100; whole tiles on sm_103).
+        (45, 81928, "none", 10272, 12288),
+        (320, 69632, "none", 8704, 10240),
+        (82, 70000, "none", 8768, 10240),
         # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10.
-        (30, 140000, "none", 8768),
-        (70, 201088, "none", 12576),
+        (30, 140000, "none", 8768, 8768),
+        (70, 201088, "none", 12576, 12576),
         # Whole tiles: the wide row kernel, a 16-CTA chunk with a cut under 1/10,
         # a one-wave 4-tile 16-CTA row kernel with a cut of at most 1/16, the
-        # 8-tile 16-CTA row kernel, and rows past five persistent waves.
-        (8, 256000, "none", 26624),
-        (32, 151936, "none", 10240),
-        (24, 151936, "none", 10240),
-        (8, 126464, "none", 8192),
-        (1, 151936, "none", 10240),
-        (180, 71680, "none", 10240),
+        # 8-tile 16-CTA row kernel, and rows past five persistent waves (sm_100).
+        (8, 256000, "none", 26624, 22528),
+        (32, 151936, "none", 10240, 10240),
+        (24, 151936, "none", 10240, 16384),
+        (8, 126464, "none", 8192, 8192),
+        (1, 151936, "none", 10240, 10240),
+        (180, 71680, "none", 10240, 10240),
     ],
 )
 def test_blackwell_cached_cluster_balanced_chunk_per_arch(
-    rows, vocab_size, temperature_kind, sm100_chunk
+    rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
 ):
-    # On sm_100 these kernels cover ceil(V / C) rounded up to 32 elements per
-    # CTA instead of whole tiles; on sm_103 every CTA covers whole tiles.
+    # These kernels cover ceil(V / C) rounded up to 32 elements per CTA instead
+    # of whole tiles; the expected chunk depends on the GPU's resident clusters.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(11)
     logits = torch.randn(rows, vocab_size, device="cuda")
@@ -791,13 +791,8 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
     kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
         logits, temperature=temperature
     )
-    tile = 2048
-    per_cta = (vocab_size + kernel[0] - 1) // kernel[0]
-    whole = (per_cta + tile - 1) // tile * tile
-    if torch.cuda.get_device_capability() == (10, 0):
-        assert kernel[5] == sm100_chunk
-    else:
-        assert kernel[5] == whole
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
     probs = flashinfer.sampling.softmax(logits, temperature=temperature)
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
