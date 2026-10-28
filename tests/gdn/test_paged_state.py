@@ -814,3 +814,128 @@ def test_paged_prefill_then_decode_end_to_end():
     _assert_state(pool[6], ckpts[0], msg="page 0")
     _assert_state(pool[1], ckpts[1], msg="page 1 (closed by decode)")
     _assert_state(pool[3], ref_final[0], msg="page 2")
+
+
+def _capture(fn):
+    """Warm ``fn`` up on a side stream, then capture it in a CUDA graph."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn(warmup=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(warmup=False)
+    return graph
+
+
+def test_paged_prefill_cuda_graph_reads_live_page_tables():
+    """A captured paged prefill derives its rows from the page table at replay
+    (no host synchronization): the same graph serves different prefixes,
+    including an unaligned one, and different page ids."""
+    _skip_if_unsupported()
+    torch.manual_seed(9)
+    random.seed(9)
+    L = 128
+    new_lens = [70, 130]
+    streams = Streams(new_lens, 4, 4, 4, torch.bfloat16)
+    q, k, v, g, beta = streams.slices([0, 0], new_lens)
+    cu = _cu(new_lens, "cuda")
+    pool = torch.randn(16, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    scratch = pool.clone()
+    indices = torch.empty(5, dtype=torch.int32, device="cuda")
+    indptr = torch.empty(3, dtype=torch.int32, device="cuda")
+    last = torch.empty(2, dtype=torch.int32, device="cuda")
+    out = torch.empty(sum(new_lens), 4, HEAD_SIZE, dtype=q.dtype, device="cuda")
+    # (page ids, page counts, last_page_len): prefixes 0 / 256, then 100 / 0.
+    steps = [
+        ([4, 7, 1, 12, 3], [1, 4], [70, 2]),
+        ([6, 9, 2, 11, 15], [2, 2], [42, 2]),
+    ]
+
+    def call(state_pool):
+        return chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            cu_seqlens=cu,
+            state_pool=state_pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_len=L,
+            last_page_len=last,
+            output=out,
+        )
+
+    def set_tables(step):
+        page_ids, counts, last_lens = step
+        indices.copy_(torch.tensor(page_ids, dtype=torch.int32))
+        indptr.copy_(_cu(counts, "cpu"))
+        last.copy_(torch.tensor(last_lens, dtype=torch.int32))
+
+    set_tables(steps[0])
+    graph = _capture(lambda warmup: call(scratch if warmup else pool))
+    for i, step in enumerate(steps):
+        set_tables(step)
+        expected_pool = pool.clone()
+        expected_out = call(expected_pool).clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        # A stale page table reads another page's (unrelated) state.
+        torch.testing.assert_close(out, expected_out, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
+        )
+
+
+def test_paged_decode_cuda_graph_reads_live_page_tables():
+    """A captured paged decode reads the page table at replay: the same graph
+    serves a token that opens a new page and one that continues a page."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 9:
+        pytest.skip("GDN decode needs SM90+")
+    torch.manual_seed(10)
+    heads = (4, 4, 8)
+    pool = torch.randn(12, heads[2], HEAD_SIZE, HEAD_SIZE, device="cuda")
+    scratch = pool.clone()
+    q, k, v, A_log, a, dt_bias, b = _decode_inputs(2, heads)
+    indices = torch.empty(4, dtype=torch.int32, device="cuda")
+    indptr = _cu([2, 2], "cuda")
+    last = torch.empty(2, dtype=torch.int32, device="cuda")
+    out = torch.empty(2, 1, heads[2], HEAD_SIZE, dtype=q.dtype, device="cuda")
+    steps = [([3, 9, 5, 0], [1, 1]), ([3, 9, 6, 2], [2, 1])]
+
+    def call(state_pool):
+        return gated_delta_rule_decode_paged(
+            q,
+            k,
+            v,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output=out,
+            state_pool=state_pool,
+            page_indices=indices,
+            page_indptr=indptr,
+            last_page_len=last,
+        )
+
+    indices.copy_(torch.tensor(steps[0][0], dtype=torch.int32))
+    last.copy_(torch.tensor(steps[0][1], dtype=torch.int32))
+    graph = _capture(lambda warmup: call(scratch if warmup else pool))
+    for i, (page_ids, last_lens) in enumerate(steps):
+        indices.copy_(torch.tensor(page_ids, dtype=torch.int32))
+        last.copy_(torch.tensor(last_lens, dtype=torch.int32))
+        expected_pool = pool.clone()
+        expected_out = call(expected_pool).clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        # A stale page table reads another page's (unrelated) state.
+        torch.testing.assert_close(out, expected_out, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(
+            pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
+        )
