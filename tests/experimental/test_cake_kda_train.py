@@ -3995,13 +3995,16 @@ ISSUE_LENGTHS, ISSUE_HEADS = (120001, 70707, 65537, 5148), 4
 
 def _autograd_step(inputs, **kwargs):
     """One forward and backward through the autograd entry on fresh leaves: ``out`` (detached) and the five
-    gradients in ``(dq, dk, dv, dbeta, dg)`` order."""
+    gradients in ``(dq, dk, dv, dbeta, dg)`` order.  The backward accumulates into the leaves: the graph task of
+    ``torch.autograd.grad`` holds the gradients it returns until the autograd engine's device thread drops it,
+    which can be after the call returned, so a memory check right after it would count them."""
     leaves = [
         inputs[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
     out = cake_backend.chunk_kda(*leaves, inputs["cu_seqlens"], **kwargs)
-    dq, dk, dv, dg, dbeta = torch.autograd.grad(out, leaves, inputs["dout"])
+    out.backward(inputs["dout"])
+    dq, dk, dv, dg, dbeta = (leaf.grad for leaf in leaves)
     return out.detach(), (dq, dk, dv, dbeta, dg)
 
 
