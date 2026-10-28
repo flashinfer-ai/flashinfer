@@ -123,6 +123,7 @@ class _MoeFinalizeKernel:
         output_ptr: cute.Pointer,
         mapping_ptr: cute.Pointer,
         scales_ptr: cute.Pointer,
+        dense_indices_ptr,
         num_tokens: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -131,7 +132,10 @@ class _MoeFinalizeKernel:
         )
         mapping = cute.make_tensor(mapping_ptr, metadata_layout)
         scales = cute.make_tensor(scales_ptr, metadata_layout)
-        self.kernel(input_ptr, output_ptr, mapping, scales).launch(
+        dense_indices = None
+        if cutlass.const_expr(dense_indices_ptr is not None):
+            dense_indices = cute.make_tensor(dense_indices_ptr, metadata_layout)
+        self.kernel(input_ptr, output_ptr, mapping, scales, dense_indices).launch(
             grid=[num_tokens * self.hidden_tiles, 1, 1],
             block=[self.threads, 1, 1],
             stream=stream,
@@ -139,7 +143,7 @@ class _MoeFinalizeKernel:
         )
 
     @cute.kernel
-    def kernel(self, input_ptr, output_ptr, mapping, scales):
+    def kernel(self, input_ptr, output_ptr, mapping, scales, dense_indices):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         token_idx = bidx // self.hidden_tiles
@@ -178,6 +182,9 @@ class _MoeFinalizeKernel:
                 row = route_base + slot
                 valid = rows[slot] != 0
             if valid:
+                if cutlass.const_expr(dense_indices is not None):
+                    # FC2 publishes these indices, so read only after its wait.
+                    row = cutlass.Int64(dense_indices[token_idx, slot])
                 for vector in cutlass.range_constexpr(self.vectors_per_thread):
                     vector_column = column + vector * self.threads * 8
                     if vector_column < self.hidden_size:
@@ -215,6 +222,7 @@ def moe_unpermute(
     top_k: int,
     enable_pdl: bool = False,
     input_is_expanded: bool = False,
+    dense_indices=None,
 ) -> None:
     """Reduce BF16 expert rows in ascending top-k order using FP32 FMA.
 
@@ -289,6 +297,7 @@ def moe_unpermute(
         vectors_per_thread,
         enable_pdl,
         input_is_expanded,
+        dense_indices is not None,
     )
     with torch.cuda.device(output.device):
         stream = current_cuda_stream()
@@ -315,6 +324,9 @@ def moe_unpermute(
                 topk_scales.data_ptr(),
                 cute.AddressSpace.gmem,
             ),
+            make_ptr(cutlass.Int32, dense_indices.data_ptr(), cute.AddressSpace.gmem)
+            if dense_indices is not None
+            else None,
         )
         compiled = _kernel_cache.get(cache_key)
         if compiled is None:

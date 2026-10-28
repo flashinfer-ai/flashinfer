@@ -48,6 +48,20 @@ _CUDA_GRID_Y_MAX = 65_535
 _blockscaled_kernel_cache: Dict[Tuple, Any] = {}
 
 
+def _use_compact_output(route_tile, output_dtype, use_fused_finalize):
+    # Automatic operand staging reserves the eligible epilogue's bulk slab.
+    return (
+        Sm100BlockScaledGroupedGemmKernel.bulk_output_element_bytes(
+            route_tile,
+            torch_to_cutlass_dtype(output_dtype),
+            True,
+            use_fused_finalize,
+            False,
+        )
+        > 0
+    )
+
+
 def _blockscaled_ptr(tensor, dtype, alignment=16):
     if tensor is None:
         return None
@@ -97,6 +111,9 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
+    output_is_routed: bool = False,
+    compact_offsets=None,
+    dense_indices=None,
 ):
     cache_policies = {
         "normal": 0,
@@ -158,6 +175,7 @@ def _run_blockscaled_gemm(
             top_k,
             sf_vec_size,
             enable_pdl,
+            compact_offsets,
         )
         activation, activation_sf = routed, routed_sf
     pointers = (
@@ -182,6 +200,8 @@ def _run_blockscaled_gemm(
         _blockscaled_ptr(num_tiles, cutlass.Int32),
         _blockscaled_ptr(token_final_scales, scale_dtype),
         _blockscaled_ptr(per_token_scale, cutlass.Float32),
+        _blockscaled_ptr(compact_offsets if scatter_output else None, cutlass.Int32),
+        _blockscaled_ptr(dense_indices, cutlass.Int32),
     )
     device_sms = get_num_sm(activation.device)
     num_sms = device_sms if sm_count is None else sm_count
@@ -213,6 +233,7 @@ def _run_blockscaled_gemm(
         num_sms,
         top_k,
         scatter_output,
+        output_is_routed,
         per_token_scale_is_routed,
         k_steps,
         overlap_activation_accumulators,
@@ -247,6 +268,7 @@ def _run_blockscaled_gemm(
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
             scatter_output=scatter_output,
+            output_is_routed=output_is_routed,
             per_token_scale_is_routed=per_token_scale_is_routed,
             k_steps=k_steps,
             num_stages=None,
@@ -345,6 +367,7 @@ def launch_gather_gemm(
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
+    compact_offsets=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare routed input and launch FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -469,6 +492,7 @@ def launch_gather_gemm(
         sf_dtype=sf_dtype_cutlass,
         sf_vec_size=sf_vec_size,
         prepare_input=True,
+        compact_offsets=compact_offsets,
         scatter_output=False,
         per_token_scale_is_routed=False,
         k_steps=k_steps,
@@ -507,8 +531,13 @@ def launch_finalize_gemm(
     use_fused_finalize: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = False,
+    output_is_routed: bool = False,
+    compact_offsets=None,
+    dense_indices=None,
 ) -> torch.Tensor:
-    """Launch FC2 with either expanded-row output or fused atomic finalize."""
+    """Launch FC2 with routed/expanded rows or fused atomic finalize."""
+    if output_is_routed and use_fused_finalize:
+        raise ValueError("Routed FC2 output requires deterministic finalize")
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
     b_dtype_cutlass = get_cutlass_dtype(b_dtype)
@@ -583,6 +612,9 @@ def launch_finalize_gemm(
         sf_vec_size=sf_vec_size,
         prepare_input=False,
         scatter_output=True,
+        output_is_routed=output_is_routed,
+        compact_offsets=compact_offsets,
+        dense_indices=dense_indices,
         per_token_scale_is_routed=True,
         k_steps=k_steps,
         overlap_activation_accumulators=False,

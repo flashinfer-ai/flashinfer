@@ -65,6 +65,7 @@ class PrepareRouted:
         mapping_ptr: cute.Pointer,
         limits_ptr: cute.Pointer,
         num_tiles_ptr: cute.Pointer,
+        compact_offsets_ptr,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -75,6 +76,7 @@ class PrepareRouted:
             mapping_ptr,
             limits_ptr,
             num_tiles_ptr,
+            compact_offsets_ptr,
         ).launch(
             grid=(self.grid, 1, 1),
             block=(self.threads, 1, 1),
@@ -92,6 +94,7 @@ class PrepareRouted:
         mapping_ptr,
         limits_ptr,
         num_tiles_ptr,
+        compact_offsets_ptr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -107,6 +110,28 @@ class PrepareRouted:
         active_rows = count * self.route_tile
         mapping = cute.make_tensor(mapping_ptr, cute.make_layout((active_rows,)))
         limits = cute.make_tensor(limits_ptr, cute.make_layout((count,)))
+        if cutlass.const_expr(compact_offsets_ptr is not None):
+            if bidx == 0 and tidx < 32:
+                offsets = cute.make_tensor(compact_offsets_ptr, limits.layout)
+                carry = cutlass.Int32(0)
+                # Only FC2 consumes this prefix, after the existing grid wait.
+                for first in cutlass.range(0, count, 32):
+                    tile = first + tidx
+                    valid = cutlass.Int32(0)
+                    if tile < count:
+                        valid = cutlass.min(
+                            self.route_tile, limits[tile] - tile * self.route_tile
+                        )
+                    total = valid
+                    for shift in cutlass.range_constexpr(5):
+                        previous = cute.arch.shuffle_sync_up(
+                            total, offset=1 << shift, mask_and_clamp=0
+                        )
+                        if tidx >= 1 << shift:
+                            total += previous
+                    if tile < count:
+                        offsets[tile] = carry + total - valid
+                    carry += cute.arch.shuffle_sync(total, 31)
         copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             cutlass.Uint32,
@@ -229,6 +254,7 @@ def prepare(
     top_k,
     sf_vec_size,
     enable_pdl=True,
+    compact_offsets=None,
 ):
     payload_bytes = activation.shape[1] * activation.element_size()
     capacity = mapping.numel()
@@ -310,7 +336,9 @@ def prepare(
         copy_bits,
         grid,
         enable_pdl,
+        compact_offsets is not None,
     )
+    tensors += (compact_offsets,)
     ptrs = tuple(
         make_ptr(
             cutlass.Uint32 if index < 4 else cutlass.Int32,
