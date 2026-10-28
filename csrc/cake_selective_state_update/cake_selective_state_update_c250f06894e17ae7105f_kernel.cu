@@ -98,7 +98,7 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_selective_state_update_a70e8dc68aabd722a74b(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, long long* __restrict__ state_batch_indices, int batch_size, int nheads, int dim, int dstate, int ngroups, int token_steps, unsigned long long state_stride_slot, int dt_softplus, long long pad_slot_id)
+kernel_cake_selective_state_update_c250f06894e17ae7105f(__nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C, float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, long long* __restrict__ state_batch_indices, int batch_size, int nheads, int dim, int dstate, int ngroups, int token_steps, unsigned long long state_stride_slot, int dt_softplus, long long pad_slot_id)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -129,9 +129,9 @@ kernel_cake_selective_state_update_a70e8dc68aabd722a74b(__nv_bfloat16* __restric
     const int s_dt_addr = smem + 1536;
 
     // === Task calls (declaration order) ===
-    int batch = bid / nheads;
-    int head = bid % nheads;
-    int heads_per_group = nheads / ngroups;
+    int batch = bid / 64;
+    int head = bid % 64;
+    int heads_per_group = 8;
     int group = head / heads_per_group;
     int token_base = batch * token_steps;
     long long source_slot = state_batch_indices[batch];
@@ -202,7 +202,6 @@ kernel_cake_selective_state_update_a70e8dc68aabd722a74b(__nv_bfloat16* __restric
         }
     }
     asm volatile("cp.async.wait_group 0;");
-    asm volatile("fence.proxy.async;" ::: "memory");
     if (tid < token_steps) {
         s_dt[tid] = dt_value;
     }
