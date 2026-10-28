@@ -275,3 +275,55 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         assert torch.equal(t_saved, t_replay), (
             f"{n}: saved-context and replay backward differ"
         )
+
+
+# --------------------------------------------------------------------------- issue #7074 (1): sync-free context preparation (one GPU)
+ISSUE_CU = [
+    0,
+    131071,
+    218602,
+    261987,
+]  # the issue's layout: 261,987 tokens in 3 documents, (H_qk, HV) = (2, 6)
+
+
+def test_context_preparation_does_not_synchronize(device) -> None:
+    """``kcp_partition`` + ``build_kcp_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
+    tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
+    plan = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp_plan")
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        part = gdn_api.kcp_partition(
+            torch.tensor(ISSUE_CU, dtype=torch.int64), 1, layout="contiguous"
+        )
+        ctx = gdn_api.build_kcp_context(part, None, 0, device)
+        prepared = ctx.prepare(2, 6)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize(device)
+    ref = plan.build_kcp_context(part, None, 0, "cpu", sm_count=ctx.sm_count)
+    ref_prepared = ref.prepare(2, 6)
+    pairs = (
+        [(f"tables.{k}", ctx.tables[k], ref.tables[k]) for k in ctx.tables]
+        + [
+            (f"halo.{k}", ctx.halo_tables[k], ref.halo_tables[k])
+            for k in ctx.halo_tables
+        ]
+        + [
+            ("frag_table", ctx.frag_table, ref.frag_table),
+            ("cu_seqlens_local", ctx.cu_seqlens_local, ref.cu_seqlens_local),
+        ]
+        + [
+            (f"prepared.{k}", prepared.device[k], ref_prepared.device[k])
+            for k in prepared.device
+        ]
+    )
+    assert len(pairs) > 20
+    for name, dev_t, cpu_t in pairs:
+        assert dev_t.device.type == "cuda", name
+        assert dev_t.dtype == cpu_t.dtype and tuple(dev_t.shape) == tuple(
+            cpu_t.shape
+        ), name
+        assert dev_t.data_ptr() % plan.UPLOAD_ALIGN_BYTES == 0, name
+        assert torch.equal(dev_t.cpu(), cpu_t), name
+    assert prepared.P == ref_prepared.P

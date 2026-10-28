@@ -1923,7 +1923,8 @@ class _Tables:
         k = ("kcp", key, str(device), dtype, content)
         t = cache.get(k)
         if t is None:
-            t = torch.tensor(list(k[4]), dtype=dtype, device=device)
+            # one asynchronous pinned copy (no synchronizing call; cake_kcp_plan.upload_tables)
+            t = cake_kcp_plan.upload_tables({"t": (k[4], dtype, None)}, device)["t"]
             cache[k] = t
         return t
 

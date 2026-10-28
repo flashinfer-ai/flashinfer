@@ -36,6 +36,7 @@ import json
 import math
 import os
 import pathlib
+import random
 import re
 
 import pytest
@@ -2314,9 +2315,7 @@ def test_checkpoint_backward_reuses_the_recompute_tapes(
     # in the first one only; any other torch build launches it in both
     assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_prep"] == [False, True]
     assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_o"] == (
-        [False]
-        if torch.__version__ in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS
-        else [False, True]
+        [False] if kcp.torch_release_verified() else [False, True]
     )
     # the hand-off forward's #2 tape launches are the replay's (same list lengths in the same order)
     kept_walks = [
@@ -3131,3 +3130,106 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
     for a, d in zip(res, direct, strict=True):
         assert torch.equal(a, d)
     assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- issue #7074 (1): sync-free context preparation (CPU)
+# The tables of a context and its head plan travel in pinned, asynchronous copies (upload_tables); the values are those of
+# torch.tensor(values, dtype).  The no-sync contract itself is measured on a device (test_cake_gdn_train.py, the dist test).
+
+
+def test_upload_tables_matches_torch_tensor() -> None:
+    gp = _package("cake_kcp_plan")
+    specs = {
+        "a": ([1, 2, 3], torch.int32, None),
+        "b": ([[1, 2], [3, 4], [5, 6]], torch.int32, (3, 2)),
+        "c": ((7, 8), torch.int64, None),
+        "e": ([], torch.int32, (0, 4)),
+        "f": ([[[9]]], torch.int32, None),
+        "g": ([], torch.int64, None),
+    }
+    out = gp.upload_tables(specs, "cpu")
+    assert set(out) == set(specs)
+    for name, (values, dtype, shape) in specs.items():
+        ref = torch.tensor(list(values), dtype=dtype)
+        ref = ref.reshape(shape) if shape is not None else ref
+        assert out[name].dtype == dtype, name
+        assert tuple(out[name].shape) == tuple(ref.shape), name
+        assert torch.equal(out[name], ref), name
+    with pytest.raises(ValueError, match="holds 3 values"):
+        gp.upload_tables({"x": ([1, 2, 3], torch.int32, (2, 2))}, "cpu")
+    assert gp.UPLOAD_ALIGN_BYTES % 128 == 0
+
+
+def _lpt_makespan_list(chains, machines):
+    """The list form of the greedy's water filling (one load per machine): the reference the multiset form equals."""
+    loads = [0] * machines
+    for L, m in sorted(chains, reverse=True):
+        L, m = int(L), int(m)
+        if L <= 0 or m <= 0:
+            continue
+
+        def needed(level):
+            return sum(-(-(level - load) // L) for load in loads if load < level)
+
+        lo = min(loads)
+        hi = lo + (m + 1) * L
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if needed(mid) <= m:
+                lo = mid
+            else:
+                hi = mid - 1
+        counts = [(-(-(lo - load) // L) if load < lo else 0) for load in loads]
+        rest = m - sum(counts)
+        loads = [load + c * L for load, c in zip(loads, counts, strict=True)]
+        if rest:
+            for i in sorted(range(machines), key=loads.__getitem__)[:rest]:
+                loads[i] += L
+    return max(loads)
+
+
+def _lpt_makespan_greedy(chains, machines):
+    """Job by job: longest first, each to the least-loaded machine."""
+    loads = [0] * machines
+    for L, m in sorted(chains, reverse=True):
+        for _ in range(int(m)):
+            if L > 0:
+                loads[loads.index(min(loads))] += int(L)
+    return max(loads)
+
+
+def test_lpt_makespan_equals_the_list_form_and_the_greedy() -> None:
+    """The multiset water filling returns the list form's integer on every instance (the plan's ``P`` vectors are
+    untouched) and the job-by-job greedy's on small ones."""
+    rng = random.Random(7074)
+    for trial in range(400):
+        machines = rng.choice([1, 2, 3, 7, 16, 132, 148, 152])
+        chains = [
+            (
+                rng.randint(0, 40),
+                rng.randint(0, 600) if rng.random() < 0.8 else rng.randint(0, 8),
+            )
+            for _ in range(rng.randint(0, 9))
+        ]
+        got = (
+            gp.lpt_makespan(chains, machines)
+            if any(L > 0 and m > 0 for L, m in chains)
+            else None
+        )
+        if got is None:
+            assert gp.lpt_makespan(chains, machines) == 0
+            continue
+        assert got == _lpt_makespan_list(chains, machines), (trial, machines, chains)
+        if sum(m for _, m in chains) <= 300:
+            assert got == _lpt_makespan_greedy(chains, machines), (
+                trial,
+                machines,
+                chains,
+            )
+    # the issue's single-rank layout: two fragments of 2048 chunks, P * HV chains each, 152 SMs
+    assert gp.lpt_makespan([(2048, 6), (2048, 6)], 152) == 2048
+    assert gp.lpt_makespan([(8, 6 * 256), (8, 6 * 256)], 152) == 8 * -(
+        -(2 * 6 * 256) // 152
+    )
+    with pytest.raises(ValueError):
+        gp.lpt_makespan([(1, 1)], 0)

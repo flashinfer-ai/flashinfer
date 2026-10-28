@@ -958,6 +958,22 @@ def _run_rank(
     flags["backward_twice_accumulates"] = all(
         torch.equal(res_twice[n], res_auto[n] + res_auto[n]) for n in GRADS
     )
+    # G10 (issue #7074): preparing a fresh context of this rank's layout -- the host plan, its table uploads and the
+    # per-key device tables -- makes no synchronizing CUDA call (pinned asynchronous copies), so a pipeline can prepare
+    # the next batch's metadata behind queued device work
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fresh_ctx = plan.build_kcp_context(part, group, rank, device)
+        fresh_ctx.prepare(H_qk, HV)
+        flags["prepare_no_sync"] = True
+    except RuntimeError as exc:  # "called a synchronizing CUDA operation"
+        info["prepare_no_sync_error"] = str(exc)[:200]
+        flags["prepare_no_sync"] = False
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    del fresh_ctx
+    torch.cuda.synchronize(device)
     # #7039: retained bytes after a checkpointed forward (graph off), per-call and caller-held workspace forms.
     # the plan's per-key device tables are uploaded first (ctx.prepare + one warm-up call of the
     # same form) so they are not counted; graph="replay" keeps a static pool and is reported, not asserted.
