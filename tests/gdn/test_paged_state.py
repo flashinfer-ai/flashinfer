@@ -474,6 +474,62 @@ def test_slot_arguments_match_packed_api():
             assert torch.equal(pool[row], before[row]), f"row {row} changed"
 
 
+def test_one_selected_state_per_sequence():
+    """One chunk-aligned intermediate state per sequence (or none) goes straight
+    to its own row: every other 64-token checkpoint entry is -1, so nothing
+    else is stored and no gather follows."""
+    _skip_if_unsupported()
+    random.seed(6)
+    torch.manual_seed(6)
+    lens = [300, 130, 64, 257]
+    # Sequence-local token counts (multiples of 64); -1 = no state wanted.
+    positions = [192, -1, 64, 256]
+    dest_rows = [5, 3, 0, 6]
+    streams = Streams(lens, 4, 4, 4, torch.bfloat16)
+    q, k, v, g, beta = streams.slices([0] * len(lens), lens)
+    cu = _cu(lens, "cuda")
+    ref_out, _, ref_ckpts = _oracle(streams, lens)
+
+    # Built on the device from the request's positions.
+    counts = (cu[1:] - cu[:-1]) // CHUNK
+    starts = torch.cumsum(counts, 0) - counts
+    pos = torch.tensor(positions, dtype=torch.int32, device="cuda")
+    rows = torch.tensor(dest_rows, dtype=torch.int32, device="cuda")
+    entries = torch.full(
+        (sum(n // CHUNK for n in lens),), -1, dtype=torch.int32, device="cuda"
+    )
+    wanted = pos > 0
+    entries[(starts + pos // CHUNK - 1)[wanted]] = rows[wanted]
+
+    states = torch.randn(8, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    before = states.clone()
+    out = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        1.0 / math.sqrt(HEAD_SIZE),
+        cu_seqlens=cu,
+        state_checkpoints=states,
+        checkpoint_cu_starts=starts.to(torch.int32),
+        checkpoint_every_n_tokens=CHUNK,
+        checkpoint_state_indices=entries,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=1e-2, rtol=1e-2)
+    expected = {
+        row: ref_ckpts[b][p // CHUNK - 1]
+        for b, (p, row) in enumerate(zip(positions, dest_rows, strict=True))
+        if p > 0
+    }
+    for row in range(states.size(0)):
+        if row in expected:
+            _assert_state(states[row], expected[row], msg=f"row {row}")
+        else:
+            assert torch.equal(states[row], before[row]), f"row {row} changed"
+
+
 def test_prefix_lens_absolute_checkpoints():
     """``prefix_lens`` moves the checkpoint grid to absolute positions; an
     unaligned prefix is chunked from its 64-aligned absolute position."""
