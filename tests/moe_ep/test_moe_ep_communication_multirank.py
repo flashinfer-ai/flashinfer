@@ -149,7 +149,7 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
     try:
         for _ in range(2):  # the second round reuses the workspace
             received = comm.dispatch(
-                x, topk_ids, topk_weights, max_tokens_per_rank=int(step_max)
+                x, topk_ids, topk_weights, runtime_max_tokens_per_rank=int(step_max)
             )
             rows = comm.ep_size * received.tokens_per_rank
             assert received.hidden_states.shape == (rows, hidden)
