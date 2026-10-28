@@ -86,6 +86,8 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
         output=None,
         initial_state=None,
     )
+    if change == "frontend":
+        monkeypatch.setattr(la.cudnn, "__version__", "1.31.0")
     la._try_cudnn_auto(decline, q, **options)
     la._try_cudnn_auto(decline, q.clone(), **options)
     assert len(calls) == 1
@@ -110,7 +112,9 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     elif change == "state":
         options["initial_state"] = torch.zeros(1, 3, 3)
     elif change == "frontend":
-        monkeypatch.setattr(la.cudnn, "__version__", "1.32.0")
+        current = la.cudnn.__version__
+        replacement = "1.31.0" if current != "1.31.0" else "1.32.0"
+        monkeypatch.setattr(la.cudnn, "__version__", replacement)
     else:
         monkeypatch.setattr(la, "_build_la_graph", lambda *args, **kwargs: None)
     la._try_cudnn_auto(decline, q, **options)

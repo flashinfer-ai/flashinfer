@@ -1484,15 +1484,18 @@ def test_public_cake_gdn_prefill_metadata_i64_record_reads_mixed_widths_without_
     _launch(case)
     torch.cuda.synchronize()
     _assert_same_outputs(case, expected)
+    # Validate casts even when the profiler cannot capture CUDA activity.
+    if zero_copy:
+        assert casts == [], casts
+    else:
+        assert torch.int64 in casts, casts
 
     _reset_outputs(case, initial_state)
     kernels = _device_kernel_names(lambda: _launch(case))
     _assert_same_outputs(case, expected)
     if zero_copy:
-        assert casts == [], casts
         assert len(kernels) == 1, kernels
     else:
-        assert torch.int64 in casts, casts
         assert len(kernels) > 1, kernels
 
 

@@ -69,10 +69,24 @@ Validated matrix (`validated_problems` in `tests/test_helpers/cake_nvfp4_per_tok
 x bf16 / fp16 output, ragged `M` in {3, 1000, 4097}, fp16 activations and a folded
 output scale on the first family, and the quantizer alone for `K` in {7168, 8192,
 16384, 18432, 28672}.  Only the kernels those shapes select are registered
-(`cake_jit.KERNELS`); a shape outside the matrix raises `NotImplementedError` naming
-the missing kernel.  The dispatch depends on the SM count (148 on B200, 152 on GB300); on
+(`cake_jit.KERNELS`).  The dispatch depends on the SM count (148 on B200, 152 on GB300); on
 GB200 (SM100, 152 SMs) and B300 (SM103, 148 SMs) a shape whose own tactic selects a kernel
-the architecture does not register runs the tactic of B200 / GB300 instead.
+the architecture does not register runs the tactic of B200 / GB300 instead.  A GEMM shape
+outside the matrix whose tactic selects a kernel that is not registered runs the nearest
+registered program: the same orientation, CTA group and closest tile width, with the raster
+group, stream-K tail, scheduler or cache hints of that program (on GB200 / B300 the program
+B200 / GB300 runs); its plan records the replaced key in `unregistered_key`.  A quantizer
+shape whose instance is not registered runs the nearest registered one-CTA-per-row program
+of the same activation dtype and folded scale whose CTA holds the row (a compiled-in row
+width only for contiguous rows of that width), and records the replaced key the same way.
+fp16 activations without such a program (row widths other than 7168, a folded output
+scale, row-strided rows) raise `NotImplementedError` naming the missing kernel.  A GEMM
+plan whose program's TMA boxes exceed the operands (its host binding would refuse the
+shape: the 64-row output box of the half-M 2-CTA pair at 33-63 tokens, the 64-column
+output box of the swapped orientation at `N` < 64) runs the nearest registered program
+whose boxes fit and records the replaced key in `unfit_key`.  Every GEMM program stores
+the output through a box at least 32 columns wide, so `N` in {8, 16, 24} raises
+`ValueError` at prepare.
 
 Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; GEMM
 `|out - ref| <= 1e-2 + 1e-2 |ref| + half an output ulp` against the FP32 dequantized

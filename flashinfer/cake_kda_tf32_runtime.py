@@ -111,6 +111,15 @@ if TYPE_CHECKING:
 HEAD_DIM = 128
 BF16_M128_CHUNK = 32
 BF16_N16_M128_CHUNK = 16
+# Most 32-token chunks of the longest sequence of a work-binned direct M128 N32
+# serving launch that takes the loader's turnover build of its module (see
+# _work_bin_turnover_route): with such short tasks a bin turns its state over
+# often enough that loading the next task's initial state and storing the
+# previous task's final state beside the current task's chunks pays.  A launch
+# with a longer sequence keeps the routed work-binned program.  Measured per
+# part: BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 on a 152-SM sm_103a.
+BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS = 8
+BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 BF16_BETA_TMA_MIN_HEADS = 8
 BF16_DIRECT_ORDER_MAX_PASSES = 1
 BF16_DIRECT_INSERTION_MAX_SEQUENCES = 16
@@ -119,6 +128,22 @@ H12_DIRECT_N32_MAX_SEQ_LEN = 256
 H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN = 128
 BF16_N32_REGISTER_INVERSE_MIN_SEQ_LEN = 256
 INDEPENDENT_DVSPLIT_CTAS = 2
+# Shortest longest-sequence of an M64 value-split launch that takes the
+# loader's pair-share build of the module (see _m64_pair_share_factory), by
+# the launch's long-task load, heads x tokens / longest sequence (its task
+# count when the sequences are equal; a short sequence counts by its length):
+# the first (most tasks, shortest longest-sequence) row that holds the load
+# decides, and a launch beyond the last row keeps the routed program.
+# Off-bench sweeps measured the pair-share build faster only on long
+# sequences, and the more long tasks share the wave, the longer the sequence
+# it needs: on a 148-SM B200 it is slower beyond 48 equal tasks at every
+# length, while a 152-SM GB300 keeps it faster up to 72.
+M64_PAIR_SHARE_MIN_SEQ_LEN = ((32, 1024), (48, 2048))
+M64_PAIR_SHARE_MIN_SEQ_LEN_GB300 = ((32, 1024), (64, 2048), (72, 4096))
+# The M64 value split's CTA: 1024 threads and the dynamic shared memory that
+# keeps it at one CTA per SM (the cluster capacity probe launches this shape).
+M64_CTA_THREADS = 1024
+M64_CTA_SMEM_BYTES = 227328
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -889,8 +914,42 @@ class _CorrectionMergeUnavailable(Exception):
     """The chain's correction module has no merging build on this device."""
 
 
+def _is_fused_m128_row(factory) -> bool:
+    """``factory`` is the plain fused M128 factory row.
+
+    That is ``partial(_factory, "compiled_bf16_fused_m128", ...)``, or the same
+    row through the work-bin turnover factory (``_work_bin_turnover_factory``,
+    which resolves the row like ``_factory``).  The fold and merge interceptors
+    rewrite only this factory row, as they would ``_factory``'s; they raise
+    their ``...Unavailable`` exception for every other one (fail closed).
+    """
+    return getattr(factory, "func", None) in (
+        _factory,
+        _work_bin_turnover_factory,
+    ) and factory.args == ("compiled_bf16_fused_m128",)
+
+
+def _built_from_table(launch, table: str) -> bool:
+    """``launch``'s body is a program the loader table ``table`` names on this device.
+
+    A fold or merge route drops another launch (the map pass, the pair-map
+    producer, the epilogue) on the strength of its body; the composite checks
+    the body it actually got before it does.
+    """
+    programs = getattr(_kda_registry, table, {}).get(detect_gpu_arch(), {})
+    return getattr(getattr(launch, "module", None), "name", None) in set(
+        programs.values()
+    )
+
+
 def _correction_merge_factory(
-    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
 ):
     """The merging build of the factory row's correction module.
 
@@ -900,7 +959,7 @@ def _correction_merge_factory(
     keywords are not part of the row's key, and a merging build has no
     work bins and no owner/helper build.
     """
-    del route_heads, route_work_bins, owner_helper
+    del route_heads, route_work_bins, owner_helper, owner_helper_pool
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
@@ -908,6 +967,195 @@ def _correction_merge_factory(
     if program is None:
         raise _CorrectionMergeUnavailable
     return _kda_registry.PreparedKernel(program, arch)
+
+
+# A minimal kernel the driver JIT-compiles for the cluster capacity probe: the
+# capacity depends on the launch shape (block, shared memory, cluster), not on
+# the body.
+_PAIR_PROBE_PTX = b"""
+.version 7.8
+.target sm_90
+.address_size 64
+.visible .entry cake_kda_pair_probe()
+{
+    ret;
+}
+\x00"""
+
+
+_M64_PAIR_CLUSTER_CAPACITY: dict = {}
+_M64_PAIR_PROBE_WARNED = False
+
+
+def _m64_pair_cluster_capacity(device: torch.device) -> int:
+    """How many 2-CTA clusters of the M64 value split's CTA the device holds at once.
+
+    ``cuOccupancyMaxActiveClusters`` for a probe kernel launched with the M64
+    CTA's threads and dynamic shared memory (one CTA per SM) in clusters of
+    two.  The driver's answer follows the part's floorsweeping, which can leave
+    it below ``sm_count // 2``.  Only an answer is cached (per device): when
+    the driver cannot answer, the call returns 0 (the runtime keeps the routed
+    program), logs one warning per process and probes again on the next call.
+    """
+    capacity = _M64_PAIR_CLUSTER_CAPACITY.get(device)
+    if capacity is None:
+        capacity = _probe_m64_pair_cluster_capacity(device)
+        if capacity is None:
+            return 0
+        _M64_PAIR_CLUSTER_CAPACITY[device] = capacity
+    return capacity
+
+
+def _probe_m64_pair_cluster_capacity(device: torch.device) -> Optional[int]:
+    """The driver's answer for ``_m64_pair_cluster_capacity``; ``None`` on failure."""
+    global _M64_PAIR_PROBE_WARNED
+    import torch
+
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device):
+            torch.empty(0, device=device)  # the primary context is current
+            module = check(driver.cuModuleLoadData(_PAIR_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"cake_kda_pair_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        M64_CTA_SMEM_BYTES,
+                    )
+                )
+                config = driver.CUlaunchConfig()
+                config.gridDimX, config.gridDimY, config.gridDimZ = 2, 1, 1
+                config.blockDimX, config.blockDimY, config.blockDimZ = (
+                    M64_CTA_THREADS,
+                    1,
+                    1,
+                )
+                config.sharedMemBytes = M64_CTA_SMEM_BYTES
+                cluster = driver.CUlaunchAttribute()
+                cluster.id = (
+                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                )
+                cluster.value.clusterDim.x = 2
+                cluster.value.clusterDim.y = 1
+                cluster.value.clusterDim.z = 1
+                config.attrs = [cluster]
+                config.numAttrs = 1
+                return int(check(driver.cuOccupancyMaxActiveClusters(function, config)))
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception as error:
+        if not _M64_PAIR_PROBE_WARNED:
+            _M64_PAIR_PROBE_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the M64 pair-share cluster capacity probe failed "
+                "(%s: %s); M64 launches keep the routed program until a probe "
+                "succeeds",
+                type(error).__name__,
+                error,
+            )
+        return None
+
+
+# Long M64 value-split launches whose clusters fit one wave take the loader's
+# ``_RENDERED_PAIR_SHARE_ROUTES`` build of the module: the two value halves of
+# a task run as a 2-CTA cluster and each prepares every second 32-token chunk
+# for both (the same bits as the routed program).  Every other launch, and a
+# module without a pair-share build, keeps the routed program.
+def _m64_pair_share_factory(name, *args, **kwargs):
+    """The pair-share build of the factory row's M64 module, else ``_factory``."""
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    program = _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(arch, {}).get(module)
+    if program is None:
+        return _factory(name, *args, **kwargs)
+    return _kda_registry.PreparedKernel(program, arch)
+
+
+def _work_bin_turnover_program(
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
+):
+    """The turnover build of the factory row's work-binned module, or ``None``.
+
+    ``None`` for a call without work bins or with owner/helper CTAs (pooled or
+    not), when the row has no module on this device, when the head-count routes
+    take the module elsewhere at ``route_heads``, when the loader names no
+    work-binned build of the module (``_factory`` would not take work bins), or
+    when it names no turnover build of it (``_RENDERED_WORK_BIN_TURN_ROUTES``).
+    The routing keywords are not part of the row's key (as in ``_factory``).
+    """
+    if not route_work_bins or owner_helper or owner_helper_pool:
+        return None
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    if module is None:
+        return None
+    heads = getattr(_kda_registry, "_RENDERED_HEAD_ROUTES", {})
+    if route_heads in heads.get(arch, {}).get(module, {}):
+        return None
+    if module not in _kda_registry._RENDERED_WORK_BIN_ROUTES.get(arch, {}):
+        return None
+    return _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).get(module)
+
+
+def _work_bin_turnover_factory(name, *args, **kwargs):
+    """The turnover build of the factory row's work-binned module.
+
+    The same bins, bits and argument plan as the module's work-binned program,
+    with each bin's state turned over in the background.  ``_build_body``
+    takes this factory only where ``_work_bin_turnover_program`` names a
+    build; any other call resolves through ``_factory``.
+    """
+    program = _work_bin_turnover_program(name, *args, **kwargs)
+    if program is None:
+        return _factory(name, *args, **kwargs)
+    return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _work_bin_turnover_route(
+    *,
+    route_work_bins: bool,
+    direct_n16: bool,
+    n32_ft_slab: bool,
+    max_seq_len: int,
+    gpu_arch: str,
+    sm_count: int,
+) -> bool:
+    """Whether a direct M128 launch may take its module's turnover build.
+
+    Only a work-binned N32 serving launch whose longest sequence has at most
+    the part's turnover chunk count.  Affine split parts (``_n32_ft_slab``)
+    never do: their slab modules have no turnover build, and the composite's
+    Fold / Merge classes intercept the factory for their own builds.
+    """
+    if not route_work_bins or direct_n16 or n32_ft_slab:
+        return False
+    limit = (
+        BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300
+        if gpu_arch == "sm_103a" and sm_count == 152
+        else BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS
+    )
+    return max_seq_len <= BF16_M128_CHUNK * limit
 
 
 # Bodies that reach an operand only through its TMA descriptor never
@@ -1085,6 +1333,39 @@ def _owner_helper_count(
         return 0
     helpers = min(OWNER_HELPER_MAX_HELPERS, sm_count // max(total_tasks, 1) - 1)
     return helpers if helpers >= 1 else 0
+
+
+# The pooled owner/helper split: the helper CTAs of a head form one pool of
+# ``pool`` CTAs that prepares the head's chunks of every sequence in chunk-major
+# order (item ``chunk * sequences + sequence`` goes to pool member ``item % pool``),
+# so the SMs the per-task split leaves idle help as well. The grid is
+# ``tasks + heads * pool``; the pool stays below ``(helpers + 1) * sequences`` so
+# the program reads the same ``helpers`` (and ring depth) from its grid as the
+# per-task split, and every wait of a member is on an item of a smaller index, so
+# the resident grid cannot deadlock. The chunk-major order needs one chunk count
+# for every sequence. The pool is taken where the per-task split has one helper
+# per task and the pool gives each head at least 13/12 as many helpers: below
+# that ratio, and wherever the split already has two helpers per task, the
+# shared ring costs more than the extra helpers return.
+OWNER_HELPER_POOL_MIN_RATIO = (13, 12)
+
+
+def _owner_helper_pool_count(
+    *, sm_count: int, num_seqs: int, num_heads: int, helpers: int, uniform_chunks: bool
+) -> int:
+    """Pooled helper CTAs per head, or 0 to keep ``tasks * (1 + helpers)`` CTAs.
+
+    Taken where the per-task split has one helper per task, every sequence has
+    the same chunk count and the pool gives a head at least
+    ``OWNER_HELPER_POOL_MIN_RATIO`` times the split's helpers
+    (``12 * pool >= 13 * sequences``).
+    """
+    if helpers != 1 or not uniform_chunks or num_seqs < 1 or num_heads < 1:
+        return 0
+    total_tasks = num_seqs * num_heads
+    pool = min((sm_count - total_tasks) // num_heads, (helpers + 1) * num_seqs - 1)
+    num, den = OWNER_HELPER_POOL_MIN_RATIO
+    return pool if den * pool >= num * helpers * num_seqs else 0
 
 
 def _should_use_small_bh_owner_helper(
@@ -1716,8 +1997,25 @@ class FlashKDABlackwellBF16FusedLaunch:
     _affine_main_indexed_initial = False
     _active_beta_f32 = False
 
-    def _build_body(self, factory, *args, **kwargs):
-        """Build one body and record which raw q / k / v pointers it never reads."""
+    def _build_body(self, factory, *args, work_bin_turnover=False, **kwargs):
+        """Build one body and record which raw q / k / v pointers it never reads.
+
+        With ``work_bin_turnover`` a ``_factory`` build takes the loader's
+        turnover build of the resolved module (``_work_bin_turnover_factory``)
+        where ``_work_bin_turnover_program`` names one; every other build keeps
+        ``factory``.
+        """
+        if (
+            work_bin_turnover
+            and getattr(factory, "func", None) is _factory
+            and _work_bin_turnover_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
+            )
+            is not None
+        ):
+            factory = partial(
+                _work_bin_turnover_factory, *factory.args, **factory.keywords
+            )
         module = self._build_kda_module(factory, *args, **kwargs)
         self._qkv_carrier_names[id(module)] = _qkv_raw_pointer_names(factory)
         return module
@@ -2460,6 +2758,16 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
             )
         )
+        # A work-binned N32 serving launch whose longest sequence has at most
+        # the part's turnover chunk count may take its module's turnover build.
+        route_work_bin_turnover = _work_bin_turnover_route(
+            route_work_bins=route_work_bins,
+            direct_n16=use_direct_m128_n16,
+            n32_ft_slab=self._n32_ft_slab,
+            max_seq_len=max_seq_len,
+            gpu_arch=gpu_arch,
+            sm_count=sm_count,
+        )
         # The bounded N32 body without the early state pack is faster on the
         # short H12 grids and bitwise identical to the early-pack body, so the
         # prepared path keeps it for every length; it also has the work-binned
@@ -2796,6 +3104,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 f"the {unexported_route} kernel family, which is not exported"
             )
         owner_helpers = 0
+        owner_helper_pool = 0
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -2848,14 +3157,32 @@ class FlashKDABlackwellBF16FusedLaunch:
                 and not (self._force_direct_m128 or self._force_direct_m128_n32)
                 else 0
             )
+            # The pooled program where its pool outnumbers the per-task
+            # helpers of every head; the factory keeps the owner/helper program
+            # for a module without one.
+            owner_helper_pool = _owner_helper_pool_count(
+                sm_count=sm_count,
+                num_seqs=num_seqs,
+                num_heads=num_heads,
+                helpers=owner_helpers,
+                uniform_chunks=len(
+                    {
+                        (end - start + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    }
+                )
+                == 1,
+            )
             self.module = self._build_body(
                 partial(
                     _factory,
                     "compiled_bf16_fused_m128",
                     route_work_bins=route_work_bins,
                     **({"owner_helper": True} if owner_helpers else {}),
+                    **({"owner_helper_pool": True} if owner_helper_pool else {}),
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
+                work_bin_turnover=route_work_bin_turnover,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
@@ -3000,8 +3327,29 @@ class FlashKDABlackwellBF16FusedLaunch:
             if self._pdl_wait_initial_state_f32 or self._pdl_publish_final_state:
                 self.schedule += "_pdl"
         elif use_independent_dvsplit:
+            pair_share_rows = (
+                M64_PAIR_SHARE_MIN_SEQ_LEN_GB300
+                if gpu_arch == "sm_103a" and sm_count == 152
+                else M64_PAIR_SHARE_MIN_SEQ_LEN
+            )
+            pair_share_min_seq_len = next(
+                (
+                    min_seq_len
+                    for most_tasks, min_seq_len in pair_share_rows
+                    if num_heads * total_tokens <= most_tasks * max_seq_len
+                ),
+                None,
+            )
+            pair_share = (
+                pair_share_min_seq_len is not None
+                and max_seq_len >= pair_share_min_seq_len
+                and total_tasks <= _m64_pair_cluster_capacity(q.device)
+            )
             self.module = self._build_body(
-                partial(_factory, "compiled_bf16_fused_m64"),
+                partial(
+                    _m64_pair_share_factory if pair_share else _factory,
+                    "compiled_bf16_fused_m64",
+                ),
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 active_beta_f32=self._active_beta_f32,
             )
@@ -3012,6 +3360,10 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._state_dtype_is_fp32
                 else "fused_m64_independent_dvsplit"
             )
+            if getattr(self.module, "name", None) in (
+                _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(gpu_arch, {}).values()
+            ):
+                self.schedule += "_pair_share"
         self.route = route
         self.gate_kind = gate_kind.value
         self.gpu_arch = gpu_arch
@@ -3139,10 +3491,24 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "work bins replace the one-CTA-per-task direct grid only"
                 )
             self.grid = (num_work_bins, 1, 1)
+            if getattr(self.module, "name", None) in (
+                _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
+            ):
+                self.schedule += "_turnover"
         self.owner_helpers = (
             owner_helpers if getattr(self.module, "owner_helper", False) else 0
         )
-        if self.owner_helpers:
+        self.owner_helper_pool = (
+            owner_helper_pool
+            if self.owner_helpers and getattr(self.module, "owner_helper_pool", False)
+            else 0
+        )
+        if self.owner_helper_pool:
+            self.grid = (total_tasks + num_heads * self.owner_helper_pool, 1, 1)
+            self.schedule += (
+                f"_owner{self.owner_helpers}helper_pool{self.owner_helper_pool}"
+            )
+        elif self.owner_helpers:
             self.grid = (total_tasks * (1 + self.owner_helpers), 1, 1)
             self.schedule += f"_owner{self.owner_helpers}helper"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
@@ -3268,6 +3634,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             # words (zero_workspace) and the consumed words
             # (state_checkpoint_needed). The program leaves every word zero when
             # it exits, so one zeroed allocation serves every launch of the plan.
+            # The pooled program keeps the per-task ring of the same helpers.
             slots = total_tasks * OWNER_HELPER_SLOTS_PER_HELPER * self.owner_helpers
             owner_helper_words = torch.zeros(
                 2 * slots, dtype=torch.uint32, device=q.device
@@ -3599,17 +3966,42 @@ class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch(
 
     @staticmethod
     def _build_kda_module(factory, *args, **kwargs):
-        if getattr(factory, "func", None) is _factory and factory.args == (
-            "compiled_bf16_fused_m128",
+        # Fail closed: any other factory (a wrapper included) has no fold
+        # build here, and the composite then keeps the pair-map producer.
+        if not _is_fused_m128_row(factory) or (
+            _pair_map_fold_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
+            )
+            is None
         ):
-            if (
-                _pair_map_fold_program(
-                    *factory.args, *args, **{**factory.keywords, **kwargs}
-                )
-                is None
-            ):
-                raise _PairMapFoldUnavailable
-            factory = partial(_pair_map_fold_factory, *factory.args, **factory.keywords)
+            raise _PairMapFoldUnavailable
+        factory = partial(_pair_map_fold_factory, *factory.args, **factory.keywords)
+        return _build_kda_module(factory, *args, **kwargs)
+
+
+class FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch(
+    FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
+):
+    """Chain-route main windows that also write the window maps of the tail windows.
+
+    The factory row is the indexed-initial main's; the body is that module's
+    map-fold build (``_chain_map_fold_factory``), whose ``tape_e`` slot takes
+    the composite's BF16 map states.  Raises ``_ChainMapFoldUnavailable``,
+    before any module is built, when the module has none.
+    """
+
+    @staticmethod
+    def _build_kda_module(factory, *args, **kwargs):
+        # Fail closed: any other factory (a wrapper included) has no map-fold
+        # build here, and the composite then keeps the map pass.
+        if not _is_fused_m128_row(factory) or (
+            _chain_map_fold_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
+            )
+            is None
+        ):
+            raise _ChainMapFoldUnavailable
+        factory = partial(_chain_map_fold_factory, *factory.args, **factory.keywords)
         return _build_kda_module(factory, *args, **kwargs)
 
 
@@ -3652,9 +4044,7 @@ class _PairMapFoldUnavailable(Exception):
     """The composite's main module has no pair-map fold build on this device."""
 
 
-def _pair_map_fold_program(
-    name, *args, route_heads=None, route_work_bins=False, owner_helper=False, **kwargs
-):
+def _pair_map_fold_program(name, *args, **kwargs):
     """The pair-map fold build of the factory row's main module, or ``None``.
 
     ``None`` when the row has no module on this device, when the head-count
@@ -3662,8 +4052,28 @@ def _pair_map_fold_program(
     for a work-binned or owner/helper build the loader names for the module
     (a fold build has neither), or when the loader names no fold build of the
     module (``_RENDERED_FOLD_ROUTES``).  The routing keywords are not part of
-    the row's key.
+    the row's key (a pooled owner/helper build is an owner/helper build).
     """
+    return _main_fold_program("_RENDERED_FOLD_ROUTES", name, *args, **kwargs)
+
+
+def _main_fold_program(
+    table,
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
+):
+    """The build the loader table ``table`` names for the factory row's module.
+
+    ``None`` under the conditions of ``_pair_map_fold_program``, for the
+    fold table ``table`` (``_RENDERED_FOLD_ROUTES`` or
+    ``_RENDERED_MAP_FOLD_ROUTES``).
+    """
+    del owner_helper_pool
     arch = detect_gpu_arch()
     rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
     module = rows.get(_kda_registry._key(args, kwargs))
@@ -3680,7 +4090,7 @@ def _pair_map_fold_program(
         arch, {}
     ):
         return None
-    return _kda_registry._RENDERED_FOLD_ROUTES.get(arch, {}).get(module)
+    return getattr(_kda_registry, table, {}).get(arch, {}).get(module)
 
 
 def _pair_map_fold_factory(name, *args, **kwargs):
@@ -3694,6 +4104,55 @@ def _pair_map_fold_factory(name, *args, **kwargs):
     program = _pair_map_fold_program(name, *args, **kwargs)
     if program is None:
         raise _PairMapFoldUnavailable
+    return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _chain_map_fold_enabled() -> bool:
+    """Kernel round 8: the chain composite's main body writes the window maps itself.
+
+    Default on where the loader names the main module's map-fold build
+    (``_RENDERED_MAP_FOLD_ROUTES``); ``CAKE_KDA_CHAIN_MAP_FOLD=0`` keeps the
+    map launch (the control for the paired comparison).
+    """
+    import os
+
+    return os.environ.get("CAKE_KDA_CHAIN_MAP_FOLD", "1") != "0"
+
+
+def _chain_map_fold_routed(device) -> bool:
+    """The loader names a chain map-fold build for ``device``."""
+    import torch
+
+    arch = {(10, 0): "sm_100a", (10, 3): "sm_103a"}.get(
+        torch.cuda.get_device_capability(device)
+    )
+    return bool(getattr(_kda_registry, "_RENDERED_MAP_FOLD_ROUTES", {}).get(arch))
+
+
+class _ChainMapFoldUnavailable(Exception):
+    """The chain composite's main module has no map-fold build on this device."""
+
+
+def _chain_map_fold_program(name, *args, **kwargs):
+    """The map-fold build of the factory row's main module, or ``None``.
+
+    ``None`` under the conditions of ``_pair_map_fold_program``, for the
+    loader's ``_RENDERED_MAP_FOLD_ROUTES``.
+    """
+    return _main_fold_program("_RENDERED_MAP_FOLD_ROUTES", name, *args, **kwargs)
+
+
+def _chain_map_fold_factory(name, *args, **kwargs):
+    """The map-fold build of the factory row's main module.
+
+    Same argument plan as the routed program; the build also writes the BF16
+    state of every tail window's map (identity initial state, zero values,
+    the map pass's operation order) through ``tape_e``, window ``p`` at
+    ``[p - 1, head]``.
+    """
+    program = _chain_map_fold_program(name, *args, **kwargs)
+    if program is None:
+        raise _ChainMapFoldUnavailable
     return _kda_registry.PreparedKernel(program, detect_gpu_arch())
 
 
@@ -3748,12 +4207,11 @@ class FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch(
 
     @staticmethod
     def _build_kda_module(factory, *args, **kwargs):
-        if getattr(factory, "func", None) is _factory and factory.args == (
-            "compiled_bf16_fused_m128",
-        ):
-            factory = partial(
-                _correction_merge_factory, *factory.args, **factory.keywords
-            )
+        # Fail closed: any other factory (a wrapper included) has no merging
+        # build here, and the composite then keeps the epilogue.
+        if not _is_fused_m128_row(factory):
+            raise _CorrectionMergeUnavailable
+        factory = partial(_correction_merge_factory, *factory.args, **factory.keywords)
         return _build_kda_module(factory, *args, **kwargs)
 
 
@@ -4254,11 +4712,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             and _affine_pair_map_fold_enabled()
             and _pair_map_fold_routed(q.device)
         )
+        # Kernel round 8: on the chain route the main body also writes the
+        # BF16 window maps of the tail windows (bitwise the map pass's) when
+        # the loader names the main module's map-fold build; the composite
+        # then launches no map pass.
+        self._chain_map_fold = bool(
+            not self._apply_route
+            and not self._use_output_projection
+            and compute_dtype == "bf16"
+            and num_parts > 1
+            and _chain_map_fold_enabled()
+            and _chain_map_fold_routed(q.device)
+        )
         main_launch_cls = (
             FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportFoldLaunch
             if self._pair_map_fold
             else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch
             if self._apply_route
+            else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerMapFoldLaunch
+            if self._chain_map_fold
             else FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
         )
         main_args = (
@@ -4291,9 +4763,34 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         try:
             self._main = main_launch_cls(*main_args, **main_kwargs)
+        except _ChainMapFoldUnavailable:
+            # The main module has no map-fold build: the map pass writes the maps.
+            self._chain_map_fold = False
+            self._main = FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch(
+                *main_args, **main_kwargs
+            )
         except _PairMapFoldUnavailable:
             # The main module has no fold build (the body without checkpoint
             # rows, for one): the pair-map producer writes the maps.
+            self._pair_map_fold = False
+            self._main = (
+                FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
+                    *main_args, **main_kwargs
+                )
+            )
+        # The map pass / pair-map producer is dropped only when the main body is
+        # the fold build the loader names; any other body takes the fallback
+        # above.
+        if self._chain_map_fold and not _built_from_table(
+            self._main, "_RENDERED_MAP_FOLD_ROUTES"
+        ):
+            self._chain_map_fold = False
+            self._main = FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch(
+                *main_args, **main_kwargs
+            )
+        if self._pair_map_fold and not _built_from_table(
+            self._main, "_RENDERED_FOLD_ROUTES"
+        ):
             self._pair_map_fold = False
             self._main = (
                 FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerExportLaunch(
@@ -4306,6 +4803,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             use_state_indices=1,
         )
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
+        if self._chain_map_fold:
+            # The map-fold build writes every tail window's BF16 map state
+            # through the main body's (otherwise unused) training-tape slot,
+            # window p at [p - 1, head]: the scan reads it as the map pass's.
+            self._main.args["tape_e"] = self._map_state.view(-1)
+            self._main.__dict__.pop("_launch_records", None)
+            self.schedule += "_mapfold"
         self._correction = None
         if not self._use_output_projection and not self._apply_route:
             correction_cls: type[FlashKDABlackwellFP32SlabM128PDLConsumerLaunch]
@@ -4351,6 +4855,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     )
                 ),
             )
+            if self._correction_merge and not _built_from_table(
+                self._correction, "_RENDERED_MERGE_ROUTES"
+            ):
+                # Not the merging build: rebuild with the epilogue (``__init__``).
+                raise _CorrectionMergeUnavailable
             if self._correction_merge:
                 # The merging body reads the per-window pool offsets through
                 # ``state_indices_addr``, the main windows' final states through
@@ -4650,6 +5159,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         # kernel it does not depend on.
         self._map_first = (
             not self._apply_route
+            and not self._chain_map_fold
             and self._correction is not None
             and self._map.prepare_module is None
             and getattr(self._map.module, "name", None) in _MAP_FIRST_MODULES
@@ -4837,6 +5347,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ),
                 prefix,
             ]
+        if getattr(self, "_chain_map_fold", False):
+            # The main body wrote the window maps: no map launch.  The map
+            # pass stays constructed for the plan-cache ABI.
+            return []
         return _settled_launch_records(self._map)
 
     def _index_prep_arguments(self) -> tuple:

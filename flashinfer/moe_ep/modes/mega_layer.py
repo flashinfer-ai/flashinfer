@@ -256,9 +256,13 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
-        if live_tokens is not None and not self._kernel.supports_live_token_tuning:
-            raise MoEEpConfigError("This backend does not support live-token tuning")
         automatic = automatic and knobs is None
+        if (
+            live_tokens is not None
+            and not automatic
+            and not self._kernel.supports_live_token_tuning
+        ):
+            raise MoEEpConfigError("This backend does not support live-token tuning")
         if automatic and live_tokens is not None:
             warnings.warn(
                 "live_tokens is ignored for automatic tuning; selection uses "

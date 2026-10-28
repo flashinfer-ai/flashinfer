@@ -131,8 +131,13 @@ into the saved set.
 
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
-`chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  The arena is not
+`chunk_kda_bwd` allocate only their outputs and the saved set when given one.
+Without one, each call allocates its arena when it starts and frees it when it
+returns, so no device memory outlives the call.  The host side of that
+workspace (the plan, which `cake_backend.plan` caches per `(S, num_docs, H,
+sm_count, arch)`, and the layout views) is kept per device, stream and arena
+option, so a repeated problem costs the host about what a caller-owned
+workspace costs.  The arena is not
 initialized: every element a launch reads is written earlier in the same
 call, so the content at allocation never reaches a result (`zero_init=True`
 zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
@@ -199,13 +204,13 @@ heads) with `ValueError` when a backward workspace is built and in the byte
 queries; it serves the contract's head counts 1, 2, 4, 8, 16, 32 and 64.
 
 `tail_passes = B` runs the chunk-parallel tail stages of the backward (the
-fused gradient `dqkg`, the GLM intra program and, on `sm_100a` / `sm_107a`,
+fused gradient `dqkg`, the GLM intra program and, on `sm_100a`,
 the gate epilogue `gate_epilogue`: the last launch steps of the backward's
 lifetime tables) once per range of `ceil(NC_pad / B)` chunks.  Each pass takes views of the
 whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
 tapes) offset to the range's first chunk, the range's slices of the chunk
 tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
-`dAqk` and, on `sm_100a` / `sm_107a`, the gate epilogue's `dg_int`, `db_int`), which are
+`dAqk` and, on `sm_100a`, the gate epilogue's `dg_int`, `db_int`), which are
 sized for one range; the token tensors
 (`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
 whole, every kernel reaching them through the absolute `chunk_bos` offsets.
@@ -230,14 +235,14 @@ shared with the state blocks.  Two passes give
 `slack` is the ceil slack of the last range (the per-pass buffers are sized
 for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
 `tail_passes` divides `NC_pad`); passes above four buy nothing more.  On
-`sm_103a`, where the GLM intra program hosts the gate epilogue, its inputs
+`sm_103a` / `sm_107a`, where the GLM intra program hosts the gate epilogue, its inputs
 `dg_int` (512 B) and `db_int` (4 B) leave the lean layouts: one
 pass gives 4104 (tape 3336), the per-pass set is 2052 and two passes give
 `2820 * R * H + max(3 * block, 258 * R * H)` (3078; tape 2310); the default
 layouts are unchanged (the two buffers share slots there).  Against the
 default's 4488 the light constants are about 8 % (one pass), 26 % (two
-passes; 31 % on `sm_103a`) and 37 % (four or more) smaller.  The table
-gives the constants (`sm_100a` / `sm_107a`; `sm_103a` where they differ);
+passes; 31 % on `sm_103a` / `sm_107a`) and 37 % (four or more) smaller.  The table
+gives the constants (`sm_100a`; `sm_103a` / `sm_107a` where they differ);
 the state blocks and the slack come on top where the formulas say so:
 
 | arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
@@ -466,10 +471,12 @@ build `dhu_v3r_f` (their `_wt` forms behind `fwdh_p3_wy`, their `_replay`
 forms on the replay)); `dqkg` (fused dq / dk / dg / dbeta partials and
 `dA_kk`; `_davq` forms host `dA_qk`; `_int` forms read the internal rows on
 the replay; persistent grid of `min(NC_pad * H, sm_count)` CTAs);
-then the GLM intra program: `glm_intra_v14` on `sm_103a` (the intra-chunk
-terms, the GLM gate chain and the gate epilogue's token-row `dg` / `dbeta` in
-one launch: no `gate_epilogue` stage there) or `glm_intra` and `gate_epilogue`
-(the token-row `dg` and `dbeta`) on `sm_100a` / `sm_107a`.
+then the GLM intra program: `glm_intra_v14` on `sm_103a` and `glm_intra_v18`
+on `sm_107a` (the intra-chunk terms, the GLM gate chain and the gate epilogue's
+token-row `dg` / `dbeta` in one launch: no `gate_epilogue` stage there;
+`glm_intra_v18` is the same program with every named-barrier slot an
+immediate, so two of its CTAs share an SM on `sm_107a`) or `glm_intra` and
+`gate_epilogue` (the token-row `dg` and `dbeta`) on `sm_100a`.
 
 Launches per call (148 SMs; the table programs of a saved-set path count only
 when the set carries no tables), on `sm_100a`:
@@ -497,16 +504,18 @@ launches as on `sm_100a`: 1 document, 16 heads (segmented, `P = 9`) 5 / 11 /
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
 `segment_plan` / `segment_args`; `cake_backend.plan(S, num_docs, H, sm_count,
-arch)` resolves them once per problem into `Plan.records[path][stage]`, and
+arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
+on its arguments; `arch=None` takes the current CUDA device's architecture, or
+the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
 backward from the plan's own light saved set).
 
 ### Programs by stage
 
-66 records naming 64 programs from 38 kernels (`fwdh_v3` and `fwdh_p3` are
+67 records naming 65 programs from 39 kernels (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `bwd_prep_g8_noqg` and
-`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel; three records
-ship on some of the architectures only: `glm_intra_v14`, `glm_intra` and
+`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel; four records
+ship on some of the architectures only: `glm_intra_v14`, `glm_intra_v18`, `glm_intra` and
 `gate_epilogue`; `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
@@ -530,8 +539,8 @@ those rows; "64-column form" `num_docs * H * 4 > 4 * sm_count`,
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
 | `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
-| `glm_intra` | `glm_intra_v14`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` (the gate epilogue fused: it writes the token-row `dg` / `dbeta` itself), `glm_intra` on `sm_100a` / `sm_107a` |
-| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` / `sm_107a` (the GLM intra program of `sm_103a` hosts it) |
+| `glm_intra` | `glm_intra_v14`, `glm_intra_v18`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` and `glm_intra_v18` on `sm_107a` (the gate epilogue fused: they write the token-row `dg` / `dbeta` themselves; `glm_intra_v18` names every named-barrier slot with an immediate, so two CTAs share an SM on `sm_107a`), `glm_intra` on `sm_100a` |
+| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` (the GLM intra programs of `sm_103a` / `sm_107a` host it) |
 
 ## Context-parallel training (KCP)
 
@@ -609,6 +618,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
 
+Workspace of a rank (`KcpWorkspace`, caller-held, reused across calls and
+layers): the local arena of the token-side stages plus the boundary pools.
+The backward's b1 / b2 send pools reuse the storage of the forward's c1 / c2
+send pools (a call waits its sends before a backward writes either), and the
+ring exchange's hop pools are allocated by the first `exchange="ring"` call.
+`kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
+(`KcpWorkspace.bytes` after its first backward); the saved set and the
+convolution's halo rows are per-call tensors outside it.
+
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`
@@ -653,6 +671,16 @@ exchange -- the default with the all-to-all exchange (an earlier revision).
 receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
+`spec3_probe` sets the debug probe of the backend's first saved-mode backward,
+which compares the backward's prep and WY rows with the forward's: `"record"`
+(the default) stores the comparison in `LAST_CALL["bwd"]["spec3"]`, `"warn"`
+warns on a difference, `"assert"` raises `KcpPreconditionError`, `"off"` skips
+it for that call.  The backward reads the value of its own call (pass it to
+`chunk_kda_kcp_bwd`; the forward's is not kept in `KcpSaved`).  Pass the
+same value on every rank: the probe is a rank-local check, so `"assert"`
+serves single-process debugging.  Under `graph="replay"` the probing
+backward runs eagerly; a rank without tokens does not hold back its capture.
+No environment variable selects it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
@@ -715,9 +743,9 @@ The KCP kernels live beside the single-rank programs:
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (the 64 programs on the
+  `cake-build/1`): one entry per `<library>_<arch>` (the 65 programs on the
   architectures each ships on: 61 on all three, `glm_intra_v14` on `sm_103a`,
-  `glm_intra` and `gate_epilogue` on `sm_100a` / `sm_107a`) with its two translation units, digests, nvcc flags
+  `glm_intra_v18` on `sm_107a`, `glm_intra` and `gate_epilogue` on `sm_100a`) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
   it and otherwise JIT-builds the entry through FlashInfer (`gen_jit_spec`,
@@ -729,14 +757,14 @@ The KCP kernels live beside the single-rank programs:
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 64 programs, shared by the
+  and binding translation units of the 65 programs, shared by the
   architectures a program ships on (per-architecture lines under `#if
   __CUDA_ARCH__`) and compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 66 records (64 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 67 records (65 programs) for `sm_100a`, `sm_103a` and
 `sm_107a` (three of them on a subset of the architectures: see the programs by
 stage), exported from the kernel snapshot named in the pull request.
 

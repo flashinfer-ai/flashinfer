@@ -33,8 +33,13 @@ k L2 normalization, ``g = None`` / ``beta = None`` from a zero state (and the
 refusal of those calls with an initial state or a pool, which no exported SM90
 program serves), FP16 I/O, caller-provided output and state buffers, the scale
 values, the 18 prefill performance rows, empty batches, sequence independence,
-bitwise reproducibility, the launch count and one launch of every exported
-prefill program.
+bitwise reproducibility, the body route of record (the V6 fork-order body for
+short sequences and for calls without a state, the merged body's unit and
+gate-saturation split programs for unit calls and long sequences; a mixed-class
+batch run as one launch per body over its own sequences, checked against the
+sequences alone), the launch count and one launch of every exported prefill
+program.  ``test_cake_gdp_prefill_route.py`` covers the route arithmetic and
+the registry without a GPU.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
@@ -81,33 +86,37 @@ UNUSED_SLOTS = 2  # pool rows no sequence names, which must come back bitwise
 SENTINEL = 7.5
 L2NORM_EPS = 1e-6
 # The flag sets the SM90 prefill route carries (use_initial_state, use_state_indices, store_final_state,
-# unit_gates, unit_beta): the gate-tensor programs and the unit programs from a zero state.
-ROUTED_FLAGS = {
+# unit_gates, unit_beta), per kernel body.  The V6 fork-order body (``prefill_sm90_v6``): the three gate-tensor
+# programs, every one storing a final state (a call keeping none gets a discard record); the body route of record
+# sends it every sequence under ``ROUTE_MIN_CHUNKS_P3`` chunks and every call without an initial and a final state.
+V6_FLAGS = {
     (False, False, True, False, False),
     (True, False, True, False, False),
     (True, True, True, False, False),
-    (False, False, False, False, False),
-    (
-        False,
-        False,
-        True,
-        True,
-        False,
-    ),  # g=None: the unit-gate program starts from zeros and stores the final state
-    (False, False, True, False, True),  # beta=None: the unit-beta program
 }
-# The gate-saturation split programs (``split_items``): the three gated flag sets that store a final state, reached
-# when the split rule of record over the host copy of ``cu_seqlens`` (``cu_seqlens_cpu``, else ``cu_seqlens.cpu()``)
-# cuts a long sequence into items.
+# The merged body (``prefill_sm90``): the unit programs from a zero state (g=None: the unit-gate program, which
+# stores the final state; beta=None: the unit-beta program) ...
+UNIT_FLAGS = {
+    (False, False, True, True, False),
+    (False, False, True, False, True),
+}
+# ... and the gate-saturation split programs (``split_items``) of the three gated flag sets, which run the
+# merged-class sequences (at least ``ROUTE_MIN_CHUNKS_P3`` chunks and the split items cheaper than the V6 steps;
+# the split rule of record over the host copy of ``cu_seqlens`` -- ``cu_seqlens_cpu``, else ``cu_seqlens.cpu()`` --
+# always cuts such a sequence).  The merged body routes no exact gate-tensor program any more.
 SPLIT_FLAGS = {
     (False, False, True, False, False),
     (True, False, True, False, False),
     (True, True, True, False, False),
 }
-SPLIT_LENS = (
-    4097,
-    1000,
-)  # a batch the rule cuts on every exported device (items > N x H)
+# The exact programs of the route: every routed program but the split ones.
+ROUTED_FLAGS = V6_FLAGS | UNIT_FLAGS
+# A batch of two 384-chunk sequences at n = 3, merged-class at the head counts the tests pass it (3 and 10; every
+# test asserts the class through the route), and the mixed-class batch of record: at H = 10 its long sequences are
+# merged-class and the short and the empty one V6-class (``[P3, V6, V6, P3]``).
+MERGED_LENS = (8192, 8192)
+MIXED_LENS = (8192, 1000, 0, 8192)
+MIXED_H = 10
 
 
 def _device() -> torch.device:
@@ -477,6 +486,23 @@ def _run_and_check(c: Case) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     return out, state
 
 
+def _classes(c: Case) -> list[str]:
+    """The body of every sequence of ``c`` under the route of record on this device, with the flags the backend
+    derives from the call: a program stores a final state when the call keeps one, reads an initial state (a pool
+    case carries its initial pool) or runs a unit program."""
+    stores = c.final or c.initial != "none" or c.unit_g or c.unit_beta
+    return loader.prefill_body_classes(
+        (0, *itertools.accumulate(c.lens)),
+        c.n,
+        c.H,
+        loader.sm_count(0),
+        store_final_state=stores,
+        unit_gates=c.unit_g,
+        unit_beta=c.unit_beta,
+        total_tokens=c.T,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Correctness matrix
 # ---------------------------------------------------------------------------
@@ -530,6 +556,25 @@ def test_write_only_pool_begins_at_zeros() -> None:
     _check(c, out, state)
 
 
+def test_write_only_pool_begins_at_zeros_on_the_split_route() -> None:
+    """A single H = 10, L = 8192, n = 3 sequence is a merged-class row (384 chunks, the split program with p > 1
+    on 132 SMs): with ``state_indices``, an output pool and no ``initial_state`` the route must still send it to
+    the merged body (a V6-routed run fails here), the sequence begins at zeros, its final state lands in the named
+    slot and the other pool rows keep their pre-launch values."""
+    c = _make(Case(lens=(8192,), H=10, n=3, initial="pool_disjoint", seed=11))
+    c.initial_state, c.initial_before = None, None
+    c.output_state.fill_(SENTINEL)
+    c.output_state_before = c.output_state.clone()
+    sm_count = loader.sm_count(0)
+    classes = loader.prefill_body_classes(c.cu_host, c.n, c.H, sm_count)
+    assert classes == [loader.ROUTE_BODY_P3], classes
+    (chunks,) = loader.route_chunk_steps(c.cu_host, c.n)
+    p, _span = loader.split_count(chunks, c.H, c.n, sm_count)
+    assert chunks == 384 and p > 1, (chunks, p, sm_count)
+    out, state = _run(c)
+    _check(c, out, state)
+
+
 @pytest.mark.parametrize("final", (True, False))
 def test_invalid_pool_slots(final: bool) -> None:
     """A negative or out-of-range slot: the sequence begins at zeros, its output rows are written, nothing is
@@ -561,6 +606,10 @@ def test_int64_metadata() -> None:
         Case(
             lens=(129, 64), H=2, n=1, initial="given", index_dtype=torch.int64, seed=10
         )
+    )
+    # The plain fork-order program reads int32 metadata only: the backend casts the int64 cu_seqlens for it.
+    _run_and_check(
+        Case(lens=(129, 1000, 0, 65), H=3, n=3, index_dtype=torch.int64, seed=12)
     )
 
 
@@ -805,6 +854,108 @@ def test_sequences_are_independent() -> None:
         assert torch.equal(alone[1][0], state[seq]), seq
 
 
+@pytest.mark.parametrize("initial", ("none", "given", "pool_disjoint", "pool_same"))
+@pytest.mark.parametrize("final", (True, False))
+def test_mixed_class_batch_matches_the_sequences_alone(
+    initial: str, final: bool
+) -> None:
+    """The mixed-class batch of record (two merged-class long sequences around a short and an empty V6-class
+    one), served by one launch per body over per-class gathered tokens, satisfies the FP64 reference, and every
+    sequence gives the same bits as alone (its output rows, its final state slot) while the pool rows of the other
+    sequences stay untouched; each class alone (its sequences as one batch) gives the same bits too.  The plain
+    call keeping no state is uniform V6-class by the route and runs the same comparison."""
+    c = Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial=initial, final=final, seed=30)
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
+    if final or initial != "none":
+        assert _classes(c) == [P3, V6, V6, P3]
+    else:
+        assert _classes(c) == [V6] * c.N
+    out, state = _run_and_check(c)
+    device = _device()
+    # Every sequence alone, then every class alone (the sequences of one body as one batch: what the backend launches
+    # for the mixed batch): the same bits in both partitions.
+    by_body: dict[str, list[int]] = {}
+    for seq, body in enumerate(_classes(c)):
+        by_body.setdefault(body, []).append(seq)
+    groups = [[seq] for seq in range(c.N)] + [
+        seqs for seqs in by_body.values() if len(seqs) > 1
+    ]
+    for group in groups:
+        rows = torch.cat(
+            [torch.arange(c.offsets[seq], c.offsets[seq + 1]) for seq in group]
+        ).to(device)
+        rows_n = (rows[:, None] * c.n + torch.arange(c.n, device=device)).reshape(-1)
+        lens = [c.offsets[seq + 1] - c.offsets[seq] for seq in group]
+        group_t = torch.tensor(group, device=device)
+        kwargs = dict(
+            num_householder=c.n,
+            output_final_state=c.final,
+            cu_seqlens=torch.tensor([0, *lens])
+            .cumsum(0)
+            .to(device=device, dtype=torch.int32),
+        )
+        pool = None
+        if c.pool:
+            # The alone call reads the pool values the batch read and writes a fresh copy of the output pool.
+            before = (
+                c.initial_before if c.initial == "pool_same" else c.output_state_before
+            )
+            pool = before.clone()
+            kwargs.update(
+                initial_state=pool if c.initial == "pool_same" else c.initial_before,
+                state_indices=c.state_indices.index_select(0, group_t),
+            )
+            if c.final:
+                kwargs["output_state"] = pool
+        elif c.initial == "given":
+            kwargs["initial_state"] = c.initial_before.index_select(
+                0, group_t
+            ).contiguous()
+        alone = cake_chunk_gated_delta_product(
+            c.q.index_select(0, rows),
+            c.k.index_select(0, rows_n),
+            c.v.index_select(0, rows_n),
+            c.g.index_select(0, rows),
+            c.beta.index_select(0, rows_n),
+            **kwargs,
+        )
+        out_alone = alone[0] if c.final else alone
+        assert torch.equal(out_alone, out.index_select(0, rows)), group
+        if not c.final:
+            continue
+        if c.pool:
+            assert alone[1] is pool
+            written = {c.slots[seq] for seq in group}
+            for row in range(c.pool_rows):
+                expected = state[row] if row in written else before[row]
+                assert torch.equal(pool[row], expected), (group, row)
+        else:
+            for i, seq in enumerate(group):
+                assert torch.equal(alone[1][i], state[seq]), (group, seq)
+
+
+@pytest.mark.parametrize("initial", ["given", "pool_disjoint"])
+def test_mixed_batch_whose_v6_class_is_only_empty_sequences(initial: str) -> None:
+    """Two merged-class long sequences around two empty ones: the V6 class has no token, so the backend launches it on
+    the one-row placeholders with ``total_tokens`` 0 (``_run_two_classes``); the empty sequences' final states are the
+    bitwise copies of their initial states (zeros from a zero record), the long sequences match the FP64 reference and
+    their output rows are the whole output."""
+    c = Case(
+        lens=(8192, 0, 0, 8192), H=MIXED_H, n=3, initial=initial, final=True, seed=31
+    )
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
+    assert _classes(c) == [P3, V6, V6, P3]
+    out, state = _run_and_check(c)
+    assert out.shape[0] == c.offsets[-1]
+    for seq in (1, 2):
+        if c.pool:
+            row = c.slots[seq]
+            before = c.initial_before if c.initial == "pool_same" else c.initial_before
+            assert torch.equal(state[row], before[row]), (seq, row)
+        else:
+            assert torch.equal(state[seq], c.initial_before[seq]), seq
+
+
 def _count_device_events(call) -> list[str]:
     from torch.profiler import ProfilerActivity, profile
 
@@ -825,21 +976,12 @@ def _count_device_events(call) -> list[str]:
 
 def test_single_launch() -> None:
     """BF16 normalized inputs, FP32 gates, an initial state and a kept final state, the host copy of ``cu_seqlens``
-    given and a batch the split rule leaves whole: the call launches the kernel alone (no fill, cast, copy or plan
-    kernel).  Without the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A batch the rule
-    cuts adds the item table upload and the workspace zero before its one kernel."""
-    sm_count = loader.sm_count(0)
+    given and a uniform V6-class batch: the call launches the kernel alone (no fill, cast, copy or plan kernel).
+    Without the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A uniform merged-class
+    batch adds the item table upload and the workspace zero before its one kernel.  The mixed-class batch of
+    record launches exactly two Cake kernels (the gather / scatter copies beside them)."""
     c = _make(Case(lens=(400,) * 8, H=24, n=3, initial="given", cu_cpu=True, seed=26))
-    assert (
-        loader.prefill_split_table(
-            c.offsets,
-            num_heads=24,
-            num_householder=3,
-            sm_count=sm_count,
-            total_tokens=c.T,
-        )
-        is None
-    )
+    assert _classes(c) == [loader.ROUTE_BODY_V6] * c.N
     _check(c, *_run(c))  # warm-up
     names = _count_device_events(lambda: _run(c))
     assert len(names) == 1 and "cake_gdp" in names[0], names
@@ -847,23 +989,21 @@ def test_single_launch() -> None:
     names_sync = _count_device_events(lambda: _run(c))
     assert [name for name in names_sync if "cake_gdp" in name] == names, names_sync
     assert sum("Memcpy" in name for name in names_sync) == 1, names_sync
-    s = _make(Case(lens=(1024,) * 4, H=24, n=3, initial="given", cu_cpu=True, seed=26))
-    assert (
-        loader.prefill_split_table(
-            s.offsets,
-            num_heads=24,
-            num_householder=3,
-            sm_count=sm_count,
-            total_tokens=s.T,
-        )
-        is not None
-    )
+    s = _make(Case(lens=MERGED_LENS, H=10, n=3, initial="given", cu_cpu=True, seed=26))
+    assert _classes(s) == [loader.ROUTE_BODY_P3] * s.N
     _check(s, *_run(s))  # warm-up
     names_split = _count_device_events(lambda: _run(s))
     kernels = [name for name in names_split if "cake_gdp" in name]
     assert (
         len(kernels) == 1 and names_split[-1] == kernels[0] and len(names_split) <= 3
     ), names_split
+    m = _make(
+        Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=26)
+    )
+    assert set(_classes(m)) == set(loader.ROUTE_BODIES)
+    _check(m, *_run(m))  # warm-up
+    names_mixed = _count_device_events(lambda: _run(m))
+    assert sum("cake_gdp" in name for name in names_mixed) == 2, names_mixed
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +1012,11 @@ def test_single_launch() -> None:
 
 
 def test_every_prefill_program_is_launched(monkeypatch) -> None:
+    """One call reaches every program of the ``prefill`` route: the three V6 programs through short batches with
+    no / a given / a pooled initial state (a short batch keeping no final state runs the V6 plain program again,
+    its final state discarded), the two unit programs, and the three split programs through merged-class long
+    batches with the host copy of ``cu_seqlens``; every uniform batch is one launch whose record names the body
+    the route classed it into."""
     arch = _arch()
     launched: list[str] = []
     original = loader.run_module
@@ -881,28 +1026,54 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
         return original(name, values, **kwargs)
 
     monkeypatch.setattr(loader, "run_module", recording)
-    for c in (
-        Case(lens=(129, 65), H=3, n=3, initial="none", final=True),
-        Case(lens=(129, 65), H=3, n=3, initial="given", final=True),
-        Case(lens=(129, 65), H=3, n=3, initial="pool_disjoint", final=True),
-        Case(lens=(129, 65), H=3, n=3, initial="none", final=False),
-        Case(lens=(129, 65), H=3, n=3, initial="none", final=True, unit_g=True),
-        Case(lens=(129, 65), H=3, n=3, initial="none", final=True, unit_beta=True),
-        # the split programs: the host copy of cu_seqlens and a batch the split rule cuts
-        Case(lens=SPLIT_LENS, H=3, n=3, initial="none", final=True, cu_cpu=True),
-        Case(lens=SPLIT_LENS, H=3, n=3, initial="given", final=True, cu_cpu=True),
-        Case(
-            lens=SPLIT_LENS, H=3, n=3, initial="pool_disjoint", final=True, cu_cpu=True
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
+    for c, body in (
+        (Case(lens=(129, 65), H=3, n=3, initial="none", final=True), V6),
+        (Case(lens=(129, 65), H=3, n=3, initial="given", final=True), V6),
+        (Case(lens=(129, 65), H=3, n=3, initial="pool_disjoint", final=True), V6),
+        (Case(lens=(129, 65), H=3, n=3, initial="none", final=False), V6),
+        (
+            Case(lens=(129, 65), H=3, n=3, initial="none", final=True, unit_g=True),
+            P3,
+        ),
+        (
+            Case(lens=(129, 65), H=3, n=3, initial="none", final=True, unit_beta=True),
+            P3,
+        ),
+        # the split programs: the host copy of cu_seqlens and a merged-class batch
+        (
+            Case(lens=MERGED_LENS, H=3, n=3, initial="none", final=True, cu_cpu=True),
+            P3,
+        ),
+        (
+            Case(lens=MERGED_LENS, H=3, n=3, initial="given", final=True, cu_cpu=True),
+            P3,
+        ),
+        (
+            Case(
+                lens=MERGED_LENS,
+                H=3,
+                n=3,
+                initial="pool_disjoint",
+                final=True,
+                cu_cpu=True,
+            ),
+            P3,
         ),
     ):
         c.seed = 28
+        assert _classes(c) == [body] * c.N, (c.lens, c.initial, c.final)
+        before = len(launched)
         _run_and_check(c)
+        assert len(launched) == before + 1, launched  # a uniform batch is one launch
+        assert loader.MODULES[launched[-1]]["body"] == body, (c.lens, launched[-1])
     prefill = {
         name
         for name, record in loader.MODULES.items()
         if record["role"] == "prefill" and arch in record["arches"]
     }
     assert set(launched) == prefill, (sorted(set(launched)), sorted(prefill))
+    assert len(prefill) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS)
     split = [
         name
         for name in launched
@@ -914,12 +1085,14 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
 
 
 def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
-    """The split rule of record over the host copy of ``cu_seqlens`` selects a split program exactly when
-    ``prefill_split_table`` cuts (a long batch), with the rule's item table as ``output_slot_indices`` and the items
-    as the tiles; a short batch runs the exact program with the same inputs; a call without ``cu_seqlens_cpu``
-    synchronizes the copy and selects the same program with the same bits; a long batch whose flags have no split
-    program (a unit program, the plain call without a final state) runs its exact program; the results agree with
-    the FP64 reference either way; ``cu_seqlens_cpu`` is checked for device, rank, length and dtype."""
+    """The per-class launch law over the host copy of ``cu_seqlens``: a merged-class long batch runs the split
+    program of its flags with the rule's item table as ``output_slot_indices`` and the items as the tiles; a
+    V6-class short batch runs the V6 program of its flags over ``N x H`` tiles without a table; a call without
+    ``cu_seqlens_cpu`` synchronizes the copy and selects the same program with the same bits; an int64 host copy
+    is accepted; a unit long batch runs its exact unit program and a long batch keeping no state the V6 plain
+    program, both over ``N x H`` tiles; the mixed-class batch of record is two recorded launches in plan order
+    (the merged body, then the V6 body) over its classes' own sequences, satisfying the FP64 reference;
+    ``cu_seqlens_cpu`` is checked for device, rank, length and dtype."""
     seen: list[tuple[str, dict]] = []
     original = loader.run_module
 
@@ -931,17 +1104,27 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
                     "tiles": kwargs.get("tiles"),
                     "slots": values["output_slot_indices"].numel(),
                     "ws": values["ainv_workspace"].numel(),
+                    "num_seqs": values["num_seqs"],
                 },
             )
         )
         return original(name, values, **kwargs)
 
     monkeypatch.setattr(loader, "run_module", recording)
+    arch = _arch()
     sm_count = loader.sm_count(0)
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     for initial in ("none", "given"):
         long = Case(
-            lens=SPLIT_LENS, H=3, n=3, initial=initial, final=True, cu_cpu=True, seed=29
+            lens=MERGED_LENS,
+            H=3,
+            n=3,
+            initial=initial,
+            final=True,
+            cu_cpu=True,
+            seed=29,
         )
+        assert _classes(long) == [P3] * long.N
         out, state = _run_and_check(long)
         table = loader.prefill_split_table(
             long.offsets,
@@ -952,11 +1135,19 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         )
         assert table is not None and len(table) > long.N * 3
         name, launch = seen[-1]
-        assert loader.MODULES[name]["build"][loader.PREFILL_SPLIT_FLAG] is True
+        assert name == loader.selected_prefill_module(
+            arch,
+            body=P3,
+            use_initial_state=initial == "given",
+            use_state_indices=False,
+            store_final_state=True,
+            split_items=True,
+        )
         assert launch == {
             "tiles": len(table),
             "slots": 4 * len(table),
             "ws": 4 * (long.N * 3 + 2 * len(table)),
+            "num_seqs": long.N,
         }
         long.cu_cpu = (
             False  # the backend reads cu_seqlens.cpu(): the same program, the same bits
@@ -980,45 +1171,108 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         short = Case(
             lens=(129, 65), H=3, n=3, initial=initial, final=True, cu_cpu=True, seed=29
         )
+        assert _classes(short) == [V6] * short.N
         _run_and_check(short)
-        assert (
-            loader.prefill_split_table(
-                short.offsets,
-                num_heads=3,
-                num_householder=3,
-                sm_count=sm_count,
-                total_tokens=short.T,
-            )
-            is None
-        )
         name, launch = seen[-1]
-        assert (
-            not loader.MODULES[name]["build"].get(loader.PREFILL_SPLIT_FLAG)
-            and launch["tiles"] == short.N * 3
+        assert name == loader.selected_prefill_module(
+            arch,
+            body=V6,
+            use_initial_state=initial == "given",
+            use_state_indices=False,
+            store_final_state=True,
         )
-    # unit programs and the plain no-final program have no split: the exact program runs the long batch
-    _run_and_check(
-        Case(
-            lens=SPLIT_LENS,
-            H=3,
-            n=3,
-            initial="none",
-            final=True,
-            unit_g=True,
-            cu_cpu=True,
-            seed=29,
-        )
+        # no item table: formal 9 takes the one-element slot placeholder, the workspace its 16-byte placeholder
+        assert launch == {
+            "tiles": short.N * 3,
+            "slots": 1,
+            "ws": 16,
+            "num_seqs": short.N,
+        }
+    # a unit long batch is merged-class at every length: its exact unit program over N x H tiles
+    unit = Case(
+        lens=MERGED_LENS,
+        H=3,
+        n=3,
+        initial="none",
+        final=True,
+        unit_g=True,
+        cu_cpu=True,
+        seed=29,
     )
-    assert (
-        not loader.MODULES[seen[-1][0]]["build"].get(loader.PREFILL_SPLIT_FLAG)
-        and seen[-1][1]["tiles"] == 2 * 3
+    assert _classes(unit) == [P3] * unit.N
+    _run_and_check(unit)
+    assert seen[-1][0] == loader.selected_prefill_module(
+        arch,
+        body=P3,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
     )
-    _run_and_check(
-        Case(lens=SPLIT_LENS, H=3, n=3, initial="none", final=False, seed=29)
+    assert seen[-1][1]["tiles"] == unit.N * 3 and seen[-1][1]["slots"] == 1
+    # a long batch keeping no state is V6-class at every length: the V6 plain program over N x H tiles
+    plain = Case(lens=MERGED_LENS, H=3, n=3, initial="none", final=False, seed=29)
+    assert _classes(plain) == [V6] * plain.N
+    _run_and_check(plain)
+    assert seen[-1][0] == loader.selected_prefill_module(
+        arch,
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
     )
-    assert (
-        not loader.MODULES[seen[-1][0]]["build"].get(loader.PREFILL_SPLIT_FLAG)
-        and seen[-1][1]["tiles"] == 2 * 3
+    assert seen[-1][1]["tiles"] == plain.N * 3 and seen[-1][1]["slots"] == 1
+    # the mixed-class batch of record: two launches in plan order, each over its class's sequences alone
+    mixed = Case(
+        lens=MIXED_LENS,
+        H=MIXED_H,
+        n=3,
+        initial="given",
+        final=True,
+        cu_cpu=True,
+        seed=29,
+    )
+    classes = _classes(mixed)
+    assert classes == [P3, V6, V6, P3]
+    assert loader.prefill_launch_plan(classes) == [(P3, [0, 3]), (V6, [1, 2])]
+    before = len(seen)
+    _run_and_check(mixed)
+    launches = seen[before:]
+    assert [loader.MODULES[name]["body"] for name, _ in launches] == [P3, V6]
+    merged_offsets = (0, MIXED_LENS[0], MIXED_LENS[0] + MIXED_LENS[3])
+    table = loader.prefill_split_table(
+        merged_offsets,
+        num_heads=MIXED_H,
+        num_householder=3,
+        sm_count=sm_count,
+        total_tokens=merged_offsets[-1],
+    )
+    assert table is not None and len(table) > 2 * MIXED_H
+    assert launches[0] == (
+        loader.selected_prefill_module(
+            arch,
+            body=P3,
+            use_initial_state=True,
+            use_state_indices=True,
+            store_final_state=True,
+            split_items=True,
+        ),
+        {
+            "tiles": len(table),
+            "slots": 4 * len(table),
+            "ws": 4 * (2 * MIXED_H + 2 * len(table)),
+            "num_seqs": 2,
+        },
+    )
+    assert launches[1] == (
+        loader.selected_prefill_module(
+            arch,
+            body=V6,
+            use_initial_state=True,
+            use_state_indices=True,
+            store_final_state=True,
+        ),
+        {"tiles": 2 * MIXED_H, "slots": 2, "ws": 16, "num_seqs": 2},
     )
     c = _make(Case(lens=(129, 65), H=3, n=3, seed=29))
 
@@ -1050,20 +1304,28 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
 
 
 def test_route_tables_are_consistent() -> None:
+    """The ``prefill`` route of the device: the three V6 records (every one storing a final state, no unit
+    program, no segment pass), the two unit records and the three split records of the merged body, in that
+    order; ``selected_prefill_module`` resolves every flag set of each body and refuses the removed merged exact
+    programs, a V6 unit program, a V6 program without a final state, an unknown further flag and both unit
+    flags; the grid rule, the route predicate and the logical names."""
     arch = _arch()
     routes = loader.ROUTES[arch]
     assert [key for key in routes if key.startswith("prefill")] == [
         loader.PREFILL_ROUTE
     ]  # no segmented path on SM90
     single = routes[loader.PREFILL_ROUTE]
-    assert len(single) == len(ROUTED_FLAGS) + len(SPLIT_FLAGS)
-    flags = set()
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
+    assert loader.ROUTE_BODIES == (P3, V6)
+    assert len(single) == len(V6_FLAGS) + len(UNIT_FLAGS) + len(SPLIT_FLAGS)
+    v6_flags = set()
+    unit_flags = set()
     split_flags = set()
     for name in single:
         record = loader.MODULES[name]
         assert (
             record["role"] == "prefill"
-            and record["body"] == "prefill_sm90"
+            and record["body"] in loader.ROUTE_BODIES
             and record["arches"] == [arch]
         )
         assert record["grid_rule"] == {"kind": "tiles"}
@@ -1083,106 +1345,183 @@ def test_route_tables_are_consistent() -> None:
             rule["unit_gates"],
             rule["unit_beta"],
         )
-        if record["build"].get(loader.PREFILL_SPLIT_FLAG):
-            # a split program spells the flag in its rule; the exact programs spell no split_items at all
+        if record["body"] == V6:
+            # a V6 record spells exactly the six flags: the final state stored, no unit program, no split items
+            assert set(rule) == {"kind", *loader.PREFILL_FLAGS}
+            assert (
+                rule["store_final_state"]
+                and not rule["unit_gates"]
+                and not rule["unit_beta"]
+            )
+            assert not record["build"].get(loader.PREFILL_SPLIT_FLAG)
+            assert record["launch"]["block"] == (384, 1, 1)
+            v6_flags.add(five)
+        elif record["build"].get(loader.PREFILL_SPLIT_FLAG):
+            # a split program spells the flag in its rule
             assert (
                 set(rule) == {"kind", loader.PREFILL_SPLIT_FLAG, *loader.PREFILL_FLAGS}
                 and rule[loader.PREFILL_SPLIT_FLAG] is True
             )
             split_flags.add(five)
         else:
+            # the exact programs of the merged body are the unit programs alone
             assert set(rule) == {"kind", *loader.PREFILL_FLAGS}
-            flags.add(five)
-    assert flags == ROUTED_FLAGS and split_flags == SPLIT_FLAGS
+            assert rule["unit_gates"] or rule["unit_beta"]
+            unit_flags.add(five)
+    assert v6_flags == V6_FLAGS and unit_flags == UNIT_FLAGS
+    assert split_flags == SPLIT_FLAGS
     assert [
-        loader.MODULES[name]["build"].get(loader.PREFILL_SPLIT_FLAG, False)
+        (
+            loader.MODULES[name]["body"],
+            loader.MODULES[name]["build"].get(loader.PREFILL_SPLIT_FLAG, False),
+        )
         for name in single
-    ] == [False] * len(ROUTED_FLAGS) + [True] * len(SPLIT_FLAGS)
-    for use_initial, use_indices, store, unit_g, unit_beta in split_flags:
-        name = loader.selected_prefill_module(
-            arch,
+    ] == [(V6, False)] * len(V6_FLAGS) + [(P3, False)] * len(UNIT_FLAGS) + [
+        (P3, True)
+    ] * len(SPLIT_FLAGS)
+    for body, table, extra in (
+        (V6, V6_FLAGS, {}),
+        (P3, UNIT_FLAGS, {}),
+        (P3, SPLIT_FLAGS, {loader.PREFILL_SPLIT_FLAG: True}),
+    ):
+        for use_initial, use_indices, store, unit_g, unit_beta in table:
+            name = loader.selected_prefill_module(
+                arch,
+                body=body,
+                use_initial_state=use_initial,
+                use_state_indices=use_indices,
+                store_final_state=store,
+                unit_gates=unit_g,
+                unit_beta=unit_beta,
+                **extra,
+            )
+            record = loader.MODULES[name]
+            assert name in single and record["body"] == body
+            assert bool(record["build"].get(loader.PREFILL_SPLIT_FLAG)) == bool(extra)
+
+    def refused(**kwargs) -> None:
+        with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
+            loader.selected_prefill_module(arch, **kwargs)
+
+    # the merged body routes no exact gate-tensor program any more (plain, h0, pool, no-final); without a body the
+    # search spans every body: the stored-final sets resolve to the V6 program of the flags alone, no-final refuses
+    for use_initial, use_indices, store in (
+        (False, False, True),
+        (True, False, True),
+        (True, True, True),
+        (False, False, False),
+    ):
+        flags = dict(
             use_initial_state=use_initial,
             use_state_indices=use_indices,
             store_final_state=store,
-            unit_gates=unit_g,
-            unit_beta=unit_beta,
-            split_items=True,
         )
-        assert loader.MODULES[name]["build"][loader.PREFILL_SPLIT_FLAG] is True
-    for use_initial, use_indices, store, unit_g, unit_beta in flags:
-        name = loader.selected_prefill_module(
-            arch,
-            use_initial_state=use_initial,
-            use_state_indices=use_indices,
-            store_final_state=store,
-            unit_gates=unit_g,
-            unit_beta=unit_beta,
-        )
-        assert name in single
-    with pytest.raises(ValueError, match="programs of the 'prefill' route"):
-        loader.selected_prefill_module(
-            arch,
+        if store:
+            name = loader.selected_prefill_module(arch, **flags)
+            assert loader.MODULES[name]["body"] == V6
+        else:
+            refused(**flags)
+        refused(body=P3, **flags)
+    # no V6 unit program; no V6 program without a final state; no V6 split program
+    refused(
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
+    )
+    refused(
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_beta=True,
+    )
+    refused(
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=False,
+    )
+    refused(
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        split_items=True,
+    )
+    # slot indices without an initial state, in either body
+    for body in loader.ROUTE_BODIES:
+        refused(
+            body=body,
             use_initial_state=False,
             use_state_indices=True,
             store_final_state=True,
         )
-    with pytest.raises(
-        ValueError, match="programs of the 'prefill' route"
-    ):  # g=None with beta=None is no shipped program
-        loader.selected_prefill_module(
-            arch,
-            use_initial_state=False,
-            use_state_indices=False,
-            store_final_state=True,
-            unit_gates=True,
-            unit_beta=True,
-        )
-    with pytest.raises(
-        ValueError, match="programs of the 'prefill' route"
-    ):  # a unit program with an initial state
-        loader.selected_prefill_module(
-            arch,
-            use_initial_state=True,
-            use_state_indices=False,
-            store_final_state=True,
-            unit_gates=True,
-        )
-    with pytest.raises(
-        ValueError, match="programs of the 'prefill' route"
-    ):  # no split program of the unit-gate flags
-        loader.selected_prefill_module(
-            arch,
-            use_initial_state=False,
-            use_state_indices=False,
-            store_final_state=True,
-            unit_gates=True,
-            split_items=True,
-        )
-    with pytest.raises(
-        ValueError, match="programs of the 'prefill' route"
-    ):  # a further flag no record spells on
-        loader.selected_prefill_module(
-            arch,
+    # g=None with beta=None is no shipped program
+    refused(
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
+        unit_beta=True,
+    )
+    # a unit program with an initial state
+    refused(
+        use_initial_state=True,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
+    )
+    # no split program of the unit-gate flags
+    refused(
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
+        split_items=True,
+    )
+    # a further flag no record spells on, in either body
+    for body in loader.ROUTE_BODIES:
+        refused(
+            body=body,
             use_initial_state=False,
             use_state_indices=False,
             store_final_state=True,
             split_rows=True,
         )
+    # an unknown body
+    refused(
+        body="prefill_sm100",
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+    )
     base = loader.selected_prefill_module(
-        arch, use_initial_state=False, use_state_indices=False, store_final_state=True
+        arch,
+        body=V6,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
     )
-    assert loader.launch_grid(loader.MODULES[base], 1, 1, tiles=1000, sm_count=132) == (
-        132,
-        1,
-        1,
+    merged = loader.selected_prefill_module(
+        arch,
+        body=P3,
+        use_initial_state=False,
+        use_state_indices=False,
+        store_final_state=True,
+        unit_gates=True,
     )
-    assert loader.launch_grid(loader.MODULES[base], 1, 1, tiles=7, sm_count=132) == (
-        7,
-        1,
-        1,
-    )
-    with pytest.raises(ValueError, match="tiles and sm_count"):
-        loader.launch_grid(loader.MODULES[base], 1, 1)
+    for name in (base, merged):
+        record = loader.MODULES[name]
+        assert loader.launch_grid(record, 1, 1, tiles=1000, sm_count=132) == (
+            132,
+            1,
+            1,
+        )
+        assert loader.launch_grid(record, 1, 1, tiles=7, sm_count=132) == (7, 1, 1)
+        with pytest.raises(ValueError, match="tiles and sm_count"):
+            loader.launch_grid(record, 1, 1)
     for n in NUM_HOUSEHOLDER:
         assert loader.prefill_route_applies(
             device_capability=_capability(), num_householder=n
@@ -1195,9 +1534,54 @@ def test_route_tables_are_consistent() -> None:
         device_capability=(12, 0), num_householder=1
     )
     assert loader.PREFILL_LOGICAL_TENSORS[:4] == ("q", "k", "v", "o")
-    assert set(loader.MODULES[base]["logical"].values()) == set(
-        loader.PREFILL_LOGICAL_TENSORS
-    ) | set(loader.PREFILL_LOGICAL_SCALARS)
+    for name in (base, merged):
+        assert set(loader.MODULES[name]["logical"].values()) == set(
+            loader.PREFILL_LOGICAL_TENSORS
+        ) | set(loader.PREFILL_LOGICAL_SCALARS)
+    # both bodies take the same 23 formals in the same order: one ``values`` dict serves every launch
+    assert loader.MODULES[base]["logical"] == loader.MODULES[merged]["logical"]
+    assert loader.MODULES[base]["arg_plan"] == loader.MODULES[merged]["arg_plan"]
+
+
+def test_no_final_state_runs_the_v6_body(monkeypatch) -> None:
+    """A long batch reading no initial state and keeping no final state is V6-class at every length (no merged
+    program stores none, and the V6 step is the cheaper): the V6 plain program runs it over ``N x H`` tiles, its
+    final state going to the discard record, and the output satisfies the FP64 reference.  The same lengths with
+    a final state are merged-class."""
+    seen: list[tuple[str, Optional[int]]] = []
+    original = loader.run_module
+
+    def recording(name, values, **kwargs):
+        seen.append((name, kwargs.get("tiles")))
+        return original(name, values, **kwargs)
+
+    monkeypatch.setattr(loader, "run_module", recording)
+    V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
+    c = Case(
+        lens=MERGED_LENS,
+        H=MIXED_H,
+        n=3,
+        initial="none",
+        final=False,
+        cu_cpu=True,
+        seed=31,
+    )
+    assert _classes(c) == [V6] * c.N
+    kept = Case(lens=MERGED_LENS, H=MIXED_H, n=3, initial="none", final=True)
+    assert _classes(kept) == [P3] * kept.N
+    _run_and_check(c)
+    assert seen == [
+        (
+            loader.selected_prefill_module(
+                _arch(),
+                body=V6,
+                use_initial_state=False,
+                use_state_indices=False,
+                store_final_state=True,
+            ),
+            c.N * c.H,
+        )
+    ]
 
 
 def test_prefill_records_reference_the_build_manifest() -> None:
@@ -1206,12 +1590,18 @@ def test_prefill_records_reference_the_build_manifest() -> None:
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     seen = 0
+    v6_seen = 0
     for name, record in loader.MODULES.items():
         if record["role"] != "prefill":
             continue
         seen += 1
         assert record["library"] == record["kernel"] == name
-        assert record["body"] == "prefill_sm90"
+        # two prefill bodies: the merged body and the V6 fork-order body of the three routed V6 flag sets
+        assert record["body"] in (loader.ROUTE_BODY_P3, loader.ROUTE_BODY_V6), (
+            name,
+            record["body"],
+        )
+        v6_seen += record["body"] == loader.ROUTE_BODY_V6
         for arch in record["arches"]:
             entry = libraries[loader.library_name(name, arch)]
             assert entry["arch"] == arch and entry["entry"] == "run"
@@ -1224,6 +1614,7 @@ def test_prefill_records_reference_the_build_manifest() -> None:
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
             assert "--use_fast_math" in entry["nvcc_flags"], (name, entry["nvcc_flags"])
     assert seen == len(ROUTED_FLAGS) + len(SPLIT_FLAGS)
+    assert v6_seen == len(V6_FLAGS), v6_seen
 
 
 def test_is_supported_reports_the_routes() -> None:

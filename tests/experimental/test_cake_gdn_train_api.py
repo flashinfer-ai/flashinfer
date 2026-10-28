@@ -166,18 +166,18 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
-def test_reuse_recompute_tapes_is_a_bool_switch_on_by_default_never_captured() -> None:
-    """The checkpoint-aware light backward is a keyword-only bool switch, on by default (``False`` restores the
-    replay form; under ``graph="replay"`` the default resolves to ``False``), part of the options
-    key (so of the CUDA-graph key), typed, and refused with ``graph="replay"`` (a captured graph bakes the arena
-    addresses of its tapes; the kept tapes are fresh tensors handed from the recompute forward to the backward)."""
+def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
+    """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
+    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
+    ``graph="replay"`` the default resolves to ``False`` -- part of the options key (so of the CUDA-graph key), typed,
+    and refused with ``graph="replay"`` (a captured graph bakes the arena addresses of its tapes; the kept tapes are
+    fresh tensors handed from the recompute forward to the backward)."""
     assert "reuse_recompute_tapes" in opt.OPTION_NAMES
-    # the shipped default (opt-in before the default flip); flipping it is this one constant (and this
-    # line) -- every other test names the state it exercises
-    assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT is True
-    assert make_options().reuse_recompute_tapes is opt.REUSE_RECOMPUTE_TAPES_DEFAULT
+    # the shipped default is this one constant (and this line) -- every other test names the state it exercises
+    assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT == "auto"
+    assert make_options().reuse_recompute_tapes == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
     # None = the shipped default; under graph="replay" (the one mode that excludes the kept tapes) it is False
-    assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes is True
+    assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").reuse_recompute_tapes is False
     both = make_options(reuse_recompute_tapes=None, graph="replay")
     assert both.reuse_recompute_tapes is False
@@ -193,6 +193,8 @@ def test_reuse_recompute_tapes_is_a_bool_switch_on_by_default_never_captured() -
         make_options(reuse_recompute_tapes=1)
     with pytest.raises(ValueError, match="graph"):
         make_options(reuse_recompute_tapes=True, graph="replay")
+    with pytest.raises(ValueError, match="graph"):
+        make_options(reuse_recompute_tapes="auto", graph="replay")
     # the other modes accept the switch (it has no effect there: documented as a no-op)
     for extra in (
         {"boundary_mode": "replay"},

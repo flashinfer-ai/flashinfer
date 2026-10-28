@@ -53,7 +53,7 @@ Programs (``*`` = new program package, ``=`` = reused verbatim):
   #5 * ``fwd_o``             ``o = qscale (q h_c) + (Aqk . mask) v_new``; persistent grid min(NC x HV, SMs), the
                              tiles beyond the grid drawn in units from the ``ticket`` word
   #6 * ``bwd_prep``          ``do_g``, ``dv_intra``; persistent grid min(NC x HV, ctas_per_sm x SMs) with two
-                             CTAs per SM on sm_100a and sm_103a and one on sm_107a (the record's per-architecture
+                             CTAs per SM on sm_100a, sm_103a and sm_107a (the record's per-architecture
                              ``ctas_per_sm``), items beyond the grid drawn from the ``ticket`` word
   #7 * ``kcp_dhu_offset``    adjoint walk from zero -> ``d_f``
      * ``kcp_dhu_tape``      adjoint walk from ``dS_out`` -> ``dh`` / ``dv_new`` tapes
@@ -279,7 +279,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 210176,
+            "dynamic_smem_bytes": 227328,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_83eb8234f378bfe68bb1",
@@ -342,7 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {
-            "ctas_per_sm": {"sm_100a": 2, "sm_103a": 2},
+            "ctas_per_sm": {"sm_100a": 2, "sm_103a": 2, "sm_107a": 2},
             "kind": "chunks_heads_persistent",
         },
         "kernel_symbol": "kernel_cake_gdn_train_3f3dd0a8504039fd93f0",
@@ -739,7 +739,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 82944,
+            "dynamic_smem_bytes": 83968,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_ac5ce25cc84be93bb2a6",
@@ -887,7 +887,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 82944,
+            "dynamic_smem_bytes": 83968,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_49450e259854e03ab17c",

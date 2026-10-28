@@ -67,9 +67,12 @@ MAX_BLOCKS = int(ROUTES["MAX_BLOCKS"])
 DIRECT_THREADS = 256
 PERSISTENT_THREADS = 288
 PAIR_THREADS = 320
-#: The pair kernel's ``consumer_regs`` build (the ``_cr232`` keys): three whole warpgroups, the two
-#: consumer groups at 232 registers each warp and the producer warpgroup at 40.
+#: The pair kernel's ``consumer_regs`` builds, three whole warpgroups each: the ``_cr232`` keys hold
+#: the two consumer groups at 232 registers each warp and the producer warpgroup at 40; the
+#: ``_cr200_pk1`` keys hold them at 200 and 104 and park each consumer thread's accumulators in
+#: tensor memory while the prefix chunk streams (``park_acc`` 1).
 PAIR_CONSUMER_REGS = 232
+PAIR_PARK_ACC_CONSUMER_REGS = 200
 PAIR_CONSUMER_REGS_THREADS = 384
 #: Physical SM counts the native ports and the pair kernel are qualified on: 148 (B200 / B300) and
 #: 152 (GB300).  They launch one CTA per SM and grid-stride over the tokens, so their grid is the
@@ -490,12 +493,15 @@ _PERSISTENT_KEY = re.compile(
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
 )
-# ``pair:k<K>_nc<nc>[_pbf16a][_fm][_cr232][_write]``: ``_cr232`` is the pair kernel built at
-# ``consumer_regs`` = ``PAIR_CONSUMER_REGS`` (``PAIR_CONSUMER_REGS_THREADS`` threads, the schedule
-# label adds ``_consumer_regs232``).
+# ``pair:k<K>_nc<nc>[_pbf16a][_fm][_cr232|_cr200_pk1][_write]``: ``_cr232`` is the pair kernel
+# built at ``consumer_regs`` = ``PAIR_CONSUMER_REGS``, ``_cr200_pk1`` the one built at
+# ``consumer_regs`` = ``PAIR_PARK_ACC_CONSUMER_REGS`` with ``park_acc`` 1 (both
+# ``PAIR_CONSUMER_REGS_THREADS`` threads; the schedule label adds ``_consumer_regs232`` /
+# ``_consumer_regs200_park_acc1``).
 _PAIR_KEY = re.compile(
     r"^pair:k(?P<K>\d+)_nc(?P<nc>\d+)(?P<pbf16a>_pbf16a)?(?P<fm>_fm)?"
-    rf"(?P<cr>_cr{PAIR_CONSUMER_REGS})?(?P<write>_write)?$"
+    rf"(?P<cr>_cr{PAIR_CONSUMER_REGS}|_cr{PAIR_PARK_ACC_CONSUMER_REGS}(?P<park>_pk1))?"
+    r"(?P<write>_write)?$"
 )
 
 
@@ -915,8 +921,8 @@ def _plan_route_exact(
 def _pair_plan(
     arch: str, num_sms: int, M: int, K: int, use_pdl: bool, key: str
 ) -> RoutePlan:
-    """The plan of a round-2 pair cell: one CTA per SM, 320 threads (384 for a ``_cr232`` key), the
-    key as the table names it."""
+    """The plan of a round-2 pair cell: one CTA per SM, 320 threads (384 for a ``_cr232`` or a
+    ``_cr200_pk1`` key), the key as the table names it."""
     match = _PAIR_KEY.match(key)
     if match is None or int(match["K"]) != K or match["write"]:
         raise ValueError(
@@ -929,7 +935,9 @@ def _pair_plan(
         schedule_id += "_prefix_bf16_add"
     if match["fm"]:
         schedule_id += "_fastmath"
-    if match["cr"]:
+    if match["park"]:
+        schedule_id += f"_consumer_regs{PAIR_PARK_ACC_CONSUMER_REGS}_park_acc1"
+    elif match["cr"]:
         schedule_id += f"_consumer_regs{PAIR_CONSUMER_REGS}"
     schedule_id += f"_grid{num_sms}"
     route_id = f"{schedule_id}.{arch}.pair_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.pair_full_sm"

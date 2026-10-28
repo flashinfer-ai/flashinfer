@@ -15,7 +15,6 @@ from flashinfer.jit.cake_moe_finalize_comm import SMALL_TOKEN_MAX
 
 
 HIDDEN_SIZE = 7168
-WORKSPACE_TOKEN_CAPACITY = 128
 BACKENDS = ("trtllm", "cake")
 ATOL = 1e-2
 RTOL = 1e-2
@@ -23,6 +22,26 @@ FP4_ATOL = 1.0
 FP4_RTOL = 0.1
 PROCESS_JOIN_TIMEOUT_S = 600.0
 PROCESS_CLEANUP_TIMEOUT_S = 30.0
+
+# Program choice of the Cake binding above SMALL_TOKEN_MAX tokens: the small-token program
+# still runs up to SMALL_TOKEN_EXTENDED_MAX tokens at world sizes 2 and 4 except for top_k 4
+# without a shared expert (while the device holds that many small-token clusters); the
+# two-shot program runs at world size 8 and at world size 4 from TWO_SHOT_MIN_TOKENS_WS4
+# tokens; the large-token program runs at world size 2 for top_k 4 above
+# LARGE_TOKEN_MIN_TOKENS tokens (LARGE_TOKEN_MIN_TOKENS_SHARED with a shared expert); the
+# persistent program runs otherwise.
+SMALL_TOKEN_EXTENDED_MAX = 71
+TWO_SHOT_MIN_TOKENS_WS4 = 96
+LARGE_TOKEN_MIN_TOKENS = 512
+LARGE_TOKEN_MIN_TOKENS_SHARED = 1280
+# SM count at which the small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters (B200, B300).
+SMALL_TOKEN_EXTENDED_MIN_SMS = 148
+_PROGRAM_SUFFIX = {
+    "small": "_small",
+    "two_shot": "_ts",
+    "large_token": "_lt",
+    "persistent": "",
+}
 
 
 def _decode_fp4_output(
@@ -145,18 +164,76 @@ def _reference(
     return residual, norm
 
 
-def _cases() -> list[tuple[int, int, bool, str, float]]:
-    """Token counts on both sides of the small-token threshold, each crossed with
-    top_k, shared expert, output profile and weight_bias."""
-    threshold = SMALL_TOKEN_MAX
+def _token_counts(world_size: int) -> tuple[int, ...]:
+    """Token counts on both sides of every program boundary of the world size."""
+    tokens = {
+        1,
+        SMALL_TOKEN_MAX,
+        SMALL_TOKEN_MAX + 1,
+        SMALL_TOKEN_EXTENDED_MAX,
+        SMALL_TOKEN_EXTENDED_MAX + 1,
+        128,
+    }
+    if world_size == 4:
+        tokens |= {TWO_SHOT_MIN_TOKENS_WS4 - 1, TWO_SHOT_MIN_TOKENS_WS4}
+    if world_size == 2:
+        tokens |= {
+            LARGE_TOKEN_MIN_TOKENS,
+            LARGE_TOKEN_MIN_TOKENS + 1,
+            LARGE_TOKEN_MIN_TOKENS_SHARED,
+            LARGE_TOKEN_MIN_TOKENS_SHARED + 1,
+        }
+    return tuple(sorted(tokens))
+
+
+def _cases(world_size: int) -> list[tuple[int, int, bool, str, float]]:
+    """Every token count of _token_counts crossed with top_k, shared expert, output
+    profile and weight_bias."""
     return [
         (tokens, top_k, use_shared, output_profile, weight_bias)
-        for tokens in (1, threshold, threshold + 1, WORKSPACE_TOKEN_CAPACITY)
+        for tokens in _token_counts(world_size)
         for top_k in (4, 8)
         for use_shared in (False, True)
         for output_profile in ("110", "111")
         for weight_bias in (0.0, 1.0)
     ]
+
+
+def _expected_program(
+    world_size: int, tokens: int, top_k: int, use_shared: bool
+) -> str:
+    if tokens <= SMALL_TOKEN_MAX:
+        return "small"
+    if (
+        world_size != 8
+        and (top_k != 4 or use_shared)
+        and tokens <= SMALL_TOKEN_EXTENDED_MAX
+    ):
+        return "small"
+    if world_size == 8 or (world_size == 4 and tokens >= TWO_SHOT_MIN_TOKENS_WS4):
+        return "two_shot"
+    large_token_min = (
+        LARGE_TOKEN_MIN_TOKENS_SHARED if use_shared else LARGE_TOKEN_MIN_TOKENS
+    )
+    if world_size == 2 and top_k == 4 and tokens > large_token_min:
+        return "large_token"
+    return "persistent"
+
+
+def _expected_kernel(
+    world_size: int,
+    tokens: int,
+    top_k: int,
+    use_shared: bool,
+    dtype: torch.dtype,
+    output_profile: str,
+) -> str:
+    dtype_name = "float16" if dtype == torch.float16 else "bfloat16"
+    program = _expected_program(world_size, tokens, top_k, use_shared)
+    return (
+        f"kernel_cake_trtllm_moe_finalize_{dtype_name}_ws{world_size}"
+        f"_o{output_profile}{_PROGRAM_SUFFIX[program]}"
+    )
 
 
 def _workspace(
@@ -165,7 +242,7 @@ def _workspace(
     result = comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
         rank,
         world_size,
-        WORKSPACE_TOKEN_CAPACITY,
+        max(_token_counts(world_size)),
         HIDDEN_SIZE,
         group=group,
     )
@@ -189,6 +266,7 @@ def _run_backend(
     output_profile: str,
     routed_scaling_factor: float | None,
     weight_bias: float,
+    kernel_names: list[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     residual_out = torch.empty_like(residual_in)
     norm_out = torch.empty_like(residual_in)
@@ -206,27 +284,43 @@ def _run_backend(
             dtype=torch.float8_e4m3fn,
             device=residual_in.device,
         )
-    comm.trtllm_moe_finalize_allreduce_fusion(
-        allreduce_in=allreduce_in,
-        residual_in=residual_in,
-        norm_weight=norm_weight,
-        expanded_idx_to_permuted_idx=inverse_indices,
-        norm_out=norm_out,
-        residual_out=residual_out,
-        quant_out=quant_out,
-        scale_out=scale_out,
-        workspace_ptrs=workspace_ptrs,
-        launch_with_pdl=launch_with_pdl,
-        world_rank=world_rank,
-        world_size=world_size,
-        eps=1e-5,
-        shared_expert_output=shared_expert_output,
-        expert_scale_factor=expert_scales,
-        routed_scaling_factor=routed_scaling_factor,
-        weight_bias=weight_bias,
-        backend=backend,
-    )
-    torch.cuda.synchronize()
+
+    def launch() -> None:
+        comm.trtllm_moe_finalize_allreduce_fusion(
+            allreduce_in=allreduce_in,
+            residual_in=residual_in,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=inverse_indices,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            workspace_ptrs=workspace_ptrs,
+            launch_with_pdl=launch_with_pdl,
+            world_rank=world_rank,
+            world_size=world_size,
+            eps=1e-5,
+            shared_expert_output=shared_expert_output,
+            expert_scale_factor=expert_scales,
+            routed_scaling_factor=routed_scaling_factor,
+            weight_bias=weight_bias,
+            backend=backend,
+        )
+        torch.cuda.synchronize()
+
+    if kernel_names is None:
+        launch()
+    else:
+        # Record the Cake kernels this call launches (the binding's program choice).
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            launch()
+        kernel_names.extend(
+            event.name
+            for event in profiler.events()
+            if event.name.startswith("kernel_cake_trtllm_moe_finalize_")
+        )
     return residual_out, norm_out, quant_out, scale_out
 
 
@@ -240,9 +334,15 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
         world_size=world_size,
     )
     group = dist.group.WORLD
-    cases = _cases()
+    cases = _cases(world_size)
+    # The small-token program holds SMALL_TOKEN_EXTENDED_MAX clusters from this SM count on;
+    # with fewer SMs the binding may run the persistent program there instead.
+    small_token_extended = (
+        torch.cuda.get_device_properties(device).multi_processor_count
+        >= SMALL_TOKEN_EXTENDED_MIN_SMS
+    )
     # One workspace per backend for the whole run: consecutive cases switch between
-    # the small-token and the persistent program on the same workspace.
+    # the Cake programs (one-shot and two-shot) on the same workspace.
     workspaces: dict[str, tuple[list[list[int]], torch.Tensor]] = {}
     try:
         for backend in BACKENDS:
@@ -314,6 +414,20 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
                 )
 
                 outputs: dict[str, tuple[torch.Tensor, ...]] = {}
+                kernel_names: list[str] | None = None
+                expected_kernel = _expected_kernel(
+                    world_size, tokens, top_k, use_shared, dtype, output_profile
+                )
+                if (
+                    not launch_with_pdl
+                    and weight_bias == 0.0
+                    and (
+                        small_token_extended
+                        or tokens <= SMALL_TOKEN_MAX
+                        or not expected_kernel.endswith("_small")
+                    )
+                ):
+                    kernel_names = []
                 for backend in BACKENDS:
                     result = _run_backend(
                         backend=backend,
@@ -330,6 +444,7 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
                         output_profile=output_profile,
                         routed_scaling_factor=routed_scaling_factor,
                         weight_bias=weight_bias,
+                        kernel_names=kernel_names if backend == "cake" else None,
                     )
                     outputs[backend] = tuple(
                         tensor.clone() for tensor in result if tensor is not None
@@ -337,6 +452,11 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
 
                 trtllm_result = outputs["trtllm"]
                 label = f"pdl={launch_with_pdl} case={case}"
+                if kernel_names is not None:
+                    assert kernel_names == [expected_kernel], (
+                        f"cake launched {kernel_names}, expected {expected_kernel} "
+                        f"({label})"
+                    )
                 for backend, result in outputs.items():
                     torch.testing.assert_close(
                         result[0].float(),
