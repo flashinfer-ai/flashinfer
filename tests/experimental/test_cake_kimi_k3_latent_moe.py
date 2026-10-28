@@ -530,11 +530,31 @@ def test_prefill_tail_plan_and_trigger():
 # Every token count the public entry points accept, both tensor-parallel degrees and the partial
 # counts the decode tail plans on (P >= 2 selects the un-staged instances).
 COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384,)
-COVERAGE_PARTIALS = (1, 2, 4)
+COVERAGE_PARTIALS = (1, 2, 4, 8)
 # The few-token multi-partial tail cells served by the global-y instances with the resident-B arithmetic.
 SB_NORM_ROUTES = {
     1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
-    8: (8, {1: 5, 2: 5, 3: 4, 4: 4}),
+    8: (8, {}),
+}
+# The few-token multi-partial tail cells served with the routed partials prefetched into L2: (first, last, sb_norm),
+# ``last`` None: from ``first`` up.
+PARTIAL_PREFETCH_ROUTES = {
+    1: {
+        1: ((4, 6, False), (7, None, True)),
+        2: ((4, 6, False), (7, None, True)),
+        3: ((4, 6, False), (7, None, True)),
+        4: ((4, 6, False), (7, None, True)),
+        5: ((3, 3, False), (5, None, True)),
+        6: ((3, 3, False), (5, None, True)),
+        7: ((3, 3, False), (5, None, True)),
+        8: ((3, 3, False), (5, None, True)),
+    },
+    8: {
+        1: ((4, None, True),),
+        2: ((4, None, True),),
+        3: ((4, None, True),),
+        4: ((3, None, True),),
+    },
 }
 
 
@@ -1735,17 +1755,25 @@ _EPS_SCALE_ROWS = (
     (8, 1, 64, 3),
     (8, 1, 100, 1),
     (8, 5, 128, 2),
+    (1, 0, 8, 3),
+    (1, 0, 8, 4),
+    (1, 0, 8, 5),
 )
 
 
 def test_eps_scale_rows_reach_every_decode_tail_program():
     """On every qualified SM count and architecture the eps-scale rows reach exactly the decode
     tail programs the package routes for T <= DECODE_MAX_T, TP1 and TP8 and P = 1 to 16 (the
-    decode tail plan depends on P only through P = 1 and the partial counts of
-    ``TAIL_SB_NORM_ROUTES``), so the near-eps check runs on every decode tail program."""
+    decode tail plan depends on P only through P = 1, the partial counts of
+    ``TAIL_SB_NORM_ROUTES`` and the partial ranges of ``TAIL_PARTIAL_PREFETCH_ROUTES``, all below
+    16 or open above), so the near-eps check runs on every decode tail program."""
     partials = range(1, 17)
     for _, cells in cb.TAIL_SB_NORM_ROUTES.values():
-        assert max(cells.values()) < max(partials)
+        assert max(cells.values(), default=1) < max(partials)
+    for cells in cb.TAIL_PARTIAL_PREFETCH_ROUTES.values():
+        for ranges in cells.values():
+            assert all(first < max(partials) for first, _, _ in ranges)
+            assert all(last is None or last < max(partials) for _, last, _ in ranges)
     for sm_count in QUALIFIED_SM_COUNTS:
         for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
             routed = {
@@ -1814,7 +1842,18 @@ def _sb_norm_rows():
     )
 
 
-def test_tail_sb_norm_rules(monkeypatch):
+@pytest.fixture
+def no_partial_prefetch(monkeypatch):
+    """The routes without the prefetch cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` (which overlay
+    ``TAIL_SB_NORM_ROUTES``; their own rules and outputs are tested below), the plan cache cleared around."""
+    monkeypatch.setattr(cb, "TAIL_PARTIAL_PREFETCH_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    yield
+    monkeypatch.undo()
+    decode_tail_plan.cache_clear()
+
+
+def test_tail_sb_norm_rules(monkeypatch, no_partial_prefetch):
     """The few-token multi-partial tails of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of the table's N_PAD with
     the resident-B arithmetic (``sb_norm``, ``_sbn``): its plan is that instance's but for the flag, on both qualified
     SM counts and from the table's partial count up; every other row keeps its plan, and the rows taken are rows of the
@@ -1862,7 +1901,7 @@ def test_tail_sb_norm_rules(monkeypatch):
 
 @pytest.mark.parametrize(("tp", "tokens", "num_partials"), _sb_norm_rows())
 def test_tail_sb_norm_is_bitwise_the_resident_b_instance(
-    monkeypatch, tp, tokens, num_partials
+    monkeypatch, no_partial_prefetch, tp, tokens, num_partials
 ):
     """The global-y instance with the resident-B arithmetic reproduces the resident-B instance's ``y`` and ``out`` bit for
     bit -- partial sums that flush to ``-0.0`` and subnormal partials of both signs included -- in the first launch,
@@ -1938,6 +1977,150 @@ def test_tail_sb_norm_is_bitwise_the_resident_b_instance(
         resident()
         torch.cuda.synchronize()
         _assert_bitwise((y_sb, out_sb), first, "resident-B instance")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def _partial_prefetch_rows():
+    """The (tp, tokens, num_partials, sb_norm) cells of ``TAIL_PARTIAL_PREFETCH_ROUTES``: the first and the last partial
+    count of every range, a range open above at 17 partials (past the measured 2 to 16)."""
+    rows = []
+    for tp, cells in sorted(cb.TAIL_PARTIAL_PREFETCH_ROUTES.items()):
+        for tokens, ranges in sorted(cells.items()):
+            for first, last, sb_norm in ranges:
+                for num_partials in sorted({first, 17 if last is None else last}):
+                    rows.append((tp, tokens, num_partials, sb_norm))
+    return tuple(rows)
+
+
+def _without_partial_prefetch(tokens, tp, num_partials, sm_count, sb_norm):
+    """The plan of the instance a prefetch cell names, without the prefetch: the global-y instance of
+    ``TAIL_SB_NORM_ROUTES`` with the resident-B arithmetic, or the resident-B instance."""
+    if sb_norm:
+        n_pad = SB_NORM_ROUTES[tp][0]
+        base = decode_tail_plan(n_pad, i_local_for_tp(tp), tp, num_partials, sm_count)
+        assert not (base["sb_norm"] or base["smem_b1"] or base["split_fin"])
+        return dict(base, sb_norm=True)
+    base = decode_tail_plan(tokens, i_local_for_tp(tp), tp, num_partials, sm_count)
+    assert base["smem_b1"] and not base["rows_smem"] and not base["sb_norm"]
+    return base
+
+
+def test_tail_partial_prefetch_rules(monkeypatch):
+    """The cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` take the instance the table names (the global-y instance with the
+    resident-B arithmetic, or the resident-B instance) with the routed partials prefetched into L2 (``_ppf``): its plan
+    is that instance's but for the flag, on both qualified SM counts and up to 17 partials (a range open above
+    included); every other row keeps its plan."""
+    assert cb.TAIL_PARTIAL_PREFETCH_ROUTES == PARTIAL_PREFETCH_ROUTES
+    taken = {}
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for tp in SUPPORTED_TP:
+            for tokens in range(1, DECODE_MAX_T + 1):
+                for num_partials in range(1, 18):
+                    plan = decode_tail_plan(
+                        tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                    )
+                    route = cb.tail_partial_prefetch(tokens, tp, num_partials)
+                    key = decode_kernel_key(plan)
+                    assert plan["partial_prefetch"] is (route is not None)
+                    assert key.endswith("_ppf") is (route is not None)
+                    if route is not None:
+                        assert key in KERNELS, key
+                        taken[sm_count, tp, tokens, num_partials] = (route, plan)
+    assert taken or not PARTIAL_PREFETCH_ROUTES
+    monkeypatch.setattr(cb, "TAIL_PARTIAL_PREFETCH_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        for (sm_count, tp, tokens, num_partials), (route, plan) in taken.items():
+            monkeypatch.setattr(cb, "TAIL_SB_NORM_ROUTES", {})
+            decode_tail_plan.cache_clear()
+            base = _without_partial_prefetch(tokens, tp, num_partials, sm_count, route)
+            monkeypatch.setattr(cb, "TAIL_SB_NORM_ROUTES", SB_NORM_ROUTES)
+            decode_tail_plan.cache_clear()
+            cell = (tp, tokens, num_partials)
+            assert plan == dict(base, partial_prefetch=True), cell
+            assert decode_kernel_key(plan) == decode_kernel_key(base) + "_ppf"
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("tp", "tokens", "num_partials", "sb_norm"), _partial_prefetch_rows()
+)
+def test_tail_partial_prefetch_is_bitwise_the_resident_b_instance(
+    monkeypatch, tp, tokens, num_partials, sb_norm
+):
+    """The routed-partial prefetch changes no output: the ``_ppf`` instance reproduces the resident-B instance the
+    planner takes without ``TAIL_SB_NORM_ROUTES`` and ``TAIL_PARTIAL_PREFETCH_ROUTES`` -- for a resident-B cell the same
+    instance without the prefetch; the global-y instance with the resident-B arithmetic is bitwise that instance too
+    (``test_tail_sb_norm_is_bitwise_the_resident_b_instance``) -- bit for bit, partial sums that flush to ``-0.0`` and
+    subnormal partials of both signs included, in the first launch, re-launches over NaN-filled outputs and graph
+    replays, with the control words back at zero."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    seed = 5200 + 97 * tp + 13 * tokens + num_partials
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    a = 2.0**-126 * (
+        1.0 + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+    )
+    m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+    cancel = pick < 0.25
+    parts[0] = torch.where(cancel, -a, parts[0])
+    parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts[2:] = torch.where(cancel, torch.full_like(parts[2:], -0.0), parts[2:])
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    args = (
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    assert runner.plan["partial_prefetch"] and runner.kernel_keys[0].endswith("_ppf")
+    assert runner.plan["sb_norm"] is sb_norm
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, "TAIL_PARTIAL_PREFETCH_ROUTES", {})
+    monkeypatch.setattr(cb, "TAIL_SB_NORM_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        out_b = torch.full_like(out, float("nan"))
+        y_b = torch.full_like(y, float("nan"))
+        base = prepare_kimi_k3_latent_moe_tail(
+            *args, out_b, tp=tp, rank=rank, y_workspace=y_b
+        )
+        assert not (base.plan["partial_prefetch"] or base.plan["sb_norm"])
+        assert base.plan["smem_b1"] and not base.plan["rows_smem"]
+        if not sb_norm:
+            assert base.kernel_keys[0] + "_ppf" == runner.kernel_keys[0]
+        base()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_b, out_b), first, "resident-B instance")
     finally:
         monkeypatch.undo()
         decode_tail_plan.cache_clear()

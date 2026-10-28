@@ -195,7 +195,7 @@ __device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_latent_moe_169fec8374c14104e051(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_575f9e22612dd9b47079(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -327,6 +327,11 @@ kernel_cake_kimi_k3_latent_moe_169fec8374c14104e051(const __grid_constant__ CUte
             if (nrow < num_tokens) {
                 unsigned long long nrow_base = (unsigned long long)nrow * 3584;
                 unsigned long long partial_stride = (unsigned long long)num_tokens * 3584;
+                if (lane >= 1) {
+                    if (lane < num_partials) {
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(routed + ((unsigned long long)lane * partial_stride + nrow_base)), "r"((uint32_t)(7168)) : "memory");
+                    }
+                }
                 unsigned int nwp[56];
                 unsigned int xp[56];
                 float nacc[112];
