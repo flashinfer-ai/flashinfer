@@ -765,6 +765,55 @@ def logits_bindings(
     )
 
 
+def check_schedule_bindings(bindings, *, num_sms, schedule=None):
+    """Check the schedule a submission's stages share before it is launched.
+
+    ``bindings`` holds the ``"metadata"`` stage and, for a prepared sequence,
+    the ``"logits"`` stage.  The scheduler runs as one CTA (grid ``(1, 1,
+    1)``) and lays out its walk for ``metadata.num_sms`` CTAs, which must be
+    the CTA budget ``num_sms`` and the logits grid ``(num_sms, 1, 1)``.  Both
+    stages bind one schedule buffer of exactly the rows the route's schedule
+    kind writes: :func:`metadata_shape` for a static route, or
+    :func:`dyn_schedule_shape` for a ``dyn`` route.  Raises ``ValueError``.
+    """
+    schedule = schedule or {"kind": "static"}
+    metadata = bindings["metadata"]
+    grid = tuple(int(metadata[key]) for key in ("grid_x", "grid_y", "grid_z"))
+    if grid != (1, 1, 1):
+        raise ValueError(f"the scheduler stage must launch grid (1, 1, 1), got {grid}")
+    if int(metadata["num_sms"]) != int(num_sms):
+        raise ValueError(
+            f"the scheduler walks {metadata['num_sms']} CTAs, the CTA budget is {num_sms}"
+        )
+    if schedule["kind"] == "dyn":
+        rows = dyn_schedule_shape(num_sms, schedule["dyn_slots"])
+        if int(metadata["dyn_slots"]) != int(schedule["dyn_slots"]):
+            raise ValueError(
+                f"the scheduler binds dyn_slots = {metadata['dyn_slots']}, "
+                f"the route schedules {schedule['dyn_slots']}"
+            )
+    else:
+        rows = metadata_shape(num_sms)
+    walk = metadata["schedule_meta"]
+    if int(walk.numel()) != rows[0] * rows[1]:
+        raise ValueError(
+            f"the {schedule['kind']} schedule needs {rows[0] * rows[1]} int32 words "
+            f"({rows}), the bound buffer has {walk.numel()}"
+        )
+    logits = bindings.get("logits")
+    if logits is None:
+        return
+    grid = tuple(int(logits[key]) for key in ("grid_x", "grid_y", "grid_z"))
+    if grid != (int(num_sms), 1, 1):
+        raise ValueError(
+            f"the logits stage must launch grid ({num_sms}, 1, 1) for the "
+            f"scheduler's {num_sms} CTAs, got {grid}"
+        )
+    read = logits["schedule_meta"]
+    if read.data_ptr() != walk.data_ptr() or read.numel() != walk.numel():
+        raise ValueError("the logits stage must read the buffer the scheduler writes")
+
+
 # ---------------------------------------------------------------------------
 # Plans
 # ---------------------------------------------------------------------------
@@ -849,6 +898,7 @@ class Sm120MetadataPlan:
                 num_next_n_atoms=self.num_next_n_atoms,
             ),
         }
+        check_schedule_bindings(bindings, num_sms=num_sms)
         self._submissions, self._programs = [], []
         self.program_names = [program for _stage, program in stages]
         for stage_name, program in stages:
@@ -1040,6 +1090,7 @@ class Sm120PagedIndexerPlan:
                 num_sms=num_sms,
             ),
         }
+        check_schedule_bindings(bindings, num_sms=num_sms, schedule=self.schedule)
         sequence = self.route.get("sequence")
         if not sequence:
             raise ValueError(

@@ -3,8 +3,9 @@
 Host-only checks of the catalog's ``policy.device_rule`` and ``device_routes``
 (schema, context windows, table well-formedness, the shipped routes left
 unchanged), of the route resolver against an independent mirror over a batch,
-hint and device grid, and of the route-aware schedule atom count the metadata
-entry uses.  The committed catalog and a synthetic catalog with populated
+hint and device grid, of the route-aware schedule atom count the metadata
+entry uses, and of the schedule bindings a plan checks before it prepares a
+submission.  The committed catalog and a synthetic catalog with populated
 tables both run through the same checks.  The synthetic static device routes
 reuse shipped sequences, so the GPU checks launch them on an SM120 device (with
 the device SM count monkeypatched to the table's key); the synthetic ``dyn``
@@ -606,6 +607,87 @@ def test_device_route_bindings_cover_every_program_argument(catalog):
         if schedule["kind"] == "dyn":
             for key in ("dyn_slots", "dyn_pct", "dyn_seg"):
                 assert bindings["metadata"][key] == int(schedule[key])
+
+
+def _host_bindings(schedule, num_sms, rows):
+    """Sequence bindings over host tensors (the checks read shapes and pointers)."""
+    heads, page_kv, next_n, batch, pages, max_context_len = 64, 64, 6, 2, 4, 128
+    walk = torch.zeros(rows, dtype=torch.int32)
+    context_lens = torch.full((batch, next_n), max_context_len, dtype=torch.int32)
+    q = torch.zeros((batch, next_n, heads, 128), dtype=torch.float8_e4m3fn)
+    fused = torch.zeros((pages, page_kv * 132), dtype=torch.uint8)
+    weights = torch.zeros((batch * next_n, heads), dtype=torch.float32)
+    block_table = torch.zeros((batch, pages), dtype=torch.int32)
+    output = torch.zeros(
+        (batch * next_n, _runtime.paged_logits_stride(max_context_len)),
+        dtype=torch.float32,
+    )
+    return {
+        "metadata": _runtime.metadata_bindings(
+            context_lens, walk, num_sms=num_sms, num_next_n_atoms=1, schedule=schedule
+        ),
+        "logits": _runtime.logits_bindings(
+            q,
+            fused,
+            weights,
+            context_lens,
+            block_table,
+            walk,
+            output,
+            num_sms=num_sms,
+        ),
+    }
+
+
+@pytest.mark.parametrize("schedule", [{"kind": "static"}, DYN], ids=["static", "dyn"])
+def test_schedule_bindings_are_checked_before_launch(schedule):
+    """The scheduler's grid and CTA count and the shared schedule's size (host-only).
+
+    The plans run this check before every submission is prepared; each broken
+    binding below must be refused.
+    """
+    num_sms = 6
+    rows = (
+        _runtime.dyn_schedule_shape(num_sms, schedule["dyn_slots"])
+        if schedule["kind"] == "dyn"
+        else _runtime.metadata_shape(num_sms)
+    )
+    bindings = _host_bindings(schedule, num_sms, rows)
+    _runtime.check_schedule_bindings(bindings, num_sms=num_sms, schedule=schedule)
+    _runtime.check_schedule_bindings(
+        {"metadata": bindings["metadata"]}, num_sms=num_sms, schedule=schedule
+    )
+
+    def broken(stage, **changes):
+        return {**bindings, stage: {**bindings[stage], **changes}}
+
+    other = bindings["logits"]["schedule_meta"].clone()
+    cases = [
+        (broken("metadata", grid_x=2), r"grid \(1, 1, 1\)"),
+        (broken("metadata", grid_z=2), r"grid \(1, 1, 1\)"),
+        (broken("metadata", num_sms=num_sms + 1), "CTA budget"),
+        (broken("logits", grid_x=num_sms + 1), "logits stage must launch"),
+        (broken("logits", grid_y=2), "logits stage must launch"),
+        (broken("logits", schedule_meta=other), "buffer the scheduler writes"),
+        (_host_bindings(schedule, num_sms, (rows[0] - 1, 2)), "int32 words"),
+        (_host_bindings(schedule, num_sms, (rows[0] + 1, 2)), "int32 words"),
+    ]
+    if schedule["kind"] == "dyn":
+        cases.append(
+            (broken("metadata", dyn_slots=schedule["dyn_slots"] + 1), "dyn_slots")
+        )
+    else:
+        cases.append(
+            (
+                _host_bindings(
+                    schedule, num_sms, _runtime.dyn_schedule_shape(num_sms, 8)
+                ),
+                "int32 words",
+            )
+        )
+    for bad, match in cases:
+        with pytest.raises(ValueError, match=match):
+            _runtime.check_schedule_bindings(bad, num_sms=num_sms, schedule=schedule)
 
 
 def _inside(data):
