@@ -2083,9 +2083,10 @@ class KdaWorkspace:
         self._epoch: list[int] = [0]
         # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
         # host-derived state blocks and tail counts and the device copy of those integers (None until a call needs
-        # it)
+        # it); the doc_lengths a CUDA-graph capture used, whose entries the cache keeps for the workspace's lifetime
         self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
+        self._doc_graphs: set[tuple[int, ...]] = set()
 
     def views(self, mode: str) -> types.SimpleNamespace:
         """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
@@ -2236,6 +2237,7 @@ class KdaWorkspace:
         other._views_cache = {}
         other._batch_views = {}
         other._doc_cache = {}
+        other._doc_graphs = set()
         return other
 
     def with_plan(self, plan: Plan) -> KdaWorkspace:
@@ -2271,7 +2273,9 @@ class KdaWorkspace:
         lengths'.  The copy goes from pinned host memory on the current stream without blocking: the host never
         waits for the device.  Under CUDA-graph capture the copy must already be cached (``RuntimeError``
         otherwise): a captured copy would read a host buffer the graph does not own, so a batched call is captured
-        on a caller-owned workspace that ran these ``doc_lengths`` once before the capture."""
+        on a caller-owned workspace that ran these ``doc_lengths`` once before the capture.  A captured graph reads
+        the copy at each replay, so the cache keeps the packings a capture used for the workspace's lifetime (as
+        the arena the graph also reads) and evicts only the others."""
         packing = self._packing(doc_lengths)
         return None if packing is None else (packing.batches, packing.lengths)
 
@@ -2280,20 +2284,26 @@ class KdaWorkspace:
         if not self.arena_option.batched:
             return None
         key = self.plan.check_doc_lengths(doc_lengths)
+        capturing = torch.cuda.is_current_stream_capturing()
         entry = self._doc_cache.get(key)
         if entry is None:
-            if len(self._doc_cache) >= 8:
-                self._doc_cache.pop(next(iter(self._doc_cache)))
             entry = _host_packing(self.plan, self.arena_option, key)
         if entry.words_dev is None:
-            if torch.cuda.is_current_stream_capturing():
+            if capturing:
                 raise RuntimeError(
                     "KdaWorkspace: a batched arena under CUDA-graph capture needs the device copy of these "
                     "doc_lengths made before the capture: pass a caller-owned workspace and run it once with "
                     "these doc_lengths outside the capture"
                 )
             entry = entry.to(self.device)
+        if key not in self._doc_cache:
+            # a new packing evicts the oldest of 8 cached ones no capture used (a graph reads its copy at each replay)
+            free = [k for k in self._doc_cache if k not in self._doc_graphs]
+            if len(free) >= 8:
+                self._doc_cache.pop(free[0])
         self._doc_cache[key] = entry
+        if capturing:
+            self._doc_graphs.add(key)
         return entry
 
     def paths(self) -> tuple[str, ...]:

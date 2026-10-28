@@ -6741,3 +6741,62 @@ def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None
         cake_backend.chunk_kda_fwd(
             q, k, v, g, beta, cu, workspace=fresh, doc_lengths=lengths
         )
+
+
+def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
+    device, manifest
+) -> None:
+    """A captured graph reads the device copy of its ``doc_lengths`` (the lengths, the tail counts and the block
+    indices of its group that is not one run) at each replay, so the workspace keeps that packing for its
+    lifetime: nine other packs run eagerly after the capture (the cache's eight and one more) evict the oldest of
+    them, never the captured one, and the replay still gives the eager results bit for bit."""
+    lengths, heads = (640, 64, 320), 2
+    others = [
+        (640, 320, 64),
+        (320, 640, 64),
+        (64, 640, 320),
+        (320, 64, 640),
+        (64, 320, 640),
+        (600, 360, 64),
+        (600, 64, 360),
+        (360, 600, 64),
+        (64, 600, 360),
+    ]
+    S, N = sum(lengths), len(lengths)
+    assert all(sum(o) == S and len(o) == N for o in others)
+    names = ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    arena = cake_backend.KdaArena(lean=True, tail_passes=3, batch_tokens=704)
+    # sized for the bound of every group, so every pack of the problem fits
+    ws = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape", arena=arena)
+    assert ws.plan.recur == "seg"
+
+    def fwd_bwd(pack, inputs):
+        q, k, v, g, beta, cu, dout = (inputs[n] for n in names)
+        o, saved = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, doc_lengths=pack
+        )
+        got = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, doc_lengths=pack
+        )
+        return [o, saved.seg_m, *got]
+
+    inputs = make_inputs(lengths, heads, device)
+    reference = [x.clone() for x in fwd_bwd(lengths, inputs)]
+    packing = ws._doc_cache[lengths]
+    assert packing.blocks[0] is None and packing.index_dev is not None
+    assert packing.tail_counts(1, packing.batches[1].NC_pad_tape) is not None
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        results = fwd_bwd(lengths, inputs)
+    assert ws._doc_graphs == {lengths}
+    for pack in others:
+        fwd_bwd(pack, make_inputs(pack, heads, device))
+    assert list(ws._doc_cache) == [lengths, *others[1:]]
+    kept = ws._doc_cache[lengths]
+    assert kept.words_dev is packing.words_dev and kept.index_dev is packing.index_dev
+    graph.replay()
+    torch.cuda.synchronize()
+    assert len(results) == len(reference) == 7
+    for i, (a, b) in enumerate(zip(results, reference, strict=True)):
+        assert _bits_equal(a, b), i
