@@ -6470,6 +6470,7 @@ def _check_mm_mxfp8_problem_size(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
+    pdl_wait_for_weight: bool = False,  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -6589,6 +6590,7 @@ def _cutlass_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    pdl_wait_for_weight: bool = False,  # unused
 ):
     # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
@@ -6619,6 +6621,7 @@ def _trtllm_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["trtllm", "auto"] = "auto",
+    pdl_wait_for_weight: bool = False,  # unused
 ):
     if out_dtype != torch.bfloat16:
         return False
@@ -6647,6 +6650,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    pdl_wait_for_weight: bool = False,  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -6669,6 +6673,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
+    pdl_wait_for_weight: bool = False,  # unused
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
         if backend != "cutedsl_low_latency":
@@ -6700,6 +6705,7 @@ def _cudnn_mm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    pdl_wait_for_weight: bool = False,  # unused
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -7615,6 +7621,7 @@ def _heuristic_func_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
+    pdl_wait_for_weight: bool = False,  # unused
 ) -> List[str]:
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
@@ -7656,6 +7663,7 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    pdl_wait_for_weight: bool = False,
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -7715,6 +7723,15 @@ def mm_mxfp8(
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
+
+    pdl_wait_for_weight: bool
+        Wait for upstream PDL producers before reading ``b`` and ``b_descale``
+        in the ``"cutedsl_low_latency"`` backend, including when selected by
+        ``"auto"``. Set this to ``True`` if an overlapping producer writes
+        either the weights or their scales, for example PDL weight quantization.
+        Defaults to ``False``, which requires both to be ready and preserves
+        weight prefetch overlap with activation producers. Other backends ignore
+        this option and retain their existing synchronization.
 
     Returns
     -------
@@ -7799,7 +7816,7 @@ def mm_mxfp8(
             else _cute_dsl_mxfp8_runners(major, minor, True, out_dtype, inputs)
         ),
         "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
-            major * 10 + minor, True
+            major * 10 + minor, True, pdl_wait_for_weight=pdl_wait_for_weight
         ),
         "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
         "b12x": lambda: _b12x_gemm_mxfp8_runner(major, minor, True, out_dtype),
@@ -8415,6 +8432,7 @@ _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 def _cutedsl_low_latency_blockscaled_gemm_runner(
     sm_version: int,
     enable_pdl: bool,
+    pdl_wait_for_weight: bool = False,
 ) -> TunableRunner:
     """Create a runner for low-latency block-scaled GEMM tactics."""
     import cutlass
@@ -8529,6 +8547,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
             return (
                 *dtypes,
                 enable_pdl,
+                pdl_wait_for_weight,
                 alpha_tensor is not None,
                 bias_tensor is not None,
             )
@@ -8647,6 +8666,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                 sf_vec_size,
                 c_cutlass_dtype,
                 enable_pdl,
+                pdl_wait_for_weight,
                 scale_tensor is not None,
                 bias_tensor is not None,
                 tactic,
@@ -8678,6 +8698,7 @@ def _cutedsl_low_latency_blockscaled_gemm_runner(
                     num_sfb_tmem_stage=num_sfb_tmem_stage,
                     sf_vec_size=sf_vec_size,
                     use_pdl=enable_pdl,
+                    pdl_wait_for_weight=pdl_wait_for_weight,
                     split_k=split_k,
                     use_scale=scale_tensor is not None,
                     use_bias=bias_tensor is not None,

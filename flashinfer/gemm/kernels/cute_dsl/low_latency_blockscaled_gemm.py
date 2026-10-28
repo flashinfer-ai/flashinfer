@@ -217,6 +217,7 @@ class LowLatencyBlockscaledGemmKernel:
         sfb_tmem_store: bool = False,
         use_scale: bool = False,
         use_bias: bool = False,
+        pdl_wait_for_weight: bool = False,
     ):
         """Initialize the Low-Latency blockscaled GEMM kernel configuration.
 
@@ -243,6 +244,10 @@ class LowLatencyBlockscaledGemmKernel:
         :type use_scale: bool
         :param use_bias: Add an M-element bias in the epilogue, broadcast across N and L.
         :type use_bias: bool
+        :param pdl_wait_for_weight: Wait before reading A and SFA when an upstream
+            PDL producer writes them. False requires A/SFA to be ready and allows
+            weight prefetch to overlap the producer of B/SFB.
+        :type pdl_wait_for_weight: bool
         """
         if split_k > 1 and acc_dtype is not cutlass.Float32:
             raise ValueError(
@@ -264,6 +269,7 @@ class LowLatencyBlockscaledGemmKernel:
         self.sfb_tmem_store = sfb_tmem_store
         self.use_scale = use_scale
         self.use_bias = use_bias
+        self.pdl_wait_for_weight = pdl_wait_for_weight
 
         # Size the distributed shared memory mailbox used by split-K
         self._mailbox_elems_per_thread = (cta_m * cta_n) // 128
@@ -1090,8 +1096,8 @@ class LowLatencyBlockscaledGemmKernel:
         tAgSFA = cute.filter_zeros(tAgSFA)
         tAgSFA = tAgSFA[(None, work_tile_info.M_idx, None, work_tile_info.L_idx)]
 
-        # Weights and their scales can be produced by the preceding grid.
-        if self.use_pdl:
+        # Ready weights can be prefetched while the activation producer runs.
+        if self.use_pdl and self.pdl_wait_for_weight:
             cute.arch.griddepcontrol_wait()
 
         # Empty barriers start at phase 0, so the producer starts at phase 1
