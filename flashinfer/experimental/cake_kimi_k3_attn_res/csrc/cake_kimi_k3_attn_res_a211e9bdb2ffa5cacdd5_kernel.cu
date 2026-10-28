@@ -600,6 +600,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             }
                         }
                     }
+#if __CUDA_ARCH__ != 1000
+                    asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+#endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     unsigned int stats_stage_base = consumer_stage * 64;
@@ -641,7 +644,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             }
                         }
                     }
+#if __CUDA_ARCH__ == 1000
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+#endif
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     int stat_source = lane / 8;
                     int stat_warp = lane % 8;

@@ -652,6 +652,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             }
                         }
                     }
+#if __CUDA_ARCH__ != 1000
+                    asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+#endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
@@ -694,7 +697,9 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                             }
                         }
                     }
+#if __CUDA_ARCH__ == 1000
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+#endif
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
