@@ -69,6 +69,7 @@ top-level exposure are covered by ``test_cake_causal_conv1d_train_api.py``.
 
 from __future__ import annotations
 
+import itertools
 import re
 import statistics
 from fractions import Fraction
@@ -315,6 +316,18 @@ def _backward_thresholds(arch: str, kind: str = "bwd") -> tuple[int, ...]:
         if rule is not None and arch in rule["channels"]:
             thresholds.add(int(rule["channels"][arch]))
     return tuple(sorted(thresholds))
+
+
+def _token_floors(arch: str, kind: str = "bwd") -> dict[str, tuple[int, int]]:
+    """The routed programs of route ``kind`` on ``arch`` whose rule carries a token floor: name -> (channel
+    threshold, token floor)."""
+
+    floors = {}
+    for name in loader.route_modules(arch, kind):
+        rule = loader.select_rule(loader.MODULES[name])
+        if rule is not None and arch in rule.get("tokens", {}):
+            floors[name] = (int(rule["channels"][arch]), int(rule["tokens"][arch]))
+    return floors
 
 
 def _fallback_program(arch: str, kind: str = "bwd") -> str:
@@ -716,6 +729,305 @@ def test_channel_split_literal_table() -> None:
     assert "flags" in loader.LOGICAL_SCALARS and "flags" not in loader.PLAN_SCALARS
 
 
+# The whole-rank trim of the backward main grid (``cake_jit.main_grid``) at 128
+# threads x 8 channels: ``(arch, co-resident grid, S, C) -> grid`` on the
+# routes the arch's rule trims (sm_103a: ``bwd`` at 304 CTAs; sm_100a: ``bwd``
+# / ``bwd_dt`` / ``bwd_fp32g`` at 296; sm_107a: none); every other route keeps
+# the co-resident grid.  The rows are the kernel module's rules-test rows.
+MAIN_GRID_TABLE = (
+    # sm_103a, 304 CTAs: C % 32, 1 < tiles <= {32: 27, 64: 9}, S >= 98304 and
+    # a last tile of at least {32: 15, 64: 49} vectors
+    ("sm_103a", 304, 250340, 1160, 300),  # ct_vec 32, 5 tiles, last tile 17
+    ("sm_103a", 304, 98304, 1144, 300),  # last tile 15
+    ("sm_103a", 304, 98304, 1136, 304),  # last tile 14
+    ("sm_103a", 304, 98303, 1160, 304),  # below the S bound
+    ("sm_103a", 304, 81920, 1160, 304),
+    ("sm_103a", 304, 250340, 1032, 304),  # last tile 1
+    ("sm_103a", 304, 250340, 1152, 304),  # C % 32 == 0
+    ("sm_103a", 304, 250340, 1184, 304),
+    ("sm_103a", 304, 250340, 1656, 301),  # 7 tiles, last 15
+    ("sm_103a", 304, 250340, 2168, 297),  # 9 tiles, last 15
+    ("sm_103a", 304, 250340, 2160, 304),  # 9 tiles, last 14
+    ("sm_103a", 304, 250340, 1416, 303),  # ct_vec 64, 3 tiles, last 49
+    ("sm_103a", 304, 250340, 1352, 304),  # ct_vec 64, last 41
+    ("sm_103a", 304, 250340, 2440, 300),  # ct_vec 64, 5 tiles, last 49
+    ("sm_103a", 304, 250340, 2376, 304),  # ct_vec 64, 5 tiles, last 41
+    ("sm_103a", 304, 250340, 2928, 304),  # ct_vec 128: never
+    ("sm_103a", 304, 250340, 1344, 304),  # C % 32 == 0
+    ("sm_103a", 304, 250340, 2048, 304),  # 2 tiles divide the grid
+    ("sm_103a", 304, 250340, 1000, 304),  # one tile
+    ("sm_103a", 304, 250340, 6904, 297),  # ct_vec 32, 27 tiles, last 31
+    ("sm_103a", 304, 250340, 4344, 289),  # ct_vec 32, 17 tiles, last 31
+    ("sm_103a", 304, 250340, 7416, 304),  # ct_vec 32, 29 tiles: past the cap
+    ("sm_103a", 304, 250340, 7928, 304),  # ct_vec 32, 31 tiles
+    ("sm_103a", 304, 250340, 8392, 304),  # ct_vec 32, 33 tiles
+    ("sm_103a", 304, 250340, 4488, 297),  # ct_vec 64, 9 tiles, last 49
+    ("sm_103a", 304, 250340, 5512, 304),  # ct_vec 64, 11 tiles
+    ("sm_103a", 296, 250340, 1160, 296),  # another co-resident grid
+    ("sm_103a", 300, 250340, 1160, 300),
+    ("sm_103a", 608, 250340, 1160, 608),
+    # sm_100a, 296 CTAs: the classes (32, 5) from S 147456 with a last tile of
+    # at least 27, (32, 7) from 65536 with 31, (64, 3) from 147456 with 59
+    ("sm_100a", 296, 250340, 1240, 295),  # ct_vec 32, 5 tiles, last 27
+    ("sm_100a", 296, 147456, 1264, 295),  # last 30, the class's S
+    ("sm_100a", 296, 458752, 1272, 295),  # last 31
+    ("sm_100a", 296, 147455, 1272, 296),  # below the class's S
+    ("sm_100a", 296, 458752, 1232, 296),  # last 26
+    ("sm_100a", 296, 250340, 1160, 296),  # last 17
+    ("sm_100a", 296, 250340, 1248, 296),  # C % 32 == 0
+    ("sm_100a", 296, 65536, 1784, 294),  # ct_vec 32, 7 tiles, last 31
+    ("sm_100a", 296, 65535, 1784, 296),  # below the class's S
+    ("sm_100a", 296, 250340, 1776, 296),  # 7 tiles, last 30
+    ("sm_100a", 296, 250340, 1656, 296),  # 7 tiles, last 15
+    ("sm_100a", 296, 250340, 2680, 296),  # 11 tiles: no class
+    ("sm_100a", 296, 250340, 2168, 296),  # 9 tiles: no class
+    ("sm_100a", 296, 147456, 1496, 294),  # ct_vec 64, 3 tiles, last 59
+    ("sm_100a", 296, 458752, 1528, 294),  # last 63
+    ("sm_100a", 296, 147455, 1528, 296),  # below the class's S
+    ("sm_100a", 296, 458752, 1488, 296),  # last 58
+    ("sm_100a", 296, 250340, 1416, 296),  # last 49
+    ("sm_100a", 296, 250340, 1504, 296),  # C % 32 == 0
+    ("sm_100a", 296, 250340, 2440, 296),  # ct_vec 64, 5 tiles: no class
+    ("sm_100a", 296, 250340, 2928, 296),  # ct_vec 128: no class
+    ("sm_100a", 304, 250340, 1272, 304),  # another co-resident grid
+    # sm_107a: no class
+    ("sm_107a", 424, 250340, 1416, 424),
+    ("sm_107a", 424, 65536, 1528, 424),
+    ("sm_107a", 424, 250340, 1160, 424),
+    ("sm_107a", 424, 250340, 2440, 424),
+    ("sm_107a", 296, 250340, 1160, 296),
+)
+MAIN_GRID_TRIMMED_ROUTES = {
+    "sm_100a": ("bwd", "bwd_dt", "bwd_fp32g"),
+    "sm_103a": ("bwd",),
+    "sm_107a": (),
+}
+
+
+def test_main_grid_literal_table() -> None:
+    """The backward main grid's whole-rank trim against the literal table, per
+    arch and route; ``grid_mult`` above 1 or a call naming no row keeps the
+    co-resident grid times ``grid_mult``."""
+
+    geometry = {"threads": 128, "vec": 8}
+    assert loader.TILE_ALIGNED_GRID == {"sm_100a": 0, "sm_103a": 304, "sm_107a": 0}
+    assert loader.TILE_ALIGNED_ROUTES == ("bwd",)
+    assert loader.TILE_ALIGNED_MIN_S == 98304
+    assert loader.TILE_ALIGNED_MIN_LAST == {32: 15, 64: 49}
+    assert loader.TILE_ALIGNED_MAX_TILES == {32: 27, 64: 9}
+    assert loader.TILE_ALIGNED_CLASSES == {
+        "sm_100a": {
+            (296, 32, 5): (147456, 27),
+            (296, 32, 7): (65536, 31),
+            (296, 64, 3): (147456, 59),
+        },
+        "sm_103a": {},
+        "sm_107a": {},
+    }
+    assert loader.TILE_ALIGNED_CLASS_ROUTES == {
+        "sm_100a": ("bwd", "bwd_dt", "bwd_fp32g"),
+        "sm_103a": (),
+        "sm_107a": (),
+    }
+    assert set(MAIN_GRID_TRIMMED_ROUTES) == set(loader.ARCHES)
+    for arch, co_resident, S, C, grid in MAIN_GRID_TABLE:
+        ct_vec, _, n_ch_tiles = loader.channel_split(C, geometry=geometry, role="bwd")
+        row = {"C": C, "n_ch_tiles": n_ch_tiles, "S": S, "ct_vec": ct_vec}
+        for kind in ROUTE_SETTINGS:
+            trims = kind in MAIN_GRID_TRIMMED_ROUTES[arch]
+            got = loader.main_grid(co_resident, arch=arch, route=kind, **row)
+            assert got == (grid if trims else co_resident), (arch, kind, S, C)
+            assert (
+                loader.main_grid(co_resident, arch=arch, grid_mult=2, route=kind, **row)
+                == 2 * co_resident
+            ), (arch, kind, S, C)
+            assert got % n_ch_tiles == 0 or got == co_resident, (arch, kind, S, C)
+        assert loader.main_grid(co_resident, arch=arch, **row) == co_resident
+        assert loader.main_grid(co_resident, arch=arch, C=C, route="bwd") == co_resident
+    assert loader.main_grid(304, arch="sm_103a", grid_mult=4) == 1216
+    with pytest.raises(ValueError):
+        loader.main_grid(304, arch="sm_103a", grid_mult=0)
+
+
+# The default backward route's program per ``(arch, S, C)`` below C = 512
+# (``cake_jit.selected_modules``): the ``stage_pair`` fallback of each arch,
+# except on sm_107a for 256 <= C < 512 from S = 262144 tokens, where the
+# ``vec=8, min_blocks=2`` program (four-token copy stages) runs.  The rows are
+# the kernel module's rules-test rows on both sides of the token and channel
+# boundaries; C = 512 is the first channel-selected program of every arch.
+BWD_FALLBACK = {
+    "sm_100a": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
+    "sm_103a": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
+    "sm_107a": "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
+}
+BWD_R200_ST4 = "cake_causal_conv1d_train_9a07bcaa0223632640ee"
+BWD_AT_512 = {
+    "sm_100a": "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
+    "sm_103a": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
+    "sm_107a": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
+}
+BWD_SELECTION_TOKENS = (250340, 262143, 262144, 300007)
+BWD_SELECTION_CHANNELS = (128, 248, 255, 256, 384, 504, 511, 512)
+
+
+def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
+    if C >= 512:
+        return BWD_AT_512[arch]
+    if arch == "sm_107a" and S >= 262144 and C >= 256:
+        return BWD_R200_ST4
+    return BWD_FALLBACK[arch]
+
+
+def test_backward_selection_literal_table() -> None:
+    """The default backward route's program below C = 512 against the literal
+    table, per arch, S and C; the token floor needs S (``ValueError`` without
+    it, on sm_107a for 256 <= C < 512 alone), and no other route or arch has
+    one."""
+
+    rule = loader.select_rule(loader.MODULES[BWD_R200_ST4])
+    assert rule == {
+        "channels": {"sm_107a": 256},
+        "kind": "channels_tokens_at_least",
+        "tokens": {"sm_107a": 262144},
+    }
+    assert loader.MODULES[BWD_R200_ST4]["arches"] == ["sm_107a"]
+    for arch in loader.ARCHES:
+        for S in BWD_SELECTION_TOKENS:
+            for C in BWD_SELECTION_CHANNELS:
+                got = loader.selected_modules(arch, "bwd", C=C, S=S)
+                assert got == (_bwd_selection_of_record(arch, S, C),), (arch, S, C)
+        for C in BWD_SELECTION_CHANNELS:
+            if arch == "sm_107a" and 256 <= C < 512:
+                with pytest.raises(ValueError, match="needs S"):
+                    loader.selected_modules(arch, "bwd", C=C)
+            else:
+                got = loader.selected_modules(arch, "bwd", C=C)
+                assert got == (_bwd_selection_of_record(arch, 1, C),), (arch, C)
+        for kind in loader.KINDS:
+            if kind == "bwd" or kind not in loader.ROUTES[arch]:
+                continue
+            for name in loader.route_modules(arch, kind):
+                rule = loader.select_rule(loader.MODULES[name])
+                channels_only = rule is None or rule["kind"] == "channels_at_least"
+                assert channels_only, (arch, kind, name)
+
+
+def test_backward_launches_the_whole_rank_grid(monkeypatch) -> None:
+    """A backward call launches :func:`cake_jit.launch_grid` of the call's
+    ``(S, C)``: the main program and its reduce see that CTA count as
+    ``main_ctas`` and a partial view of its rows; on the device whose
+    co-resident grid the rule was measured at, the row runs on whole ranks."""
+
+    arch = _arch()
+    device = _device()
+    S, C = {"sm_100a": (250340, 1240)}.get(arch, (250340, 1160))
+    x, w, cu, dy = _inputs(S, C, None)
+    launched = []
+
+    def record_launches(launches, values, *, device_index):
+        launched.extend((name, dict(values), grid) for name, grid in launches)
+
+    monkeypatch.setattr(pkg, "run_modules", record_launches)
+    cake_causal_conv1d_train_backward(x, w, cu, dy)
+    main = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
+    record = loader.MODULES[main]
+    assert [name for name, _, _ in launched] == [main, record["reduce"]]
+    values = launched[0][1]
+    ct_vec, _, n_ch_tiles = loader.channel_split(
+        C, geometry=record["grid_rule"]["geometry"], role="bwd"
+    )
+    co_resident = record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
+    want = loader.main_grid(
+        co_resident,
+        arch=arch,
+        grid_mult=loader.grid_mult(record, arch),
+        C=C,
+        n_ch_tiles=n_ch_tiles,
+        S=S,
+        ct_vec=ct_vec,
+        route="bwd",
+    )
+    assert loader.record_route(record, arch) == "bwd"
+    assert loader.launch_grid(record, device_index=device.index, C=C, S=S) == (
+        want,
+        1,
+        1,
+    )
+    assert values["main_ctas"] == want
+    # The main program launches the grid the call planned; the reduce plans its own (C / 4 CTAs).
+    assert launched[0][2] == (want, 1, 1) and launched[1][2] is None
+    assert values["partial"].shape[0] == loader.partial_rows(want, n_ch_tiles)
+    untrimmed = loader.launch_grid(record, device_index=device.index)[0]
+    assert untrimmed == loader.grid_per_sm(record, arch) * loader.sm_count(device.index)
+    if (arch, co_resident) in (("sm_103a", 304), ("sm_100a", 296)) and (
+        loader.grid_mult(record, arch) == 1
+    ):
+        assert want < untrimmed and want % n_ch_tiles == 0, (arch, want, untrimmed)
+    else:
+        assert want == untrimmed, (arch, co_resident, want)
+
+
+def test_launch_grid_plans_the_row_only_where_a_rule_may_trim(monkeypatch) -> None:
+    """:func:`cake_jit.launch_grid` of a row equals :func:`cake_jit.main_grid`
+    of the row's plan and route on every backward record, architecture and
+    co-resident grid swept; rows :func:`cake_jit.row_may_trim` rejects (no
+    rule names them) launch the untrimmed grid without planning the row."""
+
+    planned = []
+    split = loader.channel_split
+
+    def counting_split(*args, **kwargs):
+        planned.append(args)
+        return split(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "channel_split", counting_split)
+    tokens = (4097, 65535, 65536, 98303, 98304, 147455, 147456, 250340)
+    checked = trimmed = 0
+    for arch in loader.ARCHES:
+        monkeypatch.setattr(loader, "device_arch", lambda device_index, arch=arch: arch)
+        names = sorted(
+            {name for kind in loader.ROUTES[arch] for name in loader.ROUTES[arch][kind]}
+        )
+        records = [
+            loader.MODULES[name]
+            for name in names
+            if loader.MODULES[name]["grid_rule"]["kind"] == "occupancy"
+        ]
+        assert records, arch
+        for sms in (148, 152):
+            monkeypatch.setattr(loader, "sm_count", lambda device_index, sms=sms: sms)
+            for record in records:
+                rule = record["grid_rule"]
+                co_resident = int(rule["ctas_per_sm"]) * sms
+                factor = loader.grid_mult(record, arch)
+                for C in range(8, 4100, 8):
+                    for S in tokens:
+                        del planned[:]
+                        got = loader.launch_grid(record, device_index=0, C=C, S=S)[0]
+                        ct_vec, _, n_ch_tiles = split(
+                            C, geometry=rule["geometry"], role=record["role"]
+                        )
+                        want = loader.main_grid(
+                            co_resident,
+                            arch=arch,
+                            grid_mult=factor,
+                            C=C,
+                            n_ch_tiles=n_ch_tiles,
+                            S=S,
+                            ct_vec=ct_vec,
+                            route=loader.record_route(record, arch),
+                        )
+                        key = (arch, sms, record["library"], C, S)
+                        assert got == max(1, want), key
+                        may = loader.row_may_trim(
+                            record, arch, co_resident, factor, C, S
+                        )
+                        assert bool(planned) == may, key
+                        checked += 1
+                        trimmed += got < co_resident * factor
+    assert checked and trimmed, (checked, trimmed)
+
+
 def test_route_tables() -> None:
     """The host's argument -> route map and the route vocabulary."""
 
@@ -833,7 +1145,8 @@ def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 def test_backward_programs_switch_on_channel_count(kind) -> None:
     """Exactly one program of the route runs per call, every program of the route runs for some channel count,
-    and each matches the reference on both sides of its channel threshold with a NaN-poisoned workspace."""
+    and each matches the reference on both sides of its channel threshold (and of its token floor, where its rule
+    has one) with a NaN-poisoned workspace."""
 
     _require_route(kind)
     arch = _arch()
@@ -844,30 +1157,35 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
             f"the {kind} route on {arch} ships one program ({names[0]}); nothing switches"
         )
     channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    rows = [
+        (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
+    ]
+    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold.
+    for T, floor in _token_floors(arch, kind).values():
+        rows += [(S, "perf", C) for S in (floor - 8, floor) for C in (T - 8, T, T + 8)]
     launched = set()
-    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
-        for C in channels:
-            selected = loader.selected_modules(arch, kind, C=C, S=S)
-            assert len(selected) == 1, f"S={S} C={C}: {selected}"
-            launched.add(selected[0])
-            x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
-            workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
-            # Poison the whole buffer (sized for the largest partial buffer over every route): the selected
-            # program must rewrite every partial row (and dbias row) it reduces.
-            workspace.view(torch.float32).fill_(float("nan"))
-            _check(
-                S,
-                C,
-                docs,
-                x=x,
-                w=w,
-                cu=cu,
-                dy=dy,
-                b=b,
-                policy=policy,
-                workspace=workspace,
-                label=f"S={S} C={C} docs={docs} program={selected[0]}",
-            )
+    for S, docs, C in rows:
+        selected = loader.selected_modules(arch, kind, C=C, S=S)
+        assert len(selected) == 1, f"S={S} C={C}: {selected}"
+        launched.add(selected[0])
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
+        workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
+        # Poison the whole buffer (sized for the largest partial buffer over every route): the selected
+        # program must rewrite every partial row (and dbias row) it reduces.
+        workspace.view(torch.float32).fill_(float("nan"))
+        _check(
+            S,
+            C,
+            docs,
+            x=x,
+            w=w,
+            cu=cu,
+            dy=dy,
+            b=b,
+            policy=policy,
+            workspace=workspace,
+            label=f"S={S} C={C} docs={docs} program={selected[0]}",
+        )
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
@@ -1129,19 +1447,30 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     x, w, cu, dy = _inputs(S, C, docs)
     launched = []
 
-    def record_launch(name, values, *, device_index):
-        launched.append((name, dict(values), device_index))
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append((name, dict(values), device_index, grid))
 
+    def record_launches(launches, values, *, device_index):
+        for name, grid in launches:
+            record_launch(name, values, device_index=device_index, grid=grid)
+
+    # The backward issues its pair through run_modules, the forward its program through run_module.
     monkeypatch.setattr(pkg, "run_module", record_launch)
+    monkeypatch.setattr(pkg, "run_modules", record_launches)
     cake_causal_conv1d_train_backward(x, w, cu, dy)
     arch = _arch()
     main = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
     record = loader.MODULES[main]
-    assert [name for name, _, _ in launched] == [main, record["reduce"]]
-    assert {index for _, _, index in launched} == {device.index}
+    assert [name for name, _, _, _ in launched] == [main, record["reduce"]]
+    assert {index for _, _, index, _ in launched} == {device.index}
     values, reduce_values = launched[0][1], launched[1][1]
     assert reduce_values == values, "both launches see one argument set"
     grid_x = loader.launch_grid(record, device_index=device.index)[0]
+    # The main program launches the grid the call planned (run_module does not plan it again).
+    assert launched[0][3] == loader.launch_grid(
+        record, device_index=device.index, C=C, S=S
+    )
+    assert launched[1][3] is None
     _, _, n_ch_tiles = loader.channel_split(
         C, geometry=record["grid_rule"]["geometry"], role=record["role"]
     )
@@ -1158,17 +1487,37 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
         loader.launch_grid(reduce, device_index=device.index)
     launched.clear()
     cake_causal_conv1d_train_forward(x, w, cu)
-    assert [name for name, _, _ in launched] == list(
+    assert [name for name, _, _, _ in launched] == list(
         loader.selected_modules(arch, "fwd", C=C, S=S)
     )
     # The forward passes its token-chunk counters: int32, at least two words per channel tile of its plan.
     forward = loader.MODULES[launched[0][0]]
+    assert launched[0][3] == loader.launch_grid(
+        forward, device_index=device.index, C=C, S=S
+    )
     work = launched[0][1]["work"]
     _, _, fwd_tiles = loader.channel_split(
         C, geometry=forward["grid_rule"]["geometry"], role="fwd"
     )
     assert work.dtype == torch.int32 and work.numel() >= 2 * fwd_tiles
     assert loader.counter_words(forward, fwd_tiles) == 2 * fwd_tiles
+
+
+def test_run_module_names_a_missing_argument() -> None:
+    """``run_module`` refuses ``values`` that lack a logical name its module binds, naming that name and the
+    kernel parameter, before it loads or launches anything (here with the caller's planned grid)."""
+
+    name = next(
+        name
+        for name, record in loader.MODULES.items()
+        if record["role"] == "bwd" and record["workspace_rule"] is not None
+    )
+    first = loader.MODULES[name]["arg_plan"][0][1]
+    logical = loader.MODULES[name]["logical"][first]
+    with pytest.raises(
+        ValueError, match=rf"needs '{logical}' \(kernel parameter '{first}'\)"
+    ):
+        loader.run_module(name, {"C": 8, "S": 8}, device_index=0, grid=(1, 1, 1))
 
 
 def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
@@ -1583,11 +1932,16 @@ def test_workspace_bytes_and_layout() -> None:
             assert selected["workspace_rule"]["taps"] == (
                 WIDTH + 1 if "bias" in kind else WIDTH
             ), kind
-    # Both sides of every threshold of every route stay within the capacity.
+    # Both sides of every threshold of every route (and of every token floor) stay within the capacity.
     for kind in loader.backward_kinds(arch):
+        token_counts = sorted(
+            {1, *(floor for _, floor in _token_floors(arch, kind).values())}
+        )
         for T in _backward_thresholds(arch, kind):
-            for C in (T - 8, T, 8192):
-                selected = loader.MODULES[loader.selected_modules(arch, kind, C=C)[0]]
+            for C, S in itertools.product((T - 8, T, 8192), token_counts):
+                selected = loader.MODULES[
+                    loader.selected_modules(arch, kind, C=C, S=S)[0]
+                ]
                 _, _, n_ch_tiles = loader.channel_split(
                     C,
                     geometry=selected["grid_rule"]["geometry"],
@@ -2157,12 +2511,19 @@ def test_registry_records_reference_the_build_manifest() -> None:
         if "b" in logical:
             assert "flags" in logical, name
         # The selection vocabulary: a forward or backward rule is ``channels_at_least`` with one positive
-        # multiple-of-8 threshold per architecture it names.
+        # multiple-of-8 threshold per architecture it names, or ``channels_tokens_at_least`` (a backward rule)
+        # with a positive token floor beside each threshold as well.
         rule = loader.select_rule(record)
         if rule is not None:
             assert record["role"] in ("fwd", "bwd"), name
-            assert set(rule) == {"kind", "channels"}, name
             assert rule["kind"] in loader.SELECT_KINDS, name
+            if rule["kind"] == "channels_tokens_at_least":
+                assert record["role"] == "bwd", name
+                assert set(rule) == {"kind", "channels", "tokens"}, name
+                assert set(rule["tokens"]) == set(rule["channels"]), name
+                assert all(tokens > 0 for tokens in rule["tokens"].values()), name
+            else:
+                assert set(rule) == {"kind", "channels"}, name
             assert set(rule["channels"]) <= set(record["arches"]), name
             for threshold in rule["channels"].values():
                 assert threshold > 0 and threshold % loader.CHANNEL_MULTIPLE == 0, name
@@ -2203,8 +2564,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
     # Per architecture and route, forward or backward: exactly one fallback record, every routed record's
     # rule names the architecture with its own threshold (distinct thresholds, at most three routed
-    # programs), one program selected per channel count -- the highest threshold at most C, the fallback
-    # below the lowest.
+    # programs without a token floor and at most one with one), one program selected per channel count and
+    # token count -- the highest threshold at most C whose token floor (if any) S meets, the fallback below
+    # the lowest.
     for arch in loader.ARCHES:
         for kind in loader.KINDS:
             if kind not in loader.ROUTES[arch]:
@@ -2225,15 +2587,31 @@ def test_registry_records_reference_the_build_manifest() -> None:
             ), (arch, kind, names)
             thresholds = [threshold for threshold, _ in positives]
             assert thresholds == sorted(set(thresholds)), (arch, kind, positives)
-            assert len(positives) <= 3, (arch, kind, positives)
-            previous = fallbacks[0]
-            for threshold, name in positives:
-                assert loader.selected_modules(arch, kind, C=threshold) == (name,)
-                assert loader.selected_modules(arch, kind, C=threshold - 8) == (
-                    previous,
-                )
-                previous = name
-            assert loader.selected_modules(arch, kind, C=8192) == (previous,)
+            floors = _token_floors(arch, kind)
+            assert len(positives) - len(floors) <= 3, (arch, kind, positives)
+            assert len(floors) <= 1, (arch, kind, floors)
+            for S in sorted({1, *(floor for _, floor in floors.values())}):
+                previous = fallbacks[0]
+                for threshold, name in positives:
+                    at = loader.selected_modules(arch, kind, C=threshold, S=S)
+                    if name in floors and floors[name][1] > S:
+                        # Below its token floor the program never runs.
+                        assert at == (previous,), (arch, kind, S, threshold)
+                        continue
+                    below = loader.selected_modules(arch, kind, C=threshold - 8, S=S)
+                    assert at == (name,), (arch, kind, S, threshold)
+                    assert below == (previous,), (arch, kind, S, threshold)
+                    previous = name
+                top = loader.selected_modules(arch, kind, C=8192, S=S)
+                assert top == (previous,), (arch, kind, S)
+            for name, (threshold, floor) in floors.items():
+                # A token floor decides at its threshold: S below it runs another
+                # program, and no S is refused.
+                at = loader.selected_modules(arch, kind, C=threshold, S=floor)
+                below = loader.selected_modules(arch, kind, C=threshold, S=floor - 1)
+                assert at == (name,) and below != (name,), (arch, kind, name)
+                with pytest.raises(ValueError, match="needs S"):
+                    loader.selected_modules(arch, kind, C=threshold)
             for C in (8, 128, 512, 1024, 1280, 8192):
                 selected = loader.selected_modules(arch, kind, C=C, S=1)
                 assert len(selected) == 1 and selected[0] in names, (

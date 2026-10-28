@@ -39,12 +39,13 @@ FP32 preactivation for the weight gradient) and ``bwd_bias_fp32g``;
 route and the ``flags`` bit mask (``FLAG_*``) tells a route's programs which
 of ``w``, ``dw``, ``b``, ``db`` are BF16.  A route, forward or backward, may
 carry several programs of its kernel and selects exactly one per call,
-chosen by the channel count: a record's
-``select_rule`` (``channels_at_least``: ``C >= channels[arch]``) names the
-channel counts it owns, of several owners the one of the highest threshold
+chosen by the channel count (and, for one record, the token count): a
+record's ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``;
+``channels_tokens_at_least``: that and ``S >= tokens[arch]``) names the
+calls it owns, of several owners the one of the highest channel threshold
 runs, the record without a rule is the route's fallback, and
 :func:`selected_modules` applies that rule (a pure function of the
-architecture, the route and ``C``; the host never reads the data).
+architecture, the route, ``C`` and ``S``; the host never reads the data).
 Token and channel counts are runtime scalars, so a changed problem size never
 recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
@@ -93,8 +94,10 @@ the channel tile rule :func:`channel_split` of the record's role: the forward
 and the backward rules differ where no multiple of 32 divides the channel
 vectors), :func:`launch_grid` (the grid:
 ``co_resident`` records launch ``ctas_per_sm x SM count`` CTAs, ``occupancy``
-records ``grid_mult x ctas_per_sm x SM count``, ``channels_per_cta`` records
-``ceil(C / channels_per_cta)``), :func:`partial_rows` (the backward
+records ``grid_mult x ctas_per_sm x SM count``, less the CTAs
+:func:`main_grid` drops to whole channel-tile ranks on the rows it names,
+``channels_per_cta`` records ``ceil(C / channels_per_cta)``),
+:func:`partial_rows` (the backward
 workspace rows) and :func:`counter_words` (the forward's ``work`` words);
 everything else derives from them.  The public workspace is
 sized by the backward program of the largest ``grid_mult x ctas_per_sm x
@@ -116,11 +119,15 @@ the route's keywords, the sm_107a programs the channel count selects with
 ``chunk_stages=2`` instead (two eight-token stages per sub-tile and chunk);
 every backward program carries ``revision=6`` (the
 build revision of the split that retired the cooperative form; the exporter
-hashes it so the split programs replaced the cooperative ones under new names)
-and is built with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
-thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
-min_blocks=2`` (two CTAs per SM) on sm_107a, and the backwards the
-``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
+hashes it so the split programs replaced the cooperative ones under new names);
+the default route's fallback is built with ``vec=8, copy="tma2d",
+stage_pair=True`` (eight channels, 16-byte vectors, per thread; 2-D TMA row
+copies; each eight-token copy stage consumed as two four-token halves, the
+dweight fold buffer in the stage ring) on sm_100a and sm_103a and with
+``min_blocks=2`` (two CTAs per SM) beside those on sm_107a, where for
+256 <= C < 512 from S = 262144 tokens the build of ``vec=8, min_blocks=2``
+(four-token copy stages, no ``stage_pair``) runs instead, and the backwards
+the ``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
 stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs per SM): as is
 on sm_100a from C = 512 and on sm_103a from 768, with ``fold_overlap=True,
 fast_roll=True`` (the dweight fold buffer over the stage slots, the stage body
@@ -130,8 +137,10 @@ with ``fast_roll=True, roll_prefetch=True`` (each rolled pass loads the
 next pass's rows before it computes) on sm_107a from 2048.  The programs of
 the six other routes are the same bodies built with ``dtype_flags=True`` (the
 ``flags`` scalar; untyped tap / bias pointers) plus ``bias=True`` for the
-bias routes and ``grad_pre="fp32"`` for the ``_fp32g`` routes; each record's
-comment names its build.
+bias routes and ``grad_pre="fp32"`` for the ``_fp32g`` routes, their backward
+fallbacks without ``stage_pair`` (``vec=8, copy="tma2d"`` on sm_100a and
+sm_103a, ``vec=8, min_blocks=2`` on sm_107a); each record's comment names its
+build.
 """
 
 from __future__ import annotations
@@ -238,7 +247,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "words_per_tile": 2,
         },
     },
-    "cake_causal_conv1d_train_e08749684c395f2ab65e": {
+    "cake_causal_conv1d_train_9bfa65707a49df6a48ce": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -270,6 +279,8 @@ MODULES: dict[str, dict[str, Any]] = {
         # CTA another stream's kernel displaces trails by ``1 / grid_mult`` of
         # a stream instead of a whole one.  Each CTA writes one partial row;
         # ``reduce`` sums them.  The grid is a function of the device alone.
+        # The ``stage_pair`` build: each 8-token copy stage is consumed as two
+        # 4-token halves, the dweight fold buffer in the stage ring.
         # ``ctas_per_sm``: 3 CTAs per SM (168 registers at 128 threads, the
         # launch bound; ncu launch__occupancy_limit_registers), the occupancy
         # query's answer on B200 and GB300.
@@ -286,16 +297,105 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_e08749684c395f2ab65e",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_e08749684c395f2ab65e",
+        "kernel": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_9bfa65707a49df6a48ce",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 50176,
+            "dynamic_smem_bytes": 66560,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_e08749684c395f2ab65e",
+        "library": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
+        # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
+        # writes and ``reduce`` sums in a fixed order; nothing is zeroed by the
+        # host.
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # An ordinary launch of ``grid_mult x ctas_per_sm x SM count`` CTAs:
+        # ``ctas_per_sm`` is the measured co-residency, ``grid_mult`` (per
+        # architecture) splits the token streams that many times finer so a
+        # CTA another stream's kernel displaces trails by ``1 / grid_mult`` of
+        # a stream instead of a whole one.  Each CTA writes one partial row;
+        # ``reduce`` sums them.  The grid is a function of the device alone.
+        # The ``copy="tma2d", stage_pair`` build of the sm_100a / sm_103a
+        # fallback at ``min_blocks`` 2: 2-D TMA stage copies, each 8-token
+        # stage consumed as two 4-token halves, the dweight fold buffer in the
+        # stage ring.  ``ctas_per_sm``: 2 CTAs per SM, the program's
+        # ``min_blocks`` 2 launch bound (ncu launch__occupancy_limit_registers),
+        # the occupancy query's answer on R200; the ``min_blocks`` 3 build of
+        # the other two architectures measured 10 % slower at C = 128 on its
+        # 212 SMs.
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
         "logical": {
             "C": "C",
             "S": "S",
@@ -397,6 +497,19 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "reduce": "cake_causal_conv1d_train_86b5ecfbd90aca4b52e5",
         "role": "bwd",
+        # The four-token build of the sm_107a fallback runs for 256 <= C < 512
+        # from S = 262144 tokens; the ``stage_pair`` fallback runs every other
+        # C < 512 (on those rows its gain was not distinguishable from the
+        # spread between identical copies of one build).
+        "select_rule": {
+            "channels": {
+                "sm_107a": 256,
+            },
+            "kind": "channels_tokens_at_least",
+            "tokens": {
+                "sm_107a": 262144,
+            },
+        },
         # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
         # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
         # writes and ``reduce`` sums in a fixed order; nothing is zeroed by the
@@ -2321,7 +2434,7 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
-            "cake_causal_conv1d_train_e08749684c395f2ab65e",
+            "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
         ],
         "bwd_bias": [
@@ -2352,7 +2465,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd": [
-            "cake_causal_conv1d_train_e08749684c395f2ab65e",
+            "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
             "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
         ],
@@ -2384,10 +2497,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "bwd": [
-            "cake_causal_conv1d_train_9a07bcaa0223632640ee",
+            "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
             "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
             "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
             "cake_causal_conv1d_train_aeff6106e2822f313a0c",
+            "cake_causal_conv1d_train_9a07bcaa0223632640ee",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_cc7a117aee9c7ae829c4",
@@ -2466,9 +2580,10 @@ ROLES = ("fwd", "bwd", "reduce")
 GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
 # The selection-rule vocabulary of a forward or backward record
 # (``record["select_rule"]["kind"]``); of the records whose rule admits a call
-# the one of the highest threshold runs, and a record without a rule is its
-# route's fallback.  A reduce record never carries one.
-SELECT_KINDS = ("channels_at_least",)
+# the one of the highest channel threshold runs, and a record without a rule is
+# its route's fallback.  ``channels_tokens_at_least`` adds a token floor to the
+# channel threshold.  A reduce record never carries one.
+SELECT_KINDS = ("channels_at_least", "channels_tokens_at_least")
 # The ``flags`` bit mask of the ``dtype_flags`` programs (every program of the
 # six round-6 routes): the host derives it from the tap tensor, the ACTUAL
 # ``dweight`` out tensor, the bias tensor and the ACTUAL ``dbias`` out tensor;
@@ -2605,8 +2720,10 @@ def select_rule(record: dict[str, Any]) -> dict[str, Any] | None:
     route's fallback program.  ``{"kind": "channels_at_least", "channels":
     {arch: C_min, ...}}`` owns the calls whose channel count is at least
     ``channels[arch]`` on the architectures it names and never hits on the
-    others; when several records own a call, the one of the highest threshold
-    runs.
+    others.  ``{"kind": "channels_tokens_at_least", "channels": {arch: C_min,
+    ...}, "tokens": {arch: S_min, ...}}`` owns those calls only when the token
+    count is also at least ``tokens[arch]``.  When several records own a call,
+    the one of the highest channel threshold runs.
     """
 
     return record.get("select_rule")
@@ -2617,7 +2734,7 @@ def _threshold(rule: dict[str, Any], *, arch: str) -> int | None:
     (``ValueError`` for an unknown kind)."""
 
     kind = rule["kind"]
-    if kind == "channels_at_least":
+    if kind in SELECT_KINDS:
         channels = rule["channels"]
         return int(channels[arch]) if arch in channels else None
     raise ValueError(
@@ -2626,55 +2743,84 @@ def _threshold(rule: dict[str, Any], *, arch: str) -> int | None:
     )
 
 
-def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
-    """Whether a selection rule owns ``C`` channels on ``arch`` (``ValueError`` for an unknown kind)."""
+def _tokens(rule: dict[str, Any], *, arch: str) -> int | None:
+    """The token count from which a selection rule owns the calls on ``arch`` (its token floor), ``None`` when the
+    rule has none there (``ValueError`` for an unknown kind)."""
+
+    _threshold(rule, arch=arch)
+    if rule["kind"] != "channels_tokens_at_least":
+        return None
+    tokens = rule["tokens"]
+    return int(tokens[arch]) if arch in tokens else None
+
+
+def _admits(rule: dict[str, Any], *, arch: str, C: int, S: int | None = None) -> bool:
+    """Whether a selection rule owns ``C`` channels (and ``S`` tokens) on ``arch``.
+
+    ``ValueError`` for an unknown kind, or when the rule's token floor decides
+    and ``S`` is ``None``.
+    """
 
     threshold = _threshold(rule, arch=arch)
-    return threshold is not None and int(C) >= threshold
+    if threshold is None or int(C) < threshold:
+        return False
+    floor = _tokens(rule, arch=arch)
+    if floor is None:
+        return True
+    if S is None:
+        raise ValueError(
+            f"the Cake causal conv1d training selection rule {rule!r} on {arch} "
+            f"for C={int(C)} runs from S {floor}; the selection needs S"
+        )
+    return int(S) >= floor
 
 
 def selected_modules(
     arch: str, kind: str, *, C: int, S: int | None = None
 ) -> tuple[str, ...]:
-    """Ordered module names one public call launches on ``arch`` for ``C`` channels.
+    """Ordered module names one public call launches on ``arch`` for ``C`` channels and ``S`` tokens.
 
     A route may carry several programs of its kernel and launches exactly one:
-    of the records whose :func:`select_rule` admits ``C`` on ``arch`` the one
-    of the highest threshold, else the route's single fallback record (the one
-    without a rule).  The choice is a pure function of the architecture, the
-    route and the channel count -- ``S`` is accepted and unused, and the host
-    never reads the data -- so a given ``(S, C, device)`` always runs the same
-    program of a route and ``dweight`` stays bitwise reproducible.  Two
-    admitting records of one threshold, or zero or several fallbacks, are
-    registry errors (``RuntimeError``); an unknown rule kind is a
-    ``ValueError``.
+    of the records whose :func:`select_rule` admits the call on ``arch`` the
+    one of the highest channel threshold, else the route's single fallback
+    record (the one without a rule).  The choice is a pure function of the
+    architecture, the route, ``C`` and ``S`` -- ``S`` enters only through a
+    rule's token floor, and the host never reads the data -- so a given ``(S,
+    C, device)`` always runs the same program of a route and ``dweight``
+    stays bitwise reproducible.  Two records of one channel threshold that
+    both reach ``C``, or zero or several fallbacks, are registry errors
+    (``RuntimeError``); an unknown rule kind, or ``S`` of ``None`` where a
+    token floor decides, is a ``ValueError``.
     """
 
     names = route_modules(arch, kind)
-    positive: list[tuple[int, str]] = []
+    candidates: list[tuple[int, str]] = []
     fallback: list[str] = []
     for name in names:
         rule = select_rule(MODULES[name])
         if rule is None:
             fallback.append(name)
-        elif _admits(rule, arch=arch, C=C):
-            positive.append((_threshold(rule, arch=arch), name))
+            continue
+        threshold = _threshold(rule, arch=arch)
+        if threshold is not None and int(C) >= threshold:
+            candidates.append((threshold, name))
     if len(fallback) != 1:
         raise RuntimeError(
             f"the exported route {kind!r} on {arch} declares {len(fallback)} "
             "fallback programs (records without a select_rule); expected exactly one"
         )
-    if not positive:
-        return (fallback[0],)
-    positive.sort(reverse=True)
-    if len(positive) > 1 and positive[0][0] == positive[1][0]:
-        tied = [name for threshold, name in positive if threshold == positive[0][0]]
+    candidates.sort(reverse=True)
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        tied = [name for threshold, name in candidates if threshold == candidates[0][0]]
         raise RuntimeError(
             f"the exported route {kind!r} on {arch} selects {len(tied)} "
-            f"programs for C={int(C)} at one threshold {positive[0][0]} ({tied}); "
+            f"programs for C={int(C)} at one threshold {candidates[0][0]} ({tied}); "
             "thresholds must be distinct"
         )
-    return (positive[0][1],)
+    for _threshold_c, name in candidates:
+        if _admits(select_rule(MODULES[name]), arch=arch, C=C, S=S):
+            return (name,)
+    return (fallback[0],)
 
 
 def backward_kinds(arch: str) -> tuple[str, ...]:
@@ -2812,13 +2958,23 @@ def channel_split(
     rule the package shipped before round 6, ``ct_vec = min(cv, threads)``,
     for either role; the KCP path keeps it (its kernels pick the grouped path
     from ``ct_vec`` on the device and are measured under this rule).  Each
-    role's rule is kept in sync with its copies (the tart kernel module of
-    that role and the kernel-tests plan of that kind).
+    role's rule is kept in sync with its copies (the kernel generator of
+    that role and the test plan of that kind).
     """
 
-    C = int(C)
-    vec = int(geometry["vec"])
-    threads = int(geometry["threads"])
+    return _channel_split(
+        int(C), int(geometry["vec"]), int(geometry["threads"]), role, bool(legacy)
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _channel_split(
+    C: int, vec: int, threads: int, role: str | None, legacy: bool
+) -> tuple[int, int, int]:
+    """:func:`channel_split` of plain arguments, memoized: a model's channel
+    counts are few, so every call after a channel count's first reuses its
+    plan (a backward call plans its row up to twice)."""
+
     if (role is None and not legacy) or (role is not None and role not in SPLIT_ROLES):
         raise ValueError(
             f"role must be one of {SPLIT_ROLES} (or legacy=True), got {role!r}"
@@ -2918,6 +3074,175 @@ def plan(
     }
 
 
+# Whole-rank trim of the backward's single-wave main grid (:func:`main_grid`).
+# A channel tile ``ct`` of a ``grid``-CTA launch gets ``ceil((grid - ct) /
+# n_ch_tiles)`` CTAs, so when ``n_ch_tiles`` does not divide the grid two pairs
+# of neighbouring tiles stream other token ranges at any instant; a row that is
+# not 64-byte aligned shares a cache line (and a 32-byte ``dx`` sector) between
+# them, which beyond L2 is then fetched twice.  Dropping ``grid % n_ch_tiles``
+# CTAs gives every tile the same CTA count.  ``TILE_ALIGNED_GRID[arch]``: the
+# co-resident grid the rule was measured at (GB300's 304 CTAs; 0: none), on the
+# routes of ``TILE_ALIGNED_ROUTES``, from ``TILE_ALIGNED_MIN_S`` tokens, with a
+# last tile of at least ``TILE_ALIGNED_MIN_LAST[ct_vec]`` vectors and at most
+# ``TILE_ALIGNED_MAX_TILES[ct_vec]`` tiles (a ``ct_vec`` without an entry:
+# never).  ``TILE_ALIGNED_CLASSES[arch]`` holds the other devices' measured
+# classes, ``(co_resident, ct_vec, n_ch_tiles) -> (min S, min last-tile
+# vectors)`` on the routes of ``TILE_ALIGNED_CLASS_ROUTES[arch]`` (B200's 296
+# CTAs; R200 none).  Every other launch keeps its grid.  ``dx`` does not depend
+# on the grid; ``dweight`` / ``dbias`` sum other partial rows, bitwise
+# reproducible for the trimmed grid.  The rule is kept in sync with its copy in
+# the backward kernel generator.
+TILE_ALIGNED_GRID: dict[str, int] = {"sm_100a": 0, "sm_103a": 304, "sm_107a": 0}
+TILE_ALIGNED_ROUTES: tuple[str, ...] = ("bwd",)
+TILE_ALIGNED_MIN_S = 98304
+TILE_ALIGNED_MIN_LAST: dict[int, int] = {32: 15, 64: 49}
+TILE_ALIGNED_MAX_TILES: dict[int, int] = {32: 27, 64: 9}
+TILE_ALIGNED_CLASSES: dict[str, dict[tuple[int, int, int], tuple[int, int]]] = {
+    "sm_100a": {
+        (296, 32, 5): (147456, 27),
+        (296, 32, 7): (65536, 31),
+        (296, 64, 3): (147456, 59),
+    },
+    "sm_103a": {},
+    "sm_107a": {},
+}
+TILE_ALIGNED_CLASS_ROUTES: dict[str, tuple[str, ...]] = {
+    "sm_100a": ("bwd", "bwd_dt", "bwd_fp32g"),
+    "sm_103a": (),
+    "sm_107a": (),
+}
+
+
+def main_grid(
+    co_resident: int,
+    *,
+    arch: str,
+    grid_mult: int = 1,
+    C: int | None = None,
+    n_ch_tiles: int = 1,
+    S: int | None = None,
+    ct_vec: int | None = None,
+    route: str | None = None,
+) -> int:
+    """The backward main launch's CTA count: ``grid_mult x co_resident``.
+
+    ``co_resident`` is the program's co-resident CTA count on the device
+    (``ctas_per_sm x SM count``).  A single-wave launch (``grid_mult`` 1) of
+    a row the caller names (``C``, ``S``, the plan's ``n_ch_tiles`` and
+    ``ct_vec``, the ``route``) is trimmed to whole channel-tile ranks:
+    :func:`tile_aligned_grid` on a route of ``TILE_ALIGNED_ROUTES`` when
+    ``co_resident`` is ``TILE_ALIGNED_GRID[arch]``, else
+    :func:`class_aligned_grid` on a route of
+    ``TILE_ALIGNED_CLASS_ROUTES[arch]``.  A caller that names no row keeps the
+    untrimmed grid, the most CTAs any row launches.
+    """
+
+    if type(grid_mult) is not int or grid_mult < 1:
+        raise ValueError(f"grid_mult must be a positive int, got {grid_mult!r}")
+    grid = int(co_resident) * grid_mult
+    named = None not in (C, S, ct_vec)
+    if (
+        grid_mult == 1
+        and co_resident == TILE_ALIGNED_GRID[arch]
+        and route in TILE_ALIGNED_ROUTES
+        and named
+    ):
+        grid = tile_aligned_grid(grid, C, n_ch_tiles, S=S, ct_vec=ct_vec)
+    elif grid_mult == 1 and route in TILE_ALIGNED_CLASS_ROUTES[arch] and named:
+        grid = class_aligned_grid(grid, C, n_ch_tiles, arch=arch, S=S, ct_vec=ct_vec)
+    return grid
+
+
+def tile_aligned_grid(
+    grid: int, C: int, n_ch_tiles: int, *, S: int, ct_vec: int, vec: int = 8
+) -> int:
+    """``grid`` less ``grid % n_ch_tiles`` CTAs when ``C % 32`` (a row of
+    ``x`` / ``dy`` / ``dx`` is not 64-byte aligned), ``1 < n_ch_tiles <=
+    TILE_ALIGNED_MAX_TILES[ct_vec]``, ``grid % n_ch_tiles``, ``grid >
+    n_ch_tiles``, ``S >= TILE_ALIGNED_MIN_S`` and the last channel tile holds
+    at least ``TILE_ALIGNED_MIN_LAST[ct_vec]`` vectors (``C / vec -
+    (n_ch_tiles - 1) x ct_vec``); else ``grid``."""
+
+    last = C // vec - (n_ch_tiles - 1) * ct_vec
+    if (
+        1 < n_ch_tiles <= TILE_ALIGNED_MAX_TILES.get(ct_vec, 0)
+        and C % 32
+        and grid % n_ch_tiles
+        and grid > n_ch_tiles
+        and S >= TILE_ALIGNED_MIN_S
+        and last >= TILE_ALIGNED_MIN_LAST.get(ct_vec, ct_vec + 1)
+    ):
+        return grid - grid % n_ch_tiles
+    return grid
+
+
+def class_aligned_grid(
+    grid: int,
+    C: int,
+    n_ch_tiles: int,
+    *,
+    arch: str,
+    S: int,
+    ct_vec: int,
+    vec: int = 8,
+) -> int:
+    """``grid`` less ``grid % n_ch_tiles`` CTAs when ``C % 32``, ``grid %
+    n_ch_tiles`` and ``(grid, ct_vec, n_ch_tiles)`` is a class of
+    ``TILE_ALIGNED_CLASSES[arch]`` whose bounds the row meets (``S`` and the
+    last tile's ``C / vec - (n_ch_tiles - 1) x ct_vec`` vectors at least the
+    class's); else ``grid``."""
+
+    bound = TILE_ALIGNED_CLASSES[arch].get((grid, ct_vec, n_ch_tiles))
+    if bound is None or not C % 32 or not grid % n_ch_tiles or bound[0] > S:
+        return grid
+    if C // vec - (n_ch_tiles - 1) * ct_vec < bound[1]:
+        return grid
+    return grid - grid % n_ch_tiles
+
+
+def row_may_trim(
+    record: dict[str, Any], arch: str, co_resident: int, factor: int, C: int, S: int
+) -> bool:
+    """Whether :func:`main_grid` may trim ``record``'s launch for the row.
+
+    Every trim needs a single wave (``factor`` 1), ``C % 32``, the record on a
+    route of the rule and ``S`` at least the rule's smallest token bound for
+    ``co_resident``; a call failing any of these launches the untrimmed grid
+    without planning the row's channel tiles (no host cost beyond the
+    untrimmed grid's)."""
+
+    if factor != 1 or not C % 32:
+        return False
+    library = record["library"]
+    routes = ROUTES[arch]
+    if (
+        co_resident == TILE_ALIGNED_GRID[arch]
+        and S >= TILE_ALIGNED_MIN_S
+        and any(library in routes.get(kind, ()) for kind in TILE_ALIGNED_ROUTES)
+    ):
+        return True
+    return any(
+        grid == co_resident and bound[0] <= S
+        for (grid, _, _), bound in TILE_ALIGNED_CLASSES[arch].items()
+    ) and any(
+        library in routes.get(kind, ()) for kind in TILE_ALIGNED_CLASS_ROUTES[arch]
+    )
+
+
+def record_route(record: dict[str, Any], arch: str) -> str:
+    """The route of ``ROUTES[arch]`` that lists ``record`` (``ValueError`` if none)."""
+
+    return _library_route(record["library"], arch)
+
+
+@functools.cache
+def _library_route(library: str, arch: str) -> str:
+    for kind, names in ROUTES[arch].items():
+        if library in names:
+            return kind
+    raise ValueError(f"module {library} is on no route of {arch}")
+
+
 @functools.cache
 def sm_count(device_index: int) -> int:
     """Streaming multiprocessor count of one CUDA device (immutable per process)."""
@@ -2928,27 +3253,54 @@ def sm_count(device_index: int) -> int:
 
 
 def launch_grid(
-    record: dict[str, Any], *, device_index: int, C: int | None = None
+    record: dict[str, Any],
+    *,
+    device_index: int,
+    C: int | None = None,
+    S: int | None = None,
 ) -> tuple[int, int, int]:
     """Launch grid of one module on ``device_index`` under its recorded grid rule.
 
     ``co_resident`` modules launch exactly ``ctas_per_sm x SM count`` CTAs,
     the co-resident count (a cooperative KCP backward never exceeds it).
-    ``occupancy`` modules launch ``grid_mult[arch] x ctas_per_sm x SM count``
-    CTAs normally (:func:`grid_per_sm`): ``ctas_per_sm`` co-resident CTAs per
-    SM and ``grid_mult`` times finer token streams, so a CTA that finds no
-    free slot beside another stream's kernel trails by a short stream in a
-    later wave.  Either grid depends on the device only, so the deterministic
-    ``dweight`` order is a pure function of ``(S, C, device)`` and one
-    workspace serves every token count.  ``channels_per_cta`` modules (the
-    reduce programs) launch ``ceil(C / channels_per_cta)`` CTAs for the call's
-    ``C`` channels.
+    ``occupancy`` modules launch :func:`main_grid` of that count:
+    ``grid_mult[arch] x ctas_per_sm x SM count`` CTAs normally
+    (:func:`grid_per_sm`): ``ctas_per_sm`` co-resident CTAs per SM and
+    ``grid_mult`` times finer token streams, so a CTA that finds no free slot
+    beside another stream's kernel trails by a short stream in a later wave.
+    Given the call's ``C`` and ``S``, a single-wave launch of the rows
+    :func:`main_grid` names (its route, the record's plan) drops CTAs to whole
+    channel-tile ranks (the row is planned only where :func:`row_may_trim`
+    holds).  Either grid is a pure function of ``(S, C, device)`` and the
+    route, so is the deterministic ``dweight`` order, and the untrimmed grid
+    (``C`` or ``S`` not given) is the most CTAs any call launches, so one
+    workspace serves every token count.
+    ``channels_per_cta`` modules (the reduce programs) launch ``ceil(C /
+    channels_per_cta)`` CTAs for the call's ``C`` channels.
     """
 
     rule = record["grid_rule"]
     kind = rule["kind"]
     if kind in ("co_resident", "occupancy"):
-        grid_x = grid_per_sm(record, device_arch(device_index)) * sm_count(device_index)
+        arch = device_arch(device_index)
+        grid_x = grid_per_sm(record, arch) * sm_count(device_index)
+        if kind == "occupancy" and C is not None and S is not None and C % 32:
+            co_resident = int(rule["ctas_per_sm"]) * sm_count(device_index)
+            factor = grid_mult(record, arch)
+            if row_may_trim(record, arch, co_resident, factor, int(C), int(S)):
+                ct_vec, _, n_ch_tiles = channel_split(
+                    C, geometry=rule["geometry"], role=record["role"]
+                )
+                grid_x = main_grid(
+                    co_resident,
+                    arch=arch,
+                    grid_mult=factor,
+                    C=int(C),
+                    n_ch_tiles=n_ch_tiles,
+                    S=int(S),
+                    ct_vec=ct_vec,
+                    route=record_route(record, arch),
+                )
     elif kind == "channels_per_cta":
         if C is None:
             raise ValueError(
@@ -3113,37 +3465,144 @@ def specs_for_arch(arch: str) -> list[Any]:
     return cake_build.jit_specs(arch)
 
 
-def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
+_GRID_AXES = {"grid_x": 0, "grid_y": 1, "grid_z": 2}
+
+
+@functools.cache
+def _arg_sources(name: str) -> tuple[tuple[bool, Any], ...]:
+    """``(grid, source)`` per entry of ``MODULES[name]["arg_plan"]``, in
+    order: a grid slot (``source`` is the axis, 0 / 1 / 2 for ``grid_x`` /
+    ``grid_y`` / ``grid_z``) or the logical name the kernel parameter binds
+    (the record's ``logical`` map); the registry is constant, so
+    :func:`run_modules` reads it once per module."""
+
+    record = MODULES[name]
+    logical = record["logical"]
+    return tuple(
+        (True, _GRID_AXES[key]) if kind == "grid" else (False, logical[key])
+        for kind, key in record["arg_plan"]
+    )
+
+
+def _missing_argument(name: str, values: dict[str, Any]) -> ValueError:
+    """The error of a launch of module ``name`` whose ``values`` lack a
+    logical name it binds (the first such name, with its kernel parameter)."""
+
+    record = MODULES[name]
+    logical, key = next(
+        (record["logical"][key], key)
+        for kind, key in record["arg_plan"]
+        if kind != "grid" and record["logical"][key] not in values
+    )
+    return ValueError(f"module {name} needs {logical!r} (kernel parameter {key!r})")
+
+
+@functools.cache
+def _ffi_entry(name: str, device_index: int) -> Any:
+    """The FFI entry of module ``name`` loaded for CUDA device
+    ``device_index``'s architecture (:func:`load`), looked up once."""
+
+    module = load(name, device_arch(device_index))
+    return getattr(module, MODULES[name]["ffi_entry"])
+
+
+@functools.cache
+def _raw_stream_getter() -> Any:
+    """``torch._C._cuda_getCurrentRawStream``: the handle of a device's
+    current torch stream as an integer, without constructing a ``Stream``
+    object; or the ``torch.cuda`` form on a torch build without it.  Bound on
+    first use: this module imports torch lazily."""
+
+    import torch
+
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if getter is not None:
+        return getter
+
+    def fallback(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+    return fallback
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _stream_context(device_index: int) -> Any:
+    """The tvm-ffi environment-stream context of torch's current stream on
+    CUDA device ``device_index`` (a CUDA graph's capture stream during
+    capture): the bindings launch on that stream.  The FFI device handle is
+    kept per index, so entering the context costs a fraction of
+    ``tvm_ffi.use_torch_stream()``, which builds a ``torch.cuda.Stream`` and
+    parses a device string on every entry."""
+
+    device = _FFI_DEVICES.get(device_index)
+    if device is None:
+        device = _FFI_DEVICES[device_index] = tvm_ffi.device(f"cuda:{device_index}")
+    return tvm_ffi.use_raw_stream(device, _raw_stream_getter()(device_index))
+
+
+def run_modules(
+    launches: Sequence[tuple[str, tuple[int, int, int] | None]],
+    values: dict[str, Any],
+    *,
+    device_index: int,
+) -> None:
+    """Launch exported modules in order, back to back, with one set of logical
+    argument ``values``.
+
+    ``launches`` holds ``(name, grid)`` pairs, ``grid`` as in
+    :func:`run_module`.  All of them are issued inside one stream context of
+    torch's current stream on ``device_index``, each bound (grid and
+    arguments) right before it is issued, so a programmatically dependent
+    launch (the backward's reduce program) reaches the stream right behind
+    the program it depends on, while that one runs, and the first launch
+    waits for no later one's binding.  ``ValueError`` names the first logical
+    name a module binds that ``values`` lacks.
+    """
+
+    with _stream_context(device_index):
+        for name, grid in launches:
+            if grid is None:
+                grid = launch_grid(
+                    MODULES[name],
+                    device_index=device_index,
+                    C=values.get("C"),
+                    S=values.get("S"),
+                )
+            sources = _arg_sources(name)
+            try:
+                args = [
+                    grid[source] if is_grid else values[source]
+                    for is_grid, source in sources
+                ]
+            except KeyError:
+                raise _missing_argument(name, values) from None
+            _ffi_entry(name, device_index)(*args)
+
+
+def run_module(
+    name: str,
+    values: dict[str, Any],
+    *,
+    device_index: int,
+    grid: tuple[int, int, int] | None = None,
+) -> None:
     """Launch one exported module with logical argument ``values``.
 
     ``values`` maps the logical names in ``LOGICAL_TENSORS`` /
     ``LOGICAL_SCALARS`` to tensors and Python scalars; the module record maps
-    its kernel parameter names onto that vocabulary.  The launch grid is the
-    module's :func:`launch_grid` on ``device_index`` (for the call's ``C`` when
-    the rule needs it), and the kernel runs on the current torch stream; a
+    its kernel parameter names onto that vocabulary.  The launch grid is
+    ``grid`` when the caller planned it (the module's :func:`launch_grid` for
+    the call, as the public entry points pass it), else the module's
+    :func:`launch_grid` on ``device_index`` for the call's ``C`` and ``S``,
+    and the kernel runs on the current torch stream; a
     module whose launch record enables programmatic dependent launch
     (``use_pdl``) overlaps its launch with the preceding kernel of that stream
     and waits for it in-kernel.
     """
 
-    record = MODULES[name]
-    logical = record["logical"]
-    grid = launch_grid(record, device_index=device_index, C=values.get("C"))
-    grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
-    args = []
-    for kind, key in record["arg_plan"]:
-        if kind == "grid":
-            args.append(grid_values[key])
-            continue
-        logical_name = logical[key]
-        if logical_name not in values:
-            raise ValueError(
-                f"module {name} needs {logical_name!r} (kernel parameter {key!r})"
-            )
-        args.append(values[logical_name])
-    module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
-        getattr(module, record["ffi_entry"])(*args)
+    run_modules(((name, grid),), values, device_index=device_index)
 
 
 __all__ = [
@@ -3165,12 +3624,20 @@ __all__ = [
     "ROLES",
     "ROUTES",
     "SELECT_KINDS",
+    "TILE_ALIGNED_CLASSES",
+    "TILE_ALIGNED_CLASS_ROUTES",
+    "TILE_ALIGNED_GRID",
+    "TILE_ALIGNED_MAX_TILES",
+    "TILE_ALIGNED_MIN_LAST",
+    "TILE_ALIGNED_MIN_S",
+    "TILE_ALIGNED_ROUTES",
     "WIDTH",
     "WORKSPACE_KINDS",
     "arch_for_capability",
     "backward_kinds",
     "backward_route",
     "channel_split",
+    "class_aligned_grid",
     "counter_words",
     "device_arch",
     "forward_kinds",
@@ -3181,17 +3648,22 @@ __all__ = [
     "launch_grid",
     "library_name",
     "load",
+    "main_grid",
     "partial_bytes",
     "partial_rows",
     "plan",
+    "record_route",
     "route_applies",
     "route_modules",
     "route_role",
+    "row_may_trim",
     "run_module",
+    "run_modules",
     "select_rule",
     "selected_modules",
     "sm_count",
     "specs_for_arch",
+    "tile_aligned_grid",
     "workspace_layout",
     "workspace_owners",
     "workspace_record",
