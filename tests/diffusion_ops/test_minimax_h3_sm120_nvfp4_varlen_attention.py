@@ -830,3 +830,60 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_serialized_launches(
         pytest.fail("overlapped calls with serialized launches did not finish in 600 s")
     stderr_tail = result.stderr[-4000:]
     assert result.returncode == 0 and "SERIALIZED_OK" in result.stdout, stderr_tail
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_producer_builds_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The overlapped form's two producer builds, ``PREPROCESS_HEAD_MAJOR`` and ``PREPROCESS_HEAD_MAJOR_KA``
+    (a K item waits for its head's K sums in the worker's second warp), give bit-identical outputs of the
+    uncompensated route: each in turn produces for the lead and tail the host routes on this device (on 188
+    SMs the host's own producers are ``PREPROCESS_HEAD_MAJOR_KA``), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=67, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    producers = (nvfp4_ops.PREPROCESS_HEAD_MAJOR, nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA)
+    outs, routed_producers = [], []
+    for producer in producers:
+
+        def programs(plan, sms, *, delta=True, _producer=producer):
+            routed = host_programs(plan, sms, delta=delta)
+            if routed[0] in producers:
+                routed_producers.append(routed[0])
+                return (_producer, *routed[1:])
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_producers) >= 2, "the plan did not take the overlapped form"
+    if num_sms in nvfp4_ops._OVERLAP_WS_NODELTA_SMS:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA for p in routed_producers)
+    else:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR for p in routed_producers)
+    assert torch.equal(outs[0], outs[1])

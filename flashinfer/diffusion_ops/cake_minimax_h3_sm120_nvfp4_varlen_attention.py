@@ -43,6 +43,7 @@ from ..jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION_WS_NODELTA_TAIL,
     PREPROCESS,
     PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_KA,
     QUANTIZE_KV,
     QUANTIZE_KV_HBLK64,
     STATS,
@@ -131,7 +132,9 @@ _OVERLAP_WIDTH = {170: 42, 188: 46}
 # tail (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``: the ``ATTENTION_WS_NODELTA`` unit -- 8 QK /
 # softmax warps hand each tile's P record to 4 PV warps, 384 threads -- taking its units from the counter and
 # waiting for each unit's head flag) in place of ``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL``, with the
-# same grids, head-control words and protocol.
+# same grids, head-control words and protocol, and the producers ``PREPROCESS_HEAD_MAJOR_KA`` in place of
+# ``PREPROCESS_HEAD_MAJOR`` (the same launch and outputs; a K item waits for its head's K sums in the worker's second
+# warp, beside the first warp's counts of the previous item and claim of the next one).
 _OVERLAP_WS_NODELTA_SMS = (188,)
 # A plan of more than 16384 padded tokens (the statistics / quantizer plans) takes the overlapped form too when its
 # attention-weighted mean segment length -- the sum of the squared segment lengths over the token count, which the
@@ -169,7 +172,10 @@ _NVFP4_PROGRAMS = (
     ATTENTION_NODELTA_TAIL,
     ATTENTION_WS_NODELTA_LEAD,
     ATTENTION_WS_NODELTA_TAIL,
+    PREPROCESS_HEAD_MAJOR_KA,
 )
+# The producer programs of the overlapped form (its first launch).
+_NVFP4_PRODUCERS = (PREPROCESS_HEAD_MAJOR, PREPROCESS_HEAD_MAJOR_KA)
 
 
 def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int:
@@ -728,8 +734,8 @@ def minimax_h3_sm120_nvfp4_programs(
     short enough or whose separate launches would not take the warp-specialised attention (``_overlap_long``),
     runs the overlapped form instead: ``(PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)``
     (``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta`` is false, the warp-specialised
-    ``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL`` on the SM counts of
-    ``_OVERLAP_WS_NODELTA_SMS``) -- the head-major
+    ``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL`` with the producers ``PREPROCESS_HEAD_MAJOR_KA``
+    on the SM counts of ``_OVERLAP_WS_NODELTA_SMS``) -- the head-major
     pre-processing producers (a plain launch), the lead attention launch on the SMs the producers leave free
     (a programmatic dependent of the producers), then the tail attention launch (a programmatic dependent of
     the lead), which takes the remaining work on the producers' SMs as they drain."""
@@ -742,7 +748,7 @@ def minimax_h3_sm120_nvfp4_programs(
             return (PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)
         if int(num_sms) in _OVERLAP_WS_NODELTA_SMS:
             return (
-                PREPROCESS_HEAD_MAJOR,
+                PREPROCESS_HEAD_MAJOR_KA,
                 ATTENTION_WS_NODELTA_LEAD,
                 ATTENTION_WS_NODELTA_TAIL,
             )
@@ -1017,7 +1023,7 @@ class _Nvfp4Launch:
             )
         )
         fused = programs[0] is PREPROCESS
-        overlap = programs[0] is PREPROCESS_HEAD_MAJOR
+        overlap = any(programs[0] is producers for producers in _NVFP4_PRODUCERS)
         tail, tail_grid, units_per_head = -1, 1, 0
         if overlap:
             # (producers, lead attention, tail attention), the launch order: the producers take the
@@ -1672,11 +1678,13 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       tolerance on this route** (max-abs 1.2-2.7 at 2-6 tokens; a 1-token segment is exact by construction),
       so do not use it for streams that contain such segments -- the default route stays within tolerance
       there;
-    * latency: only the attention program differs (``ATTENTION_NODELTA`` / ``ATTENTION_WS_NODELTA``, which
+    * latency: the attention program differs (``ATTENTION_NODELTA`` / ``ATTENTION_WS_NODELTA``, which
       skip the compensation term); its warp-specialised form is taken from a mean segment of 1536 tokens
       with no upper bound, and on parts of at least 170 SMs also for a plan of 2048 to 16384 padded tokens;
       on parts of 188 SMs the overlapped form's two attention launches are warp-specialised too
-      (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``).
+      (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``), behind the producers
+      ``PREPROCESS_HEAD_MAJOR_KA`` (the outputs of ``PREPROCESS_HEAD_MAJOR``; a K item waits for its
+      head's K sums in a second warp).
 
     Use the default route unless the extra error has been validated for the model in question.  Inputs,
     output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route.
