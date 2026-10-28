@@ -57,6 +57,7 @@ __all__ = [
     "COPY_FORMS",
     "DIRECT_PLACE_DEFAULTS",
     "DIRECT_PLACE_ENV",
+    "DIRECT_PLACE_MIN_ROUTE_ELEMS",
     "DIRECT_PLACE_MIN_TOKENS_ENV",
     "FC2_EARLY_MAX_TOKENS",
     "FC2_EARLY_MAX_TOKENS_ENV",
@@ -198,14 +199,15 @@ FC2_EARLY_MAX_TOKENS = 128
 # top_k, EP size).  The windows hold the measured shapes and token ranges where
 # the early-start pair was faster than the regular pair on H100; other shapes and
 # rounds keep the decode window alone (there the early FC2 tiles slowed FC1 by
-# more than they saved, or made no difference).  Same tiles, same bits.  0 disables the windows (the decode window is
-# unaffected).  Rank-local, so ranks may differ.
+# more than they saved, or made no difference; the (7168, 2048, 256, 8) shape has
+# no window at EP 2 because its gain there was below 0.3 % in the latest
+# measurement).  Same tiles, same bits.  0 disables the windows (the decode window
+# is unaffected).  Rank-local, so ranks may differ.
 FC2_EARLY_WINDOWS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS"
 FC2_EARLY_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
     # (hidden, intermediate, total experts, top_k, ep): (lo, hi)
     (7168, 2048, 256, 8, 8): (128, 4096),
     (7168, 2048, 256, 8, 4): (128, 1024),
-    (7168, 2048, 256, 8, 2): (128, 1024),
     (7168, 3072, 384, 6, 8): (512, 1024),
 }
 # Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
@@ -226,9 +228,10 @@ PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
 # when every rank requests it and its pipe allows it (dedup dispatch, the grid
 # dispatch on, compact form 1, at most 1024 (expert, rank) keys, a token capacity of
 # at least both round bounds below), and then for grid-dispatch rounds with at least
-# DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``; default the EP size's
-# bound in DIRECT_PLACE_DEFAULTS, else the grid-dispatch bound) local tokens.  A pipe
-# that cannot use it keeps the regular activation matrix.
+# DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``; default at the EP sizes
+# in DIRECT_PLACE_DEFAULTS the larger of the EP size's bound and the routed-element
+# floor below, else the grid-dispatch bound) local tokens.  A pipe that cannot use
+# it keeps the regular activation matrix.
 # Bit-identical outputs.
 DIRECT_PLACE_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE"
 DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS"
@@ -237,6 +240,13 @@ DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS
 # there).  Other EP sizes (EP 2: no measured gain) keep the inbox path unless
 # direct placement is requested.
 DIRECT_PLACE_DEFAULTS: dict[int, int] = {8: 513, 4: 513}
+# Routed-element floor of the default bound: a direct round adds a count exchange of
+# a fixed cost and saves compact copies in proportion to the round's routed
+# elements (local tokens * top_k * hidden).  On H100 the rounds with at least 44M
+# routed elements gained clearly and the round with 25M did not, so by default a
+# direct round needs ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden)) local
+# tokens (586 at hidden 7168 / top-k 8, 781 at 7168 / 6, 1366 at 4096 / 6).
+DIRECT_PLACE_MIN_ROUTE_ELEMS = 1 << 25
 _DIRECT_PLACE_MAX_KEYS = 1024  # E * ep: the pipelined compact's segment tables
 _DIRECT_PLACE_MAX_ROWS = 1 << 30  # the SlotMeta row field (bits 0..29)
 
@@ -341,11 +351,14 @@ def _direct_place_default(ep: int) -> bool:
     return raw == "1"
 
 
-def _direct_place_min_tokens_default(ep: int) -> int:
+def _direct_place_min_tokens_default(ep: int, top_k: int, hidden: int) -> int:
     raw = os.environ.get(DIRECT_PLACE_MIN_TOKENS_ENV)
     if raw is not None:
         return int(raw.strip())
-    return DIRECT_PLACE_DEFAULTS.get(ep, GRID_DISPATCH_MIN_TOKENS)
+    if ep in DIRECT_PLACE_DEFAULTS:
+        floor = -(-DIRECT_PLACE_MIN_ROUTE_ELEMS // (top_k * hidden))  # ceil
+        return max(DIRECT_PLACE_DEFAULTS[ep], floor)
+    return GRID_DISPATCH_MIN_TOKENS
 
 
 def _align256(nbytes: int) -> int:
@@ -470,7 +483,10 @@ class Sm90CakeBf16MoERunner:
     the later routes of a token to the same rank.  It is effective only when every
     rank of the pipe requests it and can run it; a round is direct only when every
     rank dispatches it through the grid dispatch with at least
-    ``direct_place_min_tokens`` tokens, otherwise the round takes the inbox path.
+    ``direct_place_min_tokens`` tokens (``None`` = ``DIRECT_PLACE_MIN_TOKENS_ENV``,
+    default at the EP sizes in ``DIRECT_PLACE_DEFAULTS`` the larger of the listed
+    bound and ``ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden))``), otherwise
+    the round takes the inbox path.
     Bit-identical outputs.
 
     Precision contract: bf16 operands into both GEMMs, fp32 accumulation, bf16
@@ -611,7 +627,7 @@ class Sm90CakeBf16MoERunner:
                 f"direct_place must be a bool or None, got {direct_place!r}"
             )
         direct_min = (
-            _direct_place_min_tokens_default(pipe.ep)
+            _direct_place_min_tokens_default(pipe.ep, pipe.K, pipe.H)
             if direct_place_min_tokens is None
             else int(direct_place_min_tokens)
         )

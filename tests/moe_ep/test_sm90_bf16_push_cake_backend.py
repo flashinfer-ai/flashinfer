@@ -525,7 +525,6 @@ def _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device) -> None:
 FC2_EARLY_SHIPPED_WINDOWS = {
     (7168, 2048, 256, 8, 8): (128, 4096),
     (7168, 2048, 256, 8, 4): (128, 1024),
-    (7168, 2048, 256, 8, 2): (128, 1024),
     (7168, 3072, 384, 6, 8): (512, 1024),
 }
 # Round sizes around a shape window (128, 160] above the decode window (<= 128).
@@ -933,18 +932,37 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
 
 def test_ep1_direct_place_defaults(monkeypatch) -> None:
     """The shipped per-EP default of direct placement: on at the EP sizes of
-    DIRECT_PLACE_DEFAULTS with their round bound, off at the others, and the
-    environment fallbacks override it (host-only check)."""
+    DIRECT_PLACE_DEFAULTS with their round bound raised to the routed-element
+    floor, off at the others, and the environment fallbacks override it
+    (host-only check)."""
     from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
         cake_runner,
     )
 
     assert cake_runner.DIRECT_PLACE_DEFAULTS == {8: 513, 4: 513}
+    assert cake_runner.DIRECT_PLACE_MIN_ROUTE_ELEMS == 1 << 25
     monkeypatch.delenv(cake_runner.DIRECT_PLACE_ENV, raising=False)
     monkeypatch.delenv(cake_runner.DIRECT_PLACE_MIN_TOKENS_ENV, raising=False)
     for ep, on in ((1, False), (2, False), (4, True), (8, True), (16, False)):
         assert cake_runner._direct_place_default(ep) is on, ep
-        assert cake_runner._direct_place_min_tokens_default(ep) == 513, ep
+    # (top_k, hidden) -> default bound at EP 8 and EP 4: the smallest round whose
+    # routes carry 2**25 elements; round T - 1 stays below the floor, round T reaches it
+    for (top_k, hidden), bound in (
+        ((8, 7168), 586),
+        ((6, 7168), 781),
+        ((6, 4096), 1366),
+    ):
+        for ep in (8, 4):
+            got = cake_runner._direct_place_min_tokens_default(ep, top_k, hidden)
+            assert got == bound, (ep, top_k, hidden, got)
+        for ep in (1, 2, 16):
+            got = cake_runner._direct_place_min_tokens_default(ep, top_k, hidden)
+            assert got == 513, (ep, top_k, hidden, got)
+        assert (bound - 1) * top_k * hidden < 1 << 25 <= bound * top_k * hidden
+    # the listed bound stays the minimum for wide rounds; this file's small test
+    # shape gets a bound above its token capacities (direct placement off)
+    assert cake_runner._direct_place_min_tokens_default(8, 8, 16384) == 513
+    assert cake_runner._direct_place_min_tokens_default(4, TOP_K, HIDDEN) == 32768
     monkeypatch.setenv(cake_runner.DIRECT_PLACE_ENV, "0")
     assert cake_runner._direct_place_default(8) is False
     monkeypatch.setenv(cake_runner.DIRECT_PLACE_ENV, "1")
@@ -953,7 +971,8 @@ def test_ep1_direct_place_defaults(monkeypatch) -> None:
     with pytest.raises(ValueError, match="0 or 1"):
         cake_runner._direct_place_default(8)
     monkeypatch.setenv(cake_runner.DIRECT_PLACE_MIN_TOKENS_ENV, "700")
-    assert cake_runner._direct_place_min_tokens_default(8) == 700
+    for ep in (2, 8):
+        assert cake_runner._direct_place_min_tokens_default(ep, 8, 7168) == 700
 
 
 @requires_sm90
@@ -1891,14 +1910,18 @@ def test_ep_direct_place_bitwise(mode: str, wire: str) -> None:
 
 @requires_dist
 def test_ep_direct_place_default(monkeypatch) -> None:
-    """With no config value and no environment override, direct placement is on at
-    the EP sizes of DIRECT_PLACE_DEFAULTS (grid rounds of at least their bound are
-    placed directly) and off at the others; the bytes equal the inbox path."""
+    """With no config value and no environment override, direct placement is
+    requested at the EP sizes of DIRECT_PLACE_DEFAULTS with the bound raised to the
+    routed-element floor (above this file's token capacities, so the default layer
+    keeps the inbox path and the regular activation matrix) and not requested at the
+    others.  With an explicit round bound the default request places grid rounds of
+    at least that bound directly.  The bytes equal the inbox path."""
     import torch.distributed as dist
 
     from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
         DIRECT_PLACE_DEFAULTS,
         DIRECT_PLACE_ENV,
+        DIRECT_PLACE_MIN_ROUTE_ELEMS,
         DIRECT_PLACE_MIN_TOKENS_ENV,
     )
 
@@ -1908,16 +1931,31 @@ def test_ep_direct_place_default(monkeypatch) -> None:
     device = torch.device("cuda", rank)
     common = dict(token_capacity=640, compact_form=1, **DISPATCH_PATHS)
     off, w13, w2 = _build_layer(world_size, rank, device, direct_place=False, **common)
-    # own pool key (see test_ep_per_route_publish_pdl_bitwise)
+    on = world_size in DIRECT_PLACE_DEFAULTS
+    floor = -(-DIRECT_PLACE_MIN_ROUTE_ELEMS // (TOP_K * HIDDEN))
+    bound = max(DIRECT_PLACE_DEFAULTS[world_size], floor) if on else 513
+    assert bound == (32768 if on else 513)
+    # own pool keys (see test_ep_per_route_publish_pdl_bitwise)
     layer, _w13, _w2 = _build_layer(
         world_size, rank, device, init_timeout_s=613.0, **common
     )
     runner = _warm_runner(layer, device)
-    on = world_size in DIRECT_PLACE_DEFAULTS
-    bound = DIRECT_PLACE_DEFAULTS.get(world_size, 513)
-    assert runner.direct_place is on
     assert runner.direct_place_min_tokens == bound
-    assert (runner._a1_symm is not None) is on
+    assert runner.direct_place is False  # token capacity 640 < bound, or not requested
+    assert runner._a1_symm is None
+    explicit, _w13, _w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        init_timeout_s=617.0,
+        direct_place_min_tokens=513,
+        **common,
+    )
+    explicit_runner = _warm_runner(explicit, device)
+    assert explicit_runner.direct_place_min_tokens == 513
+    assert explicit_runner.direct_place is on
+    assert (explicit_runner._a1_symm is not None) is on
+    direct_rounds = 0
     for index, num_tokens in enumerate((512, 513, 600, 640)):
         x, ids, weights = _make_inputs(
             num_tokens,
@@ -1929,20 +1967,25 @@ def test_ep_direct_place_default(monkeypatch) -> None:
         )
         reference = _forward(off, x, ids, weights).clone()
         torch.cuda.synchronize()
-        output = _forward(layer, x, ids, weights).clone()
-        torch.cuda.synchronize()
-        expected = int(on and num_tokens >= bound)
-        assert runner._direct_flag() == expected, f"T={num_tokens}"
-        assert torch.equal(output, reference), f"T={num_tokens}"
-        _check(
-            output,
-            x,
-            ids,
-            weights,
-            w13,
-            w2,
-            label=f" ep{world_size} rank{rank} direct_place default T={num_tokens}",
-        )
+        for name, model, model_runner, expected in (
+            ("default", layer, runner, 0),
+            ("explicit 513", explicit, explicit_runner, int(on and num_tokens >= 513)),
+        ):
+            output = _forward(model, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert model_runner._direct_flag() == expected, (name, num_tokens)
+            direct_rounds += expected
+            assert torch.equal(output, reference), (name, num_tokens)
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} direct_place {name} T={num_tokens}",
+            )
+    assert direct_rounds == (3 if on else 0)
     dist.barrier()
 
 

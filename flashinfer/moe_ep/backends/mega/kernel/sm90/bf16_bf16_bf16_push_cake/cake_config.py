@@ -129,8 +129,11 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     It changes no stored value.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``; unset = on at EP
     sizes 8 and 4, where it was measured faster, and off at the others) and
-    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (default ``513``, the
-    grid-dispatch bound).
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (unset = at EP sizes 8
+    and 4 the larger of ``513`` and ``ceil(2**25 / (top_k * hidden_size))``, the
+    smallest round whose routes carry ``2**25`` elements: ``586`` at hidden 7168
+    and top-k 8, ``781`` at 7168 and 6, ``1366`` at 4096 and 6; at other EP sizes
+    ``513``, the grid-dispatch bound).
     """
 
     intermediate_size: int
