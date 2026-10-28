@@ -1,10 +1,11 @@
 // Rendered by flashinfer/jit/gemm/w8a16_fp8.py: one W8A16 module per activation dtype, so
-// each module instantiates only its own half of the kernel variants.
+// each module instantiates only its own half of the kernel variants.  Included by both the
+// launcher and the kernel unit, so it includes no TVM-FFI header itself (the kernel unit must
+// not see one; see w8a16_fp8_gemm_sm100_kernels.cu).
 #pragma once
 
-#include "tvm_ffi_utils.h"
-
 using W8A16ActType = {{ act_ctype }};
-// DLPack code of W8A16ActType (float16_code / bfloat16_code from tvm_ffi_utils.h); the
-// launcher rejects an activation of the other dtype instead of dispatching on it.
+// DLPack code of W8A16ActType (float16_code / bfloat16_code from tvm_ffi_utils.h, which the
+// launcher includes); the launcher rejects an activation of the other dtype instead of
+// dispatching on it.
 #define W8A16_ACT_DTYPE_CODE {{ act_dtype_code }}

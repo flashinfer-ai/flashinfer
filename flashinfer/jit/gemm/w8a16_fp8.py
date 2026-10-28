@@ -28,11 +28,13 @@ _ACT_DTYPE_CODE = {torch.float16: "float16_code", torch.bfloat16: "bfloat16_code
 
 
 def _gen_sources(uri: str, act_dtype: torch.dtype, cu_files: list[str]) -> list:
-    """Render the per-dtype config header next to copies of the launcher sources.
+    """Render the per-dtype config header next to copies of the module sources.
 
     One module per activation dtype: the launcher is a template over the activation
     type, so fixing it here instantiates only that dtype's kernel variants (the
-    other dtype compiles only if it is ever used).
+    other dtype compiles only if it is ever used).  The kernels are compiled in
+    their own unit (``*_kernels.cu``), apart from the TVM-FFI launcher; see that
+    file for why.
     """
     if act_dtype not in _ACT_DTYPE_CODE:
         raise ValueError(
@@ -63,7 +65,13 @@ def gen_w8a16_fp8_gemm_module(act_dtype: torch.dtype = torch.bfloat16) -> JitSpe
     return gen_jit_spec(
         uri,
         _gen_sources(
-            uri, act_dtype, ["w8a16_fp8_gemm.cu", "w8a16_fp8_gemm_jit_binding.cu"]
+            uri,
+            act_dtype,
+            [
+                "w8a16_fp8_gemm.cu",
+                "w8a16_fp8_gemm_kernels.cu",
+                "w8a16_fp8_gemm_jit_binding.cu",
+            ],
         ),
         extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16", "-DENABLE_FP8"],
     )
@@ -82,7 +90,11 @@ def gen_w8a16_fp8_gemm_sm100_module(
         _gen_sources(
             uri,
             act_dtype,
-            ["w8a16_fp8_gemm_sm100.cu", "w8a16_fp8_gemm_jit_binding.cu"],
+            [
+                "w8a16_fp8_gemm_sm100.cu",
+                "w8a16_fp8_gemm_sm100_kernels.cu",
+                "w8a16_fp8_gemm_jit_binding.cu",
+            ],
         ),
         extra_cuda_cflags=nvcc_flags
         + ["-DENABLE_BF16", "-DENABLE_FP8", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],

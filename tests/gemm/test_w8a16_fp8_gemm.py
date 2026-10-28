@@ -985,3 +985,29 @@ def test_w8a16_fp8_gemm_native_checks():
     launch(out, act, w_fp8, scale, None, ws_auto, 0)
     torch.cuda.synchronize()
     assert torch.equal(out, torch.full((m, n), 512.0, device=dev, dtype=torch.bfloat16))
+
+
+def test_w8a16_fp8_gemm_kernel_units_without_ffi_headers():
+    """The units that instantiate the kernels include no TVM-FFI header.
+
+    csrc/tvm_ffi_utils.h puts ``using tvm::ffi::Tensor`` at global scope, which
+    makes the unqualified ``Tensor`` in CUTLASS's sm100 epilogue ambiguous with
+    cute::Tensor under nvcc 12.9 and 13.x; the kernels are therefore compiled
+    apart from the launcher.  Checked on the sources (no GPU needed): the kernel
+    units and the config header they include must not pull that header in.
+    """
+    from flashinfer.jit import env as jit_env
+
+    for fname in (
+        "w8a16_fp8_gemm_kernels.cu",
+        "w8a16_fp8_gemm_sm100_kernels.cu",
+        "w8a16_fp8_gemm_config.jinja",
+    ):
+        text = (jit_env.FLASHINFER_CSRC_DIR / fname).read_text()
+        includes = [
+            line.strip() for line in text.splitlines() if line.startswith("#include")
+        ]
+        assert not any("tvm" in inc or "ffi" in inc for inc in includes), (
+            fname,
+            includes,
+        )

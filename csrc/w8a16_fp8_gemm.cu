@@ -21,6 +21,19 @@
 
 using namespace flashinfer;
 
+// The kernels are compiled in w8a16_fp8_gemm_kernels.cu, a unit without TVM-FFI headers (see
+// w8a16_fp8_gemm_sm100_kernels.cu for why); this unit only calls them.
+namespace flashinfer::gemm {
+extern template cudaError_t W8A16Fp8GemmSm90<W8A16ActType>(
+    const W8A16Sm90Plan& plan, const W8A16ActType* act, const __nv_fp8_e4m3* weight,
+    const float* scale, const W8A16ActType* bias, W8A16ActType* out, int M, int N, int K,
+    void* workspace, size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream);
+extern template cudaError_t W8A16Fp8GemmSm90WorkspaceBytes<W8A16ActType>(const W8A16Sm90Plan& plan,
+                                                                         int M, int N, int K,
+                                                                         int device_id, int num_sms,
+                                                                         size_t* bytes);
+}  // namespace flashinfer::gemm
+
 namespace {
 
 // Hopper (sm_90a): variant codes 2..W8A16Sm90MaxAlgoCode (code 1 is reserved).
