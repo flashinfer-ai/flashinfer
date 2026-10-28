@@ -981,12 +981,13 @@ class TmemSResource(DecodeGenResourceBase):
         s_vals: cutlass.Array,
         sage_q_scale: Float32,
         sage_k_stage_bytes: Int32,
+        row_maxima: cutlass.Array | None = None,
     ) -> Float32:
         """Return a complete Sage row's tile maximum in dequantized units.
 
         A dequantized row becomes ``(s - bias) * sfK`` in place. A block-scaled
-        row stays raw: each group's maximum is scaled by its word, which
-        ``_sage_row_words`` keeps for the P pass.
+        row stays raw: each group's maximum (``row_maxima`` or the registers)
+        is scaled by its word, which ``_sage_row_words`` keeps for the P pass.
         """
         cfg = self.cfg
         assert cfg.use_sage_attention and cfg.tile_size_q == 128
@@ -1023,9 +1024,17 @@ class TmemSResource(DecodeGenResourceBase):
                     self._sage_row_words[chunk_idx * groups + group_idx] = chunk_scales[
                         group_idx
                     ]
-                self._fold_sage_fragment_max(
+                if cutlass.const_expr(row_maxima is not None):
+                    maxima: tuple = ()
+                    for group_idx in cutlass.range_constexpr(groups):
+                        maxima += (row_maxima[chunk_idx * groups + group_idx],)
+                else:
+                    maxima = self._score_group_maxima(
+                        chunk, groups=groups, group_regs=chunk_regs // groups
+                    )
+                self._fold_sage_group_maxima(
                     max_chains,
-                    chunk,
+                    maxima,
                     fragment_scales=chunk_scales,
                     chain_base=chunk_idx * groups,
                     groups=groups,
@@ -1053,11 +1062,12 @@ class TmemSResource(DecodeGenResourceBase):
         s_vals: cutlass.Array,
         sage_q_scale: Float32 | None,
         sage_k_stage_bytes: Int32 | None,
+        row_maxima: cutlass.Array | None = None,
     ) -> Float32:
         """Return a complete row's tile maximum, in dequantized units for Sage."""
         if cutlass.const_expr(self.cfg.use_sage_attention):
             return self._reduce_sage_keeps_row_max(
-                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes, row_maxima
             )
         return self._reduce_keeps_row_max(s_vals)
 
@@ -1219,6 +1229,7 @@ class TmemSResource(DecodeGenResourceBase):
         membership_keep_word: Uint32,
         *,
         apply_boundary_mask: Constexpr[bool],
+        row_maxima: cutlass.Array | None = None,
     ) -> None:
         """Load one complete-row Keeps score tile with a compile-time mask policy.
 
@@ -1226,23 +1237,41 @@ class TmemSResource(DecodeGenResourceBase):
         score fragment out of the branch condition avoids carrying 64/128 live
         S registers through a post-load control-flow edge. Max reduction is a
         separate operation because the later P-materialization reload only
-        needs the masked scores.
+        needs the masked scores. ``row_maxima`` receives each ``sfK`` group's
+        maximum, from LDTM.STAT on an unmasked tile, else from the registers.
         """
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
         base_addr = self._softmax_loop_score_tmem_addr(stage_info)
-        for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
-            atom_col = load_atom_idx * 32
-            loaded = _keeps_tcgen05_ld(
-                cfg,
-                prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
-                num=32,
-                offset=cfg.tile_size_kv // 2,
-            )
+        if cutlass.const_expr(row_maxima is not None and not apply_boundary_mask):
+            # One load per group returns its scores and their maximum.
+            groups: Constexpr[int] = cfg.sage_keeps_row_groups
+            group_cols: Constexpr[int] = num_s_regs // groups
+            group_loads = []
+            for group_idx in cutlass.range_constexpr(groups):
+                group_loads.append(
+                    tcgen05_ld_32x32b_max(
+                        base_addr + Int32(group_idx * group_cols), group_cols
+                    )
+                )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            for atom_reg_idx in cutlass.range_constexpr(32):
-                s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
+            for group_idx in cutlass.range_constexpr(groups):
+                for col in cutlass.range_constexpr(group_cols):
+                    s_vals[group_idx * group_cols + col] = group_loads[group_idx][col]
+                row_maxima[group_idx] = group_loads[group_idx][group_cols]
+        else:
+            for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
+                atom_col = load_atom_idx * 32
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                for atom_reg_idx in cutlass.range_constexpr(32):
+                    s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
 
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -1386,6 +1415,20 @@ class TmemSResource(DecodeGenResourceBase):
             ):
                 for invalid_q_reg_idx in cutlass.range_constexpr(num_s_regs):
                     s_vals[invalid_q_reg_idx] = self._masked_score()
+                if cutlass.const_expr(
+                    row_maxima is not None and not apply_boundary_mask
+                ):
+                    for group_idx in cutlass.range_constexpr(cfg.sage_keeps_row_groups):
+                        row_maxima[group_idx] = self._masked_score()
+
+        if cutlass.const_expr(row_maxima is not None and apply_boundary_mask):
+            maxima = self._score_group_maxima(
+                s_vals,
+                groups=cfg.sage_keeps_row_groups,
+                group_regs=num_s_regs // cfg.sage_keeps_row_groups,
+            )
+            for group_idx in cutlass.range_constexpr(cfg.sage_keeps_row_groups):
+                row_maxima[group_idx] = maxima[group_idx]
 
     @cute.jit
     def _load_keeps_fragment(
@@ -1400,6 +1443,7 @@ class TmemSResource(DecodeGenResourceBase):
         is_valid_effective_tile: cutlass.Boolean,
         is_masked_final_wave: cutlass.Boolean,
         tile_is_unmasked: cutlass.Boolean,
+        row_maxima: cutlass.Array | None = None,
     ) -> None:
         """Select the masked or unmasked fragment loader before LDTM.
 
@@ -1434,6 +1478,7 @@ class TmemSResource(DecodeGenResourceBase):
                 is_masked_final_wave,
                 membership_keep_word,
                 apply_boundary_mask=False,
+                row_maxima=row_maxima,
             )
         else:
             self._load_keeps_fragment_impl(
@@ -1448,6 +1493,7 @@ class TmemSResource(DecodeGenResourceBase):
                 is_masked_final_wave,
                 membership_keep_word,
                 apply_boundary_mask=True,
+                row_maxima=row_maxima,
             )
 
     @cute.jit
@@ -1501,6 +1547,11 @@ class TmemSResource(DecodeGenResourceBase):
             _tile_has_valid_scores,
         ) = self._resolve_keeps_tile_context(stage_info)
 
+        row_maxima = None
+        if cutlass.const_expr(cfg.loads_keeps_row_maxima):
+            row_maxima = cutlass.Array(
+                Float32, cfg.sage_keeps_row_groups, space=cutlass.AddressSpace.rmem
+            )
         # Select the complete unmasked/masked TMEM load+max path before any S
         # registers are materialized: fully visible tiles then skip the mask
         # pass, and no loaded score crosses a post-load branch. The shared
@@ -1517,9 +1568,10 @@ class TmemSResource(DecodeGenResourceBase):
             is_valid_effective_tile,
             is_masked_final_wave,
             tile_is_unmasked,
+            row_maxima=row_maxima,
         )
         tile_max = self._reduce_keeps_tile_max(
-            stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+            stage_info, s_vals, sage_q_scale, sage_k_stage_bytes, row_maxima
         )
         self._publish_keeps_softmax_state(
             s_vals,
@@ -2985,7 +3037,26 @@ class TmemSResource(DecodeGenResourceBase):
         scores need no special case. ``_fold_sage_group_maxima`` dequantizes
         and folds the group maxima.
         """
-        group_regs = self.cfg.keeps_score_chunk_regs // groups
+        maxima = self._score_group_maxima(
+            scores, groups=groups, group_regs=self.cfg.keeps_score_chunk_regs // groups
+        )
+        self._fold_sage_group_maxima(
+            max_chains,
+            maxima,
+            fragment_scales=fragment_scales,
+            chain_base=chain_base,
+            groups=groups,
+        )
+
+    @cute.jit
+    def _score_group_maxima(
+        self,
+        scores,
+        *,
+        groups: Constexpr[int],
+        group_regs: Constexpr[int],
+    ) -> tuple:
+        """Return the maximum of each of ``groups`` consecutive score groups."""
         maxima: tuple = ()
         for group_idx in cutlass.range_constexpr(groups):
             first: Constexpr[int] = group_idx * group_regs
@@ -3012,13 +3083,7 @@ class TmemSResource(DecodeGenResourceBase):
                     ftz=True,
                 )
             maxima += (group_max,)
-        self._fold_sage_group_maxima(
-            max_chains,
-            maxima,
-            fragment_scales=fragment_scales,
-            chain_base=chain_base,
-            groups=groups,
-        )
+        return maxima
 
     @cute.jit
     def _fold_sage_group_maxima(

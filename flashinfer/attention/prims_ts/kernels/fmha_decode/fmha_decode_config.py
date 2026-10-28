@@ -1634,8 +1634,8 @@ class FmhaDecodeConfig:
     # rate; ``arch_config_args`` supplies it for the launch device, and
     # ``fragment_ex2_emulated_pairs`` caps it on KV256 tiles.
     ex2_emulated_pairs: int = 6
-    # Reduce streamed score-fragment maxima inside the TMEM load
-    # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+    # Reduce score maxima inside the TMEM load (tcgen05.ld.red) of streamed
+    # fragments and complete Sage rows; ``arch_config_args`` supplies it.
     uses_ldtm_stat: bool = False
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
@@ -2784,6 +2784,20 @@ class FmhaDecodeConfig:
         """Return the ``sfK`` groups of one complete Keeps score row."""
         chunks = self.num_s_regs_per_thread // self.keeps_score_chunk_regs
         return chunks * self.sage_k_groups_per_fragment()
+
+    @property
+    def loads_keeps_row_maxima(self) -> bool:
+        """Whether a block-scaled complete Sage row takes its group maxima from LDTM.STAT.
+
+        Masked tiles, INT32 scores (the load reduces FP32 values) and
+        page-membership masks reduce the scores in registers instead.
+        """
+        return (
+            self.uses_ldtm_stat
+            and self.keeps_sage_row_words
+            and not self.uses_int32_scores
+            and not self.uses_q_token_kv_block_sparse_page_membership
+        )
 
     @property
     def streams_tmem_p_fragments(self) -> bool:
