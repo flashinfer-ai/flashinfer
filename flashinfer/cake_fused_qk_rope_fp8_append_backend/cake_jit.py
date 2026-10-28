@@ -440,8 +440,9 @@ MODULES: dict[str, dict[str, Any]] = {
         # H100 / H200 decode of at least eight KV heads beyond one wave, and
         # single-KV-head decode with a short page row or the static Q scale; GB300
         # decode or single-KV-head prefill within 48 pages per request and without
-        # caller-owned K/V: the early guess with the request's page row prefetched
-        # at nine CTAs per SM.
+        # caller-owned K/V; B300 single-KV-head decode from 512 CTAs up to two
+        # waves on the same page rows: the early guess with the request's page row
+        # prefetched at nine CTAs per SM.
         "launch": {
             "block": (96, 1, 1),
             "cluster": (1, 1, 1),
@@ -855,9 +856,9 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "kernel": "cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
-        # B200 and B300 decode, and single-KV-head prefill, within one wave, 48
-        # pages per request and without caller-owned K/V: the early guess with
-        # the page-row prefetch.
+        # B200 and B300 decode (B300 single-KV-head decode below 512 CTAs), and
+        # single-KV-head prefill, within one wave, 48 pages per request and
+        # without caller-owned K/V: the early guess with the page-row prefetch.
         "launch": {
             "block": (96, 1, 1),
             "cluster": (1, 1, 1),
@@ -1264,10 +1265,13 @@ STAGE_POLICY: dict[str, Any] = {
         "swap_min_requests": 2,
         "gb300_sms": 152,
         "u2z_ctas": (16, 128),
+        "b300_er2pp9_min_ctas": 512,
     },
     "rule": (
-        "card = h100 (sm_90*), b200 (sm_100a), gb300 (sm_103a and num_sms == "
-        "gb300_sms) else b300; cap = ctas_per_sm * num_sms; waves = (num_rows + "
+        "num_requests == 0 -> the default build (every card: the early_rt2 "
+        "builds require a request). card = h100 (sm_90*), b200 (sm_100a), gb300 "
+        "(sm_103a and num_sms == gb300_sms) else b300; cap = ctas_per_sm * "
+        "num_sms; waves = (num_rows + "
         "num_requests) * Hkv / cap; clear_frac = num_requests * Hkv / cap; decode "
         "= num_rows == num_requests and not is_prefill; pages_ok = "
         "max_pages_per_request <= prefetch_max_pages; prefetch_ok = pages_ok and "
@@ -1288,6 +1292,8 @@ STAGE_POLICY: dict[str, Any] = {
         ">= swap_min_requests and num_rows + num_requests <= 65535 -> "
         "grid_order=2; else grid_order=3. b300 first: u2z_class and (not "
         "prefetch_ok or max_pages_per_request <= prefetch_short_row) -> u2z; "
+        "decode and Hkv == 1 and prefetch_ok and (num_rows + num_requests) * "
+        "Hkv >= b300_er2pp9_min_ctas and waves <= fold_waves[1] -> er2pp9; "
         "is_prefill and Hkv >= fold_min_kv_heads and num_requests >= "
         "swap_min_requests and waves <= 1 and order_ok -> grid_order=2; then the "
         "shared table. b200 first: is_prefill and Hkv >= fold_min_kv_heads and "
@@ -1299,7 +1305,7 @@ STAGE_POLICY: dict[str, Any] = {
         "prefetch_ok and (decode or Hkv == 1) -> early_rt2, page_prefetch, "
         "clear_tie; else the default build"
     ),
-    "version": "round3-v9-2026-10-26",
+    "version": "round3-v11-2026-10-28",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -1404,6 +1410,10 @@ def policy_knobs(
         )
     which = card(arch, num_sms)
     rows, requests, kv_heads = int(num_rows), int(num_requests), int(num_kv_heads)
+    if requests < 1:
+        # No request (with rows, a malformed table): the early_rt2 builds load their
+        # guessed request's table words before the verdict and require one.
+        return {}
     cap = int(constants["ctas_per_sm"]) * int(num_sms)
     waves = (rows + requests) * kv_heads / cap
     clear_frac = requests * kv_heads / cap
@@ -1473,6 +1483,21 @@ def policy_knobs(
         short_row = pages <= int(constants["prefetch_short_row"])
         if u2z_class and (not prefetch_ok or short_row):
             return u2z
+        if (
+            decode
+            and kv_heads == 1
+            and prefetch_ok
+            and (rows + requests) * kv_heads >= int(constants["b300_er2pp9_min_ctas"])
+            and waves <= high
+        ):
+            # Nine CTAs per SM pay off on single-KV-head decode from 512 CTAs
+            # up to two waves.
+            return {
+                "min_blocks": 9,
+                "early_rt2": True,
+                "page_prefetch": True,
+                "clear_tie": True,
+            }
         if (
             prefill
             and many_heads
@@ -1567,7 +1592,8 @@ def launch_grid(
     // kv_groups_per_cta, 1)`` -- a CTA per (packed row, KV group) and one per
     (request, KV head); ``rows_by_kv_heads`` (a ``fold`` build, decode only):
     ``(num_rows, num_kv_heads // kv_groups_per_cta, 1)``; the ``kv_heads_by_*``
-    rules (``grid_order`` 1 / 2) put the KV group axis first.
+    rules (``grid_order`` 1 / 2) put the KV group axis first.  An ``early_rt2``
+    build requires a request (its launcher refuses ``num_requests == 0``).
     """
 
     knobs = record["knobs"]
@@ -1578,6 +1604,8 @@ def launch_grid(
         raise ValueError(
             f"{groups} KV groups per CTA do not divide {kv_heads} KV heads"
         )
+    if knobs.get("early_rt2", False) and requests < 1:
+        raise ValueError("an early_rt2 build requires a request (num_requests >= 1)")
     if kind in ("rows_by_kv_heads", "kv_heads_by_rows"):
         if rows != requests:
             raise ValueError(
