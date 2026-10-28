@@ -198,6 +198,36 @@ blackwell_required = pytest.mark.skipif(
 class TestRMSNormFP4QuantCuteDSL:
     """Tests for CuTe-DSL RMSNorm + FP4 Quantization."""
 
+    def test_nvfp4_bf16_scale_reduction_avoids_product_rounding(self):
+        """Keep a BF16 product-rounding error from crossing an E4M3 midpoint."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 65 / 64, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 65 / 64, device="cuda", dtype=torch.bfloat16)
+        eps = 1e-6
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        # Place the E4M3 midpoint (1.0625) between the two scale reductions.
+        global_scale = (
+            6.0 * 1.0625 / ((reference.amax() + rounded_product.amax()) / 2)
+        ).reshape(1)
+        expected_scale = (
+            global_scale * reference.view(1, 4, 16).abs().amax(dim=-1) / 6.0
+        ).to(torch.float8_e4m3fn)
+        rounded_scale = (
+            global_scale * rounded_product.view(1, 4, 16).abs().amax(dim=-1) / 6.0
+        ).to(torch.float8_e4m3fn)
+        assert torch.all(expected_scale.float() == 1.125)
+        assert torch.all(rounded_scale.float() == 1.0)
+
+        _, actual_scale = rmsnorm_fp4quant(
+            x, weight, global_scale=global_scale, eps=eps, block_size=16
+        )
+        torch.testing.assert_close(
+            actual_scale.float(), expected_scale.float(), rtol=0, atol=0
+        )
+
     @pytest.mark.parametrize(
         "batch_size", [1, 4, 16, 32, 7, 13, 33, 100, 128, 8192, 16384]
     )

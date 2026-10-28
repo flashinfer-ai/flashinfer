@@ -50,7 +50,6 @@ from .fp4_common import (
     fmax_f32,
     hmax2,
     hmax_to_f32,
-    bfloat2_hmax_to_f32,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
     cvt_f32_to_ue8m0,
@@ -58,9 +57,7 @@ from .fp4_common import (
     # Helper functions for block processing
     load_8_half2,
     half2_mul_8,
-    bfloat2_mul_8,
     half2_max_abs_8,
-    bfloat2_max_abs_8,
     half2_to_float16,
     bfloat2_to_float16,
     quantize_and_pack_16,
@@ -517,13 +514,13 @@ class RMSNormFP4QuantKernel:
                             max_xw_h2 = half2_max_abs_8(xw_h2)
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32 = half2_to_float16(xw_h2, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2 = bfloat2_mul_8(x_h2, w_h2)
-                            max_xw_h2 = bfloat2_max_abs_8(xw_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32 = bfloat2_to_float16(xw_h2, rstd)
-
-                        max_abs = max_xw * rstd
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2, Float32(1.0)),
+                                bfloat2_to_float16(w_h2, Float32(1.0)),
+                                rstd,
+                            )
 
                         # Compute scale factor (FP8 E4M3) - Branchless clamping
                         scale_float = global_scale_val * max_abs * fp4_max_rcp
