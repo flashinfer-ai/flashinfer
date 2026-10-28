@@ -1479,6 +1479,75 @@ def test_indexed_long_rows_take_the_chain_not_the_pair_share(
     _assert_bitwise(cleared.run(), want, "pair-share table cleared")
 
 
+# The pair-share decision of a part: M64_PAIR_SHARE_MIN_SEQ_LEN on a 148-SM
+# sm_100a part, rows (32, 1024) and (48, 2048), and
+# M64_PAIR_SHARE_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a part, rows (32, 1024),
+# (64, 2048) and (72, 4096).  The first row whose task count holds the
+# launch's long-task load (heads x tokens / longest sequence) gives the
+# shortest longest sequence that takes the build; a load beyond the last row
+# keeps the routed program, and so does a launch with more tasks than the
+# device holds 2-CTA clusters.  Expected: (148-SM sm_100a, 152-SM sm_103a).
+PAIR_SHARE_PARTS = (("sm_100a", 148), ("sm_103a", 152))
+PAIR_SHARE_THRESHOLD_ROWS = [
+    # load 16: the 1024-token row of both parts
+    pytest.param([1023], 16, (False, False), id="1023-h16"),
+    pytest.param([1024], 16, (True, True), id="1024-h16"),
+    pytest.param([1025], 16, (True, True), id="1025-h16"),
+    # load 48: the 2048-token row of both parts
+    pytest.param([2047] * 3, 16, (False, False), id="3x2047-h16"),
+    pytest.param([2048] * 3, 16, (True, True), id="3x2048-h16"),
+    # load 64, and 56 with a short sequence: beyond the sm_100a rows, the
+    # 2048-token row of sm_103a
+    pytest.param([2047] * 4, 16, (False, False), id="4x2047-h16"),
+    pytest.param([2048] * 4, 16, (False, True), id="4x2048-h16"),
+    pytest.param([2048] * 3 + [1024], 16, (False, True), id="3x2048+1024-h16"),
+    # load 72: beyond the sm_100a rows, the 4096-token row of sm_103a
+    pytest.param([4095] * 6, 12, (False, False), id="6x4095-h12"),
+    pytest.param([4096] * 6, 12, (False, True), id="6x4096-h12"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads,expected", PAIR_SHARE_THRESHOLD_ROWS)
+def test_pair_share_threshold_of_the_part(lengths, heads, expected, monkeypatch):
+    """The side of the part's pair-share threshold an M64 value-split launch
+    (dense FP32 states, checkpoint rows) lands on: the exact schedule of the
+    routed or of the pair-share program.  Where the build is taken it equals
+    the routed program bit for bit, and a device that holds one 2-CTA cluster
+    fewer than the launch has tasks keeps the routed program."""
+    part = (registry.device_arch(), _sm_count())
+    if part not in PAIR_SHARE_PARTS:
+        pytest.skip(
+            f"{part}: the decisions are pinned for 148-SM sm_100a and 152-SM "
+            "sm_103a parts"
+        )
+    shared = expected[PAIR_SHARE_PARTS.index(part)]
+    tasks = len(lengths) * heads
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._probe_m64_pair_cluster_capacity(device)
+    assert capacity, "the cluster capacity probe failed"
+    if shared and capacity < tasks:
+        pytest.skip(f"{part}: {capacity} 2-CTA clusters for {tasks} tasks")
+    pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[part[0]].values())
+    routed_schedule = "fused_m64_independent_dvsplit_fp32_state"
+    d = _inputs(lengths, heads)
+    call = _Call(_own_pool(d), -5.0, indexed=False)
+    schedule = str(call.prepared.schedule)
+    assert schedule == routed_schedule + ("_pair_share" if shared else ""), schedule
+    assert bool(_modules(call.prepared) & pair_share) == shared
+    if not shared:
+        return
+    result = call.run()
+    monkeypatch.setattr(runtime, "_m64_pair_cluster_capacity", lambda _: tasks - 1)
+    routed = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(routed.prepared.schedule) == routed_schedule
+    assert not _modules(routed.prepared) & pair_share
+    _assert_bitwise(result, routed.run(), "pair-share vs routed M64")
+    monkeypatch.setattr(runtime, "_m64_pair_cluster_capacity", lambda _: tasks)
+    at_capacity = _Call(_own_pool(d), -5.0, indexed=False)
+    assert str(at_capacity.prepared.schedule) == schedule
+
+
 CHAIN_ROWS = [
     pytest.param([8192], 12, id="8192-h12"),
     pytest.param([3000, 13384], 16, id="3000+13384-h16"),
