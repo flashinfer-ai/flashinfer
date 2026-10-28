@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry of the Cake packed-varlen GQA training attention kernels, head
-dimension 256 (SM100 / SM103).  The loader and the launch plan are
+dimension 256 (SM100 / SM103 / SM107).  The loader and the launch plan are
 :mod:`.cake_backend`.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -28,9 +28,8 @@ binding; ``library`` is the program identity (``cake_gqa_train_<20 hex>``),
 so a kernel swap renames it.  ``MODULES`` is a literal table (the exporter
 and the manifest checker read it with ``ast.literal_eval``).
 
-The stages, in launch order: ``fwd`` (O and the natural-log LSE; the
-``sm_100a`` program emulates part of ``exp2`` by a polynomial, the
-``sm_103a`` program does not), ``bwd_pre`` (``dPsum``, ``LSE * log2(e)`` and
+The stages, in launch order: ``fwd`` (O and the natural-log LSE),
+``bwd_pre`` (``dPsum``, ``LSE * log2(e)`` and
 the zeroed FP32 dQ accumulator in the pack-2 scratch layout), the backward
 main kernel in its three dK / dV outputs ``bwd_fp32`` (FP32 window
 gradients), ``bwd_rowmap`` (FP32 adds into caller-owned destinations through
@@ -40,10 +39,10 @@ Every launch is a plain stream-ordered launch: nothing cooperative, no PDL.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
-ARCHES = ("sm_100a", "sm_103a")
-ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 HEAD_DIM = 256
 PACKAGE = "flashinfer.experimental.cake_gqa_train"
 LIBRARY_PREFIX = "cake_gqa_train"
@@ -54,8 +53,8 @@ MANIFEST = "build.json"
 STAGES = ("fwd", "bwd_pre", "bwd_fp32", "bwd_rowmap", "bwd_bf16", "bwd_post")
 
 MODULES: dict[str, dict[str, Any]] = {
-    "fwd_sm100a": {
-        "arches": ["sm_100a"],
+    "fwd": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "Q"],
             ["buffer", "K"],
@@ -75,7 +74,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_5ddb42f52eaa30eb1172",
+        "kernel_symbol": "kernel_cake_gqa_train_493c4a28dafa5fc6b2f1",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (2, 1, 1),
@@ -83,43 +82,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 232064,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_5ddb42f52eaa30eb1172",
-        "stage": "fwd",
-    },
-    "fwd_sm103a": {
-        "arches": ["sm_103a"],
-        "arg_plan": [
-            ["buffer", "Q"],
-            ["buffer", "K"],
-            ["buffer", "V"],
-            ["buffer", "O"],
-            ["buffer", "LSE"],
-            ["buffer", "cu_seqlens_q"],
-            ["buffer", "cu_seqlens_k"],
-            ["buffer", "tile_counter"],
-            ["parameter", "num_segments"],
-            ["parameter", "num_heads_q"],
-            ["parameter", "group"],
-            ["parameter", "total_q"],
-            ["parameter", "softmax_scale_log2"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_58ccb3bec5dcc04affa3",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (2, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 232064,
-            "use_pdl": False,
-        },
-        "library": "cake_gqa_train_58ccb3bec5dcc04affa3",
+        "library": "cake_gqa_train_493c4a28dafa5fc6b2f1",
         "stage": "fwd",
     },
     "bwd_pre": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "O"],
             ["buffer", "dO"],
@@ -137,7 +104,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_4256dcaf183f8cba790d",
+        "kernel_symbol": "kernel_cake_gqa_train_a91752e8a2732bf2e246",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -145,11 +112,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_4256dcaf183f8cba790d",
+        "library": "cake_gqa_train_a91752e8a2732bf2e246",
         "stage": "bwd_pre",
     },
     "bwd_fp32": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "Q"],
             ["buffer", "dO"],
@@ -174,7 +141,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_ce3f6563f1fcdb7f287c",
+        "kernel_symbol": "kernel_cake_gqa_train_6fa13db592acdb66a6c9",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -182,11 +149,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 231424,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_ce3f6563f1fcdb7f287c",
+        "library": "cake_gqa_train_6fa13db592acdb66a6c9",
         "stage": "bwd_fp32",
     },
     "bwd_rowmap": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "Q"],
             ["buffer", "dO"],
@@ -211,7 +178,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_16b8dc61024deef2fb9e",
+        "kernel_symbol": "kernel_cake_gqa_train_37f4cd45025705f3cfc8",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -219,11 +186,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 231424,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_16b8dc61024deef2fb9e",
+        "library": "cake_gqa_train_37f4cd45025705f3cfc8",
         "stage": "bwd_rowmap",
     },
     "bwd_bf16": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "Q"],
             ["buffer", "dO"],
@@ -248,7 +215,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_7f1fcd9976a7e8c57ce0",
+        "kernel_symbol": "kernel_cake_gqa_train_1afdfdde603ff8806b4d",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -256,11 +223,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 231424,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_7f1fcd9976a7e8c57ce0",
+        "library": "cake_gqa_train_1afdfdde603ff8806b4d",
         "stage": "bwd_bf16",
     },
     "bwd_post": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "dQ_accum"],
             ["buffer", "cu_seqlens_q"],
@@ -275,7 +242,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_c57c38ddd50eb6cb07e1",
+        "kernel_symbol": "kernel_cake_gqa_train_76decc9a5d22dc91ddd1",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -283,7 +250,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gqa_train_c57c38ddd50eb6cb07e1",
+        "library": "cake_gqa_train_76decc9a5d22dc91ddd1",
         "stage": "bwd_post",
     },
 }
@@ -299,14 +266,20 @@ MODULES: dict[str, dict[str, Any]] = {
 FWD_TILE_ROWS = 256
 FWD_CLUSTER = 2
 # Backward main kernel: a CTA pair covers 128 keys of one (segment, key head)
-# and loops the key head's query heads two at a time (``group`` even).
+# and loops the key head's query heads two at a time (``group`` even).  The
+# grid is ``(2 N, H_kv, B)``: the pair at ``(2 n, h, b)`` owns key block ``n``
+# of segment ``b``; ``N`` is at least the longest segment's key-block count
+# (from ``max_seqlen_k`` when the caller gives it, else from ``T_k``, which
+# bounds every segment), and a pair past its segment's last block does nothing.
 BWD_TILE_KEYS = 128
 BWD_CLUSTER = 2
 # Pack-2 scratch: scratch head ``s`` holds query heads ``2 s`` and ``2 s + 1``;
-# every segment starts on a 128-row tile; the preprocess and postprocess run
-# one CTA per 32 packed rows of one scratch head.
+# every segment starts on a 128-row tile.  The preprocess runs one CTA per 32
+# packed rows of one scratch head, the postprocess one per 64 (each program's
+# ``rows_per_cta``; a grid past ``rows_pad`` would read past the scratch).
 SCRATCH_TILE_ROWS = 128
-SCRATCH_ROWS_PER_CTA = 32
+PRE_ROWS_PER_CTA = 32
+POST_ROWS_PER_CTA = 64
 # Byte alignment of every scratch buffer (TMA / bulk copies need 16 B, the
 # 256-bit loads and stores of the pre/postprocess 32 B).
 SCRATCH_ALIGN = 256
@@ -357,20 +330,24 @@ def grid(
     num_heads_kv: int,
     num_segments: int,
     sm_count: int,
+    max_seqlen_k: Optional[int] = None,
 ) -> tuple[int, int, int]:
-    """The launch grid of ``stage``.  Tile counts are upper bounds from the
-    totals (``sum_b ceil(len_b / n) <= T // n + B``); the kernels decode the
-    segments on the device and retire the CTAs past the last tile."""
+    """The launch grid of ``stage``.  Tile counts are upper bounds from host
+    values (``sum_b ceil(len_b / n) <= T // n + B``; the longest segment has
+    at most ``max_seqlen_k`` or ``T_k`` keys); the kernels decode the segments
+    on the device and retire the CTAs past the last tile."""
     if stage == "fwd":
         tiles = num_heads_q * (total_q // FWD_TILE_ROWS + num_segments)
         pairs = max(1, min(sm_count // FWD_CLUSTER, tiles))
         return (FWD_CLUSTER * pairs, 1, 1)
     if stage in ("bwd_pre", "bwd_post"):
         rows = rows_pad(total_q, num_segments)
-        return (rows // SCRATCH_ROWS_PER_CTA, num_heads_q // 2, 1)
+        per_cta = PRE_ROWS_PER_CTA if stage == "bwd_pre" else POST_ROWS_PER_CTA
+        return (rows // per_cta, num_heads_q // 2, 1)
     if stage in ("bwd_fp32", "bwd_rowmap", "bwd_bf16"):
-        pairs = total_k // BWD_TILE_KEYS + num_segments
-        return (BWD_CLUSTER * pairs, num_heads_kv, 1)
+        longest = total_k if max_seqlen_k is None else min(max_seqlen_k, total_k)
+        blocks = max(1, -(-longest // BWD_TILE_KEYS))
+        return (BWD_CLUSTER * blocks, num_heads_kv, num_segments)
     raise KeyError(f"no stage {stage!r}; the stages are {STAGES}")
 
 
@@ -395,7 +372,8 @@ __all__ = [
     "MODULES",
     "PACKAGE",
     "SCRATCH_ALIGN",
-    "SCRATCH_ROWS_PER_CTA",
+    "POST_ROWS_PER_CTA",
+    "PRE_ROWS_PER_CTA",
     "SCRATCH_TILE_ROWS",
     "STAGES",
     "grid",

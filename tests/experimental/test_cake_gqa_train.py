@@ -20,7 +20,7 @@ Without a device: the registry (one record per stage and architecture, the argum
 build manifest (every record's library, the recorded source digests), the standalone loader and its pinned bytes,
 no environment read, the launch grids against the exact tile counts of generated layouts and the scratch layout.
 
-On SM100 / SM103: the output, the LSE and every gradient against an FP64 reference of the same BF16 inputs on packed
+On SM100 / SM103 / SM107: the output, the LSE and every gradient against an FP64 reference of the same BF16 inputs on packed
 layouts (unequal lengths, tails that are no multiple of a tile, keys fewer than queries, empty segments) in the three
 dK / dV forms, under the accuracy budget declared below; rows that see no key exactly (``out = 0``, ``lse = -inf``,
 zero gradients); document isolation; repeated destination rows accumulated into an existing FP32 destination;
@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import importlib
 import json
 import math
 import random
@@ -68,8 +67,13 @@ MIB = 2**20
 # of its calibration layouts).  FP32 window gradients and destinations are compared in FP32.
 FA4_REL_L2 = {"out": 2.3e-3, "lse": 1.5e-7, "dq": 2.6e-3, "dk": 2.6e-3, "dv": 2.4e-3}
 BUDGET = 1.10
-# dQ is reduced with atomic adds: two runs of one input agree to the rounding of the reduction order.
+# dQ is reduced in FP32 with atomic adds, one partial per 128-key block, in a scheduling order, then rounded to BF16
+# once: two runs of one input differ by the FP32 reordering error before that rounding.  The comparison is one BF16
+# rounding step (DQ_RTOL) plus an absolute floor for the reordering error, which is absolute (FP32 ulps of the partials;
+# it dominates on elements whose partials cancel to near zero): DQ_ATOL_FRACTION of the tensor's largest magnitude,
+# 2^9 times below one BF16 step there.  O, LSE, dK and dV are compared bitwise.
 DQ_RTOL = 2**-7
+DQ_ATOL_FRACTION = 2**-16
 # Checkpointing: memory kept after a checkpointed forward, less the output storage.
 CKPT_RETAINED_LIMIT_MIB = 2.0
 # Beside a resident side-stream kernel: busy over alone within MAX_RATIO or at most MAX_EXTRA_MS above it.
@@ -213,11 +217,10 @@ def test_the_loader_imports_standalone_without_flashinfer() -> None:
 
 def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> None:
     _manifest_or_skip()
-    other = Path(
-        importlib.import_module(
-            "flashinfer.experimental.cake_kda_train.cake_build"
-        ).__file__
-    ).parent
+    # Another package's copy, read from the repository (not imported: the vendored gate blocks flashinfer).
+    other = (
+        Path(__file__).resolve().parents[2] / "flashinfer/experimental/cake_kda_train"
+    )
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):
         assert (PACKAGE_DIR / relative).read_bytes() == (
             other / relative
@@ -284,13 +287,19 @@ def test_grids_cover_every_tile() -> None:
             1,
             1,
         )
+        # The backward main kernel: a pair per (128-key block of the longest segment, key head, segment), sized by
+        # max_seqlen_k when given (exactly) and by T_k otherwise (an upper bound).
+        longest = max(-(-k // cake_jit.BWD_TILE_KEYS) for k in k_lens)
+        assert bwd_tiles <= n * max(1, longest)
         for stage in ("bwd_fp32", "bwd_rowmap", "bwd_bf16"):
             gx, gy, gz = cake_jit.grid(stage, **dims)
-            assert gx // 2 >= bwd_tiles and (gy, gz) == (4, 1)
+            assert gx % 2 == 0 and gx // 2 >= longest and (gy, gz) == (4, n)
+            exact = cake_jit.grid(stage, **dims, max_seqlen_k=max(k_lens))
+            assert exact == (2 * max(1, longest), 4, n)
         rows = cake_jit.rows_pad(dims["total_q"], n)
         assert rows % 128 == 0 and rows >= sum(-(-2 * q // 128) * 128 for q in q_lens)
-        for stage in ("bwd_pre", "bwd_post"):
-            assert cake_jit.grid(stage, **dims) == (rows // 32, 12, 1)
+        assert cake_jit.grid("bwd_pre", **dims) == (rows // 32, 12, 1)
+        assert cake_jit.grid("bwd_post", **dims) == (rows // 64, 12, 1)
 
 
 def test_scratch_layout_is_aligned_and_sized() -> None:
@@ -370,6 +379,12 @@ def _reference(x, scale=SCALE):
     }
 
 
+def _assert_dq_close(got: torch.Tensor, ref: torch.Tensor) -> None:
+    """Two dQ of one input (see DQ_RTOL / DQ_ATOL_FRACTION)."""
+    floor = DQ_ATOL_FRACTION * float(ref.float().abs().max()) if ref.numel() else 0.0
+    torch.testing.assert_close(got, ref, rtol=DQ_RTOL, atol=floor)
+
+
 def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
     got, ref = got.double(), ref.double()
     finite = torch.isfinite(ref)
@@ -398,7 +413,11 @@ def _run(x, form, *, workspace=None, dst_init=None, row_map=None):
         softmax_scale=SCALE,
         workspace=workspace,
     )
-    kwargs = {"softmax_scale": SCALE, "workspace": workspace}
+    # The BF16 form sizes the backward grid by T_k (no hint), the FP32 forms by the exact longest key segment.
+    ck = x["ck"]
+    longest = max(ck[i + 1] - ck[i] for i in range(len(ck) - 1))
+    max_k = None if form == "bf16" else longest
+    kwargs = {"softmax_scale": SCALE, "workspace": workspace, "max_seqlen_k": max_k}
     if form == "rowmap":
         kwargs.update(
             dk_acc=dst_init[0].clone(), dv_acc=dst_init[1].clone(), row_map=row_map
@@ -426,7 +445,7 @@ def _window_row_map(x, seed=0):
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# On SM100 / SM103
+# On SM100 / SM103 / SM107
 
 
 @pytest.mark.parametrize("form", DKV_FORMS)
@@ -505,10 +524,8 @@ def test_documents_are_isolated(device) -> None:
     assert torch.equal(pert["dk"][k_other], base["dk"][k_other])
     assert torch.equal(pert["dv"][k_other], base["dv"][k_other])
     # dQ is reduced with atomic adds: the other segments agree to the reduction-order rounding of two plain runs.
-    torch.testing.assert_close(again["dq"], base["dq"], rtol=DQ_RTOL, atol=0)
-    torch.testing.assert_close(
-        pert["dq"][q_other], base["dq"][q_other], rtol=DQ_RTOL, atol=0
-    )
+    _assert_dq_close(again["dq"], base["dq"])
+    _assert_dq_close(pert["dq"][q_other], base["dq"][q_other])
 
 
 def test_dynamic_shapes_reuse_one_workspace(device) -> None:
@@ -528,7 +545,7 @@ def test_dynamic_shapes_reuse_one_workspace(device) -> None:
         torch.cuda.synchronize()
         for t in ("out", "lse", "dk", "dv"):
             assert torch.equal(shared[t], fresh[t]), (q_lens, t)
-        torch.testing.assert_close(shared["dq"], fresh["dq"], rtol=DQ_RTOL, atol=0)
+        _assert_dq_close(shared["dq"], fresh["dq"])
         sizes.append(ws.nbytes)
     assert sizes == sorted(sizes), "the workspace shrank"
     need = max(
@@ -594,7 +611,7 @@ def test_checkpoint_keeps_nothing_alive_and_matches_eager(form, device) -> None:
         results.append((out.detach(), *grads))
     eager, ckpt, eager2 = results
     assert torch.equal(ckpt[0], eager[0])
-    torch.testing.assert_close(ckpt[1], eager[1], rtol=DQ_RTOL, atol=0)
+    _assert_dq_close(ckpt[1], eager[1])
     if form == "bf16":
         assert torch.equal(ckpt[2], eager[2]) and torch.equal(ckpt[3], eager[3])
     else:

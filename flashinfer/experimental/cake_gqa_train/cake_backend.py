@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Loader, launches and autograd of the Cake packed-varlen GQA training
-attention (head dimension 256, SM100 / SM103).
+attention (head dimension 256, SM100 / SM103 / SM107).
 
 The registry (:mod:`.cake_jit`) is data plus the host plan: ``MODULES`` holds
 one record per program (its ``library`` stem; the ``build.json`` entries are
@@ -71,8 +71,9 @@ __all__ = [
     "workspace_bytes",
 ]
 
-# One verified build per architecture: B200 / GB200 (``sm_100a``) and B300 /
-# GB300 (``sm_103a``), each compiled with its exact ``-gencode`` flag set.
+# One verified build per architecture: B200 / GB200 (``sm_100a``), B300 /
+# GB300 (``sm_103a``) and R200 (``sm_107a``), each compiled with its exact
+# ``-gencode`` flag set.
 ARCHES: tuple[str, ...] = tuple(cake_jit.ARCHES)
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = dict(cake_jit.ARCH_BY_CAPABILITY)
 HEAD_DIM: int = cake_jit.HEAD_DIM
@@ -468,6 +469,7 @@ def gqa_attention_bwd(
     dk_acc: Optional[torch.Tensor] = None,
     dv_acc: Optional[torch.Tensor] = None,
     row_map: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
     workspace: Optional[Workspace] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward: ``(dq, dk, dv)``.  ``dq`` is BF16 ``[T_q, H_q, 256]``.  dK / dV are summed over the query heads of
@@ -479,8 +481,15 @@ def gqa_attention_bwd(
     - ``row_map`` given: FP32 adds into the caller's ``dk_acc`` / ``dv_acc`` ``[N_dst, H_kv, 256]``: window row ``j``
       adds into destination row ``row_map[j]`` (int32 ``[T_k]``, rows may repeat; out-of-range rows are not
       checked), and the destinations are returned as ``dk`` / ``dv``.
+
+    ``max_seqlen_k`` (host int, optional) must be at least every segment's key count (the caller's contract, as
+    FlashAttention's ``max_seqlen_k``: a smaller value leaves key blocks out); it sizes the backward grid, one CTA pair
+    per 128 keys of the longest segment, per key head and segment.  ``None`` bounds it by ``T_k``: always correct,
+    with more CTAs that retire at once.  It is never read from the device.
     """
     dims = _check_operands(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    if max_seqlen_k is not None and int(max_seqlen_k) < 0:
+        raise ValueError(f"max_seqlen_k must be >= 0, got {max_seqlen_k}")
     total_q, total_k = dims["total_q"], dims["total_k"]
     heads_q, heads_kv = dims["num_heads_q"], dims["num_heads_kv"]
     device = q.device
@@ -583,7 +592,10 @@ def gqa_attention_bwd(
             "softmax_scale_log2": scale * LOG2_E,
             "row_map": row_map,
         },
-        dims,
+        {
+            **dims,
+            "max_seqlen_k": None if max_seqlen_k is None else int(max_seqlen_k),
+        },
         device_index,
     )
     _launch("bwd_post", {**common, "dQ_accum": dq_accum, "dQ": dq}, dims, device_index)
@@ -636,6 +648,7 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
         cu_seqlens_k: torch.Tensor,
         softmax_scale: float,
         dkv_acc: Optional[DkvAccSource],
+        max_seqlen_k: Optional[int],
         workspace: Optional[Workspace],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out, lse = gqa_attention_fwd(
@@ -649,6 +662,7 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
+        ctx.max_seqlen_k = max_seqlen_k
         ctx.dkv_acc = dkv_acc
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
         ctx.mark_non_differentiable(lse)
@@ -666,13 +680,14 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
             dout = dout.contiguous()
         kwargs: dict[str, Any] = {
             "softmax_scale": ctx.softmax_scale,
+            "max_seqlen_k": ctx.max_seqlen_k,
             "workspace": workspace,
         }
         if ctx.dkv_acc is None:
             dq, dk, dv = gqa_attention_bwd(
                 q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
             )
-            return dq, dk, dv, None, None, None, None, None
+            return dq, dk, dv, None, None, None, None, None, None
         dk_t, dv_t, row_map = _resolve_dkv_acc(ctx.dkv_acc)
         if row_map is None:
             kwargs.update(dk=dk_t, dv=dv_t, dkv_dtype=torch.float32)
@@ -681,7 +696,7 @@ class VarlenGQAAttentionFunction(torch.autograd.Function):
         dq = gqa_attention_bwd(
             q, k, v, out, lse, dout, cu_seqlens_q, cu_seqlens_k, **kwargs
         )[0]
-        return dq, None, None, None, None, None, None, None
+        return dq, None, None, None, None, None, None, None, None
 
 
 def varlen_gqa_attention(
@@ -694,6 +709,7 @@ def varlen_gqa_attention(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     dkv_acc: Optional[DkvAccSource] = None,
+    max_seqlen_k: Optional[int] = None,
     workspace: Optional[Workspace] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -701,7 +717,8 @@ def varlen_gqa_attention(
 
     ``dkv_acc=None``: autograd returns BF16 gradients for ``k`` / ``v``.  A ``dkv_acc`` callable is called in
     backward; it returns ``(dk_acc, dv_acc, row_map)`` (FP32 adds into the destinations) or ``(dk_win, dv_win)`` (FP32
-    window gradients stored into them), and ``k`` / ``v`` then get no gradient.
+    window gradients stored into them), and ``k`` / ``v`` then get no gradient.  ``max_seqlen_k``: see
+    :func:`gqa_attention_bwd`.
     """
     if not causal:
         raise NotImplementedError(
@@ -712,6 +729,14 @@ def varlen_gqa_attention(
             "dkv_acc must be None or a zero-argument callable (see DkvAccSource)"
         )
     out, lse = VarlenGQAAttentionFunction.apply(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, _scale(softmax_scale), dkv_acc, workspace
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        _scale(softmax_scale),
+        dkv_acc,
+        None if max_seqlen_k is None else int(max_seqlen_k),
+        workspace,
     )
     return (out, lse) if return_lse else out

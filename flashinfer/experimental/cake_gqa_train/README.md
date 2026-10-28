@@ -1,4 +1,4 @@
-# Cake packed-varlen GQA training attention backend (head dim 256, SM100 / SM103)
+# Cake packed-varlen GQA training attention backend (head dim 256, SM100 / SM103 / SM107)
 
 Experimental backend for the forward and first-order backward of causal GQA
 attention over packed variable-length segments, head dimension 256: BF16
@@ -12,8 +12,8 @@ shape list, no recompilation, no device-to-host read, no device-wide
 synchronization.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM100 (B200 / GB200) and SM103 (B300 / GB300) are the supported
-architectures; another device raises `RuntimeError`.  The feature does not
+SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the
+supported architectures; another device raises `RuntimeError`.  The feature does not
 participate in automatic backend selection, autotuning or trace-apply.  Its
 libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
@@ -28,6 +28,7 @@ ws = gqa_train_workspace(q.device)               # optional; reused across calls
 out = varlen_gqa_attention(
     q, k, v, cu_seqlens_q, cu_seqlens_k,
     softmax_scale=0.0625,                        # default 256 ** -0.5
+    max_seqlen_k=max_k,                          # optional host bound of the longest key segment
     workspace=ws,
 )
 out.backward(dout)                               # BF16 dq, dk, dv
@@ -44,7 +45,14 @@ out = varlen_gqa_attention(q, k, v, cu_seqlens_q, cu_seqlens_k,
 
 `varlen_gqa_attention_fwd` / `varlen_gqa_attention_bwd` are the two halves
 without autograd (`dkv_dtype=torch.float32` returns FP32 window gradients;
-`dk_acc`, `dv_acc`, `row_map` add into destinations).  The backend package
+`dk_acc`, `dv_acc`, `row_map` add into destinations).  `max_seqlen_k` (a
+host int, never read from the device) must be at least every segment's key
+count, as FlashAttention's `max_seqlen_k`: a smaller value leaves key blocks
+out.  It sizes the backward grid (one CTA pair per 128 keys of the longest
+segment, per key head and segment); without it the bound is `T_k`, which is
+always correct but launches CTAs that retire at once: on a 12-segment layout of
+257K keys the backward call took 8 to 15 % longer without it on SM100, SM103
+and SM107 GPUs.  The backend package
 exposes the same entry points (`varlen_gqa_attention`, `gqa_attention_fwd`,
 `gqa_attention_bwd`, `Workspace`).
 
@@ -80,4 +88,4 @@ without one, each device stream gets its own default workspace.
   dropout, no sliding window.
 - `H_q / H_kv` must be even.
 - `dout` of the low-level backward must be contiguous (autograd makes it so).
-- `sm_100a` and `sm_103a` only.
+- `sm_100a`, `sm_103a` and `sm_107a` only.

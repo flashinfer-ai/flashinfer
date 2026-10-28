@@ -210,6 +210,7 @@ class CakeArm:
                 dk_acc=x["dk_dst"],
                 dv_acc=x["dv_dst"],
                 row_map=x["row_map"],
+                max_seqlen_k=x["max_k"],
                 workspace=self.ws,
             )
 

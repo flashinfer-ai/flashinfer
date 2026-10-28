@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Packed-varlen causal GQA attention training with head dimension 256
-(SM100 / SM103), the Cake backend.
+(SM100 / SM103 / SM107), the Cake backend.
 
 Thin experimental entry points.  The checks, the launch plan, the workspace,
 the autograd Function and the generated kernels live in
@@ -72,6 +72,7 @@ def varlen_gqa_attention(
     softmax_scale: Optional[float] = None,
     causal: bool = True,
     dkv_acc: Optional[Callable[[], tuple]] = None,
+    max_seqlen_k: Optional[int] = None,
     workspace: Optional[Any] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -93,6 +94,10 @@ def varlen_gqa_attention(
         the caller's FP32 ``[N_dst, H_kv, 256]`` destinations (window row ``j`` into row ``row_map[j]``, int32
         ``[T_k]``, repeated rows accumulate), or returning ``(dk_win, dv_win)`` stores the FP32 window gradients
         ``[T_k, H_kv, 256]`` into them; ``k`` / ``v`` then get no gradient.  Nothing is held for the backward.
+    max_seqlen_k : int, optional
+        A host int at least every segment's key count (the caller's contract, as FlashAttention's
+        ``max_seqlen_k``; a smaller value leaves key blocks out); it sizes the backward grid.  ``None`` bounds it by
+        ``T_k`` (always correct; more CTAs that retire at once).  Never read from the device.
     workspace : optional
         A workspace of :func:`gqa_train_workspace`, reused across calls and shapes (grown, never shrunk; one stream
         at a time); autograd holds it by weak reference.  ``None``: the device's per-stream default workspace.
@@ -112,6 +117,7 @@ def varlen_gqa_attention(
         softmax_scale=softmax_scale,
         causal=causal,
         dkv_acc=dkv_acc,
+        max_seqlen_k=max_seqlen_k,
         workspace=workspace,
         return_lse=return_lse,
     )
@@ -164,6 +170,7 @@ def varlen_gqa_attention_bwd(
     dk_acc: Optional[torch.Tensor] = None,
     dv_acc: Optional[torch.Tensor] = None,
     row_map: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
     workspace: Optional[Any] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     r"""Backward without autograd: ``(dq, dk, dv)`` from the forward's ``out`` and ``lse`` and a contiguous ``dout``.
@@ -171,6 +178,7 @@ def varlen_gqa_attention_bwd(
     ``dq`` is BF16.  dK / dV are FP32 sums over the query heads of each key head, returned as BF16
     (``dkv_dtype=torch.bfloat16``), as FP32 window gradients (``dkv_dtype=torch.float32``) or, with ``row_map``,
     added into the FP32 destinations ``dk_acc`` / ``dv_acc`` ``[N_dst, H_kv, 256]`` (returned as ``dk`` / ``dv``).
+    ``max_seqlen_k``: see :func:`varlen_gqa_attention`.
     """
     return _pkg().gqa_attention_bwd(
         q,
@@ -189,6 +197,7 @@ def varlen_gqa_attention_bwd(
         dk_acc=dk_acc,
         dv_acc=dv_acc,
         row_map=row_map,
+        max_seqlen_k=max_seqlen_k,
         workspace=workspace,
     )
 

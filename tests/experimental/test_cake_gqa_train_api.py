@@ -103,8 +103,9 @@ def _device_or_skip() -> torch.device:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("the Cake GQA training attention ships for SM100 / SM103")
+        pytest.skip("the Cake GQA training attention ships for SM100 / SM103 / SM107")
     from flashinfer.experimental.cake_gqa_train import cake_jit
 
     if not (Path(cake_jit.__file__).parent / "build.json").is_file():
