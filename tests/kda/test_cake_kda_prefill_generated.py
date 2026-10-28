@@ -1372,11 +1372,15 @@ def _pair_share_cases():
     """Without state indices (dense states, zero initial states) the long rows
     above take the M64 value split; with them they take the chain composite
     (test below), so the indexed pool runs on serving rows the pair-share
-    route takes on both arches."""
+    route takes on both arches.  Without checkpoint rows the program skips
+    its checkpoint handshakes: the long rows on dense states, and two
+    4096-token sequences at H16 (the route-export pin's shape) on dense
+    states and on the indexed pool."""
     rows = [([8192, 17], 12, "8192+17-h12"), ([3000, 13384], 16, "3000+13384-h16")]
     rows += [([8192], 6, "8192-h6")]
     states = [(dict(indexed=False), "dense-state")]
     states += [(dict(indexed=False, initial=False), "zero-initial-state")]
+    states += [(dict(indexed=False, rows=False), "dense-state-no-rows")]
     cases = [
         pytest.param(lengths, heads, state, id=f"{row}-{name}")
         for lengths, heads, row in rows
@@ -1386,6 +1390,11 @@ def _pair_share_cases():
         cases.append(
             pytest.param(lengths, 16, dict(indexed=True), id=f"{row}-h16-indexed-pool")
         )
+    for state, name in (
+        (dict(indexed=False, rows=False), "dense-state-no-rows"),
+        (dict(indexed=True, rows=False), "indexed-pool-no-rows"),
+    ):
+        cases.append(pytest.param([4096] * 2, 16, state, id=f"2x4096-h16-{name}"))
     return cases
 
 
@@ -1403,8 +1412,9 @@ def test_pair_share_is_bitwise_the_routed_m64_program(
 ):
     """A long M64 value-split launch that takes the pair-share build equals, bit
     for bit, the routed M64 program (the loader without pair-share builds):
-    output, final states and checkpoint rows, with and without state indices
-    and initial states; each arm has its own copy of the initial pool."""
+    output, final states and checkpoint rows, with and without state indices,
+    initial states and checkpoint rows; each arm has its own copy of the
+    initial pool."""
     arch = registry.device_arch()
     pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
     d = _inputs(lengths, heads)
