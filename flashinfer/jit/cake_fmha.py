@@ -176,6 +176,7 @@ def _validate_decode_quant_fp8_specialization(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> dict[str, int]:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
@@ -183,13 +184,30 @@ def _validate_decode_quant_fp8_specialization(
         raise ValueError("batch_size must be positive")
     if q_len != 1:
         raise ValueError("decode-quant FP8 requires q_len=1")
+    if fixed_split and full_blocks:
+        raise ValueError(
+            "the fixed-split decode-quant FP8 member masks tails at run time"
+        )
     if num_q_heads <= 0 or num_kv_heads <= 0:
         raise ValueError("num_q_heads and num_kv_heads must be positive")
     if num_q_heads != 8 * num_kv_heads:
         raise ValueError("decode-quant FP8 requires a head-group ratio of 8")
     if page_size not in (16, 32):
         raise ValueError("decode-quant FP8 requires page_size 16 or 32")
-    return {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
+    selector = {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
+    if fixed_split:
+        selector.update(_DECODE_QUANT_FP8_FIXED_SPLIT)
+    return selector
+
+
+# The fixed split plan of the FP8 decode (8 splits x 16 blocks: perf_decode_b4_s16384_fp8 on B200 and GB300) with
+# PDL between the decode and its reducer; every other plan uses the runtime-plan member.
+_DECODE_QUANT_FP8_FIXED_SPLIT = {
+    "NUM_SPLITS": 8,
+    "BLOCKS_PER_SPLIT": 16,
+    "ENABLE_PDL": 1,
+}
+_DECODE_QUANT_FP8_REDUCE_FIXED_SPLIT = {"FIXED_NUM_SPLITS": 8, "USE_PDL": 1}
 
 
 def _validate_decode_quant_nvfp4_specialization(
@@ -1976,6 +1994,7 @@ def get_cake_fmha_decode_quant_fp8_uri(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> str:
     selector = _validate_decode_quant_fp8_specialization(
         target,
@@ -1985,11 +2004,17 @@ def get_cake_fmha_decode_quant_fp8_uri(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
+    )
+    split = (
+        f"_split{selector['NUM_SPLITS']}x{selector['BLOCKS_PER_SPLIT']}_pdl"
+        if fixed_split
+        else ""
     )
     return (
         f"cake_fmha_decode_quant_fp8_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
-        f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}"
+        f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}{split}"
         f"_{CAKE_FMHA_JIT_TAG}"
     )
 
@@ -2004,6 +2029,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> JitSpec:
     """Build the authenticated FP8 decode plus split-KV reducer chain."""
 
@@ -2015,10 +2041,23 @@ def gen_cake_fmha_decode_quant_fp8_module(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
     )
+    reduce_selector = _DECODE_QUANT_FP8_REDUCE_FIXED_SPLIT if fixed_split else {}
     main_sources = _get_component_launch_sources("decode_quant_fp8", target, selector)
     reduce_sources = _get_component_launch_sources(
-        "decode_quant_fp8_reduce", target, {}
+        "decode_quant_fp8_reduce", target, reduce_selector
+    )
+    fixed_split_flags = (
+        [
+            f"-DCAKE_FMHA_FIXED_NUM_SPLITS={selector['NUM_SPLITS']}",
+            f"-DCAKE_FMHA_FIXED_BLOCKS_PER_SPLIT={selector['BLOCKS_PER_SPLIT']}",
+            f"-DCAKE_FMHA_ENABLE_PDL={selector['ENABLE_PDL']}",
+            f"-DCAKE_FMHA_REDUCE_FIXED_NUM_SPLITS={reduce_selector['FIXED_NUM_SPLITS']}",
+            f"-DCAKE_FMHA_REDUCE_USE_PDL={reduce_selector['USE_PDL']}",
+        ]
+        if fixed_split
+        else []
     )
     api_binding = get_cake_fmha_csrc_dir() / _DECODE_QUANT_FP8_JIT_BINDING
     if not api_binding.is_file():
@@ -2032,6 +2071,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
             num_kv_heads,
             page_size,
             full_blocks=full_blocks,
+            fixed_split=fixed_split,
         ),
         sources=[*main_sources, *reduce_sources, api_binding],
         extra_cuda_cflags=[
@@ -2043,6 +2083,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
             f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
             f"-DCAKE_FMHA_FULL_BLOCKS={selector['FULL_BLOCKS']}",
             "-DCAKE_FMHA_NVFP4=0",
+            *fixed_split_flags,
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -2060,6 +2101,7 @@ def load_cake_fmha_decode_quant_fp8_module(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ):
     module = gen_cake_fmha_decode_quant_fp8_module(
         target,
@@ -2069,6 +2111,7 @@ def load_cake_fmha_decode_quant_fp8_module(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
     ).build_and_load()
     logger.info("Loaded Cake FMHA FP8 decode/reduce module: %s", module)
     return module

@@ -381,6 +381,37 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
 @pytest.mark.parametrize(
     "rows,vocab_size",
     [
+        (240, 256000),  # 16-CTA persistent clusters, about 18 rows each
+        (480, 128000),  # 8-CTA persistent clusters, about 13 rows each
+    ],
+)
+def test_blackwell_persistent_softmax_every_launch_reads_its_own_rows(rows, vocab_size):
+    # The persistent route keeps clusters resident and walks each one over many
+    # rows; a shared-memory tile slot takes the next row's bulk copy once every
+    # thread has read it. Every launch must match the softmax of its own rows.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    assert (
+        route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+    )
+    probs_ref = torch.softmax(logits.double(), dim=-1).float()
+    launches = 4000
+    bad = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(launches):
+        probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+        bad += ~((probs - probs_ref).abs() <= 1e-8).all()
+    assert bad.item() == 0, f"{bad.item()} of {launches} launches differ"
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
         (31, 32000),  # B200: as many rows as resident 16-CTA clusters
         (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
         (33, 32000),  # GB300: as many rows as resident 16-CTA clusters
@@ -1046,6 +1077,70 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     )
 
 
+def _top_k_top_p_sample(x, top_k, top_p, from_logits, **kwargs):
+    if from_logits:
+        return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x, top_k, top_p, **kwargs
+        )
+    return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(x, dim=-1), top_k, top_p, **kwargs
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99])
+@pytest.mark.parametrize("top_k_max", [64, 256])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_top_k_max(
+    batch_size, top_k_max, from_logits
+):
+    torch.manual_seed(42)
+    vocab_size = 128256
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    top_k = torch.randint(1, top_k_max + 1, (batch_size,), device="cuda:0")
+    # Rows above the bound, including "no top-k" rows, behave as top_k == top_k_max.
+    top_k[0] = vocab_size
+    top_k[-1] = -1
+    expected_k = torch.where(top_k < 0, top_k_max, top_k.clamp(max=top_k_max))
+    sorted_logits, _ = torch.sort(logits, descending=True)
+    pivot = sorted_logits[torch.arange(batch_size), expected_k - 1]
+    mask = logits >= pivot.unsqueeze(-1)
+
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    for _ in range(100):
+        samples = _top_k_top_p_sample(
+            logits, top_k, 0.9, from_logits, top_k_max=top_k_max, generator=generator
+        )
+        assert torch.all(mask[torch.arange(batch_size), samples])
+
+
+@pytest.mark.parametrize("k", [16, 200])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_top_k_max_freq(k, from_logits):
+    torch.manual_seed(42)
+    p = 0.9
+    vocab_size, num_rows, num_iters = 128256, 1000, 50
+    logits = torch.randn(1, vocab_size, device="cuda:0") * 2
+    probs = torch.softmax(logits, dim=-1)
+    ref = flashinfer.sampling.top_p_renorm_probs(
+        flashinfer.sampling.top_k_renorm_probs(probs, k), p
+    )[0]
+
+    # The fast path rejects `indices`, so repeat the row instead.
+    x = logits.expand(num_rows, -1).contiguous()
+    top_k = torch.full((num_rows,), k, dtype=torch.int32, device="cuda:0")
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
+    for _ in range(num_iters):
+        samples = _top_k_top_p_sample(
+            x, top_k, p, from_logits, top_k_max=256, generator=generator
+        )
+        counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / (num_rows * num_iters)
+    assert torch.all(ref[freq > 0] > 0)
+    similarity = torch.cosine_similarity(freq, ref, dim=0)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
@@ -1594,6 +1689,55 @@ def test_chain_speculative_sampling(
                     assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
 
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
+
+
+@pytest.mark.parametrize(
+    "vocab_size", [1023, 1024, 1025, 4095, 4096, 4097, 32000, 32001, 128256, 151937]
+)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_chain_speculative_sampling_residual_normalizer(vocab_size, deterministic):
+    # The residual relu(target - draft) is spread over many indices with unequal mass,
+    # so the value of its sum decides where the inverse-CDF walk stops. A reduction
+    # that drops tiles, vector lanes, or the cross-thread step samples from a truncated
+    # distribution and lowers the mean sampled index. The stride is not a multiple of
+    # the vector width, so every lane carries mass.
+    batch_size = 512
+    draft_probs = torch.zeros(batch_size, 1, vocab_size, device="cuda:0")
+    draft_probs[..., 0] = 1.0
+    draft_token_ids = torch.zeros((batch_size, 1), device="cuda:0", dtype=torch.int32)
+    target_probs = torch.zeros(batch_size, 2, vocab_size, device="cuda:0")
+    idx = torch.arange(1, vocab_size, 65, device="cuda:0")
+    weights = torch.arange(1, idx.numel() + 1, device="cuda:0", dtype=torch.float32)
+    probs = weights / weights.sum()
+    target_probs[:, 0, idx] = probs
+    target_probs[:, 1, 0] = 1.0
+    expected_mean = (idx.double() * probs.double()).sum()
+    variance = ((idx.double() - expected_mean) ** 2 * probs.double()).sum()
+
+    samples = []
+    for seed in (12345, 999, 7):
+        output_token_ids, accepted_num, _ = (
+            flashinfer.sampling.chain_speculative_sampling(
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                deterministic=deterministic,
+                seed=seed,
+                offset=17,
+            )
+        )
+        # The draft token has no target mass, so every row resamples the residual.
+        assert torch.all(accepted_num == 0)
+        assert torch.all(output_token_ids[:, 1:] == -1)
+        assert torch.all(
+            torch.isin(output_token_ids[:, 0], idx.to(output_token_ids.dtype))
+        )
+        samples.append(output_token_ids[:, 0].double())
+
+    drawn = torch.cat(samples)
+    # Six standard errors: a correct kernel fails this about once in 5e8 runs.
+    standard_error = (variance / drawn.numel()).sqrt()
+    assert (drawn.mean() - expected_mean).abs() < 6 * standard_error
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])

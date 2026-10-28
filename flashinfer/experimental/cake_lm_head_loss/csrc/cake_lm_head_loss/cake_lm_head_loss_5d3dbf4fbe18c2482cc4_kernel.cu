@@ -62,12 +62,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_EPI_STORE_PIPE_STAGES 2
 #define NUM_CLC_PIPE_STAGES 2
 #define NUM_THR_PIPE_STAGES 2
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 32768
-#define SMEM_SMEM_V1_OFF 17408
+#define SMEM_SMEM_V1_OFF 1024
 #define SMEM_SMEM_V1_STAGE_BYTES 16384
 #define SMEM_SMEM_V1_STRIDE 32768
+#define SMEM_SMEM_V1_0_OFF 17408
+#define SMEM_SMEM_V1_0_STAGE_BYTES 16384
+#define SMEM_SMEM_V1_0_STRIDE 32768
 #define SMEM_SMEM_EPI_OFF 197632
 #define SMEM_SMEM_EPI_STAGE_BYTES 16384
 #define SMEM_SMEM_EPI_STRIDE 16384
@@ -213,10 +213,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(cluster_size));
 
     // Kernel setup ops
-    __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int smem_v0_addr = smem + 1024;
-    __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int smem_v1_addr = smem + 17408;
+    __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smem_v1_addr = smem + 1024;
+    __nv_bfloat16* smem_v1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int smem_v1_addr_0 = smem + 17408;
     float* smem_epi = reinterpret_cast<float*>(smem_raw + 197632);
     const int smem_epi_addr = smem + 197632;
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
@@ -357,17 +357,17 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                            :: "r"(smem_v0_addr + load_stage * 32768 + (unsigned int)(ld_pair_id * 8192)), "l"((&A)), "r"(ld_off_m + ld_pair_id * 64), "r"(ld_k0), "r"(0),
+                            :: "r"(smem_v1_addr + load_stage * 32768 + (unsigned int)(ld_pair_id * 8192)), "l"((&A)), "r"(ld_off_m + ld_pair_id * 64), "r"(ld_k0), "r"(0),
                                "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)((21845 & (1 << (int)cluster_size) - 1) << (cta_rank & 1))) : "memory");
                         if (ld_pairs == 1) {
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(smem_v0_addr + load_stage * 32768 + 8192), "l"((&A)), "r"(ld_off_m + 64), "r"(ld_k0), "r"(0),
+                                :: "r"(smem_v1_addr + load_stage * 32768 + 8192), "l"((&A)), "r"(ld_off_m + 64), "r"(ld_k0), "r"(0),
                                    "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)((21845 & (1 << (int)cluster_size) - 1) << (cta_rank & 1))) : "memory");
                         }
-                        tma_3d_gmem2smem_cta2(smem_v1_addr + load_stage * 32768, (&B), ld_off_n, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_v1_addr + load_stage * 32768 + 8192, (&B), ld_off_n + 64, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_v1_addr_0 + load_stage * 32768, (&B), ld_off_n, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_v1_addr_0 + load_stage * 32768 + 8192, (&B), ld_off_n + 64, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
@@ -407,7 +407,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                 load_clc_stage += 1;
                 if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                 if (_clc_valid_1 == 0) {
@@ -454,8 +454,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((mm_k == 0) ? 1 : 0);
-                            int _mma_a_lo_0 = ((((smem_v0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
-                            int _mma_b_lo_0 = ((((smem_v1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+                            int _mma_a_lo_0 = ((((smem_v1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+                            int _mma_b_lo_0 = ((((smem_v1_addr_0) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -532,7 +532,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                 mma_clc_stage += 1;
                 if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                 if (_clc_valid_2 == 0) {
@@ -590,7 +590,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (epi_clc_stage) * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
                 if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_2 ^= 1; }
                 int ep_item_t = ep_tile >> 2;
@@ -729,7 +729,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(clc_full_addr + (sched_clc_stage) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -760,7 +760,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                        :: "r"(clc_empty_addr + (sched_clc_stage) * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
                     if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_3 ^= 1; }
                     if (_clc_valid_0 == 0) {

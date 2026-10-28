@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generated programs of the BF16 small-batch matrix product (out = input @ weight.T +
-bias) on tcgen05, bit for bit the output of the mma.sync tinygemm2 kernel: seven tiles
+bias) on tcgen05, bit for bit the output of the mma.sync tinygemm2 kernel: eight tiles
 (PACKED_NARROW, PACKED_NARROW_U4, PACKED_NARROW_FULL_STAGES, PACKED_M64_N16,
-PACKED_M64_N4, PACKED, ACCUMULATORS), each with and without the bias and with and
-without programmatic dependent launch, for sm_100a, sm_103a and sm_107a. The host module
-``flashinfer.gemm.routergemm`` selects the program from the batch, the output features
-and the bias, computes the grid and launches it.
+PACKED_M64_N4, PACKED, PACKED_BOX8, ACCUMULATORS), each with and without the bias and
+with and without programmatic dependent launch, for sm_100a, sm_103a and sm_107a. The
+host module ``flashinfer.gemm.routergemm`` selects the program from the batch, the
+output features and the bias, computes the grid and launches it.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -29,12 +29,12 @@ from . import cake_program
 from .core import JitSpec
 
 PACKED_NARROW = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_848355ea3e2e0907f41e",
+    name="cake_tinygemm2_tcgen05_8b32b037a0fe50155e9a",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_848355ea3e2e0907f41e",
+    kernel="kernel_cake_tinygemm2_tcgen05_8b32b037a0fe50155e9a",
     sources=(
-        "cake_tinygemm2_tcgen05_848355ea3e2e0907f41e_kernel.cu",
-        "cake_tinygemm2_tcgen05_848355ea3e2e0907f41e_binding.cu",
+        "cake_tinygemm2_tcgen05_8b32b037a0fe50155e9a_kernel.cu",
+        "cake_tinygemm2_tcgen05_8b32b037a0fe50155e9a_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -53,12 +53,12 @@ PACKED_NARROW = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_8534911391626feea39d",
+    name="cake_tinygemm2_tcgen05_9b683dd9478a745d4c55",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_8534911391626feea39d",
+    kernel="kernel_cake_tinygemm2_tcgen05_9b683dd9478a745d4c55",
     sources=(
-        "cake_tinygemm2_tcgen05_8534911391626feea39d_kernel.cu",
-        "cake_tinygemm2_tcgen05_8534911391626feea39d_binding.cu",
+        "cake_tinygemm2_tcgen05_9b683dd9478a745d4c55_kernel.cu",
+        "cake_tinygemm2_tcgen05_9b683dd9478a745d4c55_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -77,12 +77,12 @@ PACKED_NARROW_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_971916e9f4db76eae167",
+    name="cake_tinygemm2_tcgen05_d5ad477acf131a5b9fd7",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_971916e9f4db76eae167",
+    kernel="kernel_cake_tinygemm2_tcgen05_d5ad477acf131a5b9fd7",
     sources=(
-        "cake_tinygemm2_tcgen05_971916e9f4db76eae167_kernel.cu",
-        "cake_tinygemm2_tcgen05_971916e9f4db76eae167_binding.cu",
+        "cake_tinygemm2_tcgen05_d5ad477acf131a5b9fd7_kernel.cu",
+        "cake_tinygemm2_tcgen05_d5ad477acf131a5b9fd7_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -101,12 +101,12 @@ PACKED_NARROW_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_19e715d5c3a5328f7cbb",
+    name="cake_tinygemm2_tcgen05_e440a653fc1301e5caca",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_19e715d5c3a5328f7cbb",
+    kernel="kernel_cake_tinygemm2_tcgen05_e440a653fc1301e5caca",
     sources=(
-        "cake_tinygemm2_tcgen05_19e715d5c3a5328f7cbb_kernel.cu",
-        "cake_tinygemm2_tcgen05_19e715d5c3a5328f7cbb_binding.cu",
+        "cake_tinygemm2_tcgen05_e440a653fc1301e5caca_kernel.cu",
+        "cake_tinygemm2_tcgen05_e440a653fc1301e5caca_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -125,12 +125,12 @@ PACKED_NARROW_NOBIAS_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_U4 = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_d73a7cf63897c144631c",
+    name="cake_tinygemm2_tcgen05_3030ca5eed6c47249d52",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_d73a7cf63897c144631c",
+    kernel="kernel_cake_tinygemm2_tcgen05_3030ca5eed6c47249d52",
     sources=(
-        "cake_tinygemm2_tcgen05_d73a7cf63897c144631c_kernel.cu",
-        "cake_tinygemm2_tcgen05_d73a7cf63897c144631c_binding.cu",
+        "cake_tinygemm2_tcgen05_3030ca5eed6c47249d52_kernel.cu",
+        "cake_tinygemm2_tcgen05_3030ca5eed6c47249d52_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -149,12 +149,12 @@ PACKED_NARROW_U4 = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_U4_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_0a6aae0d7977d59edb54",
+    name="cake_tinygemm2_tcgen05_c9066e280e2e908f9dab",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_0a6aae0d7977d59edb54",
+    kernel="kernel_cake_tinygemm2_tcgen05_c9066e280e2e908f9dab",
     sources=(
-        "cake_tinygemm2_tcgen05_0a6aae0d7977d59edb54_kernel.cu",
-        "cake_tinygemm2_tcgen05_0a6aae0d7977d59edb54_binding.cu",
+        "cake_tinygemm2_tcgen05_c9066e280e2e908f9dab_kernel.cu",
+        "cake_tinygemm2_tcgen05_c9066e280e2e908f9dab_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -173,12 +173,12 @@ PACKED_NARROW_U4_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_U4_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_f4ba279da7a1fdb36fc9",
+    name="cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_f4ba279da7a1fdb36fc9",
+    kernel="kernel_cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d",
     sources=(
-        "cake_tinygemm2_tcgen05_f4ba279da7a1fdb36fc9_kernel.cu",
-        "cake_tinygemm2_tcgen05_f4ba279da7a1fdb36fc9_binding.cu",
+        "cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d_kernel.cu",
+        "cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -197,12 +197,12 @@ PACKED_NARROW_U4_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_U4_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_49458d12a9f23c78d75c",
+    name="cake_tinygemm2_tcgen05_165074e6003ca45c0290",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_49458d12a9f23c78d75c",
+    kernel="kernel_cake_tinygemm2_tcgen05_165074e6003ca45c0290",
     sources=(
-        "cake_tinygemm2_tcgen05_49458d12a9f23c78d75c_kernel.cu",
-        "cake_tinygemm2_tcgen05_49458d12a9f23c78d75c_binding.cu",
+        "cake_tinygemm2_tcgen05_165074e6003ca45c0290_kernel.cu",
+        "cake_tinygemm2_tcgen05_165074e6003ca45c0290_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -221,12 +221,12 @@ PACKED_NARROW_U4_NOBIAS_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_FULL_STAGES = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_78ba265ce00c81b4045a",
+    name="cake_tinygemm2_tcgen05_af0096e77ec6f05fd1bf",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_78ba265ce00c81b4045a",
+    kernel="kernel_cake_tinygemm2_tcgen05_af0096e77ec6f05fd1bf",
     sources=(
-        "cake_tinygemm2_tcgen05_78ba265ce00c81b4045a_kernel.cu",
-        "cake_tinygemm2_tcgen05_78ba265ce00c81b4045a_binding.cu",
+        "cake_tinygemm2_tcgen05_af0096e77ec6f05fd1bf_kernel.cu",
+        "cake_tinygemm2_tcgen05_af0096e77ec6f05fd1bf_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -245,12 +245,12 @@ PACKED_NARROW_FULL_STAGES = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_FULL_STAGES_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_3001e55f6e7bd77e4033",
+    name="cake_tinygemm2_tcgen05_f33df96b451d7caa6ee5",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_3001e55f6e7bd77e4033",
+    kernel="kernel_cake_tinygemm2_tcgen05_f33df96b451d7caa6ee5",
     sources=(
-        "cake_tinygemm2_tcgen05_3001e55f6e7bd77e4033_kernel.cu",
-        "cake_tinygemm2_tcgen05_3001e55f6e7bd77e4033_binding.cu",
+        "cake_tinygemm2_tcgen05_f33df96b451d7caa6ee5_kernel.cu",
+        "cake_tinygemm2_tcgen05_f33df96b451d7caa6ee5_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -269,12 +269,12 @@ PACKED_NARROW_FULL_STAGES_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_FULL_STAGES_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_0741e44713065115edda",
+    name="cake_tinygemm2_tcgen05_00dda32c0016befaccac",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_0741e44713065115edda",
+    kernel="kernel_cake_tinygemm2_tcgen05_00dda32c0016befaccac",
     sources=(
-        "cake_tinygemm2_tcgen05_0741e44713065115edda_kernel.cu",
-        "cake_tinygemm2_tcgen05_0741e44713065115edda_binding.cu",
+        "cake_tinygemm2_tcgen05_00dda32c0016befaccac_kernel.cu",
+        "cake_tinygemm2_tcgen05_00dda32c0016befaccac_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -293,12 +293,12 @@ PACKED_NARROW_FULL_STAGES_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NARROW_FULL_STAGES_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_3be3c056425e1f5354b9",
+    name="cake_tinygemm2_tcgen05_0dd0aa0a9bc6fe52beda",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_3be3c056425e1f5354b9",
+    kernel="kernel_cake_tinygemm2_tcgen05_0dd0aa0a9bc6fe52beda",
     sources=(
-        "cake_tinygemm2_tcgen05_3be3c056425e1f5354b9_kernel.cu",
-        "cake_tinygemm2_tcgen05_3be3c056425e1f5354b9_binding.cu",
+        "cake_tinygemm2_tcgen05_0dd0aa0a9bc6fe52beda_kernel.cu",
+        "cake_tinygemm2_tcgen05_0dd0aa0a9bc6fe52beda_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -317,12 +317,12 @@ PACKED_NARROW_FULL_STAGES_NOBIAS_PDL = cake_program.CakeProgram(
 )
 
 PACKED_M64_N16 = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_4b7ed5a2958f2a9a5c65",
+    name="cake_tinygemm2_tcgen05_97a01814dc569e35cbd8",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_4b7ed5a2958f2a9a5c65",
+    kernel="kernel_cake_tinygemm2_tcgen05_97a01814dc569e35cbd8",
     sources=(
-        "cake_tinygemm2_tcgen05_4b7ed5a2958f2a9a5c65_kernel.cu",
-        "cake_tinygemm2_tcgen05_4b7ed5a2958f2a9a5c65_binding.cu",
+        "cake_tinygemm2_tcgen05_97a01814dc569e35cbd8_kernel.cu",
+        "cake_tinygemm2_tcgen05_97a01814dc569e35cbd8_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -341,12 +341,12 @@ PACKED_M64_N16 = cake_program.CakeProgram(
 )
 
 PACKED_M64_N16_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_4fa7a2697c2d9439578f",
+    name="cake_tinygemm2_tcgen05_811c4b5a0cb7b8b2de97",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_4fa7a2697c2d9439578f",
+    kernel="kernel_cake_tinygemm2_tcgen05_811c4b5a0cb7b8b2de97",
     sources=(
-        "cake_tinygemm2_tcgen05_4fa7a2697c2d9439578f_kernel.cu",
-        "cake_tinygemm2_tcgen05_4fa7a2697c2d9439578f_binding.cu",
+        "cake_tinygemm2_tcgen05_811c4b5a0cb7b8b2de97_kernel.cu",
+        "cake_tinygemm2_tcgen05_811c4b5a0cb7b8b2de97_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -365,12 +365,12 @@ PACKED_M64_N16_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_M64_N16_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_c829d06f681d5af12d74",
+    name="cake_tinygemm2_tcgen05_d2fa98684abba65a9b82",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_c829d06f681d5af12d74",
+    kernel="kernel_cake_tinygemm2_tcgen05_d2fa98684abba65a9b82",
     sources=(
-        "cake_tinygemm2_tcgen05_c829d06f681d5af12d74_kernel.cu",
-        "cake_tinygemm2_tcgen05_c829d06f681d5af12d74_binding.cu",
+        "cake_tinygemm2_tcgen05_d2fa98684abba65a9b82_kernel.cu",
+        "cake_tinygemm2_tcgen05_d2fa98684abba65a9b82_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -389,12 +389,12 @@ PACKED_M64_N16_PDL = cake_program.CakeProgram(
 )
 
 PACKED_M64_N16_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_41497cd705d43e7a3b17",
+    name="cake_tinygemm2_tcgen05_1cf48fce11475e27a2b1",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_41497cd705d43e7a3b17",
+    kernel="kernel_cake_tinygemm2_tcgen05_1cf48fce11475e27a2b1",
     sources=(
-        "cake_tinygemm2_tcgen05_41497cd705d43e7a3b17_kernel.cu",
-        "cake_tinygemm2_tcgen05_41497cd705d43e7a3b17_binding.cu",
+        "cake_tinygemm2_tcgen05_1cf48fce11475e27a2b1_kernel.cu",
+        "cake_tinygemm2_tcgen05_1cf48fce11475e27a2b1_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -413,12 +413,12 @@ PACKED_M64_N16_NOBIAS_PDL = cake_program.CakeProgram(
 )
 
 PACKED_M64_N4 = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_4c43f8c5910745235bfd",
+    name="cake_tinygemm2_tcgen05_34830dccba0f4943f78c",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_4c43f8c5910745235bfd",
+    kernel="kernel_cake_tinygemm2_tcgen05_34830dccba0f4943f78c",
     sources=(
-        "cake_tinygemm2_tcgen05_4c43f8c5910745235bfd_kernel.cu",
-        "cake_tinygemm2_tcgen05_4c43f8c5910745235bfd_binding.cu",
+        "cake_tinygemm2_tcgen05_34830dccba0f4943f78c_kernel.cu",
+        "cake_tinygemm2_tcgen05_34830dccba0f4943f78c_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -437,12 +437,12 @@ PACKED_M64_N4 = cake_program.CakeProgram(
 )
 
 PACKED_M64_N4_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_2bfd7f2e3a7ce9fecd32",
+    name="cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_2bfd7f2e3a7ce9fecd32",
+    kernel="kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e",
     sources=(
-        "cake_tinygemm2_tcgen05_2bfd7f2e3a7ce9fecd32_kernel.cu",
-        "cake_tinygemm2_tcgen05_2bfd7f2e3a7ce9fecd32_binding.cu",
+        "cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e_kernel.cu",
+        "cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -461,12 +461,12 @@ PACKED_M64_N4_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_M64_N4_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_7c03601e6f8deef1ba09",
+    name="cake_tinygemm2_tcgen05_0723e7061398f785193f",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_7c03601e6f8deef1ba09",
+    kernel="kernel_cake_tinygemm2_tcgen05_0723e7061398f785193f",
     sources=(
-        "cake_tinygemm2_tcgen05_7c03601e6f8deef1ba09_kernel.cu",
-        "cake_tinygemm2_tcgen05_7c03601e6f8deef1ba09_binding.cu",
+        "cake_tinygemm2_tcgen05_0723e7061398f785193f_kernel.cu",
+        "cake_tinygemm2_tcgen05_0723e7061398f785193f_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -485,12 +485,12 @@ PACKED_M64_N4_PDL = cake_program.CakeProgram(
 )
 
 PACKED_M64_N4_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_ac4eb7e744422a5ff332",
+    name="cake_tinygemm2_tcgen05_6638722cc0c3ce41977b",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_ac4eb7e744422a5ff332",
+    kernel="kernel_cake_tinygemm2_tcgen05_6638722cc0c3ce41977b",
     sources=(
-        "cake_tinygemm2_tcgen05_ac4eb7e744422a5ff332_kernel.cu",
-        "cake_tinygemm2_tcgen05_ac4eb7e744422a5ff332_binding.cu",
+        "cake_tinygemm2_tcgen05_6638722cc0c3ce41977b_kernel.cu",
+        "cake_tinygemm2_tcgen05_6638722cc0c3ce41977b_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -509,12 +509,12 @@ PACKED_M64_N4_NOBIAS_PDL = cake_program.CakeProgram(
 )
 
 PACKED = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_c5ced1a0b84f85fd702d",
+    name="cake_tinygemm2_tcgen05_aa21cffe57e4ba888fb3",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_c5ced1a0b84f85fd702d",
+    kernel="kernel_cake_tinygemm2_tcgen05_aa21cffe57e4ba888fb3",
     sources=(
-        "cake_tinygemm2_tcgen05_c5ced1a0b84f85fd702d_kernel.cu",
-        "cake_tinygemm2_tcgen05_c5ced1a0b84f85fd702d_binding.cu",
+        "cake_tinygemm2_tcgen05_aa21cffe57e4ba888fb3_kernel.cu",
+        "cake_tinygemm2_tcgen05_aa21cffe57e4ba888fb3_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -533,12 +533,12 @@ PACKED = cake_program.CakeProgram(
 )
 
 PACKED_NOBIAS = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_f10ae9cb82d5680d40ad",
+    name="cake_tinygemm2_tcgen05_b105a13823bfdaf262b7",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_f10ae9cb82d5680d40ad",
+    kernel="kernel_cake_tinygemm2_tcgen05_b105a13823bfdaf262b7",
     sources=(
-        "cake_tinygemm2_tcgen05_f10ae9cb82d5680d40ad_kernel.cu",
-        "cake_tinygemm2_tcgen05_f10ae9cb82d5680d40ad_binding.cu",
+        "cake_tinygemm2_tcgen05_b105a13823bfdaf262b7_kernel.cu",
+        "cake_tinygemm2_tcgen05_b105a13823bfdaf262b7_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -557,12 +557,12 @@ PACKED_NOBIAS = cake_program.CakeProgram(
 )
 
 PACKED_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_8fbddf8a6d390bda1d35",
+    name="cake_tinygemm2_tcgen05_d29459b4440f306156e7",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_8fbddf8a6d390bda1d35",
+    kernel="kernel_cake_tinygemm2_tcgen05_d29459b4440f306156e7",
     sources=(
-        "cake_tinygemm2_tcgen05_8fbddf8a6d390bda1d35_kernel.cu",
-        "cake_tinygemm2_tcgen05_8fbddf8a6d390bda1d35_binding.cu",
+        "cake_tinygemm2_tcgen05_d29459b4440f306156e7_kernel.cu",
+        "cake_tinygemm2_tcgen05_d29459b4440f306156e7_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -581,12 +581,108 @@ PACKED_PDL = cake_program.CakeProgram(
 )
 
 PACKED_NOBIAS_PDL = cake_program.CakeProgram(
-    name="cake_tinygemm2_tcgen05_6b4f9bfcf6e73dcd79d0",
+    name="cake_tinygemm2_tcgen05_39c26851b9fb3a89e76f",
     operator_dir="cake_tinygemm2_tcgen05",
-    kernel="kernel_cake_tinygemm2_tcgen05_6b4f9bfcf6e73dcd79d0",
+    kernel="kernel_cake_tinygemm2_tcgen05_39c26851b9fb3a89e76f",
     sources=(
-        "cake_tinygemm2_tcgen05_6b4f9bfcf6e73dcd79d0_kernel.cu",
-        "cake_tinygemm2_tcgen05_6b4f9bfcf6e73dcd79d0_binding.cu",
+        "cake_tinygemm2_tcgen05_39c26851b9fb3a89e76f_kernel.cu",
+        "cake_tinygemm2_tcgen05_39c26851b9fb3a89e76f_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=205824,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_BOX8 = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_4f4ee208438bbe8532fc",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_4f4ee208438bbe8532fc",
+    sources=(
+        "cake_tinygemm2_tcgen05_4f4ee208438bbe8532fc_kernel.cu",
+        "cake_tinygemm2_tcgen05_4f4ee208438bbe8532fc_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=205824,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_BOX8_NOBIAS = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_eb55bfbe52f5ff00b048",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_eb55bfbe52f5ff00b048",
+    sources=(
+        "cake_tinygemm2_tcgen05_eb55bfbe52f5ff00b048_kernel.cu",
+        "cake_tinygemm2_tcgen05_eb55bfbe52f5ff00b048_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=205824,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_BOX8_PDL = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_0bb51b8202cba55024f1",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_0bb51b8202cba55024f1",
+    sources=(
+        "cake_tinygemm2_tcgen05_0bb51b8202cba55024f1_kernel.cu",
+        "cake_tinygemm2_tcgen05_0bb51b8202cba55024f1_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=205824,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_BOX8_NOBIAS_PDL = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c",
+    sources=(
+        "cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c_kernel.cu",
+        "cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c_binding.cu",
     ),
     targets=("sm_100a", "sm_103a", "sm_107a"),
     compile_options=(
@@ -725,6 +821,10 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     PACKED_NOBIAS,
     PACKED_PDL,
     PACKED_NOBIAS_PDL,
+    PACKED_BOX8,
+    PACKED_BOX8_NOBIAS,
+    PACKED_BOX8_PDL,
+    PACKED_BOX8_NOBIAS_PDL,
     ACCUMULATORS,
     ACCUMULATORS_NOBIAS,
     ACCUMULATORS_PDL,
@@ -762,6 +862,10 @@ __all__ = [
     "PACKED_NOBIAS",
     "PACKED_PDL",
     "PACKED_NOBIAS_PDL",
+    "PACKED_BOX8",
+    "PACKED_BOX8_NOBIAS",
+    "PACKED_BOX8_PDL",
+    "PACKED_BOX8_NOBIAS_PDL",
     "ACCUMULATORS",
     "ACCUMULATORS_NOBIAS",
     "ACCUMULATORS_PDL",

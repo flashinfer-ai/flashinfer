@@ -130,7 +130,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                 qsum[e] = 0.0f;
             }
             int brow = row_begin + batch * 128;
-            float _vec_load_1[8];
+            float vec_load[8];
             {
                 const uint4* _vptr_1 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + rgrp) ? brow + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_1[1];
@@ -140,12 +140,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
-                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
+                        (&vec_load[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                        (&vec_load[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_2[8];
+            float vec_load_1[8];
             {
                 const uint4* _vptr_2 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 16 + rgrp) ? brow + 16 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_2[1];
@@ -155,12 +155,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_2[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-                        (&_vec_load_2[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
+                        (&vec_load_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                        (&vec_load_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_3[8];
+            float vec_load_2[8];
             {
                 const uint4* _vptr_3 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 32 + rgrp) ? brow + 32 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_3[1];
@@ -170,12 +170,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                        (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
+                        (&vec_load_2[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                        (&vec_load_2[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_4[8];
+            float vec_load_3[8];
             {
                 const uint4* _vptr_4 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 48 + rgrp) ? brow + 48 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_4[1];
@@ -185,12 +185,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_4[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-                        (&_vec_load_4[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
+                        (&vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+                        (&vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_5[8];
+            float vec_load_4[8];
             {
                 const uint4* _vptr_5 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 64 + rgrp) ? brow + 64 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_5[1];
@@ -200,12 +200,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_5[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
-                        (&_vec_load_5[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
+                        (&vec_load_4[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
+                        (&vec_load_4[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_6[8];
+            float vec_load_5[8];
             {
                 const uint4* _vptr_6 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 80 + rgrp) ? brow + 80 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_6[1];
@@ -215,12 +215,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_6[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
-                        (&_vec_load_6[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
+                        (&vec_load_5[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
+                        (&vec_load_5[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_7[8];
+            float vec_load_6[8];
             {
                 const uint4* _vptr_7 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 96 + rgrp) ? brow + 96 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_7[1];
@@ -230,12 +230,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_7[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
-                        (&_vec_load_7[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
+                        (&vec_load_6[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
+                        (&vec_load_6[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_8[8];
+            float vec_load_7[8];
             {
                 const uint4* _vptr_8 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 112 + rgrp) ? brow + 112 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
                 uint4 _vld_8[1];
@@ -245,19 +245,19 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) << 16);
-                        (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) & 0xffff0000u);
+                        (&vec_load_7[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) << 16);
+                        (&vec_load_7[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_8[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            qf8[0] = _vec_load_1[0];
-            qf8[1] = _vec_load_1[1];
-            qf8[2] = _vec_load_1[2];
-            qf8[3] = _vec_load_1[3];
-            qf8[4] = _vec_load_1[4];
-            qf8[5] = _vec_load_1[5];
-            qf8[6] = _vec_load_1[6];
-            qf8[7] = _vec_load_1[7];
+            qf8[0] = vec_load[0];
+            qf8[1] = vec_load[1];
+            qf8[2] = vec_load[2];
+            qf8[3] = vec_load[3];
+            qf8[4] = vec_load[4];
+            qf8[5] = vec_load[5];
+            qf8[6] = vec_load[6];
+            qf8[7] = vec_load[7];
             qsum[0] = qsum[0] + ((row_end > brow + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + rgrp) ? qf8[2] : 0.0f);
@@ -266,14 +266,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_2[0];
-            qf8[1] = _vec_load_2[1];
-            qf8[2] = _vec_load_2[2];
-            qf8[3] = _vec_load_2[3];
-            qf8[4] = _vec_load_2[4];
-            qf8[5] = _vec_load_2[5];
-            qf8[6] = _vec_load_2[6];
-            qf8[7] = _vec_load_2[7];
+            qf8[0] = vec_load_1[0];
+            qf8[1] = vec_load_1[1];
+            qf8[2] = vec_load_1[2];
+            qf8[3] = vec_load_1[3];
+            qf8[4] = vec_load_1[4];
+            qf8[5] = vec_load_1[5];
+            qf8[6] = vec_load_1[6];
+            qf8[7] = vec_load_1[7];
             qsum[0] = qsum[0] + ((row_end > brow + 16 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 16 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 16 + rgrp) ? qf8[2] : 0.0f);
@@ -282,14 +282,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 16 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 16 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 16 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_3[0];
-            qf8[1] = _vec_load_3[1];
-            qf8[2] = _vec_load_3[2];
-            qf8[3] = _vec_load_3[3];
-            qf8[4] = _vec_load_3[4];
-            qf8[5] = _vec_load_3[5];
-            qf8[6] = _vec_load_3[6];
-            qf8[7] = _vec_load_3[7];
+            qf8[0] = vec_load_2[0];
+            qf8[1] = vec_load_2[1];
+            qf8[2] = vec_load_2[2];
+            qf8[3] = vec_load_2[3];
+            qf8[4] = vec_load_2[4];
+            qf8[5] = vec_load_2[5];
+            qf8[6] = vec_load_2[6];
+            qf8[7] = vec_load_2[7];
             qsum[0] = qsum[0] + ((row_end > brow + 32 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 32 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 32 + rgrp) ? qf8[2] : 0.0f);
@@ -298,14 +298,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 32 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 32 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 32 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_4[0];
-            qf8[1] = _vec_load_4[1];
-            qf8[2] = _vec_load_4[2];
-            qf8[3] = _vec_load_4[3];
-            qf8[4] = _vec_load_4[4];
-            qf8[5] = _vec_load_4[5];
-            qf8[6] = _vec_load_4[6];
-            qf8[7] = _vec_load_4[7];
+            qf8[0] = vec_load_3[0];
+            qf8[1] = vec_load_3[1];
+            qf8[2] = vec_load_3[2];
+            qf8[3] = vec_load_3[3];
+            qf8[4] = vec_load_3[4];
+            qf8[5] = vec_load_3[5];
+            qf8[6] = vec_load_3[6];
+            qf8[7] = vec_load_3[7];
             qsum[0] = qsum[0] + ((row_end > brow + 48 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 48 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 48 + rgrp) ? qf8[2] : 0.0f);
@@ -314,14 +314,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 48 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 48 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 48 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_5[0];
-            qf8[1] = _vec_load_5[1];
-            qf8[2] = _vec_load_5[2];
-            qf8[3] = _vec_load_5[3];
-            qf8[4] = _vec_load_5[4];
-            qf8[5] = _vec_load_5[5];
-            qf8[6] = _vec_load_5[6];
-            qf8[7] = _vec_load_5[7];
+            qf8[0] = vec_load_4[0];
+            qf8[1] = vec_load_4[1];
+            qf8[2] = vec_load_4[2];
+            qf8[3] = vec_load_4[3];
+            qf8[4] = vec_load_4[4];
+            qf8[5] = vec_load_4[5];
+            qf8[6] = vec_load_4[6];
+            qf8[7] = vec_load_4[7];
             qsum[0] = qsum[0] + ((row_end > brow + 64 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 64 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 64 + rgrp) ? qf8[2] : 0.0f);
@@ -330,14 +330,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 64 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 64 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 64 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_6[0];
-            qf8[1] = _vec_load_6[1];
-            qf8[2] = _vec_load_6[2];
-            qf8[3] = _vec_load_6[3];
-            qf8[4] = _vec_load_6[4];
-            qf8[5] = _vec_load_6[5];
-            qf8[6] = _vec_load_6[6];
-            qf8[7] = _vec_load_6[7];
+            qf8[0] = vec_load_5[0];
+            qf8[1] = vec_load_5[1];
+            qf8[2] = vec_load_5[2];
+            qf8[3] = vec_load_5[3];
+            qf8[4] = vec_load_5[4];
+            qf8[5] = vec_load_5[5];
+            qf8[6] = vec_load_5[6];
+            qf8[7] = vec_load_5[7];
             qsum[0] = qsum[0] + ((row_end > brow + 80 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 80 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 80 + rgrp) ? qf8[2] : 0.0f);
@@ -346,14 +346,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 80 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 80 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 80 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_7[0];
-            qf8[1] = _vec_load_7[1];
-            qf8[2] = _vec_load_7[2];
-            qf8[3] = _vec_load_7[3];
-            qf8[4] = _vec_load_7[4];
-            qf8[5] = _vec_load_7[5];
-            qf8[6] = _vec_load_7[6];
-            qf8[7] = _vec_load_7[7];
+            qf8[0] = vec_load_6[0];
+            qf8[1] = vec_load_6[1];
+            qf8[2] = vec_load_6[2];
+            qf8[3] = vec_load_6[3];
+            qf8[4] = vec_load_6[4];
+            qf8[5] = vec_load_6[5];
+            qf8[6] = vec_load_6[6];
+            qf8[7] = vec_load_6[7];
             qsum[0] = qsum[0] + ((row_end > brow + 96 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 96 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 96 + rgrp) ? qf8[2] : 0.0f);
@@ -362,14 +362,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             qsum[5] = qsum[5] + ((row_end > brow + 96 + rgrp) ? qf8[5] : 0.0f);
             qsum[6] = qsum[6] + ((row_end > brow + 96 + rgrp) ? qf8[6] : 0.0f);
             qsum[7] = qsum[7] + ((row_end > brow + 96 + rgrp) ? qf8[7] : 0.0f);
-            qf8[0] = _vec_load_8[0];
-            qf8[1] = _vec_load_8[1];
-            qf8[2] = _vec_load_8[2];
-            qf8[3] = _vec_load_8[3];
-            qf8[4] = _vec_load_8[4];
-            qf8[5] = _vec_load_8[5];
-            qf8[6] = _vec_load_8[6];
-            qf8[7] = _vec_load_8[7];
+            qf8[0] = vec_load_7[0];
+            qf8[1] = vec_load_7[1];
+            qf8[2] = vec_load_7[2];
+            qf8[3] = vec_load_7[3];
+            qf8[4] = vec_load_7[4];
+            qf8[5] = vec_load_7[5];
+            qf8[6] = vec_load_7[6];
+            qf8[7] = vec_load_7[7];
             qsum[0] = qsum[0] + ((row_end > brow + 112 + rgrp) ? qf8[0] : 0.0f);
             qsum[1] = qsum[1] + ((row_end > brow + 112 + rgrp) ? qf8[1] : 0.0f);
             qsum[2] = qsum[2] + ((row_end > brow + 112 + rgrp) ? qf8[2] : 0.0f);
@@ -399,7 +399,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                 int valid = ((tok < row_end) ? 1 : 0);
                 int tok_c = ((tok < row_end) ? tok : row_end - 1);
                 int is_first = ((valid == 1 && tok == brow) ? 1 : 0);
-                float _vec_load_9[16];
+                float vec_load_0[16];
                 {
                     const uint4* _vptr_10 = reinterpret_cast<const uint4*>(Q + ((tok_c * num_heads + head) * 128 + col16) + 0);
                     uint4 _vld_10[2];
@@ -409,8 +409,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                         uint32_t* _vpairs_10 = reinterpret_cast<uint32_t*>(&_vld_10[_blk]);
                         #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) << 16);
-                            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) & 0xffff0000u);
+                            (&vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) << 16);
+                            (&vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_10[_pair]) & 0xffff0000u);
                         }
                     }
                 }
@@ -428,41 +428,41 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     }
                     for (int e_2 = 0; e_2 < 4; e_2++) {
                         qmv[quad * 4 + e_2] = _vec_load_10[e_2];
-                        float qf = _vec_load_9[quad * 4 + e_2];
+                        float qf = vec_load_0[quad * 4 + e_2];
                         qc[quad * 4 + e_2] = ((valid == 1) ? qf - _vec_load_10[e_2] : 0.0f);
                     }
                 }
                 unsigned int qw[2];
                 float qsf_a[1];
-                float _max_0 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(qc[0]), fabsf(qc[1])), fabsf(qc[2])), fabsf(qc[3])), fabsf(qc[4])), fabsf(qc[5])), fabsf(qc[6])), fabsf(qc[7])), fabsf(qc[8])), fabsf(qc[9])), fabsf(qc[10])), fabsf(qc[11])), fabsf(qc[12])), fabsf(qc[13])), fabsf(qc[14])), fabsf(qc[15]));
+                float max_1 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(qc[0]), fabsf(qc[1])), fabsf(qc[2])), fabsf(qc[3])), fabsf(qc[4])), fabsf(qc[5])), fabsf(qc[6])), fabsf(qc[7])), fabsf(qc[8])), fabsf(qc[9])), fabsf(qc[10])), fabsf(qc[11])), fabsf(qc[12])), fabsf(qc[13])), fabsf(qc[14])), fabsf(qc[15]));
                 uint16_t _cvt_satfinite_e4m3x2_f32_12;
-                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_12) : "f"(0.0f), "f"(_max_0 * 0.16666667f));
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_12) : "f"(0.0f), "f"(max_1 * 0.16666667f));
                 uint16_t _e4m3x2_decode_13 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_12 & 0xFFu);
                 uint32_t _f16x2_decode_13;
-                float _fp8_decode_0;
+                float fp8_decode;
                 asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_13) : "h"(_e4m3x2_decode_13));
                 uint16_t _f16_decode_13 = (uint16_t)_f16x2_decode_13;
-                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_0) : "h"(_f16_decode_13));
-                float _fdiv_rn_0 = __fdiv_rn(1.0f, _fp8_decode_0);
-                qc[0] = qc[0] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[1] = qc[1] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[2] = qc[2] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[3] = qc[3] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[4] = qc[4] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[5] = qc[5] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[6] = qc[6] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[7] = qc[7] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[8] = qc[8] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[9] = qc[9] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[10] = qc[10] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[11] = qc[11] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[12] = qc[12] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[13] = qc[13] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[14] = qc[14] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
-                qc[15] = qc[15] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_0 : 0.0f);
+                asm("cvt.f32.f16 %0, %1;" : "=f"(fp8_decode) : "h"(_f16_decode_13));
+                float fdiv_rn = __fdiv_rn(1.0f, fp8_decode);
+                qc[0] = qc[0] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[1] = qc[1] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[2] = qc[2] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[3] = qc[3] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[4] = qc[4] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[5] = qc[5] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[6] = qc[6] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[7] = qc[7] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[8] = qc[8] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[9] = qc[9] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[10] = qc[10] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[11] = qc[11] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[12] = qc[12] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[13] = qc[13] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[14] = qc[14] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
+                qc[15] = qc[15] * ((fp8_decode != 0.0f) ? fdiv_rn : 0.0f);
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(qw[0]) : "f"(qc[0]), "f"(qc[1]), "f"(qc[2]), "f"(qc[3]), "f"(qc[4]), "f"(qc[5]), "f"(qc[6]), "f"(qc[7]));
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(qw[1]) : "f"(qc[8]), "f"(qc[9]), "f"(qc[10]), "f"(qc[11]), "f"(qc[12]), "f"(qc[13]), "f"(qc[14]), "f"(qc[15]));
-                qsf_a[0] = _max_0 * 0.16666667f;
+                qsf_a[0] = max_1 * 0.16666667f;
                 unsigned int qstore[4];
                 qstore[0] = qw[0];
                 qstore[1] = qw[1];
@@ -481,35 +481,35 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                 if (is_first == 1) {
                     unsigned int mw[2];
                     float msf_a[1];
-                    float _max_1 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(qmv[0]), fabsf(qmv[1])), fabsf(qmv[2])), fabsf(qmv[3])), fabsf(qmv[4])), fabsf(qmv[5])), fabsf(qmv[6])), fabsf(qmv[7])), fabsf(qmv[8])), fabsf(qmv[9])), fabsf(qmv[10])), fabsf(qmv[11])), fabsf(qmv[12])), fabsf(qmv[13])), fabsf(qmv[14])), fabsf(qmv[15]));
+                    float max_1_0 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(qmv[0]), fabsf(qmv[1])), fabsf(qmv[2])), fabsf(qmv[3])), fabsf(qmv[4])), fabsf(qmv[5])), fabsf(qmv[6])), fabsf(qmv[7])), fabsf(qmv[8])), fabsf(qmv[9])), fabsf(qmv[10])), fabsf(qmv[11])), fabsf(qmv[12])), fabsf(qmv[13])), fabsf(qmv[14])), fabsf(qmv[15]));
                     uint16_t _cvt_satfinite_e4m3x2_f32_17;
-                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_17) : "f"(0.0f), "f"(_max_1 * 0.16666667f));
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_17) : "f"(0.0f), "f"(max_1_0 * 0.16666667f));
                     uint16_t _e4m3x2_decode_18 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_17 & 0xFFu);
                     uint32_t _f16x2_decode_18;
-                    float _fp8_decode_1;
+                    float fp8_decode_0;
                     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_18) : "h"(_e4m3x2_decode_18));
                     uint16_t _f16_decode_18 = (uint16_t)_f16x2_decode_18;
-                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_1) : "h"(_f16_decode_18));
-                    float _fdiv_rn_1 = __fdiv_rn(1.0f, _fp8_decode_1);
-                    qmv[0] = qmv[0] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[1] = qmv[1] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[2] = qmv[2] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[3] = qmv[3] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[4] = qmv[4] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[5] = qmv[5] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[6] = qmv[6] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[7] = qmv[7] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[8] = qmv[8] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[9] = qmv[9] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[10] = qmv[10] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[11] = qmv[11] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[12] = qmv[12] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[13] = qmv[13] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[14] = qmv[14] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
-                    qmv[15] = qmv[15] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(fp8_decode_0) : "h"(_f16_decode_18));
+                    float fdiv_rn_0 = __fdiv_rn(1.0f, fp8_decode_0);
+                    qmv[0] = qmv[0] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[1] = qmv[1] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[2] = qmv[2] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[3] = qmv[3] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[4] = qmv[4] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[5] = qmv[5] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[6] = qmv[6] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[7] = qmv[7] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[8] = qmv[8] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[9] = qmv[9] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[10] = qmv[10] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[11] = qmv[11] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[12] = qmv[12] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[13] = qmv[13] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[14] = qmv[14] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
+                    qmv[15] = qmv[15] * ((fp8_decode_0 != 0.0f) ? fdiv_rn_0 : 0.0f);
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(mw[0]) : "f"(qmv[0]), "f"(qmv[1]), "f"(qmv[2]), "f"(qmv[3]), "f"(qmv[4]), "f"(qmv[5]), "f"(qmv[6]), "f"(qmv[7]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(mw[1]) : "f"(qmv[8]), "f"(qmv[9]), "f"(qmv[10]), "f"(qmv[11]), "f"(qmv[12]), "f"(qmv[13]), "f"(qmv[14]), "f"(qmv[15]));
-                    msf_a[0] = _max_1 * 0.16666667f;
+                    msf_a[0] = max_1_0 * 0.16666667f;
                     int qmrow = qt * num_heads + head;
                     *(reinterpret_cast<unsigned int*>(qm4 + (qmrow * 16 + sub * 2)) + (0)) = mw[0];
                     *(reinterpret_cast<unsigned int*>(qm4 + (qmrow * 16 + sub * 2 + 1)) + (0)) = mw[1];
@@ -717,7 +717,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
         #pragma unroll 1
         for (int batch_1 = 0; batch_1 < (row_end_1 - row_begin_1 + 128 - 1) / 128; batch_1++) {
             int brow_1 = row_begin_1 + batch_1 * 128;
-            float _vec_load_21[8];
+            float vec_load_8[8];
             {
                 const uint4* _vptr_38 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + rgrp) ? brow_1 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_38[1];
@@ -727,12 +727,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_38 = reinterpret_cast<uint32_t*>(&_vld_38[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_21[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_38[_pair]) << 16);
-                        (&_vec_load_21[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_38[_pair]) & 0xffff0000u);
+                        (&vec_load_8[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_38[_pair]) << 16);
+                        (&vec_load_8[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_38[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_22[8];
+            float vec_load_1_1[8];
             {
                 const uint4* _vptr_39 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 16 + rgrp) ? brow_1 + 16 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_39[1];
@@ -742,12 +742,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_39 = reinterpret_cast<uint32_t*>(&_vld_39[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_22[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_39[_pair]) << 16);
-                        (&_vec_load_22[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_39[_pair]) & 0xffff0000u);
+                        (&vec_load_1_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_39[_pair]) << 16);
+                        (&vec_load_1_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_39[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_23[8];
+            float vec_load_2_1[8];
             {
                 const uint4* _vptr_40 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 32 + rgrp) ? brow_1 + 32 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_40[1];
@@ -757,12 +757,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_40 = reinterpret_cast<uint32_t*>(&_vld_40[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_23[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_40[_pair]) << 16);
-                        (&_vec_load_23[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_40[_pair]) & 0xffff0000u);
+                        (&vec_load_2_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_40[_pair]) << 16);
+                        (&vec_load_2_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_40[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_24[8];
+            float vec_load_3_1[8];
             {
                 const uint4* _vptr_41 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 48 + rgrp) ? brow_1 + 48 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_41[1];
@@ -772,12 +772,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_41 = reinterpret_cast<uint32_t*>(&_vld_41[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_24[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_41[_pair]) << 16);
-                        (&_vec_load_24[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_41[_pair]) & 0xffff0000u);
+                        (&vec_load_3_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_41[_pair]) << 16);
+                        (&vec_load_3_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_41[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_25[8];
+            float vec_load_4_1[8];
             {
                 const uint4* _vptr_42 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 64 + rgrp) ? brow_1 + 64 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_42[1];
@@ -787,12 +787,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_42 = reinterpret_cast<uint32_t*>(&_vld_42[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_25[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_42[_pair]) << 16);
-                        (&_vec_load_25[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_42[_pair]) & 0xffff0000u);
+                        (&vec_load_4_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_42[_pair]) << 16);
+                        (&vec_load_4_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_42[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_26[8];
+            float vec_load_5_1[8];
             {
                 const uint4* _vptr_43 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 80 + rgrp) ? brow_1 + 80 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_43[1];
@@ -802,12 +802,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_43 = reinterpret_cast<uint32_t*>(&_vld_43[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_26[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_43[_pair]) << 16);
-                        (&_vec_load_26[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_43[_pair]) & 0xffff0000u);
+                        (&vec_load_5_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_43[_pair]) << 16);
+                        (&vec_load_5_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_43[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_27[8];
+            float vec_load_6_1[8];
             {
                 const uint4* _vptr_44 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 96 + rgrp) ? brow_1 + 96 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_44[1];
@@ -817,12 +817,12 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_44 = reinterpret_cast<uint32_t*>(&_vld_44[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_27[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_44[_pair]) << 16);
-                        (&_vec_load_27[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_44[_pair]) & 0xffff0000u);
+                        (&vec_load_6_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_44[_pair]) << 16);
+                        (&vec_load_6_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_44[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            float _vec_load_28[8];
+            float vec_load_7_1[8];
             {
                 const uint4* _vptr_45 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 112 + rgrp) ? brow_1 + 112 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
                 uint4 _vld_45[1];
@@ -832,19 +832,19 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                     uint32_t* _vpairs_45 = reinterpret_cast<uint32_t*>(&_vld_45[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_28[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_45[_pair]) << 16);
-                        (&_vec_load_28[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_45[_pair]) & 0xffff0000u);
+                        (&vec_load_7_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_45[_pair]) << 16);
+                        (&vec_load_7_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_45[_pair]) & 0xffff0000u);
                     }
                 }
             }
-            kf8[0] = _vec_load_21[0];
-            kf8[1] = _vec_load_21[1];
-            kf8[2] = _vec_load_21[2];
-            kf8[3] = _vec_load_21[3];
-            kf8[4] = _vec_load_21[4];
-            kf8[5] = _vec_load_21[5];
-            kf8[6] = _vec_load_21[6];
-            kf8[7] = _vec_load_21[7];
+            kf8[0] = vec_load_8[0];
+            kf8[1] = vec_load_8[1];
+            kf8[2] = vec_load_8[2];
+            kf8[3] = vec_load_8[3];
+            kf8[4] = vec_load_8[4];
+            kf8[5] = vec_load_8[5];
+            kf8[6] = vec_load_8[6];
+            kf8[7] = vec_load_8[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + rgrp) ? kf8[2] : 0.0f);
@@ -853,14 +853,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_22[0];
-            kf8[1] = _vec_load_22[1];
-            kf8[2] = _vec_load_22[2];
-            kf8[3] = _vec_load_22[3];
-            kf8[4] = _vec_load_22[4];
-            kf8[5] = _vec_load_22[5];
-            kf8[6] = _vec_load_22[6];
-            kf8[7] = _vec_load_22[7];
+            kf8[0] = vec_load_1_1[0];
+            kf8[1] = vec_load_1_1[1];
+            kf8[2] = vec_load_1_1[2];
+            kf8[3] = vec_load_1_1[3];
+            kf8[4] = vec_load_1_1[4];
+            kf8[5] = vec_load_1_1[5];
+            kf8[6] = vec_load_1_1[6];
+            kf8[7] = vec_load_1_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[2] : 0.0f);
@@ -869,14 +869,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_23[0];
-            kf8[1] = _vec_load_23[1];
-            kf8[2] = _vec_load_23[2];
-            kf8[3] = _vec_load_23[3];
-            kf8[4] = _vec_load_23[4];
-            kf8[5] = _vec_load_23[5];
-            kf8[6] = _vec_load_23[6];
-            kf8[7] = _vec_load_23[7];
+            kf8[0] = vec_load_2_1[0];
+            kf8[1] = vec_load_2_1[1];
+            kf8[2] = vec_load_2_1[2];
+            kf8[3] = vec_load_2_1[3];
+            kf8[4] = vec_load_2_1[4];
+            kf8[5] = vec_load_2_1[5];
+            kf8[6] = vec_load_2_1[6];
+            kf8[7] = vec_load_2_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[2] : 0.0f);
@@ -885,14 +885,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_24[0];
-            kf8[1] = _vec_load_24[1];
-            kf8[2] = _vec_load_24[2];
-            kf8[3] = _vec_load_24[3];
-            kf8[4] = _vec_load_24[4];
-            kf8[5] = _vec_load_24[5];
-            kf8[6] = _vec_load_24[6];
-            kf8[7] = _vec_load_24[7];
+            kf8[0] = vec_load_3_1[0];
+            kf8[1] = vec_load_3_1[1];
+            kf8[2] = vec_load_3_1[2];
+            kf8[3] = vec_load_3_1[3];
+            kf8[4] = vec_load_3_1[4];
+            kf8[5] = vec_load_3_1[5];
+            kf8[6] = vec_load_3_1[6];
+            kf8[7] = vec_load_3_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[2] : 0.0f);
@@ -901,14 +901,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_25[0];
-            kf8[1] = _vec_load_25[1];
-            kf8[2] = _vec_load_25[2];
-            kf8[3] = _vec_load_25[3];
-            kf8[4] = _vec_load_25[4];
-            kf8[5] = _vec_load_25[5];
-            kf8[6] = _vec_load_25[6];
-            kf8[7] = _vec_load_25[7];
+            kf8[0] = vec_load_4_1[0];
+            kf8[1] = vec_load_4_1[1];
+            kf8[2] = vec_load_4_1[2];
+            kf8[3] = vec_load_4_1[3];
+            kf8[4] = vec_load_4_1[4];
+            kf8[5] = vec_load_4_1[5];
+            kf8[6] = vec_load_4_1[6];
+            kf8[7] = vec_load_4_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[2] : 0.0f);
@@ -917,14 +917,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_26[0];
-            kf8[1] = _vec_load_26[1];
-            kf8[2] = _vec_load_26[2];
-            kf8[3] = _vec_load_26[3];
-            kf8[4] = _vec_load_26[4];
-            kf8[5] = _vec_load_26[5];
-            kf8[6] = _vec_load_26[6];
-            kf8[7] = _vec_load_26[7];
+            kf8[0] = vec_load_5_1[0];
+            kf8[1] = vec_load_5_1[1];
+            kf8[2] = vec_load_5_1[2];
+            kf8[3] = vec_load_5_1[3];
+            kf8[4] = vec_load_5_1[4];
+            kf8[5] = vec_load_5_1[5];
+            kf8[6] = vec_load_5_1[6];
+            kf8[7] = vec_load_5_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[2] : 0.0f);
@@ -933,14 +933,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_27[0];
-            kf8[1] = _vec_load_27[1];
-            kf8[2] = _vec_load_27[2];
-            kf8[3] = _vec_load_27[3];
-            kf8[4] = _vec_load_27[4];
-            kf8[5] = _vec_load_27[5];
-            kf8[6] = _vec_load_27[6];
-            kf8[7] = _vec_load_27[7];
+            kf8[0] = vec_load_6_1[0];
+            kf8[1] = vec_load_6_1[1];
+            kf8[2] = vec_load_6_1[2];
+            kf8[3] = vec_load_6_1[3];
+            kf8[4] = vec_load_6_1[4];
+            kf8[5] = vec_load_6_1[5];
+            kf8[6] = vec_load_6_1[6];
+            kf8[7] = vec_load_6_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[2] : 0.0f);
@@ -949,14 +949,14 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
             ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[5] : 0.0f);
             ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[6] : 0.0f);
             ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[7] : 0.0f);
-            kf8[0] = _vec_load_28[0];
-            kf8[1] = _vec_load_28[1];
-            kf8[2] = _vec_load_28[2];
-            kf8[3] = _vec_load_28[3];
-            kf8[4] = _vec_load_28[4];
-            kf8[5] = _vec_load_28[5];
-            kf8[6] = _vec_load_28[6];
-            kf8[7] = _vec_load_28[7];
+            kf8[0] = vec_load_7_1[0];
+            kf8[1] = vec_load_7_1[1];
+            kf8[2] = vec_load_7_1[2];
+            kf8[3] = vec_load_7_1[3];
+            kf8[4] = vec_load_7_1[4];
+            kf8[5] = vec_load_7_1[5];
+            kf8[6] = vec_load_7_1[6];
+            kf8[7] = vec_load_7_1[7];
             ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[0] : 0.0f);
             ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[1] : 0.0f);
             ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[2] : 0.0f);
@@ -1050,7 +1050,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
         int tok_1 = tblk_1 * 32 + trow;
         int valid_1 = ((tok_1 < total_tokens) ? 1 : 0);
         int tok_c_1 = ((tok_1 < total_tokens) ? tok_1 : total_tokens - 1);
-        float _vec_load_29[16];
+        float vec_load_9[16];
         {
             const uint4* _vptr_47 = reinterpret_cast<const uint4*>(K + ((tok_c_1 * num_heads + head_3) * 128 + col16) + 0);
             uint4 _vld_47[2];
@@ -1060,8 +1060,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
                 uint32_t* _vpairs_47 = reinterpret_cast<uint32_t*>(&_vld_47[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_29[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_47[_pair]) << 16);
-                    (&_vec_load_29[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_47[_pair]) & 0xffff0000u);
+                    (&vec_load_9[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_47[_pair]) << 16);
+                    (&vec_load_9[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_47[_pair]) & 0xffff0000u);
                 }
             }
         }
@@ -1069,50 +1069,50 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_5add60a92c5bbd97f571(__nv_bf
         int mbase = (seg_2 * num_heads + head_3) * 128 + col16;
         float kc[16];
         for (int quad_1 = 0; quad_1 < 4; quad_1++) {
-            float _vec_load_30[4];
+            float vec_load_1_2[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(mean_k + (mbase + quad_1 * 4) + 0);
-                _vec_load_30[0 + 0] = _v4.x;
-                _vec_load_30[0 + 1] = _v4.y;
-                _vec_load_30[0 + 2] = _v4.z;
-                _vec_load_30[0 + 3] = _v4.w;
+                vec_load_1_2[0 + 0] = _v4.x;
+                vec_load_1_2[0 + 1] = _v4.y;
+                vec_load_1_2[0 + 2] = _v4.z;
+                vec_load_1_2[0 + 3] = _v4.w;
             }
             for (int e_5 = 0; e_5 < 4; e_5++) {
-                float kf = _vec_load_29[quad_1 * 4 + e_5];
-                kc[quad_1 * 4 + e_5] = ((valid_1 == 1) ? kf - _vec_load_30[e_5] : 0.0f);
+                float kf = vec_load_9[quad_1 * 4 + e_5];
+                kc[quad_1 * 4 + e_5] = ((valid_1 == 1) ? kf - vec_load_1_2[e_5] : 0.0f);
             }
         }
         unsigned int kw[2];
         float ksf_a[1];
-        float _max_2 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(kc[0]), fabsf(kc[1])), fabsf(kc[2])), fabsf(kc[3])), fabsf(kc[4])), fabsf(kc[5])), fabsf(kc[6])), fabsf(kc[7])), fabsf(kc[8])), fabsf(kc[9])), fabsf(kc[10])), fabsf(kc[11])), fabsf(kc[12])), fabsf(kc[13])), fabsf(kc[14])), fabsf(kc[15]));
+        float max_1_1 = fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fmaxf(fabsf(kc[0]), fabsf(kc[1])), fabsf(kc[2])), fabsf(kc[3])), fabsf(kc[4])), fabsf(kc[5])), fabsf(kc[6])), fabsf(kc[7])), fabsf(kc[8])), fabsf(kc[9])), fabsf(kc[10])), fabsf(kc[11])), fabsf(kc[12])), fabsf(kc[13])), fabsf(kc[14])), fabsf(kc[15]));
         uint16_t _cvt_satfinite_e4m3x2_f32_49;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_49) : "f"(0.0f), "f"(_max_2 * 0.16666667f));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_cvt_satfinite_e4m3x2_f32_49) : "f"(0.0f), "f"(max_1_1 * 0.16666667f));
         uint16_t _e4m3x2_decode_50 = (uint16_t)((unsigned int)_cvt_satfinite_e4m3x2_f32_49 & 0xFFu);
         uint32_t _f16x2_decode_50;
-        float _fp8_decode_2;
+        float fp8_decode_1;
         asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_50) : "h"(_e4m3x2_decode_50));
         uint16_t _f16_decode_50 = (uint16_t)_f16x2_decode_50;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_2) : "h"(_f16_decode_50));
-        float _fdiv_rn_2 = __fdiv_rn(1.0f, _fp8_decode_2);
-        kc[0] = kc[0] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[1] = kc[1] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[2] = kc[2] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[3] = kc[3] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[4] = kc[4] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[5] = kc[5] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[6] = kc[6] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[7] = kc[7] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[8] = kc[8] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[9] = kc[9] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[10] = kc[10] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[11] = kc[11] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[12] = kc[12] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[13] = kc[13] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[14] = kc[14] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
-        kc[15] = kc[15] * ((_fp8_decode_2 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+        asm("cvt.f32.f16 %0, %1;" : "=f"(fp8_decode_1) : "h"(_f16_decode_50));
+        float fdiv_rn_1 = __fdiv_rn(1.0f, fp8_decode_1);
+        kc[0] = kc[0] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[1] = kc[1] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[2] = kc[2] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[3] = kc[3] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[4] = kc[4] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[5] = kc[5] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[6] = kc[6] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[7] = kc[7] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[8] = kc[8] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[9] = kc[9] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[10] = kc[10] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[11] = kc[11] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[12] = kc[12] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[13] = kc[13] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[14] = kc[14] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
+        kc[15] = kc[15] * ((fp8_decode_1 != 0.0f) ? fdiv_rn_1 : 0.0f);
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[0]) : "f"(kc[0]), "f"(kc[1]), "f"(kc[2]), "f"(kc[3]), "f"(kc[4]), "f"(kc[5]), "f"(kc[6]), "f"(kc[7]));
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[1]) : "f"(kc[8]), "f"(kc[9]), "f"(kc[10]), "f"(kc[11]), "f"(kc[12]), "f"(kc[13]), "f"(kc[14]), "f"(kc[15]));
-        ksf_a[0] = _max_2 * 0.16666667f;
+        ksf_a[0] = max_1_1 * 0.16666667f;
         unsigned int kstore[4];
         unsigned int _shfl_xor_sync_51 = __shfl_xor_sync(0xFFFFFFFF, kw[0], 1);
         kstore[0] = _shfl_xor_sync_51;

@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
+    trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..utils import (
@@ -1219,8 +1220,8 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
-    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
-    # only the prebuilt cubin backend additionally covers SM107.
+    # The SM100 CAKE kernels require SM100/SM103; the prebuilt cubin backend and
+    # CuTe DSL HCA also cover SM107.
     is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
@@ -1241,9 +1242,9 @@ def _resolve_dsv4_sparse_mla_backend(
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
-    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+    if requested_backend == "cute-dsl" and not is_sm100_family:
         raise ValueError(
-            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend='cute-dsl' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
@@ -1816,6 +1817,7 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
+@flashinfer_api(trace=trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch)
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1886,7 +1888,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     the packed backend's final base-2 LSE and finite-sink semantics are
     documented in :meth:`SparseMLASm120Wrapper.run`.
 
-    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    With ``backend="cute-dsl"`` on SM100/SM103/SM107, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
@@ -2148,15 +2150,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         yet include the 128 SWA slots (``128``) or shrink every row uniformly.
         Combined with ``extra_sparse_topk_lens`` the implied 128 is added on
         top of this value.
-
-    Returns
-    -------
-    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
-        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
-        ``[sum_q, 16, 4096]`` and group-major strides
-        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
-        layout described above.
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor]
         Caller-owned, zero-initialized ``uint8`` buffer for the TRTLLM-GEN
         multi-CTA KV split semaphores, sized by
@@ -2199,6 +2192,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "cake"`` rejects them). Footer and inline caches cannot be told apart
         from their shapes, so the format must name the layout the cache was
         written in.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
+        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
+        ``[sum_q, 16, 4096]`` and group-major strides
+        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
+        layout described above.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(

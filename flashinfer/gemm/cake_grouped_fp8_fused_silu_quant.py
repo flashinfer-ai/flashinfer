@@ -18,7 +18,11 @@ FP8 E4M3).  Every route reproduces the chain's rounding points exactly:
   amortize on a few tiles, so the prepared launch runs the FlashInfer grouped
   GEMM into a private BF16 workspace followed by one generated elementwise
   kernel that fuses SwiGLU with the group quantization (two launches instead
-  of three).  The GEMM kernel is chosen by :func:`small_m_gemm_backend`.
+  of three).  The GEMM kernel is chosen by :func:`small_m_gemm_backend`, the
+  same kernel for eager and captured launches.  Exception: a known routing
+  without a complete block pair, with at most ``TINY_MIXED_MAX_UNITS``
+  odd-tail units and ``K <= TINY_MIXED_MAX_K``, takes the mixed-schedule route
+  (one kernel; see :func:`select_route`).
 * Routing-aware rule (:func:`select_route`): when the routing is known —
   the caller passes the rows per expert as ``group_counts`` (no device work),
   or ``validate_indices=True`` derives the 128-row block count of every expert
@@ -93,7 +97,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
-import tvm_ffi
 
 from ..jit.gemm.cake_grouped_fp8_fused_silu_quant import (
     ARG_PLANS,
@@ -140,6 +143,13 @@ TAIL_GEOMETRY_KEY = f"{FUSED_ROUTE}_{FUSED_TAIL_STAGE}"
 # Rows below this take ACT_ROUTE (measured B200 crossover of the fused kernel against grouped GEMM + the fused
 # activation kernel; every problem with at most 9 row blocks lost to the chain in the fused kernel).
 SMALL_M_MAX = 2048
+# Below SMALL_M_MAX a known routing without a pair tile, at most TINY_MIXED_MAX_UNITS odd-tail units and
+# K <= TINY_MIXED_MAX_K takes the mixed-schedule route instead (one kernel, no BF16 intermediate).  Measured
+# (B200 and GB300, CUDA graph) only at 2H = 256, K = 512 with one or two single-block experts: 0.81-0.93x the
+# GEMM + act route.  Small routings with pair tiles (K = 512-2048) measured 1.14-1.20x slower on the mixed
+# route, hence no pair tile; K > 512 is excluded because no pair-free routing was measured there.
+TINY_MIXED_MAX_UNITS = 2
+TINY_MIXED_MAX_K = 512
 # Elementwise kernel launch: one warp per (row, 128-column group), four warps per CTA, at most sixteen resident
 # CTAs per SM (32 registers x 128 threads, full occupancy); grid-stride beyond that.
 ACT_WARPS_PER_CTA = 4
@@ -450,13 +460,16 @@ def select_route(
     group_blocks: Optional[Sequence[int]] = None,
     k: Optional[int] = None,
 ) -> str:
-    """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
-    problems take the pair + tail route unless the routing is known
-    (``group_blocks``, 128-row blocks per expert).  With the routing and ``k`` at
-    the model's calibration geometry (``(n2, k) == ROUTE_MODEL_GEOMETRY``:
-    2H = 2048, K = 4096) the three candidates -- pair + tail, mixed schedule
-    (when :func:`mixed_clusters` gives at least one cluster) and the act route
-    of :func:`_diverted_act_route` -- are ranked by the fitted makespan model
+    """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route, except
+    a known routing without a pair tile, with at most ``TINY_MIXED_MAX_UNITS``
+    odd-tail units and ``k <= TINY_MIXED_MAX_K``, which takes the mixed-schedule
+    route (one kernel); larger problems take the pair + tail route unless the
+    routing is known (``group_blocks``, 128-row blocks per expert).  With the
+    routing and ``k`` at the model's calibration geometry
+    (``(n2, k) == ROUTE_MODEL_GEOMETRY``: 2H = 2048, K = 4096) the three
+    candidates -- pair + tail, mixed schedule (when :func:`mixed_clusters`
+    gives at least one cluster) and the act route of
+    :func:`_diverted_act_route` -- are ranked by the fitted makespan model
     (``ROUTE_MODEL_B200``; ties resolve in that order), and the model's pick
     replaces the route of :func:`_legacy_route` only when the model predicts
     the legacy route more than ``ROUTE_MODEL_MARGIN`` slower.  Any other
@@ -469,14 +482,18 @@ def select_route(
         raise ValueError("select_route requires positive M and 2H")
     if k is not None and (k <= 0 or k % K_MULTIPLE):
         raise ValueError(f"K must be a positive multiple of {K_MULTIPLE}, got {k}")
-    if m < SMALL_M_MAX:
-        return ACT_ROUTE
     if group_blocks is None or not ROUTING_AWARE_RULE:
-        return FUSED_ROUTE
+        return ACT_ROUTE if m < SMALL_M_MAX else FUSED_ROUTE
+    if m < SMALL_M_MAX and (k is None or k > TINY_MIXED_MAX_K):
+        return ACT_ROUTE
     if sum(int(b) for b in group_blocks) != -(-m // ROW_BLOCK):
         raise ValueError(
             f"group_blocks {list(group_blocks)} do not cover M={m} ({-(-m // ROW_BLOCK)} blocks)"
         )
+    if m < SMALL_M_MAX:
+        pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+        tiny = pair_tiles == 0 and 0 < odd_units <= TINY_MIXED_MAX_UNITS
+        return FUSED_MIXED_ROUTE if tiny else ACT_ROUTE
     pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
     legacy = _legacy_route(m, n2, pair_tiles, odd_units, sm_count=sm_count)
     if k is None or (n2, k) != ROUTE_MODEL_GEOMETRY:
@@ -544,19 +561,30 @@ def launch_plan(
     return route, (clusters * cluster_ctas, 1, 1)
 
 
-def tail_launch_grid(m: int, n2: int, *, sm_count: int) -> tuple[int, int, int]:
+def tail_launch_grid(
+    m: int, n2: int, *, sm_count: int, odd_units: Optional[int] = None
+) -> tuple[int, int, int]:
     """Grid of the fused route's tail kernel for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
 
-    One single-CTA 128-row tile per odd-tail block and N256 tile; the grid is
-    one CTA per SM up to the unit upper bound (every block an odd tail) and the
-    CTAs grid-stride over the actual units, so the grid does not depend on the
-    routing.  A routing without odd tails runs an empty grid, overlapped
-    with the pair kernel by programmatic dependent launch.
+    One single-CTA 128-row tile per odd-tail block and N256 tile; the CTAs
+    grid-stride over the units they find in ``m_indices`` at every launch.
+    Without the routing the grid is one CTA per SM up to the unit upper bound
+    (every block an odd tail), so it does not depend on the routing.  With the
+    routing known (``odd_units``, the odd-tail units of
+    :func:`fused_tile_counts`) the grid is one CTA per unit, at least one: CTAs
+    beyond the units find no work, and on an eager launch the ones that cannot
+    start on the SMs the pair grid leaves free wait for retiring pair CTAs and
+    extend the launch past the pair kernel.  A plan made with the routing is
+    valid for that routing only (see
+    :func:`prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant`).
     """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
     tile_m, tile_n, _ = route_geometry(TAIL_GEOMETRY_KEY)
-    return (max(1, min(math.ceil(m / tile_m) * (n2 // tile_n), sm_count)), 1, 1)
+    upper = math.ceil(m / tile_m) * (n2 // tile_n)
+    if odd_units is not None:
+        upper = min(upper, int(odd_units))
+    return (max(1, min(upper, sm_count)), 1, 1)
 
 
 def _require_tensor(
@@ -690,6 +718,11 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     any capture.  ``grid`` is the grid of the
     route's first generated kernel; ``stage_grids`` holds every generated
     kernel's grid by stage name.
+
+    A launch prepared with the routing known (``group_counts`` or
+    ``validate_indices=True``) requires ``m_indices`` to keep encoding that
+    routing: its route and grids are planned for it, and a different routing is
+    undefined behavior.
     """
 
     route: str
@@ -780,19 +813,22 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
                     device=device,
                     alignment=4,
                 )
-        with torch.cuda.device(device):
-            if self.fill_padding:
-                assert self._padding_scratch is not None
-                source = m_indices if m_indices is not None else self._padding_source
-                assert source is not None
-                _forward_fill_padding(source, *self._padding_scratch)
-            if self._gemm is not None:
-                self._gemm(a=a, a_scale=a_scale, m_indices=gemm_indices)
-            with tvm_ffi.use_torch_stream():
-                for entry, arguments, slots in self._entries:
-                    if rebound:
-                        arguments = _rebind_arguments(arguments, slots, rebound)
-                    entry(*arguments)
+        # No device or stream context: the forward fill's torch ops run on the
+        # current stream of their tensors' device, tvm-ffi (>= 0.1.11) runs every
+        # call on PyTorch's current stream of its first CUDA tensor's device, and
+        # every generated binding takes a device guard on that tensor.  The
+        # CuTe-DSL GEMM closure enters the device itself.
+        if self.fill_padding:
+            assert self._padding_scratch is not None
+            source = m_indices if m_indices is not None else self._padding_source
+            assert source is not None
+            _forward_fill_padding(source, *self._padding_scratch)
+        if self._gemm is not None:
+            self._gemm(a=a, a_scale=a_scale, m_indices=gemm_indices)
+        for entry, arguments, slots in self._entries:
+            if rebound:
+                arguments = _rebind_arguments(arguments, slots, rebound)
+            entry(*arguments)
         return rebound.get("out_q", self.out_q), rebound.get("out_s", self.out_s)
 
     __call__ = launch
@@ -901,10 +937,15 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     element for element on the same inputs.  ``M < SMALL_M_MAX`` rows run the
     FlashInfer grouped GEMM (:func:`small_m_gemm_backend`) into the BF16
     ``(M, 2H)`` ``workspace``, then one generated SwiGLU + group-quantization
-    kernel.  Preparation performs no device work beyond the optional index
+    kernel, except a known routing of at most ``TINY_MIXED_MAX_UNITS``
+    single-block units at ``K <= TINY_MIXED_MAX_K`` (:func:`select_route`).
+    Preparation performs no device work beyond the optional index
     validation; the device SM count is read once per process.  Index values
     are unchecked unless ``validate_indices=True``; violating the routing
-    contract is undefined behavior.
+    contract is undefined behavior.  With the routing known (``group_counts``
+    or ``validate_indices=True``) the route and grids are planned for that
+    routing, which becomes part of the contract: launching after ``m_indices``
+    changes to another routing is undefined behavior (prepare again).
     """
     if not isinstance(a, torch.Tensor) or a.device.type != "cuda":
         raise ValueError("a must be a CUDA torch.Tensor")
@@ -988,7 +1029,14 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks, k=k)
     stage_grids: dict[str, tuple[int, int, int]] = {ROUTE_STAGES[route][0]: grid}
     if route == FUSED_ROUTE:
-        stage_grids[FUSED_TAIL_STAGE] = tail_launch_grid(m, n2, sm_count=sm_count)
+        stage_grids[FUSED_TAIL_STAGE] = tail_launch_grid(
+            m,
+            n2,
+            sm_count=sm_count,
+            odd_units=None
+            if group_blocks is None
+            else fused_tile_counts(n2, group_blocks)[1],
+        )
     stage_module_names = {
         stage: select_stage_module(arch, route, stage) for stage in ROUTE_STAGES[route]
     }
@@ -1025,6 +1073,13 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             prepared_gemm = prepare_group_gemm_fp8_nt_groupwise_contiguous(
                 a, b, a_scale, b_scale, kernel_indices, out=gemm_out
             )
+            bound_launch = prepared_gemm.launch
+            if not prepared_gemm.fill_padding:
+                # Its launch() then only enters the device and stream contexts,
+                # which the binding takes itself (device guard, tvm-ffi stream).
+                bound_launch = functools.partial(
+                    prepared_gemm._entry, *prepared_gemm._arguments
+                )
 
             def gemm(
                 a: Optional[torch.Tensor] = None,
@@ -1034,7 +1089,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
                 y: torch.Tensor = gemm_out,
             ) -> None:
                 if a is None and a_scale is None and m_indices is None:
-                    prepared_gemm.launch()
+                    bound_launch()
                     return
                 # Rebound operands: prepare the GEMM on them (host work only, so the
                 # call stays graph-capturable).
@@ -1057,14 +1112,15 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
                 bound: tuple[torch.Tensor, ...] = (a, a_scale, kernel_indices),
                 y: torch.Tensor = gemm_out,
             ) -> None:
-                group_gemm_fp8_nt_groupwise_contiguous(
-                    bound[0] if a is None else a,
-                    b,
-                    bound[1] if a_scale is None else a_scale,
-                    b_scale,
-                    bound[2] if m_indices is None else m_indices,
-                    out=y,
-                )
+                with torch.cuda.device(y.device):
+                    group_gemm_fp8_nt_groupwise_contiguous(
+                        bound[0] if a is None else a,
+                        b,
+                        bound[1] if a_scale is None else a_scale,
+                        b_scale,
+                        bound[2] if m_indices is None else m_indices,
+                        out=y,
+                    )
 
             # The CuTe-DSL kernel is specialized (compiled on a cold cache) by its
             # first call: run it once here, into the intermediate it owns anyway,

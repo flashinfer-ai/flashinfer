@@ -142,6 +142,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             // umma_empty: 2 barriers, init_count=384
             mbarrier_init(smem + 96, 384);
             mbarrier_init(smem + 104, 384);
+            // --- pipeline 'verdict_pipe' ---
             // verdict_bar: 1 barriers, init_count=12
             mbarrier_init(smem + 112, 12);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -172,6 +173,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // load_q_main
             unsigned int _phase_q_empty = 1;
+            unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
@@ -201,8 +203,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 mbarrier_arrive_expect_tx(q_full_addr, 49920);
                                 _phase_q_empty ^= 1;
                                 if (attempt == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_q);
-                                    vphase_q ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
+                                    _phase_verdict_bar ^= 1;
                                     int f = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
                                     f = f | s_fail[4];
                                     f = f | s_fail[5];
@@ -224,6 +226,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
         { // load_k_main
             unsigned int load_k_stage = 0;
             unsigned int _phase_k_empty = 1;
+            unsigned int _phase_verdict_bar_1 = 0;
             if (elect_sync()) {
                 int unit_base_k = 0;
                 unsigned int vphase_k = 0;
@@ -328,8 +331,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     }
                                 }
                                 if (attempt_1 == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_k);
-                                    vphase_k ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
+                                    _phase_verdict_bar_1 ^= 1;
                                     int f_1 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
                                     f_1 = f_1 | s_fail[4];
                                     f_1 = f_1 | s_fail[5];
@@ -356,6 +359,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_umma_empty = 1;
+            unsigned int _phase_verdict_bar_2 = 0;
             #pragma unroll 1
             for (int seg_2 = 0; seg_2 < num_segments; seg_2++) {
                 int q0_2 = cu_seqlens_q[seg_2];
@@ -474,8 +478,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                             mbarrier_arrive(q_empty_addr);
                             _phase_q_full ^= 1;
                             if (attempt_2 == 0) {
-                                mbarrier_wait(verdict_bar_addr, vphase_m);
-                                vphase_m ^= 1;
+                                mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
+                                _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
                                 if (lane == 0) {
                                     uint32_t _shared_weak_0;
@@ -532,9 +536,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             unsigned int math_tmem_stage = 0;
             unsigned int math_tmem_phase = 0;
             int unit_base = 0;
+            int verdict_unit = 0;
             int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
             int trigger_room = 128 * check_period;
             unsigned int _phase_q_full_1 = 0;
+            unsigned int _phase_umma_full = 0;
             #pragma unroll 1
             for (int seg_3 = 0; seg_3 < num_segments; seg_3++) {
                 int q0_3 = cu_seqlens_q[seg_3];
@@ -701,7 +707,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 } else {
                                     d_pos += 1;
                                 }
-                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float _tmem_load_0[64];
                                 asm volatile(
@@ -813,10 +819,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     Cand[slot_1] = (long long)okey_1;
                                 }
                                 math_tmem_stage += 1;
-                                if (math_tmem_stage >= 2) {
-                                    math_tmem_stage -= 2;
-                                    math_tmem_phase ^= 1;
-                                }
+                                if (math_tmem_stage == 2) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
                                 int sample_now = ((ti_2 + 1 == n_s) ? 1 : 0);
                                 int do_check = ((until_check == 0) ? 1 : 0);
                                 do_check = do_check | sample_now;
@@ -1182,6 +1185,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 if (elect_sync()) {
                                     mbarrier_arrive(verdict_bar_addr);
                                 }
+                                verdict_unit += 1;
                             }
                             int n_sel = ((top_k) < (c_final) ? (top_k) : (c_final));
                             asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");

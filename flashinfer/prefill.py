@@ -300,6 +300,7 @@ def get_customize_batch_prefill_module(
     use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    v_sf_swizzled: bool = False,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -324,6 +325,7 @@ def get_customize_batch_prefill_module(
         use_token_head_sf,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
+        v_sf_swizzled=v_sf_swizzled,
     ).build_and_load()
 
 
@@ -3354,7 +3356,30 @@ class BatchPrefillWithPagedKVCacheWrapper:
         >>> wrapper.plan(...)
         """
         if self._backend == "cute-dsl-prims":
-            return (0, 0)
+            qo_indptr_host = qo_indptr.to("cpu")
+            if seq_lens is None:
+                kv_lens_arr_host = get_seq_lens(
+                    paged_kv_indptr.to("cpu"),
+                    paged_kv_last_page_len.to("cpu"),
+                    page_size,
+                )
+            else:
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+            assert self._prims_backend is not None
+            float_bytes = self._prims_backend.paged_workspace_size(
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv_host=kv_lens_arr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_qk,
+                o_dtype=canonicalize_torch_dtype(o_data_type or q_data_type),
+                page_size=page_size,
+                causal=causal,
+                fixed_split_size=fixed_split_size or -1,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
+            )
+            return (float_bytes, 0)
 
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
@@ -4111,7 +4136,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
             if block_tables is None:
                 block_tables = _build_block_tables_from_paged_kv_indices(
@@ -4138,6 +4162,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 causal=causal,
                 sm_scale=sm_scale,
+                float_workspace_buffer=self._float_workspace_buffer,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -4270,10 +4298,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
-        # Old cuDNN captures still own this table after auto selects FA2.
+        # Old cuDNN captures retain lengths even with a caller-owned table.
         # Refresh their metadata during plan; replay cannot rebind pointers.
         if self._backend == "cudnn" or (
-            self.is_cuda_graph_enabled and self._cudnn_block_tables is not None
+            self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
@@ -6072,8 +6100,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
+            if fixed_split_size not in (-1, None):
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    f"fixed_split_size={fixed_split_size} with ragged K/V"
+                )
             assert self._prims_backend is not None
             self._prims_backend.plan_ragged(
                 qo_indptr=self._qo_indptr_buf,
@@ -8810,7 +8842,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
+        # The cake backend takes a device bmm1 scale as given: its device-scale
+        # programs convert it to log2 form themselves, which saves this extra
+        # launch.
+        if backend != "cake":
+            bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
@@ -8886,18 +8922,19 @@ def trtllm_batch_context_with_kv_cache(
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # A device-scale program reads both scales through device pointers
-        # (bmm1 in log2 form). The other context adapters consume host scalar
-        # scales: device scalar values are resolved only after route
-        # selection, preserving their public value while converting bmm1 back
-        # from log2 form.
+        # A device-scale program reads both scales through device pointers and
+        # converts the raw bmm1 scale to log2 form itself. The other context
+        # adapters consume host scalar scales: device scalar values are
+        # resolved only after route selection. bmm1 keeps the value of the
+        # FP32 log2 product converted back (the value these adapters always
+        # received).
         if (
             cake_route is None
             or cake_route.program is None
             or not cake_route.device_scales
         ):
             if isinstance(bmm1_scale, torch.Tensor):
-                bmm1_scale = float(bmm1_scale.item()) / log2e
+                bmm1_scale = float((bmm1_scale * log2e).item()) / log2e
             if isinstance(bmm2_scale, torch.Tensor):
                 bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(

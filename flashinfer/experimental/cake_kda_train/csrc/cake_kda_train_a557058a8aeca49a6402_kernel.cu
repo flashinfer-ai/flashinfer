@@ -1110,7 +1110,6 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
             unsigned int wst_m = 0;
             unsigned int mst = 0;
             unsigned int _phase_wy_full = 0;
-            unsigned int _phase_vb_ready = 0;
             unsigned int _phase_tiles_full = 0;
             unsigned int _phase_w_ready = 0;
             unsigned int _phase_hs_ready_0_2 = 0;
@@ -1122,7 +1121,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
             if (elect_sync()) {
                 if (nc_3 > 0) {
                     mbarrier_wait(wy_full_addr + (wst_m) * 8, _phase_wy_full);
-                    mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_vb_ready);
+                    mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_wy_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _smem_desc_lo_0 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (wst_m) * 1024;
@@ -1211,7 +1210,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                     ubuf_1 += 1;
                     if (ubuf_1 == 2) { ubuf_1 = 0; }
                     wst_m += 1;
-                    if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; _phase_vb_ready ^= 1; }
+                    if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; }
                 }
                 #pragma unroll 1
                 for (int c_3 = 0; c_3 < nc_3; c_3++) {
@@ -1286,7 +1285,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                     if (mst == 2) { mst = 0; _phase_w_ready ^= 1; }
                     if (nc_3 > c_3 + 1) {
                         mbarrier_wait(wy_full_addr + (wst_m) * 8, _phase_wy_full);
-                        mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_vb_ready);
+                        mbarrier_wait(vb_ready_addr + (wst_m) * 8, _phase_wy_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_4 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (wst_m) * 1024;
@@ -1375,7 +1374,7 @@ kernel_cake_kda_train_a557058a8aeca49a6402(const __grid_constant__ CUtensorMap a
                         ubuf_1 += 1;
                         if (ubuf_1 == 2) { ubuf_1 = 0; }
                         wst_m += 1;
-                        if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; _phase_vb_ready ^= 1; }
+                        if (wst_m == 2) { wst_m = 0; _phase_wy_full ^= 1; }
                     }
                     mbarrier_wait(qg_full_addr, _phase_qg_full_0);
                     _phase_qg_full_0 ^= 1;

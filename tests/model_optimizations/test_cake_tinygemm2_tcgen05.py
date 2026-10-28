@@ -1,6 +1,6 @@
 """Tests for tinygemm2_tcgen05 — the generated tcgen05 tinygemm2 programs.
 
-``flashinfer.jit.cake_tinygemm2_tcgen05`` holds seven tiles, each with and
+``flashinfer.jit.cake_tinygemm2_tcgen05`` holds eight tiles, each with and
 without the bias and with and without programmatic dependent launch.  Their
 contract is the output of ``csrc/tinygemm2.cu`` bit for bit, so every parity
 test below uses ``torch.equal``, not a tolerance.
@@ -19,6 +19,7 @@ TILES = (
     "PACKED_M64_N16",
     "PACKED_M64_N4",
     "PACKED",
+    "PACKED_BOX8",
     "ACCUMULATORS",
 )
 PROGRAMS = tuple(
@@ -28,7 +29,7 @@ PROGRAMS = tuple(
     for pdl in ("", "_PDL")
 )
 
-# Every program runs every shape: batches across the tiles' 2, 4, 16 and 64 rows,
+# Every program runs every shape: batches across the tiles' 2, 4, 8, 16 and 64 rows,
 # output features across their 8, 16 and 32, and input features off the 64- and
 # 256-wide K steps of the four chains (zero-filled tails), with chains that
 # get no K chunk at all (K <= 768).
@@ -349,8 +350,14 @@ SM103_NARROW_ROUTES = [
 # the nearest measured shapes the windows exclude and an input that is not a
 # multiple of 64), PACKED on 8 rows without a bias and 9 to 16 with one from 3584
 # output features, with a bias 28 to 32 rows from 2048 output features, without one
-# 9 to 16 rows from 1728; the M=64 tiles at 2048 to 3072 output features (corners,
-# and the measured shapes past them).
+# 9 to 16 rows from 1728; PACKED_BOX8 on 8 rows without a bias from 3584 output
+# features and an input of 3072 to 6144 (the corners; below 3072 PACKED keeps the
+# rows; fewer output features, 7 or 9 rows, a longer input and a bias keep their
+# kernels); the M=64 tiles at 2048 to 3072 output features (corners,
+# and the measured shapes past them); PACKED on 17 to 23 rows without a bias whose
+# activations take less than 128 KiB, from an input of 2048 on 17 to 21 rows and from
+# 2816 / 2688 on 22 / 23 rows (the corners, the first input past 128 KiB, an input
+# below the start, 24 rows and a bias keep their kernels).
 SM107_ROUTES = [
     (4, 384, 16384, True, "PACKED_NARROW_U4"),
     (3, 512, 16384, True, "PACKED_NARROW_U4"),
@@ -401,7 +408,19 @@ SM107_ROUTES = [
     (4, 3072, 8192, True, "PACKED_M64_N4"),
     (3, 2048, 8192, True, None),
     (4, 3584, 2880, True, None),
-    (8, 4096, 4096, False, "PACKED"),
+    (8, 4096, 4096, False, "PACKED_BOX8"),
+    (8, 3584, 3072, False, "PACKED_BOX8"),
+    (8, 4096, 6144, False, "PACKED_BOX8"),
+    (8, 3856, 4600, False, "PACKED_BOX8"),
+    (8, 4096, 3064, False, "PACKED"),
+    (8, 3584, 2112, False, "PACKED"),
+    (8, 3856, 3064, False, "PACKED"),
+    (8, 4096, 2560, False, "PACKED"),
+    (8, 3568, 4096, False, None),
+    (8, 4096, 6152, False, None),
+    (7, 4096, 4096, False, None),
+    (9, 4096, 4096, False, "PACKED"),
+    (8, 4096, 4096, True, None),
     (9, 2880, 2112, True, None),
     (16, 2880, 2880, True, "PACKED_M64_N16"),
     (16, 3072, 10240, True, "PACKED_M64_N16"),
@@ -421,6 +440,19 @@ SM107_ROUTES = [
     (28, 1536, 4096, True, None),
     (32, 2048, 3072, True, "PACKED"),
     (64, 4096, 3072, True, "ACCUMULATORS"),
+    (17, 4096, 3848, False, "PACKED"),
+    (17, 4096, 3856, False, "ACCUMULATORS"),
+    (22, 3408, 2976, False, "PACKED"),
+    (21, 3456, 2048, False, "PACKED"),
+    (22, 3408, 2816, False, "PACKED"),
+    (22, 3408, 2808, False, "ACCUMULATORS"),
+    (23, 3456, 2688, False, "PACKED"),
+    (23, 3456, 2680, False, "ACCUMULATORS"),
+    (23, 3456, 2048, False, "ACCUMULATORS"),
+    (23, 4096, 2856, False, "ACCUMULATORS"),
+    (20, 4096, 2040, False, "ACCUMULATORS"),
+    (24, 4096, 2048, False, "ACCUMULATORS"),
+    (20, 4096, 3272, True, None),
 ]
 ROUTES = (
     [

@@ -436,7 +436,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                 load_clc_stage += 1;
                 if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                 if (_clc_valid_1 == 0) {
@@ -565,7 +565,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                 mma_clc_stage += 1;
                 if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                 if (_clc_valid_2 == 0) {
@@ -623,7 +623,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (epi_clc_stage) * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
                 if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_2 ^= 1; }
                 int ep_item_t = ep_tile >> 2;
@@ -747,7 +747,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(clc_full_addr + (sched_clc_stage) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -778,7 +778,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                        :: "r"(clc_empty_addr + (sched_clc_stage) * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
                     if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_3 ^= 1; }
                     if (_clc_valid_0 == 0) {

@@ -37,7 +37,7 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-void Run(TensorView a_dy, TensorView a_b, TensorView a_x, TensorView a_stats, TensorView a_db, TensorView a_gstats, int64_t a_T, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_dy, TensorView a_b, TensorView a_x, TensorView a_stats, TensorView a_db, TensorView a_gstats, int64_t a_T, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_dy.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_dy, "dy");
@@ -68,6 +68,8 @@ void Run(TensorView a_dy, TensorView a_b, TensorView a_x, TensorView a_stats, Te
   check_same_device(a_gstats, a_dy, "gstats", "dy");
   TVM_FFI_CHECK((a_T >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (T >= 0)";
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -87,10 +89,14 @@ void Run(TensorView a_dy, TensorView a_b, TensorView a_x, TensorView a_stats, Te
   config.dynamicSmemBytes = 1280;
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  int n = 0;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 1;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_mhc_train_bwd_prepare), kernel_args),
             "cudaLaunchKernelExC");
 }

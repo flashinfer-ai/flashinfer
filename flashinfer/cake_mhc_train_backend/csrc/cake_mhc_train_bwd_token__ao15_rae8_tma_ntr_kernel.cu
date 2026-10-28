@@ -334,6 +334,7 @@ kernel_cake_mhc_train_bwd_token__ao15_rae8_tma_ntr(const __grid_constant__ CUten
     }
     int gi[1];
     gi[0] = 0;
+    int ring_grp = 0;
     #pragma unroll 1
     for (int g0 = t0; g0 < t1; g0 += 8) {
         int cur_base = (gi[0] & 1) * 256 + warp_0 * 32;
@@ -5258,6 +5259,7 @@ kernel_cake_mhc_train_bwd_token__ao15_rae8_tma_ntr(const __grid_constant__ CUten
         comp[1] = ((tok < t1) ? _sub_767 : comp[1]);
         acc[1] = ((tok < t1) ? _add_202 : acc[1]);
         gi[0] = gi[0] + 1;
+        ring_grp += 1;
     }
     int fbase = (warp_0 * 32 + lane_1) * 4;
     fold[fbase] = acc[0];

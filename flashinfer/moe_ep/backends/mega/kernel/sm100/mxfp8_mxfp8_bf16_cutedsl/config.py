@@ -27,13 +27,15 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     ``kernel_variant="genphase"`` opts into the Blackwell decoding pipeline.
     Its ``knobs=None`` selects an exact cached profile or a host heuristic;
     dictionaries and explicit tile/cluster/schedule fields constrain selection.
-    ``knobs="auto"`` tunes collectively during warmup before graph capture.
-    Auto layers own a single capacity and cannot call ``create_workspace()``;
-    use fixed or offline-tuned knobs for additional capacity profiles.
+    GenPhase and the standard ``_cutedsl_next`` selector use ``knobs="auto"``
+    with ``autotune_v2()`` for collective warmup before graph capture.
+    These selectors support independent automatic handles through
+    ``create_workspace()``. The legacy inference selector retains its
+    single-capacity automatic workspace.
 
     ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
     provider export for E4M3 or E5M2. Keep ``kernel_variant="inference"`` and
-    use default or fixed ``knobs`` with this backend. Activation controls and
+    use default, fixed or automatic ``knobs``. Activation controls and
     late routing weights are available through this selector.
     """
 
@@ -46,8 +48,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
-    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
-    # finalization; it requires fixed/offline-tuned knobs.
+    # NONE exposes per-route outputs through forward_unfinalized(). The legacy
+    # selector requires fixed/offline-tuned knobs for this mode.
     finalize_mode: FinalizeMode = field(default=FinalizeMode.AUTO, kw_only=True)
     # Caller-owned CUDA int32 (1,) live-token count the PERSISTENT finalize kernel
     # reads; the workspace borrows it and never writes it. Update before every
@@ -56,13 +58,14 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
         default=None, kw_only=True
     )
     # GenPhase: None resolves the cache or geometry heuristic; dictionaries
-    # constrain tile/cluster/schedule_policy; "auto" tunes at collective warmup.
+    # constrain tile/cluster/schedule_policy; "auto" searches within autotune_v2().
     # Inference tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
-    # "auto" -> online autotune at the first forward: collectively time the
+    # Legacy "auto" -> online autotune at the first forward: collectively time the
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
+    # The standard _cutedsl_next selector defers searches to autotune_v2().
     knobs: dict | str | None = None
     # Opt-in decoding pipeline. Existing callers keep the legacy inference
     # path, including its knob cache and online autotuner.
@@ -125,7 +128,10 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
                 )
-            if self.knobs == "auto":
+            if (
+                self.knobs == "auto"
+                and self.kernel_name != "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+            ):
                 raise ValueError(
                     "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )
