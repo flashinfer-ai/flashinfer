@@ -84,6 +84,7 @@ from .cake_jit import (
     route_applies,
     route_modules,
     run_module,
+    run_modules,
     selected_modules,
     workspace_layout,
     workspace_owners,
@@ -344,12 +345,14 @@ def _route(arch: str, kind: str, *, needs: str, C: int, S: int) -> tuple[str, ..
 
 def _launch(
     record: dict, S: int, C: int, num_docs: int, *, device_index: int
-) -> tuple[dict[str, int], int]:
+) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
 
     CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
     a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
     x threads x vec`` channels is refused rather than left partly unwritten.
+    The caller launches this grid (``run_module`` / ``run_modules`` ``grid``),
+    so a call plans it once.
     """
 
     scalars = plan(
@@ -359,13 +362,13 @@ def _launch(
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
     )
-    grid_x = launch_grid(record, device_index=device_index)[0]
-    if scalars["n_ch_tiles"] > grid_x:
+    grid = launch_grid(record, device_index=device_index, C=C, S=S)
+    if scalars["n_ch_tiles"] > grid[0]:
         raise ValueError(
             f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
-            f"device is {grid_x} CTAs; every channel tile needs a CTA"
+            f"device is {grid[0]} CTAs; every channel tile needs a CTA"
         )
-    return scalars, grid_x
+    return scalars, grid
 
 
 def cake_causal_conv1d_train_backward_workspace_bytes(
@@ -378,10 +381,12 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     main program, one row per ``n_ch_tiles`` CTAs of a program's launch grid
     (``rows = ceil(grid / n_ch_tiles)``, ``grid = grid_mult x ctas_per_sm x SM
     count``: the bytes grow with the program's over-decomposition factor
-    ``grid_mult``), sized by the largest such buffer over every backward
-    program of every backward route of the architecture: the call's arguments
-    select the route and the channel count the program, every program writes
-    the leading rows of its own grid inside this buffer, and its reduce
+    ``grid_mult``; a call whose grid drops CTAs to whole channel-tile ranks,
+    ``cake_jit.main_grid``, writes fewer rows), sized by the largest such
+    buffer over every backward program of every backward route of the
+    architecture: the call's arguments select the route and the channel count
+    the program, every program writes the leading rows of its own grid inside
+    this buffer, and its reduce
     program sums exactly those.  So one buffer serves every route (the bias
     routes' fifth slab makes it 25 % larger than the dweight partials alone,
     for every caller) and, as it depends on ``C`` and the device only, every
@@ -580,7 +585,7 @@ def cake_causal_conv1d_train_forward(
     kind = forward_route(bias=b is not None, bf16_taps=w.dtype == torch.bfloat16)
     names = _route(arch, kind, needs="this forward (bias / BF16 taps)", C=C, S=S)
     device_index = _device_index(device)
-    scalars, _ = _launch(
+    scalars, grid = _launch(
         _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
     )
     values: dict[str, object] = {
@@ -600,7 +605,12 @@ def cake_causal_conv1d_train_forward(
     if work is not None:
         values["work"] = work
     for name in names:
-        run_module(name, values, device_index=device_index)
+        run_module(
+            name,
+            values,
+            device_index=device_index,
+            grid=grid if name == names[0] else None,
+        )
     return y
 
 
@@ -735,7 +745,8 @@ def cake_causal_conv1d_train_backward(
             "partial workspace"
         )
     device_index = _device_index(device)
-    scalars, grid_x = _launch(record, S, C, num_docs, device_index=device_index)
+    scalars, grid = _launch(record, S, C, num_docs, device_index=device_index)
+    grid_x = grid[0]
     if workspace is None:
         workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
     rows = partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -759,8 +770,13 @@ def cake_causal_conv1d_train_backward(
     # route's reduce program, programmatically dependent on it through its
     # binding's launch attribute, sums into dweight (and dbias) on the same
     # stream the rows of each channel tile that a grid of main_ctas CTAs wrote.
-    run_module(names[0], values, device_index=device_index)
-    run_module(record["reduce"], values, device_index=device_index)
+    # Both are issued back to back in one stream context, so the reduce is
+    # queued while the main program runs.
+    run_modules(
+        ((names[0], grid), (record["reduce"], None)),
+        values,
+        device_index=device_index,
+    )
     if db_out is None:
         return dx_out, dw_out
     return dx_out, dw_out, db_out
