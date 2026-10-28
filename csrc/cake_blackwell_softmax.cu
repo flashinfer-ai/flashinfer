@@ -53,12 +53,13 @@ constexpr uintptr_t kCachedAlignmentBytes = 32;
 // rows) or the shared-tile kernel (4 register tiles and up to 4 shared-memory
 // tiles per CTA, four resident CTAs per SM, one cluster per row; R_S resident
 // clusters), by this rule (measured on GB300 and B200):
-// - a chunk of at most 5 tiles takes the shared-tile kernel, except an 8-CTA
-//   chunk from 2.5 rows per persistent cluster (rows * 2 >= R_P * 5) up to 7
-//   rows per shared-tile cluster whose rows fill at least 4/5 of the
-//   persistent kernel's trips and whose fifth tile is more than 1/4 (sm_100)
-//   or at least 3/8 (sm_103) full, and a 16-CTA chunk whose rows fill at
-//   least 9/10 of three persistent trips;
+// - a chunk of at most 5 tiles takes the shared-tile kernel, except
+//   - an 8-CTA chunk whose rows fill at least 4/5 of the persistent kernel's
+//     trips and whose fifth tile is more than 1/4 (sm_100) or at least 3/8
+//     (sm_103) full, from three persistent trips on when the fifth tile is
+//     at least 3/8 full and from 2.5 rows per persistent cluster on
+//     otherwise, below 7 rows per shared-tile cluster;
+//   - a 16-CTA chunk whose rows fill at least 9/10 of three persistent trips;
 // - a full 8-tile chunk takes the persistent kernel, unless the rows fit one
 //   wave of shared-tile clusters while filling less than a fraction N / D of
 //   the persistent kernel's trips (rows * D < ceil(rows / R_P) * R_P * N; 4/5
@@ -79,6 +80,8 @@ constexpr uint64_t kSharedTilesRowsPerClusterFullChunkC16Sm103 = 8;
 constexpr uint64_t kSharedTilesRowsPerClusterFullChunkC8 = 7;
 constexpr uint64_t kFifthTileMaxThinEighthsSm100 = 2;
 constexpr uint64_t kFifthTileMinFillEighthsSm103 = 3;
+constexpr uint64_t kFifthTileEarlyPersistentEighthsSm100 = 3;
+constexpr uint64_t kFiveTileSharedTilesMaxTrips = 2;
 constexpr uint64_t kNarrowChunkC16PersistentTrips = 3;
 constexpr uint64_t kNarrowChunkC16TripFillNum = 9;
 constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
@@ -134,6 +137,7 @@ int cached_chunk_elements(uint32_t vocab_size, int cluster_ctas) {
 }
 
 cudaError_t row_resident_clusters(int cluster_ctas, bool pdl, int device, int* clusters);
+cudaError_t shared_tile_resident_clusters(int cluster_ctas, bool pdl, int device, int* clusters);
 cudaError_t one_cta_per_sm_clusters(int cluster_ctas, int device, int* clusters);
 
 // The wide kernels' cluster sizes, the larger first, and the narrowest of
@@ -143,6 +147,15 @@ constexpr int kWideClusterSizes[] = {12, 10};
 // A 10-CTA chunk is 1.6 times the 16-CTA chunk; the 10-CTA kernel takes the
 // batch only when the 16-CTA chunk exceeds 6 tiles (measured on B200).
 constexpr int kTenCtaMinSixteenChunkTiles = 7;
+// sm_103: the 8-CTA shared-tile kernel slows down past 7/10 of its resident
+// clusters (between 51 and 52 rows on GB300).
+constexpr uint64_t kSharedTilesSlowRowsNumSm103 = 7;
+constexpr uint64_t kSharedTilesSlowRowsDenSm103 = 10;
+// sm_100: a 4-tile 4-CTA chunk keeps spreading to 8 CTAs at twice as many CTAs
+// as SMs from 14 tiles of vocabulary, and up to 8 CTAs past that from 15.
+constexpr uint32_t kSpreadFourTileMinVocabTilesSm100 = 14;
+constexpr uint32_t kSpreadFourTilePastMinVocabTilesSm100 = 15;
+constexpr uint64_t kSpreadFourTilePastMaxCtasSm100 = 8;
 
 int wide_max_tiles(uint32_t vocab_size, int cluster_ctas) {
   const int tiles = cached_chunk_elements(vocab_size, cluster_ctas) / kCachedTileElements;
@@ -166,11 +179,15 @@ int wide_max_tiles(uint32_t vocab_size, int cluster_ctas) {
 // cluster size with fewer resident 4-tile clusters than rows, where the excess
 // clusters would run a second wave, when measured faster: before 16 CTAs if
 // 8-CTA chunks hold at most four tiles, before 8 CTAs if 4-CTA chunks hold at
-// most three. A 6- to 8-tile 8-CTA chunk whose 16-CTA chunk holds at most
-// four tiles takes the 4-tile 16-CTA kernel in two waves while its rows
-// stay within a multiple of the resident 4-tile 16-CTA clusters: 5/3 on sm_100
-// and 3/2 on sm_103 for a full 8-tile chunk, 10/7 on sm_100 for a 6- or 7-tile
-// chunk. A batch of 5-8-tile 16-CTA chunks with one row more than 16-CTA
+// most three; on sm_100 a 4-tile 4-CTA chunk of at least 14 tiles of
+// vocabulary still spreads to 8 CTAs at twice as many CTAs as SMs, and one of
+// at least 15 tiles up to 8 CTAs past that. A 6- to 8-tile 8-CTA chunk whose
+// 16-CTA chunk holds at most four tiles takes the 4-tile 16-CTA kernel in two
+// waves while its rows stay within a multiple of the resident 4-tile 16-CTA
+// clusters: on sm_100 9/5 for a full 8-tile chunk and 10/7 for a 6- or 7-tile
+// chunk; on sm_103 3/2 for a full 8-tile chunk, or 5/3 past 7/10 of the
+// resident 8-CTA shared-tile clusters.
+// A batch of 5-8-tile 16-CTA chunks with one row more than 16-CTA
 // clusters fit one CTA per SM would put two CTAs on the SMs of its last
 // cluster; it takes the wide kernel of 12 CTAs, or else 10 for a 16-CTA chunk
 // of more than 6 tiles, when that many clusters of it fit one CTA per SM
@@ -229,6 +246,24 @@ cudaError_t select_cached_variant(uint32_t rows, uint32_t vocab_size, int sm_cou
     }
     selected.cluster_ctas *= 2;
   }
+  if (selected.cluster_ctas == 4 && selected.max_tiles == 4 &&
+      vocab_size >= kSpreadFourTileMinVocabTilesSm100 * kCachedTileElements) {
+    const uint64_t ctas = static_cast<uint64_t>(rows) * selected.cluster_ctas;
+    const uint64_t twice_sms = 2 * static_cast<uint64_t>(sm_count);
+    if (ctas <= twice_sms ||
+        (ctas <= twice_sms + kSpreadFourTilePastMaxCtasSm100 &&
+         vocab_size >= kSpreadFourTilePastMinVocabTilesSm100 * kCachedTileElements)) {
+      int device_minor = 0;
+      const cudaError_t status =
+          cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor, device);
+      if (status != cudaSuccess) {
+        return status;
+      }
+      if (device_minor == 0) {
+        selected.cluster_ctas = kCachedPortableClusterSize;
+      }
+    }
+  }
   if (selected.max_tiles == kCachedMaxTiles &&
       cached_chunk_elements(vocab_size, selected.cluster_ctas) <= 4 * kCachedTileElements) {
     selected.max_tiles = 4;
@@ -244,25 +279,40 @@ cudaError_t select_cached_variant(uint32_t rows, uint32_t vocab_size, int sm_cou
     if (status != cudaSuccess) {
       return status;
     }
+    int resident = 0;
+    status = row_resident_clusters(kCachedMaxClusterSize, pdl, device, &resident);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    const uint64_t rows64 = rows;
+    const uint64_t resident64 = static_cast<uint64_t>(resident > 0 ? resident : 0);
     uint64_t rows_num = 0;
     uint64_t rows_den = 1;
-    if (portable_chunk_tiles == kCachedMaxTiles) {
-      rows_num = device_minor == 0 ? 5 : 3;
-      rows_den = device_minor == 0 ? 3 : 2;
-    } else if (device_minor == 0) {
-      rows_num = 10;
-      rows_den = 7;
+    if (device_minor == 0) {
+      rows_num = portable_chunk_tiles == kCachedMaxTiles ? 9 : 10;
+      rows_den = portable_chunk_tiles == kCachedMaxTiles ? 5 : 7;
+    } else if (portable_chunk_tiles == kCachedMaxTiles) {
+      rows_num = 3;
+      rows_den = 2;
     }
-    if (rows_num > 0) {
-      int resident = 0;
-      status = row_resident_clusters(kCachedMaxClusterSize, pdl, device, &resident);
+    bool two_waves = rows64 * rows_den <= rows_num * resident64;
+    if (!two_waves && device_minor != 0 && portable_chunk_tiles == kCachedMaxTiles &&
+        resident64 > 0) {
+      int shared_resident = 0;
+      status =
+          shared_tile_resident_clusters(kCachedPortableClusterSize, pdl, device, &shared_resident);
       if (status != cudaSuccess) {
         return status;
       }
-      if (resident > 0 &&
-          static_cast<uint64_t>(rows) * rows_den <= rows_num * static_cast<uint64_t>(resident)) {
-        selected = {kCachedMaxClusterSize, 4};
-      }
+      rows_num = 5;
+      rows_den = 3;
+      two_waves = shared_resident > 0 &&
+                  rows64 * kSharedTilesSlowRowsDenSm103 >
+                      kSharedTilesSlowRowsNumSm103 * static_cast<uint64_t>(shared_resident) &&
+                  rows64 * rows_den <= rows_num * resident64;
+    }
+    if (two_waves) {
+      selected = {kCachedMaxClusterSize, 4};
     }
   }
   if (selected.cluster_ctas == kCachedMaxClusterSize && selected.max_tiles == kCachedMaxTiles) {
@@ -501,6 +551,14 @@ cudaError_t row_resident_clusters(int cluster_ctas, bool pdl, int device, int* c
                                  cluster_ctas, cached_dynamic_smem_bytes(cluster_ctas), clusters);
 }
 
+// Resident clusters of the shared-tile kernel of 8 or 16 CTAs (or its _pdl
+// twin) on a device; the cache slot select_cached_launch fills.
+cudaError_t shared_tile_resident_clusters(int cluster_ctas, bool pdl, int device, int* clusters) {
+  return resident_clusters(
+      kResidentSharedTiles, cached_shared_tiles_kernel({cluster_ctas, kCachedMaxTiles}, pdl),
+      cluster_ctas, pdl, shared_tiles_dynamic_smem_bytes(cluster_ctas), device, clusters);
+}
+
 struct CachedLaunch {
   CachedVariant variant;
   const void* kernel;
@@ -582,12 +640,21 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, bool pdl, i
     const bool thin_last_tile =
         device_minor == 0 ? last_tile_x8 <= kFifthTileMaxThinEighthsSm100 * kCachedTileElements
                           : last_tile_x8 < kFifthTileMinFillEighthsSm103 * kCachedTileElements;
-    use_shared_tiles = sixteen
-                           ? !(trips == kNarrowChunkC16PersistentTrips &&
-                               rows64 * kNarrowChunkC16TripFillDen >=
-                                   trips * persistent_clusters * kNarrowChunkC16TripFillNum)
-                           : under_persistent || short_trips || thin_last_tile ||
-                                 rows64 >= kSharedTilesRowsPerClusterFullChunkC8 * shared_clusters;
+    if (sixteen) {
+      use_shared_tiles = !(trips == kNarrowChunkC16PersistentTrips &&
+                           rows64 * kNarrowChunkC16TripFillDen >=
+                               trips * persistent_clusters * kNarrowChunkC16TripFillNum);
+    } else {
+      // A fifth tile at least 3/8 full (on sm_103 every fifth tile that is
+      // not thin) keeps the shared-tile kernel for up to two persistent trips.
+      const bool early_persistent =
+          device_minor != 0 ||
+          last_tile_x8 >= kFifthTileEarlyPersistentEighthsSm100 * kCachedTileElements;
+      const bool few_rows =
+          early_persistent ? trips <= kFiveTileSharedTilesMaxTrips : under_persistent;
+      const bool many_rows = rows64 >= kSharedTilesRowsPerClusterFullChunkC8 * shared_clusters;
+      use_shared_tiles = few_rows || short_trips || thin_last_tile || many_rows;
+    }
   } else if (chunk_tiles == kCachedMaxTiles) {
     const uint64_t rows_per_cluster = !sixteen ? kSharedTilesRowsPerClusterFullChunkC8
                                       : device_minor == 0
