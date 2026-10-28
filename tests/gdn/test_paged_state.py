@@ -149,7 +149,9 @@ def _oracle(streams: Streams, lens: list[int], state_dtype=torch.float32):
 class PagedBatch:
     """A page table over a shuffled pool, sized for ``total_lens`` tokens."""
 
-    def __init__(self, total_lens, page_len, num_sab_heads, state_dtype, spare=7):
+    def __init__(
+        self, total_lens, page_len, num_sab_heads, state_dtype, spare=7, row_pad=0
+    ):
         self.page_len = page_len
         self.total_lens = list(total_lens)
         self.num_pages = [max(1, math.ceil(n / page_len)) for n in total_lens]
@@ -162,11 +164,12 @@ class PagedBatch:
             self.pages.append([next(it) for _ in range(n)])
         # Finite, page-distinct filler: a page read by mistake corrupts the
         # result, and a page written by mistake no longer equals its copy.
-        self.pool = torch.randn(
-            pool_pages, num_sab_heads, HEAD_SIZE, HEAD_SIZE, device="cuda"
-        ).to(state_dtype) + torch.arange(pool_pages, device="cuda").view(
-            -1, 1, 1, 1
-        ).to(state_dtype)
+        self.guarded = GuardedPool(pool_pages, num_sab_heads, state_dtype, row_pad)
+        self.pool = self.guarded.pool
+        self.pool.copy_(
+            torch.randn(pool_pages, num_sab_heads, HEAD_SIZE, HEAD_SIZE, device="cuda")
+            + torch.arange(pool_pages, device="cuda").view(-1, 1, 1, 1)
+        )
 
     def tables(self, index_dtype=torch.int32):
         indices = torch.tensor(
@@ -198,6 +201,46 @@ def _assert_state(actual, expected, *, msg):
     )
 
 
+GUARD = 1.0e4
+
+
+class GuardedPool:
+    """``rows`` state rows between two guard rows. ``row_pad`` extra elements
+    after each row make the row stride larger than ``H * V * K``. A write
+    through a ``-1`` row or past a row's ``[H, V, K]`` block hits a guard."""
+
+    def __init__(self, rows, num_heads, dtype, row_pad=0):
+        self.row = num_heads * HEAD_SIZE * HEAD_SIZE
+        self.storage = torch.full(
+            (rows + 2, self.row + row_pad), GUARD, dtype=dtype, device="cuda"
+        )
+        self.pool = self.storage[1:-1, : self.row].unflatten(
+            1, (num_heads, HEAD_SIZE, HEAD_SIZE)
+        )
+
+    def assert_guards(self):
+        for name, part in (
+            ("row -1", self.storage[0]),
+            ("the row past the end", self.storage[-1]),
+            ("the row padding", self.storage[1:-1, self.row :]),
+        ):
+            assert torch.equal(part, torch.full_like(part, GUARD)), f"wrote {name}"
+
+
+def _guarded_output(num_tokens, num_heads, dtype):
+    """An output buffer behind ``CHUNK`` guard rows: a sequence chunked from
+    before its first token must not store the rows before it."""
+    buf = torch.full(
+        (CHUNK + num_tokens, num_heads, HEAD_SIZE), GUARD, dtype=dtype, device="cuda"
+    )
+    return buf, buf[CHUNK:]
+
+
+def _assert_output_guard(buf):
+    head = buf[:CHUNK]
+    assert torch.equal(head, torch.full_like(head, GUARD)), "stored before row 0"
+
+
 def _run_paged_prefill_case(
     prefix_lens,
     new_lens,
@@ -206,11 +249,14 @@ def _run_paged_prefill_case(
     dtype,
     state_dtype,
     index_dtype=torch.int32,
+    row_pad=0,
 ):
     num_q_heads, num_k_heads, num_v_heads = heads
     totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
     streams = Streams(totals, num_q_heads, num_k_heads, num_v_heads, dtype)
-    batch = PagedBatch(totals, page_len, streams.num_sab_heads, state_dtype)
+    batch = PagedBatch(
+        totals, page_len, streams.num_sab_heads, state_dtype, row_pad=row_pad
+    )
     num_seqs = len(totals)
 
     # Seed every prefix page with its true state; the call must only read the
@@ -227,7 +273,8 @@ def _run_paged_prefill_case(
 
     q, k, v, g, beta = streams.slices(prefix_lens, totals)
     indices, indptr, last = batch.tables(index_dtype)
-    out = chunk_gated_delta_rule_paged(
+    guard, out = _guarded_output(sum(new_lens), streams.num_sab_heads, dtype)
+    chunk_gated_delta_rule_paged(
         q,
         k,
         v,
@@ -240,8 +287,11 @@ def _run_paged_prefill_case(
         page_indptr=indptr,
         page_len=page_len,
         last_page_len=last,
+        output=out,
     )
     torch.cuda.synchronize()
+    _assert_output_guard(guard)
+    batch.guarded.assert_guards()
 
     ref_out, ref_final, ref_ckpts = _oracle(streams, totals, state_dtype)
     ref_rows = torch.cat(
@@ -290,6 +340,25 @@ def test_paged_prefill_ragged(page_len, state_dtype, dtype, heads):
     prefix_lens = [0, 0, L, 2 * L, CHUNK, L + 2 * CHUNK, 37, L + 5, 3 * L - 1, L - 1]
     new_lens = [1, 3 * L + 17, L, 5, 2 * L, L + 7, L - 37, 2 * L + 63, 1, 1]
     _run_paged_prefill_case(prefix_lens, new_lens, L, heads, dtype, state_dtype)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_paged_prefill_unaligned_first_sequence_padded_pool(state_dtype):
+    """The first sequence has an unaligned prefix, so its chunking starts before
+    output row 0, and the pool rows are padded (row stride > H * V * K)."""
+    _skip_if_unsupported()
+    random.seed(8)
+    torch.manual_seed(8)
+    L = 128
+    _run_paged_prefill_case(
+        [37, 0, L + 5],
+        [100, 64, 30],
+        L,
+        (4, 4, 4),
+        torch.bfloat16,
+        state_dtype,
+        row_pad=96,
+    )
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
@@ -387,6 +456,7 @@ def test_chunked_prefill_continuation_at_unaligned_offsets():
         q, k, v, g, beta = streams.slices(done, new_done)
         pages = [math.ceil(n / L) if n else 1 for n in new_done]
         used = [batch.pages[b][: pages[b]] for b in range(2)]
+        guard, out = _guarded_output(sum(chunk), 4, torch.bfloat16)
         chunk_gated_delta_rule_paged(
             q,
             k,
@@ -406,9 +476,14 @@ def test_chunked_prefill_continuation_at_unaligned_offsets():
                 dtype=torch.int32,
                 device="cuda",
             ),
+            output=out,
         )
+        # The last call's sequence 1 continues from token 1008 right after
+        # an empty sequence: its chunking starts 48 rows before row 0.
+        torch.cuda.synchronize()
+        _assert_output_guard(guard)
         done = new_done
-    torch.cuda.synchronize()
+    batch.guarded.assert_guards()
     _, ref_final, ref_ckpts = _oracle(streams, [1040, 1050])
     for b in range(2):
         _assert_state(
@@ -432,7 +507,9 @@ def test_slot_arguments_match_packed_api():
     scale = 1.0 / math.sqrt(HEAD_SIZE)
     ref_out, ref_final, ref_ckpts = _oracle(streams, lens)
 
-    pool = torch.randn(12, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    guarded = GuardedPool(12, 4, torch.float32)
+    pool = guarded.pool
+    pool.copy_(torch.randn_like(pool))
     before = pool.clone()
     read = torch.tensor([-1, -1, -1], dtype=torch.int32, device="cuda")
     write = torch.tensor([9, -1, 2], dtype=torch.int32, device="cuda")
@@ -458,6 +535,7 @@ def test_slot_arguments_match_packed_api():
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out.float(), ref_out.float(), atol=1e-2, rtol=1e-2)
+    guarded.assert_guards()
     expected = {
         9: ref_final[0],
         2: ref_final[2],
@@ -501,7 +579,9 @@ def test_one_selected_state_per_sequence():
     wanted = pos > 0
     entries[(starts + pos // CHUNK - 1)[wanted]] = rows[wanted]
 
-    states = torch.randn(8, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    guarded = GuardedPool(8, 4, torch.float32, row_pad=64)
+    states = guarded.pool
+    states.copy_(torch.randn_like(states))
     before = states.clone()
     out = chunk_gated_delta_rule(
         q,
@@ -517,6 +597,7 @@ def test_one_selected_state_per_sequence():
         checkpoint_state_indices=entries,
     )
     torch.cuda.synchronize()
+    guarded.assert_guards()
     torch.testing.assert_close(out.float(), ref_out.float(), atol=1e-2, rtol=1e-2)
     expected = {
         row: ref_ckpts[b][p // CHUNK - 1]
@@ -548,6 +629,9 @@ def test_prefix_lens_absolute_checkpoints():
     ckpts = torch.zeros(sum(counts), 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
     init = prefix_final.clone()
     final = torch.zeros_like(init)
+    # Sequence 0 (prefix 100) is chunked from absolute position 64, 36 rows
+    # before output row 0.
+    guard, out = _guarded_output(sum(new), 4, torch.bfloat16)
     out, final = chunk_gated_delta_rule(
         q,
         k,
@@ -563,8 +647,10 @@ def test_prefix_lens_absolute_checkpoints():
         checkpoint_cu_starts=_cu(counts, "cuda"),
         checkpoint_every_n_tokens=N,
         prefix_lens=torch.tensor(prefix, dtype=torch.int32, device="cuda"),
+        output=out,
     )
     torch.cuda.synchronize()
+    _assert_output_guard(guard)
     ref_rows = torch.cat(
         [
             torch.arange(s + p, s + t)
@@ -619,20 +705,34 @@ def test_slot_arguments_reject_other_routes(kwargs, match):
         )
 
 
-def test_paged_prefill_rejects_bad_page_len():
+@pytest.mark.parametrize(
+    "page_len, strided, match",
+    [
+        (100, False, "multiple of 64"),
+        (128.0, False, "Python int"),
+        (128, True, "page_indices must be contiguous"),
+    ],
+)
+def test_paged_prefill_rejects_bad_arguments(page_len, strided, match):
     q, k, v = gen_qkv([8], 4, 4, 4, HEAD_SIZE, torch.bfloat16)
-    pool = torch.zeros(2, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    pool = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
     one = torch.ones(1, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="multiple of 64"):
+    if strided:
+        # Column 0 of a [2, 2] page table: two page ids with stride 2.
+        table = torch.arange(4, dtype=torch.int32, device="cuda").view(2, 2)
+        indices, indptr = table[:, 0], _cu([2], "cuda")
+    else:
+        indices, indptr = one - 1, _cu([1], "cuda")
+    with pytest.raises(ValueError, match=match):
         chunk_gated_delta_rule_paged(
             q.cuda(),
             k.cuda(),
             v.cuda(),
             cu_seqlens=_cu([8], "cuda"),
             state_pool=pool,
-            page_indices=one - 1,
-            page_indptr=_cu([1], "cuda"),
-            page_len=100,
+            page_indices=indices,
+            page_indptr=indptr,
+            page_len=page_len,
             last_page_len=one * 8,
         )
 
@@ -808,9 +908,10 @@ def test_paged_prefill_then_decode_end_to_end():
         use_cp=False,
         **gate_kwargs,
     )
-    torch.testing.assert_close(
-        torch.stack(outs).float(), ref_out[prompt:].float(), atol=2e-2, rtol=2e-2
-    )
+    # Strong decay keeps these outputs small: compare the relative error.
+    got, ref = torch.stack(outs).float(), ref_out[prompt:].float()
+    rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < 2e-2, f"decode outputs: relative error {rel:.3e}"
     _assert_state(pool[6], ckpts[0], msg="page 0")
     _assert_state(pool[1], ckpts[1], msg="page 1 (closed by decode)")
     _assert_state(pool[3], ref_final[0], msg="page 2")
@@ -846,7 +947,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables():
     indices = torch.empty(5, dtype=torch.int32, device="cuda")
     indptr = torch.empty(3, dtype=torch.int32, device="cuda")
     last = torch.empty(2, dtype=torch.int32, device="cuda")
-    out = torch.empty(sum(new_lens), 4, HEAD_SIZE, dtype=q.dtype, device="cuda")
+    guard, out = _guarded_output(sum(new_lens), 4, q.dtype)
     # (page ids, page counts, last_page_len): prefixes 0 / 256, then 100 / 0.
     steps = [
         ([4, 7, 1, 12, 3], [1, 4], [70, 2]),
@@ -884,6 +985,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables():
         expected_out = call(expected_pool).clone()
         graph.replay()
         torch.cuda.synchronize()
+        _assert_output_guard(guard)
         # A stale page table reads another page's (unrelated) state.
         torch.testing.assert_close(out, expected_out, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(

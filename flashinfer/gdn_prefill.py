@@ -1229,8 +1229,9 @@ def chunk_gated_delta_rule(
         bfloat16, float16, float8_e4m3fn, or float8_e5m2. Required when
         ``output_final_state=True``.  When ``state_indices`` is given it is
         instead the output state **pool** ``[N_pool, ...]`` and sequence
-        ``i``'s final state is written to row ``state_indices[i]`` (in place
-        when ``output_state is initial_state``); it must be provided by the
+        ``i``'s final state is written to row ``state_indices[i]``, or to row
+        ``output_state_indices[i]`` when that is given (in place when
+        ``output_state is initial_state``); it must be provided by the
         caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
         buffer would be indexed out of bounds by the pool slot ids).
         SM100/SM103 accepts the same positive, non-overlapping rank-4 stride
@@ -1245,8 +1246,12 @@ def chunk_gated_delta_rule(
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
         int64 on the same CUDA device as ``q``.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
-        number of checkpoints for sequence ``i`` (= ``seq_len_i //
-        checkpoint_every_n_tokens``).  Required when
+        number of checkpoints for sequence ``i``: ``seq_len_i //
+        checkpoint_every_n_tokens``, or ``(prefix_lens[i] + seq_len_i) // N -
+        prefix_lens[i] // N`` with ``prefix_lens`` (``N =
+        checkpoint_every_n_tokens``). With ``checkpoint_state_indices`` only
+        ``checkpoint_cu_starts[i]`` is read and ``[num_seqs]`` entries are
+        also accepted.  Required when
         ``checkpoint_every_n_tokens > 0``. The values must be monotonic and
         consistent with ``cu_seqlens``; this caller precondition is not checked
         at launch to avoid a device-to-host synchronization.
@@ -1268,18 +1273,23 @@ def chunk_gated_delta_rule(
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
         ``state_indices[i]`` and writes its final state back to the same row
-        (in place when ``output_state is initial_state``). This lets callers
+        (in place when ``output_state is initial_state``), or to row
+        ``output_state_indices[i]`` when that is given. This lets callers
         that keep a paged/indexed state pool avoid gathering the active rows
         into a packed buffer and scattering the result back. The pool may be
         any positive, non-overlapping rank-4 stride layout on SM100/SM103.
         ``None`` (default) keeps sequence-ordered row mapping without requiring
         the physical view itself to be contiguous.
 
-        The ids **must be unique**: as with any indexed scatter, two sequences
-        sharing a slot id would concurrently write the same pool row across
-        work tiles, leaving that row's final state nondeterministic. Uniqueness
-        is a caller precondition (not checked at launch, to avoid a per-call
-        host sync); the caller's slot allocator is expected to guarantee it.
+        Without ``output_state_indices`` the ids **must be unique**: as with
+        any indexed scatter, two sequences sharing a slot id would
+        concurrently write the same pool row across work tiles, leaving that
+        row's final state nondeterministic. Uniqueness is a caller
+        precondition (not checked at launch, to avoid a per-call host sync);
+        the caller's slot allocator is expected to guarantee it. With
+        ``output_state_indices`` read ids may repeat or be ``-1``; only the
+        rows a sequence writes must not be read or written by another
+        sequence.
         ``backend="cudnn"`` requires frontend 1.31+, int32 indices and
         float32/bfloat16 pools with dense ``[H, V, K]`` rows and a 16-byte
         aligned slot stride. It supports identical input/output pool views
@@ -1419,7 +1429,10 @@ def chunk_gated_delta_rule(
         of ``checkpoint_every_n_tokens`` (``1 <= n <= seq_len_i``). Prefix
         lengths need not be multiples of the 64-token chunk; a sequence whose
         prefix is not chunk-aligned is chunked from its aligned absolute
-        position, so every checkpoint falls on a chunk boundary.
+        position, so every checkpoint falls on a chunk boundary. Sequence
+        ``i`` then has ``(prefix_lens[i] + seq_len_i) // N - prefix_lens[i] //
+        N`` checkpoints (``N = checkpoint_every_n_tokens``); size
+        ``checkpoint_cu_starts`` accordingly.
 
         ``output_state_indices``, ``checkpoint_state_indices`` and
         ``prefix_lens`` are served by the native non-CP kernels on SM8x, SM90,
@@ -1435,7 +1448,8 @@ def chunk_gated_delta_rule(
         ``(output, final_state)`` where ``final_state`` has shape
         ``[num_seqs, num_sab_heads, head_size, head_size]`` — or, when
         ``state_indices`` is given, the state pool ``[N_pool, ...]`` itself
-        (i.e. ``output_state``), whose rows named by ``state_indices`` now
+        (i.e. ``output_state``), whose rows named by ``state_indices`` (by
+        ``output_state_indices`` when given; ``-1`` rows are not written) now
         hold the updated final states.
 
     Notes
@@ -1676,8 +1690,9 @@ def chunk_gated_delta_rule(
             else (num_seqs, num_seqs + 1)
         )
         if checkpoint_cu_starts.size(0) not in cu_starts_lengths:
+            expected = " or ".join(str(n) for n in cu_starts_lengths)
             raise ValueError(
-                f"checkpoint_cu_starts must have {num_seqs + 1} elements, "
+                f"checkpoint_cu_starts must have {expected} elements, "
                 f"got {checkpoint_cu_starts.size(0)}"
             )
         expected_shape = (

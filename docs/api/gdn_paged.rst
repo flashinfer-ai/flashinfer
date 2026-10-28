@@ -89,7 +89,9 @@ cache layouts can use directly:
 ``prefix_lens``
     Number of tokens each sequence has processed before this call. Checkpoints
     are taken at absolute positions: after new token ``n`` when
-    ``(prefix_lens[i] + n) % checkpoint_every_n_tokens == 0``.
+    ``(prefix_lens[i] + n) % checkpoint_every_n_tokens == 0``. Sequence ``i``
+    then has ``(prefix_lens[i] + seq_len_i) // N - prefix_lens[i] // N``
+    checkpoints (``N = checkpoint_every_n_tokens``).
 
 ``initial_state``, ``output_state`` and ``state_checkpoints`` may be the same
 pool. Rows written by one sequence must not be read or written by another

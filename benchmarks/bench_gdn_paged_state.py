@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""
+DESCRIPTION = """
 Paged recurrent-state GDN prefill and decode (flashinfer.gdn_paged).
 
 Prefill compares, on batches whose prefixes end on page boundaries (the only
@@ -23,16 +23,21 @@ case the packed API can serve):
 - paged: ``chunk_gated_delta_rule_paged`` reads the prefix page and writes every
   page boundary and the final state into the pool in one call.
 - packed+copy: what a caller does with the packed checkpoint API: gather the
-  prefix states, run ``chunk_gated_delta_rule`` with a packed initial state,
-  packed final state and a packed ``state_checkpoints`` buffer
+  prefix states (zero-filling sequences without a prefix), run
+  ``chunk_gated_delta_rule`` with a packed initial state, packed final state
+  and a packed ``state_checkpoints`` buffer
   (``checkpoint_every_n_tokens=page_len``), then scatter the checkpoints and
-  final states into their pages.
+  the final states that do not end on a page boundary into their pages.
 - no-ckpt: ``chunk_gated_delta_rule`` with ``state_indices`` and no
-  checkpoints, the cost of the recurrence alone (its final state overwrites
-  the prefix page, so it is a timing reference, not a correct caching scheme).
+  checkpoints: each sequence reads and overwrites its last page. This is the
+  cost of the recurrence alone, a timing reference, not a correct caching
+  scheme.
 
-One selected state per sequence (a chunk-aligned, sequence-local position,
-different for every sequence) compares:
+Workloads whose prefixes are not multiples of ``--page-len`` are skipped.
+
+One selected state per sequence (a chunk-aligned, sequence-local position: one
+of the last three chunk ends of the sequence, chosen by its index modulo 3)
+compares:
 
 - selected: ``checkpoint_every_n_tokens=64`` with ``checkpoint_state_indices``
   that are ``-1`` except at the selected entry, which names the sequence's row
@@ -157,8 +162,10 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
         if t % page_len:
             final_rows.append(pages[-1])
             final_src.append(i)
-    has_prefix = torch.tensor([r >= 0 for r in read_rows], device="cuda")
+    no_prefix = [i for i, r in enumerate(read_rows) if r < 0]
+    no_prefix_idx = torch.tensor(no_prefix, dtype=torch.long, device="cuda")
     read_idx = torch.tensor([max(r, 0) for r in read_rows], device="cuda")
+    final_all = len(final_src) == b
     final_idx = torch.tensor(final_rows, dtype=torch.long, device="cuda")
     final_src_idx = torch.tensor(final_src, dtype=torch.long, device="cuda")
     ckpt_idx = torch.tensor(ckpt_rows, dtype=torch.long, device="cuda")
@@ -168,9 +175,10 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     final_buf = torch.empty_like(init_buf)
     ckpt_buf = torch.empty(n_ckpt, h, D, D, dtype=state_dtype, device="cuda")
     out = torch.empty(t_new, max(hq, hv), D, dtype=torch.bfloat16, device="cuda")
-    owned_bytes = (
-        init_buf.numel() + final_buf.numel() + ckpt_buf.numel()
-    ) * init_buf.element_size()
+    owned = final_buf.numel() + ckpt_buf.numel()
+    if len(no_prefix) < b:
+        owned += init_buf.numel()
+    owned_bytes = owned * init_buf.element_size()
 
     def paged():
         chunk_gated_delta_rule_paged(
@@ -190,8 +198,10 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
         )
 
     def packed_copy():
-        torch.index_select(pool, 0, read_idx, out=init_buf)
-        init_buf.mul_(has_prefix.view(-1, 1, 1, 1))
+        if len(no_prefix) < b:
+            torch.index_select(pool, 0, read_idx, out=init_buf)
+            if no_prefix:
+                init_buf.index_fill_(0, no_prefix_idx, 0)
         chunk_gated_delta_rule(
             q,
             k,
@@ -199,7 +209,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
             g,
             beta,
             scale,
-            initial_state=init_buf,
+            initial_state=init_buf if len(no_prefix) < b else None,
             output_final_state=True,
             cu_seqlens=cu,
             output=out,
@@ -211,7 +221,9 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
         )
         if ckpt_rows:
             pool.index_copy_(0, ckpt_idx, ckpt_buf[: len(ckpt_rows)])
-        if final_rows:
+        if final_all:
+            pool.index_copy_(0, final_idx, final_buf)
+        elif final_rows:
             pool.index_copy_(0, final_idx, final_buf[final_src_idx])
 
     no_ckpt_rows = torch.tensor(
@@ -268,6 +280,9 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
 def bench_prefill(heads, page_len, state_dtype, workloads):
     rows = []
     for name, spans in workloads:
+        if any(p % page_len for p, _ in spans):
+            print(f"# skipped {name}: a prefix is not a multiple of page_len")
+            continue
         rows.append(_prefill_row(name, spans, heads, page_len, state_dtype))
         torch.cuda.empty_cache()
     return rows
@@ -428,7 +443,9 @@ def bench_decode(heads, state_dtype, batches):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--heads", type=int, nargs=3, default=[16, 16, 32])
     parser.add_argument("--page-len", type=int, default=1024)
     parser.add_argument(
@@ -436,6 +453,8 @@ def main():
     )
     parser.add_argument("--decode-batches", type=int, nargs="*", default=[1, 32, 256])
     args = parser.parse_args()
+    if args.page_len <= 0 or args.page_len % 64:
+        parser.error("--page-len must be a positive multiple of 64")
     state_dtype = getattr(torch, args.state_dtype)
     dev = torch.cuda.get_device_properties(0)
     print(

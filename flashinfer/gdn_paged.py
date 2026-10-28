@@ -121,8 +121,8 @@ def chunk_gated_delta_rule_paged(
         updated in place. Each row must be one dense ``[H, V, K]`` block; the
         row stride may be padded. Its dtype is the state dtype.
     page_indices : torch.Tensor
-        ``[num_indices]`` int32/int64 page ids, in any order and need not be
-        contiguous.
+        ``[num_indices]`` contiguous int32/int64 page ids. The ids may be in
+        any order and need not be consecutive.
     page_indptr : torch.Tensor
         ``[num_seqs + 1]`` int32/int64 CSR offsets into ``page_indices``.
         Sequence ``b`` owns ``page_indices[page_indptr[b]:page_indptr[b + 1]]``
@@ -144,10 +144,17 @@ def chunk_gated_delta_rule_paged(
     sequence of the same call. The page table and lengths are caller
     preconditions; they are not validated against each other on the device.
     """
-    if type(page_len) is not int or page_len <= 0 or page_len % 64 != 0:
+    if type(page_len) is not int:
+        raise ValueError(
+            f"page_len must be a Python int, got {type(page_len).__name__}"
+        )
+    if page_len <= 0 or page_len % 64 != 0:
         raise ValueError(f"page_len must be a positive multiple of 64, got {page_len}")
     num_seqs = cu_seqlens.size(0) - 1
     _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, q.device)
+    # The kernels read page_indices directly as checkpoint rows.
+    if not page_indices.is_contiguous():
+        raise ValueError("page_indices must be contiguous")
     if state_pool.ndim != 4:
         raise ValueError(
             "state_pool must be [num_pages, num_sab_heads, head_size, head_size], "
