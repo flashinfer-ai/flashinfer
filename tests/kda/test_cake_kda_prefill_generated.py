@@ -1217,21 +1217,53 @@ def test_chain_map_fold_is_bitwise_the_map_pass(lengths, heads, part, monkeypatc
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
+# The last three rows hold the launches that differ most from the others in a
+# graph: the 2-CTA cluster launch of the pair-share program, the cooperative
+# launch of the pooled owner/helper program, and the chain composite whose
+# main body writes the window maps (no map pass).
 GRAPH_ROWS = [
-    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, id="mixed-h12"),
-    pytest.param([64] * 16, 16, -5.0, id="bs16x64-h16-lb5"),
-    pytest.param([8128, 64, 8128, 64], 16, None, id="long-short-h16"),
+    pytest.param(
+        [17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, None, id="mixed-h12"
+    ),
+    pytest.param([64] * 16, 16, -5.0, None, id="bs16x64-h16-lb5"),
+    pytest.param([8128, 64, 8128, 64], 16, None, None, id="long-short-h16"),
+    pytest.param([8192] * 2, 16, -5.0, "pair-share", id="2x8192-h16-lb5-pair-share"),
+    pytest.param([4096] * 4, 16, None, "pool", id="4x4096-h16-pool"),
+    pytest.param([8192], 12, -5.0, "map-fold", id="8192-h12-lb5-map-fold"),
 ]
 
 
+def _assert_route(route, prepared):
+    """The launch a graph / plan-cache row is there for, before it runs."""
+    if route is None:
+        return
+    arch = registry.device_arch()
+    schedule = str(prepared.schedule)
+    loaded = _modules(prepared)
+    if route == "pair-share":
+        assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
+        assert schedule.endswith("_pair_share"), schedule
+        assert loaded & set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
+    elif route == "pool":
+        assert re.search(r"_owner1helper_pool\d+$", schedule), schedule
+        assert loaded & set(registry._RENDERED_OWNER_HELPER_POOL_ROUTES[arch].values())
+    else:
+        assert route == "map-fold", route
+        assert schedule.startswith("split_seq_affine_prefix"), schedule
+        if _chain_map_fold_enabled():
+            assert "_mapfold" in schedule, schedule
+            assert loaded & set(registry._RENDERED_MAP_FOLD_ROUTES[arch].values())
+
+
 @requires_blackwell
-@pytest.mark.parametrize("lengths,heads,lower_bound", GRAPH_ROWS)
-def test_routed_launch_replays_from_a_cuda_graph(lengths, heads, lower_bound):
+@pytest.mark.parametrize("lengths,heads,lower_bound,route", GRAPH_ROWS)
+def test_routed_launch_replays_from_a_cuda_graph(lengths, heads, lower_bound, route):
     d = _inputs(lengths, heads)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         call = _Call(d, lower_bound)
+        _assert_route(route, call.prepared)
         eager = call.run()
     torch.cuda.current_stream().wait_stream(side)
     call.poison()
@@ -1247,15 +1279,17 @@ def test_routed_launch_replays_from_a_cuda_graph(lengths, heads, lower_bound):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("lengths,heads,lower_bound", GRAPH_ROWS)
-def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound):
+@pytest.mark.parametrize("lengths,heads,lower_bound,route", GRAPH_ROWS)
+def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound, route):
     cache = KDAPrefillPlanCache(8)
     first = _inputs(lengths, heads, seed=1)
     second = _inputs(lengths, heads, seed=2)
     miss = _Call(first, lower_bound, plan_cache=cache)
+    _assert_route(route, miss.prepared)
     miss.run()
     hit = _Call(second, lower_bound, plan_cache=cache)
     assert (cache.misses, cache.hits) == (1, 1)
+    _assert_route(route, hit.prepared)
     got = hit.run()
     fresh = _Call(second, lower_bound)
     _assert_bitwise(got, fresh.run(), "plan-cache hit")
