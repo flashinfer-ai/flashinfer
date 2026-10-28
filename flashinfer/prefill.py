@@ -3524,6 +3524,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "BatchPrefillWithPagedKVCacheWrapper.workspace_size",
                 )
             )
+            args.append(False)  # fixed_uniform_q_len
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
@@ -4256,6 +4257,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "BatchPrefillWithPagedKVCacheWrapper.plan",
                 )
                 args.append(forwarded_uniform_q_len)
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -6606,6 +6608,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "BatchPrefillWithRaggedKVCacheWrapper.plan",
                     )
                 )
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
