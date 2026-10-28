@@ -4175,7 +4175,7 @@ def _select_auto_launch_mode(
     seq_len_kv: int,
     num_q_tiles: int = 1,
     tile_size_kv: int = AUTO_LAUNCH_TILE_SIZE_KV,
-    persistent_min_waves: int = 1,
+    persistent_min_waves: float = 1,
     persistent_min_tiles_per_cta: int = 1,
     split_kv: bool = True,
     service_capacity: int | None = None,

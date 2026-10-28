@@ -237,6 +237,7 @@ def _select_block_sparse_scheduler(
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
     use_block_sparse: bool,
+    query_paired: bool = False,
 ) -> tuple[int, bool]:
     """Select the Q tile and scheduler without depending on KV storage.
 
@@ -263,7 +264,7 @@ def _select_block_sparse_scheduler(
     }
     if not use_block_sparse:
         return q_tile_size, _select_persistent_launch(
-            seq_len_kv=seq_len_kv, **launch_args
+            seq_len_kv=seq_len_kv, query_paired=query_paired, **launch_args
         )
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
@@ -286,6 +287,7 @@ def _select_block_sparse_scheduler(
         persistent_min_tiles_per_cta=(
             _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
         ),
+        query_paired=query_paired,
         **launch_args,
     )
 
@@ -300,13 +302,15 @@ def _select_persistent_launch(
     num_kv_heads: int,
     q_tile_size: int,
     kv_route_size: int,
-    persistent_min_waves: int = 1,
+    query_paired: bool = False,
+    persistent_min_waves: float = 1,
     persistent_min_tiles_per_cta: int = 1,
 ) -> bool:
     """Return whether the decode launch heuristic selects the CLC scheduler.
 
     ``seq_len_kv`` sizes each task. These plans never split K/V, so any other
-    outcome selects the static grid.
+    outcome selects the static grid. ``persistent_min_waves`` counts waves of
+    one-Q-tile tasks.
     """
 
     from ..kernels.fmha_decode.fmha_decode_config import (
@@ -319,12 +323,19 @@ def _select_persistent_launch(
         heads_q_per_kv=num_qo_heads // num_kv_heads,
         groups_tokens_heads_q=True,
     )
+    num_q_ctas = q_geometry.num_q_ctas(seq_len_q)
+    if query_paired:
+        # A paired CTA runs two Q tiles, so the threshold halves in paired
+        # CTAs, but not below one wave: a grid that fits on the device at
+        # once leaves the persistent scheduler nothing to balance.
+        num_q_ctas = ceil_div(num_q_ctas, 2)
+        persistent_min_waves = max(persistent_min_waves / 2, 1)
     with torch.cuda.device(device_index):
         mode = _select_auto_launch_mode(
             batch_size=batch_size,
             num_heads_kv=num_kv_heads,
             seq_len_kv=seq_len_kv,
-            num_q_tiles=q_geometry.num_q_ctas(seq_len_q),
+            num_q_tiles=num_q_ctas,
             tile_size_kv=kv_route_size,
             persistent_min_waves=persistent_min_waves,
             persistent_min_tiles_per_cta=persistent_min_tiles_per_cta,
@@ -700,6 +711,7 @@ def _resolve_block_sparse_launch_spec(
         use_kv_valid_bits=use_kv_valid_bits,
         max_row_route_capacity=max_row_route_capacity,
         use_block_sparse=use_block_sparse,
+        query_paired=query_paired,
     )
     if not use_block_sparse:
         _validate_dense_contiguous_kv_extent(
