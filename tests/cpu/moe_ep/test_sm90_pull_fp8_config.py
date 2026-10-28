@@ -33,6 +33,7 @@ def _config(**overrides) -> Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
 
 
 class TestSm90PullFp8Config:
+    @pytest.mark.cpu_only
     def test_defaults(self) -> None:
         cfg = _config()
         assert cfg.kernel_name == "sm90_fp8_fp8_bf16_pull_cutedsl"
@@ -56,9 +57,11 @@ class TestSm90PullFp8Config:
         # heuristic table (see kernel_src sm90 shim/tuner.py).
         assert cfg.knobs is None
 
+    @pytest.mark.cpu_only
     def test_is_mega_kernel_config(self) -> None:
         assert is_mega_kernel_config(_config())
 
+    @pytest.mark.cpu_only
     def test_registry_resolves_backend(self) -> None:
         backend = create_mega_kernel(_config())
         assert isinstance(backend, Sm90PullFp8MegaKernelBackend)
@@ -68,11 +71,13 @@ class TestSm90PullFp8Config:
             == "sm90_fp8_fp8_bf16_pull_cutedsl"
         )
 
+    @pytest.mark.cpu_only
     def test_registry_lists_kernel_in_unknown_error(self) -> None:
         bogus = dataclasses.replace(_config(), kernel_name="definitely_not_a_kernel")
         with pytest.raises(KeyError, match="sm90_fp8_fp8_bf16_pull_cutedsl"):
             create_mega_kernel(bogus)
 
+    @pytest.mark.cpu_only
     def test_public_reexports(self) -> None:
         import flashinfer.moe_ep as moe_ep
 
@@ -86,6 +91,7 @@ class TestSm90PullFp8Config:
 
 
 class TestSm90PullFp8RuntimeRequirements:
+    @pytest.mark.cpu_only
     def test_requires_nvshmem_and_torch_dist(self, monkeypatch) -> None:
         monkeypatch.delenv("MEGA_NO_DIST", raising=False)
         from flashinfer.moe_ep.config import BootstrapConfig
@@ -101,6 +107,7 @@ class TestSm90PullFp8RuntimeRequirements:
         assert sm90_pull_fp8_runtime_requirements(bootstrap) == expected
         assert backend.runtime_requirements(bootstrap) == expected
 
+    @pytest.mark.cpu_only
     def test_mega_no_dist_needs_nothing(self, monkeypatch) -> None:
         monkeypatch.setenv("MEGA_NO_DIST", "1")
         from flashinfer.moe_ep.config import BootstrapConfig
@@ -111,6 +118,7 @@ class TestSm90PullFp8RuntimeRequirements:
 
 
 class TestSm90ArchGate:
+    @pytest.mark.cpu_only
     def test_validate_mega_arch_sm90_no_cuda_is_noop(self, monkeypatch) -> None:
         import torch
 
@@ -119,6 +127,7 @@ class TestSm90ArchGate:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         validate_mega_arch_sm90()  # must not raise on CPU-only hosts
 
+    @pytest.mark.cpu_only
     def test_validate_mega_arch_sm90_rejects_non_hopper(self, monkeypatch) -> None:
         import torch
 

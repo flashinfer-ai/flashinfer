@@ -18,6 +18,7 @@ def _config(arch, dtype):
     return getattr(module, name)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "arch,dtype",
     [
@@ -48,6 +49,7 @@ def test_routing_aliases_remain_live(arch, dtype):
     assert "apply_topk_in_fc1" not in dataclasses.asdict(config)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "dtype", ["bf16_bf16_bf16", "bf16_nvfp4_bf16", "nvfp4_nvfp4_bf16"]
 )
@@ -126,6 +128,7 @@ def test_finalize_alias_and_old_positional_slot(dtype):
         assert config.num_valid_tokens_tensor is None
 
 
+@pytest.mark.cpu_only
 def test_mxfp8_positional_knobs_are_not_finalize_mode():
     cls = _config("sm100", "mxfp8_mxfp8_bf16")
     config = cls(
@@ -150,6 +153,7 @@ def test_mxfp8_positional_knobs_are_not_finalize_mode():
     assert config.num_valid_tokens_tensor is None
 
 
+@pytest.mark.cpu_only
 def test_new_finalize_validation_is_preserved():
     cls = _config("sm100", "nvfp4_nvfp4_bf16")
     with pytest.raises(TypeError, match="FinalizeMode"):
@@ -162,6 +166,7 @@ def test_new_finalize_validation_is_preserved():
 _SHIM = "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "name", ["Sm100BlockScaledMoeConfig", "Sm100GenphaseMoeConfig"]
 )
@@ -193,6 +198,7 @@ def test_blackwell_next_routing_aliases(name):
         config.apply_topk_at_fc1 = True
 
 
+@pytest.mark.cpu_only
 def test_frozen_shim_config_aliases_and_replace():
     module = importlib.import_module(f"{_SHIM}.nvfp4")
     cls = module.MegaMoENvfp4Config
@@ -221,6 +227,7 @@ def test_frozen_shim_config_aliases_and_replace():
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "module_name,class_name",
     [
@@ -239,6 +246,7 @@ def test_input_live_token_count_is_optional(module_name, class_name):
     assert cls(**inputs).num_valid_tokens is None
 
 
+@pytest.mark.cpu_only
 def test_cache_accepts_old_and_new_keywords(tmp_path, monkeypatch):
     cache = importlib.import_module(f"{_SHIM}.knob_cache")
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
@@ -273,6 +281,7 @@ def test_cache_accepts_old_and_new_keywords(tmp_path, monkeypatch):
     assert cache.lookup_knobs(**geometry, use_custom_finalize=True) is None
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "name",
     [

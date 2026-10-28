@@ -11,9 +11,10 @@ import pytest
 import torch
 
 from .test_mega_workspace_api import _make_layer
-from .test_sm107_block_scaled_config import _BACKENDS
+from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "config_name,package,dtype",
     [
@@ -66,7 +67,7 @@ def test_backend_retains_successful_tuning_result(config_name, package, dtype):
             sys.executable,
             "-c",
             "import sys, pytest; "
-            "from tests.moe_ep.test_mega_tuned_knobs import _check_tuning_result; "
+            "from tests.cpu.moe_ep.test_mega_tuned_knobs import _check_tuning_result; "
             "_check_tuning_result(pytest.MonkeyPatch(), *sys.argv[1:])",
             config_name,
             package,
@@ -105,6 +106,7 @@ def _check_tuning_result(monkeypatch, config_name, package, dtype):
     assert backend.get_tuned_knobs() == winner
 
 
+@pytest.mark.cpu_only
 def test_layer_getter_returns_independent_result_and_checks_lifecycle():
     from flashinfer.moe_ep import MoEEpConfigError
 
@@ -123,6 +125,7 @@ def test_layer_getter_returns_independent_result_and_checks_lifecycle():
         layer.get_tuned_knobs()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
 def test_rubin_getter_selects_workspace_without_allocation(
     config_cls, backend_cls, name

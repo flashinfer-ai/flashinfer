@@ -40,6 +40,7 @@ def _packed_tensors():
     return w13, w2, w13_scale, w2_scale
 
 
+@pytest.mark.cpu_only
 def test_factory_returns_unquantized_without_scales():
     w13, w2 = _bf16_tensors()
     pack = MoEWeightPack(w13, w2)
@@ -49,6 +50,7 @@ def test_factory_returns_unquantized_without_scales():
     assert pack.w13_scale is None and pack.w2_scale is None
 
 
+@pytest.mark.cpu_only
 def test_factory_returns_prequantized_with_both_scales():
     w13, w2, s13, s2 = _packed_tensors()
     for pack in (
@@ -60,6 +62,7 @@ def test_factory_returns_prequantized_with_both_scales():
         assert pack.w13_scale is s13 and pack.w2_scale is s2
 
 
+@pytest.mark.cpu_only
 def test_factory_tolerates_explicit_none_scales():
     # Regression: type_call re-runs the variant's __init__ with the caller's
     # ORIGINAL arguments, so explicit-None scales (positional or kwargs) used
@@ -74,12 +77,14 @@ def test_factory_tolerates_explicit_none_scales():
         assert pack.w13_scale is None and pack.w2_scale is None
 
 
+@pytest.mark.cpu_only
 def test_direct_unquantized_rejects_real_scales():
     w13, w2, s13, s2 = _packed_tensors()
     with pytest.raises(TypeError, match="no scale planes"):
         UnquantizedMoEWeights(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2)
 
 
+@pytest.mark.cpu_only
 def test_mixed_scale_state_raises():
     w13, w2, s13, s2 = _packed_tensors()
     with pytest.raises(ValueError, match="BOTH scale planes"):
@@ -88,6 +93,7 @@ def test_mixed_scale_state_raises():
         MoEWeightPack(w13, w2, w2_scale=s2)
 
 
+@pytest.mark.cpu_only
 def test_missing_tensors_raise():
     with pytest.raises(TypeError):
         MoEWeightPack()
@@ -95,6 +101,7 @@ def test_missing_tensors_raise():
         MoEWeightPack(w13=torch.zeros(1, 2, 2))
 
 
+@pytest.mark.cpu_only
 def test_direct_variant_construction():
     w13, w2 = _bf16_tensors()
     pack = UnquantizedMoEWeights(w13=w13, w2=w2)
@@ -106,17 +113,20 @@ def test_direct_variant_construction():
         PrequantizedMoEWeights(w13=pw13, w2=pw2)  # scales are required fields
 
 
+@pytest.mark.cpu_only
 def test_variants_are_frozen():
     pack = MoEWeightPack(*_bf16_tensors())
     with pytest.raises(dataclasses.FrozenInstanceError):
         pack.w13 = torch.zeros(1)
 
 
+@pytest.mark.cpu_only
 def test_dummy_moe_weights_is_unquantized():
     pack = dummy_moe_weights(num_local_experts=E, hidden=HIDDEN, intermediate=INTER)
     assert type(pack) is UnquantizedMoEWeights
 
 
+@pytest.mark.cpu_only
 def test_deep_gemm_discrimination_by_type():
     # deep_gemm preprocess re-quantizes iff the pack is NOT Prequantized;
     # verify the branch condition itself (full preprocess needs deep_gemm/GPU).
@@ -126,6 +136,7 @@ def test_deep_gemm_discrimination_by_type():
     assert isinstance(pre, PrequantizedMoEWeights)
 
 
+@pytest.mark.cpu_only
 def test_nvfp4_preprocess_dispatches_prequantized_shapes():
     # The prequantized branch validates scale shapes before any GPU work:
     # a wrong scale shape must raise from the prequantized path (proving the

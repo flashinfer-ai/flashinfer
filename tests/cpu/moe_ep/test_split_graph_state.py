@@ -44,6 +44,7 @@ def tensors():
     )
 
 
+@pytest.mark.cpu_only
 def test_graph_state_accepts_in_place_updates_and_equivalent_views(layer, tensors):
     state = layer.create_graph_state(tensors)
     tensors.hidden_states.fill_(2)
@@ -58,6 +59,7 @@ def test_graph_state_accepts_in_place_updates_and_equivalent_views(layer, tensor
     state._check(layer, aliases)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", ["hidden_states", "topk_ids", "topk_weights"])
 @pytest.mark.parametrize("change", ["dtype", "strides"])
 def test_graph_state_rejects_same_address_reinterpretation(
@@ -81,6 +83,7 @@ def test_graph_state_rejects_same_address_reinterpretation(
         state._check(layer, tensors)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", ["hidden_states", "topk_ids", "topk_weights", "out"])
 def test_graph_state_rejects_in_place_storage_rebinding(layer, tensors, name):
     state = layer.create_graph_state(tensors)
@@ -92,6 +95,7 @@ def test_graph_state_rejects_in_place_storage_rebinding(layer, tensors, name):
         state._check(layer, tensors)
 
 
+@pytest.mark.cpu_only
 def test_graph_state_rejects_output_layout_mutation(layer, tensors):
     state = layer.create_graph_state(tensors)
     state.out.as_strided_(state.out.shape, (1, state.out.shape[0]))
@@ -99,6 +103,7 @@ def test_graph_state_rejects_output_layout_mutation(layer, tensors):
         state._check(layer, tensors)
 
 
+@pytest.mark.cpu_only
 def test_graph_state_alias_cannot_hide_rebound_handle_weights(layer, tensors):
     state = layer.create_graph_state(tensors)
     bound = tensors.topk_weights
@@ -108,6 +113,7 @@ def test_graph_state_alias_cannot_hide_rebound_handle_weights(layer, tensors):
         state._check(layer, tensors)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("invalid", ["shape", "dtype", "device", "strides"])
 def test_create_graph_state_rejects_invalid_output_before_handle(
     layer, tensors, invalid
@@ -128,6 +134,7 @@ def test_create_graph_state_rejects_invalid_output_before_handle(
     layer._fleet.create_handle.assert_not_called()
 
 
+@pytest.mark.cpu_only
 def test_create_graph_state_uses_supplied_output(layer, tensors):
     out = torch.empty_like(tensors.hidden_states)
     state = layer.create_graph_state(tensors, out=out)

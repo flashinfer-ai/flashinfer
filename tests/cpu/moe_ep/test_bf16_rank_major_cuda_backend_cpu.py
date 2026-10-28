@@ -48,6 +48,7 @@ def _backend() -> Bf16RankMajorCudaMegaKernelBackend:
     return backend
 
 
+@pytest.mark.cpu_only
 def test_public_config_is_registered_with_fixed_kernel_identity():
     config = Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig()
     assert config.intermediate_size == 2048
@@ -56,6 +57,7 @@ def test_public_config_is_registered_with_fixed_kernel_identity():
     assert isinstance(create_mega_kernel(config), Bf16RankMajorCudaMegaKernelBackend)
 
 
+@pytest.mark.cpu_only
 def test_init_accepts_only_the_exact_rank_major_coordinate():
     backend = _backend()
     bootstrap = BootstrapConfig(world_size=8, rank=0, auto_bootstrap=False)
@@ -66,6 +68,7 @@ def test_init_accepts_only_the_exact_rank_major_coordinate():
         backend.validate_init(bootstrap, _exact_fleet())
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -90,6 +93,7 @@ def test_init_rejects_coordinate_drift(field: str, value: object):
         backend.validate_init(bootstrap, fleet)
 
 
+@pytest.mark.cpu_only
 def test_init_rejects_high_throughput_mode():
     backend = _backend()
     fleet = replace(
@@ -110,6 +114,7 @@ def test_init_rejects_high_throughput_mode():
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("config", "message"),
     (
@@ -138,6 +143,7 @@ def test_init_rejects_kernel_config_coordinate_drift(config, message: str):
         )
 
 
+@pytest.mark.cpu_only
 def test_init_rejects_world_size_and_nondefault_stream():
     backend = _backend()
     with (
@@ -169,6 +175,7 @@ def test_init_rejects_world_size_and_nondefault_stream():
         )
 
 
+@pytest.mark.cpu_only
 def test_weight_preprocess_swaps_gate_up_before_block_major_shuffle():
     intermediate = hidden = 64
     gate = (
@@ -204,6 +211,7 @@ def test_weight_preprocess_swaps_gate_up_before_block_major_shuffle():
     assert [physical[i].item() for i in (0, 8, 16, 24)] == [101, 1, 102, 2]
 
 
+@pytest.mark.cpu_only
 def test_weight_preprocess_rejects_non_bf16_canonical_weights():
     weights = MoEWeightPack(
         torch.zeros(1, 128, 64),
@@ -239,6 +247,7 @@ def _fake_inputs(*, tokens: int = 128, ids_dtype=torch.int64):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens", (1, 127, 128))
 @pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
 def test_forward_validation_accepts_active_prefix_abi(tokens: int, ids_dtype):
@@ -250,6 +259,7 @@ def test_forward_validation_accepts_active_prefix_abi(tokens: int, ids_dtype):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("tokens", "message"),
     ((0, "1..128 active tokens"), (129, "exceeds max_tokens_per_rank=128")),
@@ -266,6 +276,7 @@ def test_forward_validation_rejects_active_count_outside_capacity(
         )
 
 
+@pytest.mark.cpu_only
 def test_forward_validation_rejects_dtype_drift():
     backend = _backend()
     with pytest.raises(
@@ -278,6 +289,7 @@ def test_forward_validation_rejects_dtype_drift():
         )
 
 
+@pytest.mark.cpu_only
 def test_stage_and_compute_delegate_to_the_session_in_order():
     backend = _backend()
     tensors = _fake_inputs()

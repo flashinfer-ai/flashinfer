@@ -112,23 +112,28 @@ def _params(**overrides) -> MoEEpCommParams:
 
 
 class TestCommParams:
+    @pytest.mark.cpu_only
     def test_rejects_non_positive_sizes(self) -> None:
         with pytest.raises(ValueError, match="max_tokens_per_rank"):
             _params(max_tokens_per_rank=0)
 
+    @pytest.mark.cpu_only
     def test_rejects_top_k_above_num_experts(self) -> None:
         with pytest.raises(ValueError, match="top_k"):
             _params(top_k=5)
 
+    @pytest.mark.cpu_only
     def test_rejects_invalid_id_inside_expert_range(self) -> None:
         with pytest.raises(ValueError, match="invalid_expert_id"):
             _params(invalid_expert_id=2)
         assert _params(invalid_expert_id=4).invalid_expert_id == 4
 
+    @pytest.mark.cpu_only
     def test_token_dtype_defaults_to_bf16(self) -> None:
         assert _params().token_dtype == torch.bfloat16
         assert _params(dtype=torch.float32).token_dtype == torch.float32
 
+    @pytest.mark.cpu_only
     def test_dispatch_bytes_follow_the_dispatch_format(self) -> None:
         def dispatch_bytes(**overrides):
             return _params(hidden_size=7168, **overrides).dispatch_bytes_per_token
@@ -142,6 +147,7 @@ class TestCommParams:
 
 
 class TestRegistry:
+    @pytest.mark.cpu_only
     def test_builtin_backends_are_registered(self) -> None:
         for name in ("nvlink_one_sided", "cake", "nvlink_two_sided"):
             assert is_communication_backend(name)
@@ -152,11 +158,13 @@ class TestRegistry:
         assert not is_communication_backend("nixl_ep")
         assert not is_communication_backend(object())
 
+    @pytest.mark.cpu_only
     def test_cuda_graph_capability(self) -> None:
         assert NVLinkOneSidedAlltoAll.supports_cuda_graph
         assert CakeAlltoAll.supports_cuda_graph
         assert NVLinkTwoSidedAlltoAll.supports_cuda_graph
 
+    @pytest.mark.cpu_only
     def test_create_by_name_and_by_config(self, loopback_backend) -> None:
         bootstrap = BootstrapConfig(world_size=1, rank=0)
         comm = create_communication(bootstrap, _params(), "test_loopback", tag=7)
@@ -169,12 +177,14 @@ class TestRegistry:
         create_communication(bootstrap, _params(), config)
         assert loopback_backend["config"] is config
 
+    @pytest.mark.cpu_only
     def test_unknown_backend_raises(self) -> None:
         with pytest.raises(KeyError, match="unknown communication backend"):
             create_communication(
                 BootstrapConfig(world_size=1, rank=0), _params(), "no_such_backend"
             )
 
+    @pytest.mark.cpu_only
     def test_experts_must_divide_across_ranks(self, loopback_backend) -> None:
         with pytest.raises(ValueError, match="divisible"):
             create_communication(
@@ -218,6 +228,7 @@ def _split_layer(comm, layout=EpLayout.RANK_MAJOR, num_experts=4, hidden=8):
 
 
 class TestSplitLayerRouting:
+    @pytest.mark.cpu_only
     def test_fleet_backends_keep_the_fleet_path(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend",
@@ -226,14 +237,17 @@ class TestSplitLayerRouting:
         layer = _split_layer(NCCLEPConfig(), layout=EpLayout.EXPERT_MAJOR)
         assert not layer._uses_communication()
 
+    @pytest.mark.cpu_only
     def test_unregistered_backend_is_rejected_at_init(self) -> None:
         with pytest.raises(MoEEpConfigError, match="registered as neither"):
             _split_layer("no_such_backend")
 
+    @pytest.mark.cpu_only
     def test_communication_backend_requires_rank_major(self, loopback_backend) -> None:
         with pytest.raises(MoEEpConfigError, match="RANK_MAJOR"):
             _split_layer(_LoopbackConfig(), layout=EpLayout.EXPERT_MAJOR)
 
+    @pytest.mark.cpu_only
     def test_communication_path_translates_routing_to_local_ids(
         self, loopback_backend, isolated_single_rank_gloo
     ) -> None:
@@ -271,6 +285,7 @@ class TestSplitLayerRouting:
         assert state.destroyed
         assert loopback_backend["destroyed"]
 
+    @pytest.mark.cpu_only
     def test_graph_state_requires_a_capturable_backend(
         self, loopback_backend, isolated_single_rank_gloo, monkeypatch
     ) -> None:
@@ -363,6 +378,7 @@ def fake_cake(monkeypatch):
     return ops
 
 
+@pytest.mark.cpu_only
 def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
     create_communication(
         BootstrapConfig(world_size=2, rank=0),
@@ -376,6 +392,7 @@ def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
     assert combine_bytes == 64 * 2
 
 
+@pytest.mark.cpu_only
 def test_cake_payload_plumbing(fake_cake) -> None:
     comm = create_communication(
         BootstrapConfig(world_size=2, rank=0),
@@ -440,6 +457,7 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         comm.dispatch(hidden, ids, weights)
 
 
+@pytest.mark.cpu_only
 def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -459,6 +477,7 @@ def test_cake_rejects_dispatch_into_the_combine_region(fake_cake) -> None:
     comm.destroy()
 
 
+@pytest.mark.cpu_only
 def test_cake_instances_sharing_a_workspace_cannot_interleave(fake_cake) -> None:
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -488,6 +507,7 @@ def test_cake_instances_sharing_a_workspace_cannot_interleave(fake_cake) -> None
     first.dispatch(hidden, ids, torch.ones(2, 2))
 
 
+@pytest.mark.cpu_only
 def test_cake_checkpoint_needs_an_idle_live_instance(fake_cake) -> None:
     comm = create_communication(
         BootstrapConfig(world_size=2, rank=0), _params(), "cake"
@@ -505,6 +525,7 @@ def test_cake_checkpoint_needs_an_idle_live_instance(fake_cake) -> None:
         comm.checkpoint_restore(None)
 
 
+@pytest.mark.cpu_only
 def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
     from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
 
@@ -637,6 +658,7 @@ def _one_sided(params=None, **config):
     )
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
     _one_sided(
         _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
@@ -655,6 +677,7 @@ def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
     assert combine_recv == tokens * 64 * 2
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     comm = _one_sided(cft=False)
     assert not comm._cft_enabled
@@ -677,12 +700,14 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert _one_sided(cft=True)._use_cft(3, 2)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_enable_pdl_override(fake_one_sided) -> None:
     # The fixture reports PDL support; an explicit config value wins.
     assert _one_sided()._enable_pdl
     assert not _one_sided(enable_pdl=False)._enable_pdl
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
         communication as one_sided,
@@ -699,6 +724,7 @@ def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
     assert "FABRIC" in one_sided._cft_unsupported_reason(0, fabric_handles=False)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(
     fake_one_sided,
 ) -> None:
@@ -718,6 +744,7 @@ def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(
         first.dispatch(hidden, ids)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
     fake_one_sided, monkeypatch
 ) -> None:
@@ -736,6 +763,7 @@ def test_nvlink_one_sided_checkpoint_needs_an_idle_live_instance(
         comm.checkpoint_restore(None)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     calls = fake_one_sided.module.calls
     comm = _one_sided(
@@ -800,6 +828,7 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
         comm.combine(buffer)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_rank_mask(fake_one_sided) -> None:
     comm = _one_sided(enable_rank_mask=True)
     mask = comm.active_rank_mask([0, 1, 255 % comm.ep_size])
@@ -814,6 +843,7 @@ def test_nvlink_one_sided_rank_mask(fake_one_sided) -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
     with pytest.raises(ValueError, match="timeout_sec"):
         _one_sided(timeout_sec=0)
@@ -823,6 +853,7 @@ def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
         _one_sided(eplb_stats_num_experts=5)
 
 
+@pytest.mark.cpu_only
 def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
     import flashinfer.comm.mnnvl as mnnvl
     from flashinfer.comm.mapping import Mapping

@@ -56,6 +56,7 @@ ALIAS_ROWS = [
 IDS = [row[0] for row in ALIAS_ROWS]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), ALIAS_ROWS, ids=IDS)
 def test_registry_alias_resolves_to_canonical_backend(
     alias: str, canonical: str, _old: str, _new: str
@@ -67,6 +68,7 @@ def test_registry_alias_resolves_to_canonical_backend(
     assert registry._MEGA_KERNEL_DEPRECATED_ALIASES[alias] == canonical
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), ALIAS_ROWS, ids=IDS)
 def test_registry_alias_warns_deprecation(
     alias: str, canonical: str, _old: str, _new: str
@@ -75,6 +77,7 @@ def test_registry_alias_warns_deprecation(
         registry._warn_if_deprecated_mega_name(alias)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), ALIAS_ROWS, ids=IDS)
 def test_canonical_name_does_not_warn(
     alias: str, canonical: str, _old: str, _new: str
@@ -86,6 +89,7 @@ def test_canonical_name_does_not_warn(
         registry._warn_if_deprecated_mega_name(canonical)
 
 
+@pytest.mark.cpu_only
 def test_available_mega_kernels_hides_aliases() -> None:
     available = registry._available_mega_kernels()
     for alias, canonical, _old, _new in ALIAS_ROWS:
@@ -93,6 +97,7 @@ def test_available_mega_kernels_hides_aliases() -> None:
         assert alias not in available
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("alias", "_canonical", "old", "new"), ALIAS_ROWS, ids=IDS)
 def test_config_class_alias_is_same_class(
     alias: str, _canonical: str, old: str, new: str
@@ -100,6 +105,7 @@ def test_config_class_alias_is_same_class(
     assert getattr(moe_ep, old) is getattr(moe_ep, new)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("alias", "_canonical", "old", "_new"), ALIAS_ROWS, ids=IDS)
 def test_alias_config_is_mega_kernel_config(
     alias: str, _canonical: str, old: str, _new: str

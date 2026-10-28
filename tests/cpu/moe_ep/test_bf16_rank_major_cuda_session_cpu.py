@@ -18,7 +18,7 @@ import pytest
 import torch
 
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_TREE_PACKAGE_ROOT = (
     _PROJECT_ROOT / "flashinfer" / "moe_ep" / "kernel_src" / "blackwell_bf16_rank_major"
 )
@@ -111,12 +111,14 @@ def _write_bundle(tmp_path: Path, module, manifest: dict | None = None):
     return resolved_manifest, source_path
 
 
+@pytest.mark.cpu_only
 def test_session_import_defers_optional_cuda_driver_bindings():
     driver_before = sys.modules.get("cuda.bindings.driver")
     _session_module()
     assert sys.modules.get("cuda.bindings.driver") is driver_before
 
 
+@pytest.mark.cpu_only
 def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     module = _session_module()
 
@@ -128,6 +130,7 @@ def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     )
 
 
+@pytest.mark.cpu_only
 def test_barrier_flag_pad_covers_epochs_and_double_buffered_peer_mailboxes():
     module = _session_module()
 
@@ -139,6 +142,7 @@ def test_barrier_flag_pad_covers_epochs_and_double_buffered_peer_mailboxes():
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("tokens", "gemm_y"),
     ((1, 32), (4, 35), (5, 36), (127, 158), (128, 159)),
@@ -160,6 +164,7 @@ def test_active_stage_grids_are_bounded_by_capacity(tokens, gemm_y):
         assert all(value <= bound for value, bound in zip(grid, maximum, strict=True))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens", (1, 2, 4, 5, 8, 9, 32, 33, 128))
 def test_ll_path_grids_cover_only_small_active_counts(tokens):
     module = _session_module()
@@ -175,12 +180,14 @@ def test_ll_path_grids_cover_only_small_active_counts(tokens):
         assert not any(name.startswith("ll_") for name in grids)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens", (0, 129))
 def test_active_stage_grids_reject_counts_outside_capacity(tokens):
     with pytest.raises(ValueError, match=r"\[1, 128\]"):
         _session_module()._active_stage_grids(tokens)
 
 
+@pytest.mark.cpu_only
 def test_packaged_source_manifest_is_complete_and_self_consistent():
     module = _session_module()
     manifest, source_path = module._load_manifest()
@@ -193,6 +200,7 @@ def test_packaged_source_manifest_is_complete_and_self_consistent():
     assert tuple(stage["name"] for stage in manifest["stages"]) == (module._STAGE_NAMES)
 
 
+@pytest.mark.cpu_only
 def test_package_data_declares_the_immutable_source_pair():
     pyproject_path = _PROJECT_ROOT / "pyproject.toml"
     if not pyproject_path.is_file():
@@ -206,6 +214,7 @@ def test_package_data_declares_the_immutable_source_pair():
     assert '"src/*.json"' in package_block
 
 
+@pytest.mark.cpu_only
 def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
     module = _session_module()
     expected, source_path = _write_bundle(tmp_path, module)
@@ -217,6 +226,7 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
     assert actual_source == source_path
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -278,6 +288,7 @@ def test_manifest_drift_fails_closed(tmp_path, monkeypatch, mutation, message):
         module._load_manifest()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("missing", (_SOURCE_NAME, "manifest.json"))
 def test_manifest_requires_both_generated_files(tmp_path, monkeypatch, missing):
     module = _session_module()
@@ -289,6 +300,7 @@ def test_manifest_requires_both_generated_files(tmp_path, monkeypatch, missing):
         module._load_manifest()
 
 
+@pytest.mark.cpu_only
 def test_source_tampering_is_rejected_by_manifest_checksum(tmp_path, monkeypatch):
     module = _session_module()
     _, source_path = _write_bundle(tmp_path, module)
@@ -299,6 +311,7 @@ def test_source_tampering_is_rejected_by_manifest_checksum(tmp_path, monkeypatch
         module._load_manifest()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("field", "value", "expected"),
     (
@@ -328,6 +341,7 @@ def test_session_rejects_coordinate_drift_before_cuda_use(field, value, expected
         module.BlackwellBf16RankMajorSession(**kwargs)
 
 
+@pytest.mark.cpu_only
 def test_exact_session_coordinate_fails_cleanly_without_cuda(monkeypatch):
     module = _session_module()
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
@@ -345,6 +359,7 @@ def test_exact_session_coordinate_fails_cleanly_without_cuda(monkeypatch):
         )
 
 
+@pytest.mark.cpu_only
 def test_process_group_name_is_required():
     module = _session_module()
     assert module._group_name(SimpleNamespace(group_name="ep_group")) == "ep_group"
@@ -363,6 +378,7 @@ def _unpack_block_major(weight: torch.Tensor) -> torch.Tensor:
     return weight.permute(0, 2, 1, 3).reshape(experts, rows, blocks * width)
 
 
+@pytest.mark.cpu_only
 def test_weight_transform_matches_full_fc1_and_fc2_logical_layout():
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda.weights import (
@@ -403,6 +419,7 @@ def test_weight_transform_matches_full_fc1_and_fc2_logical_layout():
     assert torch.equal(logical_fc2, w2)
 
 
+@pytest.mark.cpu_only
 def test_cpu_transformed_weights_cannot_cross_the_cuda_session_boundary():
     from flashinfer.moe_ep import MoEWeightPack, MoEEpConfigError
     from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda.weights import (
@@ -461,6 +478,7 @@ def _bound_backend(*, group, rank=1, world_size=8, config=None):
     return backend, bootstrap
 
 
+@pytest.mark.cpu_only
 def test_workspace_pool_key_covers_every_allocation_coordinate():
     from flashinfer.moe_ep import (
         Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
@@ -518,6 +536,7 @@ def test_workspace_pool_key_covers_every_allocation_coordinate():
         assert backend._workspace_pool_key(fleet) != baseline
 
 
+@pytest.mark.cpu_only
 def test_workspace_pool_shares_session_and_refcounts_destroy(monkeypatch):
     from flashinfer.moe_ep.core.kernel import workspace_pool
 

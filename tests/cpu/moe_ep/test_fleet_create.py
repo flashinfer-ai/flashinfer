@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.mark.cpu_only
 def test_create_fleet_unknown_backend_raises_key_error():
     from flashinfer.moe_ep import BootstrapConfig, FleetParams, create_fleet
 
@@ -16,6 +17,7 @@ def test_create_fleet_unknown_backend_raises_key_error():
         )
 
 
+@pytest.mark.cpu_only
 def test_create_fleet_rejects_non_string_backend_name():
     from flashinfer.moe_ep import BootstrapConfig, FleetParams, create_fleet
 
@@ -30,6 +32,7 @@ def test_create_fleet_rejects_non_string_backend_name():
         )
 
 
+@pytest.mark.cpu_only
 def test_create_fleet_accepts_config_object_backend_name(stubbed_fleet_registry):
     from flashinfer.moe_ep import BootstrapConfig, NvepConfig, FleetParams, create_fleet
 

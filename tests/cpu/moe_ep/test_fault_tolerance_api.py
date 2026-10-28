@@ -37,6 +37,7 @@ class _BareFleet(Fleet):
 
 
 class TestFaultToleranceKnob:
+    @pytest.mark.cpu_only
     def test_defaults(self) -> None:
         k = FleetAlgoKnobFaultTolerance()
         assert k.enabled is True
@@ -44,16 +45,19 @@ class TestFaultToleranceKnob:
         assert k.reconcile_timeout_s > 0
         assert k.coordinator_takeover_s > 0
 
+    @pytest.mark.cpu_only
     def test_frozen_and_hashable(self) -> None:
         k = FleetAlgoKnobFaultTolerance(timeout_ms=5000)
         with pytest.raises(dataclasses.FrozenInstanceError):
             k.timeout_ms = 1  # type: ignore[misc]
         assert hash(k) == hash(FleetAlgoKnobFaultTolerance(timeout_ms=5000))
 
+    @pytest.mark.cpu_only
     def test_rejects_negative_timeout(self) -> None:
         with pytest.raises(ValueError, match="timeout_ms"):
             FleetAlgoKnobFaultTolerance(timeout_ms=-1)
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "kwargs",
         [{"reconcile_timeout_s": 0.0}, {"coordinator_takeover_s": -1.0}],
@@ -62,6 +66,7 @@ class TestFaultToleranceKnob:
         with pytest.raises(ValueError, match="must be positive"):
             FleetAlgoKnobFaultTolerance(**kwargs)
 
+    @pytest.mark.cpu_only
     def test_index_knobs_round_trip(self) -> None:
         k = FleetAlgoKnobFaultTolerance(timeout_ms=1234)
         idx = _index_knobs([k])
@@ -71,15 +76,18 @@ class TestFaultToleranceKnob:
 class TestFleetAbcDefaults:
     """The FT methods are concrete raising defaults, not @abstractmethod."""
 
+    @pytest.mark.cpu_only
     def test_bare_fleet_is_instantiable(self) -> None:
         # Regression guard: if any FT method were made abstract, this would
         # raise TypeError and break every out-of-tree Fleet implementation.
         _BareFleet()
 
+    @pytest.mark.cpu_only
     def test_capability_defaults_false(self) -> None:
         assert _BareFleet().supports_fault_tolerance is False
         assert _BareFleet().active_mask_epoch == 0
 
+    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "call",
         [
@@ -97,6 +105,7 @@ class TestFleetAbcDefaults:
         # The message must name the knob so the fix is obvious.
         assert "FleetAlgoKnobFaultTolerance" in str(ei.value)
 
+    @pytest.mark.cpu_only
     def test_stub_fleet_still_works(self, stubbed_fleet_registry) -> None:
         # The duck-typed _StubFleet in conftest does not implement the FT
         # methods at all; adding them to the ABC must not break it.
@@ -112,9 +121,11 @@ class TestFleetAbcDefaults:
 
 
 class TestSupportsFaultTolerance:
+    @pytest.mark.cpu_only
     def test_unknown_backend_is_false(self) -> None:
         assert supports_fault_tolerance("bogus") is False
 
+    @pytest.mark.cpu_only
     def test_never_raises(self) -> None:
         # Safe to call on a host with no transport built at all.
         for backend in ("nccl_ep", "nixl_ep", ""):
@@ -122,6 +133,7 @@ class TestSupportsFaultTolerance:
 
 
 class TestTransportError:
+    @pytest.mark.cpu_only
     def test_message_includes_decoded_name(self) -> None:
         err = MoEEpTransportError(
             "ncclEpMaskQuery", 5, "  (hint)", code_name="ncclInvalidUsage"
@@ -131,5 +143,6 @@ class TestTransportError:
         assert "ncclInvalidUsage (5)" in str(err)
         assert "(hint)" in str(err)
 
+    @pytest.mark.cpu_only
     def test_message_without_name(self) -> None:
         assert "failed: 3" in str(MoEEpTransportError("ncclEpMaskClean", 3))

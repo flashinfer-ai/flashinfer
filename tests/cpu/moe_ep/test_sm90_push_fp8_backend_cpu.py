@@ -11,6 +11,7 @@ from unittest import mock
 import pytest
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_backend_import_defers_kernel_package():
     code = textwrap.dedent(
         """
@@ -47,6 +48,7 @@ def test_sm90_push_backend_import_defers_kernel_package():
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_timeout_requires_supported_setter():
     import torch.distributed as dist
 
@@ -62,6 +64,7 @@ def test_sm90_push_timeout_requires_supported_setter():
         _set_process_group_timeout(object(), 1.0)
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_unfused_intermediate_size_limit():
     from flashinfer.moe_ep import BootstrapConfig, FleetParams, MoEEpConfigError
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
@@ -98,6 +101,7 @@ def test_sm90_push_unfused_intermediate_size_limit():
         backend.validate_init(bootstrap, fleet)
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_fp8_config_defaults_to_unfused_fc1():
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.config import (
         Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
@@ -108,6 +112,7 @@ def test_sm90_push_fp8_config_defaults_to_unfused_fc1():
     assert config.fuse_fc1_epilogue is False
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_staging_binds_layer_weights_and_records_lease():
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
@@ -150,6 +155,7 @@ def test_sm90_push_staging_binds_layer_weights_and_records_lease():
     assert workspace.staged_tokens == 3
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_compute_finishes_round_before_rejecting_different_weights():
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
@@ -185,6 +191,7 @@ def test_sm90_push_compute_finishes_round_before_rejecting_different_weights():
     assert workspace.poisoned is False
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("runner_state", "expected_poisoned"),
     [("idle", False), ("poisoned", True)],
@@ -221,6 +228,7 @@ def test_sm90_push_compute_mirrors_runner_poison_state(runner_state, expected_po
     assert workspace.staged_weights is None
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_workspace_pool_key_covers_construction_state():
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
@@ -292,6 +300,7 @@ def test_sm90_push_workspace_pool_key_covers_construction_state():
         assert make_backend(config)._workspace_pool_key(fleet) != baseline
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_destroy_uses_workspace_pool_refcount(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.backend import (
         Sm90PushFp8MegaKernelBackend,
@@ -327,6 +336,7 @@ def test_sm90_push_destroy_uses_workspace_pool_refcount(monkeypatch):
     assert workspace.staged_weights is None
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_destroy_quiesces_locally_before_releasing_views(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
         Sm90PushPipe,
@@ -350,6 +360,7 @@ def test_sm90_push_destroy_quiesces_locally_before_releasing_views(monkeypatch):
     assert pipe._destroyed
 
 
+@pytest.mark.cpu_only
 def test_sm90_push_destroy_preserves_peer_views_after_local_sync_failure(monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
         Sm90PushPipe,

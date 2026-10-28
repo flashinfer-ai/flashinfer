@@ -40,6 +40,7 @@ def dispatched(monkeypatch):
     return calls
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "arch,dtype,backend",
     [
@@ -61,6 +62,7 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
     assert dispatched == [f".backends.mega.kernel.{backend}.tuner"]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "options",
     [
@@ -95,6 +97,7 @@ def test_unsupported_tuner_options_fail_before_import(options, dispatched, capsy
     assert capsys.readouterr().err
 
 
+@pytest.mark.cpu_only
 def test_v1_cache_option_is_rejected(dispatched, capsys):
     with pytest.raises(SystemExit) as exc:
         tune.main([*_GEOMETRY, "--autotune-cache", "cache.json"])
@@ -103,6 +106,7 @@ def test_v1_cache_option_is_rejected(dispatched, capsys):
     assert "unrecognized arguments: --autotune-cache" in capsys.readouterr().err
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "options,do_finalize",
     [([], True), (["--do-finalize"], True), (["--no-do-finalize"], False)],
@@ -134,6 +138,7 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
     assert not args.apply_routing_weights_before_fc2
 
 
+@pytest.mark.cpu_only
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
     received = []
     monkeypatch.setattr(
@@ -178,6 +183,7 @@ def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
     ) == (2, 0.5, 0.25, 4)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "field", ["input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const"]
 )
@@ -189,12 +195,14 @@ def test_invalid_tuning_scalar_identifies_argument(field):
         run_tuning(args, "nvfp4")
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm90", "sm100"])
 def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", "mxfp4_mxfp8"]) == 2
     assert capsys.readouterr().err
 
 
+@pytest.mark.cpu_only
 def test_genphase_reaches_sm107_tuner(dispatched):
     assert (
         tune.main([*_GEOMETRY, "--arch", "sm107", "--kernel-variant", "genphase"]) == 17
@@ -202,6 +210,7 @@ def test_genphase_reaches_sm107_tuner(dispatched):
     assert len(dispatched) == 1
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm90", "sm100"])
 def test_genphase_rejects_other_architectures(arch, dispatched):
     dtype = "sm90_fp8_e4m3" if arch == "sm90" else "nvfp4"
@@ -222,6 +231,7 @@ def test_genphase_rejects_other_architectures(arch, dispatched):
     assert not dispatched
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
 def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched):
@@ -242,6 +252,7 @@ def test_sm107_quantized_combine_reaches_tuner(dtype, combine_dtype, dispatched)
     assert len(dispatched) == 1
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 @pytest.mark.parametrize(
     "options",
