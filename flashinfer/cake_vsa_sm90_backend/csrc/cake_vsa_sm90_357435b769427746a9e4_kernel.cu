@@ -3191,8 +3191,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                     o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
                     o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                    int o_off_3 = o_row_base_1 + m_local_r_1 * 128 + (4 * sset + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_3)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
+                    int o_off_1_0 = o_row_base_1 + m_local_r_1 * 128 + (4 * sset + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_0)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
                     int m_local_r_0 = m1_local;
                     __nv_bfloat162 _bit_cast_src_326 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                     o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_326)[0];
@@ -3358,8 +3358,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                     o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                     o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                    int o_off_8 = o_row_base_2 + m_local_r_2 * 128 + (4 * sset_3 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_8)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
+                    int o_off_1_2 = o_row_base_2 + m_local_r_2 * 128 + (4 * sset_3 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_2)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                     int m_local_r_0_1 = m1_local;
                     __nv_bfloat162 _bit_cast_src_354 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                     o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_354)[0];
@@ -3393,8 +3393,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                     o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
                     o_vec_2[3] = ((qj2_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                    int o_off_1_2 = o_row_base_2 + m_local_r_0_1 * 128 + (4 * sset_3 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_1_2)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
+                    int o_off_1_3 = o_row_base_2 + m_local_r_0_1 * 128 + (4 * sset_3 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_3)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                 }
                 int sset_4 = sc_split + 2 * n_active;
                 if (sset_4 < 4) {
@@ -3525,8 +3525,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                     o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                     o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                    int o_off_9 = o_row_base_3 + m_local_r_4 * 128 + (4 * sset_4 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_9)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
+                    int o_off_1_4 = o_row_base_3 + m_local_r_4 * 128 + (4 * sset_4 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_4)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                     int m_local_r_0_2 = m1_local;
                     __nv_bfloat162 _bit_cast_src_382 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                     o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_382)[0];
@@ -3560,8 +3560,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                     o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
                     o_vec_3[3] = ((qj2_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                    int o_off_1_3 = o_row_base_3 + m_local_r_0_2 * 128 + (4 * sset_4 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_1_3)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
+                    int o_off_1_5 = o_row_base_3 + m_local_r_0_2 * 128 + (4 * sset_4 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_5)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                 }
                 int sset_5 = sc_split + 3 * n_active;
                 if (sset_5 < 4) {
@@ -3692,8 +3692,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_4[1] = ((qj2_4 != 0) ? o_tmp_4[1] : o_vec_4[1]);
                     o_vec_4[2] = ((qj2_4 == 0) ? o_tmp_4[2] : o_vec_4[2]);
                     o_vec_4[3] = ((qj2_4 == 0) ? o_tmp_4[3] : o_vec_4[3]);
-                    int o_off_10 = o_row_base_4 + m_local_r_5 * 128 + (4 * sset_5 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_10)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
+                    int o_off_1_6 = o_row_base_4 + m_local_r_5 * 128 + (4 * sset_5 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_6)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
                     int m_local_r_0_3 = m1_local;
                     __nv_bfloat162 _bit_cast_src_410 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
                     o_vec_4[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_410)[0];
@@ -3727,8 +3727,8 @@ kernel_cake_vsa_sm90_357435b769427746a9e4(const __grid_constant__ CUtensorMap Q,
                     o_vec_4[1] = ((qj2_4 != 0) ? o_tmp_4[1] : o_vec_4[1]);
                     o_vec_4[2] = ((qj2_4 == 0) ? o_tmp_4[2] : o_vec_4[2]);
                     o_vec_4[3] = ((qj2_4 == 0) ? o_tmp_4[3] : o_vec_4[3]);
-                    int o_off_1_4 = o_row_base_4 + m_local_r_0_3 * 128 + (4 * sset_5 + qj) * 8;
-                    reinterpret_cast<int4*>(O + o_off_1_4)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
+                    int o_off_1_7 = o_row_base_4 + m_local_r_0_3 * 128 + (4 * sset_5 + qj) * 8;
+                    reinterpret_cast<int4*>(O + o_off_1_7)[0] = reinterpret_cast<int4*>(o_vec_4)[0];
                 }
             }
         }

@@ -161,6 +161,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # build manifest (build.json) of its Cake backend, the public entry's default route on SM80-SM90.
 "flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
 "flashinfer.experimental.cake_qsa_nvfp4" = ["csrc/**", "build.json"]
+# CUDA sources of the experimental fused MNNVL all-reduce + mHC post-map / pre-norm backend.
+"flashinfer.experimental.allreduce_mhc_post_prenorm" = ["csrc/**"]
 # CUDA sources of the experimental SM103 fused mHC post -> pre kernels, JIT-compiled on first use.
 "flashinfer.experimental.mhc_fused_post_pre" = ["csrc/**"]
 # CUDA source of the experimental SM100/SM103 mHC pre big-fuse + RMSNorm cluster kernel.

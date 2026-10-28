@@ -54,6 +54,7 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
     _MAX_PLANS,
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
+    _capturing,
     _ceil_div,
     _check_thd,
     _current_stream,
@@ -127,14 +128,18 @@ _OVERLAP_WIDTH = {170: 42, 188: 46}
 # A plan of more than 16384 padded tokens (the statistics / quantizer plans) takes the overlapped form too when its
 # attention-weighted mean segment length -- the sum of the squared segment lengths over the token count, which the
 # pre-processing share of the call falls with -- is at most ``_OVERLAP_LONG_MAX_SEGMENT[(SM count, delta)]`` tokens
-# (no entry: never), with the overlap width ``_OVERLAP_WIDTH_LONG``.  On 170 and 188 SMs both routes overlap every
-# such plan: the hidden pre-processing pays for the overlap attention's per-unit Q load at any segment length.
+# (no entry: never), with the overlap width ``_OVERLAP_WIDTH_LONG``.  On 170 SMs both routes and on 188 SMs the
+# compensated route overlap every such plan: the hidden pre-processing pays for the overlap attention's per-unit Q
+# load at any segment length.  On 188 SMs the uncompensated route overlaps such a plan up to an attention-weighted
+# mean segment of 40960 tokens; above it the separate launches with the warp-specialised attention
+# (``ATTENTION_WS_NODELTA``, three warps per SM sub-partition) finish first, unless the plan's mean segment keeps
+# the separate launches on the base attention (``_warp_specialised``), which keeps the overlap.
 _OVERLAP_WIDTH_LONG = {170: 64, 188: 46}
 _OVERLAP_LONG_MAX_SEGMENT = {
     (170, True): 1 << 40,
     (170, False): 1 << 40,
     (188, True): 1 << 40,
-    (188, False): 1 << 40,
+    (188, False): 40960,
 }
 # Workers per producer CTA of the overlapped form (one 768-thread CTA runs three 256-thread workers).
 _OVERLAP_PRODUCER_WORKERS = 3
@@ -710,12 +715,12 @@ def minimax_h3_sm120_nvfp4_programs(
 
     A plan of the fused pre-processing on a part whose SM count has an overlap width
     (``minimax_h3_sm120_nvfp4_overlap_grids``), and a longer plan whose attention-weighted mean segment is
-    short enough (``_overlap_long``), runs the overlapped form instead: ``(PREPROCESS_HEAD_MAJOR,
-    ATTENTION_LEAD, ATTENTION_TAIL)`` (``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta``
-    is false) -- the head-major pre-processing producers (a plain launch), the lead attention launch on the
-    SMs the producers leave free (a programmatic dependent of the producers), then the tail attention launch
-    (a programmatic dependent of the lead), which takes the remaining work on the producers' SMs as they
-    drain."""
+    short enough or whose separate launches would not take the warp-specialised attention (``_overlap_long``),
+    runs the overlapped form instead: ``(PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)``
+    (``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta`` is false) -- the head-major
+    pre-processing producers (a plain launch), the lead attention launch on the SMs the producers leave free
+    (a programmatic dependent of the producers), then the tail attention launch (a programmatic dependent of
+    the lead), which takes the remaining work on the producers' SMs as they drain."""
     padded = int(plan.padded_tokens)
     fused = _PREPROCESS_MIN_TOKENS <= padded <= _PREPROCESS_MAX_TOKENS
     if int(num_sms) in _OVERLAP_WIDTH and (
@@ -730,23 +735,31 @@ def minimax_h3_sm120_nvfp4_programs(
         pre = (STATS, QUANTIZE_KV_HBLK64)
     else:
         pre = (STATS, QUANTIZE_KV)
-    tokens, segments = int(plan.total_tokens), int(plan.num_segments)
-    bound = _WS_MAX_MEAN_SEGMENT if delta else 0
-    ws = tokens >= _WS_MIN_MEAN_SEGMENT * segments and (
-        (int(num_sms) >= _WS_MIN_SMS and (bound <= 0 or tokens < bound * segments))
-        or (not delta and fused and int(num_sms) >= _WS_NODELTA_FUSED_MIN_SMS)
-    )
-    if ws:
+    if _warp_specialised(plan, num_sms, delta, fused):
         attention = ATTENTION_WS if delta else ATTENTION_WS_NODELTA
     else:
         attention = ATTENTION if delta else ATTENTION_NODELTA
     return (*pre, attention)
 
 
+def _warp_specialised(plan, num_sms: int, delta: bool, fused: bool) -> bool:
+    """Whether the separate launches of ``plan`` take the warp-specialised attention: the mean segment
+    ``tokens / segments`` (empty segments included) is at least 1536 tokens and either the part has at least 188
+    SMs (with ``delta``, a mean below 16384 tokens) or, without ``delta``, the plan runs the fused pre-processing
+    on a part of at least 170 SMs."""
+    tokens, segments = int(plan.total_tokens), int(plan.num_segments)
+    bound = _WS_MAX_MEAN_SEGMENT if delta else 0
+    return tokens >= _WS_MIN_MEAN_SEGMENT * segments and (
+        (int(num_sms) >= _WS_MIN_SMS and (bound <= 0 or tokens < bound * segments))
+        or (not delta and fused and int(num_sms) >= _WS_NODELTA_FUSED_MIN_SMS)
+    )
+
+
 def _overlap_long(plan, num_sms: int, delta: bool) -> bool:
     """Whether a plan of more than 16384 padded tokens takes the overlapped form on a part of ``num_sms`` SMs: its
     attention-weighted mean segment length ``sum(len ** 2) / tokens`` is at most
-    ``_OVERLAP_LONG_MAX_SEGMENT[(num_sms, delta)]``."""
+    ``_OVERLAP_LONG_MAX_SEGMENT[(num_sms, delta)]``, or its separate launches would not take the warp-specialised
+    attention (``_warp_specialised``)."""
     if int(plan.padded_tokens) <= _PREPROCESS_MAX_TOKENS:
         return False
     limit = _OVERLAP_LONG_MAX_SEGMENT.get((int(num_sms), bool(delta)))
@@ -754,7 +767,9 @@ def _overlap_long(plan, num_sms: int, delta: bool) -> bool:
         return False
     bounds = [int(b) for b in plan.bounds]
     squares = sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:], strict=False))
-    return squares <= limit * bounds[-1]
+    return squares <= limit * bounds[-1] or not _warp_specialised(
+        plan, num_sms, delta, False
+    )
 
 
 def minimax_h3_sm120_nvfp4_launch_grids(
@@ -1240,9 +1255,8 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
                 v_sf,
             )
             key = (q.device.index, attention)
-            if (
-                key not in _NVFP4_OVERLAP_LOADED
-                and not torch.cuda.is_current_stream_capturing()
+            if key not in _NVFP4_OVERLAP_LOADED and not _capturing(
+                q.device.index, stream
             ):
                 _load_overlap(
                     target,

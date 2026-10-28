@@ -770,6 +770,82 @@ def test_sf_ring_rows():
             cb.gemm_plan(8192, 7168, 16384, False, other, sm_count, tactic=tactic)
 
 
+def test_sf_ring_form_rows():
+    # On sm_103a at 152 SMs the GEMM alone and the chain run the ring program of the
+    # cell's form on the SF_RING_FORM_CELLS ranges of their kind (the plan's static
+    # program without raster groups, or CLC program without or with raster groups of
+    # 8); the token counts next to a range keep the plan's program, the chain keeps it
+    # on the cells of the GEMM alone only, and the other parts never take the ring.
+    arch = cb.SF_RING_ARCH
+    sm_count = cb.MEASURED_SM_COUNT[arch]
+
+    def runs(plan, kind):
+        hook = cb.gemm_alone_tactic if kind == "gemm" else cb.chain_gemm_tactic
+        tactic = hook(plan)
+        if tactic is None:
+            return plan
+        return _registered(
+            cb.gemm_plan(
+                plan.M, plan.N, plan.K, plan.out_f16, arch, sm_count, tactic=tactic
+            ),
+            arch,
+        )
+
+    def ring_key(plan, form):
+        tactic = {
+            name: value
+            for name, value in plan.tactic.items()
+            if name not in ("sched", "stream_k", "sk_split")
+        }
+        tactic.update(cb.SF_RING_FORMS[form], sf_ring=True)
+        return cb.gemm_kernel_key(tactic, plan.out_f16)
+
+    checked = 0
+    for kind, cells in cb.SF_RING_FORM_CELLS.items():
+        for (k, n), ranges in cells.items():
+            for lo, hi, form in ranges:
+                top = hi if hi is not None else 16384
+                for out_f16 in (False, True):
+                    for m in (lo, (lo + top) // 2, top):
+                        plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                        assert plan.kernel_key in cb.SF_RING_FORM_KEYS, (m, n, k)
+                        run = runs(plan, kind)
+                        assert run.kernel_key == ring_key(plan, form), (kind, m, n, k)
+                        assert run.kernel_key.endswith("_sfr")
+                        assert run.num_tiles == plan.num_tiles
+                        same_sched = (plan.tactic.get("sched") == "clc") == (
+                            cb.SF_RING_FORMS[form].get("sched") == "clc"
+                        )
+                        assert run.grid == plan.grid or not same_sched
+                        checked += 1
+                    for m in (lo - 1,) + ((hi + 1,) if hi is not None else ()):
+                        plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                        covered = any(
+                            a <= m and (b is None or m <= b) for a, b, _ in ranges
+                        )
+                        if plan.kernel_key in cb.SF_RING_FORM_KEYS and not covered:
+                            run = runs(plan, kind)
+                            assert not run.kernel_key.endswith("_sfr"), (kind, m)
+                    chain_ranges = cb.SF_RING_FORM_CELLS["chain"].get((k, n), ())
+                    if kind == "gemm" and not any(
+                        a <= lo and (b is None or lo <= b) for a, b, _ in chain_ranges
+                    ):
+                        plan = cb.gemm_plan(lo, n, k, out_f16, arch, sm_count)
+                        assert cb.chain_gemm_tactic(plan) == plan.tactic
+                        assert runs(plan, "chain").kernel_key == plan.kernel_key
+    assert checked
+    for other, other_sms in (("sm_103a", 148), ("sm_100a", 148), ("sm_100a", 152)):
+        for cells in cb.SF_RING_FORM_CELLS.values():
+            for (k, n), ranges in cells.items():
+                for lo, hi, _ in ranges:
+                    for m in (lo, hi if hi is not None else 16384):
+                        for out_f16 in (False, True):
+                            plan = cb.gemm_plan(m, n, k, out_f16, other, other_sms)
+                            for hook in (cb.gemm_alone_tactic, cb.chain_gemm_tactic):
+                                tactic = hook(plan)
+                                assert tactic is None or not tactic.get("sf_ring")
+
+
 def test_cake_is_registered_but_never_auto_selected():
     assert "cake" in mm_fp4.experimental_backends
     assert mm_fp4.is_backend_supported("cake", 100)
@@ -799,7 +875,8 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
     # Each architecture ships on a 148- and a 152-SM part (sm_100a: B200 / GB200,
     # sm_103a: B300 / GB300) and registers the kernels of its measured part.  The
     # validated matrix resolves on both parts; on the other part an edge row whose own
-    # tactic selects an unregistered kernel runs the measured part's kernel, and every
+    # tactic selects an unregistered kernel runs the measured part's default kernel (the
+    # FOLD_CELLS / B2_FOLD_CELLS rules hold at the measured SM count only), and every
     # other row keeps its own.
     registered = KERNELS[arch]
     missing = sorted(set(required_kernel_keys(arch, sm_count)) - set(registered))
@@ -833,7 +910,8 @@ def test_plans_resolve_on_148_and_152_sms(arch, sm_count):
                 if own_key in registered:
                     assert key == own_key, (m, n, k, out_f16)
                 else:
-                    assert key == reference.kernel_key, (m, n, k, out_f16)
+                    default = cb._gemm_plan(m, n, k, out_f16, arch, measured)
+                    assert key == default.kernel_key, (m, n, k, out_f16)
     assert served
 
 
@@ -1288,6 +1366,8 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         (8, 8192, 8192, torch.float16),  # 8-token tile
         (17, 7168, 16384, torch.bfloat16),  # 32-token tile, split-K 2
         (32, 8192, 8192, torch.bfloat16),  # 32-token tile
+        (24, 28672, 8192, torch.bfloat16),  # 32-token tile, two CTAs per SM on 152 SMs
+        (32, 28672, 8192, torch.float16),  # 32-token tile, two CTAs per SM on 152 SMs
         (128, 18432, 7168, torch.float16),  # one 128-token tile, 128-wide weight tiles
         (130, 18432, 7168, torch.bfloat16),  # one 128-token tile + the remainder fold
         (136, 18432, 7168, torch.float16),  # one 128-token tile + the remainder fold
@@ -1378,12 +1458,13 @@ def test_gemm_alone_entry_prefetch_matches_plain_program(n, k, out_dtype):
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("m", [129, 130, 136, 257, 264, 272])
-def test_token_remainder_fold_matches_route(m, out_dtype):
-    # On a token-remainder fold cell (K 7168, N 18432 at the measured SM count)
-    # mm_fp4 and the prepared GEMM run the fold program, bitwise equal to the program
-    # of the plan without the fold (the 2-CTA pair program over the plain token tiles).
+@pytest.mark.parametrize("n,k", [(18432, 7168), (28672, 8192)])
+def test_token_remainder_fold_matches_route(m, n, k, out_dtype):
+    # On a token-remainder fold cell (a FOLD_CELLS / B2_FOLD_CELLS (K, N) at the
+    # measured SM count) mm_fp4 and the prepared GEMM run the fold program, bitwise
+    # equal to the program of the plan without the fold (the 2-CTA pair program over
+    # the plain token tiles).
     device = _require_program()
-    n, k = 18432, 7168
     out_f16 = out_dtype == torch.float16
     _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
         m, n, k, torch.bfloat16, device, seed=500 + m
@@ -1482,6 +1563,79 @@ def test_sf_ring_matches_route(m, n, k, out_dtype):
     tactic = cb.chain_gemm_tactic(plan)
     expected = plan.kernel_key + ("_sfr" if tactic.get("sf_ring") else "")
     assert chain.kernels[1] == expected
+    chain()
+    chain_plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(
+        ws.fp4, ws.sf, w_u8, w_sf, ws.scale, chain_plain, tactic=plan.tactic
+    )()
+    torch.cuda.synchronize()
+    assert torch.equal(chained, chain_plain)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (513, 18432, 7168),  # g16_clc_sfr, first row (GEMM alone and chain)
+        (2560, 18432, 7168),  # g16_clc_sfr, last row (GEMM alone and chain)
+        (1537, 28672, 8192),  # g16_clc_sfr, first row (GEMM alone and chain)
+        (2560, 28672, 8192),  # g16_clc_sfr, last row (GEMM alone and chain)
+        (5889, 8192, 28672),  # g8_sfr, first row (GEMM alone and chain)
+        (8192, 8192, 28672),  # g8_sfr, last row (GEMM alone and chain)
+        (2561, 28672, 8192),  # clc_sfr, first row (GEMM alone and chain)
+        (8192, 28672, 8192),  # clc_sfr, last row (GEMM alone and chain)
+    ],
+)
+def test_sf_ring_form_matches_route(m, n, k, out_dtype):
+    # Where SF_RING_FORM_CELLS take a ring program, mm_fp4, the prepared GEMM and the
+    # chain's GEMM run it, bitwise equal to the plan's program without the ring.
+    device = _require_program()
+    out_f16 = out_dtype == torch.float16
+    plan = cb.gemm_plan(m, n, k, out_f16, cb._device_arch(device), cb._sm_count(device))
+    alone = cb.gemm_alone_tactic(plan)
+    chain_tactic = cb.chain_gemm_tactic(plan)
+    if not any(t is not None and t.get("sf_ring") for t in (alone, chain_tactic)):
+        pytest.skip(f"{plan.kernel_key}: no scale-factor ring cell on this part")
+    x, _, a_fp4, a_sf, alpha, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=700 + m
+    )
+    a_u8, w_u8 = a_fp4.view(torch.uint8), w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+    alone_key = plan.kernel_key if alone is None else cb.gemm_kernel_key(alone, out_f16)
+    assert runner.plan.kernel_key == alone_key
+    assert runner.plan.num_tiles == plan.num_tiles
+    runner()
+    plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(
+        a_u8, a_sf, w_u8, w_sf, alpha, plain, tactic=plan.tactic
+    )()
+    public = mm_fp4(
+        a_fp4,
+        w_fp4.T,
+        a_sf,
+        w_sf.T,
+        alpha,
+        out_dtype,
+        None,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="cake",
+        use_nvfp4=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain) and torch.equal(public, plain)
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+    ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    chained = torch.full_like(out, float("nan"))
+    chain = cb.prepare_nvfp4_per_token_chain(
+        x, gs_inv, w_u8, w_sf, chained, ws, out_scale=w_scale
+    )
+    chain_key = (
+        alone_key if chain_tactic is None else cb.gemm_kernel_key(chain_tactic, out_f16)
+    )
+    assert chain.kernels[1] == chain_key
     chain()
     chain_plain = torch.full_like(out, float("nan"))
     cb.prepare_mm_fp4_per_token(
