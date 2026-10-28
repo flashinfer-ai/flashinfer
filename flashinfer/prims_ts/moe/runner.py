@@ -1307,6 +1307,7 @@ class _PrimsTsMoERunnerMixin:
                     f"{self.__class__.__name__} tactic {tactic}: {exc}"
                 )
 
+        tactics = _node_rank_rotated(tactics)
         # Compilation is mostly host-side; fan out tactics when there are several.
         max_workers = min(4, max(1, len(tactics)))
         if max_workers == 1 or len(tactics) <= 1:
@@ -1318,6 +1319,22 @@ class _PrimsTsMoERunnerMixin:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 list(pool.map(_precompile_one, tactics))
         return True
+
+
+def _node_rank_rotated(items: List[Any]) -> List[Any]:
+    """``items`` rotated by this process's share of the node's local ranks.
+
+    Compiled GEMMs persist on disk and every process loads what another one
+    has already compiled. Ranks that tune the same tactics then start their
+    precompile at different places and compile disjoint GEMMs side by side
+    instead of the same ones in step.
+    """
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if world <= 1 or not 0 <= rank < world:
+        return list(items)
+    start = len(items) * rank // world
+    return list(items[start:]) + list(items[:start])
 
 
 class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
@@ -2100,10 +2117,32 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        def map_tactic(tactic):
+            requested_tactic = [-1, -1] if tactic == -1 else tactic
+            return self._map_tactic(requested_tactic, moe_inputs, kwargs)
+
+        # The tactics are FC1 x FC2 config pairs: compile each distinct GEMM
+        # once, through the first tactic that uses it.
+        jobs = []
+        seen = set()
         for tactic in tactics:
             try:
-                requested_tactic = [-1, -1] if tactic == -1 else tactic
-                pair = self._map_tactic(requested_tactic, moe_inputs, kwargs)
+                pair = map_tactic(tactic)
+            except Exception as exc:
+                logger.debug(
+                    "[Prims-TS MoE] Skipping MXFP4xMXFP8 precompile for tactic "
+                    f"{tactic}: {exc}"
+                )
+                continue
+            for fc, gemm in (("fc1", pair.fc1), ("fc2", pair.fc2)):
+                key = (fc, tuple(sorted(gemm.cfg.kwargs.items())))
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append((tactic, fc))
+
+        for tactic, fc in _node_rank_rotated(jobs):
+            try:
+                pair = map_tactic(tactic)
                 resolved_tactic = _concrete_tactic(pair)
                 ok, reason = is_prims_ts_mxfp4_mxfp8_supported(
                     self,
@@ -2198,25 +2237,14 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     hidden_size=self.hidden_size,
                 )
 
-                fc1_io = build_mxfp4_mxfp8_launch_io(
-                    fc="fc1", cfg=fc1_cfg, **common_io_kwargs
+                gemm_cfg = fc1_cfg if fc == "fc1" else fc2_cfg
+                gemm_io = build_mxfp4_mxfp8_launch_io(
+                    fc=fc, cfg=gemm_cfg, **common_io_kwargs
                 )
-                fc1_hash = stable_config_hash(fc1_io["cfg"])
                 get_compiled_gemm(
-                    fc1_hash,
-                    "mxfp4_mxfp8_fc1",
-                    fc1_io,
-                    stream,
-                )
-
-                fc2_io = build_mxfp4_mxfp8_launch_io(
-                    fc="fc2", cfg=fc2_cfg, **common_io_kwargs
-                )
-                fc2_hash = stable_config_hash(fc2_io["cfg"])
-                get_compiled_gemm(
-                    fc2_hash,
-                    "mxfp4_mxfp8_fc2",
-                    fc2_io,
+                    stable_config_hash(gemm_io["cfg"]),
+                    f"mxfp4_mxfp8_{fc}",
+                    gemm_io,
                     stream,
                 )
                 torch_stream.synchronize()

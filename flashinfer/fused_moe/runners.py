@@ -7695,6 +7695,25 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 launch_state.static_kwargs["weight_layout"]
             )
 
+    def precompile_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        tactics: List[Any],
+        profile: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """Compile the GEMMs of every tactic before the autotuner profiles them."""
+        self._require_built()
+        launch_state = kwargs.pop("launch_state", None)
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState) or self._inner is None:
+            return False
+        self._sync_inner_static_extras(launch_state)
+        return self._inner.precompile_tactics(
+            inputs, tactics, profile, **launch_state.static_kwargs
+        )
+
     def forward(
         self,
         inputs: List[torch.Tensor],
