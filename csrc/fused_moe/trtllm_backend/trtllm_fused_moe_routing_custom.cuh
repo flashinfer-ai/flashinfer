@@ -51,6 +51,7 @@ bool launchClusterKernelBlockDim512(Data const& data, void* stream);
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
 bool launchBlockPermutationKernel(Data const& data, void* stream);
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream);
 bool launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
                                  void* stream);
 bool launchBlockScoresKernel(Data const& data, void* stream);
@@ -920,6 +921,37 @@ __global__ void __launch_bounds__(NumThreads)
 bool launchBlockPermutationKernel(Data const& data, void* stream) {
   LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockPermutationKernel, /*numBlocks=*/1,
                         NumThreads, /*smemSize=*/0, stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+// Permutation of precomputed top-k ids over a cluster of NumBlocksPerSmallCluster CTAs: fewer
+// distributed shared memory reads and cheaper cluster barriers than the full cluster for batches
+// a single CTA permutes too slowly.
+template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+__global__ void __cluster_dims__(NumBlocksPerSmallCluster, 1, 1) __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     NumBlocksPerSmallCluster>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                               blockIdx.x);
+}
+#else
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams /* params */) {
+  assert(false && "routingIndicesSmallClusterPermutationKernel is only supported on SM90+");
+}
+#endif
+
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesSmallClusterPermutationKernel,
+                        NumBlocksPerSmallCluster, NumThreads, /*smemSize=*/0, stream);
   return queryPolicyHasCompiledTier(data);
 }
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
