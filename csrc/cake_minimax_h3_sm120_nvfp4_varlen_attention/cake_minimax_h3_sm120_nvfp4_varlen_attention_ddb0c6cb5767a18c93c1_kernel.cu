@@ -2047,7 +2047,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_ddb0c6cb5767a18c93c1(const _
         unsigned int _acquire_observed;
         do {
         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(hctr) + (5 * num_heads + 2))) : "memory");
-        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(lead_ctas)) >= static_cast<unsigned int>(1));
+        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(lead_ctas + 1)) >= static_cast<unsigned int>(1));
         }
         unsigned int pold;
         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"

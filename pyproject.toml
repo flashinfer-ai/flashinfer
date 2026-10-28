@@ -94,6 +94,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gdn_train" = ["csrc/**", "build.json", "build.test.json"]
+"flashinfer.experimental.cake_gdn_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
@@ -155,6 +156,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
 "flashinfer.experimental.qwen_3_5_block" = ["README.md"]
 "flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
+"flashinfer.experimental.qwen_3_8_block" = ["README.md"]
 # CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention, and the generated sources and
 # build manifest (build.json) of its Cake backend, the public entry's default route on SM80-SM90.
 "flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
@@ -163,6 +165,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.allreduce_mhc_post_prenorm" = ["csrc/**"]
 # CUDA sources of the experimental SM103 fused mHC post -> pre kernels, JIT-compiled on first use.
 "flashinfer.experimental.mhc_fused_post_pre" = ["csrc/**"]
+# CUDA source of the experimental SM100/SM103 mHC pre big-fuse + RMSNorm cluster kernel.
+"flashinfer.experimental.mhc_pre_big_fuse_with_norm" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [

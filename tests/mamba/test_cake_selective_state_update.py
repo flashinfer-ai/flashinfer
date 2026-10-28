@@ -497,6 +497,17 @@ def _routes_as_measured() -> bool:
     return cake._sm_count(torch.cuda.current_device()) in (148, 152)
 
 
+def _build(program, plan) -> str:
+    """The build ``plan`` runs for the measured ``program`` (a name, or a name per architecture): its ``_lean`` build
+    where the architecture lists the program or the launch's CTAs fall inside its lean band
+    (:func:`cake.lean_program`), else the program."""
+    if isinstance(program, dict):
+        program = program[plan.arch]
+    return cake.lean_program(
+        program, plan.arch, plan.grid[0], cake._sm_count(plan.device_index)
+    )
+
+
 # (name, batch, state dtype, program, groups): 128 heads of 64 rows, 64 program heads when paired.
 _RAW_DECODE_CASES = (
     ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16_dt8_bf16_i32", 8),
@@ -529,7 +540,16 @@ _RAW_DECODE_CASES = (
         "stp_hd64_paired_hpc2_s2w4_bf16_i32",
         4,
     ),
-    ("paired_bf16_two_ctas", 8, torch.bfloat16, "stp_hd64_paired_hpc2_mb2_bf16_i32", 8),
+    (
+        "paired_bf16_two_ctas",
+        8,
+        torch.bfloat16,
+        {
+            "sm_100a": "stp_hd64_paired_hpc2_mb2_bf16_i32",
+            "sm_103a": "stp_hd64_paired_hpc2_ratio8_s2w4_bf16_i32",
+        },
+        8,
+    ),
     (
         "split_bf16_four_heads",
         16,
@@ -573,7 +593,7 @@ def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
     plan = _route(dict(candidate, x=candidate["x"]), output_like=candidate["x"])
     assert plan is not None
     if _routes_as_measured():
-        assert plan.program == cake.lean_program(program, plan.arch)
+        assert plan.program == _build(program, plan)
     _assert_split_grid(plan)
     out_candidate = torch.empty(
         (batch_size, 128, 64), dtype=torch.bfloat16, device="cuda"
@@ -774,7 +794,7 @@ def test_hd64_route_falls_back_for_non_dense_rows(cake_hits) -> None:
     """Rows with a non-unit inner stride are outside the programs' addressing; the call runs on FlashInfer."""
     inputs = _make_case(_case("stp_hd64_paired_rows"))
     plan = _route(inputs)
-    assert plan.program == cake.lean_program("stp_hd64_paired_hpc2", plan.arch)
+    assert plan.program == _build("stp_hd64_paired_hpc2", plan)
     batch_size, nheads, dim = inputs["x"].shape
     wide = torch.zeros(
         (batch_size, nheads, 2 * dim), dtype=torch.bfloat16, device="cuda"
@@ -913,7 +933,9 @@ def test_split_programs_follow_the_work() -> None:
     assert hd64(244, 8) == mb5  # 976 CTAs
     assert hd64(277, 8) == mb5  # 1108 CTAs: below 7.5 per SM
     assert hd64(278, 8) is None  # 1112 CTAs
-    assert hd64(244, 8, 152, "sm_103a") is None  # 976 CTAs: below 6.6 per SM on sm_103a
+    assert hd64(227, 8, 152, "sm_103a") is None  # 1816: below the band on sm_103a too
+    assert hd64(228, 8, 152, "sm_103a") == mb5  # 912 CTAs: 6 per SM on sm_103a
+    assert hd64(244, 8, 152, "sm_103a") == mb5  # 976 CTAs
     assert hd64(251, 8, 152, "sm_103a") == mb5  # 1004 CTAs
     assert hd64(284, 8, 152, "sm_103a") == mb5  # 1136 CTAs: below 7.5 per SM
     assert hd64(285, 8, 152, "sm_103a") is None  # 1140 CTAs
@@ -921,6 +943,16 @@ def test_split_programs_follow_the_work() -> None:
     assert hd64(888, 8) == mb5  # 3552 CTAs: 24 per SM
     assert hd64(888, 8, 152, "sm_103a") is None
     assert hd64(1824, 8, 152, "sm_103a") == mb5  # 7296 CTAs: 48 per SM
+    # The two-head two-CTA build on sm_103a from 1.68 to 1.90 of its CTAs per SM: split two ways (one wave of four
+    # CTAs per SM); every other launch of it, and sm_100a, keep the build.
+    c2_ratio8 = ("stp_hd64_paired_hpc2_ratio8_s2w4", 2, 2)
+    assert hd64(60, 8, 152, "sm_103a") is None  # 480 / 240 CTAs: 1.58 per SM
+    assert hd64(64, 8, 152, "sm_103a") == c2_ratio8  # 512 / 256 CTAs: 1.68 per SM
+    assert hd64(72, 8, 152, "sm_103a") == c2_ratio8  # 576 / 288 CTAs: 1.89 per SM
+    assert hd64(73, 8, 152, "sm_103a") is None  # 584 / 292 CTAs: 1.92 per SM
+    assert hd64(8, 64, 152, "sm_103a") == hpc2_s2  # 512 in one group of 64
+    assert hd64(64, 8, 152, "sm_103a", raw=True) == (f"{c2_ratio8[0]}_bf16_i32", 2, 2)
+    assert hd64(64, 8) is None  # sm_100a: 512 / 256 CTAs keep the two-CTA build
 
     def dim128(rg, hpg, arch="sm_100a", gated=False):
         return cake.dim128_split_program(rg, hpg, 148, arch, gated)
@@ -1002,6 +1034,20 @@ def test_lean_builds_follow_the_architecture() -> None:
         == "stp_hd64_paired_hpc2_lean_bf16_i32"
     )
     assert lean("stp_hd64_paired_hpc2", "sm_103a") == "stp_hd64_paired_hpc2"
+    # sm_103a runs the two-head build's lean form from 6.10 to 26.95 of its CTAs per SM.
+    gb300_hpc2 = (
+        ("stp_hd64_paired_hpc2", "sm_103a"),
+        ("stp_hd64_paired_hpc2_bf16_i32", "sm_103a"),
+    )
+    for (program, arch), suffix in zip(gb300_hpc2, ("", "_bf16_i32"), strict=True):
+        assert lean(program, arch, 927, 152) == program
+        assert lean(program, arch, 928, 152) == f"stp_hd64_paired_hpc2_lean{suffix}"
+        assert lean(program, arch, 4096, 152) == f"stp_hd64_paired_hpc2_lean{suffix}"
+        assert lean(program, arch, 4100, 152) == program
+    assert (
+        lean("stp_hd64_paired_hpc2", "sm_100a", 4100, 148)
+        == "stp_hd64_paired_hpc2_lean"
+    )
     assert lean("stp_hd64_paired_hpc1_s4w2", "sm_100a") == "stp_hd64_paired_hpc1_s4w2"
     assert (
         lean("stp_hd64_paired_hpc1_s4w2", "sm_103a") == "stp_hd64_paired_hpc1_s4w2_lean"
@@ -1026,7 +1072,10 @@ def test_lean_builds_follow_the_architecture() -> None:
             arches = cake.MODULES[module].get("arches", ["sm_100a", "sm_103a"])
             base = name.removesuffix("_bf16_i32")
             if base.endswith("_lean"):
-                takes = base.removesuffix("_lean") in cake._LEAN_PROGRAMS[arch]
+                takes = base.removesuffix("_lean") in cake._LEAN_PROGRAMS[arch] or (
+                    base.removesuffix("_lean")
+                    in cake._LEAN_BAND_HUNDREDTHS.get(arch, {})
+                )
                 assert (arch in arches) == takes, (name, arch)
             elif base in cake._LEAN_PROGRAMS[arch]:
                 assert arch not in arches, (name, arch)
@@ -1070,13 +1119,30 @@ def test_every_route_build_ships_for_its_architecture() -> None:
                 split = cake.dim128_split_program(rg, hpg, sms, arch, False)
                 named.add(split[0] if split else cake.dim128_program(hpg, False)[0])
         named |= {"stp_dim128_z_gated", "stp_dim128_z_balanced"}
+        named |= {cake.dim128_fp32_program(bh) for bh in range(1, 9000)}
+        if any(cake.dim128_stp_ring(b, 64, 8, sms, arch) for b in range(1, 3000)):
+            named.add(_STP_RING)
+        named |= {
+            cake.mtp_short_program(b, nheads, 8, t, sms, arch)[0]
+            for b in range(1, 3000)
+            for t in (1, 2)
+            for nheads in (32, 64)
+        }
         named |= {
             cake.dynamic_program(b, t, arch) for b in range(1, 9) for t in range(1, 9)
         }
         for program in named:
-            build = cake.lean_program(program, arch)
-            module = cake.PROGRAMS[build]
-            assert arch in cake.MODULES[module].get("arches", [arch]), (build, arch)
+            builds = {cake.lean_program(program, arch)}
+            band = cake._LEAN_BAND_HUNDREDTHS.get(arch, {}).get(
+                program.removesuffix("_bf16_i32")
+            )
+            if band is not None:
+                builds.add(
+                    cake.lean_program(program, arch, band[0] * sms // 100 + 1, sms)
+                )
+            for build in builds:
+                module = cake.PROGRAMS[build]
+                assert arch in cake.MODULES[module].get("arches", [arch]), (build, arch)
 
 
 @requires_blackwell
@@ -1099,7 +1165,8 @@ def test_dim128_two_head_split_starts_at_sixteen_waves(batch_size) -> None:
 
 # (case, z, the program the route selects): canonical layouts on every paired row-major program.
 _PAIRED_ROWS_CASES = (
-    (("dim128_hpc2", 64, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
+    # Batch 48: no batch the one-token ring takes.
+    (("dim128_hpc2", 48, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
     (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_s2w4"),
     (("dim128_hpc1_mb4", 40, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
     (("dim128_z", 64, 64, 8, 128, 128, 0), True, "stp_dim128_z_balanced"),
@@ -1117,7 +1184,14 @@ _PAIRED_ROWS_CASES = (
         "stp_hd64_paired_hpc2_ratio8_s2w4",
     ),
     (("hd64_two_heads_g4", 5, 128, 4, 64, 128, 0), False, "stp_hd64_paired_hpc2_s2w4"),
-    (("hd64_two_ctas", 8, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc2_mb2"),
+    (
+        ("hd64_two_ctas", 8, 128, 8, 64, 128, 0),
+        False,
+        {
+            "sm_100a": "stp_hd64_paired_hpc2_mb2",
+            "sm_103a": "stp_hd64_paired_hpc2_ratio8_s2w4",
+        },
+    ),
     (("hd64_one_head_odd", 20, 32, 16, 64, 128, 0), False, "stp_hd64_paired_hpc1"),
     (("hd64_four_split", 10, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s2w4"),
     (("hd64_four_heads", 16, 128, 8, 64, 128, 0), False, "stp_hd64_paired_hpc4_s2w4"),
@@ -1148,7 +1222,7 @@ def test_paired_rows_routes_match_flashinfer(case, gated, program, cake_hits) ->
     plan = _route(inputs)
     assert plan is not None
     if _routes_as_measured():
-        assert plan.program == cake.lean_program(program, plan.arch)
+        assert plan.program == _build(program, plan)
     _assert_split_grid(plan)
     reference, candidate = _split_arms(inputs)
     out_reference = selective_state_update(**reference, backend="flashinfer")
@@ -1594,10 +1668,26 @@ def test_hd64_rows_program_follows_the_bands() -> None:
             "stp_hd64_rows_fp32_dt1_large",
             4,
         )
-        assert program(f32, True, 1, 32768, arch, 128) == (
+        assert program(f32, True, 1, 28671, arch, 128) == (
             "stp_hd64_rows_fp32_dt1_large_bf16_i32",
             4,
         )
+        assert program(f32, False, 1, 40961, arch, 128) == (
+            "stp_hd64_rows_fp32_dt1_large",
+            4,
+        )
+    # sm_103a from 28672 to 40960 batch-heads: the read-ahead build that stores the state with an L2 evict-first
+    # policy; sm_100a keeps the read-ahead build.
+    for raw_abi, suffix in ((False, ""), (True, "_bf16_i32")):
+        for batch_heads in (28672, 32768, 40960):
+            assert program(f32, raw_abi, 1, batch_heads, "sm_103a", 128) == (
+                f"stp_hd64_rows_fp32_dt1_large_sl2first{suffix}",
+                4,
+            )
+            assert program(f32, raw_abi, 1, batch_heads, "sm_100a", 128) == (
+                f"stp_hd64_rows_fp32_dt1_large{suffix}",
+                4,
+            )
 
 
 def test_cache_program_follows_the_projection_layout() -> None:
@@ -1755,7 +1845,7 @@ def _assert_falls_back(inputs, cake_hits):
 def test_identity_route_falls_back_for_non_broadcast_coefficients(cake_hits) -> None:
     """A dense A (one value per element instead of one per head) never reaches the 128x128 FP32 program."""
     inputs = _make_case(_case("stp_fp32"))
-    assert _route(inputs).program == "stp_dim128_fp32"
+    assert _route(inputs).program == "stp_dim128_fp32_l2_prefetch"
     inputs["A"] = inputs["A"].contiguous()
     assert _route(inputs) is None
     _assert_falls_back(inputs, cake_hits)
@@ -1775,11 +1865,78 @@ def test_identity_route_falls_back_for_non_contiguous_inputs(cake_hits) -> None:
     _assert_falls_back(inputs, cake_hits)
 
 
+# (batch x nheads, build): both edges of the 128x128 FP32 program's L2 read-ahead window.
+_DIM128_FP32_WINDOW_EDGES = (
+    (1407, "stp_dim128_fp32"),
+    (1408, "stp_dim128_fp32_l2_prefetch"),
+    (6656, "stp_dim128_fp32_l2_prefetch"),
+    (6657, "stp_dim128_fp32"),
+)
+
+
+@pytest.mark.parametrize("batch_heads, program", _DIM128_FP32_WINDOW_EDGES)
+def test_dim128_fp32_program_follows_the_l2_prefetch_window(
+    batch_heads, program
+) -> None:
+    assert cake.dim128_fp32_program(batch_heads) == program
+
+
+@requires_blackwell
+@pytest.mark.parametrize("batch_size", (21, 22, 104, 105, 112))
+def test_fp32_route_takes_the_l2_prefetch_build_inside_its_window(
+    batch_size, cake_hits
+) -> None:
+    """A 128x128 FP32 single-token call of 64 heads runs the L2 read-ahead build from 1408 to 6656 batch-heads
+    (batches 22 to 104) and the plain build outside them (batch 21: 1344; 105: 6720; 112: 7168), on the same
+    grid, and matches FlashInfer."""
+    fp32 = torch.float32
+    case = ("fp32_window", batch_size, 64, 8, 128, 128, 0, fp32, "auto", False, None)
+    inputs = _make_case(case)
+    plan = _route(inputs)
+    if batch_size * 64 < 8 * cake._sm_count(torch.cuda.current_device()):
+        pytest.skip("below the FP32 program's eight batch-heads per SM")
+    assert plan is not None
+    inside = 22 <= batch_size <= 104
+    program = "stp_dim128_fp32_l2_prefetch" if inside else "stp_dim128_fp32"
+    assert (plan.program, plan.grid) == (program, (8, 64, batch_size))
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("variant", ("plain", "pad"))
+def test_fp32_l2_prefetch_build_is_bitwise_the_plain_build(variant) -> None:
+    """The L2 read-ahead build writes the output and state of the plain 128x128 FP32 build, bit for bit, on the
+    same bindings (a pad slot keeps its state)."""
+    inputs = _make_case(_case("stp_fp32"))
+    if variant == "pad":
+        inputs["state_batch_indices"][3] = -1
+    prefetch_arm, plain_arm = _split_arms(inputs)
+    plans = [_route(arm) for arm in (prefetch_arm, plain_arm)]
+    assert plans[0] is not None and plans[1] is not None
+    builds = ("stp_dim128_fp32_l2_prefetch", "stp_dim128_fp32")
+    with torch.cuda.device(plans[0].device_index):
+        for plan, build in zip(plans, builds, strict=True):
+            cake._program(build, plan.arch, ()).launch(plan.grid, plan.bindings)
+    outputs = [plan.bindings["output"] for plan in plans]
+    assert torch.equal(outputs[0], outputs[1])
+    assert torch.equal(prefetch_arm["state"], plain_arm["state"])
+
+
 @requires_blackwell
 @pytest.mark.parametrize(
     "case_name, program",
     [
-        ("mtp_short2", "mtp_short_ring_heads64_groups8_t2"),
+        (
+            "mtp_short2",
+            {
+                "sm_100a": "mtp_short_ring_heads64_groups8_t2_jr",
+                "sm_103a": "mtp_short_ring_heads64_groups8_t2_jr_hb",
+            },
+        ),
         ("mtp_short2_b16", "mtp_short_prefetch_heads64_groups8"),
     ],
 )
@@ -1787,7 +1944,10 @@ def test_short_route_falls_back_for_non_contiguous_inputs(
     case_name, program, cake_hits
 ) -> None:
     inputs = _make_case(_case(case_name))
-    planned = _route(inputs).program
+    plan = _route(inputs)
+    planned = plan.program
+    if isinstance(program, dict):
+        program = program[plan.arch]
     if _routes_as_measured():
         assert planned == program
     inputs["x"] = _padded_steps(inputs["x"])
@@ -1798,34 +1958,56 @@ def test_short_route_falls_back_for_non_contiguous_inputs(
 
 
 # (batch, tokens, SMs, architecture, ring): the short program's TMA-ring domain on 64 heads of 8 groups.
+_JR_RING = "mtp_short_ring_heads64_groups8_t2_jr"
+# (batch, tokens, SMs, architecture, ring): the ring build the call runs (``None``: the build folding 64 heads of 8
+# groups).
 _SHORT_RING_DOMAIN_CASES = (
     # sm_100a, one token: batches 32 to 96, the last wave of 296 eight-head CTAs at least half full.
-    (31, 1, 148, "sm_100a", False),
-    (32, 1, 148, "sm_100a", True),
-    (37, 1, 148, "sm_100a", True),  # one whole wave
-    (38, 1, 148, "sm_100a", False),
-    (55, 1, 148, "sm_100a", False),
-    (56, 1, 148, "sm_100a", True),
-    (96, 1, 148, "sm_100a", True),
-    (97, 1, 148, "sm_100a", False),
-    # sm_100a, two tokens: from batch 32, the last wave at least a quarter full.
-    (31, 2, 148, "sm_100a", False),
-    (46, 2, 148, "sm_100a", False),
-    (47, 2, 148, "sm_100a", True),
-    (192, 2, 148, "sm_100a", False),
-    (256, 2, 148, "sm_100a", True),
+    (31, 1, 148, "sm_100a", None),
+    (32, 1, 148, "sm_100a", "t1"),
+    (33, 1, 148, "sm_100a", "t1"),  # a joint-reduction batch of two tokens
+    (37, 1, 148, "sm_100a", "t1"),  # one whole wave
+    (38, 1, 148, "sm_100a", None),
+    (55, 1, 148, "sm_100a", None),
+    (56, 1, 148, "sm_100a", "t1"),
+    (96, 1, 148, "sm_100a", "t1"),
+    (97, 1, 148, "sm_100a", None),
+    # sm_100a, two tokens: from batch 32, the last wave at least a quarter full; the joint-reduction ring at its
+    # measured batches.
+    (31, 2, 148, "sm_100a", None),
+    (46, 2, 148, "sm_100a", None),
+    (47, 2, 148, "sm_100a", "t2"),
+    (192, 2, 148, "sm_100a", None),
+    (256, 2, 148, "sm_100a", "t2_jr"),
+    (257, 2, 148, "sm_100a", "t2"),
+    # The same batches on another SM count of sm_100a: the two-token ring.
+    (256, 2, 152, "sm_100a", "t2"),
+    (64, 2, 132, "sm_100a", "t2"),
     # sm_103a, one token: batches 64 to 96, the last wave of 304 CTAs at least half full.
-    (63, 1, 152, "sm_103a", False),
-    (64, 1, 152, "sm_103a", True),
-    (76, 1, 152, "sm_103a", True),  # two whole waves
-    (77, 1, 152, "sm_103a", False),
-    (94, 1, 152, "sm_103a", False),
-    (95, 1, 152, "sm_103a", True),  # exactly half
-    (97, 1, 152, "sm_103a", False),
-    # sm_103a, two tokens: every batch from 32.
-    (31, 2, 152, "sm_103a", False),
-    (32, 2, 152, "sm_103a", True),
-    (4096, 2, 152, "sm_103a", True),
+    (63, 1, 152, "sm_103a", None),
+    (64, 1, 152, "sm_103a", "t1"),
+    (76, 1, 152, "sm_103a", "t1"),  # two whole waves
+    (77, 1, 152, "sm_103a", None),
+    (94, 1, 152, "sm_103a", None),
+    (95, 1, 152, "sm_103a", "t1"),  # exactly half
+    (97, 1, 152, "sm_103a", None),
+    # sm_103a, two tokens: every batch from 32; the joint-reduction ring with the per-head state base at its
+    # measured batches, the two-token ring at the others.
+    (31, 2, 152, "sm_103a", None),
+    (32, 2, 152, "sm_103a", "t2_jr_hb"),
+    (37, 2, 152, "sm_103a", "t2_jr_hb"),
+    (38, 2, 152, "sm_103a", "t2_jr_hb"),
+    (47, 2, 152, "sm_103a", "t2"),
+    (75, 2, 152, "sm_103a", "t2"),
+    (77, 2, 152, "sm_103a", "t2_jr_hb"),
+    (256, 2, 152, "sm_103a", "t2_jr_hb"),
+    (319, 2, 152, "sm_103a", "t2"),
+    (320, 2, 152, "sm_103a", "t2_jr_hb"),
+    (321, 2, 152, "sm_103a", "t2"),
+    (4096, 2, 152, "sm_103a", "t2"),
+    # The same batches on another SM count of sm_103a: the two-token ring.
+    (32, 2, 148, "sm_103a", "t2"),
+    (320, 2, 132, "sm_103a", "t2"),
 )
 
 
@@ -1839,10 +2021,7 @@ def test_short_program_follows_the_ring_domain(
         batch_size, 64, 8, token_steps, sm_count, arch
     )
     if ring:
-        assert (program, head_tiles) == (
-            f"mtp_short_ring_heads64_groups8_t{token_steps}",
-            1,
-        )
+        assert (program, head_tiles) == (f"mtp_short_ring_heads64_groups8_{ring}", 1)
     else:
         assert (program, head_tiles) == ("mtp_short_prefetch_heads64_groups8", 0)
     for nheads, ngroups in ((32, 8), (64, 4), (128, 8)):
@@ -1906,6 +2085,313 @@ def test_short_route_falls_back_for_mismatched_shapes() -> None:
     assert _route(dict(inputs, x=half_heads)) is None
 
 
+# The two-token ring reducing both tokens' projections together, which two-token calls of 64 heads in 8 groups
+# take at the measured batches of sm_100a at 148 SMs: every batch of the set and its neighbours.
+_JR_BATCH_LIST = (
+    "33-35, 51-65, 68, 86, 88-101, 104, 107-108, 110-111, 122-138, 140-141, 158-168, 170, "
+    "172-178, 195-202, 204-206, 232-237, 239-245, 248, 254-256, 270, 285, 296, 306"
+)
+_JR_BATCHES = frozenset(
+    batch
+    for part in _JR_BATCH_LIST.split(", ")
+    for batch in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)
+)
+
+
+def test_jr_ring_follows_the_measured_batches() -> None:
+    """On sm_100a at 148 SMs a two-token call of 64 heads in 8 groups runs the joint-reduction ring exactly at its
+    109 measured batches and the two-token ring at every other batch the ring serves; nothing else changes."""
+    assert len(_JR_BATCHES) == 109
+    for batch_size in range(1, 4097):
+        program, head_tiles = cake.mtp_short_program(
+            batch_size, 64, 8, 2, 148, "sm_100a"
+        )
+        if batch_size in _JR_BATCHES:
+            assert (program, head_tiles) == (_JR_RING, 1), batch_size
+        else:
+            assert program != _JR_RING, batch_size
+
+
+def test_jr_ring_stays_off_other_devices_and_token_counts() -> None:
+    """The joint-reduction batches are measured on sm_100a at 148 SMs: another architecture or SM count, one token,
+    or another head or group count never runs it."""
+    devices = (("sm_103a", 152), ("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
+    for batch_size in range(1, 4097):
+        for arch, sm_count in devices:
+            for token_steps in (1, 2):
+                program = cake.mtp_short_program(
+                    batch_size, 64, 8, token_steps, sm_count, arch
+                )[0]
+                assert program != _JR_RING
+        assert (
+            cake.mtp_short_program(batch_size, 64, 8, 1, 148, "sm_100a")[0] != _JR_RING
+        )
+        for nheads, ngroups in ((32, 8), (64, 4), (128, 8)):
+            program = cake.mtp_short_program(
+                batch_size, nheads, ngroups, 2, 148, "sm_100a"
+            )[0]
+            assert program != _JR_RING
+
+
+# The sm_103a joint-reduction ring with each consumer's state base set before the head's first wait, which
+# two-token calls of 64 heads in 8 groups take at the measured batches of sm_103a at 152 SMs.
+_JR_HB_RING = "mtp_short_ring_heads64_groups8_t2_jr_hb"
+_JR_HB_BATCH_LIST = (
+    "32-46, 50, 54-74, 76-78, 81, 83-106, 108, 110, 112-118, 123-148, 154, "
+    "156-184, 186-188, 190-256, 260, 266, 270, 280, 285, 296, 304, 320"
+)
+_JR_HB_BATCHES = frozenset(
+    batch
+    for part in _JR_HB_BATCH_LIST.split(", ")
+    for batch in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)
+)
+
+
+def test_jr_hb_ring_follows_the_measured_batches() -> None:
+    """On sm_103a at 152 SMs a two-token call of 64 heads in 8 groups runs the joint-reduction ring with the
+    per-head state base exactly at its 208 measured batches and the two-token ring at every other batch the ring
+    serves; nothing else changes."""
+    assert len(_JR_HB_BATCHES) == 208
+    for batch_size in range(1, 4097):
+        program, head_tiles = cake.mtp_short_program(
+            batch_size, 64, 8, 2, 152, "sm_103a"
+        )
+        if batch_size in _JR_HB_BATCHES:
+            assert (program, head_tiles) == (_JR_HB_RING, 1), batch_size
+        elif batch_size >= 32:
+            assert (program, head_tiles) == (
+                "mtp_short_ring_heads64_groups8_t2",
+                1,
+            ), batch_size
+
+
+def test_jr_hb_ring_stays_off_other_devices_and_token_counts() -> None:
+    """The batches are measured on sm_103a at 152 SMs: another architecture or SM count, one token, or another
+    head or group count never runs the joint-reduction ring with the per-head state base."""
+    devices = (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 148), ("sm_103a", 132))
+    for batch_size in range(1, 4097):
+        for arch, sm_count in devices:
+            for token_steps in (1, 2):
+                program = cake.mtp_short_program(
+                    batch_size, 64, 8, token_steps, sm_count, arch
+                )[0]
+                assert program != _JR_HB_RING
+        assert (
+            cake.mtp_short_program(batch_size, 64, 8, 1, 152, "sm_103a")[0]
+            != _JR_HB_RING
+        )
+        for nheads, ngroups in ((32, 8), (64, 4), (128, 8)):
+            program = cake.mtp_short_program(
+                batch_size, nheads, ngroups, 2, 152, "sm_103a"
+            )[0]
+            assert program != _JR_HB_RING
+
+
+def _jr_case(batch_size):
+    bf16 = torch.bfloat16
+    return _make_case(
+        ("mtp_short2", batch_size, 64, 8, 128, 128, 2, bf16, "auto", False, None)
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "batch_size", (32, 33, 34, 38, 64, 66, 296, 306, 307, 320, 321)
+)
+def test_jr_ring_route_takes_the_measured_batches(batch_size, cake_hits) -> None:
+    """A two-token call of 64 heads in 8 groups runs the device's joint-reduction ring (one CTA per batch row and
+    group) at its measured batches, the two-token ring at the ring's other batches, and matches FlashInfer."""
+    inputs = _jr_case(batch_size)
+    plan = _route(inputs)
+    assert plan is not None
+    sm_count = cake._sm_count(plan.device_index)
+    expected = cake.mtp_short_program(batch_size, 64, 8, 2, sm_count, plan.arch)[0]
+    assert plan.program == expected
+    if (plan.arch, sm_count) == ("sm_100a", 148):
+        assert (plan.program == _JR_RING) is (batch_size in _JR_BATCHES)
+    if (plan.arch, sm_count) == ("sm_103a", 152):
+        assert (plan.program == _JR_HB_RING) is (batch_size in _JR_HB_BATCHES)
+    if plan.program in (_JR_RING, _JR_HB_RING):
+        assert plan.grid == (batch_size * 8, 1, 1)
+        assert (plan.bindings["head_tiles"], plan.bindings["token_steps"]) == (1, 2)
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("variant", ("plain", "pad"))
+@pytest.mark.parametrize("batch_size", (32, 33, 34, 38, 64, 296, 320))
+def test_jr_ring_is_bitwise_the_two_token_ring(
+    batch_size, variant, monkeypatch
+) -> None:
+    """The device's joint-reduction ring writes the output and state of the two-token ring bit for bit on the
+    same inputs (a pad slot keeps its state and writes a zero output), and matches FlashInfer."""
+    inputs = _jr_case(batch_size)
+    if variant == "pad":
+        inputs["state_batch_indices"][3] = -1
+    reference = dict(inputs, state=inputs["state"].clone())
+    out_reference = selective_state_update(
+        **reference, backend="flashinfer", pad_slot_id=-1
+    )
+    jr_arm, ring_arm = _split_arms(inputs)
+    jr_plan = _route(jr_arm)
+    if jr_plan is None or jr_plan.program not in (_JR_RING, _JR_HB_RING):
+        pytest.skip("the route takes no joint-reduction ring on this device")
+    monkeypatch.setattr(cake, "_MTP_SHORT_RING_JR_BATCHES", {})
+    ring_plan = _route(ring_arm)
+    assert ring_plan is not None
+    assert ring_plan.program == "mtp_short_ring_heads64_groups8_t2"
+    assert ring_plan.grid == jr_plan.grid
+    with torch.cuda.device(jr_plan.device_index):
+        for plan in (jr_plan, ring_plan):
+            cake._program(plan.program, plan.arch, plan.defines).launch(
+                plan.grid, plan.bindings
+            )
+    out_jr, out_ring = jr_plan.bindings["output"], ring_plan.bindings["output"]
+    assert torch.equal(out_jr, out_ring)
+    assert torch.equal(jr_arm["state"], ring_arm["state"])
+    torch.testing.assert_close(out_jr, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        jr_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+
+
+# The one-token ring in the single-token programs' arithmetic, which BF16 single-token calls of 64 heads in 8
+# groups take at the measured batches.
+_STP_RING = "mtp_short_ring_heads64_groups8_t1_stp"
+# (batch, ring): both edges of every batch interval in which such a call runs the ring on sm_100a at 148 SMs.
+_STP_RING_EDGES = (
+    (15, False),
+    (16, True),
+    (18, True),
+    (19, False),
+    (27, False),
+    (28, True),
+    (29, True),
+    (30, False),
+    (31, True),
+    (37, True),
+    (38, False),
+    (55, False),
+    (56, True),
+    (67, True),
+    (68, False),
+    (69, False),
+    (70, True),
+    (71, True),
+    (72, False),
+)
+
+
+@pytest.mark.parametrize("batch_size, ring", _STP_RING_EDGES)
+def test_stp_ring_follows_the_measured_batches(batch_size, ring) -> None:
+    assert cake.dim128_stp_ring(batch_size, 64, 8, 148, "sm_100a") is ring
+
+
+def test_stp_ring_stays_off_other_devices_and_head_counts() -> None:
+    """The ring's batches are measured on sm_100a at 148 SMs: another architecture or SM count, or another head
+    or group count, never runs it."""
+    devices = (("sm_103a", 152), ("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
+    shapes = ((32, 8), (64, 4), (64, 16), (128, 8), (128, 16))
+    for batch_size in range(1, 4097):
+        for arch, sm_count in devices:
+            assert not cake.dim128_stp_ring(batch_size, 64, 8, sm_count, arch)
+        for nheads, ngroups in shapes:
+            assert not cake.dim128_stp_ring(batch_size, nheads, ngroups, 148, "sm_100a")
+
+
+def _stp_ring_case(batch_size):
+    bf16 = torch.bfloat16
+    return _make_case(
+        ("stp_ring", batch_size, 64, 8, 128, 128, 0, bf16, "auto", False, None)
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("batch_size, ring", _STP_RING_EDGES)
+def test_stp_ring_route_takes_the_measured_batches(batch_size, ring, cake_hits) -> None:
+    """A canonical BF16 single-token call of 64 heads in 8 groups runs the one-token ring (one CTA per batch row
+    and group) at the device's measured batches, a single-token program at the others, and matches
+    FlashInfer."""
+    inputs = _stp_ring_case(batch_size)
+    plan = _route(inputs)
+    assert plan is not None
+    sm_count = cake._sm_count(plan.device_index)
+    if cake.dim128_stp_ring(batch_size, 64, 8, sm_count, plan.arch):
+        assert (plan.program, plan.grid) == (_STP_RING, (batch_size * 8, 1, 1))
+        assert (plan.bindings["head_tiles"], plan.bindings["token_steps"]) == (1, 1)
+    else:
+        assert plan.program != _STP_RING
+    if (plan.arch, sm_count) == ("sm_100a", 148):
+        assert (plan.program == _STP_RING) is ring
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("variant", ("plain", "pad", "softplus"))
+@pytest.mark.parametrize("batch_size", (16, 33, 64))
+def test_stp_ring_is_bitwise_the_single_token_build(
+    batch_size, variant, monkeypatch
+) -> None:
+    """The one-token ring writes the output and state of the single-token program the call runs off the ring's
+    batches, bit for bit, on the same inputs (a pad slot keeps its state; softplus), and matches FlashInfer."""
+    inputs = _stp_ring_case(batch_size)
+    if variant == "pad":
+        inputs["state_batch_indices"][3] = -1
+    elif variant == "softplus":
+        inputs["dt_softplus"] = True
+    reference = dict(inputs, state=inputs["state"].clone())
+    out_reference = selective_state_update(
+        **reference, backend="flashinfer", pad_slot_id=-1
+    )
+    ring_arm, rows_arm = _split_arms(inputs)
+    ring_plan = _route(ring_arm)
+    if ring_plan is None or ring_plan.program != _STP_RING:
+        pytest.skip("the route takes no one-token ring on this device")
+    monkeypatch.setattr(cake, "_DIM128_STP_RING_BATCHES", {})
+    rows_plan = _route(rows_arm)
+    assert rows_plan is not None and rows_plan.program != _STP_RING
+    with torch.cuda.device(ring_plan.device_index):
+        for plan in (ring_plan, rows_plan):
+            cake._program(plan.program, plan.arch, plan.defines).launch(
+                plan.grid, plan.bindings
+            )
+    out_rows = rows_plan.bindings["output"]
+    out_ring = ring_plan.bindings["output"].view(out_rows.shape)
+    assert torch.equal(out_ring, out_rows)
+    assert torch.equal(ring_arm["state"], rows_arm["state"])
+    torch.testing.assert_close(out_ring, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        ring_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("variant", ("z", "dst", "disable", "padded", "dense_dt"))
+def test_stp_ring_route_keeps_the_single_token_programs_off_its_layout(
+    variant,
+) -> None:
+    """A call at a ring batch that the ring does not read -- a gate ``z``, a destination table, no state update,
+    ``x`` / ``B`` / ``C`` at a wider batch stride, one ``dt`` per element -- never plans the ring."""
+    inputs = _stp_ring_case(64)
+    plan = _route(inputs)
+    if plan is None or plan.program != _STP_RING:
+        pytest.skip("the route takes no one-token ring on this device")
+    if variant == "dense_dt":
+        inputs["dt"] = inputs["dt"].contiguous()
+    else:
+        inputs = _vary(inputs, variant)
+    plan = _route(inputs)
+    assert plan is None or plan.program != _STP_RING
+
+
 @requires_blackwell
 def test_horizontal_route_serves_padded_rows(cake_hits) -> None:
     """x, B, C and the state reach the horizontal program through tensor maps built from their strides: a padded x stays on it."""
@@ -1960,13 +2446,21 @@ _MULTI_TOKEN_ROUTES = (
     ("mtp_cache", "mtp_cache_groups8_heads64", (1, 64, 4)),
     ("mtp_cache_g1", "mtp_cache_groups1_heads64", (1, 64, 4)),
     ("mtp_short1", "mtp_short_ring_heads64_groups8_t1", (64 * 8, 1, 1)),
-    ("mtp_short2", "mtp_short_ring_heads64_groups8_t2", (64 * 8, 1, 1)),
-    ("mtp_short2_b256", "mtp_short_ring_heads64_groups8_t2", (256 * 8, 1, 1)),
+    (
+        "mtp_short2",
+        {"sm_100a": _JR_RING, "sm_103a": _JR_HB_RING},
+        (64 * 8, 1, 1),
+    ),
+    (
+        "mtp_short2_b256",
+        {"sm_100a": _JR_RING, "sm_103a": _JR_HB_RING},
+        (256 * 8, 1, 1),
+    ),
     ("mtp_short1_b16", "mtp_short_prefetch_heads64_groups8", (16 * 64, 1, 1)),
     ("mtp_short2_h32", "mtp_short_prefetch", (64 * 32, 1, 1)),
     ("mtp_horizontal", "mtp_horizontal_early", (32 * 64 // 2, 1, 1)),
     ("mtp_horizontal_b64", "mtp_horizontal_direct", (64 * 64 // 2, 1, 1)),
-    ("stp_fp32", "stp_dim128_fp32", (8, 64, 64)),
+    ("stp_fp32", "stp_dim128_fp32_l2_prefetch", (8, 64, 64)),
 )
 
 
@@ -2171,7 +2665,7 @@ def test_registry_names_every_program() -> None:
         "hpc1_ratio8": (both, None),
         "hpc1": (both, None),
         "hpc2_mb2": (None, both),
-        "hpc2": (gb300, b200),
+        "hpc2": (gb300, both),
         "hpc4": (None, both),
         "hpc1_ratio8_s4w2": (b200, gb300),
         "hpc1_s4w2": (b200, gb300),
@@ -2208,7 +2702,7 @@ def test_registry_names_every_program() -> None:
             for name, arches in paired_rows.items()
             if "_lean" in name and arch in arches
         }
-        assert len(lean) == {"sm_100a": 19, "sm_103a": 21}[arch]
+        assert len(lean) == {"sm_100a": 19, "sm_103a": 23}[arch]
     rows = {
         f"stp_hd64_rows_{band}{abi}"
         for band in ("bf16_dt8", "bf16_dt4_od", "fp32_dt8", "fp32_dt1_large")
@@ -2221,7 +2715,10 @@ def test_registry_names_every_program() -> None:
         "stp_hd64_rows_fp32_dt2_bf16_i32",
         "stp_hd64_rows_fp32_dt1_bf16_i32",
         "stp_hd64_rows_fp32_dt1_l2_prefetch_bf16_i32",
+        "stp_hd64_rows_fp32_dt1_large_sl2first",
+        "stp_hd64_rows_fp32_dt1_large_sl2first_bf16_i32",
         "stp_dim128_fp32",
+        "stp_dim128_fp32_l2_prefetch",
     }
     multi_token = {
         "dynamic_lanes8",
@@ -2236,6 +2733,9 @@ def test_registry_names_every_program() -> None:
         "mtp_short_prefetch_heads64_groups8",
         "mtp_short_ring_heads64_groups8_t1",
         "mtp_short_ring_heads64_groups8_t2",
+        _STP_RING,
+        _JR_RING,
+        _JR_HB_RING,
         "mtp_horizontal_early",
         "mtp_horizontal_direct",
     }
@@ -2244,11 +2744,19 @@ def test_registry_names_every_program() -> None:
     # three).
     carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
     assert set(cake.PROGRAMS) == set(paired_rows) | rows | multi_token | carried
-    assert len(cake.PROGRAMS) == 69
+    assert len(cake.PROGRAMS) == 75
     # A build shipping on one architecture spells it; every other record serves both.
+    expected_arches = dict(
+        paired_rows,
+        **{_STP_RING: b200, _JR_RING: b200, _JR_HB_RING: gb300},
+        **{
+            f"stp_hd64_rows_fp32_dt1_large_sl2first{abi}": gb300
+            for abi in ("", "_bf16_i32")
+        },
+    )
     for program, module in cake.PROGRAMS.items():
         arches = cake.MODULES[module].get("arches", both)
-        assert arches == paired_rows.get(program, both), program
+        assert arches == expected_arches.get(program, both), program
     for program in carried:
         assert cake.MODULES[cake.PROGRAMS[program]]["defines"]
     for program in set(cake.PROGRAMS) - carried:

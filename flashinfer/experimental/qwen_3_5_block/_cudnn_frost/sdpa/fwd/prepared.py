@@ -194,6 +194,8 @@ class ThdLaunchSpec:
         "lse_stride",
         "s_q_max",
         "cga_tile_m",
+        "wave_policy",
+        "wave_geometry",
         "total_q",
         "total_kv",
         "fixed_batch",
@@ -206,12 +208,13 @@ class ThdLaunchSpec:
         "split_workspace",
         "neg_inf",
         "device_index",
+        "origin_specs",
     )
 
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots the native THD binder writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form thd_origin_ptrs o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
@@ -248,6 +251,12 @@ def _covering(shape: Tuple[int, ...], strides: Tuple[int, ...]) -> bool:
     return True
 
 
+@lru_cache(maxsize=256)
+def _host_parameter_order(host) -> Tuple[str, ...]:
+    """Immutable template-host slots; compiled wrappers are checked separately."""
+    return tuple(n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation))
+
+
 def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     """``(raw positional entry, compiled artifact, host slot order)`` of the adapter's compiled kernel;
     NotImplementedError when the artifact has no positional entry or the host is not the expected shape."""
@@ -259,7 +268,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
+    order = list(_host_parameter_order(host))
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
     wrapper_sig = getattr(compiled, "_kwargs_wrapper", None) or compiled
@@ -281,6 +290,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s = ThdLaunchSpec()
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
+    s.origin_specs = getattr(api, "_thd_origin_specs", None)
     s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
@@ -310,6 +320,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
             raise ValueError("cudnn.sdpa: padded Stats strides must not overlap")
         s.lse_fill_plan = tuple(s.lse_fill_plan)
     s.cga_tile_m = int(plan.cga_tile_m)
+    s.wave_policy = getattr(plan, "wave_policy", None)
+    s.wave_geometry = getattr(plan, "wave_geometry", None)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
@@ -381,6 +393,22 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
             "cudnn.sdpa: the prepared THD binder of this build has no epilogue-gate role (the pybind extension predates the THD gate "
             "descriptor); rebuild the extension, or run the gate as its own stage"
         )
+    if s.wave_policy is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_waves", False):
+        raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires runtime initial-wave binding; rebuild the extension")
+    if s.wave_geometry is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_initial_wave_geometry", False):
+        raise NotImplementedError("cudnn.sdpa: this prepared THD launch requires packed initial-wave geometry; rebuild the extension")
+    if s.origin_specs is not None and not getattr(_pybind_module._SdpaThdBinder, "supports_physical_origins", False):
+        raise NotImplementedError("physical THD origins require rebuilding the native extension")
+    if s.origin_specs is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_physical_origins", False):
+        raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
+    if s.quant is not None and s.paged and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_fp8_physical_origins", False):
+        raise NotImplementedError("paged FP8 THD requires rebuilding the native extension")
     s.native = _pybind_module._SdpaThdBinder(s)
     return s
 
@@ -434,6 +462,10 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
 
     roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    if getattr(spec, "origin_specs", None) is not None:
+        from .thd_origins import ROLES
+
+        roles += ROLES
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     gate_index = -1
     if gate is not None:
@@ -523,22 +555,33 @@ class PreparedThdLaunch:
                 tensor = getattr(binding, name)
                 if tensor is not None:
                     uids[name] = tensor.get_uid()
+        if spec.origin_specs is not None:
+            from .thd_origins import ROLES
+
+            for role, origin in zip(ROLES, spec.origin_specs):
+                if origin is not None:
+                    uids[role] = getattr(binding, role).get_uid()
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        roles = dict(zip(self._roles, self._indices))
+        native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+        if self.spec.origin_specs is not None:
+            from .thd_origins import ROLES
+
+            native_roles += ROLES
+        self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
-        indices = self._indices
-        if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         if self._native_indices is None:
-            roles = dict(zip(self._roles, indices))
-            native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
-            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+            self._prepare_indices(pack.index_of)
         self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
 
 
@@ -548,7 +591,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots the native dense binder writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form thd_origin_ptrs o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
     "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
     "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
@@ -849,7 +892,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100 import split_combine
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost import _pybind_module
 
-        s.combine_q_lens = bool(s.has_sink) and s.quant is None and s.seq_q_present and not s.ragged
+        if s.has_sink and s.quant is not None and not getattr(_pybind_module._SdpaDenseBinder, "supports_quantized_split_sink", False):
+            raise NotImplementedError("cudnn.sdpa: FP8 split attention with a sink needs the native quantized sink-combine binder; rebuild the extension")
+        s.combine_q_lens = bool(s.has_sink) and s.seq_q_present and not s.ragged
         if s.combine_q_lens and not getattr(_pybind_module._SdpaDenseBinder, "supports_combine_q_lens", False):
             raise NotImplementedError(
                 "cudnn.sdpa: a split attention sink over padded query lengths needs the native binder that passes them to the combine; rebuild the extension"
@@ -875,8 +920,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # compiled with its griddepcontrol sites releases this pass early, and this pass waits before its first read).
             **({"use_pdl": True} if getattr(api, "use_pdl", False) else {}),
             decode_grid=decode_grid,
-            # Half flavors fold the attention sink in the combine (sink-free partials).
-            has_sink=bool(s.has_sink) and s.quant is None,
+            # Every admitted split sink is folded once over sink-free partials.
+            has_sink=bool(s.has_sink),
             has_q_lens=s.combine_q_lens,
         )
         fn = positional_entry(owner)

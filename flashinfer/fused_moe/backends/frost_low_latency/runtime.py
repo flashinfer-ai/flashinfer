@@ -113,8 +113,13 @@ def _execute(inputs, config, tile_k):
         else cutlass.Float8E4M3FN
     )
 
+    from ....utils import get_compute_capability
+
+    capability = get_compute_capability(q.device)
+    major, minor = capability
     key = (
-        "mx-tc-ffi-v1",
+        "mx-tc-ffi-v2",
+        capability,
         geometry,
         tile_k,
         pdl,
@@ -157,7 +162,7 @@ def _execute(inputs, config, tile_k):
                     narrow_weights,
                     config.finalize.do_finalize,
                     cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                    options="--enable-tvm-ffi",
+                    options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
                 )
                 # The cache owns only executable and immutable shape metadata.
                 compiled = (entry, first_shape, second_shape)

@@ -120,15 +120,17 @@ def test_quantizer_takes_the_static_k_instance_below_the_row_limit():
                     assert KERNELS[arch][runtime_key] not in set(family.values())
             # A strided view cannot take the compiled-in instance (the program assumes
             # contiguous rows); the runtime-geometry sibling it falls back to exists only
-            # where the validated matrix reaches that CTA shape -- see
-            # test_row_strided_activation_at_a_new_width_names_its_missing_program.
+            # where the validated matrix reaches that CTA shape, else the rows run the
+            # nearest registered program -- see
+            # test_row_strided_activation_at_a_new_width_runs_a_registered_program.
             strided = cb.quant_plan(
                 m, k, True, True, "sm_100a", 148, x_row_stride=k + 16
             )
             if m == 1:
                 assert strided == plan
             else:
-                assert strided.kernel_key == runtime_key and strided.k_static is None
+                key = strided.unregistered_key or strided.kernel_key
+                assert key == runtime_key and strided.k_static is None
         # the row counts of the tier span exactly two CTA shapes per width
         shapes = {
             cb.cta_config(k, m) for m in (1, 8, 16, 130, 511, cb.LARGE_ROW_MIN_M, 2048)
@@ -151,28 +153,31 @@ def test_quantizer_takes_the_static_k_instance_below_the_row_limit():
     assert other.k_static is None
 
 
-def test_row_strided_activation_at_a_new_width_names_its_missing_program():
+def test_row_strided_activation_at_a_new_width_runs_a_registered_program():
     """A row-strided activation cannot take the compiled-in instance -- the program assumes
-    contiguous rows -- so it falls back to the runtime-geometry key of the same CTA shape.
-    The CTA shapes that only the new widths reach (K = 2688 / 4096 at or above
-    LARGE_ROW_MIN_M) have no runtime-geometry program in this package, and the dispatcher
-    names the missing key instead of mis-dispatching.  Generating the runtime-geometry
-    sibling of those shapes is a recorded follow-up."""
-    named = 0
+    contiguous rows -- so it takes the runtime-geometry key of the same CTA shape.  The
+    CTA shapes that only the new widths reach (K = 2688 / 4096) have no runtime-geometry
+    program in this package: those rows run the nearest registered runtime-geometry
+    program of the same input dtype and folded scale whose CTA holds the row (one CTA per
+    padded row), and the plan records the key it replaces."""
+    replaced = 0
     for k in (2688, 4096):
-        for m in (cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
-            plan = cb.quant_plan(m, k, True, False, "sm_100a", 148, x_row_stride=k + 16)
-            assert plan.k_static is None
-            if plan.kernel_key in KERNELS["sm_100a"]:
-                continue
-            named += 1
-            with pytest.raises(
-                NotImplementedError, match=r"quant:t\d+_b\d+_mb\d+_bf16"
-            ):
-                kernel_module_name("sm_100a", plan.kernel_key)
-    assert (
-        named > 0
-    )  # recorded follow-up: runtime-geometry sibling of the new CTA shapes
+        for m in (2, 130, cb.LARGE_ROW_MIN_M, 2048, cb.STATIC_M_LIMIT - 1):
+            for fold in (False, True):
+                plan = cb.quant_plan(
+                    m, k, True, fold, "sm_100a", 148, x_row_stride=k + 16
+                )
+                assert plan.k_static is None and plan.kernel_key in KERNELS["sm_100a"]
+                if plan.unregistered_key is None:
+                    continue
+                replaced += 1
+                assert plan.unregistered_key not in KERNELS["sm_100a"]
+                assert not re.search(r"_k\d+$", plan.kernel_key), plan.kernel_key
+                assert ("_fold" in plan.kernel_key) == fold
+                assert "_bf16" in plan.kernel_key
+                assert plan.threads * plan.blocks_per_thread * 16 >= k
+                assert plan.grid == plan.padded_rows and plan.cluster_split == 1
+    assert replaced > 0
 
 
 def test_quant_plan_grid_and_keys():
@@ -286,9 +291,15 @@ def test_quantizer_alone_cluster_split_rows():
     other = {"sm_100a": 152, "sm_103a": 148}
     for arch, table in cb.QUANT_ALONE_CLUSTER_SPLIT.items():
         sm_count = cb.MEASURED_SM_COUNT[arch]
+        # REACHABLE_M steps by 4 and misses some range endpoints (M = 130): plan
+        # every endpoint of the table too.
+        ms = sorted(
+            set(REACHABLE_M)
+            | {v for ranges in table.values() for lo, hi, _ in ranges for v in (lo, hi)}
+        )
         served = set()
         for k in sorted(set(REACHABLE_K) | set(table)):
-            for m in REACHABLE_M:
+            for m in ms:
                 for fold in (False, True):
                     chain = cb.quant_plan(m, k, True, fold, arch, sm_count)
                     alone = _registered(
@@ -316,7 +327,7 @@ def test_quantizer_alone_cluster_split_rows():
             (k, m)
             for k, ranges in table.items()
             for lo, hi, _ in ranges
-            for m in REACHABLE_M
+            for m in ms
             if lo <= m <= hi
         }
         assert served == listed, (arch, sorted(listed - served))
@@ -324,10 +335,18 @@ def test_quantizer_alone_cluster_split_rows():
 
 def test_f16_quantizer_shapes_match_the_validated_f16_rows():
     """fp16 activations are generated for the validated fp16 rows (K = 7168 at
-    256 threads, scale not folded); every other fp16 shape names its missing
-    program instead of mis-dispatching."""
+    256 threads, scale not folded).  Contiguous K = 7168 rows of any token count run
+    those programs (a single row and STATIC_M_LIMIT rows or more as the nearest
+    registered program); every other fp16 shape names its missing program instead
+    of mis-dispatching."""
     for m in VALIDATED_F16_INPUT_ROWS:
         _registered(cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a")
+    for m in (1, cb.STATIC_M_LIMIT, 16384):
+        plan = _registered(
+            cb.quant_plan(m, 7168, False, False, "sm_100a", 148), "sm_100a"
+        )
+        assert plan.unregistered_key is not None and plan.k_static == 7168
+        assert plan.grid == plan.padded_rows and plan.cluster_split == 1
     unregistered = 0
     for k in REACHABLE_K:
         for m in REACHABLE_M:
@@ -732,7 +751,8 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
 
 # The validated matrix (validated_problems in tests/test_helpers/
 # cake_nvfp4_per_token.py): bf16 activations on
-# every K x M x fold; fp16 activations on the validated fp16 rows of K=7168 only.
+# every K x M x fold; fp16 activations on the validated fp16 rows of K=7168, and the
+# K=7168 rows outside them that run the nearest registered program (1 and 8192 tokens).
 _QUANT_CASES = (
     [
         (m, k, torch.bfloat16, fold)
@@ -740,7 +760,7 @@ _QUANT_CASES = (
         for k in (7168, 16384)
         for m in (1, 17, 130, 257, 4097)
     ]
-    + [(m, 7168, torch.float16, False) for m in VALIDATED_F16_INPUT_ROWS]
+    + [(m, 7168, torch.float16, False) for m in (*VALIDATED_F16_INPUT_ROWS, 1, 8192)]
     # Row lengths outside the measured families and the token counts between tiles.
     + [
         (m, k, torch.bfloat16, False)
@@ -821,8 +841,8 @@ def test_quantizer_alone_split_matches_the_chain_quantizer(k, m, fold):
 
 # K = 2688 / 4096 are covered at M = 1 only: a single row has no stride, so it keeps the
 # compiled-in instance.  Multi-row strided sets at those widths fall back to a runtime-geometry
-# program the package does not carry -- see
-# test_row_strided_activation_at_a_new_width_names_its_missing_program.
+# program of another CTA shape -- see
+# test_quantize_reads_row_strided_activations_at_a_new_width.
 @pytest.mark.parametrize("k,m", [(7168, 130), (7168, 8), (2688, 1), (4096, 1)])
 def test_quantize_reads_row_strided_activations_in_place(k, m):
     device = _require_program()
@@ -842,6 +862,18 @@ def test_quantize_reads_row_strided_activations_in_place(k, m):
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a.reshape(-1), b.reshape(-1))
     _check_against_reference(x, gs_inv, None, *got)
+
+
+@pytest.mark.parametrize("k,m", [(2688, 130), (4096, 2048)])
+def test_quantize_reads_row_strided_activations_at_a_new_width(k, m):
+    # Multi-row strided sets at K = 2688 / 4096 run the nearest registered
+    # runtime-geometry program (test_row_strided_activation_at_a_new_width_runs_a_
+    # registered_program); the outputs equal the contiguous copy's bit for bit.
+    device = _require_program()
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    plan = cb.quant_plan(m, k, True, False, arch, sm_count, x_row_stride=k + 64)
+    assert plan.k_static is None and plan.kernel_key in KERNELS[arch]
+    test_quantize_reads_row_strided_activations_in_place(k, m)
 
 
 def test_quantize_repeated_call_allocates_only_its_outputs():

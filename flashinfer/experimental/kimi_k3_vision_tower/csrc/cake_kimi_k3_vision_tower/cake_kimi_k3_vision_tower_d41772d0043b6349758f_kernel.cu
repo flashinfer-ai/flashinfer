@@ -905,17 +905,23 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
+            int p_rel_0 = 0;
+            int p_rel_1 = 0;
+            int c_rel_0 = 0;
+            int c_rel_1 = 0;
             asm volatile(
                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                 :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
+            p_rel_0 += 1;
             asm volatile(
                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                 :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+            p_rel_1 += 1;
             unsigned int q_slot_c = 0;
-            unsigned int _phase_o_full_0 = 0;
-            unsigned int _phase_o_full_1 = 0;
             unsigned int _phase_scale_full_0 = 0;
             unsigned int _phase_scale_full_1 = 0;
+            unsigned int _phase_o_full_0 = 0;
+            unsigned int _phase_o_full_1 = 0;
             #pragma unroll 1
             for (unsigned int tile_idx_1 = cluster_id; tile_idx_1 < total_tiles; tile_idx_1 += num_clusters) {
                 int rec_1 = tile_idx_1 * 2;
@@ -938,6 +944,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                 mbarrier_wait(scale_full_addr, _phase_scale_full_0);
                 _phase_scale_full_0 ^= 1;
                 mbarrier_arrive(corr_done_addr);
+                c_rel_0 += 1;
 #if __CUDA_ARCH__ == 1000
                 mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
                 _phase_scale_full_1 ^= 1;
@@ -980,8 +987,56 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
+                    p_rel_0 += 1;
 #if __CUDA_ARCH__ == 1000
+#else
+                    if (live_1 != 0) {
+                        mbarrier_arrive(corr_done_addr + 8);
+                        c_rel_1 += 1;
+                        mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
+                        _phase_scale_full_1 ^= 1;
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        float _tmem_load_2[1];
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x1.b32"
+                            " {%0}, [%1];"
+                            : "=f"(_tmem_load_2[0])
+                            : "r"(taddr + (unsigned int)BLOCK_M + (unsigned int)(warp % 4 * 32 << 16)));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        float scale1 = _tmem_load_2[0];
+                        int skip_rescale1 = __all_sync(0xFFFFFFFF, scale1 == 1.0f);
+                        if (skip_rescale1 == 0) {
+                            #pragma unroll
+                            for (int col_1 = 0; col_1 < HEAD_DIM / 16; col_1++) {
+                                int addr1 = taddr + (unsigned int)384 + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(col_1 * 16);
+                                float _tmem_load_3[16];
+                                tmem_ld_x16(&_tmem_load_3[0], addr1);
+                                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                                const float2 _scale2_1 = {scale1, scale1};
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
+                                tmem_st_x16_f32(addr1, _tmem_load_3);
+                            }
+                            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                        }
+                        asm volatile("tcgen05.fence::before_thread_sync;");
+                        asm volatile(
+                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                            :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                        p_rel_1 += 1;
+                        mbarrier_arrive(corr_done_addr);
+                        c_rel_0 += 1;
+                    } else {
+                        mbarrier_arrive(corr_done_addr);
+                        c_rel_0 += 1;
+                    }
+                }
+                if (live_1 != 0) {
+#endif
                     mbarrier_arrive(corr_done_addr + 8);
+                    c_rel_1 += 1;
+#if __CUDA_ARCH__ == 1000
                     mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
                     _phase_scale_full_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1002,70 +1057,27 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                             tmem_ld_x16(&_tmem_load_3[0], addr1);
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             const float2 _scale2_1 = {scale1, scale1};
-#else
-                    if (live_1 != 0) {
-                        mbarrier_arrive(corr_done_addr + 8);
-                        mbarrier_wait(scale_full_addr + 8, _phase_scale_full_1);
-                        _phase_scale_full_1 ^= 1;
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        float _tmem_load_2[1];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.32x32b.x1.b32"
-                            " {%0}, [%1];"
-                            : "=f"(_tmem_load_2[0])
-                            : "r"(taddr + (unsigned int)BLOCK_M + (unsigned int)(warp % 4 * 32 << 16)));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float scale1 = _tmem_load_2[0];
-                        int skip_rescale1 = __all_sync(0xFFFFFFFF, scale1 == 1.0f);
-                        if (skip_rescale1 == 0) {
-#endif
                             #pragma unroll
-#if __CUDA_ARCH__ == 1000
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
                             tmem_st_x16_f32(addr1, _tmem_load_3);
-#else
-                            for (int col_1 = 0; col_1 < HEAD_DIM / 16; col_1++) {
-                                int addr1 = taddr + (unsigned int)384 + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(col_1 * 16);
-                                float _tmem_load_3[16];
-                                tmem_ld_x16(&_tmem_load_3[0], addr1);
-                                asm volatile("tcgen05.wait::ld.sync.aligned;");
-                                const float2 _scale2_1 = {scale1, scale1};
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 8; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
-                                tmem_st_x16_f32(addr1, _tmem_load_3);
-                            }
-                            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-#endif
                         }
-#if __CUDA_ARCH__ == 1000
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-#else
-                        asm volatile("tcgen05.fence::before_thread_sync;");
-                        asm volatile(
-                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                            :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
-                        mbarrier_arrive(corr_done_addr);
-                    } else {
-                        mbarrier_arrive(corr_done_addr);
-#endif
                     }
-#if __CUDA_ARCH__ == 1000
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                    p_rel_1 += 1;
                     mbarrier_arrive(corr_done_addr);
+                    c_rel_0 += 1;
 #else
 #endif
                 }
 #if __CUDA_ARCH__ == 1000
                 mbarrier_arrive(corr_done_addr + 8);
+                c_rel_1 += 1;
 #else
-                if (live_1 != 0) {
-                    mbarrier_arrive(corr_done_addr + 8);
-                }
 #endif
                 mbarrier_wait(o_full_addr, _phase_o_full_0);
                 _phase_o_full_0 ^= 1;
@@ -1127,6 +1139,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
+                    p_rel_0 += 1;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 3, 128;" ::: "memory");
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1208,6 +1221,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr) & 0xFEFFFFFF) : "memory");
+                    p_rel_0 += 1;
                 }
 #if __CUDA_ARCH__ == 1000
                 int tile1_valid = tile0_valid - BLOCK_M;
@@ -1247,6 +1261,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                    p_rel_1 += 1;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 3, 128;" ::: "memory");
                     if (warp == 8) {
@@ -1372,6 +1387,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                         asm volatile(
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                             :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                        p_rel_1 += 1;
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("barrier.sync 3, 128;" ::: "memory");
                         if (warp == 8) {
@@ -1452,6 +1468,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                         asm volatile(
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                             :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                        p_rel_1 += 1;
 #endif
                     }
 #if __CUDA_ARCH__ == 1000
@@ -1459,6 +1476,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((p_full_addr + 8) & 0xFEFFFFFF) : "memory");
+                    p_rel_1 += 1;
 #else
 #endif
                 }
@@ -1478,15 +1496,22 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
     // ---- Role: mma ----
     if (warp == 12) {
         { // mma_main
+            unsigned int _phase_q_full = 0;
+            unsigned int _phase_kv_full = 0;
             unsigned int _phase_p_full_0 = 0;
             unsigned int _phase_p_full_2_0 = 0;
             unsigned int _phase_p_full_1 = 0;
             unsigned int _phase_p_full_2_1 = 0;
             if (cta_rank == 0) {
                 unsigned int kv_stage = 0;
-                unsigned int kv_phase = 0;
+                int s_pub_0 = 0;
+                int s_pub_1 = 0;
+                int o_units = 0;
+#if __CUDA_ARCH__ == 1000
+#else
+                int o_units1 = 0;
+#endif
                 unsigned int q_stage = 0;
-                unsigned int q_phase = 0;
                 #pragma unroll 1
                 for (unsigned int tile_idx_2 = cluster_id; tile_idx_2 < total_tiles; tile_idx_2 += num_clusters) {
                     int rec_2 = tile_idx_2 * 2;
@@ -1498,7 +1523,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     int doc_len_2 = seg_len[seg_2];
                     int m_block_2 = c_2 * 2 + cta_rank;
                     int num_n_blocks_2 = (doc_len_2 + BLOCK_N - 1) / BLOCK_N;
-                    mbarrier_wait_cluster_hint(q_full_addr + (q_stage) * 8, q_phase, 10000000);
+                    mbarrier_wait_cluster_hint(q_full_addr + (q_stage) * 8, _phase_q_full, 10000000);
 #if __CUDA_ARCH__ == 1000
 #else
                     int unit_rows_2 = doc_len_2 - (m_block_2 - cta_rank) * (2 * BLOCK_M);
@@ -1507,7 +1532,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                         live_2 = 1;
                     }
 #endif
-                    mbarrier_wait(kv_full_addr + (kv_stage) * 8, kv_phase);
+                    mbarrier_wait(kv_full_addr + (kv_stage) * 8, _phase_kv_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_a_lo_0 = (((smem_qa_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                     int _mma_b_lo_0 = (((smem_kv_addr) >> 4) & 0x3FFF) + (kv_stage) * 1024;
@@ -1566,6 +1591,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_scores), "r"(0) : "memory");
                     elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
+                    s_pub_0 += 1;
 #if __CUDA_ARCH__ == 1000
                     int _mma_a_lo_1 = (((smem_qb_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                     int _mma_b_lo_1 = (((smem_kv_addr) >> 4) & 0x3FFF) + (kv_stage) * 1024;
@@ -1631,22 +1657,21 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_scores + (128))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1000
                     elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
+                    s_pub_1 += 1;
 #else
                         elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
+                        s_pub_1 += 1;
                     }
 #endif
                     elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
                     kv_stage += 1;
-                    if (kv_stage == 5) { kv_stage = 0; kv_phase ^= 1; }
+                    if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
                     unsigned int first_pv = 1;
                     #pragma unroll 1
                     for (unsigned int n_iter_2 = 0; n_iter_2 < num_n_blocks_2 - 1; n_iter_2++) {
                         unsigned int v_stage = kv_stage;
-                        unsigned int v_phase = kv_phase;
-                        kv_stage += 1;
-                        if (kv_stage == 5) { kv_stage = 0; kv_phase ^= 1; }
+                        mbarrier_wait(kv_full_addr + (kv_stage) * 8, _phase_kv_full);
                         int first_pv_flag = first_pv;
-                        mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
                         mbarrier_wait(p_full_addr, _phase_p_full_0);
                         _phase_p_full_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1713,11 +1738,8 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%0], [ta], db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_3), "r"(tmem_probs_0), "r"(1) : "memory");
-                        unsigned int k_stage = kv_stage;
-                        unsigned int k_phase = kv_phase;
-                        kv_stage += 1;
-                        if (kv_stage == 5) { kv_stage = 0; kv_phase ^= 1; }
-                        mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
+                        unsigned int k_stage = ((kv_stage + 1 < 5) ? kv_stage + 1 : (unsigned int)0);
+                        mbarrier_wait(kv_full_addr + (((kv_stage + 1 < 5) ? kv_stage + 1 : (unsigned int)0)) * 8, ((kv_stage + 1 < 5) ? _phase_kv_full : _phase_kv_full ^ 1));
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int _mma_a_lo_2 = (((smem_qa_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                         int _mma_b_lo_4 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
@@ -1776,6 +1798,7 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_4), "r"(tmem_scores), "r"(0) : "memory");
                         elect_commit_cg2_multicast(s_full_addr, (uint16_t)(3));
+                        s_pub_0 += 1;
 #if __CUDA_ARCH__ == 1000
                         mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                         _phase_p_full_1 ^= 1;
@@ -1863,7 +1886,9 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
 #else
                         }
 #endif
-                        elect_commit_cg2_multicast(kv_empty_addr + (v_stage) * 8, (uint16_t)(3));
+                        elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
+                        kv_stage += 1;
+                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
 #if __CUDA_ARCH__ == 1000
                         int _mma_a_lo_3 = (((smem_qb_addr) >> 4) & 0x3FFF) + (q_stage) * 4096;
                         int _mma_b_lo_7 = (((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024;
@@ -1929,17 +1954,21 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_7), "r"((tmem_scores + (128))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1000
                         elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
+                        s_pub_1 += 1;
 #else
                             elect_commit_cg2_multicast(s_full_addr + 8, (uint16_t)(3));
+                            s_pub_1 += 1;
                         }
 #endif
-                        elect_commit_cg2_multicast(kv_empty_addr + (k_stage) * 8, (uint16_t)(3));
+                        elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
+                        kv_stage += 1;
+                        if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
                         first_pv = 0;
                     }
                     q_stage += 1;
-                    if (q_stage == 2) { q_stage = 0; q_phase ^= 1; }
+                    if (q_stage == 2) { q_stage = 0; _phase_q_full ^= 1; }
                     int first_pv_flag_1 = first_pv;
-                    mbarrier_wait(kv_full_addr + (kv_stage) * 8, kv_phase);
+                    mbarrier_wait(kv_full_addr + (kv_stage) * 8, _phase_kv_full);
                     mbarrier_wait(p_full_addr, _phase_p_full_0);
                     _phase_p_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2095,13 +2124,18 @@ kernel_cake_kimi_k3_vision_tower_d41772d0043b6349758f(const __grid_constant__ CU
 #endif
                     elect_commit_cg2_multicast(kv_empty_addr + (kv_stage) * 8, (uint16_t)(3));
                     kv_stage += 1;
-                    if (kv_stage == 5) { kv_stage = 0; kv_phase ^= 1; }
+                    if (kv_stage == 5) { kv_stage = 0; _phase_kv_full ^= 1; }
                     elect_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
 #if __CUDA_ARCH__ == 1000
                     elect_commit_cg2_multicast(o_full_addr + 8, (uint16_t)(3));
 #else
+#endif
+                    o_units += 1;
+#if __CUDA_ARCH__ == 1000
+#else
                     if (live_2 != 0) {
                         elect_commit_cg2_multicast(o_full_addr + 8, (uint16_t)(3));
+                        o_units1 += 1;
                     }
 #endif
                 }

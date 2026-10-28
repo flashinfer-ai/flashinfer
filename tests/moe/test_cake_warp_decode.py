@@ -1120,7 +1120,8 @@ _GPU_SEED = 20260205
 # of their generated source file). Rows that differ only in workfeed CTAs launch
 # the same kernels and are not listed.
 _GPU_GEOMETRIES = (
-    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 3, 4, 32)),
+    # T2: sm103 finalize ecc88726. T5: sm103 finalize b13a3c73.
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 3, 4, 5, 32)),
     _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
     _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
     _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),

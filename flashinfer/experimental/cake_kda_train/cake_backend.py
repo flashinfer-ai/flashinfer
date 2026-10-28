@@ -386,7 +386,7 @@ class Plan:
     pseudo-sequences; ``proportional`` / ``seg_arg`` are the block table's form and the walk programs' segment
     scalar, :func:`cake_jit.segment_args`) or ``"serial"`` (``P = 1``, ``NSEG = 0``); ``gsize`` is the segment
     group size of the two-level carry where the plan dispatches ``seg_carry_v8`` (:func:`cake_jit.carry_choice`),
-    else 0; ``gate_fused`` whether the GLM intra program writes the gate gradients itself (``glm_intra_v14``: no
+    else 0; ``gate_fused`` whether the GLM intra program writes the gate gradients itself (``glm_intra_v14`` / ``glm_intra_v18``: no
     ``gate_epilogue`` launch, no ``dg_int`` / ``db_int`` buffers).  ``records[path]`` maps
     every stage of the path (:data:`cake_jit.PATHS`; ``light_states`` on the segmented route only) to the registry
     record its ``select_rule`` admits (``None`` for an optional stage the path or route does not launch) and
@@ -1111,7 +1111,7 @@ _PASS_OCCUPANTS: tuple[Occupant, ...] = (
     ("db_int", "V32p", 0, (7, 8)),
 )
 # the gate epilogue's inputs (GLM intra's per-row gate gradients); absent from the layouts of the architectures
-# whose GLM intra program writes the token-row dg / dbeta itself (``glm_intra_v14``, no gate_epilogue launch)
+# whose GLM intra program writes the token-row dg / dbeta itself (``glm_intra_v14`` / ``glm_intra_v18``, no gate_epilogue launch)
 _GATE_BUFFERS = ("dg_int", "db_int")
 # the segmented route's backward state blocks (as in BWD_SLOTS: offsets / transfers / carried states, then the
 # reverse offsets and carried adjoint states on the first and third block)
