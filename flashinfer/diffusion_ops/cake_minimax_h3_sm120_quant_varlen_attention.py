@@ -17,7 +17,8 @@ limitations under the License.
 import functools
 from collections import OrderedDict
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import threading
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import tvm_ffi
@@ -185,14 +186,14 @@ class MiniMaxH3VarlenPlan:
         self.unit_table = i32(unit_table or [0, 0])
 
 
-# Most recently used segment plans (device tables) and per-(device, stream) workspace sets.  Both are
-# bounded: the oldest entry is evicted once the limit is reached, so varying segment layouts cannot grow
-# device memory without bound.
+# Most recently used segment plans (device tables) and workspace sets, one set per workspace owner
+# (``_owner``).  Both are bounded: the oldest entry is evicted once the limit is reached (a workspace set as a
+# whole), so varying segment layouts cannot grow device memory without bound.
 _MAX_PLANS = 256
 _MAX_WORKSPACE_SETS = 8
 _PLANS: "OrderedDict[Tuple, MiniMaxH3VarlenPlan]" = OrderedDict()
-_WORKSPACES: "OrderedDict[Tuple[int, int], Dict[str, torch.Tensor]]" = OrderedDict()
-_STREAM_WORKSPACES: "OrderedDict[Tuple[int, int], _StreamWorkspace]" = OrderedDict()
+_WORKSPACES: "OrderedDict[Tuple[int, ...], Dict[str, torch.Tensor]]" = OrderedDict()
+_STREAM_WORKSPACES: "OrderedDict[Tuple[int, ...], _StreamWorkspace]" = OrderedDict()
 
 
 def _device_index(device: torch.device) -> int:
@@ -229,7 +230,7 @@ def _plan_at(
 
 
 class _Launch:
-    """One plan's workspace slices and launch facts, built once per (device, stream) workspace: ``args``
+    """One plan's workspace slices and launch facts, built once per workspace set (``_owner``): ``args``
     are the custom op's arguments from ``cu_seqlens`` through ``attention_grid``, the tensors among them
     already converted to tvm-ffi tensors, so a call hands the bindings no DLPack exchange but Q, K, V
     and the output's."""
@@ -304,13 +305,15 @@ class _Launch:
 
 
 class _StreamWorkspace:
-    """The grow-only buffers of one (device, stream) and the launches sliced from them, per plan.
+    """The grow-only buffers of one workspace owner (``_owner``) and the launches sliced from them, per plan.
 
     The quantized operands, the scales and the statistics partials are rewritten every call, so the
-    buffers are shared between calls on the same stream; concurrent streams get their own set (no
-    cross-stream reuse races).  The arrival counters of the statistics launch start zeroed and the
-    kernel resets them after every complete call, so they too are per stream (interleaved arrivals
-    would misidentify the last tile of a (segment, head)).
+    buffers are shared between the calls of one owner, which are ordered; concurrent streams and
+    distinct graph captures get their own set (no cross-stream reuse races).  The arrival counters of
+    the statistics launch start zeroed and the kernel resets them after every complete call, so they
+    too are per owner (interleaved arrivals would misidentify the last tile of a (segment, head)).
+    Created during a graph capture, a buffer comes from the graph's memory pool, and a zeroed one is
+    zeroed by a memset node of the graph at every replay.
     """
 
     __slots__ = ("device", "buffers", "launches")
@@ -342,40 +345,49 @@ class _StreamWorkspace:
         return launch
 
 
-def _workspace(index: int, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
-    """Grow-only buffer ``name`` of the (device, current stream) workspace set.
+def _owner_entry(
+    entries: "OrderedDict[Tuple[int, ...], Any]",
+    owner: Tuple[int, ...],
+    make: Callable[[], Any],
+) -> Any:
+    """The entry of workspace owner ``owner`` in the bounded map ``entries``, made by ``make()`` when missing
+    (the least recently used entries are evicted first, whole), and now the most recently used one.  Only
+    calls of one owner touch its entry, under one stream lock; a call of another owner on another host
+    thread may evict it, so the entry is moved by pop and re-insert rather than ``move_to_end``."""
+    entry = entries.get(owner)
+    if entry is None:
+        while len(entries) >= _MAX_WORKSPACE_SETS:
+            entries.popitem(last=False)
+        entry = entries[owner] = make()
+    elif next(reversed(entries)) != owner:
+        entries[owner] = entries.pop(owner, entry)
+    return entry
 
-    The quantized operands and scales are rewritten every call, so buffers are shared between calls on
-    the same stream; concurrent streams get their own set (no cross-stream reuse races).
+
+def _workspace(
+    owner: Tuple[int, ...], name: str, numel: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Grow-only buffer ``name`` of the workspace set of ``owner`` (``_owner``; device ``owner[0]``).
+
+    The quantized operands and scales are rewritten every call, so buffers are shared between the calls
+    of one owner, which are ordered; concurrent streams and distinct graph captures get their own set
+    (no cross-stream reuse races).  Created during a graph capture, a buffer comes from the graph's
+    memory pool.
     """
 
-    key = (index, torch.cuda.current_stream(index).cuda_stream)
-    buffers = _WORKSPACES.get(key)
-    if buffers is None:
-        while len(_WORKSPACES) >= _MAX_WORKSPACE_SETS:
-            _WORKSPACES.popitem(last=False)
-        buffers = _WORKSPACES[key] = {}
-    else:
-        _WORKSPACES.move_to_end(key)
+    buffers = _owner_entry(_WORKSPACES, owner, dict)
     buffer = buffers.get(name)
     if buffer is None or buffer.numel() < numel:
         buffer = torch.empty(
-            max(numel, 16), dtype=dtype, device=torch.device("cuda", index)
+            max(numel, 16), dtype=dtype, device=torch.device("cuda", owner[0])
         )
         buffers[name] = buffer
     return buffer
 
 
-def _stream_workspace(index: int, stream: int) -> _StreamWorkspace:
-    key = (index, stream)
-    workspace = _STREAM_WORKSPACES.get(key)
-    if workspace is None:
-        while len(_STREAM_WORKSPACES) >= _MAX_WORKSPACE_SETS:
-            _STREAM_WORKSPACES.popitem(last=False)
-        workspace = _STREAM_WORKSPACES[key] = _StreamWorkspace(index)
-    elif next(reversed(_STREAM_WORKSPACES)) != key:
-        _STREAM_WORKSPACES.move_to_end(key)
-    return workspace
+def _stream_workspace(owner: Tuple[int, ...]) -> _StreamWorkspace:
+    """The ``_StreamWorkspace`` of ``owner`` (``_owner``; device ``owner[0]``)."""
+    return _owner_entry(_STREAM_WORKSPACES, owner, lambda: _StreamWorkspace(owner[0]))
 
 
 _raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
@@ -389,13 +401,69 @@ def _current_stream(index: int) -> int:
     return torch.cuda.current_stream(index).cuda_stream
 
 
+def _capture_id(stream: int) -> int:
+    """CUDA's id of the capture the raw stream ``stream`` takes part in, 0 when it is not capturing.
+
+    Two captures are distinct even on the same stream, and one capture can be joined by several
+    streams (forked branches); the id identifies the capture itself.
+    """
+
+    from cuda.bindings import runtime as cudart
+
+    info = cudart.cudaStreamGetCaptureInfo(stream)
+    if info[0] != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaStreamGetCaptureInfo failed: {info[0]!r}")
+    if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return 0
+    return int(info[2])
+
+
+def _owner(index: int, stream: int) -> Tuple[int, ...]:
+    """The workspace owner of a call on device ``index`` and raw stream ``stream``: ``(index, stream)`` for
+    an eager call, ``(index, stream, capture id)`` for a call captured into a CUDA graph.
+
+    Every workspace buffer a call reads or writes, its zero-start control words (arrival counters,
+    grid-barrier and head-control words) and its cached launches belong to the workspace set of its
+    owner.  Calls of one owner are ordered: eager calls on one stream by the stream, captured calls by
+    the stream order of their capture (replays of one graph are ordered too), and the per-(device,
+    stream) host lock (``_stream_lock``) keeps the launches of each call contiguous on its stream.  Calls
+    of different owners share no buffer: graphs captured one after another on one stream, a graph
+    replayed beside eager calls on its capture stream, forked branches of one capture and calls on
+    other streams never see each other's words.
+    """
+    # Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
+    # instantiated more than once from one captured graph (or cloned as child graphs) share this op's
+    # workspace and must not run concurrently.
+    if torch.cuda.is_current_stream_capturing():
+        capture = _capture_id(stream)
+        if capture:
+            return (index, stream, capture)
+    return (index, stream)
+
+
+_STREAM_LOCKS: Dict[Tuple[int, int], threading.Lock] = {}
+_STREAM_LOCKS_LOCK = threading.Lock()
+
+
+def _stream_lock(index: int, stream: int) -> threading.Lock:
+    """The host lock of (device ``index``, raw stream ``stream``), held by a call from its workspace lookup
+    through its last launch: the launches of one call stay contiguous on the stream even when several host
+    threads call on it (interleaved launches of two calls would share the owner's control words)."""
+    key = (index, stream)
+    lock = _STREAM_LOCKS.get(key)
+    if lock is None:
+        with _STREAM_LOCKS_LOCK:
+            lock = _STREAM_LOCKS.setdefault(key, threading.Lock())
+    return lock
+
+
 @functools.cache
 def _ffi_device(index: int):
     return tvm_ffi.device(f"cuda:{index}")
 
 
 def workspace_bytes(tokens: int, num_heads: int, num_segments: int) -> int:
-    """Bytes of the (device, stream) workspace set the operator needs for ``tokens`` packed rows."""
+    """Bytes of one (device, stream) workspace set the operator needs for ``tokens`` packed rows."""
 
     padded = max(1, _ceil_div(tokens, _BLOCK_N)) * _BLOCK_N
     q8 = k8 = tokens * num_heads * MINIMAX_H3_HEAD_DIM
@@ -655,10 +723,14 @@ def minimax_h3_sm120_varlen_attention_fp8(
     statistics with their per-segment fold, the quantizer, the attention), serve any ``tokens``
     and any segment lengths (including empty segments and lengths below one tile); the grids are
     ``minimax_h3_sm120_quant_varlen_attention_launch_grids``.  The quantized operands
-    live in a grow-only workspace per (device, stream) (``workspace_bytes``); the most recent 8
-    stream sets and 256 segment plans are kept.  The programs ship for ``sm_120a`` alone: a call
-    with a non-empty segment on a device of another compute capability than 12.0 raises
-    ``RuntimeError``.
+    live in a grow-only workspace per (device, stream), and per capture for a call captured into a
+    CUDA graph (``workspace_bytes``); the most recent 8 workspace sets and 256 segment plans are
+    kept.  The programs ship for ``sm_120a`` alone: a call with a non-empty segment on a device of
+    another compute capability than 12.0 raises ``RuntimeError``.
+
+    Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
+    instantiated more than once from one captured graph (or cloned as child graphs) share this op's
+    workspace and must not run concurrently.
 
     Parameters
     ----------
@@ -710,16 +782,18 @@ def minimax_h3_sm120_varlen_attention_fp8(
         return out  # every segment is empty: nothing to write
     target = _fp8_target(index)
     stream = _current_stream(index)
-    _minimax_h3_sm120_varlen_attention_fp8_impl(
-        q,
-        k,
-        v,
-        out,
-        *_stream_workspace(index, stream).launch(plan, index).args,
-        _softmax_scale_log2(softmax_scale),
-        stream,
-        target,
-    )
+    # the stream's host lock from the workspace lookup through the last launch (``_stream_lock``)
+    with _stream_lock(index, stream):
+        _minimax_h3_sm120_varlen_attention_fp8_impl(
+            q,
+            k,
+            v,
+            out,
+            *_stream_workspace(_owner(index, stream)).launch(plan, index).args,
+            _softmax_scale_log2(softmax_scale),
+            stream,
+            target,
+        )
     return out
 
 
