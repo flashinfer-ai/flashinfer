@@ -1110,6 +1110,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "071d313ffa28826f59fce81d4091804888be23e93eae4ca9d6a391f4047c0b64",
         },
     },
+    "6d96bb93d7840b5b9b42": {
+        "arg_plan": "gemm_2cta_ptr",
+        "closure_sha256": {
+            "sm_103a": "a27bcfeca0a8b0a14782908f4847344a74932177229516c606a38a268e1b23ec",
+        },
+    },
     "6ed9e5d8627577028e1d": {
         "arg_plan": "gemm",
         "closure_sha256": {
@@ -2213,6 +2219,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "17bd5b01aa5be0d19e1c9b662d1838b1f22711283eaf9f02fcba1b9263ede13a",
         },
     },
+    "fb4cabc9f04a36b804d3": {
+        "arg_plan": "gemm_2cta_ptr",
+        "closure_sha256": {
+            "sm_103a": "2384d5825822d9043752deb7ecfdb8e48642f81091ad58bbe4a6cec378eda3c2",
+        },
+    },
     "fbb5be3d584b9a5e954d": {
         "arg_plan": "quant",
         "closure_sha256": {
@@ -2425,6 +2437,7 @@ _KERNELS_ONLY: dict[str, dict[str, str]] = {
         "gemm:m192_f16_bF_l2256b": "cake_nvfp4_per_token_cce6da2b9b938e36636e",
         "gemm:m256_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_ae447cd8c8a488cbe10c",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_05cdc205d9b471f666a1",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_clc_sfr": "cake_nvfp4_per_token_6d96bb93d7840b5b9b42",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_1957cf0620e9be66eee8",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc_sfr": "cake_nvfp4_per_token_ecef0c7e6fb2c77bd726",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_102a58d983738fb4ba20",
@@ -2432,6 +2445,7 @@ _KERNELS_ONLY: dict[str, dict[str, str]] = {
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g8_sfr": "cake_nvfp4_per_token_e3d47605ebbbddca6c95",
         "gemm:m256_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_60a084e22436164149fc",
         "gemm:m256_2cta_f16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_34d44d8d6d4e632aea8c",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_clc_sfr": "cake_nvfp4_per_token_fb4cabc9f04a36b804d3",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_3deb92b0859de2875bd4",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc_sfr": "cake_nvfp4_per_token_afb177dad29f9232b073",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_9db9fb4fa9cbe2095158",

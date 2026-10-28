@@ -753,8 +753,9 @@ SF_RING_G8_CELLS: dict[str, dict[tuple[int, int], tuple[int, int]]] = {
 # without or with raster groups of 8) take a ring program of SF_RING_FORMS on the
 # measured cells of SF_RING_FORM_CELLS: per kind, keyed by ``(K, N)``, the token
 # ranges (``None``: no upper bound) and the form, ``"g8"`` (static, raster groups
-# of 8) or ``"g16_clc"`` (CLC, raster groups of 16).  The tile order and the
-# schedule change; the MMA sequence of every tile and so the outputs do not.
+# of 8), ``"g16_clc"`` (CLC, raster groups of 16) or ``"clc"`` (CLC, no raster
+# groups).  The tile order and the schedule may change; the MMA sequence of every
+# tile and so the outputs do not.
 SF_RING_FORM_KEYS = frozenset(
     f"gemm:m256_2cta_{out}_aL_bL_l2256b{suffix}"
     for out in ("bf16", "f16")
@@ -763,18 +764,19 @@ SF_RING_FORM_KEYS = frozenset(
 SF_RING_FORMS: dict[str, dict[str, Any]] = {
     "g8": {"raster_group": 8},
     "g16_clc": {"raster_group": 16, "sched": "clc"},
+    "clc": {"sched": "clc"},
 }
 SF_RING_FORM_CELLS: dict[
     str, dict[tuple[int, int], tuple[tuple[int, Optional[int], str], ...]]
 ] = {
     "gemm": {
         (7168, 18432): ((513, 2560, "g16_clc"),),
-        (8192, 28672): ((1537, 2560, "g16_clc"),),
+        (8192, 28672): ((1537, 2560, "g16_clc"), (2561, 8192, "clc")),
         (28672, 8192): ((5889, 8192, "g8"),),
     },
     "chain": {
         (7168, 18432): ((513, 2560, "g8"),),
-        (8192, 28672): ((1537, 2560, "g16_clc"),),
+        (8192, 28672): ((1537, 2560, "g16_clc"), (2561, 8192, "clc")),
         (28672, 8192): ((5889, 8192, "g8"),),
     },
 }
@@ -1512,12 +1514,12 @@ def _gemm_plan(
         or tactic.get("num_stages") is not None
         or int(tactic.get("ep_stages", 0))
         or (int(tactic.get("raster_group") or 0), sched_is_clc(tactic))
-        not in ((8, False), (16, True))
+        not in ((8, False), (16, True), (0, True))
     ):
         raise ValueError(
             "sf_ring is a knob of the sm_103a K = 96 2-CTA pair programs with 256-wide"
             " weight tiles and evict-last operands: the static schedule with raster"
-            " groups of 8 or the CLC schedule with groups of 16"
+            " groups of 8 or the CLC schedule with groups of 16 or without groups"
         )
     # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
     tok_tile = (

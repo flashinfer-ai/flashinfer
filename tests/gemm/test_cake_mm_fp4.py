@@ -1582,6 +1582,8 @@ def test_sf_ring_matches_route(m, n, k, out_dtype):
         (2560, 28672, 8192),  # g16_clc_sfr, last row (GEMM alone and chain)
         (5889, 8192, 28672),  # g8_sfr, first row (GEMM alone and chain)
         (8192, 8192, 28672),  # g8_sfr, last row (GEMM alone and chain)
+        (2561, 28672, 8192),  # clc_sfr, first row (GEMM alone and chain)
+        (8192, 28672, 8192),  # clc_sfr, last row (GEMM alone and chain)
     ],
 )
 def test_sf_ring_form_matches_route(m, n, k, out_dtype):
