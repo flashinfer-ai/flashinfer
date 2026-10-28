@@ -702,8 +702,8 @@ def test_long_plans_overlap_at_the_long_width(num_sms, padded_tokens, expected) 
         # empty segments add no work but count in the token total
         (188, False, (0, 0, 1024, 1024, 2048), 80),
         (170, True, (0, 1000, 1000, 1950), 64),
-        # a plan of more than 16384 padded tokens keeps the long width whatever its mean segment
-        (170, False, tuple(range(0, 24577, 2048)), 64),
+        # a plan of more than 16384 padded tokens takes the long table, not the light table
+        (170, False, tuple(range(0, 20481, 1024)), 64),
         (188, True, tuple(range(0, 24577, 2048)), 46),
     ],
 )
@@ -762,6 +762,76 @@ def test_light_widths_fit_the_sm_count(num_sms, num_units) -> None:
             assert tail == width
             assert lead >= 1 and producers >= 1
             assert lead + producers <= num_sms
+    for delta in (True, False):
+        for bound, width in ops._OVERLAP_LONG_LIGHT_WIDTHS.get((num_sms, delta), ()):
+            lead, producers, tail = ops.minimax_h3_sm120_nvfp4_overlap_grids(
+                num_sms,
+                num_units=num_units,
+                padded_tokens=32768,
+                total_tokens=32768,
+                work=bound * 32768,
+                delta=delta,
+            )
+            assert tail == width
+            assert lead >= 1 and producers >= 1
+            assert lead + producers <= num_sms
+
+
+def _cum(lengths):
+    bounds = [0]
+    for length in lengths:
+        bounds.append(bounds[-1] + length)
+    return tuple(bounds)
+
+
+@pytest.mark.parametrize(
+    ("num_sms", "delta", "bounds", "width"),
+    [
+        # 170 SMs, both routes: 48 for an attention-weighted mean segment above 1792 and up to 2560 tokens, else
+        # the long width 64
+        (170, False, _cum([1792] * 10), 64),
+        (170, True, _cum([1792] * 10), 64),
+        (170, False, _cum([1793] * 10), 48),
+        (170, True, _cum([1793] * 10), 48),
+        (170, True, _cum([2048] * 12), 48),
+        (170, False, _cum([2560] * 7), 48),
+        (170, True, _cum([2560] * 7), 48),
+        (170, False, _cum([2561] * 7), 64),
+        (170, True, _cum([2561] * 7), 64),
+        (170, False, _cum([1024] * 20), 64),
+        (170, True, _cum([4096] * 5), 64),
+        # empty segments add no work but count in the token total
+        (170, False, _cum([0, 2048, 0] + [2048] * 8), 48),
+        (170, True, _cum([2048] * 40), 48),
+        # 188 SMs keep the long width 46
+        (188, False, _cum([2048] * 12), 46),
+        (188, True, _cum([2560] * 7), 46),
+        (188, False, _cum([1024] * 20), 46),
+    ],
+)
+def test_long_light_plans_overlap_at_the_long_light_width(
+    num_sms, delta, bounds, width
+) -> None:
+    plan = _plan(bounds)
+    assert plan.padded_tokens > ops._PREPROCESS_MAX_TOKENS
+    grids = ops.minimax_h3_sm120_nvfp4_overlap_grids(
+        num_sms,
+        num_units=1792,
+        padded_tokens=plan.padded_tokens,
+        total_tokens=plan.total_tokens,
+        work=ops._attention_work(plan),
+        delta=delta,
+    )
+    assert grids == (num_sms - width, width, width)
+    # without the plan's work the long width
+    shipped = ops.minimax_h3_sm120_nvfp4_overlap_grids(
+        num_sms, num_units=1792, padded_tokens=plan.padded_tokens
+    )
+    assert shipped[2] == ops._OVERLAP_WIDTH_LONG[num_sms]
+
+
+def test_long_light_widths_only_on_170_sms() -> None:
+    assert {sms for sms, _delta in ops._OVERLAP_LONG_LIGHT_WIDTHS} == {170}
 
 
 # The custom op's tensor arguments from ``tok_seg`` through ``qm_sf_words``: stand-ins, the launches are

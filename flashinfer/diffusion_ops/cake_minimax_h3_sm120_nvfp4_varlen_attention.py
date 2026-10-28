@@ -165,11 +165,19 @@ _OVERLAP_LONG_MAX_SEGMENT = {
 # the squared segment lengths over the token count: the attention work per pre-processed token) is short is bound
 # by its producers: it takes the width P of the first ``(bound, P)`` of ``_OVERLAP_LIGHT_WIDTHS[(SM count, delta)]``
 # (rising bounds) whose bound is at least that mean; a plan above every bound keeps ``_OVERLAP_WIDTH``.
-_OVERLAP_LIGHT_WIDTHS = {
+_OVERLAP_LIGHT_WIDTHS: Dict[Tuple[int, bool], Tuple[Tuple[int, int], ...]] = {
     (170, False): ((1280, 64), (1536, 56), (2048, 50)),
     (170, True): ((1280, 64), (1536, 56), (1792, 50)),
     (188, False): ((1280, 80), (1536, 64), (2048, 56)),
     (188, True): ((1280, 80), (1536, 64), (2048, 56)),
+}
+# The overlapped form of a longer plan (more than ``_PREPROCESS_MAX_TOKENS`` padded tokens) whose attention-weighted
+# mean segment length is short takes the width P of the first ``(bound, P)`` of
+# ``_OVERLAP_LONG_LIGHT_WIDTHS[(SM count, delta)]`` (rising bounds) whose bound is at least that mean; a plan above
+# every bound, and an SM count or route without an entry, keeps ``_OVERLAP_WIDTH_LONG``.
+_OVERLAP_LONG_LIGHT_WIDTHS: Dict[Tuple[int, bool], Tuple[Tuple[int, int], ...]] = {
+    (170, False): ((1792, 64), (2560, 48)),
+    (170, True): ((1792, 64), (2560, 48)),
 }
 # Workers per producer CTA of the overlapped form (one 768-thread CTA runs three 256-thread workers).
 _OVERLAP_PRODUCER_WORKERS = 3
@@ -904,7 +912,9 @@ def minimax_h3_sm120_nvfp4_overlap_grids(
     (the sum of the squared segment lengths), a plan of at most 16384 padded tokens takes the width of the
     first ``(bound, P)`` of ``_OVERLAP_LIGHT_WIDTHS[(num_sms, delta)]`` whose bound is at least
     ``work / total_tokens``: on 188 SMs 80, 64 and 56 up to 1280, 1536 and 2048 tokens; on 170 SMs 64, 56
-    and 50 up to 1280, 1536 and (``delta`` false) 2048 or (``delta`` true) 1792 tokens.  The tuple keeps this
+    and 50 up to 1280, 1536 and (``delta`` false) 2048 or (``delta`` true) 1792 tokens.  A longer plan takes
+    the width of ``_OVERLAP_LONG_LIGHT_WIDTHS`` the same way: on 170 SMs 48 for a mean above 1792 and up to
+    2560 tokens, else the long width; on 188 SMs always the long width.  The tuple keeps this
     order; the launch order is producers, lead, tail (``minimax_h3_sm120_nvfp4_programs``).  The lead attention
     takes one persistent CTA per SM on all but ``P`` SMs up to the unit count, ``lead = max(1, min(num_sms - P,
     num_units))``; the producers ``min(3 * P, num_sms - lead)`` CTAs, one per SM, each running three workers
@@ -918,8 +928,11 @@ def minimax_h3_sm120_nvfp4_overlap_grids(
         return None
     if padded_tokens is not None and int(padded_tokens) > _PREPROCESS_MAX_TOKENS:
         width = _OVERLAP_WIDTH_LONG.get(sms, width)
-    elif total_tokens is not None and work is not None and int(total_tokens) > 0:
-        for bound, light in _OVERLAP_LIGHT_WIDTHS.get((sms, bool(delta)), ()):
+        light_widths = _OVERLAP_LONG_LIGHT_WIDTHS
+    else:
+        light_widths = _OVERLAP_LIGHT_WIDTHS
+    if total_tokens is not None and work is not None and int(total_tokens) > 0:
+        for bound, light in light_widths.get((sms, bool(delta)), ()):
             if int(work) <= bound * int(total_tokens):
                 width = light
                 break

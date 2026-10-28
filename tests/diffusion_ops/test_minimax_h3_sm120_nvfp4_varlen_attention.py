@@ -548,10 +548,13 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_concurrent_streams_are_bitwise(
 
 # Plans of the fused pre-processing with a short attention-weighted mean segment, whose overlapped form takes a
 # width of the light table (``_OVERLAP_LIGHT_WIDTHS``): 1024 tokens (every SM count and route) and 2048 tokens (188
-# SMs, and the uncompensated route on 170 SMs; the compensated route on 170 SMs keeps the shipped width).
+# SMs, and the uncompensated route on 170 SMs; the compensated route on 170 SMs keeps the shipped width).  A longer
+# plan with a 1900-token mean segment takes the long light width on 170 SMs (``_OVERLAP_LONG_LIGHT_WIDTHS``) and
+# the long width on 188 SMs.
 LIGHT_CU_SEQLENS = [
     (0, 1024, 2048, 3072, 4096),
     (0, 2048, 4096),
+    tuple(range(0, 19001, 1900)),
 ]
 
 
@@ -584,6 +587,9 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_light_overlap_widths_are_bitwis
     )
     if cu_seqlens[1] == 1024:
         assert expected[2] > nvfp4_ops._OVERLAP_WIDTH[sms]
+    if plan.padded_tokens > nvfp4_ops._PREPROCESS_MAX_TOKENS:
+        long_width = nvfp4_ops._OVERLAP_WIDTH_LONG[sms]
+        assert expected[2] == (48 if sms == 170 else long_width)
     owner = nvfp4_ops._owner(device.index, nvfp4_ops._current_stream(device.index))
     launch = nvfp4_ops._nvfp4_launch(
         plan, delta, owner, nvfp4_ops._nvfp4_target(device.index)
