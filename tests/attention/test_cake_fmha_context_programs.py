@@ -916,7 +916,9 @@ def test_cake_fmha_context_fp8_split_costs_scale_with_the_tile_rows(target) -> N
 
 
 # (batch, max_q_len, max_kv_len, num_q_heads, pack): launches the split choice
-# sees; a smaller pack runs a plan only for a launch of one m-block.
+# sees; a smaller pack runs a plan only where it holds the launch in one
+# m-block (a launch of several m-blocks only on the targets of
+# _CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS).
 _SPLIT_CHOICE_ROWS = [
     (1, 32, 16384, 32, 8),
     (1, 32, 1024, 32, 8),
@@ -933,6 +935,12 @@ _SPLIT_CHOICE_ROWS = [
     (1, 32, 16384, 64, 8),
     (1, 128, 16384, 32, 8),
     (2, 300, 6000, 32, 8),
+    (2, 128, 1500, 32, 8),
+    (1, 128, 1500, 32, 8),
+    (1, 64, 1500, 32, 8),
+    (2, 256, 2048, 32, 8),
+    (12, 96, 1536, 32, 4),
+    (12, 48, 2048, 64, 8),
     (1, 64, 4096, 64, 4),
     (1, 32, 16384, 32, 4),
     (1, 256, 8192, 32, 1),
@@ -947,12 +955,13 @@ _SPLIT_CHOICE_ROWS = [
 def test_cake_fmha_context_fp8_split_choice(
     target, batch, max_q, max_kv, num_q_heads, pack
 ) -> None:
-    """The split choice keeps the pack's plan, or, for a launch of one
-    m-block, runs a smaller shipped pack whose tiles hold every query token in
-    one stage: the pack's split (``split_blocks``, ``num_splits``) over its
-    tiles, or its own best split; only where the cost model of each pack's
-    tile rows predicts it faster than the pack's plan (or whole tiles) by both
-    margins."""
+    """The split choice keeps the pack's plan, or runs a smaller shipped pack
+    whose tiles hold every query token in one m-block: for a launch of one
+    m-block, the pack's split (``split_blocks``, ``num_splits``) over its
+    tiles, or its own best split; for a launch of several m-blocks (on the
+    targets of ``_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS`` only) its own best
+    split; only where the cost model of each pack's tile rows predicts it
+    faster than the pack's plan (or whole tiles) by both margins."""
 
     sm_count = _SM_COUNT[target]
     choice = cake_api._context_fp8_split_choice(
@@ -970,7 +979,14 @@ def test_cake_fmha_context_fp8_split_choice(
         return
     assert chosen < pack and pack % chosen == 0
     assert chosen in (*cake_api._CONTEXT_FP8_RUNTIME_PACKS, 1)
-    assert max_q <= 2 * (128 // pack) and max_q <= 128 // chosen
+    one_m_block = max_q <= 2 * (128 // pack)
+    assert max_q <= 2 * (128 // chosen)
+    if one_m_block:
+        assert max_q <= 128 // chosen
+    assert one_m_block or (
+        target in cake_api._CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS
+        and batch * (num_q_heads // chosen) <= sm_count
+    )
     blocks = cake_api._context_fp8_tile_blocks(batch, max_q, max_kv, num_q_heads, pack)
     smaller = cake_api._context_fp8_tile_blocks(
         batch, max_q, max_kv, num_q_heads, chosen
@@ -979,7 +995,8 @@ def test_cake_fmha_context_fp8_split_choice(
     assert 1 <= split_tiles <= min(len(smaller), sm_count - 1)
     assert 2 <= num_splits <= cake_api._CONTEXT_FP8_SPLIT_MAX
     repack = (
-        own is not None
+        one_m_block
+        and own is not None
         and own[0] == len(blocks)
         and plan == (len(smaller), own[1], own[2])
     )
@@ -1047,6 +1064,56 @@ def test_cake_fmha_context_fp8_split_choice_bounds(monkeypatch, target) -> None:
             assert result is None or result[0] == 8, row
     finally:
         # the cached choices of the patched costs must not outlive the test
+        _clear_split_caches()
+
+
+def test_cake_fmha_context_fp8_split_choice_of_several_m_blocks(monkeypatch) -> None:
+    """On B200 (sm100a) a launch of several m-blocks also takes the own split
+    of a smaller pack that holds every query token in one m-block: 2 requests
+    of 128 query tokens over 1500 keys, heads 32/4 (4 m-blocks of pack 8)
+    run pack 1's split (64, 6, 2) instead of pack 8's (32, 4, 3), and route
+    to pack 1's split-KV program.  12 requests of 96 query tokens over 1536
+    keys, heads 32/8 (2 m-blocks of pack 4) keep pack 4's plan: pack 2's 192
+    tiles fill more than one wave.  A launch of one m-block still runs pack
+    8's split over pack 4's tiles.  On GB300 (sm103a), and on B200 without
+    the target in ``_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS``, the launch of
+    several m-blocks keeps its pack's plan."""
+
+    choice = cake_api._context_fp8_split_choice
+    plan = cake_api._context_fp8_split_plan
+    row = (2, 128, 1500, 32)
+    assert plan("sm100a", *row, 8, 148) == (32, 4, 3)
+    assert choice("sm100a", *row, 8, 148) == (1, (64, 6, 2))
+    own = plan("sm103a", *row, 8, 152)
+    assert choice("sm103a", *row, 8, 152) == (None if own is None else (8, own))
+    wide = (12, 96, 1536, 32, 4, 148)
+    own = plan("sm100a", *wide)
+    assert choice("sm100a", *wide) == (None if own is None else (4, own))
+    for target, sm_count in _SM_COUNT.items():
+        own = plan(target, 1, 32, 16384, 32, 8, sm_count)
+        assert choice(target, 1, 32, 16384, 32, 8, sm_count) == (4, (8, own[1], own[2]))
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: 148)
+    meta = torch.device("meta")
+    shape = ("context_fp8", 2, 128, 1500, 32, 4, 16, True, None)
+    need = cake_api._context_fp8_split_workspace_bytes(64, 2)
+    kwargs = dict(
+        _context_kwargs(shape, device="meta"),
+        workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta"),
+    )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == "RUNTIME_SK_PACK1", route
+    assert (route.pack_g, route.num_m_blocks) == (1, 1)
+    try:
+        monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS", frozenset())
+        _clear_split_caches()
+        assert choice("sm100a", *row, 8, 148) == (8, (32, 4, 3))
+        route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+        assert route.program == "RUNTIME_SK_PACK8", route
+        assert (route.pack_g, route.num_m_blocks) == (8, 4)
+    finally:
+        # the cached choices of the patched gate must not outlive the test
         _clear_split_caches()
 
 

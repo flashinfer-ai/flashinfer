@@ -4305,6 +4305,15 @@ _CONTEXT_FP8_SPLIT_WHOLE_BLOCK: dict[str, float] = {"sm103a": 0.880}
 _CONTEXT_FP8_SPLIT_REL_MARGIN = 0.02
 _CONTEXT_FP8_SPLIT_ABS_MARGIN = 0.5
 _CONTEXT_FP8_SPLIT_MAX_WAVES = 4
+# Targets whose launches of several m-blocks also take a smaller pack's own
+# split plan where that pack holds every query token in one m-block and its
+# tiles fit one wave (:func:`_context_fp8_split_choice`): on B200 (sm100a)
+# the split units of fewer query rows store and merge less (timed: 128 query
+# tokens over 1500 keys, heads 32/4, run pack 1's split faster than pack
+# 8's).  A tile of fewer query rows still runs its empty stage at full cost:
+# with more than one wave of tiles the smaller pack timed no faster on the
+# whole, and some of those launches timed slower.
+_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS = frozenset({"sm100a"})
 
 
 def _context_fp8_tile_blocks(
@@ -4548,18 +4557,22 @@ def _context_fp8_split_choice(
     pack is ``pack``, or ``None`` when it does not split (a pure function of
     its integers, cached).
 
-    The plan is ``pack``'s (:func:`_context_fp8_split_plan`), except for a
-    launch of one m-block, whose tiles a smaller shipped pack holds in one
-    query stage each (fewer query rows per tile: the cost model's units,
-    partial stores and merges cost less, :func:`_context_fp8_split_costs`):
+    The plan is ``pack``'s (:func:`_context_fp8_split_plan`), except where a
+    smaller shipped pack holds the launch in one m-block (fewer query rows per
+    tile: the cost model's units, partial stores and merges cost less,
+    :func:`_context_fp8_split_costs`), for a launch of one m-block or, on the
+    targets of :data:`_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS`, of several where
+    the smaller pack's tiles fit one wave:
 
-    - a launch of two query stages whose plan splits every tile runs the same
-      split (``split_blocks`` and ``num_splits``) over the tiles of a smaller
-      pack, where predicted faster by the margins: every query row meets the
-      same KV units, merged in the same order, so the output is the same;
-    - then the launch takes the best split of a smaller pack (its own plan)
-      where predicted faster than that by the margins: its rows meet other KV
-      units, so the output differs by the rounding of the FP32 merge only."""
+    - a launch of one m-block of two query stages whose plan splits every
+      tile runs the same split (``split_blocks`` and ``num_splits``) over the
+      tiles of a smaller pack, where predicted faster by the margins: every
+      query row meets the same KV units, merged in the same order, so the
+      output is the same;
+    - then the launch takes the best split of a smaller pack of one m-block
+      (its own plan) where predicted faster than that by the margins: its rows
+      meet other KV units, so the output differs by the rounding of the FP32
+      merge only."""
 
     plan = _context_fp8_split_plan(
         target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
@@ -4570,16 +4583,20 @@ def _context_fp8_split_choice(
     blocks = _context_fp8_tile_blocks(
         batch_size, max_q_len, max_kv_len, num_q_heads, pack
     )
+    one_m_block = max_q_len <= 2 * tokens
     if (
         costs is None
-        or max_q_len > 2 * tokens
+        or not (one_m_block or target in _CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS)
         or len(blocks) > _CONTEXT_FP8_SPLIT_MAX_WAVES * sm_count
     ):
         return choice
     smaller_packs = [
         smaller
         for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
-        if smaller < pack and pack % smaller == 0
+        if smaller < pack
+        and pack % smaller == 0
+        and max_q_len <= 2 * (128 // smaller)
+        and (one_m_block or batch_size * (num_q_heads // smaller) <= sm_count)
     ]
     time = _context_fp8_split_makespan(
         blocks,
@@ -4589,7 +4606,12 @@ def _context_fp8_split_choice(
         if plan
         else _context_fp8_whole_costs(target, max_q_len, max_kv_len, pack, costs),
     )
-    if plan is not None and max_q_len > tokens and plan[0] == len(blocks):
+    if (
+        plan is not None
+        and one_m_block
+        and max_q_len > tokens
+        and plan[0] == len(blocks)
+    ):
         repack: tuple[int, tuple[int, int, int]] | None = None
         repack_time = time
         for smaller in smaller_packs:
