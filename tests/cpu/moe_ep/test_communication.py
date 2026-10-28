@@ -68,7 +68,7 @@ def loopback_backend():
             topk_weights=None,
             *,
             hidden_states_scale=None,
-            max_tokens_per_rank=None,
+            runtime_max_tokens_per_rank=None,
             eplb_local_stats=None,
         ):
             rows = self.params.max_tokens_per_rank

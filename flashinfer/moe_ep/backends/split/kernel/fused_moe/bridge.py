@@ -205,6 +205,7 @@ def build_activation_pack_rank_major(
     global_scale: Optional[torch.Tensor] = None,
     mxfp8_dispatch: bool = False,
     hidden_size: Optional[int] = None,
+    recv_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
 
@@ -241,6 +242,10 @@ def build_activation_pack_rank_major(
         when this rank owns fewer than all experts.
     quant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
+    recv_scale : torch.Tensor, optional
+        ``[M, *]`` received scale factors when the tokens were quantized by
+        :func:`quantize_for_dispatch` before dispatch; ``recv_tensors`` then
+        holds the quantized values and is not quantized again.
     """
     if recv_tensors.dim() != 3:
         raise ValueError(
@@ -285,7 +290,49 @@ def build_activation_pack_rank_major(
         global_scale=global_scale,
         mxfp8_dispatch=mxfp8_dispatch,
         hidden_size=hidden_size,
+        flat_scale=recv_scale,
     )
+
+
+def dispatch_quant_format(
+    quant: "QuantConfig", *, per_token_activation: bool, mxfp8_dispatch: bool
+):
+    """Activation format tokens can be quantized to before a rank-major dispatch.
+
+    NVFP4 with a unit global scale and MXFP8 quantize each token row on its
+    own, so quantizing before dispatch yields the same values the receiver
+    would compute. Per-token NVFP4 scaling and the packed ``mxfp8_dispatch``
+    row are excluded, as is any unquantized activation. Returns ``None`` when
+    the tokens must be dispatched unquantized.
+    """
+    from flashinfer.fused_moe.api import QuantFormat
+
+    activation = quant.pair[1]
+    if activation is QuantFormat.NVFP4 and not per_token_activation:
+        return QuantFormat.NVFP4
+    if activation is QuantFormat.MXFP8 and not mxfp8_dispatch:
+        return QuantFormat.MXFP8
+    return None
+
+
+def quantize_for_dispatch(
+    x: torch.Tensor, quant: "QuantConfig"
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Quantize ``[num_tokens, hidden]`` tokens for a rank-major dispatch.
+
+    Returns ``(values, scales)`` as uint8 rows, which every rank-major
+    transport carries as raw bytes; :func:`build_activation_pack_rank_major`
+    restores the dtypes the runners expect.
+    """
+    q, scale, _ = _quantize_activations(
+        x,
+        quant=quant,
+        per_token_activation=False,
+        global_scale=None,
+        mxfp8_dispatch=False,
+        hidden_size=None,
+    )
+    return q.view(torch.uint8), scale.view(torch.uint8)
 
 
 def _quantize_and_pack(
@@ -298,13 +345,72 @@ def _quantize_and_pack(
     global_scale: Optional[torch.Tensor],
     mxfp8_dispatch: bool,
     hidden_size: Optional[int],
+    flat_scale: Optional[torch.Tensor] = None,
 ) -> "MoEActivationPack":
     """Prepare ``flat`` for the configured activation path and assemble the pack.
 
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
-    ``selected_experts`` / ``final_scales`` are synthesized.
+    ``selected_experts`` / ``final_scales`` are synthesized. With
+    ``flat_scale``, ``flat`` already holds the values
+    :func:`quantize_for_dispatch` produced and is only reinterpreted.
     """
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantFormat
+    from flashinfer.fused_moe.api import MoEActivationPack
+
+    if flat_scale is None:
+        hidden_states_q, hidden_states_scale, per_token_scale = _quantize_activations(
+            flat,
+            quant=quant,
+            per_token_activation=per_token_activation,
+            global_scale=global_scale,
+            mxfp8_dispatch=mxfp8_dispatch,
+            hidden_size=hidden_size,
+        )
+    else:
+        hidden_states_q, hidden_states_scale = _view_dispatched_activations(
+            flat, flat_scale, quant
+        )
+        per_token_scale = None
+
+    return MoEActivationPack(
+        hidden_states_q=hidden_states_q,
+        hidden_states_scale=hidden_states_scale,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+        per_token_scale=per_token_scale,
+    )
+
+
+def _view_dispatched_activations(
+    values: torch.Tensor, scales: torch.Tensor, quant: "QuantConfig"
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Give received :func:`quantize_for_dispatch` rows the runners' dtypes."""
+    from flashinfer.fused_moe.api import QuantFormat
+
+    weight, activation = quant.pair
+    values = values.view(torch.uint8)
+    scales = scales.view(torch.uint8)
+    if activation is QuantFormat.MXFP8:
+        values = values.view(torch.float8_e4m3fn)
+        if weight is QuantFormat.MXFP4:
+            scales = scales.view(torch.float8_e4m3fn)
+    return values, scales
+
+
+def _quantize_activations(
+    flat: torch.Tensor,
+    *,
+    quant: "QuantConfig",
+    per_token_activation: bool,
+    global_scale: Optional[torch.Tensor],
+    mxfp8_dispatch: bool,
+    hidden_size: Optional[int],
+) -> "tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]":
+    """Quantize ``flat`` to the configured activation format.
+
+    Returns ``(values, scales, per_token_scale)`` in the dtypes the runners
+    consume; ``scales`` is None for BF16 activations.
+    """
+    from flashinfer.fused_moe.api import QuantFormat
 
     pair = quant.pair
     activation = pair[1]
@@ -399,13 +505,7 @@ def _quantize_and_pack(
             f"activation={pair[1].name}"
         )
 
-    return MoEActivationPack(
-        hidden_states_q=hidden_states_q,
-        hidden_states_scale=hidden_states_scale,
-        topk_ids=selected_experts,
-        topk_weights=final_scales,
-        per_token_scale=per_token_scale,
-    )
+    return hidden_states_q, hidden_states_scale, per_token_scale
 
 
 def reshape_for_combine(out_2d: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:

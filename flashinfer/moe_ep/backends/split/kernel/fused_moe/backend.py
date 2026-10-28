@@ -13,7 +13,9 @@ from .....weights import MoEWeightPack
 from .bridge import (
     build_activation_pack,
     build_activation_pack_rank_major,
+    dispatch_quant_format,
     pack_mxfp8_dispatch_payload,
+    quantize_for_dispatch,
     reshape_for_combine,
 )
 from .config import FusedMoeKernelConfig
@@ -72,6 +74,17 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
     @property
     def packs_dispatch_payload(self) -> bool:
         return self._mxfp8_dispatch
+
+    def dispatch_format(self):
+        quant = self._moe_config.quant
+        return dispatch_quant_format(
+            quant,
+            per_token_activation=bool(quant.per_token_scale),
+            mxfp8_dispatch=self._mxfp8_dispatch,
+        )
+
+    def quantize_for_dispatch(self, x):
+        return quantize_for_dispatch(x, self._moe_config.quant)
 
     def preprocess_weights(
         self,
@@ -142,6 +155,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
+                recv_scale=ctx.expert_tensors_scale,
             )
         else:
             act_pack = build_activation_pack(
