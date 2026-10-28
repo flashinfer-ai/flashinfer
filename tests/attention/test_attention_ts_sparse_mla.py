@@ -1467,17 +1467,21 @@ def test_sparse_d576_rejected(change, match):
         batch_sparse_mla_decode_with_paged_kv_cache(q, kv, indices, lengths, **change)
 
 
-def test_sparse_d576_compile_capacity_bucket(monkeypatch):
-    """Capacities in one 128-key tile bucket compile one kernel."""
-    seen = []
-    monkeypatch.setattr(
-        mla_decode_module,
-        "_compile_sparse_d576",
-        lambda *args, **kwargs: seen.append(kwargs["capacity"]),
-    )
-    for topk in (132, 136, 256):
-        _d576_plan(150, 64, topk)
-    assert seen == [256] * 3
+def test_sparse_d576_compile_capacity_bucket():
+    """Capacities in one 128-key tile bucket resolve to one compiled kernel."""
+    signatures = {
+        mla_decode_module._resolve_sparse_mla_plan(
+            torch.device("cuda"),
+            150,
+            64,
+            max_topk=topk,
+            q_data_type=torch.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )[2].kernel_signature
+        for topk in (132, 136, 256)
+    }
+    assert len(signatures) == 1
 
 
 def test_sparse_d576_rejects_grid_z_overflow():
@@ -1510,8 +1514,12 @@ def test_sparse_d576_capture_without_eager_run():
 
 
 @pytest.mark.parametrize(
-    "option", [dict(assume_valid_prefix=True), dict(num_output_groups=1)]
+    "option,match",
+    [
+        (dict(assume_valid_prefix=True), "does not take assume_valid_prefix"),
+        (dict(num_output_groups=1), "require output_quant_block_size"),
+    ],
 )
-def test_sparse_d576_rejects_d512_plan_options(option):
-    with pytest.raises(ValueError, match="does not take"):
+def test_sparse_d576_rejects_d512_plan_options(option, match):
+    with pytest.raises(ValueError, match=match):
         _d576_plan(2, 64, 64, **option)
