@@ -1100,6 +1100,99 @@ def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("q_length, expected_backend", [(128, "cudnn"), (129, "fa2")])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_paged_auto_sm107_short_prefix_boundary(
+    q_length, expected_backend, use_cuda_graph
+):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires native SM107")
+    if not prefill._cudnn_supports_paged_auto():
+        pytest.skip("requires the qualified paged-auto cuDNN runtime")
+    # Exercise the real auto wrapper on both sides of the new boundary. A
+    # missing cuDNN admission must fail here, not turn into a skipped test.
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    q = torch.randn(q_length, 16, 128, device=device, dtype=torch.bfloat16)
+    k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, q_length], dtype=torch.int32)
+    ip = torch.tensor([0, 512], dtype=torch.int32)
+    ix = torch.arange(512, dtype=torch.int32).roll(17)
+    last = torch.tensor([16], dtype=torch.int32)
+    graph_buffers = (
+        dict(
+            qo_indptr_buf=torch.empty_like(qo, device=device),
+            paged_kv_indptr_buf=torch.empty_like(ip, device=device),
+            paged_kv_indices_buf=torch.empty_like(ix, device=device),
+            paged_kv_last_page_len_buf=torch.empty_like(last, device=device),
+            max_total_num_rows=q_length,
+        )
+        if use_cuda_graph
+        else {}
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=device, dtype=torch.uint8),
+        "HND",
+        backend="auto",
+        use_cuda_graph=use_cuda_graph,
+        **graph_buffers,
+    )
+    wrapper.plan(
+        qo,
+        ip,
+        ix,
+        last,
+        16,
+        4,
+        128,
+        16,
+        causal=True,
+        q_data_type=q.dtype,
+        max_token_per_sequence=q_length,
+        max_sequence_kv=8192,
+    )
+    assert wrapper._backend == expected_backend
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+
+    def run():
+        wrapper.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_base="ln")
+
+    def check():
+        # CPU reference avoids depending on a second GPU attention provider.
+        expected, stats = _reference(
+            q.cpu(),
+            k.transpose(1, 2).cpu(),
+            v.transpose(1, 2).cpu(),
+            qo,
+            ip,
+            ix,
+            last,
+            causal=True,
+            scale=128**-0.5,
+        )
+        torch.testing.assert_close(out.cpu().float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse.cpu(), stats, atol=0.004, rtol=0.004)
+        assert wrapper._backend == expected_backend
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        q.mul_(0.75)
+        v.mul_(0.5)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        check()
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 def test_paged_single_token_gqa_writes_every_lse_head():
     """cuDNN < 9.27 mis-stores a ragged Stats tensor for single-token GQA
     (NVBug 6783545); the plan then binds the packed LSE through the unragged
