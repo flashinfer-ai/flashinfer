@@ -592,6 +592,10 @@ kernel_cake_gdn_train_ac5ce25cc84be93bb2a6(const __grid_constant__ CUtensorMap q
                 tab_rs[0] = rowscale[(long long)(trow_n_1 + lane) * (long long)num_heads + (long long)head_1];
                 tab_rs[1] = rowscale[(long long)(trow_n_1 + 32 + lane) * (long long)num_heads + (long long)head_1];
                 tab_cl[0] = (unsigned int)chunk_len[c0_1 + c_n_1];
+#if __CUDA_ARCH__ == 1000
+#else
+                int tok_n = chunk_bos[c0_1 + c_n_1];
+#endif
                 mbarrier_wait(rest_empty_addr, _phase_rest_empty);
                 __syncwarp();
                 if (elect_sync()) {
@@ -604,6 +608,21 @@ kernel_cake_gdn_train_ac5ce25cc84be93bb2a6(const __grid_constant__ CUtensorMap q
                     #pragma unroll
                     for (int panel_2 = 0; panel_2 < 1; panel_2++) {
                         tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_2 * 8192), (&do_g_tma), panel_2 * 64 + vbase_1, head_1, trow_1, rest_full_addr);
+#if __CUDA_ARCH__ == 1000
+#else
+                    }
+                    if (c_1 > 0) {
+                        #pragma unroll
+                        for (int panel_3 = 0; panel_3 < 2; panel_3++) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&k_tma))), "r"((int)(panel_3 * 64)), "r"((int)(qk_head_1)), "r"((int)(tok_n)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&q_tma))), "r"((int)(panel_3 * 64)), "r"((int)(qk_head_1)), "r"((int)(tok_n)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&w_tma))), "r"((int)(panel_3 * 64)), "r"((int)(head_1)), "r"((int)(trow_n_1)) : "memory");
+                        }
+                        #pragma unroll
+                        for (int panel_4 = 0; panel_4 < 1; panel_4++) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&do_g_tma))), "r"((int)(panel_4 * 64 + vbase_1)), "r"((int)(head_1)), "r"((int)(trow_n_1)) : "memory");
+                        }
+#endif
                     }
                 }
                 _phase_rest_empty ^= 1;
@@ -633,12 +652,12 @@ kernel_cake_gdn_train_ac5ce25cc84be93bb2a6(const __grid_constant__ CUtensorMap q
                     mbarrier_wait(dhs_ready_addr, _phase_dhs_ready_0);
                     _phase_dhs_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                    int _smem_desc_lo_0 = ((k_op_addr) >> 4) & 0x7FFF;
-                    int _smem_desc_lo_1 = (((dhs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                     int _smem_desc_lo_0 = ((k_op_addr) >> 4) & 0x3FFF;
                     int _smem_desc_lo_1 = (((dhs_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
+#else
+                    int _smem_desc_lo_0 = ((k_op_addr) >> 4) & 0x7FFF;
+                    int _smem_desc_lo_1 = (((dhs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -699,12 +718,12 @@ kernel_cake_gdn_train_ac5ce25cc84be93bb2a6(const __grid_constant__ CUtensorMap q
                     _phase_k_full ^= 1;
                     mbarrier_wait(rest_full_addr, _phase_rest_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                    int _smem_desc_lo_2 = (((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-                    int _smem_desc_lo_3 = (((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                     int _smem_desc_lo_2 = (((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
                     int _smem_desc_lo_3 = (((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+#else
+                    int _smem_desc_lo_2 = (((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_3 = (((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -743,12 +762,12 @@ kernel_cake_gdn_train_ac5ce25cc84be93bb2a6(const __grid_constant__ CUtensorMap q
                     mbarrier_wait(bdv_ready_addr, _phase_bdv_ready_0);
                     _phase_bdv_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                    int _smem_desc_lo_4 = (((w_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-                    int _smem_desc_lo_5 = (((bdv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-#else
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
                     int _smem_desc_lo_4 = (((w_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
                     int _smem_desc_lo_5 = (((bdv_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+#else
+                    int _smem_desc_lo_4 = (((w_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_5 = (((bdv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #endif
                     asm volatile(
                     "{\n\t"
