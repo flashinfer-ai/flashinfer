@@ -191,8 +191,8 @@ def issue_dynamic_bf16_mma_tile(
     b_frag_tile,
     k_tile_idx,
     valid_tokens_in_tile,
-    mma_tiler_mnk: tuple,
-    n_alignment: int = 16,
+    tiled_mma: cute.TiledMma,
+    stage_k: int,
     loc=None,
     ip=None,
 ):
@@ -210,27 +210,30 @@ def issue_dynamic_bf16_mma_tile(
     multi-atom fragments explicitly: their per-atom N tails and two-CTA B
     partitions would need separate descriptors and load shifts.
     """
-    umma_m, allocated_n, tile_k = mma_tiler_mnk
-    cta_group = 2 if umma_m == 256 else 1
+    umma_m = cute.size(tiled_mma.shape_mnk, mode=[0])
+    allocated_n = cute.size(tiled_mma.shape_mnk, mode=[1])
+    atom_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+    cta_group = cute.size(tiled_mma.thr_id.shape)
+    n_alignment = 8 * cta_group
+    num_k_atoms = cute.ceil_div(stage_k, atom_k)
     if (
-        n_alignment not in (8, 16)
-        or (cta_group == 2 and n_alignment != 16)
+        cta_group not in (1, 2)
         or not n_alignment <= allocated_n <= 256
         or allocated_n % n_alignment
-        or tile_k % 16
+        or atom_k != 16
+        or not 0 < stage_k <= cute.size(a_frag_tile, mode=[2]) * atom_k
     ):
         raise ValueError("Unsupported BF16 N/K geometry.")
     if (
         cute.size(a_frag_tile, mode=[1]) != 1
         or cute.size(b_frag_tile, mode=[1]) != 1
-        or cute.size(a_frag_tile, mode=[2]) != tile_k // 16
-        or cute.size(b_frag_tile, mode=[2]) != tile_k // 16
+        or cute.size(a_frag_tile, mode=[2]) != cute.size(b_frag_tile, mode=[2])
     ):
         raise ValueError("Dynamic BF16 MMA requires one M/N atom and K16 fragments.")
     descriptor = Int32(bf16_static_idesc(umma_m)) | (
         (_align_n(valid_tokens_in_tile, n_alignment) >> Int32(3)) << Int32(17)
     )
-    for inner_k in range(tile_k // 16):
+    for inner_k in range(num_k_atoms):
         a_atom = a_frag_tile[(None, 0, inner_k)]
         b_atom = b_frag_tile[(None, 0, inner_k)]
         acc_atom = acc_tensor[(None, 0, 0)]
@@ -506,6 +509,7 @@ class Sm100W4A16GroupedGemmKernel:
         b_frag_tile: cute.Tensor,
         k_tile_idx: cutlass.Int32,
         valid_tokens: cutlass.Int32,
+        stage_k: cutlass.Constexpr[int],
     ):
         if cutlass.const_expr(self.use_dynamic_n):
             issue_dynamic_bf16_mma_tile(
@@ -514,14 +518,15 @@ class Sm100W4A16GroupedGemmKernel:
                 b_frag_tile=b_frag_tile,
                 k_tile_idx=k_tile_idx,
                 valid_tokens_in_tile=valid_tokens,
-                mma_tiler_mnk=self.mma_tiler,
-                n_alignment=16 if self.use_2cta_instrs else 8,
+                tiled_mma=tiled_mma,
+                stage_k=stage_k,
             )
         else:
+            num_k_atoms = cute.ceil_div(
+                stage_k, cute.size(tiled_mma.shape_mnk, mode=[2])
+            )
             tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile_idx != 0)
-            for kblock_idx in cutlass.range(
-                cute.size(a_frag_tile, mode=[2]), unroll_full=True
-            ):
+            for kblock_idx in cutlass.range(num_k_atoms, unroll_full=True):
                 cute.gemm(
                     tiled_mma,
                     accumulators,
@@ -1944,30 +1949,48 @@ class Sm100W4A16GroupedGemmKernel:
                         cutlass.min(work_tile.distance_to_boundary, self.mma_tiler[1]),
                     )
                     # Mma mainloop
-                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        trans2mma_pipeline.consumer_wait(
-                            trans2mma_consumer_state, peek_trans2mma_full_status
-                        )
-                        b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
-                        self._issue_mma_tile(
-                            tiled_mma,
-                            tCtAcc,
-                            tCrA[(None, None, None, trans2mma_consumer_state.index)],
-                            tCrB[(None, None, None, b_load2mma_consumer_state.index)],
-                            _k_tile,
-                            valid_tokens,
-                        )
-                        trans2mma_pipeline.consumer_release(trans2mma_consumer_state)
-                        b_load2mma_pipeline.consumer_release(b_load2mma_consumer_state)
-                        trans2mma_consumer_state.advance()
-                        b_load2mma_consumer_state.advance()
-                        peek_trans2mma_full_status = cutlass.Boolean(1)
-                        if trans2mma_consumer_state.count < k_tile_cnt:
-                            peek_trans2mma_full_status = (
-                                trans2mma_pipeline.consumer_try_wait(
-                                    trans2mma_consumer_state
-                                )
+                    # Peel the static K tail; retain one wait/release per stage.
+                    full_k_tiles = mA_mkl.shape[1] // self.mma_tiler[2]
+                    tail_k = mA_mkl.shape[1] % self.mma_tiler[2]
+                    for section in cutlass.range_constexpr(1 + (tail_k != 0)):
+                        first_stage = 0 if section == 0 else full_k_tiles
+                        last_stage = full_k_tiles if section == 0 else k_tile_cnt
+                        stage_k = self.mma_tiler[2] if section == 0 else tail_k
+                        for _k_tile in cutlass.range(
+                            first_stage, last_stage, 1, unroll=1
+                        ):
+                            trans2mma_pipeline.consumer_wait(
+                                trans2mma_consumer_state, peek_trans2mma_full_status
                             )
+                            b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
+                            self._issue_mma_tile(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[
+                                    (None, None, None, trans2mma_consumer_state.index)
+                                ],
+                                tCrB[
+                                    (None, None, None, b_load2mma_consumer_state.index)
+                                ],
+                                _k_tile,
+                                valid_tokens,
+                                stage_k,
+                            )
+                            trans2mma_pipeline.consumer_release(
+                                trans2mma_consumer_state
+                            )
+                            b_load2mma_pipeline.consumer_release(
+                                b_load2mma_consumer_state
+                            )
+                            trans2mma_consumer_state.advance()
+                            b_load2mma_consumer_state.advance()
+                            peek_trans2mma_full_status = cutlass.Boolean(1)
+                            if trans2mma_consumer_state.count < k_tile_cnt:
+                                peek_trans2mma_full_status = (
+                                    trans2mma_pipeline.consumer_try_wait(
+                                        trans2mma_consumer_state
+                                    )
+                                )
                     # Async arrive accumulator buffer full
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
@@ -2398,6 +2421,13 @@ class Sm100W4A16GroupedGemmKernel:
                             tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
                                 relu, relu
                             )
+                    elif cutlass.const_expr(not self.use_fused_finalize):
+                        alpha_f32 = cutlass.Float32(alpha_val)
+                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+                                (tTR_rAcc[i], tTR_rAcc[i + 1]),
+                                (alpha_f32, alpha_f32),
+                            )
                     if cutlass.const_expr(self.use_fused_finalize):
                         finalize_thr_slice = m_thr_offset[
                             (None, None, None, subtile_idx)
@@ -2506,8 +2536,6 @@ class Sm100W4A16GroupedGemmKernel:
                     ):
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        if cutlass.const_expr(not self.fuse_activation):
-                            acc_vec = cutlass.Float32(alpha_val) * acc_vec
                         acc_vec = acc_vec.to(self.c_dtype)
                         tRS_rC.store(acc_vec)
                         num_prev_subtiles += 1
@@ -2537,8 +2565,6 @@ class Sm100W4A16GroupedGemmKernel:
                     else:
                         # Convert to C type
                         acc_vec = tTR_rAcc.load()
-                        if cutlass.const_expr(not self.fuse_activation):
-                            acc_vec = cutlass.Float32(alpha_val) * acc_vec
                         acc_vec = acc_vec.to(self.c_dtype)
                         tTR_rC.store(acc_vec)
                         # Compute predicate for SIMT store
