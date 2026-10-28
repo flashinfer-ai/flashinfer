@@ -141,12 +141,12 @@ kernel_cake_lm_head_loss_8eccf1c4d61d3cd4f354(__nv_bfloat16* __restrict__ z, lon
                 for (int w = 0; w < 4; w++) {
                     uint32_t _prmt_1;
                     asm("prmt.b32 %0, %1, %2, 0x1044;" : "=r"(_prmt_1) : "r"(zw[k * 4 + w]), "r"(zero32));
-                    float _exp_0 = expf(__uint_as_float(_prmt_1) - lse_t);
+                    float exp = expf(__uint_as_float(_prmt_1) - lse_t);
                     uint32_t _prmt_2;
                     asm("prmt.b32 %0, %1, %2, 0x3244;" : "=r"(_prmt_2) : "r"(zw[k * 4 + w]), "r"(zero32));
-                    float _exp_1 = expf(__uint_as_float(_prmt_2) - lse_t);
-                    out[2 * w] = d_raw * (-_exp_0);
-                    out[2 * w + 1] = d_raw * (-_exp_1);
+                    float exp_0 = expf(__uint_as_float(_prmt_2) - lse_t);
+                    out[2 * w] = d_raw * (-exp);
+                    out[2 * w + 1] = d_raw * (-exp_0);
                 }
                 if (vi == lbl_vec) {
                     int col0 = vi * 8;
