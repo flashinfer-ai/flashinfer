@@ -55,6 +55,7 @@ def test_context_sage_cold_compile(tmp_path: Path) -> None:
         cwd=Path(__file__).resolve().parents[2],
         env=dict(
             os.environ,
+            PYTEST_ADDOPTS="",
             FLASHINFER_WORKSPACE_BASE=str(tmp_path),
             CUTE_DSL_CACHE_DIR=str(tmp_path / "cute_dsl"),
         ),
