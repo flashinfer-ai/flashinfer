@@ -194,8 +194,8 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
   const bool aligned_peer = fa->signal_slots_ == fi::kUlyssesSignalSlots && B == 1 &&
                             row_bytes % 8 == 0 && row_elems > 0 && row_elems <= INT32_MAX / W &&
                             S_local <= INT32_MAX / (W * row_elems);
-  const int blocks = static_cast<int>(std::max<int64_t>(
-      1, std::min<int64_t>(aligned_peer ? fa->max_blocks_ : vllm::kMaxBlocks, num_rows)));
+  const int cap = aligned_peer ? fa->max_blocks_ : std::min(fa->max_blocks_, vllm::kMaxBlocks);
+  const int blocks = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(cap, num_rows)));
   const int threads = fi::kUlyssesThreads;
   const size_t out_bytes = out.numel() * get_element_size(out);
 

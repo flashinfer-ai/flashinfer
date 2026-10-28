@@ -1679,12 +1679,11 @@ def _mixed_alignment_body(rank, world_size, group, _unused):
     return ("ok", "mixed alignment")
 
 
-def _mixed_capacity_body(rank, world_size, group, _unused):
+def _mixed_capacity_body(rank, world_size, group, shape):
     ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     module = ulysses_mod.get_ulysses_a2a_module()
     original_query = module.ulysses_a2a_safe_blocks
     module.ulysses_a2a_safe_blocks = lambda *_args: 16 if rank == 0 else 32
-    shape = (1, 11, 24, 16)
     try:
         comm = UlyssesCommunicator(
             group,
@@ -2903,8 +2902,9 @@ def test_portable_nvlink_mixed_rank_alignment():
     _run_multi_rank("_mixed_alignment_body", 2, None, allow_skip=True)
 
 
-def test_portable_nvlink_mixed_rank_capacity():
-    _run_multi_rank("_mixed_capacity_body", 2, None, allow_skip=True)
+@pytest.mark.parametrize("shape", [(1, 11, 24, 16), (1, 19, 6, 7)])
+def test_portable_nvlink_mixed_rank_capacity(shape):
+    _run_multi_rank("_mixed_capacity_body", 2, shape, allow_skip=True)
 
 
 @pytest.mark.parametrize("world_size", [2, 3])
