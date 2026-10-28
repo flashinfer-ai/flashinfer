@@ -26,8 +26,8 @@ the same inputs, to bitwise idempotence, to stream-private workspaces and to its
 Concurrent use of the NVFP4 routes (several streams, CUDA graphs captured on one stream or with forked
 branches, two host threads on one stream, serialized launches) completes and reproduces every call's
 single-stream result bit for bit; each such test fails at a progress deadline instead of hanging.
-Every test needs an SM120 GPU (the JIT modules only build for compute capability 12.x) except the
-workspace estimators and the ``pv_mode`` validation.
+Numerical and concurrency tests require exact compute capability 12.0: the generated programs
+ship only sm_120a. Input validation and unsupported-device rejection remain covered on other GPUs.
 """
 
 import math
@@ -91,13 +91,33 @@ PV_MODES = ("fp4", "fp8")
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+    not _supported(),
+    reason="generated programs require exact compute capability 12.0 (sm_120a)",
 )
+
+
+@pytest.mark.parametrize(
+    "cuda_available, capability, expected",
+    [
+        (False, (12, 0), False),
+        (True, (12, 0), True),
+        (True, (12, 1), False),
+        (True, (10, 0), False),
+    ],
+)
+def test_supported_requires_exact_sm120(
+    monkeypatch, cuda_available, capability, expected
+):
+    # The generated programs ship sm_120a only; Spark must not enter the numerical suite.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setitem(
+        _supported.__globals__, "get_compute_capability", lambda device: capability
+    )
+    assert _supported() is expected
 
 
 def synthetic_inputs(tokens: int, heads: int, seed: int, device: torch.device):
@@ -236,7 +256,23 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_custom_scale_and_empty_stream()
     )
 
 
-@requires_sm120
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pv_mode", PV_MODES)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_unsupported_device(
+    pv_mode,
+) -> None:
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=(0, 1), pv_mode=pv_mode
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
     q, k, v = synthetic_inputs(300, 4, seed=3, device=device)
