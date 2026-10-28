@@ -42,7 +42,7 @@ extern "C" __attribute__((visibility("default"))) void FlashInferSetCubinCallbac
 }
 
 // Thread-local variable that stores the current cubin.
-// It is reset on every call to `getCubin()`.
+// It is cleared on every call to `getCubin()` before the callback runs.
 thread_local std::string current_cubin;
 
 // Called by the callback to set the current cubin.
@@ -56,19 +56,16 @@ extern "C" __attribute__((visibility("default"))) void FlashInferSetCurrentCubin
  *
  * @param name The artifact path of the cubin.
  * @param sha256 The expected checksum, passed through to the callback.
- * @return The cubin bytes; throws when the callback delivered nothing.
+ * @return The cubin bytes. Empty when the callback delivered nothing (a failed download or
+ *         checksum, which the Python loader logs). The caller decides whether that is fatal: a
+ *         checked driver load of empty data fails with a CUresult like any other bad cubin.
  */
 std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
+  // Never hand back the previous call's data when the callback sets nothing.
   current_cubin.clear();
   callbackGetCubin(name.c_str(), sha256.c_str());
-  if (current_cubin.empty()) {
-    throw std::runtime_error("FlashInfer cubin loader returned no data for " + name +
-                             " (expected sha256 " + sha256 +
-                             "); see the preceding Python log line for the download or checksum "
-                             "error");
-  }
   return current_cubin;
 }

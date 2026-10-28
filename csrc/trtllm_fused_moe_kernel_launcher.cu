@@ -1143,8 +1143,8 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
  * Reports a tile_N fallback once per (device, tile) pair on stderr; token-by-token inference
  * would otherwise print the same line on every launch.
  *
- * @param tile_N The tile the heuristic chose, which has no loadable default config.
- * @param chosen The tile used instead.
+ * @param tile_N The tile the heuristic chose, which has no kernel that loads on this driver.
+ * @param chosen The next tile tried instead.
  */
 inline void reportTileFallbackOnce(int64_t tile_N, int64_t chosen) {
   static std::mutex reported_mutex;
@@ -1159,39 +1159,29 @@ inline void reportTileFallbackOnce(int64_t tile_N, int64_t chosen) {
   }
   std::fprintf(stderr,
                "[FlashInfer] tile_N %lld has no trtllm-gen kernel that loads on this driver; "
-               "using tile_N %lld (GitHub #5322)\n",
+               "trying tile_N %lld (GitHub #5322)\n",
                static_cast<long long>(tile_N), static_cast<long long>(chosen));
 }
 
 /**
- * When the default tactic is requested and the heuristic tile has no config whose cubin loads
- * on this driver (cubinLoads() in trtllm_batched_gemm_runner.cu), pick the nearest tile that has
- * one: larger tiles first (they hold the two-CTA kernels), then smaller ones. In every other case
- * tile_N is returned unchanged, so behaviour is identical where every cubin loads.
+ * Tiles to try for a default-tactic launch, in order: the heuristic tile itself, then larger
+ * tiles ascending (they hold the two-CTA kernels), then smaller tiles descending. A launch moves
+ * to the next entry only when the batched-GEMM runner reports that none of the current tile's
+ * kernels loads on this driver (NoLoadableKernelError, GitHub #5322); where every cubin loads
+ * the first entry succeeds and the rest is never consulted.
  *
- * @param tile_N The tile resolved from the tactic or the heuristic.
- * @param config The config index of the tactic; -1 requests the default tactic.
+ * @param tile_N The tile resolved from the heuristic.
  * @param launchers The per-tile launchers of this MoE entry.
- * @return The tile to use.
+ * @return The tiles to try, starting with tile_N.
  */
 template <typename LauncherMap>
-int64_t pickTileWithDefaultConfig(int64_t tile_N, int64_t config, LauncherMap const& launchers) {
-  if (config != -1) {
-    return tile_N;
-  }
-  auto hasDefault = [&launchers](int64_t t) {
-    auto it = launchers.find(static_cast<int32_t>(t));
-    return it != launchers.end() && it->second->default_config_available();
-  };
-  if (hasDefault(tile_N)) {
-    return tile_N;
-  }
+std::vector<int64_t> tileFallbackOrder(int64_t tile_N, LauncherMap const& launchers) {
   std::vector<int64_t> tiles;
   for (auto const& entry : launchers) {
     tiles.push_back(entry.first);
   }
   std::sort(tiles.begin(), tiles.end());
-  std::vector<int64_t> order;
+  std::vector<int64_t> order{tile_N};
   for (auto t : tiles) {
     if (t > tile_N) {
       order.push_back(t);
@@ -1202,13 +1192,7 @@ int64_t pickTileWithDefaultConfig(int64_t tile_N, int64_t config, LauncherMap co
       order.push_back(*it);
     }
   }
-  for (auto t : order) {
-    if (hasDefault(t)) {
-      reportTileFallbackOnce(tile_N, t);
-      return t;
-    }
-  }
-  return tile_N;
+  return order;
 }
 
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
@@ -1779,19 +1763,6 @@ class FusedMoeLauncher {
     this->moe_tactic = moe_tactic;
   }
 
- public:
-  /** True when a default tactic exists for this launcher's tile on this device and driver. */
-  bool default_config_available() {
-    try {
-      int64_t tactic = -1;
-      prepare_moe_runner(tactic);
-      return true;
-    } catch (std::exception const&) {
-      return false;
-    }
-  }
-
- protected:
   /** Allocate the FC workspaces required by the resolved complete tactic. */
   void prepare_moe_common(int64_t& moe_tactic) {
     prepare_moe_runner(moe_tactic);
@@ -6475,52 +6446,67 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // The probe below runs on the device of hidden_states; the tile may not change once routing
-  // metadata was prepared for it (DA body preparation and replay).
-  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   auto const [resolved_tile_N, config] = resolveMoeTileAndConfig(
       config_index, mSupportedTileN, num_tokens, totalExpertsPerToken, totalLocalExperts);
-  int64_t const tile_N = (is_da_body_preparation || !da_routing_metadata.empty())
-                             ? resolved_tile_N
-                             : pickTileWithDefaultConfig(resolved_tile_N, config, launchers_map);
+  bool const is_da_launch = is_da_body_preparation || !da_routing_metadata.empty();
+  // A default-tactic launch moves to another tile when none of its tile's kernels loads on this
+  // driver (GitHub #5322). An explicit tactic names its tile, and a DA launch's routing metadata
+  // was prepared for its tile, so both keep it.
+  std::vector<int64_t> const tile_order = (config == -1 && !is_da_launch)
+                                              ? tileFallbackOrder(resolved_tile_N, launchers_map)
+                                              : std::vector<int64_t>{resolved_tile_N};
+  for (size_t attempt = 0; attempt < tile_order.size(); ++attempt) {
+    int64_t const tile_N = tile_order[attempt];
 
-  // Get the launcher for the selected tile_N
-  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
-  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
-                   "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
-  auto& selected_launcher = launcher_it->second;
-  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           config, config_index[0] != -1, query_workspace_size,
-                                           is_da_body_preparation || !da_routing_metadata.empty());
-      size.has_value()) {
-    return size.value();
-  }
-
-  if (is_da_body_preparation) {
-    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
-        << "DA body preparation does not accept an existing body workspace.";
-    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
-    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
-  }
-  if (!da_routing_metadata.empty()) {
-    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    auto const body = FP4DABodyBuffers::from_ffi(da_body_workspace);
-    selected_launcher->run_da_body(routing, body, config, enable_pdl);
-    if (do_finalize) {
-      return {selected_launcher->finalized_da_output()};
+    // Get the launcher for the selected tile_N
+    auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+    FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                     "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
+    auto& selected_launcher = launcher_it->second;
+    if (auto size =
+            apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer, config,
+                                     config_index[0] != -1, query_workspace_size, is_da_launch);
+        size.has_value()) {
+      return size.value();
     }
-    return {body.gemm2_output, routing.expert_weights, routing.expanded_idx_to_permuted_idx};
-  }
-  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
-      << "A DA body workspace requires routing metadata.";
 
-  // Run the launcher - it will create its own runner internally
-  return selected_launcher
-      ->run(config, enable_pdl,
-            /*use_routing_scales_on_input=*/false,
-            /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
-      .to_ffi();
+    if (is_da_body_preparation) {
+      TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+          << "DA body preparation does not accept an existing body workspace.";
+      auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+      auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+      return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
+    }
+    if (!da_routing_metadata.empty()) {
+      auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+      auto const body = FP4DABodyBuffers::from_ffi(da_body_workspace);
+      selected_launcher->run_da_body(routing, body, config, enable_pdl);
+      if (do_finalize) {
+        return {selected_launcher->finalized_da_output()};
+      }
+      return {body.gemm2_output, routing.expert_weights, routing.expanded_idx_to_permuted_idx};
+    }
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "A DA body workspace requires routing metadata.";
+
+    // Run the launcher - it will create its own runner internally. The tactic is resolved after
+    // routing and before either GEMM, so a tile whose kernels do not load fails before the GEMMs
+    // and the next launcher reruns routing for its own tile.
+    try {
+      return selected_launcher
+          ->run(config, enable_pdl,
+                /*use_routing_scales_on_input=*/false,
+                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
+          .to_ffi();
+    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
+      if (attempt + 1 == tile_order.size()) {
+        throw;
+      }
+      reportTileFallbackOnce(resolved_tile_N, tile_order[attempt + 1]);
+    }
+  }
+  // Unreachable: the loop returns or rethrows. Added to suppress compiler warning.
+  return Array<Optional<Tensor>>();
 }
 
 Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
@@ -6797,9 +6783,15 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
       runnerIt = runners.emplace(tileN, std::move(runner)).first;
     }
     auto const components = runnerIt->second->getConfigComponents(configIndex);
-    auto const anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
-        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
-        hidden_size_output > 0 ? hidden_size_output : hidden_size);
+    int64_t anchorIndex = -1;
+    try {
+      anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
+          hidden_size_output > 0 ? hidden_size_output : hidden_size);
+    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
+      // No kernel of this tile loads on this driver (GitHub #5322): the tile has no anchor, and
+      // profiling rejects its tactics one by one as run() raises for each.
+    }
     result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
                       configIndex == anchorIndex ? 1 : 0});
   }

@@ -254,8 +254,7 @@ def get_artifact(
     or its SHA-256 doesn't match, it is downloaded from
     ``FLASHINFER_CUBINS_REPOSITORY``.
 
-    Returns the file contents as bytes; raises RuntimeError when the file is
-    still unreadable or its SHA-256 mismatches after the download.
+    Returns the file contents as bytes, or empty bytes on failure.
     """
     local_path = str(FLASHINFER_CUBIN_DIR / file_name)
     data = load_cubin(local_path, sha256)
@@ -274,13 +273,7 @@ def get_artifact(
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching {file_name} from {uri}")
     download_file(uri, local_path, session=session, expected_sha256=sha256)
-    data = load_cubin(local_path, sha256)
-    if data is None:
-        raise RuntimeError(
-            f"Failed to load {file_name} after downloading from {uri}: "
-            f"the file is unreadable or its sha256 does not match {sha256}"
-        )
-    return data
+    return load_cubin(local_path, sha256) or b""
 
 
 # Backward-compatible alias
@@ -371,13 +364,15 @@ def setup_cubin_loader(dll_path: str) -> None:
     def get_cubin_callback(name: bytes, sha256: bytes):
         """Deliver the cubin bytes for ``name`` to the native side; never raises into native code."""
         # Both name and sha256 are bytes (c_char_p). A ctypes callback cannot
-        # propagate an exception: log it and set nothing, so the native side
-        # sees an empty cubin and raises (getCubin in cubin_loader.h).
+        # propagate an exception, so always hand the native side a buffer:
+        # empty bytes mean the cubin is unavailable (a failed download or
+        # checksum, logged by get_artifact), and the consumer's checked driver
+        # load decides whether that is fatal or skippable.
         try:
             cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
         except Exception as e:
             logger.error(f"Failed to load cubin {name.decode('utf-8', 'replace')}: {e}")
-            return
+            cubin = b""
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )
