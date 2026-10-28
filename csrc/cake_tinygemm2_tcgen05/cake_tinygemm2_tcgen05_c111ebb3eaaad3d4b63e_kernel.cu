@@ -353,8 +353,8 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
             if (elect_sync()) {
                 #pragma unroll 1
                 for (int rho_2 = 0; rho_2 < n_rounds_m; rho_2 += 4) {
-                    int s0m = rho_2 * 16;
-                    if (s0m < n_groups_m) {
+                    int s0m_3_0 = rho_2 * 16;
+                    if (s0m_3_0 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -398,7 +398,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m + 1) {
+                        if (n_groups_m > s0m_3_0 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 512;
                             int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 128;
@@ -441,7 +441,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m + 2) {
+                        if (n_groups_m > s0m_3_0 + 2) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_4 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 512;
                             int _smem_desc_lo_5 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 128;
@@ -484,7 +484,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m + 3) {
+                        if (n_groups_m > s0m_3_0 + 3) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_6 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 512;
                             int _smem_desc_lo_7 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 128;
@@ -531,8 +531,8 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 3) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int s0m_0 = (rho_2 + 1) * 16;
-                    if (s0m_0 < n_groups_m) {
+                    int s0m_3_1 = (rho_2 + 1) * 16;
+                    if (s0m_3_1 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -576,7 +576,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m_0 + 1) {
+                        if (n_groups_m > s0m_3_1 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_10 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 512;
                             int _smem_desc_lo_11 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 128;
@@ -619,7 +619,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_0 + 2) {
+                        if (n_groups_m > s0m_3_1 + 2) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_12 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 512;
                             int _smem_desc_lo_13 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 128;
@@ -662,7 +662,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_0 + 3) {
+                        if (n_groups_m > s0m_3_1 + 3) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_14 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 512;
                             int _smem_desc_lo_15 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 128;
@@ -709,8 +709,8 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 3) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int s0m_1 = (rho_2 + 2) * 16;
-                    if (s0m_1 < n_groups_m) {
+                    int s0m_3_2 = (rho_2 + 2) * 16;
+                    if (s0m_3_2 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -754,7 +754,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_16), "r"(_smem_desc_lo_17), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m_1 + 1) {
+                        if (n_groups_m > s0m_3_2 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_18 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 512;
                             int _smem_desc_lo_19 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 128;
@@ -797,7 +797,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_18), "r"(_smem_desc_lo_19), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_1 + 2) {
+                        if (n_groups_m > s0m_3_2 + 2) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_20 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 512;
                             int _smem_desc_lo_21 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 128;
@@ -840,7 +840,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_20), "r"(_smem_desc_lo_21), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_1 + 3) {
+                        if (n_groups_m > s0m_3_2 + 3) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_22 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 512;
                             int _smem_desc_lo_23 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 128;
@@ -887,8 +887,8 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 3) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int s0m_2 = (rho_2 + 3) * 16;
-                    if (s0m_2 < n_groups_m) {
+                    int s0m_3_3 = (rho_2 + 3) * 16;
+                    if (s0m_3_3 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -932,7 +932,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_24), "r"(_smem_desc_lo_25), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m_2 + 1) {
+                        if (n_groups_m > s0m_3_3 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_26 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 512;
                             int _smem_desc_lo_27 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 1) * 128;
@@ -975,7 +975,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_26), "r"(_smem_desc_lo_27), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_2 + 2) {
+                        if (n_groups_m > s0m_3_3 + 2) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_28 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 512;
                             int _smem_desc_lo_29 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 2) * 128;
@@ -1018,7 +1018,7 @@ kernel_cake_tinygemm2_tcgen05_c111ebb3eaaad3d4b63e(const __grid_constant__ CUten
                     "}\n"
                     :: "r"(_smem_desc_lo_28), "r"(_smem_desc_lo_29), "r"(tmem_acc), "r"(1) : "memory");
                         }
-                        if (n_groups_m > s0m_2 + 3) {
+                        if (n_groups_m > s0m_3_3 + 3) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_30 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 512;
                             int _smem_desc_lo_31 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 4 + 3) * 128;

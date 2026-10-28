@@ -611,8 +611,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_16_0 = rho_2 * 4 * 4 + 1;
-                    if (g0m_16_0 < n_groups_m) {
+                    int g0m_0 = rho_2 * 4 * 4 + 1;
+                    if (g0m_0 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -660,8 +660,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_17_0 = rho_2 * 4 * 4 + 2;
-                    if (g0m_17_0 < n_groups_m) {
+                    int g0m_1 = rho_2 * 4 * 4 + 2;
+                    if (g0m_1 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -709,8 +709,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_18_0 = rho_2 * 4 * 4 + 3;
-                    if (g0m_18_0 < n_groups_m) {
+                    int g0m_2 = rho_2 * 4 * 4 + 3;
+                    if (g0m_2 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -808,8 +808,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_16_1 = (rho_2 * 4 + 1) * 4 + 1;
-                    if (g0m_16_1 < n_groups_m) {
+                    int g0m_3 = (rho_2 * 4 + 1) * 4 + 1;
+                    if (g0m_3 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -857,8 +857,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_17_1 = (rho_2 * 4 + 1) * 4 + 2;
-                    if (g0m_17_1 < n_groups_m) {
+                    int g0m_4 = (rho_2 * 4 + 1) * 4 + 2;
+                    if (g0m_4 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -906,8 +906,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_18_1 = (rho_2 * 4 + 1) * 4 + 3;
-                    if (g0m_18_1 < n_groups_m) {
+                    int g0m_5 = (rho_2 * 4 + 1) * 4 + 3;
+                    if (g0m_5 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1005,8 +1005,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_16_2 = (rho_2 * 4 + 2) * 4 + 1;
-                    if (g0m_16_2 < n_groups_m) {
+                    int g0m_6 = (rho_2 * 4 + 2) * 4 + 1;
+                    if (g0m_6 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1054,8 +1054,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_17_2 = (rho_2 * 4 + 2) * 4 + 2;
-                    if (g0m_17_2 < n_groups_m) {
+                    int g0m_7 = (rho_2 * 4 + 2) * 4 + 2;
+                    if (g0m_7 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1103,8 +1103,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_18_2 = (rho_2 * 4 + 2) * 4 + 3;
-                    if (g0m_18_2 < n_groups_m) {
+                    int g0m_8 = (rho_2 * 4 + 2) * 4 + 3;
+                    if (g0m_8 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1202,8 +1202,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_16_3 = (rho_2 * 4 + 3) * 4 + 1;
-                    if (g0m_16_3 < n_groups_m) {
+                    int g0m_9 = (rho_2 * 4 + 3) * 4 + 1;
+                    if (g0m_9 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1251,8 +1251,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_17_3 = (rho_2 * 4 + 3) * 4 + 2;
-                    if (g0m_17_3 < n_groups_m) {
+                    int g0m_10 = (rho_2 * 4 + 3) * 4 + 2;
+                    if (g0m_10 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -1300,8 +1300,8 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 18) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int g0m_18_3 = (rho_2 * 4 + 3) * 4 + 3;
-                    if (g0m_18_3 < n_groups_m) {
+                    int g0m_11 = (rho_2 * 4 + 3) * 4 + 3;
+                    if (g0m_11 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070

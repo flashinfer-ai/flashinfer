@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generated programs of the BF16 small-batch matrix product (out = input @ weight.T +
-bias) on tcgen05, bit for bit the output of the mma.sync tinygemm2 kernel: eight tiles
+bias) on tcgen05, bit for bit the output of the mma.sync tinygemm2 kernel: nine tiles
 (PACKED_NARROW, PACKED_NARROW_U4, PACKED_NARROW_FULL_STAGES, PACKED_M64_N16,
-PACKED_M64_N4, PACKED, PACKED_BOX8, ACCUMULATORS), each with and without the bias and
-with and without programmatic dependent launch, for sm_100a, sm_103a and sm_107a. The
-host module ``flashinfer.gemm.routergemm`` selects the program from the batch, the
-output features and the bias, computes the grid and launches it.
+PACKED_M64_N4, PACKED, PACKED_BOX8, PACKED_M64_N8, ACCUMULATORS), each with and without
+the bias and with and without programmatic dependent launch, for sm_100a, sm_103a and
+sm_107a (PACKED_M64_N8 for sm_107a only). The host module ``flashinfer.gemm.routergemm``
+selects the program from the batch, the output features and the bias, computes the grid
+and launches it.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -700,6 +701,86 @@ PACKED_BOX8_NOBIAS_PDL = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
+PACKED_M64_N8 = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2",
+    sources=(
+        "cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2_kernel.cu",
+        "cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2_binding.cu",
+    ),
+    targets=("sm_107a",),
+    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=101376,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_M64_N8_NOBIAS = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_53e595e7d938f773c823",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_53e595e7d938f773c823",
+    sources=(
+        "cake_tinygemm2_tcgen05_53e595e7d938f773c823_kernel.cu",
+        "cake_tinygemm2_tcgen05_53e595e7d938f773c823_binding.cu",
+    ),
+    targets=("sm_107a",),
+    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=101376,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_M64_N8_PDL = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_8e89c0a937878adae26b",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_8e89c0a937878adae26b",
+    sources=(
+        "cake_tinygemm2_tcgen05_8e89c0a937878adae26b_kernel.cu",
+        "cake_tinygemm2_tcgen05_8e89c0a937878adae26b_binding.cu",
+    ),
+    targets=("sm_107a",),
+    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=101376,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PACKED_M64_N8_NOBIAS_PDL = cake_program.CakeProgram(
+    name="cake_tinygemm2_tcgen05_e7244c463ed684737af3",
+    operator_dir="cake_tinygemm2_tcgen05",
+    kernel="kernel_cake_tinygemm2_tcgen05_e7244c463ed684737af3",
+    sources=(
+        "cake_tinygemm2_tcgen05_e7244c463ed684737af3_kernel.cu",
+        "cake_tinygemm2_tcgen05_e7244c463ed684737af3_binding.cu",
+    ),
+    targets=("sm_107a",),
+    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
+    tensors=("W", "X", "out", "bias"),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=101376,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
 ACCUMULATORS = cake_program.CakeProgram(
     name="cake_tinygemm2_tcgen05_1e984369d617712da373",
     operator_dir="cake_tinygemm2_tcgen05",
@@ -825,6 +906,10 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     PACKED_BOX8_NOBIAS,
     PACKED_BOX8_PDL,
     PACKED_BOX8_NOBIAS_PDL,
+    PACKED_M64_N8,
+    PACKED_M64_N8_NOBIAS,
+    PACKED_M64_N8_PDL,
+    PACKED_M64_N8_NOBIAS_PDL,
     ACCUMULATORS,
     ACCUMULATORS_NOBIAS,
     ACCUMULATORS_PDL,
@@ -866,6 +951,10 @@ __all__ = [
     "PACKED_BOX8_NOBIAS",
     "PACKED_BOX8_PDL",
     "PACKED_BOX8_NOBIAS_PDL",
+    "PACKED_M64_N8",
+    "PACKED_M64_N8_NOBIAS",
+    "PACKED_M64_N8_PDL",
+    "PACKED_M64_N8_NOBIAS_PDL",
     "ACCUMULATORS",
     "ACCUMULATORS_NOBIAS",
     "ACCUMULATORS_PDL",
