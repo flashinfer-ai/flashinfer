@@ -27,7 +27,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import (
+    E2M1_TO_FLOAT32,
+    cast_from_fp4,
+    ref_fp4_quant,
+)
 
 
 def get_cc():
@@ -427,6 +431,39 @@ class TestRMSNormFP4QuantCuteDSL:
 @blackwell_required
 class TestRMSNormFP4QuantMXFP4:
     """Tests for MXFP4 format (block_size=32, UE8M0 scales)."""
+
+    def test_mxfp4_bf16_packed_values_avoid_product_rounding(self):
+        """Check exact FP4 bytes across a value boundary with unchanged scales."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 129 / 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 0.75, device="cuda", dtype=torch.bfloat16)
+        weight[::32] = 4.0
+        eps = 1e-4
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        assert reference[0, 1] < 0.75 < rounded_product[0, 1]
+
+        reference_values, reference_scales = ref_fp4_quant(
+            reference, 1.0, 32, sf_use_ue8m0=True
+        )
+        _, rounded_scales = ref_fp4_quant(rounded_product, 1.0, 32, sf_use_ue8m0=True)
+        assert torch.all(reference_scales == 1.0)
+        torch.testing.assert_close(rounded_scales, reference_scales, rtol=0, atol=0)
+        # All operands are positive; map the reference FP4 values to nibbles.
+        levels = torch.tensor(E2M1_TO_FLOAT32[:8], device=x.device)
+        codes = torch.searchsorted(levels, reference_values).to(torch.uint8)
+        expected_bytes = codes[:, 0::2] | (codes[:, 1::2] << 4)
+        expected_scales = torch.full((1, 2), 127, device=x.device, dtype=torch.uint8)
+
+        actual_fp4, actual_scales = rmsnorm_fp4quant(
+            x, weight, eps=eps, block_size=32, scale_format="ue8m0"
+        )
+        torch.testing.assert_close(actual_scales, expected_scales, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_fp4.view(torch.uint8), expected_bytes, rtol=0, atol=0
+        )
 
     def test_mxfp4_bf16_scale_reduction_avoids_product_rounding(self):
         """Keep BF16 product rounding from crossing the UE8M0 scale boundary."""
