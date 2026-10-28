@@ -4116,9 +4116,7 @@ def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
             ((lean, None), (batched, lengths)) if runs[0] else ((batched, lengths),)
         )
         for arena, doc in options:
-            ws = KdaWorkspace(
-                plan, device, backward=True, arena=arena, doc_lengths=doc
-            )
+            ws = KdaWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
             for kwargs in (
                 {"arena": arena},
                 {"arena": arena},
@@ -6515,7 +6513,8 @@ def test_host_chain_ranks_match_every_seq_order_writer(
         ws = KdaWorkspace.for_problem(S, N, heads, device, backward=False)
         p = ws.plan
         written = [(p.record("table", "light"), original(ws, cu, "light"))]
-        if N <= 256:  # the forward's own tables (above 256 documents the same table program writes them)
+        # the forward's own tables (above 256 documents the same table program writes them)
+        if N <= 256:
             seen: list = []
 
             def spy(*args, _seen=seen, **kwargs):
