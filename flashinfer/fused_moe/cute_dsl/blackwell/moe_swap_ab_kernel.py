@@ -2577,7 +2577,11 @@ class Sm100BlockScaledGroupedGemmKernel:
         warp = tidx // 32
         block, block_y, block_z = cute.arch.block_idx()
         grid, _, _ = cute.arch.grid_dim()
-        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank = (
+            cutlass.Int32(0)
+            if cutlass.const_expr(self.cta_group_size == 1)
+            else cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        )
         # Static grids have a guaranteed physical CTA0. CLC can cancel it, so
         # each executing cluster keeps its own ancestor-publication owner.
         publishes_ancestors = (block == 0) and (block_y == 0) and (block_z == 0)
