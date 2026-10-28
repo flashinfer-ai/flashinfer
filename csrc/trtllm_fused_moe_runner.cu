@@ -562,6 +562,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.hiddenDim =
         args.valid_hidden_size.value_or(args.hidden_size_output.value_or(args.hidden_size));
     finalizeData.hiddenDimPadded = getGemm2OutputHiddenSize(args);
+    finalizeData.outputRowStride = args.output_row_stride;
     FLASHINFER_CHECK(finalizeData.hiddenDim <= finalizeData.hiddenDimPadded,
                      "Finalize output width ", finalizeData.hiddenDim,
                      " exceeds the GEMM2 output row stride ", finalizeData.hiddenDimPadded, ".");

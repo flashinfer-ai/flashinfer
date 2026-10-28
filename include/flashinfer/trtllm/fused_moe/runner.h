@@ -368,6 +368,8 @@ struct MoERunnerArgs {
   //     Only finalize sees it; it writes exactly that many of GEMM2's columns, so the caller never
   //     receives uninitialized columns.
   std::optional<int32_t> hidden_size_output;
+  // Row stride of the finalized output; zero keeps contiguous rows.
+  int64_t output_row_stride{0};
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
   int32_t n_group{0};

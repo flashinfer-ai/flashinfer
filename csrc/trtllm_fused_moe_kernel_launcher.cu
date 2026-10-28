@@ -102,6 +102,24 @@ int32_t moe_hidden_size_output(int64_t output_hidden_width, int32_t hidden_size,
   return output_hidden_width > 0 ? static_cast<int32_t>(output_hidden_width) : hidden_size;
 }
 
+// Row stride, in elements, of a caller-supplied finalized `output`, which may be a row view of a
+// wider buffer (out[:, :hidden] of a [num_tokens, width] tensor). Finalize writes token t's row at
+// t * stride, and its vectorized stores need the base and every row aligned to 16 bytes.
+int64_t finalized_output_row_stride(TensorView const& output) {
+  TVM_FFI_ICHECK_EQ(output.stride(1), 1) << "MoE output must be contiguous within each row";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(output.data_ptr()) % 16, 0)
+      << "MoE output must start on a 16-byte boundary";
+  if (output.size(0) <= 1) {
+    return output.size(1);
+  }
+  int64_t const row_stride = output.stride(0);
+  int64_t const element_bits = output.dtype().bits * output.dtype().lanes;
+  TVM_FFI_ICHECK_GE(row_stride, output.size(1)) << "MoE output rows must not overlap";
+  TVM_FFI_ICHECK_EQ(row_stride * element_bits % 128, 0)
+      << "MoE output row stride must be a multiple of 16 bytes, got " << row_stride << " elements";
+  return row_stride;
+}
+
 // Validates the caller's valid_* dims and records them on `args`.
 //
 // Must run after args.hidden_size / args.intermediate_size are set. It does NOT read or write
@@ -2876,6 +2894,7 @@ void run_staged_moe_finalize(btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool 
   finalizeData.topK = static_cast<int32_t>(top_k);
   finalizeData.hiddenDim = static_cast<int32_t>(hidden_size);
   finalizeData.hiddenDimPadded = static_cast<int32_t>(hidden_size);
+  finalizeData.outputRowStride = finalized_output_row_stride(output);
   finalizeData.totalNumPaddedTokens =
       static_cast<int32_t*>(const_cast<void*>(total_num_padded_tokens.data_ptr()));
 
@@ -5483,6 +5502,9 @@ Array<Optional<Tensor>> trtllm_bf16_moe(
     args->intermediate_size = intermediate_size;
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
@@ -5604,6 +5626,9 @@ Array<Optional<Tensor>> trtllm_fp8_per_tensor_scale_moe(
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
@@ -5730,6 +5755,9 @@ Array<Optional<Tensor>> trtllm_fp8_per_tensor_scale_routed_moe(
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
 
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
@@ -5815,6 +5843,9 @@ Array<Optional<Tensor>> trtllm_fp8_per_channel_scale_moe(
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
 
     auto launcher = std::make_unique<Fp8PerChannelLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
@@ -5976,6 +6007,9 @@ Array<Optional<Tensor>> trtllm_fp8_block_scale_moe(
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
@@ -6178,6 +6212,9 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     args->do_finalize = do_finalize;
     args->nvfp4_4over6_code = nvfp4_4over6_code;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
@@ -6324,6 +6361,9 @@ Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
+    if (do_finalize) {
+      args->output_row_stride = finalized_output_row_stride(output);
+    }
     args->output_scale = nullptr;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 

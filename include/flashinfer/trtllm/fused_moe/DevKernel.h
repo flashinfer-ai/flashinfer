@@ -394,6 +394,8 @@ struct Data {
   int32_t hiddenDim;
   // Hidden dimension output stride of FC2.
   int32_t hiddenDimPadded;
+  // Row stride of the finalized output; zero means hiddenDim (contiguous rows).
+  int64_t outputRowStride{0};
   int32_t const* totalNumPaddedTokens;
 };
 
@@ -415,6 +417,7 @@ struct KernelParams {
 
   int32_t hiddenDim;
   int32_t hiddenDimPadded;
+  int64_t outputRowStride{0};
   int32_t numTokens;
   int32_t numExperts;
   int32_t topK;
@@ -433,6 +436,7 @@ struct KernelParams {
 
     params.hiddenDim = data.hiddenDim;
     params.hiddenDimPadded = data.hiddenDimPadded;
+    params.outputRowStride = data.outputRowStride ? data.outputRowStride : data.hiddenDim;
     params.numTokens = data.numTokens;
     params.numExperts = data.numExperts;
     params.topK = data.topK;
