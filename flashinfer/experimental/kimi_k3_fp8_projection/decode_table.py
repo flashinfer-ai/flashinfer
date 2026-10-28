@@ -52,7 +52,12 @@ limitations under the License.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
 # entry, where the fastest route changes inside one bucket; ``decode_table_m_ranges(arch)``
-# reads it.  Generated from the Cake measurement sweeps recorded in the source
+# reads it.  A row may name twins that only its launches into a TMA-store
+# output view take (``tstore_twins``, ``{selected kernel key: twin kernel
+# key}`` as in ``ROUTE_TWINS``), and a GEMM row whose ``gemm_bn`` ships the
+# TMA-store epilogue only the width of its staged-register view
+# (``gemm_rstaged_bn``); its other views keep the selected programs.
+# Generated from the Cake measurement sweeps recorded in the source
 # repository; do not edit by hand.
 
 from __future__ import annotations
@@ -1244,7 +1249,12 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pf": 1,
             "tstore": True,
         },
-        "96,28,512": {"route": "gemm", "gemm_bn": 384},
+        "96,28,512": {
+            "route": "gemm",
+            "gemm_bn": 352,
+            "gemm_rstaged_bn": 384,
+            "tstore_twins": {"quant:u4": "quant:u4_xef_qel"},
+        },
         "96,28,2048": {"route": "gemm", "gemm_skf": 1, "gemm_bk": 128},
         "96,28,16384": {"route": "gemm", "gemm_bn": 384},
         "144,6,1": {

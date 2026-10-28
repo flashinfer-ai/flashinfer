@@ -125,7 +125,7 @@ GEMM_N384_SUFFIX = "_n384"  # kernel-key suffix of the 384-wide instance (stem p
 GEMM_TSTORE_ONLY_BLOCK_N = (
     224,
     352,
-)  # round 12 (FTP-N / FTP-W): pair-tile widths whose instances ship the TMA-store epilogue only (``_n224``: the 192 / 256 forms' two-block scale layout; ``_n352``: the 384-wide form's three-block layout); a staged-register or register-epilogue view of their cells keeps the 256-wide program
+)  # round 12 (FTP-N / FTP-W): pair-tile widths whose instances ship the TMA-store epilogue only (``_n224``: the 192 / 256 forms' two-block scale layout; ``_n352``: the 384-wide form's three-block layout); a staged-register or register-epilogue view of their cells keeps the 256-wide program (round 12 F, lever VIEW-BN: a staged-register view of a ``gemm_rstaged_bn`` cell takes that width, ``gemm_rstaged_block_n``)
 _GEMM_BN_TOKEN = re.compile(
     r"_n(\d+)"
 )  # the bn token ``_n<bn>`` of a GEMM program stem, right after the epilogue base (none: 256)
@@ -1315,8 +1315,48 @@ def gemm_bn_wide(bn: int) -> bool:
 def gemm_bn_rstaged(bn: int) -> bool:
     """Round 12: whether the ``bn``-wide pair tile has a staged-register instance; the 224- and 352-wide tiles
     ship the TMA-store epilogue only (:data:`GEMM_TSTORE_ONLY_BLOCK_N`), so a staged-register view of their cells takes
-    the 256-wide program."""
+    the 256-wide program (or the cell's ``gemm_rstaged_bn``-wide one, :func:`gemm_rstaged_block_n`)."""
     return int(bn) not in GEMM_TSTORE_ONLY_BLOCK_N
+
+
+def gemm_rstaged_block_n(entry: Optional[dict[str, Any]]) -> int:
+    """Round 12 F (lever VIEW-BN): the pair-tile width of the staged-register view of a GEMM cell whose
+    ``gemm_bn`` ships the TMA-store epilogue only (:func:`gemm_bn_rstaged`): the cell's ``gemm_rstaged_bn``, or 256
+    without the key.  The key names a wide width with a staged-register instance beside a wide TMA-store-only
+    ``gemm_bn`` (the 384-wide program beside the 352-wide tile: one wide form, the 128-K ring and the plain CLC
+    schedule, so :func:`gemm_n384_cell_conflicts` holds for both); any other pairing names no program and is refused."""
+    entry = entry or {}
+    if "gemm_rstaged_bn" not in entry:
+        return BLOCK_N
+    bn, rbn = int(entry.get("gemm_bn", BLOCK_N)), int(entry["gemm_rstaged_bn"])
+    if not (
+        gemm_bn_wide(bn)
+        and not gemm_bn_rstaged(bn)
+        and gemm_bn_wide(rbn)
+        and gemm_bn_rstaged(rbn)
+        and rbn % 32 == 0
+        and rbn <= WIDE_TILE_ROWS
+    ):
+        raise ValueError(
+            "decode table entry gemm_rstaged_bn must name a wide width with a staged-register instance (up to "
+            f"{WIDE_TILE_ROWS}) beside a wide TMA-store-only gemm_bn (got {entry})"
+        )
+    return rbn
+
+
+def entry_tstore_twins(entry: Optional[dict[str, Any]]) -> dict[str, str]:
+    """Round 12 F (lever VIEW-BN): the ``tstore_twins`` key of a table row -- ``{selected kernel key: twin
+    kernel key}`` as in a ``ROUTE_TWINS`` cell, taken only by launches into an output view that admits the TMA store
+    (:func:`gemm_tma_store_eligible`); the staged-register and register-epilogue views keep the selected keys.  A row
+    of an in-bucket M range reads the range's entry (:func:`decode_table_entry`)."""
+    twins = (entry or {}).get("tstore_twins", {})
+    if not isinstance(twins, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in twins.items()
+    ):
+        raise ValueError(
+            f"decode table entry tstore_twins must map kernel keys to kernel keys (got {entry})"
+        )
+    return twins
 
 
 def _stem_block_n(stem: str) -> int:
@@ -2649,7 +2689,9 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                 # ``_k128`` form, never with stage / stream-K / prefetch tokens (a cell naming one is refused, as in the
                 # Cake launcher); the fallbacks stay registered through the base list.  Round 12: every wide width (the
                 # 352-wide tile); a TMA-store-only width's staged-register rows take the 256-wide program of the cell's
-                # raster group and hand-off (``gemm_bn_rstaged``)
+                # raster group and hand-off (``gemm_bn_rstaged``), round 12 F: or the cell's ``gemm_rstaged_bn``-wide
+                # program (lever VIEW-BN, ``gemm_rstaged_block_n``)
+                rbn = gemm_rstaged_block_n(entry)
                 conflicts = gemm_n384_cell_conflicts(entry)
                 if conflicts:
                     raise ValueError(
@@ -2664,7 +2706,9 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     (GEMM_RSTAGED_KERNEL_KEY, wide_rstaged),
                 ):
                     gkey = base + gemm_bn_suffix(gbn) + gsfx + GEMM_K128_SUFFIX
-                    if base == GEMM_RSTAGED_KERNEL_KEY and not gemm_bn_rstaged(gbn):
+                    if base == GEMM_RSTAGED_KERNEL_KEY and rbn != BLOCK_N:
+                        gkey = base + gemm_bn_suffix(rbn) + gsfx + GEMM_K128_SUFFIX
+                    elif base == GEMM_RSTAGED_KERNEL_KEY and not gemm_bn_rstaged(gbn):
                         gkey = (
                             base
                             + gsfx
@@ -2881,6 +2925,13 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
         for twin in twins.values():
             if twin not in keys:
                 keys.append(twin)
+    # round 12 F (lever VIEW-BN): the twins a row segment's TMA-store-view launches take (``tstore_twins``);
+    # a ``gemm_rstaged_bn`` that names no program beside its cell's ``gemm_bn`` is refused here, at build time
+    for _, entry, _ in segments:
+        gemm_rstaged_block_n(entry)
+        for twin in entry_tstore_twins(entry).values():
+            if twin not in keys:
+                keys.append(twin)
     return tuple(keys)
 
 
@@ -2890,17 +2941,30 @@ def route_twin_keys(
     n_tiles128: int,
     num_k_iters: int,
     arch: str,
+    *,
+    tma_store: bool = False,
 ) -> tuple[str, ...]:
     """The launched keys of a route: each selected key replaced by the twin its cell names on ``arch``
-    (``decode_table.route_twins``) when the twin's program is built for ``arch``, else kept."""
+    (``decode_table.route_twins``) when the twin's program is built for ``arch``, else kept.  Round 12 F
+    (lever VIEW-BN): into an output view that admits the TMA store (``tma_store``), the twin the row's entry names for
+    that view (:func:`entry_tstore_twins`) first, when its program is built for ``arch``."""
     bucket = next((b for b in DECODE_TABLE_BUCKETS if b >= M), None)
     if bucket is None:
         return tuple(kernels)
     twins = route_twins(arch).get(f"{int(n_tiles128)},{int(num_k_iters)},{bucket}", {})
-    return tuple(
-        twins[key] if key in twins and route_available(arch, (twins[key],)) else key
-        for key in kernels
+    view_twins = (
+        entry_tstore_twins(decode_table_entry(M, n_tiles128, num_k_iters, arch))
+        if tma_store
+        else {}
     )
+    launched = []
+    for key in kernels:
+        for pairs in (view_twins, twins):
+            if key in pairs and route_available(arch, (pairs[key],)):
+                key = pairs[key]
+                break
+        launched.append(key)
+    return tuple(launched)
 
 
 def _bucket_rows(bucket: int) -> tuple[int, ...]:
@@ -3421,9 +3485,14 @@ def route_plan(
             prepared.n_pad,
         )
         # round 12: a TMA-store-only width (224 / 352, ``gemm_bn_rstaged``) has no staged-register or
-        # register-epilogue instance, so those views of its cells take the 256-wide program, as a cell without ``gemm_bn``
+        # register-epilogue instance, so those views of its cells take the 256-wide program, as a cell without ``gemm_bn``;
+        # round 12 F (lever VIEW-BN): the staged-register view of a ``gemm_rstaged_bn`` cell takes that width instead
         if base != GEMM_TSTORE_KERNEL_KEY and not gemm_bn_rstaged(gbn):
-            gbn = BLOCK_N
+            gbn = (
+                gemm_rstaged_block_n(gentry)
+                if base == GEMM_RSTAGED_KERNEL_KEY
+                else BLOCK_N
+            )
         # round 10 (S3): the 384-wide pair-tile form the table row asks for (TMA-store and staged-register epilogues only;
         # the predicated register epilogue keeps the 256-wide program).  It implies the 128-K ring, one staging tile, no
         # weight prefetch and the plain CLC schedule; a cell naming a conflicting key is refused, as in the Cake launcher.
@@ -3725,7 +3794,14 @@ def route_plan(
         kernels.append(key)
         grids.append(cfg.grid)
     kernels = list(
-        route_twin_keys(kernels, M, prepared.n_tiles128, prepared.num_k_iters, arch)
+        route_twin_keys(
+            kernels,
+            M,
+            prepared.n_tiles128,
+            prepared.num_k_iters,
+            arch,
+            tma_store=bool(gemm_tma_store),
+        )
     )
     return ProjectionPlan(
         arch=arch,
