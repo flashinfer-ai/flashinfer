@@ -1837,6 +1837,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
         },
+        "96,1,4096": {
+            "gemm_tstore_k128_s2_ts4": "gemm_tstore_k128_s2_ts4_tde_prg",
+        },
         "96,28,1": {
             "decode:t16_p4_fused_dpf": "decode:t16_p4_fused_dpf_wef",
         },
