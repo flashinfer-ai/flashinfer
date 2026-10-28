@@ -9,6 +9,7 @@ import torch
 _topk_module = importlib.import_module("flashinfer.msa_ops.sparse_topk_select")
 
 
+@pytest.mark.cpu_only
 def test_sm100_sm103_reject_per_token_bounds_before_backend_dispatch(monkeypatch):
     monkeypatch.setattr(_topk_module, "is_blackwell_msa_device", lambda _device: True)
 
@@ -23,6 +24,7 @@ def test_sm100_sm103_reject_per_token_bounds_before_backend_dispatch(monkeypatch
         _topk_module.msa_topk_select(max_score, 16, num_valid_pages=num_valid_pages)
 
 
+@pytest.mark.cpu_only
 def test_sm100_sm103_scalar_bound_still_reaches_backend(monkeypatch):
     monkeypatch.setattr(_topk_module, "is_blackwell_msa_device", lambda _device: True)
     sentinel = torch.empty((2, 1, 16), dtype=torch.int32)

@@ -250,6 +250,7 @@ def _host_bound_names(function_names: tuple[str, ...]) -> set[str]:
     return names
 
 
+@pytest.mark.cpu_only
 def test_every_program_serves_exactly_one_route():
     """``ROUTES`` names each registered program once; no program is unrouted; every record's plan is one
     of the named plans."""
@@ -263,6 +264,7 @@ def test_every_program_serves_exactly_one_route():
         assert any(jm.MODULES[name]["arg_plan"] is plan for plan in plans), name
 
 
+@pytest.mark.cpu_only
 def test_every_route_family_has_a_host_binding_site():
     """The host's op-kind table and this file's site table name the same route families, and every
     delivered route belongs to one of them."""
@@ -272,6 +274,7 @@ def test_every_route_family_has_a_host_binding_site():
     assert {ch._route_family(route) for route in jm.ROUTES} <= kinds
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", _PROGRAMS)
 def test_units_match_the_record(name):
     """Both units the record names exist under the unit directory; the binding has the generated form (its
@@ -321,6 +324,7 @@ def test_units_match_the_record(name):
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, " in binding
 
 
+@pytest.mark.cpu_only
 def test_shared_bindings_serve_one_route_family_each():
     """A binding source is shared only within a route family (its tensor-map geometry and argument plan
     are the family's), and the programs sharing it differ in their flag values; a kernel source is shared
@@ -353,6 +357,7 @@ def test_shared_bindings_serve_one_route_family_each():
             assert "void CAKE_PROGRAM_KERNEL(" in (_CSRC / kernel).read_text(), kernel
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("plan_name", sorted(jm._ARG_PLANS))
 def test_plan_ends_in_the_grid_triple(plan_name):
     """Each named argument plan ends in the three grid scalars, names each argument once, places no grid
@@ -366,6 +371,7 @@ def test_plan_ends_in_the_grid_triple(plan_name):
     assert "trace" not in names
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("family", sorted(_HOST_SITES))
 def test_plan_names_are_arguments_the_host_binds(family):
     """Every non-grid name of a plan of this route family is an argument its launch template or
@@ -381,6 +387,7 @@ def test_plan_names_are_arguments_the_host_binds(family):
         assert not missing, f"{route}: {missing} not bound by {_HOST_SITES[family]}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", _PROGRAMS)
 def test_binding_checks_the_dtypes_the_host_passes(name):
     """Every tensor of the plan is checked by the binding, once, for the DLPack dtype the host passes
@@ -403,6 +410,7 @@ def test_binding_checks_the_dtypes_the_host_passes(name):
         assert (code, bits, lanes) == (*expected[argument], 1), f"{route}: {argument!r}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", _PROGRAMS)
 def test_jit_key_is_the_content_digest(name):
     """The JIT / AOT key is the program name, the target and the first twenty hex digits of the
