@@ -10,7 +10,9 @@ reuse shipped sequences, so the GPU checks launch them on an SM120 device (with
 the device SM count monkeypatched to the table's key); the synthetic ``dyn``
 route checks the plan-private schedule binding without a launch.  Every
 committed device route also launches, driven by one of its table entries, and
-must score the default route's bits.
+must score the default route's bits; the first committed static and ``dyn``
+routes also replay from a CUDA Graph on changed contents, and the one-shot
+entry runs the ``dyn`` one.
 """
 
 import copy
@@ -802,6 +804,30 @@ def test_dyn_route_binds_the_private_schedule(monkeypatch):
         )
 
 
+# The grid context of each window: a caller's hint there is 1.3 x that context.
+WINDOW_CONTEXTS = (4096, 16384, 65536)
+
+
+def _route_hint(case, heads, page_kv, next_n, window):
+    """A ``max_context_hint`` inside ``window`` at which the case's route applies.
+
+    A table keys its window by the policy atom of the grid's hint (1.3 x the
+    window's grid context); inside a window the default atom can change with
+    the hint (the 16K window's lower part at batch 2..8), where the default
+    route runs.  So the grid's hint comes first, then the window's bounds.
+    """
+    route, sms, _key, batch = case
+    low, high = (int(bound) for bound in _runtime.device_rule()["ctx_windows"][window])
+    grid = [int(1.3 * c) for c in WINDOW_CONTEXTS if low <= int(1.3 * c) < high]
+    for hint in (*grid, low, high - 1):
+        found = _runtime.resolve_route(
+            heads, page_kv, next_n, batch, hint, cta_budget=sms, device_sms=sms
+        )
+        if found == route:
+            return hint
+    raise AssertionError(f"{route}: no hint in {window} [{low}, {high}) resolves to it")
+
+
 def _committed_route_cases():
     """One table entry per committed device route: ``(route, sms, key, batch)``."""
     rule = _runtime._catalog()["policy"]["device_rule"]
@@ -823,17 +849,18 @@ def _committed_route_cases():
 def test_committed_device_route_matches_the_default_route(monkeypatch, case):
     """Every committed device route, driven by its table entry, scores the default route's bits.
 
-    The device SM count is monkeypatched to the table's key and the hint is the
-    window's lower bound, so the route runs on either SM120 device; contexts
-    stay small.  A ``dyn`` route also runs twice to the same bits and leaves
-    the caller's ``schedule_meta`` unwritten.
+    The device SM count is monkeypatched to the table's key and the hint is one
+    inside the window at which the route applies (:func:`_route_hint`), so the
+    route runs on either SM120 device; contexts stay small.  A ``dyn`` route
+    also runs twice to the same bits, leaves its counter word zero after every
+    launch and leaves the caller's ``schedule_meta`` unwritten.
     """
     route, sms, key, batch = case
     arch = _sm120_arch()
     monkeypatch.setattr(_runtime, "device_facts", lambda index: (arch, sms))
     heads, page_kv, next_n, _atom, window = TABLE_KEY.match(key).groups()
     heads, page_kv, next_n = int(heads), int(page_kv), int(next_n)
-    hint = int(_runtime.device_rule()["ctx_windows"][window][0])
+    hint = _route_hint(case, heads, page_kv, next_n, window)
     data = _inputs(heads, page_kv, next_n, batch, 256, seed=53)
     caller = torch.full((sms + 1, 2), -7, dtype=torch.int32, device="cuda")
     args = (
@@ -862,9 +889,131 @@ def test_committed_device_route_matches_the_default_route(monkeypatch, case):
     inside = _inside(data)
     assert torch.equal(plan.logical_output[inside], default.logical_output[inside])
     if plan.schedule["kind"] == "dyn":
+        assert _counter_word(plan) == 0
         first = plan.logical_output.clone()
         plan.output.fill_(float("nan"))
         plan.run()
         torch.cuda.synchronize()
         assert torch.equal(plan.logical_output[inside], first[inside])
+        assert _counter_word(plan) == 0
         assert bool((caller == -7).all())
+
+
+def _counter_word(plan):
+    """Ticket counter word of a ``dyn`` plan's private schedule (zero after a launch)."""
+    return int(plan.dyn_schedule[-1, 0])
+
+
+def _schedule_kind(route):
+    return _runtime.route_schedule(_runtime.route_record(route))["kind"]
+
+
+def _replay_cases():
+    """The first committed static and the first committed ``dyn`` device route."""
+    picked = {}
+    for case in _committed_route_cases():
+        picked.setdefault(_schedule_kind(case[0]), case)
+    return [picked[kind] for kind in ("static", "dyn") if kind in picked]
+
+
+def _committed_route_plan(monkeypatch, case, seed):
+    """Inputs, the caller's poisoned ``schedule_meta`` and the plan of ``case``."""
+    route, sms, key, batch = case
+    arch = _sm120_arch()
+    monkeypatch.setattr(_runtime, "device_facts", lambda index: (arch, sms))
+    heads, page_kv, next_n, _atom, window = TABLE_KEY.match(key).groups()
+    heads, page_kv, next_n = int(heads), int(page_kv), int(next_n)
+    hint = _route_hint(case, heads, page_kv, next_n, window)
+    data = _inputs(heads, page_kv, next_n, batch, 256, seed=seed)
+    caller = torch.full((sms + 1, 2), -7, dtype=torch.int32, device="cuda")
+    args = (
+        data["q"],
+        data["kv_cache"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        data["max_context_len"],
+    )
+    plan = prepare_sm120_paged_mqa_logits(
+        *args, schedule_meta=caller, max_context_hint=hint
+    )
+    assert plan.route_name == route
+    return data, args, caller, hint, plan
+
+
+@pytest.mark.parametrize(
+    "case",
+    _replay_cases()
+    or [pytest.param(None, marks=pytest.mark.skip(reason="no committed device route"))],
+    ids=lambda case: case[0] if case else "none",
+)
+def test_committed_device_route_graph_replay(monkeypatch, case):
+    """CUDA Graph replay of a committed device route follows changed tensor contents.
+
+    One static and one ``dyn`` route: the replay scores the eager bits, then on
+    changed weights and context lengths the reference and the default route's
+    bits.  A ``dyn`` route's counter word is zero after every replay and the
+    caller's ``schedule_meta`` stays unwritten.
+    """
+    data, args, caller, _hint, plan = _committed_route_plan(monkeypatch, case, 59)
+    dyn = plan.schedule["kind"] == "dyn"
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    eager = plan.logical_output.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            plan.run()
+    with torch.cuda.stream(stream):
+        plan.output.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    inside = _inside(data)
+    assert torch.equal(plan.logical_output[inside], eager[inside])
+    if dyn:
+        assert _counter_word(plan) == 0
+    with torch.cuda.stream(stream):
+        data["weights"].neg_()
+        data["context_lens"].copy_((data["context_lens"] - 3).clamp_min(1))
+        plan.output.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    default = prepare_sm120_paged_mqa_logits(*args)
+    default.output.fill_(float("nan"))
+    default.run()
+    torch.cuda.synchronize()
+    inside = _inside(data)
+    assert torch.equal(plan.logical_output[inside], default.logical_output[inside])
+    if dyn:
+        assert _counter_word(plan) == 0
+        assert bool((caller == -7).all())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in _replay_cases() if _schedule_kind(case[0]) == "dyn"]
+    or [pytest.param(None, marks=pytest.mark.skip(reason="no committed dyn route"))],
+    ids=lambda case: case[0] if case else "none",
+)
+def test_committed_dyn_route_one_shot_entry(monkeypatch, case):
+    """The one-shot entry on a committed ``dyn`` route scores the plan's bits.
+
+    It schedules privately: the caller's ``schedule_meta`` stays unwritten.
+    """
+    data, args, caller, hint, plan = _committed_route_plan(monkeypatch, case, 61)
+    assert plan.schedule["kind"] == "dyn"
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    one_shot = fp8_paged_mqa_logits(
+        *args[:5], caller, data["max_context_len"], max_context_hint=hint
+    )
+    torch.cuda.synchronize()
+    inside = _inside(data)
+    assert torch.equal(one_shot[inside], plan.logical_output[inside])
+    assert _counter_word(plan) == 0
+    assert bool((caller == -7).all())
