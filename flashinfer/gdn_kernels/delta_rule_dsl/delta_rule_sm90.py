@@ -918,8 +918,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 checkpoint_every_n_tokens, block_end, seq_len, ckpt_key
             )
             if entry >= cutlass.Int32(0):
+                # 64-bit entry stride: entry * H * D * D exceeds 2**31 past
+                # 4096 checkpoints at H = 32.
                 checkpoint_layout = cute.make_ordered_layout(
-                    (self.D, self.D, num_sab_heads, total_checkpoints),
+                    (
+                        self.D,
+                        self.D,
+                        cutlass.Int64(num_sab_heads),
+                        total_checkpoints,
+                    ),
                     order=(0, 1, 2, 3),
                 )
                 mCheckpoint = cute.make_tensor(
