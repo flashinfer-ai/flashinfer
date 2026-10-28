@@ -15,11 +15,12 @@ def _use_fused_stage() -> bool:
 
 
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
+    """Resolve activation dtype, using E4M3 for mixed MXFP4/MXFP8 weights."""
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
     from ......kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
 
-    return kind_data_dtype(kind)
+    return kind_data_dtype("mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind)
 
 
 def stage_mega_moe_inputs(
@@ -74,7 +75,7 @@ def stage_mega_moe_inputs(
             x_sf,
             topk_idx_out,
             topk_weights_out,
-            quant_type=kind,
+            quant_type="mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind,
         )
         return
 
@@ -180,7 +181,9 @@ def validate_mxfp8_forward_inputs(
         )
 
 
-def validate_genphase_forward_inputs(t, fleet_params, *, top_k, quantize_input):
+def validate_genphase_forward_inputs(
+    t, fleet_params, *, top_k, quantize_input, kind="mxfp8_e4m3"
+):
     """GenPhase metadata checks; callers provide valid, unique expert routing."""
     for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
         if getattr(t, name) is not None:
@@ -195,6 +198,7 @@ def validate_genphase_forward_inputs(t, fleet_params, *, top_k, quantize_input):
         top_k=top_k,
         quantize_input=quantize_input,
         scales=t.scales,
+        kind=kind,
     )
     if quantize_input and t.hidden_states.dtype != torch.bfloat16:
         raise MoEEpConfigError("GenPhase quantize_input=True requires BF16 inputs.")
@@ -215,7 +219,7 @@ def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
     # Match the legacy SM100 input contract without per-step device scans:
     # valid routes are unique IDs in [0, E) with finite scores; -1 is masked.
     num_tokens = t.hidden_states.shape[0]
-    sf_cols = workspace.config.hidden // 32
+    sf_cols = workspace.config.hidden // workspace.config.sf_vec_size
     if quantize_input:
         # Only the logical SF columns are staged. The padded columns were
         # zeroed at allocation and are never written by either input path.
@@ -227,6 +231,7 @@ def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
             workspace.x_sf[:, :sf_cols],
             workspace.topk_idx,
             workspace.topk_weights,
+            kind=workspace.config.quant_kind,
         )
     else:
         from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
