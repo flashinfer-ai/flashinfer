@@ -90,11 +90,12 @@ When a FlashInfer operation executes, the autotuner resolves the best
 Outside tuning mode, a lookup whose bucket lies above every bucket tuned for
 the operation (same runners, cache-key extras and non-dynamic dimensions)
 repeats levels 1–4 at the largest tuned bucket before using the fallback, and
-logs this once at INFO.  This covers runtime sizes above the tuned range and
-tuning under ``autotune(tuning_buckets=...)`` whose top bucket the operation's
-own bucket mapper never produces.  Lookups below or between tuned buckets
-still use the fallback, and replay coverage reports still count such a lookup
-as a miss.
+logs this once at INFO.  The largest tuned bucket is taken from levels 1–3;
+bundled package configs (level 4) are not scanned for it.  This covers runtime
+sizes above the tuned range and tuning under ``autotune(tuning_buckets=...)``
+whose top bucket the operation's own bucket mapper never produces.  Lookups
+below or between tuned buckets still use the fallback, and replay coverage
+reports still count such a lookup as a miss.
 
 Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes

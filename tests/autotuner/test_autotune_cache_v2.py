@@ -376,9 +376,10 @@ def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypat
         pass  # hydrate the entries for buckets 4 and 8
     # A malformed key must not break the scan for the top tuned bucket.
     store = AutoTuner.get()._active_managed_store
-    AutoTuner.get()._managed_decoded[
-        (str(store.root), store.env_hash, ("too", "short"))
-    ] = object()
+    for bad_key in (("too", "short"), (_OP, "DummyRunner", None, ())):
+        AutoTuner.get()._managed_decoded[(str(store.root), store.env_hash, bad_key)] = (
+            object()
+        )
     # 12 maps to bucket 16, above both tuned buckets.
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], config, [torch.zeros(12, 16)]
