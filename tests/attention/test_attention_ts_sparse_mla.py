@@ -1465,8 +1465,6 @@ def test_sparse_d576_rejected(change, match):
         change.update(extra_kv_cache=kv, extra_indices=indices, extra_lengths=lengths)
     if change.pop("sinks", False):
         change["sinks"] = torch.zeros(heads, device="cuda")
-    if "output_quant_block_size" in change:
-        change["num_output_groups"] = 1
     with pytest.raises(ValueError, match=match):
         batch_sparse_mla_decode_with_paged_kv_cache(q, kv, indices, lengths, **change)
 
