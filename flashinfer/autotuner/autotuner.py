@@ -910,6 +910,7 @@ def autotune(
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
     cuda_graph_profile_replays: int | None = None,
+    only_ops: str | set[str] | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -982,10 +983,27 @@ def autotune(
             operations configured with ``use_cold_l2_cache=True`` flush L2
             before every replay. ``None`` inherits the enclosing context or
             each operation's ``TuningConfig`` value.
+        only_ops: Optional set of ``custom_op`` names that are the only
+            operations tuned in this context.  Every other operation behaves
+            as outside ``autotune()``: it uses cached or loaded configs and
+            never profiles, rather than taking the ``skip_ops`` fallback
+            tactic.  This lets a framework tune one family of kernels across a
+            whole forward pass, e.g. ``only_ops={"sparse_mla_sm120"}``, without
+            entering a context around each of its calls.  Unlike the other
+            controls it is per thread: ``AutoTuner.is_tuning_mode`` stays
+            ``False`` inside it, and the named operations must consult
+            :meth:`AutoTuner.tuning_enabled` (``choose_one`` and protocols
+            do).  Nested scopes **intersect** their sets, and ``skip_ops``
+            still applies to the named operations.  Requires
+            ``tune_mode=True`` and must not be entered inside an active
+            ``autotune(True)`` context, whose other operations would keep
+            tuning.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
         ValueError: If ``cuda_graph_profile_replays`` is less than one.
+        ValueError: If ``only_ops`` is combined with ``tune_mode=False`` or
+            entered while an ``autotune(True)`` context is active.
 
     .. rubric:: Edge-case behaviour
 
@@ -1045,6 +1063,10 @@ def autotune(
         # Measure every tactic under sustained CUDA graph execution
         with autotune(True, cuda_graph_profile_replays=20):
             model(inputs)
+
+        # Tune only the SM120 sparse MLA kernels during a full forward pass
+        with autotune(True, only_ops={"sparse_mla_sm120"}):
+            model(inputs)  # GEMMs and MoE use their cached configs
     """
     tuner = AutoTuner.get()
 
@@ -1055,6 +1077,14 @@ def autotune(
         )
     if cuda_graph_profile_replays is not None and cuda_graph_profile_replays < 1:
         raise ValueError("cuda_graph_profile_replays must be at least one")
+    if only_ops is not None:
+        if not tune_mode:
+            raise ValueError("only_ops requires tune_mode=True")
+        if tuner.is_tuning_mode:
+            raise ValueError(
+                "only_ops cannot narrow an active autotune(True) context: "
+                "operations outside only_ops would keep tuning"
+            )
 
     # Load configs from cache file on entry (if it exists).  A file with
     # mismatched metadata is ignored here; whether it may be overwritten on
@@ -1079,6 +1109,17 @@ def autotune(
         skip_ops_set = {skip_ops} if isinstance(skip_ops, str) else skip_ops
         current = skip_ops_stack[-1] if skip_ops_stack else frozenset()
         skip_ops_stack.append(current | frozenset(skip_ops_set))
+
+    # Push only_ops onto its per-thread stack.  Each entry is the cumulative
+    # intersection, so a nested scope can only narrow the tuned set.
+    only_ops_stack = tuner._get_only_ops_stack()
+    only_enabled = False
+    if only_ops is not None:
+        only_ops_set = frozenset({only_ops} if isinstance(only_ops, str) else only_ops)
+        only_enabled = not only_ops_stack
+        only_ops_stack.append(
+            only_ops_stack[-1] & only_ops_set if only_ops_stack else only_ops_set
+        )
 
     # Push tuning bucket overrides onto per-thread stack.  Inherits from the
     # current top-of-stack when a parameter is not explicitly supplied.
@@ -1112,19 +1153,28 @@ def autotune(
     # autotune(False) context overlaps on another thread.
     try:
         with tuner._lock:
-            if tune_mode:
+            # An only_ops scope tunes its operations on this thread alone and
+            # leaves the process-wide tuning mode untouched.
+            if tune_mode and only_ops is None:
                 tuner._active_tuning_contexts += 1
             old_mode = tuner.is_tuning_mode
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
-            autotune_enabled = tune_mode and not old_mode
+            autotune_enabled = tune_mode and only_ops is None and not old_mode
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
+        elif only_enabled:
+            logger.info(
+                "[Autotuner]: Autotuning process starts for %s ...",
+                ", ".join(sorted(only_ops_stack[-1])) or "no operations",
+            )
     except BaseException:
         _tuning_scope.reset(scope_token)
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
             skip_ops_stack.pop()
+        if only_ops is not None:
+            only_ops_stack.pop()
         raise
 
     try:
@@ -1132,7 +1182,7 @@ def autotune(
     finally:
         _tuning_scope.reset(scope_token)
         with tuner._lock:
-            if tune_mode:
+            if tune_mode and only_ops is None:
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
 
@@ -1141,8 +1191,10 @@ def autotune(
             override_stack.pop()
         if skip_ops is not None:
             skip_ops_stack.pop()
+        if only_ops is not None:
+            only_ops_stack.pop()
 
-        if autotune_enabled:
+        if autotune_enabled or only_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
         # Save configs on exit when tuning with a cache path, but only if
@@ -1667,6 +1719,10 @@ class _SkipOpsLocal(threading.local):
     stack: list[frozenset[str]]
 
 
+class _OnlyOpsLocal(threading.local):
+    stack: list[frozenset[str]]
+
+
 class _V2Local(threading.local):
     """Per-thread record of the (single, non-nestable) active autotune_v2
     context.
@@ -1842,6 +1898,8 @@ class AutoTuner:
         self._override_local: _OverrideLocal = _OverrideLocal()
         # Per-thread stack of frozenset[str] for skip_ops overrides.
         self._skip_ops_local: _SkipOpsLocal = _SkipOpsLocal()
+        # Per-thread stack of frozenset[str] for only_ops scopes.
+        self._only_ops_local: _OnlyOpsLocal = _OnlyOpsLocal()
         # Measure-derived TuningConfig variants, keyed by original config
         # identity (same rationale as _override_config_cache below).
         self._measure_config_cache: weakref.WeakKeyDictionary[
@@ -2063,6 +2121,36 @@ class AutoTuner:
         stack = self._get_skip_ops_stack()
         return stack[-1] if stack else frozenset[str]()
 
+    def _get_only_ops_stack(self) -> list[frozenset[str]]:
+        """Return the per-thread only_ops stack, creating it on first access."""
+        local = self._only_ops_local
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
+    def _op_tuning_mode(self, custom_op: str) -> bool:
+        """Whether ``custom_op`` runs in tuning mode, before skip_ops.
+
+        True inside any ``autotune(True)`` context, and for the ops named by
+        the current thread's ``autotune(True, only_ops=...)`` scope.
+        """
+        if self.is_tuning_mode:
+            return True
+        stack = self._get_only_ops_stack()
+        return bool(stack) and custom_op in stack[-1]
+
+    def tuning_enabled(self, custom_op: str) -> bool:
+        """Whether ``custom_op`` may profile or calibrate in this context.
+
+        Operations that tune outside :meth:`choose_one` (their own calibration
+        or protocol) must ask this instead of reading ``is_tuning_mode``, so
+        that both ``skip_ops`` and ``only_ops`` apply to them.
+        """
+        return (
+            self._op_tuning_mode(custom_op)
+            and custom_op not in self._effective_skip_ops
+        )
+
     @property
     def _override_tuning_buckets(self) -> tuple[int, ...] | None:
         """Currently active tuning-bucket override for this thread, or ``None``."""
@@ -2187,7 +2275,7 @@ class AutoTuner:
             winner_identity = self._winner_cache_identity()
             excluded_file_keys = self._excluded_file_keys.get(winner_identity, ())
             check_memory_policy = require_profiling_policy or (
-                self.is_tuning_mode and self._active_managed_store is None
+                self._op_tuning_mode(custom_op) and self._active_managed_store is None
             )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
@@ -2247,7 +2335,7 @@ class AutoTuner:
                         continue
                     if file_key in self._file_configs:
                         if (
-                            self.is_tuning_mode
+                            self._op_tuning_mode(custom_op)
                             and self._file_config_policies.get(file_key, default_policy)
                             != requested_policy
                         ):
@@ -2371,7 +2459,7 @@ class AutoTuner:
             # 3. Bundled package configs (legacy .py files)
             if (
                 os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
-                and not self.is_tuning_mode
+                and not self._op_tuning_mode(custom_op)
                 and not self._isolate_legacy_configs
             ):
                 for r_id, cache_key in runner_keys:
@@ -2491,8 +2579,7 @@ class AutoTuner:
         return TuningContext(
             tuner=self,
             namespace=custom_op,
-            tuning_enabled=force_tune
-            or (self.is_tuning_mode and custom_op not in self._effective_skip_ops),
+            tuning_enabled=force_tune or self.tuning_enabled(custom_op),
             force_tune=force_tune,
             scope=_tuning_scope.get(),
         )
@@ -2524,7 +2611,7 @@ class AutoTuner:
         """
         with self._lock:
             if self._v2_local.replay_report is not None and (
-                force_tune or self.is_tuning_mode
+                force_tune or self._op_tuning_mode(custom_op)
             ):
                 raise RuntimeError("replay diagnostics forbid protocol tuning")
             context = self.protocol_context(custom_op, force_tune=force_tune)
@@ -2607,7 +2694,7 @@ class AutoTuner:
         # the op's built-in heuristic, avoiding kernel compilation.
         # Checked before acquiring the lock since _effective_skip_ops is
         # thread-local and does not touch shared state.
-        if self.is_tuning_mode and _tune_process_group is not None:
+        if self._op_tuning_mode(custom_op) and _tune_process_group is not None:
             _check_tuning_group_phase(
                 "operation",
                 (
@@ -2642,7 +2729,9 @@ class AutoTuner:
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
-            if self._v2_local.replay_report is not None and self.is_tuning_mode:
+            if self._v2_local.replay_report is not None and self._op_tuning_mode(
+                custom_op
+            ):
                 raise RuntimeError("replay diagnostics forbid tuning")
             if (
                 self._override_tuning_buckets is not None
@@ -2664,7 +2753,7 @@ class AutoTuner:
             input_shapes = tuple(self._get_input_sizes(inputs))
 
             # Early return if it's not tuning, use cache found one or fallback one
-            if not self.is_tuning_mode:
+            if not self._op_tuning_mode(custom_op):
                 is_cache_hit, runner_id, tactic, _ = self.search_cache(
                     custom_op, runners, input_shapes, tuning_config, inputs=inputs
                 )
@@ -3226,7 +3315,7 @@ class AutoTuner:
         time are returned for callers that need a shortlist (e.g. multi-stage
         compound-tactic refinement).
         """
-        if self.is_tuning_mode and _tune_process_group is not None:
+        if self._op_tuning_mode(custom_op) and _tune_process_group is not None:
             _check_tuning_group_phase(
                 "operation",
                 (
@@ -3245,10 +3334,10 @@ class AutoTuner:
                 f"for op '{custom_op}'"
             )
 
-        if self._v2_local.replay_report is not None and self.is_tuning_mode:
+        if self._v2_local.replay_report is not None and self._op_tuning_mode(custom_op):
             raise RuntimeError("replay diagnostics forbid tuning")
 
-        if k == 1 or not self.is_tuning_mode:
+        if k == 1 or not self._op_tuning_mode(custom_op):
             _, tactic = self.choose_one(
                 custom_op, runners, tuning_config, inputs, **kwargs
             )
