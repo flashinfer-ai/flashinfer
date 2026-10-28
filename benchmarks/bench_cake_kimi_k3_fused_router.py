@@ -162,7 +162,7 @@ def main():
     device = torch.device("cuda", 0)
     results = []
     print(f"{torch.cuda.get_device_name(device)}, {len(args.rows)} rows")
-    header = f"{'row':<14}{'arm':>5}{'grid':>6}{'fused us':>10}"
+    header = f"{'row':<14}{'arm':>9}{'grid':>6}{'fused us':>10}"
     have_sglang = None
     for name in args.rows:
         num_tokens, block_m = ROWS[name]
@@ -191,7 +191,7 @@ def main():
         if baseline is None:
             fused_us = _median_us(runner, cupti=args.cupti)
             row["fused_us"] = fused_us
-            print(f"{name:<14}{runner.arm:>5}{runner.grid_x:>6}{fused_us:>10.2f}")
+            print(f"{name:<14}{runner.arm:>9}{runner.grid_x:>6}{fused_us:>10.2f}")
         else:
             fused_us, baseline_us = _paired_us(
                 runner, baseline, cupti=args.cupti, rounds=args.rounds
@@ -200,7 +200,7 @@ def main():
                 fused_us=fused_us, sglang_us=baseline_us, speedup=baseline_us / fused_us
             )
             print(
-                f"{name:<14}{runner.arm:>5}{runner.grid_x:>6}{fused_us:>10.2f}"
+                f"{name:<14}{runner.arm:>9}{runner.grid_x:>6}{fused_us:>10.2f}"
                 f"{baseline_us:>11.2f}{baseline_us / fused_us:>9.3f}"
             )
         results.append(row)

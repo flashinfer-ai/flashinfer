@@ -155,7 +155,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_17558f644007f80ad4e8(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -232,13 +232,6 @@ kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits
     int expert_base = tid * ITEMS_PER_THREAD;
     int stash_base = warp * TOP_K;
     unsigned int join_token = 0;
-    int pf_lane = 0;
-    if (((unsigned long long)logits & 15) == 0) {
-        if (lane == 31) {
-            pf_lane = 1;
-        }
-    }
-    int pf_first = bid * NUM_WARPS + warp;
     int ae_now = 1;
     if (M <= num_bids * NUM_WARPS) {
         ae_now = 0;
@@ -277,11 +270,6 @@ kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits
             _vec_load_0[0 + 1] = _v4.y;
             _vec_load_0[0 + 2] = _v4.z;
             _vec_load_0[0 + 3] = _v4.w;
-        }
-        if (pf_lane != 0) {
-            if (pf_first < M) {
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<float*>(logits) + ((unsigned long long)pf_first * 896)), "r"((uint32_t)(3584)) : "memory");
-            }
         }
         #pragma unroll
         for (int f_slot = 0; f_slot < 4; f_slot++) {
@@ -1081,6 +1069,9 @@ kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits
         if (ws_cta >= 0) {
             ws_first = ws_cta * 7 + warp;
         }
+        if (num_bids * 2 >= 896) {
+            ws_first = 896;
+        }
         int ws_cnt = 0;
         if (ws_first < 896) {
             ws_cnt = expert_counts[ws_first];
@@ -1253,11 +1244,20 @@ kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits
         for (int sort_expert_a = bid; sort_expert_a < 896; sort_expert_a += num_bids * 2) {
             int eff_a = cnt_a;
             int eff_b = cnt_b;
-            if (eff_a <= 32) {
-                eff_a = 0;
-            }
-            if (eff_b <= 32) {
-                eff_b = 0;
+            if (num_bids * 2 < 896) {
+                if (eff_a <= 32) {
+                    eff_a = 0;
+                }
+                if (eff_b <= 32) {
+                    eff_b = 0;
+                }
+            } else {
+                if (eff_a <= 1) {
+                    eff_a = 0;
+                }
+                if (eff_b <= 1) {
+                    eff_b = 0;
+                }
             }
             int r_fast = 0;
             int r_wide = 0;
