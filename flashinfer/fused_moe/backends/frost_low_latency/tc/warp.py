@@ -180,6 +180,8 @@ class WarpGroupedProjection:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.COL_MAJOR
         self.packed_nvfp4 = block_scales is not None
+        if cutlass.const_expr(self.packed_nvfp4 and self.weight_first):
+            raise ValueError("Packed NVFP4 requires cooperative gathering")
         if cutlass.const_expr(
             self.tile_k == 256
             and not (

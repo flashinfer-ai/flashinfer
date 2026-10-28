@@ -83,3 +83,42 @@ def test_nvfp4_compiler_tuning_cache_key(monkeypatch):
         monkeypatch.setattr(cutlass, "CUDA_VERSION", SimpleNamespace(major=major))
         keys.append(runner._cache_key_extras())
     assert len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("dtype_name", ["BFloat16", "Float16"])
+def test_nvfp4_rejects_weight_first_projection(dtype_name):
+    cutlass = pytest.importorskip("cutlass", minversion="4.8")
+    from cutlass import cute
+    from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+
+    from flashinfer.fused_moe.backends.frost_low_latency.tc.warp import (
+        WarpGroupedProjection,
+    )
+
+    def tensor(dtype, shape):
+        strides = []
+        stride = 1
+        for size in reversed(shape):
+            strides.append(stride)
+            stride *= size
+        return make_fake_tensor(
+            dtype, shape, tuple(reversed(strides)), assumed_align=16
+        )
+
+    dtype = getattr(cutlass, dtype_name)
+    projection = WarpGroupedProjection(True, 4, 2, 128, 10, weight_first=True)
+    # Exercise the actual JIT entry with metadata only; no GPU launch. A serial
+    # producer cannot initialize the scale rows owned by the other three warps.
+    with pytest.raises(ValueError, match="Packed NVFP4 requires cooperative gathering"):
+        cute.compile(
+            projection,
+            tensor(cutlass.Uint8, (19, 1024, 1024)),
+            tensor(dtype, (8, 2048)),
+            tensor(cutlass.Int32, (8, 10)),
+            tensor(dtype, (80, 512)),
+            make_fake_stream(use_tvm_ffi_env_stream=True),
+            tensor(cutlass.Float32, (19, 2)),
+            None,
+            tensor(cutlass.Uint8, (19, 1024, 128)),
+            options="--gpu-arch sm_120a --enable-tvm-ffi",
+        )
