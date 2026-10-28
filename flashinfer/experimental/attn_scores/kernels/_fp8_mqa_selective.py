@@ -789,7 +789,8 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
 
         gather_atom, gather_tensor = tma_atom_a, tma_tensor_a
         if cutlass.const_expr(self.sparse_sample_load_warps > 0):
-            gather_atom, gather_tensor = self._make_sparse_gather4_atom(
+            # Only the sparse SAMPLE subclass enables this compile-time branch.
+            gather_atom, gather_tensor = self._make_sparse_gather4_atom(  # type: ignore[attr-defined]
                 kv_fused, num_phys_blocks
             )
 
@@ -2024,7 +2025,8 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         elif is_store_warp:
             if cutlass.const_expr(self.sparse_sample_load_warps > 0):
                 cute.arch.setmaxregister_decrease(32)
-                self._run_sparse_sample_loaders(
+                # The sparse SAMPLE subclass supplies this specialized producer.
+                self._run_sparse_sample_loaders(  # type: ignore[attr-defined]
                     mSparseKV,
                     mSamplePages,
                     mBlockTable,
