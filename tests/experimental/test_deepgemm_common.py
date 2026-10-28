@@ -297,6 +297,58 @@ def test_every_family_catalog_in_the_tree_loads(path):
         assert catalog.routes(arch), f"{path.parent.name} has no {arch} routes"
 
 
+def _merged_catalog_shared_arg_plan():
+    """Merged catalog whose programs name one argument plan of the top-level
+    ``arg_plans`` table; one program keeps the inline list, one names a plan
+    the table does not carry."""
+    plan = [["buffer", "x"], ["parameter", "n"], ["grid", "grid_x"]]
+    return {
+        "schema": "unit.v4",
+        "arg_plans": {"shared": plan},
+        "programs": {
+            "k_named": {
+                "sources": ["csrc/x/named.cu"],
+                "compile_flags": [],
+                "arches": ["sm_100a"],
+                "arg_plan": "shared",
+            },
+            "k_inline": {
+                "sources": ["csrc/x/inline.cu"],
+                "compile_flags": [],
+                "arches": ["sm_100a"],
+                "arg_plan": [list(entry) for entry in plan],
+            },
+            "k_dangling": {
+                "sources": ["csrc/x/dangling.cu"],
+                "compile_flags": [],
+                "arches": ["sm_103a"],
+                "arg_plan": "missing",
+            },
+        },
+        "routes": {"a": {"program": "k_named"}},
+    }
+
+
+def test_shared_arg_plan_references_resolve_to_the_inline_list():
+    catalog = Catalog(_merged_catalog_shared_arg_plan(), label="Unit")
+    programs = catalog.programs("sm_100a")
+    assert programs["k_named"]["arg_plan"] == programs["k_inline"]["arg_plan"]
+    # The readers iterate the plan; a named plan iterates like the inline one.
+    assert [name for _kind, name in programs["k_named"]["arg_plan"]] == [
+        "x",
+        "n",
+        "grid_x",
+    ]
+    assert catalog.program("sm_100a", "k_named") == {
+        "sources": ["csrc/x/named.cu"],
+        "compile_flags": [],
+        "arches": ["sm_100a"],
+        "arg_plan": [["buffer", "x"], ["parameter", "n"], ["grid", "grid_x"]],
+    }
+    with pytest.raises(ValueError, match="names the shared argument plan 'missing'"):
+        catalog.programs("sm_103a")
+
+
 class TestRandomInputs:
     @pytest.fixture(autouse=True)
     def _torch(self):

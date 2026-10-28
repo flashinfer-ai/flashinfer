@@ -36,53 +36,65 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   token count (a single CTA for one token, otherwise one cluster of
   `num_tokens` CTAs -- 2, 4, 8 or 16 -- exchanging the selected ids through
   distributed shared memory; these are the only kernels bound to their exact
-  token count, so 3 or 17 tokens take the 32-token cell's arm), one-join plan
-  builders for up to 128 tokens (the 32- to 128-token cells use a second
-  kernel of the small-batch builder's family which loads the bias and the
-  first row's logits into registers before its prologue barrier; the plain
-  builder keeps 128 tokens x `block_m = 16` on both architectures plus 128
-  tokens x `block_m = 8` on SM100 and 64 tokens x `block_m = 16` on SM103), a
-  one-join bitmap builder for the 256-token cell (129 to 256 tokens; its owner
-  scratch holds 256 rows on SM100 and 2048 on SM103), a 4-CTA-cluster variant
-  at four CTAs per SM for 257 to 2048 tokens (the 2048-token cell uses a
-  second kernel of that family which prefetches the next row's logits into
-  registers) and a warp-per-row two-join persistent kernel from 2049 tokens
-  up. The two architectures' tables differ only in two small-batch cells.
-- Every arm but the small-batch per-token-count one is a cooperative persistent launch
-  whose grid is bounded by the device SM count (three CTAs per SM on CC 10.0,
-  four on CC 10.3; the 4-CTA-cluster arms and the largest-batch arm use their
-  own launch bounds of four CTAs per SM, and the two small-batch one-join
-  arms launch at least their 128 plan-owner CTAs).
-  The two 4-CTA-cluster arms are additionally bounded by the number of
-  co-resident clusters the driver reports for the kernel
-  (`cudaOccupancyMaxActiveClusters`, queried once per device and program
-  through a small helper linked next to the generated binding of exactly
-  those programs). The 16-CTA cluster of the `num_tokens = 16` kernel exceeds
-  the portable cluster size; the generated program sets the non-portable
-  cluster-size attribute on that kernel before launching it, and preparation
-  requires the driver to admit at least one such cluster on the device.
-- Every kernel source serves both architectures (the architecture-specific
-  lines of the L, LP and M arms sit behind `__CUDA_ARCH__` guards) and both
-  route block alignments (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the compile
-  line). The registry in `cake_jit.py` lists each program (a kernel source
-  with its launcher) once and maps the per-architecture dispatch keys to
-  it; the L, LP and M arms keep one program per architecture, and the two
-  programs of such an arm compile the same kernel source, the SM103
-  program selecting its own kernel symbol through the `CAKE_PROGRAM_KERNEL`
-  compile definition.
-- The four- and eight-token cluster kernels are one kernel source: the
-  eight-token program compiles it with the compile definitions `ROWS=8` (the
-  cluster size) and `CAKE_PROGRAM_KERNEL=<its kernel symbol>`; without them
-  the source is the four-token kernel. Each of the two programs keeps its own
-  registry record and kernel symbol (the record's `compile_flags` carries the
-  definitions).
-- Programs of one launcher shape share one host launcher source: the seven
-  cooperative plan-builder programs (arms L, LP, M and GW), the two-, four- and
-  eight-token cluster programs and the Q4S / Q4SP pair. A shared launcher names
-  its kernel `CAKE_PROGRAM_KERNEL`, its host-shim namespace `CAKE_PROGRAM_SHIM`
-  and the launch value its programs differ in (the dynamic shared memory
-  `CAKE_BINDING_SMEM` or the cluster size `CAKE_BINDING_CLUSTER`) and does not
-  build without them; each record's `compile_flags` carries its values.
+  token count), one cluster of 16 CTAs of two row groups each for every other
+  count up to 32 (the 32-token cell, so 3 or 17 tokens take it; two kernels
+  serve it, one waiting for its cluster at entry and one after its row
+  selection: SM100 takes the second at `block_m = 8` and the first at
+  `block_m = 16`, SM103 the other way round), one-join plan
+  builders for 33 to 128 tokens (the 64- and 128-token cells use a second
+  kernel of the builder's family which loads the bias and the first row's
+  logits into registers before its prologue barrier; the plain builder keeps
+  both 128-token cells on SM100 and, on SM103, 64 tokens x `block_m = 16` and
+  128 tokens x `block_m = 16`; every builder cell on SM100 launches with an
+  explicit cluster of one CTA),
+  a one-join
+  bitmap builder for the 256-token cell (129 to 256 tokens; its owner scratch
+  holds 256 rows on SM100 and 2048 on SM103), a 4-CTA-cluster variant at four
+  CTAs per SM for 257 to 2048 tokens (the 2048-token cell uses a second kernel
+  of that family which prefetches the next row's logits into registers) and a
+  warp-per-row two-join persistent kernel launched as CTA pairs from 2049
+  tokens up. The two architectures' tables differ only in three small-batch
+  cells.
+- The 4-CTA-cluster cells follow the batch against the device's capacity
+  `C`, four times the co-resident clusters the driver reports for the
+  next-row-prefetch kernel (568 on a 148-SM B200, 592 on a 152-SM GB300): up
+  to `C` tokens keep the cell's arm (every CTA selects at most one row). Above
+  `C` a CTA selects a second row, which a next-row prefetch covers: SM100 runs
+  the next-row-prefetch kernel; SM103 runs the first kernel of the family with
+  the same prefetch up to 1024 tokens and the next-row-prefetch kernel above.
+  From `2C + 64` up a kernel of the family that selects one row per warp runs
+  (1200 tokens on a B200, 1248 on a GB300), on SM103 at `block_m` 8 from `2C`
+  (1184 tokens on a GB300). That kernel ranks the route pairs of its owner
+  CTAs in their own shared memory, except on SM100 at `block_m` 16, where the
+  ranking goes through the cluster peers. `C` is queried once per device and
+  `block_m`, so the rule follows smaller devices and MIG slices
+  (`cake_backend.CAPACITY_ROUTES`, keyed by architecture and `block_m`).
+- Every arm but the small-batch cluster ones (one kernel per token count and
+  the 16-CTA two-row-group kernel) is a cooperative persistent launch whose
+  grid is bounded by the device SM count (three CTAs per SM on CC 10.0, four
+  on CC 10.3; the 4-CTA-cluster arms and the largest-batch arm use their own
+  launch bounds of four CTAs per SM, and the one-join builder arms launch at
+  least their 128 plan-owner CTAs; the bitmap builder and every builder cell
+  on SM100 launch with an explicit cluster of one CTA). The 4-CTA-cluster arms and the
+  largest-batch arm, a cooperative grid of 2-CTA clusters launched as a whole
+  number of pairs, are additionally bounded by the number of co-resident
+  clusters the driver reports for the kernel (`cudaOccupancyMaxActiveClusters`,
+  queried once per device and program through a small helper linked next to
+  the generated binding of exactly the cluster-bounded programs). The 16-CTA
+  clusters of the `num_tokens = 16` kernel and of the 32-token cell's kernels
+  exceed the portable cluster size; the generated program sets the
+  non-portable cluster-size attribute on those kernels before launching them,
+  and preparation requires the driver to admit at least one such cluster on
+  the device.
+- Every program ships its own kernel source and launcher, and each source
+  serves both route block alignments (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the
+  compile line). The registry in `cake_jit.py` lists each program once and
+  maps the per-architecture dispatch keys to it; a program built alike for
+  both architectures is one source whose architecture-specific lines sit
+  behind `__CUDA_ARCH__` guards, while the bitmap builder and the
+  largest-batch arm keep one program per architecture, the prefetching
+  builder ships for SM103 alone and its explicit-cluster launch for SM100
+  alone.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.
@@ -126,7 +138,7 @@ runner()  # same runner (or a captured graph), new logits
 
 Preparation validates shapes, dtypes, contiguity, plan capacity and that no
 two buffers overlap, selects the dispatch arm for the device architecture and
-token count, loads the arm's JIT module and computes the launch grid from the
+token count (and the device's cluster capacity), loads the arm's JIT module and computes the launch grid from the
 device facts cached per device (compute capability, SM count, cluster
 occupancy); it makes no host copy of the inputs.
 `cake_backend.generated_program_available(device)` reports whether the
@@ -136,11 +148,16 @@ Limits of the current route: FP32 logits and bias, exactly 896 experts and
 top-16, `block_m` 8 or 16, SM100 (B200) and SM103 (B300 / GB300) only. Finite
 logits are expected. Token counts between the 28 measured cells are served by
 the neighbouring cell's arm and validated for correctness; their timings were
-measured at the cells. Token counts above 8192 raise `ValueError`.
+measured at the cells. Token counts above 8192 raise `ValueError`. Token
+counts from 129 to 2048 use arms whose 128 plan-owner CTAs must all be
+co-resident, and the cluster arms need at least one co-resident cluster; on a
+device or MIG slice that cannot hold them, preparation raises `RuntimeError`
+instead of launching.
 
 See `tests/experimental/test_cake_kimi_k3_fused_router.py` for the torch
 reference and validated shape set (all 28 measured cells, token counts between
-them, CUDA Graph replay, no-allocation launch) and
+them, both sides of the capacity thresholds, CUDA Graph replay, no-allocation
+launch) and
 `benchmarks/bench_cake_kimi_k3_fused_router.py` for the benchmark against
 SGLang's `moe_route_radix` + `moe_align_block_size` route on the same tensors
 (when `sglang` is importable).

@@ -235,9 +235,6 @@ kernel_cake_stepfun_moe_c96f943c65b2c8eaa9ab(const __grid_constant__ CUtensorMap
     const int tmem_accum = taddr;
     const int tmem_sfa = taddr + 16;
     const int tmem_sfb = taddr + 64;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 8 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -270,9 +267,8 @@ kernel_cake_stepfun_moe_c96f943c65b2c8eaa9ab(const __grid_constant__ CUtensorMap
                 int expert = tile_expert[n_tile];
                 int valid_rows = (unsigned int)tile_mn_limit[n_tile] - n_tile * 8;
                 float cl = clamp_limit[expert];
-                float _sub_0;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(0.0f), "f"(cl));
-                float neg_cl = _sub_0;
+                float neg_cl;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(neg_cl) : "f"(0.0f), "f"(cl));
                 mbarrier_wait(mma_full_addr + (acc_stage) * 8, _phase_mma_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int acc_offset = acc_stage * 8;
@@ -301,102 +297,96 @@ kernel_cake_stepfun_moe_c96f943c65b2c8eaa9ab(const __grid_constant__ CUtensorMap
                     float value = 0.0f;
                     x0 = _tmem_load_0[token_group * 4];
                     x1 = _tmem_load_0[token_group * 4 + 2];
-                    float _exp2_0 = approx_exp2(mul_f32_rn_ftz(x1, -1.4426950408889634f));
-                    float _add_0;
-                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(1.0f), "f"(_exp2_0));
-                    float _rcp_0 = approx_rcp(_add_0);
+                    float _exp2_2 = approx_exp2(mul_f32_rn_ftz(x1, -1.442695f));
+                    float _add_1;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(1.0f), "f"(_exp2_2));
+                    float _rcp_0 = approx_rcp(_add_1);
                     sig = _rcp_0;
                     swish = mul_f32_rn_ftz(x1, sig);
-                    float _max_0;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_0) : "f"(x0), "f"(neg_cl));
-                    float _min_0;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_0) : "f"(_max_0), "f"(cl));
-                    float _min_1;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_1) : "f"(swish), "f"(cl));
-                    value = mul_f32_rn_ftz(_min_0, _min_1);
+                    float _max_4;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_4) : "f"(x0), "f"(neg_cl));
+                    float _min_3;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_3) : "f"(_max_4), "f"(cl));
+                    float _min_5;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_5) : "f"(swish), "f"(cl));
+                    value = mul_f32_rn_ftz(_min_3, _min_5);
                     values[token_group * 4] = value;
                     x0 = _tmem_load_0[token_group * 4 + 1];
                     x1 = _tmem_load_0[token_group * 4 + 2 + 1];
-                    float _exp2_1 = approx_exp2(mul_f32_rn_ftz(x1, -1.4426950408889634f));
-                    float _add_1;
-                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(1.0f), "f"(_exp2_1));
-                    float _rcp_1 = approx_rcp(_add_1);
-                    sig = _rcp_1;
+                    float _exp2_8 = approx_exp2(mul_f32_rn_ftz(x1, -1.442695f));
+                    float _add_7;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(1.0f), "f"(_exp2_8));
+                    float _rcp_6 = approx_rcp(_add_7);
+                    sig = _rcp_6;
                     swish = mul_f32_rn_ftz(x1, sig);
-                    float _max_1;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_1) : "f"(x0), "f"(neg_cl));
-                    float _min_2;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_2) : "f"(_max_1), "f"(cl));
-                    float _min_3;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_3) : "f"(swish), "f"(cl));
-                    value = mul_f32_rn_ftz(_min_2, _min_3);
+                    float _max_10;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_10) : "f"(x0), "f"(neg_cl));
+                    float _min_9;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_9) : "f"(_max_10), "f"(cl));
+                    float _min_11;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_11) : "f"(swish), "f"(cl));
+                    value = mul_f32_rn_ftz(_min_9, _min_11);
                     values[token_group * 4 + 1] = value;
                     x0 = _tmem_load_1[token_group * 4];
                     x1 = _tmem_load_1[token_group * 4 + 2];
-                    float _exp2_2 = approx_exp2(mul_f32_rn_ftz(x1, -1.4426950408889634f));
-                    float _add_2;
-                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(1.0f), "f"(_exp2_2));
-                    float _rcp_2 = approx_rcp(_add_2);
-                    sig = _rcp_2;
+                    float _exp2_14 = approx_exp2(mul_f32_rn_ftz(x1, -1.442695f));
+                    float _add_13;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(1.0f), "f"(_exp2_14));
+                    float _rcp_12 = approx_rcp(_add_13);
+                    sig = _rcp_12;
                     swish = mul_f32_rn_ftz(x1, sig);
-                    float _max_2;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(x0), "f"(neg_cl));
-                    float _min_4;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_4) : "f"(_max_2), "f"(cl));
-                    float _min_5;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_5) : "f"(swish), "f"(cl));
-                    value = mul_f32_rn_ftz(_min_4, _min_5);
+                    float _max_16;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_16) : "f"(x0), "f"(neg_cl));
+                    float _min_15;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_15) : "f"(_max_16), "f"(cl));
+                    float _min_17;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_17) : "f"(swish), "f"(cl));
+                    value = mul_f32_rn_ftz(_min_15, _min_17);
                     values[token_group * 4 + 2] = value;
                     x0 = _tmem_load_1[token_group * 4 + 1];
                     x1 = _tmem_load_1[token_group * 4 + 2 + 1];
-                    float _exp2_3 = approx_exp2(mul_f32_rn_ftz(x1, -1.4426950408889634f));
-                    float _add_3;
-                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(1.0f), "f"(_exp2_3));
-                    float _rcp_3 = approx_rcp(_add_3);
-                    sig = _rcp_3;
+                    float _exp2_20 = approx_exp2(mul_f32_rn_ftz(x1, -1.442695f));
+                    float _add_19;
+                    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(1.0f), "f"(_exp2_20));
+                    float _rcp_18 = approx_rcp(_add_19);
+                    sig = _rcp_18;
                     swish = mul_f32_rn_ftz(x1, sig);
-                    float _max_3;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(x0), "f"(neg_cl));
-                    float _min_6;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_6) : "f"(_max_3), "f"(cl));
-                    float _min_7;
-                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_7) : "f"(swish), "f"(cl));
-                    value = mul_f32_rn_ftz(_min_6, _min_7);
+                    float _max_22;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_22) : "f"(x0), "f"(neg_cl));
+                    float _min_21;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_21) : "f"(_max_22), "f"(cl));
+                    float _min_23;
+                    asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_23) : "f"(swish), "f"(cl));
+                    value = mul_f32_rn_ftz(_min_21, _min_23);
                     values[token_group * 4 + 2 + 1] = value;
-                    float _fabs_0 = fabsf(values[token_group * 4]);
-                    float _fabs_1 = fabsf(values[token_group * 4 + 2]);
-                    float _max_4;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_4) : "f"(_fabs_0), "f"(_fabs_1));
-                    float bm0 = _max_4;
-                    float _fabs_2 = fabsf(values[token_group * 4 + 1]);
-                    float _fabs_3 = fabsf(values[token_group * 4 + 3]);
-                    float _max_5;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_5) : "f"(_fabs_2), "f"(_fabs_3));
-                    float bm1 = _max_5;
-                    float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, bm0, 4);
-                    float _max_6;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_6) : "f"(bm0), "f"(_shfl_xor_0));
-                    bm0 = _max_6;
-                    float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, bm1, 4);
-                    float _max_7;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_7) : "f"(bm1), "f"(_shfl_xor_1));
-                    bm1 = _max_7;
-                    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, bm0, 8);
-                    float _max_8;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_8) : "f"(bm0), "f"(_shfl_xor_2));
-                    bm0 = _max_8;
-                    float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, bm1, 8);
-                    float _max_9;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_9) : "f"(bm1), "f"(_shfl_xor_3));
-                    bm1 = _max_9;
-                    float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, bm0, 16);
-                    float _max_10;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_10) : "f"(bm0), "f"(_shfl_xor_4));
-                    bm0 = _max_10;
-                    float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, bm1, 16);
-                    float _max_11;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_11) : "f"(bm1), "f"(_shfl_xor_5));
-                    bm1 = _max_11;
+                    float bm0;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(bm0) : "f"(fabsf(values[token_group * 4])), "f"(fabsf(values[token_group * 4 + 2])));
+                    float bm1;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(bm1) : "f"(fabsf(values[token_group * 4 + 1])), "f"(fabsf(values[token_group * 4 + 3])));
+                    float _shfl_xor_sync_25 = __shfl_xor_sync(0xFFFFFFFF, bm0, 4);
+                    float _max_24;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_24) : "f"(bm0), "f"(_shfl_xor_sync_25));
+                    bm0 = _max_24;
+                    float _shfl_xor_sync_27 = __shfl_xor_sync(0xFFFFFFFF, bm1, 4);
+                    float _max_26;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_26) : "f"(bm1), "f"(_shfl_xor_sync_27));
+                    bm1 = _max_26;
+                    float _shfl_xor_sync_29 = __shfl_xor_sync(0xFFFFFFFF, bm0, 8);
+                    float _max_28;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_28) : "f"(bm0), "f"(_shfl_xor_sync_29));
+                    bm0 = _max_28;
+                    float _shfl_xor_sync_31 = __shfl_xor_sync(0xFFFFFFFF, bm1, 8);
+                    float _max_30;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_30) : "f"(bm1), "f"(_shfl_xor_sync_31));
+                    bm1 = _max_30;
+                    float _shfl_xor_sync_33 = __shfl_xor_sync(0xFFFFFFFF, bm0, 16);
+                    float _max_32;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_32) : "f"(bm0), "f"(_shfl_xor_sync_33));
+                    bm0 = _max_32;
+                    float _shfl_xor_sync_35 = __shfl_xor_sync(0xFFFFFFFF, bm1, 16);
+                    float _max_34;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_34) : "f"(bm1), "f"(_shfl_xor_sync_35));
+                    bm1 = _max_34;
                     block_max[token_group * 2] = bm0;
                     block_max[token_group * 2 + 1] = bm1;
                     int token0 = lane_1 % 4 * 2 + token_group * 8;
@@ -411,44 +401,44 @@ kernel_cake_stepfun_moe_c96f943c65b2c8eaa9ab(const __grid_constant__ CUtensorMap
                     int token1 = token0_1 + 1;
                     float peer0 = amax_smem[(warp_0 ^ 1) * 8 + token0_1];
                     float peer1 = amax_smem[(warp_0 ^ 1) * 8 + token1];
-                    float _max_12;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_12) : "f"(block_max[token_group_1 * 2]), "f"(peer0));
-                    float amax0 = _max_12;
-                    float _max_13;
-                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_13) : "f"(block_max[token_group_1 * 2 + 1]), "f"(peer1));
-                    float amax1 = _max_13;
-                    uint32_t _f32_setp_0_bits;
-                    asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_0_bits) : "f"(amax0), "f"(1.1754943508222875e-38f));
-                    bool _f32_setp_0 = _f32_setp_0_bits != 0;
-                    amax0 = ((_f32_setp_0) ? amax0 : 0.0f);
-                    uint32_t _f32_setp_1_bits;
-                    asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_1_bits) : "f"(amax1), "f"(1.1754943508222875e-38f));
-                    bool _f32_setp_1 = _f32_setp_1_bits != 0;
-                    amax1 = ((_f32_setp_1) ? amax1 : 0.0f);
-                    uint32_t _f32_setp_2_bits;
-                    asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_2_bits) : "f"(amax0), "f"(0.0f));
-                    bool _f32_setp_2 = _f32_setp_2_bits != 0;
-                    float sf0_src = ((_f32_setp_2) ? amax0 : 448.0f);
-                    float sf0 = mul_f32_rn_ftz(sf0_src, 0.0022321429569274187f);
-                    uint32_t _f32_setp_3_bits;
-                    asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_f32_setp_3_bits) : "f"(amax1), "f"(0.0f));
-                    bool _f32_setp_3 = _f32_setp_3_bits != 0;
-                    float sf1_src = ((_f32_setp_3) ? amax1 : 448.0f);
-                    float sf1 = mul_f32_rn_ftz(sf1_src, 0.0022321429569274187f);
+                    float amax0;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(amax0) : "f"(block_max[token_group_1 * 2]), "f"(peer0));
+                    float amax1;
+                    asm("max.ftz.f32 %0, %1, %2;" : "=f"(amax1) : "f"(block_max[token_group_1 * 2 + 1]), "f"(peer1));
+                    uint32_t _setp_36_bits;
+                    asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_36_bits) : "f"(amax0), "f"(1.1754944e-38f));
+                    bool _setp_36 = _setp_36_bits != 0;
+                    amax0 = ((_setp_36) ? amax0 : 0.0f);
+                    uint32_t _setp_37_bits;
+                    asm("{ .reg .pred p; setp.ge.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_37_bits) : "f"(amax1), "f"(1.1754944e-38f));
+                    bool _setp_37 = _setp_37_bits != 0;
+                    amax1 = ((_setp_37) ? amax1 : 0.0f);
+                    uint32_t _setp_38_bits;
+                    asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_38_bits) : "f"(amax0), "f"(0.0f));
+                    bool _setp_38 = _setp_38_bits != 0;
+                    float sf0_src = ((_setp_38) ? amax0 : 448.0f);
+                    float sf0;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(sf0) : "f"(sf0_src), "f"(0.002232143f));
+                    uint32_t _setp_39_bits;
+                    asm("{ .reg .pred p; setp.neu.ftz.f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(_setp_39_bits) : "f"(amax1), "f"(0.0f));
+                    bool _setp_39 = _setp_39_bits != 0;
+                    float sf1_src = ((_setp_39) ? amax1 : 448.0f);
+                    float sf1;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(sf1) : "f"(sf1_src), "f"(0.002232143f));
                     uint16_t _ue8m0x2_f32_0;
                     asm("cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;" : "=h"(_ue8m0x2_f32_0) : "f"(sf1), "f"(sf0));
                     unsigned int code0 = (unsigned int)_ue8m0x2_f32_0 & 255;
                     unsigned int code1 = (unsigned int)_ue8m0x2_f32_0 >> 8 & 255;
                     float inv0 = __uint_as_float(254 - code0 << 23);
                     float inv1 = __uint_as_float(254 - code1 << 23);
-                    float2 _f2_0 = make_float2(values[token_group_1 * 4], values[token_group_1 * 4 + 2]);
-                    float2 _f2_1 = make_float2(inv0, inv0);
+                    float2 _f32x2_mul_a_40 = make_float2(values[token_group_1 * 4], values[token_group_1 * 4 + 2]);
+                    float2 _f32x2_mul_b_41 = make_float2(inv0, inv0);
                     float2 scaled0;
-                    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled0) : "l"(*(const unsigned long long*)&_f2_0), "l"(*(const unsigned long long*)&_f2_1));
-                    float2 _f2_2 = make_float2(values[token_group_1 * 4 + 1], values[token_group_1 * 4 + 3]);
-                    float2 _f2_3 = make_float2(inv1, inv1);
+                    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_40), "l"(*(const unsigned long long*)&_f32x2_mul_b_41));
+                    float2 _f32x2_mul_a_42 = make_float2(values[token_group_1 * 4 + 1], values[token_group_1 * 4 + 3]);
+                    float2 _f32x2_mul_b_43 = make_float2(inv1, inv1);
                     float2 scaled1;
-                    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled1) : "l"(*(const unsigned long long*)&_f2_2), "l"(*(const unsigned long long*)&_f2_3));
+                    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_42), "l"(*(const unsigned long long*)&_f32x2_mul_b_43));
                     uint16_t _e4m3x2_f32_0;
                     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(scaled0.y), "f"(scaled0.x));
                     uint16_t _e4m3x2_f32_1;
@@ -1103,47 +1093,50 @@ kernel_cake_stepfun_moe_c96f943c65b2c8eaa9ab(const __grid_constant__ CUtensorMap
                     mbarrier_wait(sfa_full_addr + (stage_5) * 8, _phase_sfa_full);
                     mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_k_done_3);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    if (elect_sync()) {
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                        #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                        #endif
-                        {
-                            uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                            asm volatile(
-                                "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                :: "r"((uint32_t)((unsigned int)tmem_sfa + stage_5 * 16)), "l"(_tcgen05_cp_desc_0)
-                                : "memory");
-                        }
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                        #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                        #endif
-                        {
-                            uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                            asm volatile(
-                                "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 4))), "l"(_tcgen05_cp_desc_1)
-                                : "memory");
-                        }
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                        #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                        #endif
-                        {
-                            uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                            asm volatile(
-                                "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 8))), "l"(_tcgen05_cp_desc_2)
-                                : "memory");
-                        }
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                        #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                        #endif
-                        {
-                            uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                            asm volatile(
-                                "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
-                                :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 12))), "l"(_tcgen05_cp_desc_3)
-                                : "memory");
-                        }
+                    uint32_t _elected_0 = elect_sync();
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                    #endif
+                    {
+                        uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                        asm volatile(
+                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                            "@leader tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n\t}\n"
+                            :: "r"((uint32_t)((unsigned int)tmem_sfa + stage_5 * 16)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
+                            : "memory");
+                    }
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                    #endif
+                    {
+                        uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                        asm volatile(
+                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                            "@leader tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n\t}\n"
+                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 4))), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
+                            : "memory");
+                    }
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                    #endif
+                    {
+                        uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                        asm volatile(
+                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                            "@leader tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n\t}\n"
+                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 8))), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
+                            : "memory");
+                    }
+                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                    #endif
+                    {
+                        uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_5 * 2048 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                        asm volatile(
+                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                            "@leader tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n\t}\n"
+                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 16 + 12))), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
+                            : "memory");
                     }
                     elect_commit2(tmem_sfa_full_addr + (stage_5) * 8, sfa_free_addr + (stage_5) * 8);
                     stage_5 += 1;

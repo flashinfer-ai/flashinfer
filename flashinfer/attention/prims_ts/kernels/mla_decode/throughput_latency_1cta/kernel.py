@@ -96,6 +96,7 @@ from .parallel_reduction import (
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
+from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
     runtime_query_tile_is_active,
@@ -244,7 +245,7 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
         self.batch_size = batch_size
         self.cache_seqs = cache_seqs
         self.cu_seqlens_q = cu_seqlens_q
-        self.enable_runtime_skip = cu_seqlens_q is not None
+        self.enable_runtime_skip = cache_seqs is not None or cu_seqlens_q is not None
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: WorkTileInfo):
@@ -327,7 +328,7 @@ class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
         self.cfg = cfg
         self.cache_seqs = cache_seqs
         self.cu_seqlens_q = cu_seqlens_q
-        self.enable_runtime_skip = cu_seqlens_q is not None
+        self.enable_runtime_skip = cache_seqs is not None or cu_seqlens_q is not None
         self._clc_response_alloc = SmemAllocation(
             self.name + "_clc_response", dtype=cutlass.Int128, count=2, alignment=16
         )
@@ -1679,6 +1680,7 @@ class ThroughputLatencyMlaDecodeTs:
         mask_type: MaskType | str = MaskType.CAUSAL,
         sparse_profile=None,
         finalize_output: bool = False,
+        softmax_rescale_threshold_log2: float = 0.0,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1709,6 +1711,11 @@ class ThroughputLatencyMlaDecodeTs:
         self.mask_type = normalize_mask_type(mask_type)
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
+        self.softmax_rescale_threshold_log2 = (
+            canonicalize_softmax_rescale_threshold_log2(
+                softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
+            )
+        )
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
@@ -1849,6 +1856,7 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_split_kv=self.explicit_split_kv,
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
+            softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
@@ -2419,9 +2427,7 @@ class ThroughputLatencyMlaDecodeTs:
             cfg.use_multi_ctas_kv == 1
             and runtime_split_pruning_is_profitable(cfg.num_ctas_per_seq_kv)
         )
-        has_runtime_activity_guard = tile_sched_params is None and (
-            cu_seqlens_q is not None or enable_runtime_split_pruning
-        )
+        has_runtime_activity_guard = tile_sched_params is None
         if cutlass.const_expr(has_runtime_activity_guard):
             # Decode launch coordinates against the configured maximum grid,
             # then independently drop compact-Q padding and profitable split
@@ -2446,6 +2452,11 @@ class ThroughputLatencyMlaDecodeTs:
                     cta_idx_kv,
                 )
                 split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
+            # An empty request publishes neither O/LSE nor split scratch.
+            # Cluster peers agree on this batch-owned predicate.
+            query_tile_is_active = query_tile_is_active & (
+                cache_seqs[batch_idx] > Int32(0)
+            )
             run_task_graph = query_tile_is_active and split_tile_is_active
         if cutlass.const_expr(tile_sched_params is not None):
             cta_idx_q = None

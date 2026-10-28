@@ -43,9 +43,12 @@ mapping arithmetic is FP32-quality throughout (exact three-way BF16 split of
 FP32 forward sigmoid rounds to one.
 
 Retained between forward and backward: the inputs and ``stats`` (256 bytes
-per token); with ``cake_mhc_train_prepare(..., save_stats=False)`` the
-statistics are recomputed from ``X`` in the backward with bitwise the same
-gradients (checkpoint replay).  Workspaces are caller-held
+per token), all through the autograd saved tensors, so an activation
+checkpoint (``torch.utils.checkpoint``) frees them after the forward and
+recomputes them in the backward; with
+``cake_mhc_train_prepare(..., save_stats=False)`` the statistics are instead
+recomputed from ``X`` in the backward with bitwise the same gradients
+(checkpoint replay).  Workspaces are caller-held
 (``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
 nothing.  All tensors are contiguous: ``X``, ``Y``, ``dY``, ``dX`` BF16
 ``[T, 4, 4096]``; ``U``, ``B``, ``dU``, ``dB`` BF16 ``[T, 4096]``; ``fn`` FP32
@@ -128,12 +131,14 @@ def cake_mhc_train_forward_prepare(
     base : torch.Tensor
         FP32 ``[24]`` logit offsets.
     rms_eps : float
-        Normalization epsilon; the exported kernels implement ``1e-5`` (any other
-        value raises ``NotImplementedError``).
+        Normalization epsilon (default ``1e-5``): a launch argument of the exported
+        kernels, so any finite positive value runs on the same compiled programs.
     hc_eps : float
-        Coefficient epsilon; the exported kernels implement ``1e-6``.
+        Coefficient epsilon (default ``1e-6``): a launch argument like ``rms_eps``.
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count; the exported kernels implement ``20``.
+        Finite Sinkhorn iteration count (default ``20``): a compile-time constant of
+        the exported programs; a count the export has not delivered raises
+        ``NotImplementedError``.
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
@@ -189,11 +194,12 @@ def cake_mhc_train_forward_stats(
     base : torch.Tensor
         FP32 ``[24]`` logit offsets.
     rms_eps : float
-        Normalization epsilon (``1e-5`` implemented).
+        Normalization epsilon (default ``1e-5``; a launch argument).
     hc_eps : float
-        Coefficient epsilon (``1e-6`` implemented).
+        Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (``20`` implemented).
+        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
+        counts only).
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
@@ -335,11 +341,12 @@ def cake_mhc_train_backward_finish(
     grad_stats : torch.Tensor
         FP32 ``[T, 32]`` record returned by :func:`cake_mhc_train_backward_prepare`.
     rms_eps : float
-        Normalization epsilon (``1e-5`` implemented).
+        Normalization epsilon (default ``1e-5``; a launch argument).
     hc_eps : float
-        Coefficient epsilon (``1e-6`` implemented).
+        Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (``20`` implemented).
+        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
+        counts only).
     accumulate : bool
         ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
         ``True``: the caller passes all three and the fixed-order sums are added
@@ -414,11 +421,12 @@ def cake_mhc_train_prepare(
     base : torch.Tensor
         FP32 ``[24]`` logit offsets (may require gradients).
     rms_eps : float
-        Normalization epsilon (``1e-5`` implemented).
+        Normalization epsilon (default ``1e-5``; a launch argument).
     hc_eps : float
-        Coefficient epsilon (``1e-6`` implemented).
+        Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (``20`` implemented).
+        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
+        counts only).
     save_stats : bool
         ``True`` (default): the per-token statistics are kept for the backward.
         ``False``: they are dropped after the forward and recomputed from ``X``

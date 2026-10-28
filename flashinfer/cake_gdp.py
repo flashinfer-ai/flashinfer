@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Cake Gated DeltaProduct (GDP) decode and MTP verification
-(SM100 / SM103).
+(SM90 / SM100 / SM103).
 
 GDP (arXiv:2502.10297) generalizes the gated delta rule from one Householder
 update per token to ``n = num_householder`` of them, with one per-head scalar
@@ -171,7 +171,8 @@ def cake_gated_delta_product_mtp(
 
     Notes
     -----
-    - Requires an SM100 or SM103 device (``sm_100a`` / ``sm_103a`` programs).
+    - Requires an SM90, SM100 or SM103 device (``sm_90a`` / ``sm_100a`` /
+      ``sm_103a`` programs).
     - ``T`` is a runtime value up to the exported maximum (16); ``T`` of 1, 4
       and 8 with ``num_householder == 3`` run programs compiled for that token
       count, selected by ``B x HV``.

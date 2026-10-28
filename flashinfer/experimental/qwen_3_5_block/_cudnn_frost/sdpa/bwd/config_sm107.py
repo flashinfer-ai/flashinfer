@@ -2070,18 +2070,20 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
 # ---------------------------------------------------------------------------
 
 
-def validate_head_chunk(h_q: int, h_kv: int, qh_chunk: int) -> None:
+def validate_head_chunk(h_q: int, h_kv: int, qh_chunk: int, allow_subgroups: bool = False) -> None:
     """The dS workspace is head-chunked (``qh_chunk`` heads per launch, runtime
     ``head_base``).  A chunk must be a divisor of ``H_q`` AND whole GQA groups
     (a multiple of ``H_q // H_kv``), or the per-Q-head dK/dV partial fold over a
     chunk is incomplete and a KV head's gradient is summed from a partial
-    group."""
+    group. A dense chain that writes global per-Q-head partials and folds only
+    after ALL chunks may explicitly allow a chunk that evenly divides one group.
+    Other chains retain the whole-group requirement."""
     if h_kv < 1 or h_q < 1 or h_q % h_kv != 0:
         raise ValueError(f"sm107 bwd d256: H_q ({h_q}) must be a positive multiple of H_kv ({h_kv})")
     group = h_q // h_kv
     if qh_chunk < 1 or h_q % qh_chunk != 0:
         raise ValueError(f"sm107 bwd d256: qh_chunk ({qh_chunk}) must be a positive divisor of H_q ({h_q})")
-    if qh_chunk % group != 0:
+    if qh_chunk % group != 0 and not (allow_subgroups and group % qh_chunk == 0):
         raise ValueError(
             f"sm107 bwd d256: qh_chunk ({qh_chunk}) must be a multiple of the GQA group H_q/H_kv = {group}, or the dK/dV fold over a chunk is partial"
         )

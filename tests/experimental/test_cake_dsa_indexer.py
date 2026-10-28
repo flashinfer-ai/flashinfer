@@ -66,6 +66,7 @@ visible_key_count = cake_backend.visible_key_count
 visible_key_counts = cake_backend.visible_key_counts
 MERGE_KEY = cake_policy.MERGE_KEY
 POLICY_FIELDS = cake_policy.POLICY_FIELDS
+SAMPLE_SHIFT_PERMILLE_BOUNDS = cake_policy.SAMPLE_SHIFT_PERMILLE_BOUNDS
 DispatchPolicy = cake_policy.DispatchPolicy
 finalize_grid = cake_policy.finalize_grid
 finalize_key = cake_policy.finalize_key
@@ -95,18 +96,27 @@ _COMMON = dict(
     candidate_slack=128,
     cand_mult_rule=[384.0, 8],
     cand_cap_floor=8192,
+    candidate_multiplier_unsampled=4,
+    cand_mult_rule_unsampled=[384.0, 8],
+    cand_cap_floor_unsampled=8192,
+    cand_cap_ceiling=None,
+    cand_cap_ceiling_unsampled=None,
+    wide_first_rule=None,
     split_max=32,
     split_min_range_tiles=64,
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
     sample_fit_max_mean_tiles=512,
+    sample_fit_kinds=["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],
     sample_tiles_max=32,
     sample_tiles_short_units=16,
     sample_dispatch_mean_tiles_max=640,
     sample_tiles_tiny_units=8,
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
+    sample_shift_rule=None,
+    far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
     check_period_cap_divisor=512,
@@ -141,6 +151,7 @@ NARROW_PAIR_POLICY = DispatchPolicy.from_record(
         wide_rule=[6.0, 300.0],
         split_wave_rule=None,
         pair_rule=[128.0, 256.0, 512],
+        pair_units=["l6"],
         snake_rule=None,
         tile_unroll_rule=None,
         rank_rule=[524288, 262144],
@@ -156,6 +167,7 @@ SNAKE_UNROLL_POLICY = DispatchPolicy.from_record(
         wide_rule=[2.0, 250.0],
         split_wave_rule=[1000, 0.12],
         pair_rule=[0.0, 4096.0, 512],
+        pair_units=["l6", "narrow", "wide"],
         snake_rule=[
             ["narrow", "wide", "l6", "pair_narrow", "pair_wide", "pair_l6"],
             32.0,
@@ -320,6 +332,26 @@ def test_registry_records_are_well_formed():
         # the rank finalize programs are registered exactly where the architecture's rule admits a call
         assert bool(rank_keys) == (
             policy.rank_finalize and policy.rank_rule is not None
+        ), arch
+        # the CTA pair serves exactly the unit geometries whose pair program the architecture registers
+        assert policy.pair_units == sorted(
+            {
+                k.split(":")[1][len("pair_") :]
+                for k in scan_keys
+                if k.startswith("scan:pair_")
+            }
+        ), arch
+        # the wide-first precedence reaches the unrolled wide program in both fit forms
+        if policy.wide_first_rule is not None:
+            assert {"scan:wide:u2:s0:f0", "scan:wide:u2:s0:f1"} <= set(keys), arch
+        # the sampled rank shift rule: a top_k floor a call can reach, a shift the default does not already give
+        if policy.sample_shift_rule is not None:
+            assert 1 <= policy.sample_shift_rule[0] <= MAX_TOP_K, arch
+            assert policy.sample_shift_rule[1] != policy.sample_shift_permille, arch
+        # a split needs grid // units >= 2 (rounds <= 0.5) and a wide unit needs rounds >= wide_rule[0], so without
+        # the two-way wave split the wide split program is unreachable where wide_rule[0] > 0.5 and need not ship
+        assert "scan:split_wide:u1:s0:f0" in keys or (
+            policy.split_wave_rule is None and policy.wide_rule[0] > 0.5
         ), arch
         for key in rank_keys:
             _role, threads, window, *form = key.split(":")
@@ -615,9 +647,65 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
+        dict(far_sample=-1),
+        dict(far_sample=True),
+        dict(candidate_multiplier_unsampled=0),  # the unsampled capacity values
+        dict(cand_mult_rule_unsampled=384),
+        dict(cand_cap_floor_unsampled=8192.5),
+        # the capacity ceilings: positive, at or above the floor
+        dict(cand_cap_ceiling=0),
+        dict(cand_cap_ceiling=4096),
+        dict(cand_cap_ceiling=32768.5),
+        dict(cand_cap_ceiling_unsampled=4096),
+        # the kinds with a sampled-fit program: an ascending list of physical kinds
+        dict(sample_fit_kinds="l6"),
+        dict(sample_fit_kinds=["split"]),
+        dict(sample_fit_kinds=["wide", "l6"]),
+        dict(sample_fit_kinds=["l6", "l6"]),
+        # the wide-first precedence floor: [min mean unit tiles] or None
+        dict(wide_first_rule=512),
+        dict(wide_first_rule=[]),
+        dict(wide_first_rule=[512.0, 1]),
+        dict(wide_first_rule=[-1.0]),
+        dict(wide_first_rule=[True]),
+        # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
+        dict(pair_units="l6"),
+        dict(pair_units=["pair_l6"]),
+        dict(pair_units=["split"]),
+        dict(pair_units=["wide", "l6"]),
+        dict(pair_units=["l6", "l6"]),
+        dict(pair_units=[]),
+        # the sampled rank shift rule: [min top_k, shift permille] or None, the shift inside the knob's bound
+        dict(sample_shift_rule=4096),
+        dict(sample_shift_rule=[]),
+        dict(sample_shift_rule=[4096]),
+        dict(sample_shift_rule=[4096, 500, 1]),
+        dict(sample_shift_rule=[-1, 500]),
+        dict(sample_shift_rule=[0, 500]),
+        dict(sample_shift_rule=[4096, 20000]),
+        dict(sample_shift_rule=[4096, -1001]),
+        dict(sample_shift_rule=["a", 500]),
+        dict(sample_shift_rule=[4096.0, 500]),
+        dict(sample_shift_rule=[4096, 500.0]),
+        dict(sample_shift_rule=[True, 500]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
+    first = DispatchPolicy.from_record(dict(record, wide_first_rule=[192.0]))
+    assert first.wide_first_rule == [192.0]
+    assert first.record()["wide_first_rule"] == [192.0]
+    assert DispatchPolicy.from_record(first.record()) == first
+    bare = DispatchPolicy.from_record(dict(record, pair_rule=None, pair_units=[]))
+    assert bare.pair_units == []  # no pair rule: an empty unit list is well-formed
+    shifted = DispatchPolicy.from_record(dict(record, sample_shift_rule=[4096, 500]))
+    assert shifted.sample_shift_rule == [4096, 500]
+    assert shifted.record()["sample_shift_rule"] == [4096, 500]
+    assert DispatchPolicy.from_record(shifted.record()) == shifted
+    # both ends of the knob's bound are admissible shifts
+    for shift in SAMPLE_SHIFT_PERMILLE_BOUNDS:
+        edge = DispatchPolicy.from_record(dict(record, sample_shift_rule=[1, shift]))
+        assert edge.sample_shift_for(1) == shift
 
 
 def test_policy_capacity_period_and_finalize():
@@ -645,6 +733,50 @@ def test_policy_capacity_period_and_finalize():
     assert p.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 32
     assert p.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 4
+    # the unsampled capacity values stand in when the sampled first threshold is off
+    raised = DispatchPolicy.from_record(
+        dict(p.record(), candidate_multiplier=16, cand_cap_floor=16384)
+    )
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 256, sampled=False) == 32
+    geometry = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    sampled = cake_policy.select_program(raised, **geometry)
+    unsampled = cake_policy.select_program(raised, sample_tiles_max=0, **geometry)
+    assert sampled.cand_cap == 32768 and sampled.sample_tiles_max > 0
+    assert unsampled.cand_cap == 8192 and unsampled.sample_tiles_max == 0
+    assert (
+        unsampled.cand_cap
+        == cake_policy.select_program(p, sample_tiles_max=0, **geometry).cand_cap
+    )
+    assert (unsampled.scan_key, unsampled.n_split) == (
+        sampled.scan_key,
+        sampled.n_split,
+    )
+    # the ceiling lowers the multiplier once multiplier x top_k would exceed it: 16 x top_k up to 32768 slots, long units
+    # and the floor untouched
+    capped = DispatchPolicy.from_record(
+        dict(
+            p.record(),
+            candidate_multiplier=16,
+            cand_cap_floor=16384,
+            cand_cap_ceiling=32768,
+        )
+    )
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 4096) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 3000) == 10
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 256) == 64
+    assert capped.cand_cap_multiplier_for(8192, 1048576, 1, 1, 2048) == 8
+    assert capped.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
+    assert [
+        capped.candidate_capacity(
+            k, capped.cand_cap_multiplier_for(65536, 65536, 1, 1, k)
+        )
+        for k in (256, 2048, 3000, 4096)
+    ] == [16384, 32768, 30080, 32768]
     # right-sized finalize programs for small top_k, 256 threads up to 2048, 512 above
     assert [p.finalize_threads_for(k) for k in (1, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 4096)] == [
         32, 32, 64, 64, 128, 128, 256, 256, 512, 512,
@@ -979,7 +1111,7 @@ def test_select_program_narrow_pair_policy():
         and c.sample_tiles_max == 8
         and c.key_bits == 13
     )
-    assert c.workspace_bytes == 148 * 6 * 8192 * 8
+    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + 128
     # one causal 64k document: the CTA-pair three-warpgroup program
     c = _select(p, 65536, 65536)
     assert c.scan_key == "scan:pair_l6:u1:s0:f1" and c.pair and c.grid_ctas == 148
@@ -996,7 +1128,7 @@ def test_select_program_narrow_pair_policy():
     )
     assert c.scan_key == "scan:split_narrow:u1:s0:f0" and c.merge_key == MERGE_KEY
     assert c.cand_cap_multiplier == 8 and c.cand_cap == 16384 and c.check_period == 32
-    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8
+    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + 128
     assert (
         c.keys == ("scan:split_narrow:u1:s0:f0", "merge", "finalize:t256")
         and c.rank_window is None
@@ -1042,14 +1174,23 @@ def test_select_program_narrow_pair_policy():
         candidate_multiplier=2,
         check_period=1,
         sample_tiles_max=0,
+        far_sample=1,
         finalize_threads=512,
     )
-    assert (c.cand_cap, c.check_period, c.sample_tiles_max, c.finalize_key) == (
+    assert (
+        c.cand_cap,
+        c.check_period,
+        c.sample_tiles_max,
+        c.far_sample,
+        c.finalize_key,
+    ) == (
         4096,
         1,
         0,
+        1,
         "finalize_rank:t512:w16384",
     )
+    assert _select(p, 8192, 8192).far_sample == p.far_sample == 0  # record default
     assert (
         _select(p, 8192, 1048576, finalize_threads=512).finalize_key == "finalize:t512"
     )
@@ -1113,6 +1254,93 @@ def test_select_program_narrow_pair_policy():
         _select(p, 8192, 8192, finalize_threads=32)
     with pytest.raises(ValueError, match="grid_ctas"):
         _select(p, 8192, 8192, grid=0)
+    with pytest.raises(ValueError, match="far_sample"):
+        _select(p, 8192, 8192, far_sample=2)
+
+
+def test_wide_first_precedence_and_pair_units_guard():
+    """``wide_first_rule`` gives a wide-eligible call of at least its mean tiles the wide program before the
+    three-warpgroup rule; ``pair_units`` keeps the CTA pair on the units whose pair program the architecture
+    registers.  The fixture takes the sm_103a rule shape (``l6_rule`` to 1024 tiles, ``pair_rule`` 64..1024 tiles,
+    floor 512 tiles) on a 148-CTA grid; ``NARROW_PAIR_POLICY`` has no unroll rule, so its wide keys are ``u1``."""
+    first = DispatchPolicy.from_record(
+        dict(
+            NARROW_PAIR_POLICY.record(),
+            l6_rule=[1024.0, 512],
+            pair_rule=[64.0, 1024.0, 512],
+            wide_first_rule=[512.0],
+        )
+    )
+    # 128k causal document: 512.0 mean tiles, 16384 / 148 = 110.7 wide rounds -> wide first, no pair (the unit is
+    # not in pair_units); the long-unit multiplier 8 x 2048 = 16384 slots fit the 512-tile unit (offset 0) -> f1
+    c = _select(first, 131072, 131072)
+    assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
+    assert c.grid_ctas == 148 and c.cand_cap == 16384
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + 128
+    # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
+    assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
+    # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
+    # precedence never demotes the call; the pair stays (the guard against any narrow demotion)
+    assert _select(first, 4096, 131072).scan_key == "scan:pair_l6:u1:s0:f0"
+    # the context-parallel tail of 496 tiles: the same ineligible pair (the 480-tile offset leaves no fitting unit)
+    assert _select(first, 4096, 65536).scan_key == "scan:pair_l6:u1:s0:f0"
+    # 8k causal document: 32 tiles, work 6.9 x 32 = 221 < 300 -> ineligible, below the pair floor: plain l6
+    assert _select(first, 8192, 8192).scan_key == "scan:l6:u1:s0:f1"
+    # top_k 256 at 64k: no three-warpgroup floor, the wide unit as before (the precedence adds no new wide call)
+    assert _select(first, 65536, 65536, K=256).kind == "wide"
+    # the guard: the same record with the wide unit admitted to the pair composes pair_wide on the wide-first call,
+    # a program sm_103a does not register -- the field, not the pair interval, keeps the dispatch on shipped programs
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    open_ = DispatchPolicy.from_record(dict(first.record(), pair_units=["l6", "wide"]))
+    assert _select(open_, 131072, 131072).scan_key == "scan:pair_wide:u1:s0:f1"
+    with pytest.raises(NotImplementedError, match="pair_wide"):
+        program_for("sm_103a", "scan:pair_wide:u1:s0:f1")
+    # a hostile record (no l6 rule, the pair interval open, the floor at zero) still selects sm_103a programs only
+    hostile = DispatchPolicy.from_record(
+        dict(
+            first.record(),
+            l6_rule=None,
+            pair_rule=[0.0, 4096.0, 512],
+            wide_first_rule=[0.0],
+        )
+    )
+    registered = cake_jit.PROGRAM_KEYS["sm_103a"]
+    for T, Tkv, S, ratio, top_k in _dense_geometries(hostile):
+        c = _select(hostile, T, Tkv, S=S, K=top_k, ratio=ratio)
+        assert c.kind not in ("pair_wide", "pair_narrow"), (T, Tkv, S, ratio, top_k)
+        assert c.scan_key in registered, (T, Tkv, S, ratio, top_k, c.scan_key)
+    hostile_open = DispatchPolicy.from_record(
+        dict(hostile.record(), pair_units=["l6", "wide"])
+    )
+    assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
+
+
+def test_sample_shift_rule_precedence():
+    """``sample_shift_rule`` replaces the sampled rank shift from its ``top_k`` floor on; below the floor, and on a
+    record without a rule, ``sample_shift_permille`` stands; an explicit ``sample_shift_permille`` knob overrides both.
+    The shift is a launch scalar only: the programs, capacity and workspace of a call do not depend on it."""
+    p = NARROW_PAIR_POLICY
+    assert p.sample_shift_rule is None
+    assert p.sample_shift_for(2048) == 250 and p.sample_shift_for(4096) == 250
+    shifted = DispatchPolicy.from_record(
+        dict(p.record(), sample_shift_rule=[4096, 500])
+    )
+    assert shifted.sample_shift_for(4095) == 250
+    assert shifted.sample_shift_for(4096) == 500
+    for K, shift in ((2048, 250), (4096, 500)):
+        base, rule = _select(p, 8192, 8192, K=K), _select(shifted, 8192, 8192, K=K)
+        assert base.sample_shift_permille == 250
+        assert rule.sample_shift_permille == shift
+        assert (rule.keys, rule.cand_cap, rule.workspace_bytes) == (
+            base.keys,
+            base.cand_cap,
+            base.workspace_bytes,
+        )
+        # the knob wins over the rule and over the default alike
+        for q in (p, shifted):
+            knob = _select(q, 8192, 8192, K=K, sample_shift_permille=-500)
+            assert knob.sample_shift_permille == -500
 
 
 def test_select_program_snake_unroll_policy():
@@ -1174,7 +1402,9 @@ def _dense_geometries(policy, *, steps_t=32, steps_m=28):
 def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
     """Every program the frozen policy selects on a dense geometry grid is registered for the architecture: the host
     fails closed by name on an unregistered program, so a selectable but unregistered program is a production failure
-    (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered)."""
+    (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered).
+    Both sample modes: the unsampled plan family (``sample_tiles_max=0``, the ``*_unsampled`` capacity values) is
+    otherwise unseen by the grid."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -1187,31 +1417,213 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                 ):  # lever RW: S equal segments and one long segment
                     bounds += sorted({-(-Tkv // S), Tkv})
                 for bound in bounds:
-                    choice = select_program(
-                        policy,
-                        num_queries=T,
-                        num_keys=Tkv,
-                        num_segments=S,
-                        ratio=ratio,
-                        top_k=top_k,
-                        grid=grid,
-                        max_seqlen_k=bound,
-                    )
-                    selected = [choice.scan_key, choice.finalize_key] + (
-                        [MERGE_KEY] if choice.n_split > 1 else []
-                    )
-                    for key in selected:
-                        assert key in keys, (
-                            arch,
-                            grid,
-                            T,
-                            Tkv,
-                            S,
-                            ratio,
-                            top_k,
-                            bound,
-                            key,
+                    for sample_tiles_max in (None, 0):
+                        choice = select_program(
+                            policy,
+                            num_queries=T,
+                            num_keys=Tkv,
+                            num_segments=S,
+                            ratio=ratio,
+                            top_k=top_k,
+                            grid=grid,
+                            sample_tiles_max=sample_tiles_max,
+                            max_seqlen_k=bound,
                         )
+                        selected = [choice.scan_key, choice.finalize_key] + (
+                            [MERGE_KEY] if choice.n_split > 1 else []
+                        )
+                        for key in selected:
+                            assert key in keys, (
+                                arch,
+                                grid,
+                                T,
+                                Tkv,
+                                S,
+                                ratio,
+                                top_k,
+                                bound,
+                                sample_tiles_max,
+                                key,
+                            )
+
+
+def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
+    """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
+    the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
+    split units of 22k-42k keys fit the buffer and selected ``scan:split_l6:u1:s0:f1``, which has no program)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        registered = sorted(
+            {
+                key.split(":")[1]
+                for key in keys
+                if key.startswith("scan:") and key.endswith(":f1")
+            }
+        )
+        assert policy_for(arch).sample_fit_kinds == registered, arch
+    # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    p = policy_for("sm_103a")
+    geometry = dict(
+        num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
+    )
+    c = select_program(p, candidate_multiplier=16, **geometry)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 2, 32768)
+    assert c.physical_kind == "split_l6" and not c.sample_fit
+    assert (
+        select_program(p, **geometry).cand_cap == 32768
+    )  # the record's own multiplier reaches the same plan
+    wider = DispatchPolicy.from_record(
+        dict(p.record(), sample_fit_kinds=sorted(p.sample_fit_kinds + ["split_l6"]))
+    )
+    c = select_program(wider, candidate_multiplier=16, **geometry)
+    assert c.scan_key == "scan:split_l6:u1:s0:f1" and c.sample_fit
+    assert p.sample_fit_for(4, 22018, 1, 1, 32768) and not p.sample_fit_for(
+        4, 22018, 1, 1, 32768, "split_l6"
+    )
+
+
+def test_shipped_capacity_rules_by_architecture():
+    """sm_103a: short units (under 384 mean tiles) take 16 x top_k slots up to the 32768-slot ceiling, long units keep
+    8 x top_k above the 16384-slot floor; sm_100a keeps 4 x top_k above the floor; the unsampled values (``sample_tiles_max=0``)
+    are the 8192-slot rule on both."""
+    short = dict(
+        num_queries=65536, num_keys=65536, num_segments=1, ratio=1, grid=148
+    )  # 256 mean tiles
+    long = dict(
+        num_queries=16384, num_keys=270336, num_segments=2, ratio=1, grid=148
+    )  # 1024 mean tiles
+    p103, p100 = policy_for("sm_103a"), policy_for("sm_100a")
+    caps = lambda p, g, **kw: [
+        select_program(p, top_k=k, **g, **kw).cand_cap for k in (256, 2048, 4096)
+    ]  # noqa: E731
+    assert caps(p103, short) == [16384, 32768, 32768]
+    assert caps(p103, long) == [16384, 16384, 32768]
+    assert caps(p100, short) == [16384, 16384, 16384]
+    assert caps(p100, long) == [16384, 16384, 32768]
+    assert (
+        caps(p103, short, sample_tiles_max=0)
+        == caps(p100, short, sample_tiles_max=0)
+        == [8192, 8192, 16384]
+    )
+    assert (
+        caps(p103, long, sample_tiles_max=0)
+        == caps(p100, long, sample_tiles_max=0)
+        == [8192, 16384, 32768]
+    )
+
+
+def test_shipped_unit_rules_by_architecture():
+    """sm_103a (``wide_first_rule [512.0]``, ``pair_units ["l6"]``): a wide-eligible call of 512 or more mean tiles takes the
+    unrolled wide program before the three-warpgroup rule, in both sample modes; below the floor and on calls short of six
+    wide rounds the three-warpgroup pair stays, and the 32-tile document keeps plain l6.  sm_100a and sm_107a carry no floor
+    (``None``) and list every registered pair unit, so their plans are the previous package's by code path."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p103, p100, p107 = (
+        policy_for("sm_103a"),
+        policy_for("sm_100a"),
+        policy_for("sm_107a"),
+    )
+    for grid in (152, 148):
+        for knobs in ({}, {"sample_tiles_max": 0}):
+            # 128k causal document: 512.0 mean tiles, 16384 / grid >= 107 rounds -> wide first; 8 x 2048 slots fit -> f1
+            assert (
+                _select(p103, 131072, 131072, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f1"
+            ), (grid, knobs)
+            # 262k causal document: 1024.0 tiles -> wide first; above the 512-tile fit bound -> f0
+            assert (
+                _select(p103, 262144, 262144, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f0"
+            ), (grid, knobs)
+            # 16k queries over two 135k-key segments: (270336 - 8192) / 2 / 128 = 1024.0 tiles, 13.5 rounds -> wide first
+            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling)
+            for K in (2048, 4096):
+                assert (
+                    _select(p103, 16384, 270336, S=2, K=K, grid=grid, **knobs).scan_key
+                    == "scan:wide:u2:s0:f0"
+                ), (grid, knobs, K)
+            # 64k causal document: 256 tiles, below the floor -> the three-warpgroup pair as before
+            assert (
+                _select(p103, 65536, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f1"
+            ), (grid, knobs)
+            # context-parallel tail: 496 tiles but 512 / grid = 3.4 rounds < 6 -> ineligible, the pair stays (no fit:
+            # the 480-tile offset exceeds the 127 fitting tiles)
+            assert (
+                _select(p103, 4096, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f0"
+            ), (grid, knobs)
+            # 8k causal document: 32 tiles, 1024 / grid = 6.7 rounds but work 6.7 x 32 = 216 < 300 -> ineligible, below
+            # the 64-tile pair floor -> plain l6
+            assert (
+                _select(p103, 8192, 8192, grid=grid, **knobs).scan_key
+                == "scan:l6:u1:s0:f1"
+            ), (grid, knobs)
+            # sm_100a: the previous package's plans (l6 to 256 tiles, pair 128..256, no floor)
+            assert (
+                _select(p100, 65536, 65536, grid=grid, **knobs).scan_key
+                == "scan:pair_l6:u1:s0:f1"
+            ), (grid, knobs)
+            assert (
+                _select(p100, 16384, 270336, S=2, grid=grid, **knobs).scan_key
+                == "scan:wide:u2:s0:f0"
+            ), (grid, knobs)
+            assert (
+                _select(p100, 4096, 65536, grid=grid, **knobs).scan_key
+                == "scan:narrow:u1:s0:f0"
+            ), (grid, knobs)
+    # the identity guard of the untimed records: no floor, every registered pair unit listed
+    assert p100.wide_first_rule is None and p100.pair_units == ["l6"]
+    assert p107.wide_first_rule is None
+    assert p107.pair_units == ["l6", "narrow", "wide"]
+    assert p103.wide_first_rule == [512.0] and p103.pair_units == ["l6"]
+
+
+def test_shipped_sample_shift_rule_by_architecture():
+    """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
+    ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
+    same scalar (host-only: ``arch`` and the SM count given)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p103, p100, p107 = (
+        policy_for("sm_103a"),
+        policy_for("sm_100a"),
+        policy_for("sm_107a"),
+    )
+    assert p103.sample_shift_rule == [4096, 375]
+    assert p100.sample_shift_rule is None and p107.sample_shift_rule is None
+    # the 64-tile document, the 512-tile document and the two-segment 1024-tile call: on sm_103a the three-warpgroup
+    # pair and both wide fit forms
+    rows = ((16384, 16384, 1), (131072, 131072, 1), (16384, 270336, 2))
+    for grid in (152, 148):
+        for knobs in ({}, {"sample_tiles_max": 0}):
+            for T, Tkv, S in rows:
+                for K, shift in ((2048, 250), (4096, 375)):
+                    where = (grid, knobs, T, Tkv, S, K)
+                    c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **knobs)
+                    assert c.sample_shift_permille == shift, where
+                    for p in (p100, p107):
+                        c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
+                        assert c.sample_shift_permille == 250, where
+                    forced = dict(knobs, sample_shift_permille=-500)
+                    c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
+                    assert c.sample_shift_permille == -500, where
+
+    # the backend's plan carries the same scalar
+    for arch, K, knobs, shift in (
+        ("sm_103a", 4096, {}, 375),
+        ("sm_103a", 2048, {}, 250),
+        ("sm_100a", 4096, {}, 250),
+        ("sm_107a", 4096, {}, 250),
+        ("sm_103a", 4096, {"sample_shift_permille": 250}, 250),
+    ):
+        plan = plan_dsa_indexer_topk(
+            16384, 16384, 1, top_k=K, arch=arch, num_sms=152, **knobs
+        )
+        assert plan.sample_shift_permille == shift, (arch, K, knobs)
 
 
 def test_program_keys_and_slugs():
@@ -1857,19 +2269,23 @@ def test_tile_boundary_neighbours(lq, lk, top_k):
 # Geometries that reach the host dispatch's program kinds (which kind a geometry takes depends on the
 # architecture's policy; every kind computes the same result).  The 64-query / 256k-key row splits its key ranges
 # on every registered architecture and so exercises the merge stage; the 16k causal document reaches the CTA-pair
-# program where the architecture's rule admits it.
+# program where the architecture's rule admits it; the 8k-query / 72k-key row reaches the wide-first precedence
+# where the architecture's record sets a floor; the 16k causal document at top_k 4096 reaches the sampled rank
+# shift rule where the architecture's record sets one.
 _DISPATCH_ROWS = [
     ([64], [262144], 2048),  # 16 narrow units over 2047 tiles: key-range split + merge
-    (
-        [16384],
-        [16384],
-        2048,
-    ),  # one causal document of 128 mean tiles: three-warpgroup / pair programs
-    (
-        [4096],
-        [65536],
-        2048,
-    ),  # context-parallel tail: narrow or wide unit by the architecture's rule
+    # one causal document of 64 mean tiles: three-warpgroup / pair programs (pair_l6 on sm_103a: at its 64-tile pair
+    # floor, below the wide-first floor)
+    ([16384], [16384], 2048),
+    # context-parallel tail of 496 tiles: narrow, the three-warpgroup pair (sm_103a: 3.4 wide rounds at 148-152 SMs,
+    # ineligible for the wide-first precedence) or the CTA-pair wide program by the architecture's rule
+    ([4096], [65536], 2048),
+    # one causal 8k query block over 72k keys, 544 mean tiles: wide-first on sm_103a, wide on sm_100a, CTA-pair wide on
+    # sm_107a
+    ([8192], [73728], 2048),
+    # the 64-tile document at top_k 4096: the sampled rank shift rule on sm_103a (375 permille from top_k 4096 on;
+    # the 32768-slot ceiling), the 250 default elsewhere; same bits for every shift
+    ([16384], [16384], 4096),
     ([4096], [4096], 256),  # small top_k: capacity floor, right-sized finalize
 ]
 
@@ -1966,12 +2382,36 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_far_sample_knob_is_validated_on_the_host():
+    """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch in cake_jit.ARCHES:
+        grid = _FROZEN_GRIDS[arch][0]
+        plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, arch=arch, num_sms=grid)
+        assert plan.far_sample in (0, 1)
+        assert plan.far_sample == policy_for(arch).far_sample
+        for value in (0, 1):
+            assert (
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=value
+                ).far_sample
+                == value
+            )
+        for bad in (2, -1, True):
+            with pytest.raises(ValueError, match="far_sample"):
+                plan_dsa_indexer_topk(
+                    1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=bad
+                )
+
+
 PARTITION_KNOBS = (
     {"grid_ctas": 37},
     {"candidate_multiplier": 2},
     {"check_period": 1},
     {"sample_tiles_max": 0},
     {"sample_shift_permille": -500},
+    {"far_sample": 1},
     {
         "finalize_threads": 512
     },  # the 512-thread finalize program (the rank form where the policy admits the call)
@@ -1990,6 +2430,91 @@ def test_partition_knobs_do_not_change_results(knobs):
     _judge_ok(base, ref.select_reference(inputs))
     other = _run(inputs, **knobs)
     assert ref.same_bits(base, other), f"partition knob {knobs} changed the result"
+
+
+# -- the attention-sink + local-band distribution (flashinfer-ai/flashinfer#7042) ----------------------------------
+# Small context-parallel geometries whose long units overflow the candidate buffer and run the sampled first
+# threshold (the issue's regime: the nearest key tile of every unit -- the diagonal -- holds a hot band of top-k
+# keys), judged like the random rows against the FP64 / FP32 reference under both settings of the far-sample
+# switch and compared bitwise with the sampled threshold switched off and with the forced re-stream.  Host plan,
+# hand-evaluated from the registry policies (the test asserts the host-visible parts): narrow units (l6 on sm_107a for ``cp16_16k``), ``cand_cap`` 8192,
+# ``check_period`` 16; ``cp16_16k`` (mean unit tiles 64) samples 8 tiles at stride 16 on its 125-128-tile units,
+# ``tail_30848`` (mean 239) samples 16 tiles at stride 15 / 16 on its 238-241-tile units.  The 241-tile units of
+# ``tail_30848`` satisfy ``(n_tiles - 1) % stride == 0``, so both tile orders sample the same tiles, the diagonal
+# and the sink tile included.  The 16384-token document of ``cp16_16k`` is the issue's 262144-token zigzag at 1/16
+# (``cp16_16k`` = ``cp_zigzag_rank0(16384)``: queries ``[0, 512)`` and ``[15872, 16384)``).
+SINK_GEOMETRIES = {
+    "cp16_16k": dict(seg_q_len=[512, 512], seg_k_len=[512, 16384], top_k=256),
+    "tail_30848": dict(seg_q_len=[512], seg_k_len=[30848], top_k=256),
+}
+
+
+def _longest_unit_samples(inputs, plan) -> bool:
+    """The kernel's ``sample_plan`` conditions for the longest unit, from host-visible numbers only: its key tiles
+    overflow the candidate buffer and the plan admits at least two sample tiles."""
+    tile = policy_for(arch_for(inputs.device)).tile_keys
+    tiles = -(-max(inputs.seg_k_len) // tile)
+    max_tiles = min(plan.sample_tiles_max, plan.cand_cap // tile - plan.check_period)
+    return tiles * tile + tile > plan.cand_cap and max_tiles >= 2
+
+
+@pytest.mark.parametrize("far_sample", [0, 1])
+@pytest.mark.parametrize("name", list(SINK_GEOMETRIES))
+def test_sink_distribution_is_exact_and_knob_invariant(name, far_sample):
+    _require_program()
+    inputs = ref.make_sink_inputs(
+        **SINK_GEOMETRIES[name], seed=ref.SINK_SEED, device="cuda", label=name
+    )
+    plan = _plan(inputs, far_sample=far_sample)
+    assert plan.sample_tiles_max > 0 and _longest_unit_samples(inputs, plan), plan
+    assert plan.far_sample == far_sample
+    base = _run(inputs, far_sample=far_sample)
+    verdict = _judge_ok(base, ref.select_reference(inputs))
+    assert (
+        verdict.max_fp32_error_over_bound <= 1.0
+        and verdict.max_fp64_error_over_bound <= 1.0
+    )
+    # the sink: most rows select key 0 (the issue reports 94-100 %; an iid row selects it with probability
+    # ~ top_k / visible)
+    assert float((base[0] == 0).any(dim=1).float().mean()) > 0.5
+    nosample = _run(inputs, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample), (
+        "sample_tiles_max=0 changed the result on the sink distribution"
+    )
+    restream = _run(inputs, sample_shift_permille=-500)
+    assert ref.same_bits(base, restream), (
+        "the forced re-stream changed the result on the sink distribution"
+    )
+
+
+def test_sink_issue_geometry_full():
+    """The issue's call: one 262144-token document, CP16 zigzag rank 0, top-k 2048, ``max_seqlen_k`` 262144.
+    ``FLASHINFER_CAKE_DSA_INDEXER_FULL=1`` only: 2.1 G visible pairs through the matmul-order reference (minutes)."""
+    _require_program()
+    if not FULL:
+        pytest.skip("set FLASHINFER_CAKE_DSA_INDEXER_FULL=1 for the 262k sink geometry")
+    inputs = ref.make_sink_inputs(
+        [8192, 8192],
+        [8192, 262144],
+        top_k=2048,
+        seed=ref.SINK_SEED,
+        device="cuda",
+        label="Z1",
+    )
+    plan = _plan(inputs, max_seqlen_k=262144)
+    # unsplit units, 32 sample tiles, 16384-entry candidate buffers checked every 32 tiles: the plan the issue
+    # prints (the unit kind is the architecture's: wide on sm_100a, the l6 CTA pair on sm_103a)
+    assert plan.n_split == 1 and _longest_unit_samples(inputs, plan), plan
+    assert plan.sample_tiles_max == 32 and plan.cand_cap == 16384, plan
+    assert plan.check_period == 32, plan
+    base = _run(inputs, max_seqlen_k=262144)
+    _judge_ok(base, ref.select_reference(inputs))
+    nosample = _run(inputs, max_seqlen_k=262144, sample_tiles_max=0)
+    assert ref.same_bits(base, nosample)
+    far = _run(inputs, max_seqlen_k=262144, far_sample=1)
+    assert ref.same_bits(base, far)
+    unbounded = _run(inputs)
+    assert ref.same_bits(base, unbounded)
 
 
 # ---------------------------------------------------------------------------
@@ -2109,6 +2634,7 @@ def test_workspace_bound_is_respected():
     assert (
         nbytes
         == (plan.grid_ctas * plan.block_q * plan.cand_cap + plan.staging_entries) * 8
+        + 128
     )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     indices = torch.empty(

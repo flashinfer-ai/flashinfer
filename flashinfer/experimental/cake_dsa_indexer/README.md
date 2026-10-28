@@ -117,8 +117,12 @@ all padding).
   the program the host dispatches for a geometry (unit geometry, key-range
   split, CTA pair, tile-loop unroll, unit order, sampled first threshold) nor
   the partition knobs of the backend (`grid_ctas`, `candidate_multiplier`,
-  `check_period`, `sample_tiles_max`, `sample_shift_permille`,
-  `finalize_threads`) change a result (the tests compare bitwise).
+  `check_period`, `sample_tiles_max`, `sample_shift_permille`, `far_sample`,
+  `finalize_threads`) change a result (the tests compare bitwise).  `far_sample`
+  (`0` or `1`; the architecture's record sets the default) set to `1` makes the
+  sampled first threshold of the ascending-tile-order scan programs rank the far
+  sample tiles only, leaving out the sample tile nearest the diagonal (an
+  attention sink's local band); the descending-order and wide programs ignore it.
 
 ## Non-finite inputs
 
@@ -152,13 +156,14 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 
 | decision | rule (record fields) |
 |---|---|
-| unit geometry | `block_q_l6` queries per unit (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when the call has at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`; else `block_q_narrow` |
+| unit geometry | `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
 | key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round |
-| CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]` and the call is not split (grid made even) |
+| CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]`, the call is not split (grid made even) and the unit geometry is one of `pair_units` (the units whose pair program the architecture registers) |
 | unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
-| sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles` and the mean segment offset leaves fitting units |
-| candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), raised to `cand_cap_floor` slots, rounded up to whole tiles; the default check period follows the capacity (`check_period_cap_divisor`, per-kind overrides) |
+| sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
+| sampled rank shift | `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`; an explicit `sample_shift_permille=` knob overrides both.  A launch scalar only: it sets how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or an output bit; unsampled calls (`sample_tiles_max=0`) do not read it |
+| candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), raised to `cand_cap_floor` slots and lowered to `cand_cap_ceiling` slots where the record sets one (the multiplier becomes `ceiling // top_k`, so the buffer stops growing with `top_k` once it holds the ceiling), rounded up to whole tiles; with the sampled first threshold off (`sample_tiles_max=0`) the `candidate_multiplier_unsampled` / `cand_mult_rule_unsampled` / `cand_cap_floor_unsampled` / `cand_cap_ceiling_unsampled` values apply instead; the default check period follows the capacity (`check_period_cap_divisor`, per-kind overrides) |
 | finalize program | threads = the smallest power of two of sort slots holding `top_k` (`finalize_threads_fit` x `finalize_items`) for small `top_k`, else `finalize_threads_small` up to `finalize_top_k_small`, else `finalize_threads`.  Where the rank rules admit the call -- `rank_finalize` and `top_k >= rank_top_k_min` -- the row sort is a prefix-popcount rank finalize program sized for the call's **pool**: `Tkv`, or the caller's `max_seqlen_k` where `rank_seg_window` is set (lever RW; a bound above `Tkv` or below `ceil(Tkv / S)` is rejected whether or not the switch is set).  A pool above `rank_slab_window_max` takes the two-level (bucket + word) program of the smallest `rank_two_level_window_variants` entry holding it, with no segment bound, where `rank_two_level` is set and the window is within `rank_two_level_rule` (lever FR2; key `finalize_rank:t<threads>:w<window>:two`, staged where `rank_two_level_staged_rule` admits the window); a pool within the slab bound takes the smallest `rank_window_variants` entry holding it and one bitmap word (32 bits) per thread when `pool <= rank_rule[0]` and the segment -- mean `Tkv / S`, or `max_seqlen_k` itself under lever RW -- is at most `rank_rule[1]`, skipping the `rank_window_variants_seg_only` entries when the pool is `Tkv` (`finalize_rank:t<threads>:w<window>`, stage role `finalize_rank`; the kernel reads the segment boundaries on the device; where `rank_staged` is set and `rank_staged_rule` admits the window, its SMEM-staged, coalesced-I/O form `...:staged` -- lever FRS, same role and arguments); every other call sorts with the CUB block radix sort program (`finalize:t<threads>`, `(Tkv - 1).bit_length()` key bits).  Both produce the same ids and bits  Two forms of the staged program carry their own key tags: `:i16` (`rank_t16` / `rank_t16_slots`: the 4096-slot staged form runs 256 launched threads x 16 slots) and `:bulk` (`rank_bulk_io` / `rank_bulk_align_bytes`: `cp.async.bulk` row I/O when `top_k x 4` and the output addresses are multiples of the granule; unaligned caller-owned outputs run the registered plain twin, same results).  Where the record's `rank_persist_max_k` is above zero (SM107 only), the staged bulk program of rows with `top_k <= rank_persist_max_k` and 8-item threads carries `:persist` (the `:i16` form keeps the one-row program): one persistent grid of `min(rows, rank_persist_ctas_per_sm x SMs)` CTAs ranks the call's rows, each CTA landing its next row while it ranks the current one (`cake_policy.finalize_grid`); same results as the one-row program. |
 
 The dispatched program must be registered for the device's architecture
@@ -172,13 +177,24 @@ that writes the registry verifies the record against them before it is frozen.
 * **Workspace bound** (`dsa_indexer_topk_workspace_size(T, Tkv, S, top_k=,
   ratio=, device=)`): `grid_ctas x queries_per_unit x
   candidate_capacity(top_k) x 8` bytes of persistent candidate buffers for the
-  dispatched unit geometry and capacity (for example about 37 MiB at `top_k =
-  2048` with four queries per unit on 148 SMs, 74 MiB with eight queries per
-  unit or the doubled long-unit capacity) plus `T x n_split x top_k x 8` bytes
+  dispatched unit geometry and capacity (for example about 74 MiB at `top_k =
+  2048` with four queries per unit on 148 SMs at the 16384-slot capacity
+  floor, 148 MiB with eight queries per unit; on `sm_103a`, whose short units
+  take 16 x `top_k` slots up to the 32768-slot ceiling, 148 MiB with four
+  queries per unit and 296 MiB with eight at `top_k = 2048`) plus `T x n_split x top_k x 8` bytes
   of staging when the dispatch splits the key ranges.  The bound depends on the
   call geometry; size a reused buffer for the largest bound over the
-  geometries it serves.  Separate from the inputs and the two `[T, top_k]`
-  outputs.
+  geometries it serves.  On `sm_103a`, units of 512-1024 mean tiles with
+  `top_k >= 512` and at least six wide rounds now take eight queries per unit
+  (`wide_first_rule`): 152 MiB (159383552 B) at the 16384-slot floor and
+  304 MiB (318767104 B) at `top_k = 4096` on 152 SMs, where the previous
+  package needed 114 / 228 MiB (119537664 / 239075328 B); a reused buffer
+  sized under the previous package for such a call must be re-sized (the
+  runner rejects it with `workspace_buffer needs N bytes`), and
+  `dsa_indexer_topk_workspace_size` follows the new plan automatically.  It is
+  sized for the sampled default; a call with `sample_tiles_max=0` (the
+  unsampled capacity values) needs at most as much.  Separate from the inputs
+  and the two `[T, top_k]` outputs.
 * **No host synchronization**: the segment boundaries and offsets are read on
   the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
   count and the strides.  The eager entry point allocates the outputs and the
@@ -191,10 +207,17 @@ that writes the registry verifies the record against them before it is frozen.
 ## Layout of this package
 
 The kernel and launcher sources under `csrc/`, the registry `cake_jit.py` and
-`build.json` are exporter output, hand-folded here pending exporter support:
-programs that differ only in their constants or lever text share one
-translation unit, and each `build.json` entry selects its program through its
-own `-D` definitions.
+`build.json` were produced by the Cake exporter and are maintained by hand
+pending exporter support: programs that differ only in their constants or lever
+text share one translation unit, and each `build.json` entry selects its
+program through its own `-D` definitions.  A changed kernel program is
+re-rendered from the Cake kernel source, re-folded into its shared unit, and
+every entry of that unit, expanded under its `-D` definitions, is checked token
+for token against the program's own render before it ships; `build.json`
+records every source's digest and a closure digest per entry (the identity rule
+over program, architecture, kernel symbol, compile flags, source and shared
+header digests for re-rendered entries; the original exporter's digests for the
+others).  `csrc/.clang-format` disables formatting so the digests stay valid.
 
 * `cake_jit.py` -- registry: one record per program (`PROGRAMS`: role, the
   architecture-free `library` stem, architectures), the program of every
@@ -240,8 +263,7 @@ own `-D` definitions.
   preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
   `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
   functions are content-addressed files under `csrc/cake_device_helpers/`
-  (`csrc/.clang-format` disables formatting: the sources are identity-checked by
-  the export).
+  (`csrc/.clang-format` disables formatting so the digests stay valid).
 
 ## Tests and benchmark
 

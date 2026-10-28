@@ -21,7 +21,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ out, int* __restrict__ topk_length, int num_rows, int topk, int idx_stride, int indices_offset, int num_docs, int search_iters, int causal, int has_docs, int flat_bound, int write_out);
+extern "C" __global__ void kernel_cake_dsa_h64_nope_train_db791110b21a91be1388(int* __restrict__ indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ out, int* __restrict__ topk_length, int num_rows, int topk, int idx_stride, int indices_offset, int num_docs, int search_iters, int causal, int has_docs, int flat_bound, int write_out, int compact, int* __restrict__ length_in, int has_length_in);
 
 namespace cake_binding_kernel_cake_dsa_h64_nope_train_db791110b21a91be1388 {
 
@@ -36,7 +36,7 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-void Run(TensorView a_indices, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_out, TensorView a_topk_length, int64_t a_num_rows, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_num_docs, int64_t a_search_iters, int64_t a_causal, int64_t a_has_docs, int64_t a_flat_bound, int64_t a_write_out, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_indices, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_out, TensorView a_topk_length, int64_t a_num_rows, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_num_docs, int64_t a_search_iters, int64_t a_causal, int64_t a_has_docs, int64_t a_flat_bound, int64_t a_write_out, int64_t a_compact, TensorView a_length_in, int64_t a_has_length_in, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_indices.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_indices, "indices");
@@ -79,6 +79,14 @@ void Run(TensorView a_indices, TensorView a_cu_seqlens_q, TensorView a_cu_seqlen
   TVM_FFI_CHECK(a_write_out >= -2147483648LL && a_write_out <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'write_out' = " << a_write_out
       << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_compact >= -2147483648LL && a_compact <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'compact' = " << a_compact
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_length_in, "length_in");
+  check_dtype(a_length_in, DLDataType{kDLInt, 32, 1}, "length_in");
+  TVM_FFI_CHECK(a_has_length_in >= -2147483648LL && a_has_length_in <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'has_length_in' = " << a_has_length_in
+      << " is outside the i32 range [-2147483648, 2147483647]";
   check_contiguous(a_indices, "indices");
   check_contiguous(a_cu_seqlens_q, "cu_seqlens_q");
   check_same_device(a_cu_seqlens_q, a_indices, "cu_seqlens_q", "indices");
@@ -88,6 +96,8 @@ void Run(TensorView a_indices, TensorView a_cu_seqlens_q, TensorView a_cu_seqlen
   check_same_device(a_out, a_indices, "out", "indices");
   check_contiguous(a_topk_length, "topk_length");
   check_same_device(a_topk_length, a_indices, "topk_length", "indices");
+  check_contiguous(a_length_in, "length_in");
+  check_same_device(a_length_in, a_indices, "length_in", "indices");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -108,7 +118,10 @@ void Run(TensorView a_indices, TensorView a_cu_seqlens_q, TensorView a_cu_seqlen
   int32_t v_has_docs = static_cast<int32_t>(a_has_docs);
   int32_t v_flat_bound = static_cast<int32_t>(a_flat_bound);
   int32_t v_write_out = static_cast<int32_t>(a_write_out);
-  void* kernel_args[] = {&v_indices, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_out, &v_topk_length, &v_num_rows, &v_topk, &v_idx_stride, &v_indices_offset, &v_num_docs, &v_search_iters, &v_causal, &v_has_docs, &v_flat_bound, &v_write_out};
+  int32_t v_compact = static_cast<int32_t>(a_compact);
+  void* v_length_in = DataPtr(a_length_in);
+  int32_t v_has_length_in = static_cast<int32_t>(a_has_length_in);
+  void* kernel_args[] = {&v_indices, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_out, &v_topk_length, &v_num_rows, &v_topk, &v_idx_stride, &v_indices_offset, &v_num_docs, &v_search_iters, &v_causal, &v_has_docs, &v_flat_bound, &v_write_out, &v_compact, &v_length_in, &v_has_length_in};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(128, 1, 1);

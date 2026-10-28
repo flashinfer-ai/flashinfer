@@ -15,7 +15,8 @@ from .quantization import (
     float_to_ue8m0_fast,
     cvt_f32_to_e4m3,
 )
-from .activation import swiglu
+from .activation import activate
+from .io import pack_scale, combine
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,9 @@ class Geometry:
     clamp_limit: Optional[float] = None
     alpha: float = 1.0
     beta: float = 0.0
+    activation: str = "swiglu"
+    activation_parameters: Optional[Tuple] = None
+    gated: bool = True
 
     def __post_init__(self):
         if not 1 <= self.tokens <= 8:
@@ -63,6 +67,9 @@ def activate_tile(
     limit: cutlass.Constexpr,
     alpha: cutlass.Constexpr,
     beta: cutlass.Constexpr,
+    name: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
     tile: cutlass.Int32,
     route: cutlass.Int32,
 ):
@@ -70,14 +77,19 @@ def activate_tile(
     lane = cute.arch.lane_idx()
     # The producing CTA owns adjacent 64-channel gate and up tiles. The
     # GEMM body ends with a CTA barrier before these FP32 values are read.
-    if tid < 64:
-        col = tile * 64 + tid
+    width = 64 if cutlass.const_expr(gated) else 128
+    if tid < width:
+        col = tile * width + tid
         if col < physical:
-            gate = partials[route, tile * 128 + tid]
-            up = partials[route, tile * 128 + tid + 64]
+            gate = cutlass.Float32(0)
+            if cutlass.const_expr(gated):
+                gate = partials[route, tile * 128 + tid]
+                up = partials[route, tile * 128 + tid + 64]
+            else:
+                up = partials[route, col]
             value = cutlass.Float32(0)
             if col < logical:
-                value = swiglu(up, gate, limit, alpha, beta)
+                value = activate(up, gate, name, limit, alpha, beta, parameters)
             maximum = cute.arch.warp_reduction_max(abs(value))
             scale = float_to_ue8m0_fast(_mul(maximum, cutlass.Float32(1.0 / 448.0)))
             code = cvt_f32_to_e4m3(_mul(value, _inverse_scale(scale)))
@@ -109,6 +121,73 @@ class Pipeline:
         )
 
     @cute.jit
+    def launch(
+        self,
+        q,
+        sf,
+        ids,
+        weights,
+        w1,
+        s1,
+        w2,
+        s2,
+        packed_sf,
+        partials,
+        midq,
+        midsf,
+        routes,
+        output,
+        problem1: Tuple[
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+        ],
+        problem2: Tuple[
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+            cutlass.Int32,
+        ],
+        weight_dtype: cutlass.Constexpr,
+        narrow_weights: cutlass.Constexpr,
+        finalize: cutlass.Constexpr,
+        stream,
+    ):
+        route_ids = cute.make_tensor(ids.iterator, cute.make_layout(cute.size(ids)))
+        first = (
+            cute.recast_ptr(w1.iterator, dtype=weight_dtype),
+            cute.recast_ptr(s1.iterator, dtype=cutlass.Float8E8M0FNU),
+            q.iterator,
+            cute.recast_ptr(packed_sf.iterator, dtype=cutlass.Float8E8M0FNU),
+            partials.iterator,
+            None,
+            None,
+            problem1,
+            route_ids,
+        )
+        second = (
+            cute.recast_ptr(w2.iterator, dtype=weight_dtype),
+            cute.recast_ptr(s2.iterator, dtype=cutlass.Float8E8M0FNU),
+            midq.iterator,
+            cute.recast_ptr(midsf.iterator, dtype=cutlass.Float8E8M0FNU),
+            routes.iterator,
+            None,
+            None,
+            problem2,
+            route_ids,
+        )
+        pack_scale(sf, packed_sf, midsf, stream)
+        self.gate_up(first, (partials, midq, midsf), stream)
+        self.down_project(second, stream)
+        if cutlass.const_expr(finalize):
+            combine(routes, weights, output, narrow_weights, stream)
+
+    @cute.jit
     def gate_up(self, pointers: Tuple, activation: Tuple, stream):
         args, grid = self.gu.prepare(*pointers, stream)
         self.gate_up_kernel(args, activation).launch(
@@ -138,6 +217,9 @@ class Pipeline:
             self.geometry.clamp_limit,
             self.geometry.alpha,
             self.geometry.beta,
+            self.geometry.activation,
+            self.geometry.activation_parameters,
+            self.geometry.gated,
             tile,
             route,
         )
