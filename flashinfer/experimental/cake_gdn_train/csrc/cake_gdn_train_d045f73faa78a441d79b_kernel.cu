@@ -1044,368 +1044,368 @@ kernel_cake_gdn_train_d045f73faa78a441d79b(const __grid_constant__ CUtensorMap q
                                     asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_2), "f"(negv) : "memory");
                                 }
                             }
-                            float lrow_0[16];
+                            float lrow_r_0[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_0[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_0[(0) + 3]))
                                 : "r"(l_row0 + 544));
-                            float accv_1 = 0.0f;
-                            accv_1 = __fmaf_rn(lrow_0[0], a_vals[0], accv_1);
-                            accv_1 = __fmaf_rn(lrow_0[1], a_vals[1], accv_1);
-                            float negv_2 = -accv_1;
-                            a_vals[2] = ((jj < 2) ? negv_2 : a_vals[2]);
+                            float accv_r_0 = 0.0f;
+                            accv_r_0 = __fmaf_rn(lrow_r_0[0], a_vals[0], accv_r_0);
+                            accv_r_0 = __fmaf_rn(lrow_r_0[1], a_vals[1], accv_r_0);
+                            float negv_r_0 = -accv_r_0;
+                            a_vals[2] = ((jj < 2) ? negv_r_0 : a_vals[2]);
                             if (jj < 2) {
                                 {
                                     uint32_t _addr_3 = static_cast<uint32_t>(a_col + 544);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_3), "f"(negv_2) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_3), "f"(negv_r_0) : "memory");
                                 }
                             }
-                            float lrow_3[16];
+                            float lrow_r_1[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_3[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_1[(0) + 3]))
                                 : "r"(l_row0 + 816));
-                            float accv_4 = 0.0f;
-                            accv_4 = __fmaf_rn(lrow_3[0], a_vals[0], accv_4);
-                            accv_4 = __fmaf_rn(lrow_3[1], a_vals[1], accv_4);
-                            accv_4 = __fmaf_rn(lrow_3[2], a_vals[2], accv_4);
-                            float negv_5 = -accv_4;
-                            a_vals[3] = ((jj < 3) ? negv_5 : a_vals[3]);
+                            float accv_r_1 = 0.0f;
+                            accv_r_1 = __fmaf_rn(lrow_r_1[0], a_vals[0], accv_r_1);
+                            accv_r_1 = __fmaf_rn(lrow_r_1[1], a_vals[1], accv_r_1);
+                            accv_r_1 = __fmaf_rn(lrow_r_1[2], a_vals[2], accv_r_1);
+                            float negv_r_1 = -accv_r_1;
+                            a_vals[3] = ((jj < 3) ? negv_r_1 : a_vals[3]);
                             if (jj < 3) {
                                 {
                                     uint32_t _addr_4 = static_cast<uint32_t>(a_col + 816);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_4), "f"(negv_5) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_4), "f"(negv_r_1) : "memory");
                                 }
                             }
-                            float lrow_6[16];
+                            float lrow_r_2[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_6[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_2[(0) + 3]))
                                 : "r"(l_row0 + 1088));
-                            float accv_7 = 0.0f;
-                            accv_7 = __fmaf_rn(lrow_6[0], a_vals[0], accv_7);
-                            accv_7 = __fmaf_rn(lrow_6[1], a_vals[1], accv_7);
-                            accv_7 = __fmaf_rn(lrow_6[2], a_vals[2], accv_7);
-                            accv_7 = __fmaf_rn(lrow_6[3], a_vals[3], accv_7);
-                            float negv_8 = -accv_7;
-                            a_vals[4] = ((jj < 4) ? negv_8 : a_vals[4]);
+                            float accv_r_2 = 0.0f;
+                            accv_r_2 = __fmaf_rn(lrow_r_2[0], a_vals[0], accv_r_2);
+                            accv_r_2 = __fmaf_rn(lrow_r_2[1], a_vals[1], accv_r_2);
+                            accv_r_2 = __fmaf_rn(lrow_r_2[2], a_vals[2], accv_r_2);
+                            accv_r_2 = __fmaf_rn(lrow_r_2[3], a_vals[3], accv_r_2);
+                            float negv_r_2 = -accv_r_2;
+                            a_vals[4] = ((jj < 4) ? negv_r_2 : a_vals[4]);
                             if (jj < 4) {
                                 {
                                     uint32_t _addr_5 = static_cast<uint32_t>(a_col + 1088);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_5), "f"(negv_8) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_5), "f"(negv_r_2) : "memory");
                                 }
                             }
-                            float lrow_9[16];
+                            float lrow_r_r_0[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(0) + 3]))
                                 : "r"(l_row0 + 1360));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_9[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_0[(4) + 3]))
                                 : "r"(l_row0 + 1360 + 16));
-                            float accv_10 = 0.0f;
-                            accv_10 = __fmaf_rn(lrow_9[0], a_vals[0], accv_10);
-                            accv_10 = __fmaf_rn(lrow_9[1], a_vals[1], accv_10);
-                            accv_10 = __fmaf_rn(lrow_9[2], a_vals[2], accv_10);
-                            accv_10 = __fmaf_rn(lrow_9[3], a_vals[3], accv_10);
-                            accv_10 = __fmaf_rn(lrow_9[4], a_vals[4], accv_10);
-                            float negv_11 = -accv_10;
-                            a_vals[5] = ((jj < 5) ? negv_11 : a_vals[5]);
+                            float accv_r_r_0 = 0.0f;
+                            accv_r_r_0 = __fmaf_rn(lrow_r_r_0[0], a_vals[0], accv_r_r_0);
+                            accv_r_r_0 = __fmaf_rn(lrow_r_r_0[1], a_vals[1], accv_r_r_0);
+                            accv_r_r_0 = __fmaf_rn(lrow_r_r_0[2], a_vals[2], accv_r_r_0);
+                            accv_r_r_0 = __fmaf_rn(lrow_r_r_0[3], a_vals[3], accv_r_r_0);
+                            accv_r_r_0 = __fmaf_rn(lrow_r_r_0[4], a_vals[4], accv_r_r_0);
+                            float negv_r_r_0 = -accv_r_r_0;
+                            a_vals[5] = ((jj < 5) ? negv_r_r_0 : a_vals[5]);
                             if (jj < 5) {
                                 {
                                     uint32_t _addr_6 = static_cast<uint32_t>(a_col + 1360);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_6), "f"(negv_11) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_6), "f"(negv_r_r_0) : "memory");
                                 }
                             }
-                            float lrow_12[16];
+                            float lrow_r_r_1[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(0) + 3]))
                                 : "r"(l_row0 + 1632));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_12[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_1[(4) + 3]))
                                 : "r"(l_row0 + 1632 + 16));
-                            float accv_13 = 0.0f;
-                            accv_13 = __fmaf_rn(lrow_12[0], a_vals[0], accv_13);
-                            accv_13 = __fmaf_rn(lrow_12[1], a_vals[1], accv_13);
-                            accv_13 = __fmaf_rn(lrow_12[2], a_vals[2], accv_13);
-                            accv_13 = __fmaf_rn(lrow_12[3], a_vals[3], accv_13);
-                            accv_13 = __fmaf_rn(lrow_12[4], a_vals[4], accv_13);
-                            accv_13 = __fmaf_rn(lrow_12[5], a_vals[5], accv_13);
-                            float negv_14 = -accv_13;
-                            a_vals[6] = ((jj < 6) ? negv_14 : a_vals[6]);
+                            float accv_r_r_1 = 0.0f;
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[0], a_vals[0], accv_r_r_1);
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[1], a_vals[1], accv_r_r_1);
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[2], a_vals[2], accv_r_r_1);
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[3], a_vals[3], accv_r_r_1);
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[4], a_vals[4], accv_r_r_1);
+                            accv_r_r_1 = __fmaf_rn(lrow_r_r_1[5], a_vals[5], accv_r_r_1);
+                            float negv_r_r_1 = -accv_r_r_1;
+                            a_vals[6] = ((jj < 6) ? negv_r_r_1 : a_vals[6]);
                             if (jj < 6) {
                                 {
                                     uint32_t _addr_7 = static_cast<uint32_t>(a_col + 1632);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_7), "f"(negv_14) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_7), "f"(negv_r_r_1) : "memory");
                                 }
                             }
-                            float lrow_15[16];
+                            float lrow_r_r_2[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(0) + 3]))
                                 : "r"(l_row0 + 1904));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_15[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_2[(4) + 3]))
                                 : "r"(l_row0 + 1904 + 16));
-                            float accv_16 = 0.0f;
-                            accv_16 = __fmaf_rn(lrow_15[0], a_vals[0], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[1], a_vals[1], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[2], a_vals[2], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[3], a_vals[3], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[4], a_vals[4], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[5], a_vals[5], accv_16);
-                            accv_16 = __fmaf_rn(lrow_15[6], a_vals[6], accv_16);
-                            float negv_17 = -accv_16;
-                            a_vals[7] = ((jj < 7) ? negv_17 : a_vals[7]);
+                            float accv_r_r_2 = 0.0f;
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[0], a_vals[0], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[1], a_vals[1], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[2], a_vals[2], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[3], a_vals[3], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[4], a_vals[4], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[5], a_vals[5], accv_r_r_2);
+                            accv_r_r_2 = __fmaf_rn(lrow_r_r_2[6], a_vals[6], accv_r_r_2);
+                            float negv_r_r_2 = -accv_r_r_2;
+                            a_vals[7] = ((jj < 7) ? negv_r_r_2 : a_vals[7]);
                             if (jj < 7) {
                                 {
                                     uint32_t _addr_8 = static_cast<uint32_t>(a_col + 1904);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_8), "f"(negv_17) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_8), "f"(negv_r_r_2) : "memory");
                                 }
                             }
-                            float lrow_18[16];
+                            float lrow_r_r_3[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(0) + 3]))
                                 : "r"(l_row0 + 2176));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_18[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_3[(4) + 3]))
                                 : "r"(l_row0 + 2176 + 16));
-                            float accv_19 = 0.0f;
-                            accv_19 = __fmaf_rn(lrow_18[0], a_vals[0], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[1], a_vals[1], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[2], a_vals[2], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[3], a_vals[3], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[4], a_vals[4], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[5], a_vals[5], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[6], a_vals[6], accv_19);
-                            accv_19 = __fmaf_rn(lrow_18[7], a_vals[7], accv_19);
-                            float negv_20 = -accv_19;
-                            a_vals[8] = ((jj < 8) ? negv_20 : a_vals[8]);
+                            float accv_r_r_3 = 0.0f;
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[0], a_vals[0], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[1], a_vals[1], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[2], a_vals[2], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[3], a_vals[3], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[4], a_vals[4], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[5], a_vals[5], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[6], a_vals[6], accv_r_r_3);
+                            accv_r_r_3 = __fmaf_rn(lrow_r_r_3[7], a_vals[7], accv_r_r_3);
+                            float negv_r_r_3 = -accv_r_r_3;
+                            a_vals[8] = ((jj < 8) ? negv_r_r_3 : a_vals[8]);
                             if (jj < 8) {
                                 {
                                     uint32_t _addr_9 = static_cast<uint32_t>(a_col + 2176);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_9), "f"(negv_20) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_9), "f"(negv_r_r_3) : "memory");
                                 }
                             }
-                            float lrow_21[16];
+                            float lrow_r_r_r_0[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(0) + 3]))
                                 : "r"(l_row0 + 2448));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(4) + 3]))
                                 : "r"(l_row0 + 2448 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_21[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_0[(8) + 3]))
                                 : "r"(l_row0 + 2448 + 32));
-                            float accv_22 = 0.0f;
-                            accv_22 = __fmaf_rn(lrow_21[0], a_vals[0], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[1], a_vals[1], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[2], a_vals[2], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[3], a_vals[3], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[4], a_vals[4], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[5], a_vals[5], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[6], a_vals[6], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[7], a_vals[7], accv_22);
-                            accv_22 = __fmaf_rn(lrow_21[8], a_vals[8], accv_22);
-                            float negv_23 = -accv_22;
-                            a_vals[9] = ((jj < 9) ? negv_23 : a_vals[9]);
+                            float accv_r_r_r_0 = 0.0f;
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[0], a_vals[0], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[1], a_vals[1], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[2], a_vals[2], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[3], a_vals[3], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[4], a_vals[4], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[5], a_vals[5], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[6], a_vals[6], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[7], a_vals[7], accv_r_r_r_0);
+                            accv_r_r_r_0 = __fmaf_rn(lrow_r_r_r_0[8], a_vals[8], accv_r_r_r_0);
+                            float negv_r_r_r_0 = -accv_r_r_r_0;
+                            a_vals[9] = ((jj < 9) ? negv_r_r_r_0 : a_vals[9]);
                             if (jj < 9) {
                                 {
                                     uint32_t _addr_10 = static_cast<uint32_t>(a_col + 2448);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_10), "f"(negv_23) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_10), "f"(negv_r_r_r_0) : "memory");
                                 }
                             }
-                            float lrow_24[16];
+                            float lrow_r_r_r_1[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(0) + 3]))
                                 : "r"(l_row0 + 2720));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(4) + 3]))
                                 : "r"(l_row0 + 2720 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_24[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_1[(8) + 3]))
                                 : "r"(l_row0 + 2720 + 32));
-                            float accv_25 = 0.0f;
-                            accv_25 = __fmaf_rn(lrow_24[0], a_vals[0], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[1], a_vals[1], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[2], a_vals[2], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[3], a_vals[3], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[4], a_vals[4], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[5], a_vals[5], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[6], a_vals[6], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[7], a_vals[7], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[8], a_vals[8], accv_25);
-                            accv_25 = __fmaf_rn(lrow_24[9], a_vals[9], accv_25);
-                            float negv_26 = -accv_25;
-                            a_vals[10] = ((jj < 10) ? negv_26 : a_vals[10]);
+                            float accv_r_r_r_1 = 0.0f;
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[0], a_vals[0], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[1], a_vals[1], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[2], a_vals[2], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[3], a_vals[3], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[4], a_vals[4], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[5], a_vals[5], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[6], a_vals[6], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[7], a_vals[7], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[8], a_vals[8], accv_r_r_r_1);
+                            accv_r_r_r_1 = __fmaf_rn(lrow_r_r_r_1[9], a_vals[9], accv_r_r_r_1);
+                            float negv_r_r_r_1 = -accv_r_r_r_1;
+                            a_vals[10] = ((jj < 10) ? negv_r_r_r_1 : a_vals[10]);
                             if (jj < 10) {
                                 {
                                     uint32_t _addr_11 = static_cast<uint32_t>(a_col + 2720);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_11), "f"(negv_26) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_11), "f"(negv_r_r_r_1) : "memory");
                                 }
                             }
-                            float lrow_27[16];
+                            float lrow_r_r_r_2[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(0) + 3]))
                                 : "r"(l_row0 + 2992));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(4) + 3]))
                                 : "r"(l_row0 + 2992 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_27[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_2[(8) + 3]))
                                 : "r"(l_row0 + 2992 + 32));
-                            float accv_28 = 0.0f;
-                            accv_28 = __fmaf_rn(lrow_27[0], a_vals[0], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[1], a_vals[1], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[2], a_vals[2], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[3], a_vals[3], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[4], a_vals[4], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[5], a_vals[5], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[6], a_vals[6], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[7], a_vals[7], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[8], a_vals[8], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[9], a_vals[9], accv_28);
-                            accv_28 = __fmaf_rn(lrow_27[10], a_vals[10], accv_28);
-                            float negv_29 = -accv_28;
-                            a_vals[11] = ((jj < 11) ? negv_29 : a_vals[11]);
+                            float accv_r_r_r_2 = 0.0f;
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[0], a_vals[0], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[1], a_vals[1], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[2], a_vals[2], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[3], a_vals[3], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[4], a_vals[4], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[5], a_vals[5], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[6], a_vals[6], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[7], a_vals[7], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[8], a_vals[8], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[9], a_vals[9], accv_r_r_r_2);
+                            accv_r_r_r_2 = __fmaf_rn(lrow_r_r_r_2[10], a_vals[10], accv_r_r_r_2);
+                            float negv_r_r_r_2 = -accv_r_r_r_2;
+                            a_vals[11] = ((jj < 11) ? negv_r_r_r_2 : a_vals[11]);
                             if (jj < 11) {
                                 {
                                     uint32_t _addr_12 = static_cast<uint32_t>(a_col + 2992);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_12), "f"(negv_29) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_12), "f"(negv_r_r_r_2) : "memory");
                                 }
                             }
-                            float lrow_30[16];
+                            float lrow_r_r_r_3[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(0) + 3]))
                                 : "r"(l_row0 + 3264));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(4) + 3]))
                                 : "r"(l_row0 + 3264 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_30[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_3[(8) + 3]))
                                 : "r"(l_row0 + 3264 + 32));
-                            float accv_31 = 0.0f;
-                            accv_31 = __fmaf_rn(lrow_30[0], a_vals[0], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[1], a_vals[1], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[2], a_vals[2], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[3], a_vals[3], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[4], a_vals[4], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[5], a_vals[5], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[6], a_vals[6], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[7], a_vals[7], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[8], a_vals[8], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[9], a_vals[9], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[10], a_vals[10], accv_31);
-                            accv_31 = __fmaf_rn(lrow_30[11], a_vals[11], accv_31);
-                            float negv_32 = -accv_31;
-                            a_vals[12] = ((jj < 12) ? negv_32 : a_vals[12]);
+                            float accv_r_r_r_3 = 0.0f;
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[0], a_vals[0], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[1], a_vals[1], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[2], a_vals[2], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[3], a_vals[3], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[4], a_vals[4], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[5], a_vals[5], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[6], a_vals[6], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[7], a_vals[7], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[8], a_vals[8], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[9], a_vals[9], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[10], a_vals[10], accv_r_r_r_3);
+                            accv_r_r_r_3 = __fmaf_rn(lrow_r_r_r_3[11], a_vals[11], accv_r_r_r_3);
+                            float negv_r_r_r_3 = -accv_r_r_r_3;
+                            a_vals[12] = ((jj < 12) ? negv_r_r_r_3 : a_vals[12]);
                             if (jj < 12) {
                                 {
                                     uint32_t _addr_13 = static_cast<uint32_t>(a_col + 3264);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_13), "f"(negv_32) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_13), "f"(negv_r_r_r_3) : "memory");
                                 }
                             }
-                            float lrow_33[16];
+                            float lrow_r_r_r_r_0[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(0) + 3]))
                                 : "r"(l_row0 + 3536));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(4) + 3]))
                                 : "r"(l_row0 + 3536 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(8) + 3]))
                                 : "r"(l_row0 + 3536 + 32));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_33[(12) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_0[(12) + 3]))
                                 : "r"(l_row0 + 3536 + 48));
-                            float accv_34 = 0.0f;
-                            accv_34 = __fmaf_rn(lrow_33[0], a_vals[0], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[1], a_vals[1], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[2], a_vals[2], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[3], a_vals[3], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[4], a_vals[4], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[5], a_vals[5], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[6], a_vals[6], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[7], a_vals[7], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[8], a_vals[8], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[9], a_vals[9], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[10], a_vals[10], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[11], a_vals[11], accv_34);
-                            accv_34 = __fmaf_rn(lrow_33[12], a_vals[12], accv_34);
-                            float negv_35 = -accv_34;
-                            a_vals[13] = ((jj < 13) ? negv_35 : a_vals[13]);
+                            float accv_r_r_r_r_0 = 0.0f;
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[0], a_vals[0], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[1], a_vals[1], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[2], a_vals[2], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[3], a_vals[3], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[4], a_vals[4], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[5], a_vals[5], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[6], a_vals[6], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[7], a_vals[7], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[8], a_vals[8], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[9], a_vals[9], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[10], a_vals[10], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[11], a_vals[11], accv_r_r_r_r_0);
+                            accv_r_r_r_r_0 = __fmaf_rn(lrow_r_r_r_r_0[12], a_vals[12], accv_r_r_r_r_0);
+                            float negv_r_r_r_r_0 = -accv_r_r_r_r_0;
+                            a_vals[13] = ((jj < 13) ? negv_r_r_r_r_0 : a_vals[13]);
                             if (jj < 13) {
                                 {
                                     uint32_t _addr_14 = static_cast<uint32_t>(a_col + 3536);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_14), "f"(negv_35) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_14), "f"(negv_r_r_r_r_0) : "memory");
                                 }
                             }
-                            float lrow_36[16];
+                            float lrow_r_r_r_r_1[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(0) + 3]))
                                 : "r"(l_row0 + 3808));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(4) + 3]))
                                 : "r"(l_row0 + 3808 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(8) + 3]))
                                 : "r"(l_row0 + 3808 + 32));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_36[(12) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_1[(12) + 3]))
                                 : "r"(l_row0 + 3808 + 48));
-                            float accv_37 = 0.0f;
-                            accv_37 = __fmaf_rn(lrow_36[0], a_vals[0], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[1], a_vals[1], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[2], a_vals[2], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[3], a_vals[3], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[4], a_vals[4], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[5], a_vals[5], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[6], a_vals[6], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[7], a_vals[7], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[8], a_vals[8], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[9], a_vals[9], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[10], a_vals[10], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[11], a_vals[11], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[12], a_vals[12], accv_37);
-                            accv_37 = __fmaf_rn(lrow_36[13], a_vals[13], accv_37);
-                            float negv_38 = -accv_37;
-                            a_vals[14] = ((jj < 14) ? negv_38 : a_vals[14]);
+                            float accv_r_r_r_r_1 = 0.0f;
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[0], a_vals[0], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[1], a_vals[1], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[2], a_vals[2], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[3], a_vals[3], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[4], a_vals[4], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[5], a_vals[5], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[6], a_vals[6], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[7], a_vals[7], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[8], a_vals[8], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[9], a_vals[9], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[10], a_vals[10], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[11], a_vals[11], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[12], a_vals[12], accv_r_r_r_r_1);
+                            accv_r_r_r_r_1 = __fmaf_rn(lrow_r_r_r_r_1[13], a_vals[13], accv_r_r_r_r_1);
+                            float negv_r_r_r_r_1 = -accv_r_r_r_r_1;
+                            a_vals[14] = ((jj < 14) ? negv_r_r_r_r_1 : a_vals[14]);
                             if (jj < 14) {
                                 {
                                     uint32_t _addr_15 = static_cast<uint32_t>(a_col + 3808);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_15), "f"(negv_38) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_15), "f"(negv_r_r_r_r_1) : "memory");
                                 }
                             }
-                            float lrow_39[16];
+                            float lrow_r_r_r_r_2[16];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(0) + 3]))
                                 : "r"(l_row0 + 4080));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(4) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(4) + 3]))
                                 : "r"(l_row0 + 4080 + 16));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(8) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(8) + 3]))
                                 : "r"(l_row0 + 4080 + 32));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_39[(12) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lrow_r_r_r_r_2[(12) + 3]))
                                 : "r"(l_row0 + 4080 + 48));
-                            float accv_40 = 0.0f;
-                            accv_40 = __fmaf_rn(lrow_39[0], a_vals[0], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[1], a_vals[1], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[2], a_vals[2], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[3], a_vals[3], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[4], a_vals[4], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[5], a_vals[5], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[6], a_vals[6], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[7], a_vals[7], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[8], a_vals[8], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[9], a_vals[9], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[10], a_vals[10], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[11], a_vals[11], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[12], a_vals[12], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[13], a_vals[13], accv_40);
-                            accv_40 = __fmaf_rn(lrow_39[14], a_vals[14], accv_40);
-                            float negv_41 = -accv_40;
-                            a_vals[15] = ((jj < 15) ? negv_41 : a_vals[15]);
+                            float accv_r_r_r_r_2 = 0.0f;
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[0], a_vals[0], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[1], a_vals[1], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[2], a_vals[2], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[3], a_vals[3], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[4], a_vals[4], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[5], a_vals[5], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[6], a_vals[6], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[7], a_vals[7], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[8], a_vals[8], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[9], a_vals[9], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[10], a_vals[10], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[11], a_vals[11], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[12], a_vals[12], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[13], a_vals[13], accv_r_r_r_r_2);
+                            accv_r_r_r_r_2 = __fmaf_rn(lrow_r_r_r_r_2[14], a_vals[14], accv_r_r_r_r_2);
+                            float negv_r_r_r_r_2 = -accv_r_r_r_r_2;
+                            a_vals[15] = ((jj < 15) ? negv_r_r_r_r_2 : a_vals[15]);
                             if (jj < 15) {
                                 {
                                     uint32_t _addr_16 = static_cast<uint32_t>(a_col + 4080);
-                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_16), "f"(negv_41) : "memory");
+                                    asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_16), "f"(negv_r_r_r_r_2) : "memory");
                                 }
                             }
                         }

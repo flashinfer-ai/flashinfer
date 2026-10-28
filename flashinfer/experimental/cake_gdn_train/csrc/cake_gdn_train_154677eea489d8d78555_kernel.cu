@@ -332,14 +332,14 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
             }
             tmem_st_x32_f32(taddr + (unsigned int)row_base, init_vals);
             #pragma unroll
-            for (int j_1 = 0; j_1 < 32; j_1++) {
-                float one_here_1 = 0.0f;
+            for (int j_0 = 0; j_0 < 32; j_0++) {
+                float one_here_0 = 0.0f;
                 if (init_mode == 0) {
-                    if (32 + j_1 == lane_v) {
-                        one_here_1 = 1.0f;
+                    if (32 + j_0 == lane_v) {
+                        one_here_0 = 1.0f;
                     }
                 }
-                init_vals[j_1] = one_here_1;
+                init_vals[j_0] = one_here_0;
             }
             tmem_st_x32_f32(taddr + (unsigned int)row_base + 32, init_vals);
             #pragma unroll
@@ -931,8 +931,8 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                 unsigned int hi_1_0[32];
                 unsigned int lo_2_0[32];
                 #pragma unroll
-                for (int j_4 = 0; j_4 < 32; j_4++) {
-                    hi_1_0[j_4] = __as_u32(_tmem_load_3[j_4]) + half_tf32 & mask_tf32;
+                for (int j_1 = 0; j_1 < 32; j_1++) {
+                    hi_1_0[j_1] = __as_u32(_tmem_load_3[j_1]) + half_tf32 & mask_tf32;
                 }
                 float xd_1_0[32];
                 #pragma unroll
@@ -947,8 +947,8 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                 unsigned int hi_2_0[32];
                 unsigned int lo_3_0[32];
                 #pragma unroll
-                for (int j_5 = 0; j_5 < 32; j_5++) {
-                    hi_2_0[j_5] = __as_u32(_tmem_load_3[32 + j_5]) + half_tf32 & mask_tf32;
+                for (int j_4 = 0; j_4 < 32; j_4++) {
+                    hi_2_0[j_4] = __as_u32(_tmem_load_3[32 + j_4]) + half_tf32 & mask_tf32;
                 }
                 float xd_3_0[32];
                 #pragma unroll
@@ -991,8 +991,8 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                 unsigned int hi_1_1[32];
                 unsigned int lo_2_1[32];
                 #pragma unroll
-                for (int j_6 = 0; j_6 < 32; j_6++) {
-                    hi_1_1[j_6] = __as_u32(_tmem_load_14[j_6]) + half_tf32 & mask_tf32;
+                for (int j_5 = 0; j_5 < 32; j_5++) {
+                    hi_1_1[j_5] = __as_u32(_tmem_load_14[j_5]) + half_tf32 & mask_tf32;
                 }
                 float xd_1_1[32];
                 #pragma unroll
@@ -1007,8 +1007,8 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                 unsigned int hi_2_1[32];
                 unsigned int lo_3_1[32];
                 #pragma unroll
-                for (int j_7 = 0; j_7 < 32; j_7++) {
-                    hi_2_1[j_7] = __as_u32(_tmem_load_14[32 + j_7]) + half_tf32 & mask_tf32;
+                for (int j_6 = 0; j_6 < 32; j_6++) {
+                    hi_2_1[j_6] = __as_u32(_tmem_load_14[32 + j_6]) + half_tf32 & mask_tf32;
                 }
                 float xd_3_1[32];
                 #pragma unroll
@@ -1117,8 +1117,8 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 float bvv[64];
                 #pragma unroll
-                for (int j_8 = 0; j_8 < 64; j_8++) {
-                    bvv[j_8] = uv[j_8] - _tmem_load_4[j_8];
+                for (int j_7 = 0; j_7 < 64; j_7++) {
+                    bvv[j_7] = uv[j_7] - _tmem_load_4[j_7];
                 }
                 float rs[32];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -1147,14 +1147,14 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(rsb_addr + (unsigned int)(par * 256 + 112)));
                 float bs[32];
                 #pragma unroll
-                for (int j_9 = 0; j_9 < 32; j_9++) {
-                    bs[j_9] = bvv[j_9] * rs[j_9];
+                for (int j_8 = 0; j_8 < 32; j_8++) {
+                    bs[j_8] = bvv[j_8] * rs[j_8];
                 }
                 unsigned int bhi[32];
                 unsigned int blo[32];
                 #pragma unroll
-                for (int j_10 = 0; j_10 < 32; j_10++) {
-                    bhi[j_10] = __as_u32(bs[j_10]) + half_tf32 & mask_tf32;
+                for (int j_9 = 0; j_9 < 32; j_9++) {
+                    bhi[j_9] = __as_u32(bs[j_9]) + half_tf32 & mask_tf32;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x32.b32"
@@ -1187,14 +1187,14 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(rsb_addr + (unsigned int)(par * 256 + 128 + 112)));
                 float bs_10[32];
                 #pragma unroll
-                for (int j_11 = 0; j_11 < 32; j_11++) {
-                    bs_10[j_11] = bvv[32 + j_11] * rs_9[j_11];
+                for (int j_10 = 0; j_10 < 32; j_10++) {
+                    bs_10[j_10] = bvv[32 + j_10] * rs_9[j_10];
                 }
                 unsigned int bhi_11[32];
                 unsigned int blo_12[32];
                 #pragma unroll
-                for (int j_12 = 0; j_12 < 32; j_12++) {
-                    bhi_11[j_12] = __as_u32(bs_10[j_12]) + half_tf32 & mask_tf32;
+                for (int j_11 = 0; j_11 < 32; j_11++) {
+                    bhi_11[j_11] = __as_u32(bs_10[j_11]) + half_tf32 & mask_tf32;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x32.b32"
@@ -1702,13 +1702,13 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(taddr + 128 + (unsigned int)row_base + 128));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int j_13 = 0; j_13 < 32; j_13++) {
-                    _tmem_load_5[j_13] = _tmem_load_5[j_13] + _tmem_load_6[j_13];
+                for (int j_12 = 0; j_12 < 32; j_12++) {
+                    _tmem_load_5[j_12] = _tmem_load_5[j_12] + _tmem_load_6[j_12];
                 }
                 if (write_transposed == 1) {
                     #pragma unroll
-                    for (int j_14 = 0; j_14 < 32; j_14++) {
-                        *(reinterpret_cast<float*>(out) + (tile + (long long)(j_14 * 128 + lane_v))) = _tmem_load_5[j_14];
+                    for (int j_13 = 0; j_13 < 32; j_13++) {
+                        *(reinterpret_cast<float*>(out) + (tile + (long long)(j_13 * 128 + lane_v))) = _tmem_load_5[j_13];
                     }
                 } else {
                     long long row_at = tile + (long long)(lane_v * 128);
@@ -1759,13 +1759,13 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(taddr + 128 + (unsigned int)row_base + 160));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 32; j_15++) {
-                    _tmem_load_7[j_15] = _tmem_load_7[j_15] + _tmem_load_8[j_15];
+                for (int j_14 = 0; j_14 < 32; j_14++) {
+                    _tmem_load_7[j_14] = _tmem_load_7[j_14] + _tmem_load_8[j_14];
                 }
                 if (write_transposed == 1) {
                     #pragma unroll
-                    for (int j_16 = 0; j_16 < 32; j_16++) {
-                        *(reinterpret_cast<float*>(out) + (tile + (long long)((32 + j_16) * 128 + lane_v))) = _tmem_load_7[j_16];
+                    for (int j_15 = 0; j_15 < 32; j_15++) {
+                        *(reinterpret_cast<float*>(out) + (tile + (long long)((32 + j_15) * 128 + lane_v))) = _tmem_load_7[j_15];
                     }
                 } else {
                     long long row_at_1 = tile + (long long)(lane_v * 128 + 32);
@@ -1816,13 +1816,13 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(taddr + 128 + (unsigned int)row_base + 192));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int j_17 = 0; j_17 < 32; j_17++) {
-                    _tmem_load_9[j_17] = _tmem_load_9[j_17] + _tmem_load_10[j_17];
+                for (int j_16 = 0; j_16 < 32; j_16++) {
+                    _tmem_load_9[j_16] = _tmem_load_9[j_16] + _tmem_load_10[j_16];
                 }
                 if (write_transposed == 1) {
                     #pragma unroll
-                    for (int j_18 = 0; j_18 < 32; j_18++) {
-                        *(reinterpret_cast<float*>(out) + (tile + (long long)((64 + j_18) * 128 + lane_v))) = _tmem_load_9[j_18];
+                    for (int j_17 = 0; j_17 < 32; j_17++) {
+                        *(reinterpret_cast<float*>(out) + (tile + (long long)((64 + j_17) * 128 + lane_v))) = _tmem_load_9[j_17];
                     }
                 } else {
                     long long row_at_2 = tile + (long long)(lane_v * 128 + 64);
@@ -1873,13 +1873,13 @@ kernel_cake_gdn_train_154677eea489d8d78555(const __grid_constant__ CUtensorMap k
                     : "r"(taddr + 128 + (unsigned int)row_base + 224));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int j_19 = 0; j_19 < 32; j_19++) {
-                    _tmem_load_11[j_19] = _tmem_load_11[j_19] + _tmem_load_12[j_19];
+                for (int j_18 = 0; j_18 < 32; j_18++) {
+                    _tmem_load_11[j_18] = _tmem_load_11[j_18] + _tmem_load_12[j_18];
                 }
                 if (write_transposed == 1) {
                     #pragma unroll
-                    for (int j_20 = 0; j_20 < 32; j_20++) {
-                        *(reinterpret_cast<float*>(out) + (tile + (long long)((96 + j_20) * 128 + lane_v))) = _tmem_load_11[j_20];
+                    for (int j_19 = 0; j_19 < 32; j_19++) {
+                        *(reinterpret_cast<float*>(out) + (tile + (long long)((96 + j_19) * 128 + lane_v))) = _tmem_load_11[j_19];
                     }
                 } else {
                     long long row_at_3 = tile + (long long)(lane_v * 128 + 96);
