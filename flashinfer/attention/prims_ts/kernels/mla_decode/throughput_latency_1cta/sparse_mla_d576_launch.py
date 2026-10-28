@@ -28,12 +28,18 @@ import ctypes
 import dataclasses
 import functools
 
+from typing import Optional
+
 import torch
+
+from .. import sparse_policy
+from ..helpers.math import canonicalize_softmax_rescale_threshold_log2
 
 HEAD_DIM = 576
 LATENT_DIM = 512
 ROPE_DIM = 64
 V_DIM = 512
+_SUPPORTED_HEADS = (64, 128)
 _DESCRIPTOR_BYTES = 128
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _PROFILE = "h64_keeps_mma_ab"
@@ -380,3 +386,98 @@ def launch_sparse_mla_d576_kernel(
             # every parameter positionally, including this defaulted one.
             None,
         )
+
+
+# Plan-time helpers of the sparse MLA wrapper's D576 mode.
+
+
+def check_plan(
+    *,
+    num_heads: int,
+    max_topk: int,
+    max_extra_topk: int,
+    q_data_type: torch.dtype,
+    has_sinks: bool,
+    output_quant_block_size: Optional[int],
+) -> None:
+    """Reject wrapper options the D576 schedule does not implement."""
+    if q_data_type != torch.float8_e4m3fn:
+        raise ValueError("D576 sparse MLA (qk_rope_head_dim=64) requires E4M3 Q / KV")
+    if num_heads not in _SUPPORTED_HEADS:
+        raise ValueError(
+            "D576 sparse MLA supports 64 or 128 query heads (64-row tiles), "
+            f"got {num_heads}"
+        )
+    if max_extra_topk:
+        raise ValueError("D576 sparse MLA attends to one KV pool (max_extra_topk=0)")
+    if has_sinks:
+        raise ValueError("D576 sparse MLA does not support attention sinks")
+    if output_quant_block_size is not None:
+        raise ValueError("D576 sparse MLA does not support output quantization")
+
+
+def resolve_split(device_index: int, max_rows: int, num_heads: int, max_topk: int):
+    """``(split_kv, head_dim_split)`` for a plan of ``max_rows`` query tokens.
+
+    Fixed at plan time, so every run of the plan (and a CUDA graph captured
+    from it) uses one compiled kernel.
+    """
+    return sparse_policy.select_sparse_mla_d576_split(
+        max_rows * (num_heads // 64),
+        max_topk,
+        torch.cuda.get_device_properties(device_index).multi_processor_count,
+    )
+
+
+def compile_plan(
+    device_index: int,
+    *,
+    num_heads: int,
+    max_topk: int,
+    softmax_rescale_threshold_log2: Optional[float],
+    split_kv: int,
+    head_dim_split: int,
+):
+    """Compile (or load from the PrimTS disk cache) the kernel of one plan."""
+    threshold = canonicalize_softmax_rescale_threshold_log2(
+        0.0
+        if softmax_rescale_threshold_log2 is None
+        else softmax_rescale_threshold_log2,
+        qkv_dtype="e4m3",
+    )
+    return compile_sparse_mla_d576_kernel(
+        device_index,
+        num_heads=num_heads,
+        # The kernel uses the capacity only through its 128-key tile count:
+        # capacities in one tile bucket share a kernel.
+        sparse_mla_top_k=-(-max_topk // 128) * 128,
+        softmax_rescale_threshold_log2=threshold,
+        split_kv=split_kv,
+        head_dim_split=head_dim_split,
+    )
+
+
+def kv_rows(cache: torch.Tensor, *, device, kv_layout: str, name: str) -> torch.Tensor:
+    """Flatten an E4M3 ``[N, 576]`` / ``[pages, page_size, 576]`` / one-KV-head
+    4-D cache to the ``[rows, 576]`` view the Gather4 maps address."""
+    if not isinstance(cache, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if cache.ndim == 4:
+        axis = 1 if kv_layout == "HND" else 2
+        if cache.shape[axis] != 1:
+            raise ValueError(f"{name} requires one KV head")
+        cache = cache.squeeze(axis)
+    if cache.ndim not in (2, 3) or cache.shape[-1] != HEAD_DIM or cache.numel() == 0:
+        raise ValueError(
+            f"{name} must have shape [N,{HEAD_DIM}] or [pages,page_size,{HEAD_DIM}]"
+        )
+    if cache.device != device or cache.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"{name} must be an E4M3 tensor on the planned device")
+    if not cache.is_contiguous() or cache.data_ptr() % 16:
+        raise ValueError(
+            f"{name} must be contiguous and start at a 16-byte-aligned address"
+        )
+    rows = cache.view(-1, HEAD_DIM)
+    if rows.shape[0] >= 0x7FFFFFFF:
+        raise ValueError(f"{name} exceeds the int32 row range")
+    return rows

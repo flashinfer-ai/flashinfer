@@ -14,11 +14,15 @@ pytest.importorskip("cutlass", minversion="4.7.0")
 triton = pytest.importorskip("triton")
 import triton.language as tl
 from flashinfer.attention.prims_ts import (
-    _dsa,
     BatchSparseMLADecodePagedTSWrapper,
     MLAAttentionTuning,
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
+)
+
+from flashinfer.attention.prims_ts.kernels.mla_decode import sparse_policy
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+    sparse_mla_d576_launch,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -1380,7 +1384,11 @@ def test_sparse_d576_packed_query():
 def test_sparse_d576_forced_split(split, head_dim_split, topk, monkeypatch):
     """Forced splits (incl. empty and one-tile splits, V head-dim splits) and
     the direct store agree with the reference, natural-log LSE included."""
-    monkeypatch.setattr(_dsa, "_select_fp8_split", lambda *_: (split, head_dim_split))
+    monkeypatch.setattr(
+        sparse_policy,
+        "select_sparse_mla_d576_split",
+        lambda *_: (split, head_dim_split),
+    )
     q, kv, indices, lengths = _d576_inputs(6, 64, topk, 0.3)
     lengths[1:] = torch.randint(1, topk + 1, (5,), device="cuda")
     lengths[2] = 0
@@ -1393,7 +1401,7 @@ def test_sparse_d576_split_policy():
     """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave
     (one tile for a top-k of one tile pair), then a V head-dim split while the
     grid fills at most a quarter / half of the SMs."""
-    select = _dsa._select_fp8_split
+    select = sparse_policy.select_sparse_mla_d576_split
     ctas = (1, 4, 5, 8, 9, 16, 18, 19, 37, 38, 74, 75, 96)
     assert [select(t, 2048, 148) for t in ctas] == [
         (8, 4),
@@ -1467,7 +1475,7 @@ def test_sparse_d576_compile_capacity_bucket(monkeypatch):
     """Capacities in one 128-key tile bucket compile one kernel."""
     seen = []
     monkeypatch.setattr(
-        _dsa,
+        sparse_mla_d576_launch,
         "compile_sparse_mla_d576_kernel",
         lambda *args, **kwargs: seen.append(kwargs["sparse_mla_top_k"]),
     )

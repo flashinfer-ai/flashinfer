@@ -1254,7 +1254,7 @@ def _get_compiled_mla_decode(
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
 
-    # The 1CTA kernel also serves D576 sparse MLA (``_dsa.py``), which
+    # The 1CTA kernel also serves D576 sparse MLA (``sparse_mla_d576_launch.py``), which
     # passes its raw Gather4 descriptors after ``output_scale``; dense and
     # native-sparse MLA leave that operand unset.
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -2406,9 +2406,11 @@ def _resolve_sparse_d576_plan(
     qk_rope_head_dim=64,
 ):
     """Resolve a D576 plan's split and scratch sizing without allocation/compilation."""
-    from . import _dsa
+    from .kernels.mla_decode.throughput_latency_1cta import (
+        sparse_mla_d576_launch as _d576,
+    )
 
-    if (kv_lora_rank, qk_rope_head_dim) != (_dsa.KV_LORA_RANK, _dsa.QK_ROPE_HEAD_DIM):
+    if (kv_lora_rank, qk_rope_head_dim) != (_d576.LATENT_DIM, _d576.ROPE_DIM):
         raise ValueError(
             "sparse MLA supports (kv_lora_rank, qk_rope_head_dim) = (512, 0) "
             "(D512) or (512, 64) (D576)"
@@ -2426,7 +2428,7 @@ def _resolve_sparse_d576_plan(
             raise ValueError(f"{name} must be a positive integer")
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
-    _dsa.check_plan(
+    _d576.check_plan(
         num_heads=num_heads,
         max_topk=max_topk,
         max_extra_topk=max_extra_topk,
@@ -2449,13 +2451,17 @@ def _resolve_sparse_d576_plan(
             "D576 sparse MLA supports at most 65535 query tokens per plan "
             f"(batch_size * max_seq_len_q), got {max_rows}"
         )
-    split_kv, head_dim_split = _dsa.resolve_split(
+    split_kv, head_dim_split = _d576.resolve_split(
         device.index, max_rows, num_heads, max_topk
     )
     sections = {}
     byte_end = 0
     for name, shape, dtype in (
-        ("core", (_dsa.workspace_bytes(max_rows, num_heads, split_kv),), torch.int8),
+        (
+            "core",
+            (_d576.sparse_mla_d576_workspace_bytes(max_rows, num_heads, split_kv),),
+            torch.int8,
+        ),
         ("public_lse", (max_rows, num_heads), torch.float32),
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
@@ -2680,7 +2686,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         qk_rope_head_dim,
     ):
         """Plan the D576 sparse MLA (DSA, one E4M3 pool) schedule."""
-        from . import _dsa
+        from .kernels.mla_decode.throughput_latency_1cta import (
+            sparse_mla_d576_launch as _d576,
+        )
 
         (device, split_kv, head_dim_split, threshold, sections, byte_end) = (
             _resolve_sparse_d576_plan(
@@ -2703,7 +2711,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         if workspace is None:
             workspace = torch.empty(byte_end, device=device, dtype=torch.uint8)
         _validate_workspace_buffer(workspace, device=device, required_bytes=byte_end)
-        compiled = _dsa.compile_plan(
+        compiled = _d576.compile_plan(
             device.index,
             num_heads=num_heads,
             max_topk=max_topk,
@@ -2758,7 +2766,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         validate,
     ):
         """Run a D576 plan: Q [..,H,576] over one E4M3 [..,576] pool."""
-        from . import _dsa
+        from .kernels.mla_decode.throughput_latency_1cta import (
+            sparse_mla_d576_launch as _d576,
+        )
 
         state = self._state
         if any(
@@ -2784,7 +2794,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             num_heads=state["heads"],
             max_seq_len_q=state["max_q"],
             q_dtype=state["dtype"],
-            query_dim=_dsa.HEAD_DIM,
+            query_dim=_d576.HEAD_DIM,
         )
         prefix = tuple(query.shape[:-2])
         rows = math.prod(prefix)
@@ -2800,7 +2810,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                     raise ValueError("invalid packed query offsets")
         elif qo_indptr is not None:
             raise ValueError("fixed queries do not accept qo_indptr")
-        kv = _dsa.kv_rows(
+        kv = _d576.kv_rows(
             kv_cache,
             device=state["device"],
             kv_layout=state["kv_layout"],
@@ -2834,7 +2844,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             scales.append(float(value))
         if out is None:
             out = torch.empty(
-                (*prefix, state["heads"], _dsa.V_DIM),
+                (*prefix, state["heads"], _d576.V_DIM),
                 device=state["device"],
                 dtype=torch.bfloat16,
             )
@@ -2870,16 +2880,16 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
         if rows:
             split_ws = state["buffers"]["core"]
-            _dsa.launch(
+            _d576.launch_sparse_mla_d576_kernel(
                 state["compiled"],
-                query=query.view(rows, state["heads"], _dsa.HEAD_DIM),
-                kv=kv,
-                indices=si,
-                lengths=sl,
-                out=out.view(rows, state["heads"], _dsa.V_DIM),
+                query=query.view(rows, state["heads"], _d576.HEAD_DIM),
+                kv_pool=kv,
+                block_tables=si,
+                top_k_lens=sl,
+                out=out.view(rows, state["heads"], _d576.V_DIM),
                 lse=lse.view(rows, state["heads"]),
-                softmax_scale=scales[0],
-                output_scale=scales[1],
+                bmm1_scale=scales[0],
+                bmm2_scale=scales[1],
                 workspace=split_ws if split_ws.numel() else None,
                 split_kv=state["splits"],
             )

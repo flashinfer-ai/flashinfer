@@ -554,9 +554,6 @@ class SmemPageOffsetsResource(MlaResource):
         """Load page ids for one K or V producer stage into SMEM."""
         if cutlass.const_expr(self.page_offsets is None):
             return
-        if cutlass.const_expr(self.cfg.sparse_d576):
-            self._producer_load_token_rows(stage_info, inst_id, is_v, section=section)
-            return
         cfg = self.cfg
         lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
         pages_per_tile = Int32(cfg.pages_per_kv_tile)
@@ -642,58 +639,6 @@ class SmemPageOffsetsResource(MlaResource):
                 prims.cp_async_shared_global(
                     smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
                 )
-
-    @cute.jit
-    def _producer_load_token_rows(
-        self,
-        stage_info: StageInfo,
-        inst_id: int,
-        is_v: int,
-        *,
-        section: cutlass.Constexpr[MlaStage],
-    ):
-        """D576 sparse stage: lane ``l`` stages row indices of tokens ``4l .. 4l+3``.
-
-        Four independent 4-byte ``cp.async`` copies per lane keep the producer
-        fully asynchronous (a synchronous load per stage would serialize the
-        global-memory latency into the K/V cadence).  Entries past the token's
-        active width are clamped to its last entry; those keys are removed by
-        the KV-length tail mask.  The per-key validity words are published by
-        the Gather4 loader, which already holds the indices in registers.
-        """
-        cfg = self.cfg
-        lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
-        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
-        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
-        seq_len_kv = runtime_seq_len_kv_from_task_cache(
-            cfg,
-            decode_gen_task_cache(stage_info),
-            cta_idx_q,
-            self.cu_seqlens_q,
-            batch_idx,
-        )
-        local_tile_idx = local_kv_tile_idx(
-            cfg, stage_info, inst_id, is_v, section=section
-        )
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
-        last_valid = cute.math.max(seq_len_kv - Int32(1), Int32(0))
-        stage_base = stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
-        tile_entry_base = tile_idx * Int32(cfg.tile_size_kv) + lane_idx * Int32(4)
-        page_offsets_batch = self.page_offsets[None, batch_idx]
-        page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
-        for entry_sub in cutlass.range_constexpr(4):
-            logical_idx = cute.math.min(tile_entry_base + Int32(entry_sub), last_valid)
-            smem_offset = stage_base + lane_idx * Int32(4) + Int32(entry_sub)
-            gmem_ptr = page_offsets_flat[None, logical_idx].iterator.llvm_ptr
-            smem_ptr = cutlass.inttoptr(
-                self._smem_page_offsets.data_ptr(smem_offset).toint(cutlass.Int32),
-                3,
-                cutlass.Int32,
-            )
-            prims.cp_async_shared_global(
-                smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-            )
 
     @producer_work
     @cute.jit
