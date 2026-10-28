@@ -814,6 +814,7 @@ def _target_splits(caps: Caps, rows: int) -> tuple[int, int]:
 def _scratch_layout(
     caps: Caps,
 ) -> tuple[_ScratchLayout, int, int, int, int, int]:
+    """Size bounded score storage and aligned operands for a fixed QSA capacity."""
     workspace_q_rows = int(caps.max_q_rows)
     score_width_limit = max(
         1,
@@ -1987,6 +1988,8 @@ def _bind_materialized(
         state.scratch_specs(),
         owner="qsa",
     )
+    if int(scratch_storage.data_ptr()) % 16:
+        raise ValueError("QSA scratch base must be 16-byte aligned")
     if main_k_cache.ndim != 4 or tuple(main_k_cache.shape[1:]) != (
         int(caps.main_page_size),
         int(caps.kv_heads),
