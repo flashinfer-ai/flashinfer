@@ -32,6 +32,9 @@ from ._backends.cute_dsl_modular_backend import (
 from ._backends.cute_dsl_monolithic_backend import (
     _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
+from ._backends.cute_dsl_rubin_mtp_backend import (
+    _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
+)
 from ._backends.cutile_backend import (
     _BatchMLAPagedAttentionCutileBackend,
 )
@@ -47,7 +50,10 @@ from ._contracts import (
     _structural_mla_input_facts,
 )
 from ._planning import _MLAPlanArguments
-from ._auto_policy import _BatchMLAPagedAttentionAutoBackend
+from ._auto_policy import (
+    _BatchMLAPagedAttentionAutoBackend,
+    _BatchMLAPagedAttentionAutotuneBackend,
+)
 
 
 class _PlannedBackend(Protocol):
@@ -96,6 +102,7 @@ class _BatchMLAPagedAttentionCuteDslBackend:
     _candidate_types: ClassVar[tuple[type[_ConcreteWrapperBackendType], ...]] = (
         _BatchMLAPagedAttentionCuteDslMonolithicBackend,
         _BatchMLAPagedAttentionCuteDslModularBackend,
+        _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
     )
 
     @classmethod
@@ -135,6 +142,8 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "xqa": _BatchMLAPagedAttentionXqaBackend,
     "cute-dsl-monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
     "cute-dsl-modular": _BatchMLAPagedAttentionCuteDslModularBackend,
+    "cute-dsl-rubin-mtp": _BatchMLAPagedAttentionCuteDslRubinMtpBackend,
+    "autotune": _BatchMLAPagedAttentionAutotuneBackend,  # dispatch wrapper, see _auto_policy.py
     "auto": _BatchMLAPagedAttentionAutoBackend,  # dispatch wrapper, see _auto_policy.py
     "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,  # dispatch wrapper
 }
@@ -174,8 +183,8 @@ class BatchMLAPagedAttentionWrapper:
     representation.
 
     See :ref:`MLA Page Layout <mla-page-layout>` for the paged KV-cache layout
-    and the `FlashInfer MLA blog post
-    <http://flashinfer.ai/2025/02/10/flashinfer-deepseek-mla.html>`_ for the
+    and the `FlashInfer 0.2 release post
+    <https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html#fused-multi-head-latent-attention-mla-decoding-kernel>`_ for the
     computation and Matrix Absorption background.
     """
 
@@ -274,12 +283,18 @@ class BatchMLAPagedAttentionWrapper:
         kv_len_arr : Optional[torch.Tensor]
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
-        backend : {"auto", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"}
+        backend : {"auto", "autotune", "fa2", "fa3", "cutlass", "cutile", "trtllm-gen", "xqa", "cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular", "cute-dsl-rubin-mtp"}
             Requested policy or concrete backend. ``"auto"`` selects a backend
             in :meth:`plan` based on architecture and request facts.
             See ``_auto_policy.py``.
             Explicit requests remain strict; ``"cute-dsl"`` is a family alias.
-            Compilation and selection finish before normal execution or capture.
+            ``"cute-dsl-rubin-mtp"`` supports SM107 causal absorbed MLA with
+            uniform Q=2/4, 128 heads, latent/RoPE widths 512/64, page size
+            64/128, and FP8 E4M3 query, KV, and output tensors. It requires
+            a CuTe DSL compiler with native SM107 and mixed-CGA support.
+            ``"autotune"`` benchmarks and selects among eligible backends during
+            :meth:`run` inside ``with flashinfer.autotune(True):``.
+            See ``_auto_policy.py``.
             Canonical dense or CSR metadata is accepted; independent split query
             or KV storage requires a backend with native split-input support.
             Existing non-FA graph plans allow one plan per wrapper. Use a new
@@ -459,6 +474,9 @@ class BatchMLAPagedAttentionWrapper:
         metadata on the wrapper device. Retain and update those device tensors
         in place for replay; CPU and CSR-only graph metadata are rejected.
         Query offsets and lengths must remain fixed after graph planning.
+        ``backend="autotune"`` instead snapshots metadata during planning;
+        modifying caller metadata does not update that plan. Replan eagerly,
+        or create a new wrapper for a different CUDA graph workload.
 
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,
@@ -510,10 +528,13 @@ class BatchMLAPagedAttentionWrapper:
             Required log-sum-exp output mode.
         output_dtype : Optional[torch.dtype]
             Required output dtype; defaults to ``q_data_type``.
+            Set ``torch.float8_e4m3fn`` for Rubin MTP; monolithic CuTe also
+            supports this output dtype, while modular CuTe requires FP16/BF16.
         output_scale : {"none", "per-tensor"}
             Required output scaling mode.
         scale_mode : {"default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"}
             Required KV or BMM scale mode for subsequent :meth:`run` calls.
+            TRTLLM-GEN supports ``"bmm-tensor"`` for FP8 query/KV inputs.
         skip_softmax : bool
             Whether the plan must support the skip-softmax threshold feature.
         enable_pdl, use_sinks : optional
@@ -622,7 +643,7 @@ class BatchMLAPagedAttentionWrapper:
             and scale_mode == "default"
             and not (
                 q_data_type == torch.float8_e4m3fn
-                and _get_compute_capability(self.device) == (10, 0)
+                and _get_compute_capability(self.device) in ((10, 0), (10, 3), (10, 7))
             )
         ):
             # Existing FP8 callers always supply CKV/KPE scales at run time.
@@ -720,6 +741,11 @@ class BatchMLAPagedAttentionWrapper:
             if planned_backend._plan_capabilities.requires_packed_kv_cache
             else "split"
         )
+        if self._backend_type is _BatchMLAPagedAttentionAutotuneBackend:
+            # A policy has no selected backend layout at plan time. Preserve
+            # the declared representation for each candidate's adapter.
+            self._planned_query_layout = query_layout
+            self._planned_kv_cache_layout = kv_cache_layout
         self._publish_backend_mirrors(planned_backend)
         self._legacy_flat_csr_plan = legacy_flat_csr
         self._qo_indptr_buf = getattr(
@@ -949,8 +975,9 @@ class BatchMLAPagedAttentionWrapper:
         bmm1_scale, bmm2_scale : Optional[float or torch.Tensor]
             Backend-specific BMM scale pair. Both values must be provided
             together, use the same scalar/tensor family, and match the planned
-            ``scale_mode``. Tensor BMM scales are reserved for later backend
-            support and are rejected by this wrapper version.
+            ``scale_mode``. TRTLLM-GEN tensor scales must each contain one
+            float32 value on the query device. Their values may change between
+            runs and CUDA graph replays; graph replay reads the captured tensors.
 
         Notes
         -----

@@ -687,39 +687,6 @@ def test_cake_backend_requires_out():
         )
 
 
-def test_cake_backend_requires_tma_workspace():
-    """backend='cake' must raise ValueError when tma_descriptor_workspace= is omitted."""
-    device = torch.device("cuda")
-    torch.manual_seed(0)
-    batch, num_heads, num_blocks = 1, 2, 2
-    seqlen = num_blocks * BLOCK
-    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
-    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
-    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
-    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
-    index = (
-        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
-        .expand(batch, num_heads, num_blocks, num_blocks)
-        .contiguous()
-    )
-    out = torch.empty(
-        batch, num_heads, seqlen, HEAD_DIM, dtype=torch.bfloat16, device=device
-    )
-    with pytest.raises(ValueError, match="requires tma_descriptor_workspace"):
-        bsa_attn_sm120_blk64_sage_fwd(
-            q8,
-            k8,
-            v8,
-            qs,
-            ks,
-            vs,
-            index,
-            block_sparse_num=num_blocks,
-            out=out,
-            backend="cake",
-        )
-
-
 def test_unsupported_backend():
     """An unknown backend name must raise ValueError."""
     device = torch.device("cuda")
@@ -751,9 +718,8 @@ def test_unsupported_backend():
 
 def test_vsa_sm120_sage_default_backend_is_cake():
     """The default `backend` must remain "cake": omitting it (and the
-    cake-required `out`/`tma_descriptor_workspace` kwargs) must raise the
-    cake-specific error, not silently succeed via cute_dsl (which allocates
-    `out` internally and does not require `tma_descriptor_workspace`)."""
+    cake-required `out` kwarg) must raise the cake-specific error, not
+    silently succeed via cute_dsl (which allocates `out` internally)."""
     device = torch.device("cuda")
     torch.manual_seed(0)
     batch, num_heads, num_blocks = 1, 2, 2

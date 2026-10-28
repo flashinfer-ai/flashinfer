@@ -13,35 +13,50 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Generated-program backend: Kimi-K3 fused MoE router (SM100 / SM103).
+Experimental generated-program backend of the Kimi-K3 fused MoE router.
 
 One launch routes FP32 gate logits for 896 experts (sigmoid gate, top-16
 selection on ``sigmoid(logit) + bias``, weights renormalized over the selected
 sigmoid scores) and writes the expert-aligned route plan (``sorted_token_ids``,
 ``expert_ids``, ``num_tokens_post_padded``, per-expert counts / offsets /
 scatter offsets) consumed by grouped MoE GEMMs.  The program is a family of
-kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
-routed set, selected by a per-architecture table.  Most arms launch as a
-cooperative persistent grid bounded by the device's SM count (arms L and LP
--- the same one-join plan-builder kernel family for 32 to 128 tokens, LP
-being the variant that loads the bias and the first row's logits into
-registers before its prologue barrier -- launch at least their 128 plan-owner
-CTAs; arms Q4S and Q4SP -- the same 4-CTA-cluster kernel family at four CTAs
-per SM, Q4SP being the 2048-token variant that prefetches the next row's
-logits into registers -- are bounded by the driver's co-resident cluster
-capacity; arm GW, the warp-per-row two-join kernel for the largest batches,
-uses a per-architecture CTAs-per-SM bound);
-arm LC serves the smallest batches with one non-cooperative kernel per token
-count: a single CTA for one token, otherwise one cluster of ``num_tokens``
-CTAs (2, 4, 8 or 16; the 16-CTA cluster is above the portable maximum of 8
-and the generated program opts into it with the non-portable cluster-size
-attribute).  Nothing is planned on the host and nothing is allocated
-at launch, so a prepared runner is CUDA Graph safe.  See ``README.md`` in
+kernels, one dispatch arm per ``(num_tokens, block_m)`` cell of a
+per-architecture table measured at the powers of two from 1 to 8192 tokens;
+every other token count up to 8192 is served by the arm of the next measured
+cell up
+(the arms take ``num_tokens`` at runtime; only arm LC, one cluster of exactly
+``num_tokens`` CTAs for 1, 2, 4, 8 or 16 tokens, is bound to its row count).
+The arms of the 4-CTA-cluster cells follow the batch against the device's
+co-resident capacity instead of the cell (``CAPACITY_ROUTES``).
+Most arms launch as a cooperative persistent grid bounded by the device's SM
+count (arms L, LP and LPC -- the same one-join plan-builder kernel family for
+up to 128 tokens, LP being the variant that loads the bias and the first row's
+logits into registers before its prologue barrier and LPC the LP kernel
+launched with an explicit cluster of one CTA -- launch at least their 128
+plan-owner CTAs; arms Q4S, Q4SB, Q4SP, Q4SPW and Q4SPW_LR -- the same
+4-CTA-cluster kernel family at four CTAs per SM, Q4SP being the variant that
+prefetches the next row's logits into registers, Q4SB the Q4S kernel with the
+same prefetch, Q4SPW the Q4SP kernel selecting one row per warp and Q4SPW_LR
+the Q4SPW kernel whose owner CTAs rank the route pairs in their own shared
+memory -- are bounded by the driver's co-resident cluster capacity; arm GW, the
+warp-per-row two-join kernel for the largest batches, launches CTA pairs under
+a per-architecture CTAs-per-SM bound and the co-resident pair capacity); arms
+LC, LCG and LCG_LW launch one non-cooperative cluster (``num_tokens`` CTAs for
+LC; 16 CTAs of two row groups for LCG and LCG_LW, which serve every other count
+up to 32, LCG_LW being the LCG kernel that waits for its cluster after the row
+selection instead of before it; a 16-CTA cluster is above the portable maximum
+of 8 and the generated program opts into it with the non-portable cluster-size
+attribute).  Nothing is
+planned on the host and nothing is allocated at launch, so a prepared runner
+is CUDA Graph safe.  Device facts (compute capability, SM count, cluster
+occupancy) are queried once per device and program.  See ``README.md`` in
 this package.
 """
 
 from __future__ import annotations
 
+import bisect
+import functools
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -50,51 +65,119 @@ import tvm_ffi
 
 from .cake_jit import (
     MODULES,
+    kernel_key,
     load_kimi_k3_fused_router_module,
-    module_num_tokens,
-    registered_programs,
-    select_module,
-    uses_cluster_launch,
+    program_for,
+    queries_occupancy,
+    registered_keys,
 )
 
 NUM_EXPERTS = 896
 TOP_K = 16
 BLOCK_M_VALUES = (8, 16)
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-_INT32_MAX = 2**31 - 1
+# Largest token count the kernels serve: every arm reconstructs the route plan
+# from per-expert token bitmaps sized for 8192 rows (the largest measured cell).
+MAX_NUM_TOKENS = 8192
 
 # Kernel geometry shared by every arm: 224 threads = 7 warps, each thread owns
 # four experts; the plan-building arms use 896 / 7 = 128 owner CTAs.
 THREADS = 224
 NUM_WARPS = THREADS // 32
 OWNER_CTAS = NUM_EXPERTS // NUM_WARPS
-ARM_L_MAX_TOKENS = 512
-# Arms L / LP launch at least this many CTAs (the plan owners) whatever num_tokens is.
+# Arms L / LP / LPC: one-join plan builder; admits at most this many tokens and
+# launches ARM_L_MIN_GRID CTAs (the plan owners) whatever num_tokens is, or the
+# persistent grid cap if that is smaller: the owners stride over the experts by
+# the owner count, so any grid publishes the whole plan.
+ARM_L_MAX_TOKENS = 128
 ARM_L_MIN_GRID = 128
-# Arm LP (v58): the L body with the bias and first-row logits loads issued before
-# the prologue barrier (a register prefetch), a second kernel of the same family;
-# identical outputs, thread count, admission guard and grid rule.  Which of the
-# 32- to 128-token shapes it serves is decided per architecture (route tables);
-# the 128-token x block_m 16 shape stays on L on both.
-ARM_L_FAMILY = ("L", "LP")
+# Arm LP: the L body with the bias and first-row logits loads issued before the
+# prologue barrier (a register prefetch), a second kernel of the same family;
+# identical outputs, thread count, admission guard and grid rule.  Arm LPC: the
+# LP kernel with its cooperative grid launched with an explicit cluster of one
+# CTA; the same outputs and grid rule.  On SM100 arm L launches the same way.
+ARM_L_FAMILY = ("L", "LP", "LPC")
 # Arm LC: one kernel per token count, launched as a single cluster of num_tokens
 # CTAs (a single CTA for one token).  The 16-token kernel is a 16-CTA cluster,
 # above the portable maximum of 8: the generated program sets the non-portable
-# cluster-size attribute on that kernel before the launch.
+# cluster-size attribute on that kernel before the launch, and preparation
+# requires the driver to admit at least one such cluster on the device.
 ARM_LC_TOKENS = (1, 2, 4, 8, 16)
+# Arms LCG and LCG_LW: one cluster of 16 CTAs of two row groups each (group g
+# of CTA k selects row k + 16 g), serving any num_tokens up to 32; the route
+# sends them the 32-token cell (every count up to 32 that is not an LC row
+# count).  LCG_LW is the LCG kernel waiting for its cluster after the row
+# selection (LCG waits at entry); each architecture routes one block_m of the
+# cell to each.  A non-cooperative launch of one non-portable cluster, like the
+# 16-token LC kernel: preparation requires the driver to admit one such cluster.
+ARM_LCG_FAMILY = ("LCG", "LCG_LW")
+ARM_LCG_CLUSTER = 16
+ARM_LCG_MAX_TOKENS = 32
 # Arm GW: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel,
-# __launch_bounds__(224, 4) on both architectures).
+# __launch_bounds__(224, 4) on both architectures), launched cooperatively as
+# clusters of ARM_GW_CLUSTER CTAs: the grid is a whole number of pairs and at
+# most the co-resident pair capacity the driver reports for the program.
 ARM_GW_CTAS_PER_SM = {(10, 0): 4, (10, 3): 4}
-ARM_M_MAX_TOKENS = 2048
+ARM_GW_CLUSTER = 2
+# Arm M: one-join bitmap plan builder.  Its owner scratch is sized per
+# architecture: 256 rows on SM100 (the kernel measured at the 256-token cell),
+# 2048 rows on SM103.  CTA b < OWNER_CTAS publishes experts 7b to 7b + 6 and no
+# other CTA does, so the launch needs OWNER_CTAS co-resident CTAs (as the Q4S
+# family does).
+ARM_M_MAX_TOKENS = {(10, 0): 256, (10, 3): 2048}
 # Arm Q4S: 4-CTA clusters, kernel compiled with __launch_bounds__(224, 4); grid =
 # min(num_tokens, 4 x SM count, co-resident cluster capacity) in whole clusters.
 ARM_Q4S_MAX_TOKENS = 2048
 ARM_Q4S_CLUSTER = 4
 ARM_Q4S_CTAS_PER_SM = 4
-# Arm Q4SP (v57): the Q4S body with a register prefetch of the next row's logits,
-# a second kernel of the same family serving the 2048-token shapes; identical
-# cluster shape, launch bounds, admission guards and grid rule.
-ARM_Q4S_FAMILY = ("Q4S", "Q4SP")
+# Arm Q4SP: the Q4S body with a register prefetch of the next row's logits, a
+# second kernel of the same family; arm Q4SB: the Q4S kernel with the same
+# next-row prefetch; arm Q4SPW: the Q4SP kernel selecting one row per warp (all
+# of a CTA's rows side by side); arm Q4SPW_LR: the Q4SPW kernel whose owner CTAs
+# rank the route pairs of their own quarter of the tokens in their own shared
+# memory instead of pushing them into the cluster peers'.  Identical cluster
+# shape, launch bounds, admission guards and grid rule.
+ARM_Q4S_FAMILY = ("Q4S", "Q4SB", "Q4SP", "Q4SPW", "Q4SPW_LR")
+
+
+class CapacityRule(NamedTuple):
+    """Arms of the Q4S-family cells by the batch against the capacity C.
+
+    ``above`` lists ``(largest num_tokens, arm)`` bands in ascending order for
+    C < num_tokens < 2C + ``wide_offset``; ``wide`` runs from 2C +
+    ``wide_offset`` tokens.
+    """
+
+    above: tuple[tuple[int, str], ...]
+    wide: str
+    wide_offset: int
+
+    def arms(self) -> tuple[str, ...]:
+        """Every arm of the rule, in band order."""
+        return tuple(dict.fromkeys((*(arm for _, arm in self.above), self.wide)))
+
+
+# Capacity routing of the Q4S-family cells, per (architecture, block_m) (a pair
+# absent here keeps the arm of its table).  C is ARM_Q4S_CLUSTER x the
+# co-resident cluster capacity of the CAPACITY_PROGRAM_ARM program on the device
+# (the Q4S-family grid cap, 568 on a 148-SM B200, 592 on a 152-SM GB300):
+# num_tokens <= C keeps the cell's arm; C < num_tokens < 2C + W runs the arm of
+# the first ``above`` band holding num_tokens (a CTA then selects a second row,
+# which the next-row prefetch covers); num_tokens >= 2C + W runs the wide arm
+# (two or more rows per CTA, one row per warp).  Above C, SM103 runs the Q4S
+# kernel with the prefetch (Q4SB) up to 1024 tokens and Q4SP beyond; SM100 runs
+# Q4SP.  The wide arm is Q4SPW_LR, except Q4SPW on SM100 at block_m 16.  W is 64
+# (from 1200 tokens on a B200, from 1248 on a GB300 at block_m 16), except 0 on
+# SM103 at block_m 8 (from 1184 tokens on a GB300).
+_SM100_ABOVE_C = ((ARM_Q4S_MAX_TOKENS, "Q4SP"),)
+_SM103_ABOVE_C = ((1024, "Q4SB"), (ARM_Q4S_MAX_TOKENS, "Q4SP"))
+CAPACITY_ROUTES: dict[tuple[str, int], CapacityRule] = {
+    ("sm_100a", 8): CapacityRule(_SM100_ABOVE_C, "Q4SPW_LR", 64),
+    ("sm_100a", 16): CapacityRule(_SM100_ABOVE_C, "Q4SPW", 64),
+    ("sm_103a", 8): CapacityRule(_SM103_ABOVE_C, "Q4SPW_LR", 0),
+    ("sm_103a", 16): CapacityRule(_SM103_ABOVE_C, "Q4SPW_LR", 64),
+}
+CAPACITY_PROGRAM_ARM = "Q4SP"
 
 # Exact keyword set of the generated program's ``run`` entry (bound by the
 # export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
@@ -113,9 +196,13 @@ MAIN_KWARGS = (
     "grid",
 )
 
-# Per-shape dispatch arm, keyed by (num_tokens, block_m).  Both tables cover
-# the same 28 shapes with the same arms; they differ in exactly two cells of
-# the L / LP family (see _SM103_SHAPE_ROUTE below).
+# Measured dispatch cells, keyed by (num_tokens, block_m): the 28 shapes the
+# generated program was benchmarked at on each architecture.  Both tables cover
+# the same cells; they differ in exactly three cells of the L family
+# (ARM_L_FAMILY) and in the two 32-token cells (ARM_LCG_FAMILY; see
+# _SM103_SHAPE_ROUTE below).  On both architectures the
+# capacity rule (CAPACITY_ROUTES) refines the arms of the 512- to 2048-token
+# cells.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "LC",
     (1, 16): "LC",
@@ -127,10 +214,10 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (8, 16): "LC",
     (16, 8): "LC",
     (16, 16): "LC",
-    (32, 8): "LP",
-    (32, 16): "LP",
-    (64, 8): "LP",
-    (64, 16): "LP",  # sm_103a: L
+    (32, 8): "LCG_LW",  # sm_103a: LCG
+    (32, 16): "LCG",  # sm_103a: LCG_LW
+    (64, 8): "LPC",  # sm_103a: LP
+    (64, 16): "LPC",  # sm_103a: L
     (128, 8): "L",  # sm_103a: LP
     (128, 16): "L",
     (256, 8): "M",
@@ -146,16 +233,24 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (8192, 8): "GW",
     (8192, 16): "GW",
 }
-# sm_103a: the sm_100a table with the two L / LP cells that differ between the
-# architectures -- sm_100a keeps L at (128, 8) and routes (64, 16) to LP;
-# sm_103a keeps L at (64, 16) and routes (128, 8) to LP.
+# sm_103a: the sm_100a table with the three cells of the L family that differ
+# between the architectures -- sm_100a routes both 64-token cells to LPC (the
+# LP kernel launched with an explicit cluster of one CTA) and keeps L at
+# (128, 8); sm_103a routes (64, 8) and (128, 8) to LP and (64, 16) to L -- and
+# the two 32-token cells: sm_100a routes (32, 8) to LCG_LW and (32, 16) to
+# LCG, sm_103a the other way round.
 _SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     **_SM100_SHAPE_ROUTE,
+    (32, 8): "LCG",
+    (32, 16): "LCG_LW",
+    (64, 8): "LP",
     (64, 16): "L",
     (128, 8): "LP",
 }
 SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
-SUPPORTED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))
+MEASURED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))
+# Token counts below this cell that are not an LC row count take its arm.
+_SMALLEST_SHARED_CELL = 32
 
 
 # ---------------------------------------------------------------------------
@@ -224,16 +319,98 @@ def allocate_kimi_k3_route_plan(
 # ---------------------------------------------------------------------------
 
 
-def route_arm(arch: str, num_tokens: int, block_m: int) -> str:
-    """Dispatch arm for an exact ``(num_tokens, block_m)`` shape on ``arch``."""
+def route_cell(num_tokens: int) -> Optional[int]:
+    """Measured token count whose arm serves ``num_tokens`` (``None`` above
+    ``MAX_NUM_TOKENS``).
+
+    A measured count is its own cell; any other count takes the next measured
+    count up, except that counts below 32 which are not an LC row count take
+    the 32-token cell (the LC kernels are bound to their exact row count).
+    """
+    rows = int(num_tokens)
+    if rows in ARM_LC_TOKENS:
+        return rows
+    if rows < _SMALLEST_SHARED_CELL:
+        return _SMALLEST_SHARED_CELL
+    index = bisect.bisect_left(MEASURED_NUM_TOKENS, rows)
+    if index == len(MEASURED_NUM_TOKENS):
+        return None
+    return MEASURED_NUM_TOKENS[index]
+
+
+def capacity_arm(arm: str, num_tokens: int, capacity: int, rule: CapacityRule) -> str:
+    """Arm of the capacity rule ``rule`` for a cell arm.
+
+    ``capacity`` is C, the Q4S-family grid cap of the device (see
+    ``CAPACITY_ROUTES``): ``rule.wide`` from 2C + ``rule.wide_offset`` tokens,
+    else above C the arm of the first ``rule.above`` band holding
+    ``num_tokens`` (the last band beyond its bound), else ``arm``.  Arms
+    outside the Q4S family are returned unchanged.
+    """
+    if arm not in ARM_Q4S_FAMILY:
+        return arm
+    capacity = int(capacity)
+    if capacity < 1:
+        raise RuntimeError(
+            f"arm {arm} needs co-resident 4-CTA clusters; the driver admits none"
+        )
+    rows = int(num_tokens)
+    if rows >= 2 * capacity + int(rule.wide_offset):
+        return rule.wide
+    if rows > capacity:
+        for bound, above in rule.above:
+            if rows <= bound:
+                return above
+        return rule.above[-1][1]
+    return arm
+
+
+def route_arm(
+    arch: str,
+    num_tokens: int,
+    block_m: int,
+    *,
+    cluster_capacity: Optional[int] = None,
+) -> str:
+    """Dispatch arm for ``(num_tokens, block_m)`` on ``arch``.
+
+    Measured cells map through the architecture's table; other token counts
+    take the arm of :func:`route_cell`; counts above ``MAX_NUM_TOKENS`` are
+    rejected (no kernel serves them).  With ``cluster_capacity`` (C of
+    ``CAPACITY_ROUTES``, see :func:`route_capacity`) an ``(arch, block_m)``
+    pair listed in ``CAPACITY_ROUTES`` applies its capacity rule to the
+    Q4S-family cells; without it the cell's arm is returned (the arm of
+    ``num_tokens <= C``).
+    """
     try:
-        return SHAPE_ROUTES[arch][(int(num_tokens), int(block_m))]
+        table = SHAPE_ROUTES[arch]
     except KeyError:
         raise NotImplementedError(
-            "the generated Kimi-K3 fused router serves exactly num_tokens in "
-            f"{SUPPORTED_NUM_TOKENS} with block_m in {BLOCK_M_VALUES}; got "
-            f"num_tokens={num_tokens}, block_m={block_m} on {arch}"
+            f"the generated Kimi-K3 fused router is registered for {sorted(SHAPE_ROUTES)}, not {arch}"
         ) from None
+    rows, block_m = int(num_tokens), int(block_m)
+    if block_m not in BLOCK_M_VALUES:
+        raise ValueError(f"block_m must be one of {BLOCK_M_VALUES}, got {block_m}")
+    if rows <= 0:
+        raise ValueError("num_tokens must be positive")
+    if rows > MAX_NUM_TOKENS:
+        raise ValueError(f"num_tokens must be at most {MAX_NUM_TOKENS}, got {rows}")
+    cell = route_cell(rows)
+    assert cell is not None
+    arm = table[(cell, block_m)]
+    rule = CAPACITY_ROUTES.get((arch, block_m))
+    if rule is not None and cluster_capacity is not None:
+        arm = capacity_arm(arm, rows, cluster_capacity, rule)
+    return arm
+
+
+def route_arm_candidates(arch: str, num_tokens: int, block_m: int) -> tuple[str, ...]:
+    """Every arm :func:`route_arm` may select for the shape on some device."""
+    arm = route_arm(arch, num_tokens, block_m)
+    rule = CAPACITY_ROUTES.get((arch, int(block_m)))
+    if rule is None or arm not in ARM_Q4S_FAMILY:
+        return (arm,)
+    return (arm, *(other for other in rule.arms() if other != arm))
 
 
 def persistent_grid_cap(compute_capability: tuple[int, int], sm_count: int) -> int:
@@ -250,10 +427,12 @@ def launch_grid(
     sm_count: int,
     max_active_clusters: Optional[int] = None,
 ) -> int:
-    """``grid_x`` of the persistent launch for ``arm`` on the described device.
+    """``grid_x`` of the launch for ``arm`` on the described device.
 
-    ``max_active_clusters`` is the driver's co-resident cluster capacity for the
-    Q4S-family kernels (required for arms Q4S and Q4SP only).
+    ``max_active_clusters`` is the driver's co-resident cluster capacity of the
+    arm's program: required for the Q4S family and GW, optional for the
+    one-cluster arms LC, LCG and LCG_LW (a capacity below one cluster is
+    refused).
     """
     rows = int(num_tokens)
     major, minor = (int(v) for v in compute_capability)
@@ -261,18 +440,38 @@ def launch_grid(
     grid_rows = 8 if rows in (2, 4) else rows
     cap = persistent_grid_cap(compute_capability, sm_count)
     grid_x = max(1, min(grid_rows, cap))
-    if arm == "LC":
-        if rows not in ARM_LC_TOKENS:
+    if arm == "LC" or arm in ARM_LCG_FAMILY:
+        if arm == "LC" and rows not in ARM_LC_TOKENS:
             raise RuntimeError(f"arm LC serves exactly num_tokens in {ARM_LC_TOKENS}")
-        return rows
+        if arm in ARM_LCG_FAMILY and rows > ARM_LCG_MAX_TOKENS:
+            raise RuntimeError(f"arm {arm} admits at most {ARM_LCG_MAX_TOKENS} tokens")
+        cluster = rows if arm == "LC" else ARM_LCG_CLUSTER
+        if max_active_clusters is not None and int(max_active_clusters) < 1:
+            raise RuntimeError(
+                f"arm {arm} launches one {cluster}-CTA cluster; the driver admits "
+                f"{int(max_active_clusters)} co-resident clusters"
+            )
+        return cluster
     if arm in ARM_L_FAMILY:
         if rows > ARM_L_MAX_TOKENS:
             raise RuntimeError(f"arm {arm} admits at most {ARM_L_MAX_TOKENS} tokens")
         return max(1, min(max(grid_rows, ARM_L_MIN_GRID), cap))
     if arm == "M":
-        if rows > ARM_M_MAX_TOKENS or rows < OWNER_CTAS:
+        try:
+            max_tokens = ARM_M_MAX_TOKENS[compute_capability]
+        except KeyError:
             raise RuntimeError(
-                f"arm M admits {OWNER_CTAS} <= num_tokens <= {ARM_M_MAX_TOKENS}"
+                f"arm M has no owner scratch bound for compute capability {compute_capability}"
+            ) from None
+        if rows > max_tokens or rows < OWNER_CTAS:
+            raise RuntimeError(
+                f"arm M admits {OWNER_CTAS} <= num_tokens <= {max_tokens} on compute "
+                f"capability {compute_capability}"
+            )
+        if grid_x < OWNER_CTAS:
+            raise RuntimeError(
+                f"arm M needs {OWNER_CTAS} co-resident owner CTAs; the device admits "
+                f"{cap} persistent CTAs"
             )
         return grid_x
     if arm in ARM_Q4S_FAMILY:
@@ -300,7 +499,18 @@ def launch_grid(
             raise RuntimeError(
                 f"arm GW has no launch bound for compute capability {compute_capability}"
             ) from None
-        return max(1, min(grid_rows, ctas_per_sm * int(sm_count)))
+        if max_active_clusters is None:
+            raise RuntimeError("arm GW needs the driver's co-resident cluster capacity")
+        pair_cap = int(max_active_clusters) * ARM_GW_CLUSTER
+        whole_pairs = -(-grid_rows // ARM_GW_CLUSTER) * ARM_GW_CLUSTER
+        grid_x = min(whole_pairs, ctas_per_sm * int(sm_count), pair_cap)
+        grid_x = (grid_x // ARM_GW_CLUSTER) * ARM_GW_CLUSTER
+        if grid_x < ARM_GW_CLUSTER:
+            raise RuntimeError(
+                f"arm GW launches {ARM_GW_CLUSTER}-CTA clusters; the driver admits "
+                f"{int(max_active_clusters)} co-resident clusters"
+            )
+        return grid_x
     raise ValueError(f"unknown dispatch arm {arm!r}")
 
 
@@ -318,9 +528,9 @@ def _require_plain_int(name: str, value: Any) -> int:
 def _validate_problem(num_tokens: Any, block_m: Any) -> tuple[int, int]:
     num_tokens = _require_plain_int("num_tokens", num_tokens)
     block_m = _require_plain_int("block_m", block_m)
-    if num_tokens <= 0 or num_tokens * TOP_K > _INT32_MAX:
+    if num_tokens <= 0 or num_tokens > MAX_NUM_TOKENS:
         raise ValueError(
-            "num_tokens must be positive and num_tokens * 16 must fit in int32"
+            f"num_tokens must be positive and at most {MAX_NUM_TOKENS}, got {num_tokens}"
         )
     if block_m not in BLOCK_M_VALUES:
         raise ValueError(f"block_m must be one of {BLOCK_M_VALUES}, got {block_m}")
@@ -432,6 +642,20 @@ class KimiK3FusedRouterRunner:
     __call__ = launch
 
 
+# ---------------------------------------------------------------------------
+# Device facts (resolved once per device / program)
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _device_facts(device_index: int) -> tuple[tuple[int, int], int]:
+    """``(compute_capability, sm_count)`` of CUDA device ``device_index``."""
+    properties = torch.cuda.get_device_properties(device_index)
+    return (int(properties.major), int(properties.minor)), int(
+        properties.multi_processor_count
+    )
+
+
 def _device_arch(device: torch.device) -> str:
     capability = torch.cuda.get_device_capability(device)
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
@@ -443,6 +667,55 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
+@functools.cache
+def _max_active_clusters(name: str, arch: str, block_m: int, device_index: int) -> int:
+    """Co-resident cluster capacity of program ``name`` on ``device_index``.
+
+    The query runs once per (program, architecture, block_m, device); the
+    answer depends only on the kernel's resource usage and the device.
+    """
+    launch = MODULES[name]["launch"]
+    block = [int(v) for v in launch["block"]] + [1, 1, 1]
+    cluster = [int(v) for v in launch["cluster"]] + [1, 1, 1]
+    module = load_kimi_k3_fused_router_module(name, arch, block_m)
+    with torch.cuda.device(device_index):
+        return int(
+            module.max_active_clusters(
+                int(device_index),
+                block[0],
+                block[1],
+                block[2],
+                cluster[0],
+                cluster[1],
+                cluster[2],
+                int(launch["dynamic_smem_bytes"]),
+                bool(launch["cooperative"]),
+            )
+        )
+
+
+@functools.cache
+def _route_capacity(arch: str, block_m: int, device_index: int) -> Optional[int]:
+    if (arch, block_m) not in CAPACITY_ROUTES:
+        return None
+    name = program_for(arch, CAPACITY_PROGRAM_ARM)
+    return ARM_Q4S_CLUSTER * _max_active_clusters(name, arch, block_m, device_index)
+
+
+def route_capacity(device: torch.device, block_m: int) -> Optional[int]:
+    """C of ``CAPACITY_ROUTES`` on ``device`` (``None`` where no rule applies).
+
+    The co-resident cluster capacity of the ``CAPACITY_PROGRAM_ARM`` program is
+    queried once per (architecture, block_m, device).
+    """
+    device = torch.device(device)
+    arch = _device_arch(device)
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _route_capacity(arch, int(block_m), int(device_index))
+
+
 def generated_program_available(
     device: torch.device,
     num_tokens: Optional[int] = None,
@@ -450,45 +723,29 @@ def generated_program_available(
 ) -> bool:
     """True when this checkout registers the program for ``device``.
 
-    With ``num_tokens`` / ``block_m`` the check names the exact dispatch arm of
-    that shape; without them it asks whether every arm of the device's route
-    table is registered.
+    With ``num_tokens`` / ``block_m`` the check names every dispatch arm the
+    shape may take on the architecture (the capacity rule's arms included);
+    without them it asks whether every arm of the device's route table and
+    capacity rule is registered.
     """
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
     if arch is None:
         return False
-    registered = registered_programs(arch)
+    registered = registered_keys(arch)
     if num_tokens is None and block_m is None:
         needed = {
-            (arm, bm, module_num_tokens(arm, rows))
-            for (rows, bm), arm in SHAPE_ROUTES[arch].items()
+            kernel_key(arm, rows if arm == "LC" else None)
+            for (rows, _), arm in SHAPE_ROUTES[arch].items()
         }
+        for (rule_arch, _), rule in CAPACITY_ROUTES.items():
+            if rule_arch == arch:
+                needed.update(rule.arms())
         return bool(MODULES) and needed <= registered
     if num_tokens is None or block_m is None:
         raise ValueError("pass both num_tokens and block_m or neither")
-    key = (int(num_tokens), int(block_m))
-    arm = SHAPE_ROUTES[arch].get(key)
-    return (
-        arm is not None and (arm, key[1], module_num_tokens(arm, key[0])) in registered
-    )
-
-
-def _max_active_clusters(module: Any, record: dict[str, Any], device_index: int) -> int:
-    launch = record["main"]["launch"]
-    block = [int(v) for v in launch["block"]] + [1, 1, 1]
-    cluster = [int(v) for v in launch["cluster"]] + [1, 1, 1]
-    return int(
-        module.max_active_clusters(
-            int(device_index),
-            block[0],
-            block[1],
-            block[2],
-            cluster[0],
-            cluster[1],
-            cluster[2],
-            int(launch["dynamic_smem_bytes"]),
-            bool(launch["cooperative"]),
-        )
+    return all(
+        kernel_key(arm, int(num_tokens) if arm == "LC" else None) in registered
+        for arm in route_arm_candidates(arch, num_tokens, block_m)
     )
 
 
@@ -510,7 +767,6 @@ def prepare_kimi_k3_fused_router(
     if device.type != "cuda" or bias.device != device:
         raise ValueError("logits and bias must be on one CUDA device")
     arch = _device_arch(device)
-    arm = route_arm(arch, num_tokens, block_m)
     if plan is None:
         plan = allocate_kimi_k3_route_plan(num_tokens, block_m, device)
     else:
@@ -520,22 +776,29 @@ def prepare_kimi_k3_fused_router(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    module_name = select_module(arch, arm, block_m, module_num_tokens(arm, num_tokens))
-    record = MODULES[module_name]
-    physical = record["main"]
-    with torch.cuda.device(device_index):
-        module = load_kimi_k3_fused_router_module(module_name, "main")
-        properties = torch.cuda.get_device_properties(device_index)
-        max_active_clusters = None
-        if arm in ARM_Q4S_FAMILY and uses_cluster_launch(record):
-            max_active_clusters = _max_active_clusters(module, record, device_index)
-        grid_x = launch_grid(
-            arm,
+    arm = route_arm(arch, num_tokens, block_m)
+    if arm in ARM_Q4S_FAMILY and (arch, block_m) in CAPACITY_ROUTES:
+        arm = route_arm(
+            arch,
             num_tokens,
-            compute_capability=(int(properties.major), int(properties.minor)),
-            sm_count=int(properties.multi_processor_count),
-            max_active_clusters=max_active_clusters,
+            block_m,
+            cluster_capacity=_route_capacity(arch, block_m, device_index),
         )
+    name = program_for(arch, arm, num_tokens if arm == "LC" else None)
+    record = MODULES[name]
+    compute_capability, sm_count = _device_facts(device_index)
+    with torch.cuda.device(device_index):
+        module = load_kimi_k3_fused_router_module(name, arch, block_m)
+    max_active_clusters = None
+    if queries_occupancy(name):
+        max_active_clusters = _max_active_clusters(name, arch, block_m, device_index)
+    grid_x = launch_grid(
+        arm,
+        num_tokens,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        max_active_clusters=max_active_clusters,
+    )
     main_kwargs = dict(
         logits=logits,
         bias=bias,
@@ -553,11 +816,11 @@ def prepare_kimi_k3_fused_router(
     assert tuple(main_kwargs) == MAIN_KWARGS
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
-        grid[name] if kind == "grid" else main_kwargs[name]
-        for kind, name in physical["arg_plan"]
+        grid[kwarg] if kind == "grid" else main_kwargs[kwarg]
+        for kind, kwarg in record["arg_plan"]
     )
-    entry = getattr(module, physical["ffi_entry"])
-    return KimiK3FusedRouterRunner(module_name, arm, grid_x, plan, entry, arguments)
+    entry = getattr(module, record["ffi_entry"])
+    return KimiK3FusedRouterRunner(name, arm, grid_x, plan, entry, arguments)
 
 
 def kimi_k3_fused_router(

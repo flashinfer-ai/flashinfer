@@ -95,7 +95,15 @@ def _assert_no_ref_mismatch(mismatch_counts):
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
-def warmup_jit():
+def warmup_jit(request):
+    # NVFP4-only shards do not use this fp16/fp8 warmup grid.
+    if all(
+        "nvfp4" in item.name
+        for item in request.session.items
+        if item.module is request.module
+    ):
+        yield
+        return
     flashinfer.jit.build_jit_specs(
         gen_prefill_attention_modules(
             [torch.float16],  # q_dtypes

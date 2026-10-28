@@ -326,6 +326,73 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
         )
 
 
+def _run_cute_dsl_fp4_tactic(m, n, k, fp4_type, tactic):
+    """Launch one forced tactic through the cute-dsl FP4 runner; check output."""
+    from flashinfer.gemm import gemm_base
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if major != 10:
+        pytest.skip("cute-dsl FP4 GEMM needs SM100/SM103.")
+    use_nvfp4 = fp4_type == "nvfp4"
+    if use_nvfp4:
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    else:
+        a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+        b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+        a_fp4, a_s = mxfp4_quantize(a)
+        b_fp4, b_s = mxfp4_quantize(b)
+        alpha = None
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    runner = gemm_base._cute_dsl_gemm_fp4_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16, use_nvfp4
+    )
+    runner(
+        inputs=[
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            16 if use_nvfp4 else 32,
+            use_nvfp4,
+            workspace,
+        ],
+        tactic=tactic,
+    )
+    torch.cuda.synchronize()
+    cos_sim = F.cosine_similarity(
+        torch.mm(a, b.T).float().reshape(-1), out.float().reshape(-1), dim=0
+    )
+    assert cos_sim > 0.97
+
+
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_mm_fp4_cute_dsl_stale_narrow_tile_tactic_falls_back(fp4_type, m, tile_n):
+    """A narrow swap-AB tactic tuned for M<=32 must not be replayed at M>32.
+
+    Narrow (< 64) N tiles cover at most 32 kernel-N columns; the runner falls
+    back to the untuned selector instead of faulting with
+    cudaErrorMisalignedAddress.
+    """
+    _run_cute_dsl_fp4_tactic(
+        m, 256, 2048, fp4_type, ((128, tile_n), (1, 1), True, False, "sm100", None)
+    )
+
+
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 32])
+def test_mm_fp4_cute_dsl_stale_split_k_tactic_falls_back(m, tile_n):
+    """A split-K tactic tuned for M<=32 falls back at M>32 instead of raising."""
+    _run_cute_dsl_fp4_tactic(
+        m, 256, 2048, "nvfp4", ((128, tile_n), (1, 1), True, False, "sm100sk", 2)
+    )
+
+
 def _skip_unless_per_token_alpha_gpu():
     major, minor = get_compute_capability(torch.device("cuda"))
     if (major, minor) not in [(10, 0), (10, 3)]:

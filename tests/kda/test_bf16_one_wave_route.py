@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.kda_prefill import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -88,8 +89,15 @@ def _prepare(lengths, heads, *, active_beta):
         # and drifted 0.026 at 1024 tokens under trained deep-layer statistics
         # (CAKE-736 round 8 routed it to the direct N32 body); the round-9 body
         # accumulates the decay correction onto the FP32 state (delta decay),
-        # so the split is back.
-        ((33, 1025), 12, False, "fused_m64_independent_dvsplit_fp32_state"),
+        # so the split is back.  Its long-task load, 12 x 1058 / 1025 tokens,
+        # is in the first pair-share row of both parts (32 tasks, 1024
+        # tokens), so the 1025-token launch takes the pair-share build.
+        (
+            (33, 1025),
+            12,
+            False,
+            "fused_m64_independent_dvsplit_fp32_state_pair_share",
+        ),
         # Logit beta, FP32 state, single-chunk residuals: the split stays.
         ((17, 64, 33, 64, 9, 64), 6, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Mixed lengths with six heads (36 tasks), active beta.
@@ -102,7 +110,11 @@ def _prepare(lengths, heads, *, active_beta):
     ],
 )
 def test_one_wave_bf16_grid_uses_m64_value_split(lengths, heads, active_beta, expected):
-    assert _prepare(lengths, heads, active_beta=active_beta) == expected
+    # A long launch whose 2-CTA clusters fit one wave takes the pair-share build
+    # of the same split (schedule suffix ``_pair_share``, the same bits); the
+    # active-beta split has no pair-share build and the other rows are short.
+    schedule = _prepare(lengths, heads, active_beta=active_beta)
+    assert schedule == expected
 
 
 def test_short_h12_logit_beta_keeps_direct_n16_tile():
@@ -117,3 +129,18 @@ def test_multi_wave_grid_keeps_direct_tile():
     schedule = _prepare((128,) * 8, 12, active_beta=True)
     assert "m64" not in schedule
     assert schedule.startswith("fused_")
+
+
+def test_select_bf16_schedule_route_is_the_shared_planner_adapter():
+    """The prepared runtime shares the planner's metadata adapter, which takes
+    the compute capability directly (no device probe).  The packed H12 grid of
+    1025 + 33 tokens (24 tasks, one M64 chain wave on 148 SMs) takes the BT16
+    prepare-chain M64 split on both supported architectures."""
+    kwargs = dict(
+        sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
+    )
+    for compute_capability in ((10, 0), (10, 3)):
+        assert (
+            select_bf16_schedule_route(compute_capability=compute_capability, **kwargs)
+            == "bt16_prepare_chain_m64"
+        )

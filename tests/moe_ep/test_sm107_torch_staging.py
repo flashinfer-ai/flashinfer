@@ -20,6 +20,9 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
     sampled_reference,
 )
+from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+    AutoTuningState,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required; any supported Torch GPU"
@@ -72,19 +75,19 @@ def test_sampled_oracle_matches_full_raw_scale_oracle(kind):
         quant_kind=kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_at_fc1=True,
+        apply_routing_weights_before_fc2=True,
     )
     torch.testing.assert_close(expected, full[indices], rtol=0.01, atol=0.001)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 def test_prequantized_metadata_rejects_wrong_encoding_and_oversized_scales(kind):
     fp = FleetParams(num_experts=4, max_tokens_per_rank=10, token_hidden_size=128)
     dtype = (
         torch.float4_e2m1fn_x2
         if kind == "nvfp4"
         else torch.float8_e4m3fn
-        if kind == "mxfp8_e4m3"
+        if kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
         else torch.float8_e5m2
     )
     sf_dtype = torch.float8_e4m3fn if kind == "nvfp4" else torch.float8_e8m0fnu
@@ -169,6 +172,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     )
     ws = object.__new__(Sm107BlockScaledSymmBuffer)
     ws.config = cfg
+    # The dummy kernel retains launch-side clearing of invalid combine slots.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws.device = torch.device("cuda", torch.cuda.current_device())
     ws._destroyed = False
     ws._launch_key = None
@@ -192,6 +197,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws._compiled = lambda **kwargs: ws.output_activation.fill_(3)
     # The dummy kernel does not use peer mapping, which imports Rubin-only code.
     ws._peer_mapper = lambda: None
+    # __init__ creates this since #6535; launch() marks it under stream capture.
+    ws._tuning_state = AutoTuningState()
     weights = preprocess_block_scaled_weights(
         torch.randn(4, 128, 128, device="cuda").bfloat16(),
         torch.randn(4, 128, 64, device="cuda").bfloat16(),

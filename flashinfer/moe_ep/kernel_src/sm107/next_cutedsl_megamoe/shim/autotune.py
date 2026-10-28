@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Collective offline tuning for the SM107 block-scaled kernel.
+"""Collective tuning for the SM107 block-scaled kernel.
 
 Each candidate builds a session, copies the staged inputs, compiles and times
-its kernel, then destroys the session. The caller's workspace stays unchanged;
-the winner is saved in the knob cache for later backend construction.
+its kernel, then destroys the session. Offline tuning leaves the caller's
+workspace unchanged; online tuning installs and prepares the winner before execution.
 
 All EP ranks must use the same candidates in the same order. Timing takes the
 maximum rank duration for each sample, then the median across samples.
@@ -55,17 +55,21 @@ def sm107_candidates(
     quant_kind: str = "nvfp4",
     *,
     allow_in_kernel_fc2_reduce: bool = False,
+    kernel_variant: str = "inference",
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    16 candidates (32 with the ikr axis), spanning the axes the upstream
-    Rubin perf report showed to matter (see TUNING.md):
+    Inference uses 16 candidates (32 with the ikr axis):
 
     - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
+
+    Default GenPhase candidates use cluster (4, 1) and require FC2 bulk stores.
+    MXFP8 E4M3 and mixed FP4/FP8 additionally include the N64 decode tile,
+    using one FC2 stage and deterministic separate top-k reduction.
 
     ``token_in_flag_batch`` and the phase-interleave hint are skew-sensitive —
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
@@ -77,11 +81,20 @@ def sm107_candidates(
         ((2, 1), None, ("grouped", None), "grid_stride"),
         ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
     )
+    if kernel_variant == "genphase":
+        launches = (
+            ((4, 1), None, ("grouped", None), "grid_stride"),
+            ((4, 1), None, ("phase_interleave", None), "atomic_counter"),
+        )
+    elif kernel_variant != "inference":
+        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
     out: List[Dict[str, Any]] = []
     for tile_n in (128, 256):
         for cluster, fallback, schedule, work_id in launches:
             for epi in ((1, 4), (2, 4)):
-                for fc2_bulk in (False, True):
+                for fc2_bulk in (
+                    (True,) if kernel_variant == "genphase" else (False, True)
+                ):
                     for ikr in (
                         (False, True) if allow_in_kernel_fc2_reduce else (False,)
                     ):
@@ -100,15 +113,43 @@ def sm107_candidates(
                                 "reduce_topk_in_kernel": ikr,
                             }
                         )
+    if kernel_variant == "genphase" and quant_kind in (
+        "mxfp8_e4m3",
+        "mxfp4_mxfp8",
+    ):
+        # These are additional candidates, not a replacement for wider tiles:
+        # routing, cache residency and token count change the best pipeline.
+        for schedule, work_id in (
+            (("grouped", None), "grid_stride"),
+            (("grouped", None), "atomic_counter"),
+            (("phase_interleave", None), "atomic_counter"),
+        ):
+            out.append(
+                {
+                    "mma_tiler_mnk": (256, 64, 128),
+                    "cluster_shape_mn": (4, 1),
+                    "fallback_cluster_shape_mn": None,
+                    "schedule_policy": schedule,
+                    "work_id_mode": work_id,
+                    "fc2_use_bulk": True,
+                    "fc2_tma_stages": 1,
+                    "epi_flag_batches": (1, 4),
+                    "token_in_flag_batch": 1,
+                    "token_back_mode": "epi_warps",
+                    "reduce_topk_in_kernel": False,
+                }
+            )
     return out
 
 
-def sm107_schedule_candidates(base: Dict[str, Any]) -> List[Dict[str, Any]]:
+def sm107_schedule_candidates(
+    base: Dict[str, Any], *, kernel_variant: str = "inference"
+) -> List[Dict[str, Any]]:
     """Expand a base knob dict into the skew-sensitive schedule grid
     (phase-interleave hint x token-in flag batch)."""
     out: List[Dict[str, Any]] = []
     for hint in (None, 3, 4, 6):
-        for tif in (1, 4):
+        for tif in (1,) if kernel_variant == "genphase" else (1, 4):
             out.append(
                 {
                     **base,
@@ -120,7 +161,24 @@ def sm107_schedule_candidates(base: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def autotune_sm107_block_scaled_mega_moe(
+def _prepare_collectively(prepare, world_size, process_group):
+    """Finish host preparation on every rank before launching collective kernels."""
+    error = None
+    try:
+        prepare()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = [error]
+    if world_size > 1:
+        import torch.distributed as dist
+
+        errors = [None] * world_size
+        dist.all_gather_object(errors, error, group=process_group)
+    if any(errors):
+        raise RuntimeError(f"MegaMoE preparation failed on EP ranks: {errors}")
+
+
+def _sweep_sm107_block_scaled_mega_moe(
     y,
     transformed_l1: Any,
     transformed_l2: Any,
@@ -131,8 +189,9 @@ def autotune_sm107_block_scaled_mega_moe(
     warmup_iters: int = 3,
     timed_iters: int = 10,
     process_group=None,
-) -> Dict[str, Any]:
-    """Validate candidates against a sampled Torch oracle, time, and cache.
+    measurement=None,
+) -> tuple[Dict[str, Any], float, int]:
+    """Validate candidates against a sampled Torch oracle and time survivors.
 
     Every EP rank must participate. GPU allocation, compile, or launch errors
     abort the sweep: run distributed tuning under a worker supervisor with
@@ -146,10 +205,15 @@ def autotune_sm107_block_scaled_mega_moe(
     from .block_scaled import Sm107BlockScaledSymmBuffer, sm107_block_scaled_mega_moe
     from .comm import ensure_not_capturing
     from .correctness import output_error, sampled_reference
+    from .tuning_measurement import CaptureUnsupported, measure_samples
 
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
-    candidates = sm107_candidates(cfg.quant_kind) if candidates is None else candidates
+    candidates = (
+        sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
+        if candidates is None
+        else candidates
+    )
     if not candidates:
         raise ValueError("autotune needs a non-empty candidate list.")
     if warmup_iters < 1 or timed_iters < 1:
@@ -157,6 +221,11 @@ def autotune_sm107_block_scaled_mega_moe(
     num_tokens = symm_buffer.staged_tokens() if num_tokens is None else num_tokens
     if num_tokens is None or not 0 <= num_tokens <= cfg.max_tokens_per_rank:
         raise ValueError("stage a valid num_tokens before autotuning.")
+
+    if y is None:
+        y = torch.empty(
+            num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
+        )
 
     collective = cfg.world_size > 1
     if collective:
@@ -227,8 +296,15 @@ def autotune_sm107_block_scaled_mega_moe(
         trial.topk_weights.copy_(symm_buffer.topk_weights)
         if cfg.quant_kind == "nvfp4":
             for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                getattr(trial, name).copy_(getattr(symm_buffer, name))
+                # the scalars the workspace's launches use (bound per-call tensors by
+                # default, where the workspace tensors stay unwritten)
+                getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
         trial.note_staged_tokens(num_tokens)
+        _prepare_collectively(
+            lambda: trial.prepare(transformed_l1, transformed_l2),
+            cfg.world_size,
+            process_group,
+        )
         barrier()
         for _ in range(warmup_iters):
             sm107_block_scaled_mega_moe(
@@ -247,18 +323,27 @@ def autotune_sm107_block_scaled_mega_moe(
             barrier()
             continue
 
-        samples = []
-        for _ in range(timed_iters):
-            barrier()
-            start, end = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
+        try:
+            samples = measure_samples(
+                trial,
+                (transformed_l1, transformed_l2),
+                timed_iters,
+                measurement
+                or {
+                    "cuda_graph_profile_replays": None,
+                    "cold_l2": False,
+                    "timer": "native_events",
+                },
+                process_group,
             )
-            start.record()
-            trial.launch(transformed_l1, transformed_l2)
-            end.record()
-            end.synchronize()
-            samples.append(start.elapsed_time(end) * 1e3)
+        except CaptureUnsupported as exc:
+            if cfg.rank == 0:
+                print(f"[sm107-autotune] rejected {knobs}: {exc}", flush=True)
+            scores.append(math.inf)
+            errors.append(math.inf)
+            trial.destroy()
+            barrier()
+            continue
         times = torch.tensor(samples, dtype=torch.float64, device="cuda")
         if collective:
             # Reduce each matched sample before taking its median.
@@ -284,36 +369,63 @@ def autotune_sm107_block_scaled_mega_moe(
         )
     winner = candidates[best]
     if cfg.rank == 0:
-        from .knob_cache import record_knobs
-
-        record_knobs(
-            winner,
-            dtype=cfg.quant_kind,
-            world_size=cfg.world_size,
-            hidden=cfg.hidden,
-            intermediate=cfg.intermediate,
-            num_experts=cfg.num_total_experts,
-            topk=cfg.num_topk,
-            max_tokens=cfg.max_tokens_per_rank,
-            p50_us=scores[best],
-            source="autotune-cuda-events-sampled-oracle",
-            allow_nondeterministic=any(
-                k.get("reduce_topk_in_kernel", cfg.reduce_topk_in_kernel)
-                for k in candidates
-            ),
-            apply_topk_at_fc1=cfg.apply_topk_at_fc1,
-            activation=cfg.activation,
-            situ_beta=cfg.situ_beta,
-            situ_linear_beta=cfg.situ_linear_beta,
-            gate_up_clamp=cfg.gate_up_clamp,
-        )
         for score, error, knobs in zip(scores, errors, candidates, strict=False):
             print(
                 f"[sm107-autotune] {score:.2f} us p50(max rank), rel_l2={error:.5f}: {knobs}",
                 flush=True,
             )
         print(f"[sm107-autotune] winner {winner}", flush=True)
-    return winner
+    return winner, scores[best], sum(math.isfinite(s) for s in scores)
+
+
+def autotune_sm107_block_scaled_mega_moe(
+    y,
+    transformed_l1: Any,
+    transformed_l2: Any,
+    symm_buffer: Any,
+    *,
+    num_tokens: Optional[int] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    warmup_iters: int = 3,
+    timed_iters: int = 10,
+    process_group=None,
+    force_tune: bool = True,
+    install_winner: bool = False,
+    allow_nondeterministic: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run the native sweep through FlashInfer's autotuner.
+
+    Explicit calls search afresh. Online callers pass ``force_tune=False``
+    and ``install_winner=True`` to honor the shared context and prepare the
+    winner in the caller's workspace. A disabled cache miss returns None.
+    """
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import AutoTuner
+
+    from .tuning_protocol import NAMESPACE, RubinTuningProtocol
+
+    protocol = RubinTuningProtocol(
+        y,
+        transformed_l1,
+        transformed_l2,
+        symm_buffer,
+        num_tokens=num_tokens,
+        candidates=candidates,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        process_group=process_group,
+        install_winner=install_winner,
+        allow_nondeterministic=allow_nondeterministic,
+    )
+    tuner = AutoTuner.get()
+    if force_tune and not tuner._in_v2_context:
+        store = tuner._active_managed_store
+        with autotune_v2(
+            cache_root=None if store is None else store.root,
+            measurement_policy=tuner.protocol_context(NAMESPACE).measurement_policy,
+        ):
+            return tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=True)
+    return tuner.choose_with_protocol(NAMESPACE, protocol, force_tune=force_tune)
 
 
 __all__ = [

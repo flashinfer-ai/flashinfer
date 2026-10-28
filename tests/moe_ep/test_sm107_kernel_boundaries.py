@@ -18,6 +18,8 @@ def _run_case(kind, capacity, topk, knobs):
     )
 
     hidden, intermediate = (192, 64) if kind == "nvfp4" else (384, 192)
+    if kind == "mxfp4_mxfp8":
+        intermediate = 256
     torch.manual_seed(1973)
     w13 = (
         torch.randn(8, 2 * intermediate, hidden, device="cuda") / hidden**0.5
@@ -89,7 +91,7 @@ def test_router_vector_tails(monkeypatch, kind, capacity, topk):
     _run_case(kind, capacity, topk, {})
 
 
-@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("kind", (*KINDS, "mxfp4_mxfp8"))
 @pytest.mark.parametrize(
     "variant", ["one_cta", "deep_k", "mixed_ikr", "late_weight_clamp"]
 )
@@ -122,7 +124,10 @@ def test_supported_knob_variants(monkeypatch, kind, variant):
             fc2_tma_stages=4,
             reduce_topk_in_kernel=True,
         ),
-        "late_weight_clamp": dict(apply_topk_at_fc1=False, gate_up_clamp=0.75),
+        "late_weight_clamp": dict(
+            apply_routing_weights_before_fc2=False,
+            gate_up_clamp=0.75,
+        ),
     }
     _run_case(kind, 65, 3, variants[variant])
 

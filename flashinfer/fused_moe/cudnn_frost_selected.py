@@ -19,7 +19,7 @@ def cudnn_frost_grouped_gemm1_swiglu_workspace_size(
 ) -> int:
     """Return workspace bytes required by all matching generated tactics."""
 
-    from ..experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    from .backends.cudnn_frost import (
         workspace_size,
     )
 
@@ -53,7 +53,7 @@ def cudnn_frost_grouped_gemm1_swiglu(
     Routing, token permutation, and GEMM2 are intentionally outside this API.
     """
 
-    from ..experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    from .backends.cudnn_frost import (
         CudnnFrostGroupedGemm1SwiGLURunner,
         workspace_size,
     )

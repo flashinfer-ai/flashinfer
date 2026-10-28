@@ -1,80 +1,408 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-"""Capability router for MiniMax-H3 NVFP4 pre-attention CUDA stages."""
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Generated programs of the MiniMax-H3 NVFP4 pre-attention: the RMSNorm + AdaLN + NVFP4
+quantize stage (NORM, sm_100a and sm_103a; NORM_V5, the same stage with the activation
+staged in shared memory, sm_103a) and the fused NVFP4 QKV GEMM with the Q/K RMSNorm, the
+RoPE and the destination-major output in its epilogue, one schedule per target and one
+program per output format (FUSED_PACK_K96 / FUSED_E4M3_K96 on sm_103a, FUSED_PACK_EPI8 /
+FUSED_E4M3_EPI8 on sm_100a). The host module
+``flashinfer.diffusion_ops.cake_minimax_h3_nvfp4`` computes the grids and launches them.
+
+Generated file: every value below is derived from the exported sources and checked
+against them; do not edit.
+"""
 
 from __future__ import annotations
 
-import importlib
-from typing import Literal
+from . import cake_program
+from .core import JitSpec
 
-import torch
+NORM = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_20e84bf6e3b060b63b42_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "write_debug",
+        "eps",
+        "M",
+        "out_sf",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "out_sf",
+    ),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=128,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
 
-MiniMaxH3Nvfp4Target = Literal["sm100a", "sm103a"]
-MiniMaxH3Nvfp4Stage = Literal[
-    "norm_adaln_nvfp4_quantize",
-    "qkv_nvfp4_gemm_fused_pack",
-]
+NORM_V5 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_0506c1b5a5af5680cd0a_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "write_debug",
+        "eps",
+        "M",
+        "out_sf",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "x",
+        "x_norm_weight",
+        "adaln_scale",
+        "adaln_shift",
+        "adaln_index",
+        "x_global_scale",
+        "activation_q",
+        "activation_sf",
+        "debug_adaln_bf16",
+        "out_sf",
+    ),
+    block=(128, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=21632,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+FUSED_PACK_K96 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_67b0631ae7190dedd63d",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_67b0631ae7190dedd63d",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_67b0631ae7190dedd63d_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_67b0631ae7190dedd63d_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+        "write_debug",
+        "eps",
+        "M",
+        "m_tiles",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+    ),
+    block=(640, 1, 1),
+    cluster=(2, 1, 1),
+    dynamic_smem_bytes=231552,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+FUSED_PACK_EPI8 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_48daf3781ff6b1c46b43_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+        "write_debug",
+        "eps",
+        "M",
+        "m_tiles",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+    ),
+    block=(320, 1, 1),
+    cluster=(2, 1, 1),
+    dynamic_smem_bytes=228480,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+FUSED_E4M3_K96 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_9cc4be9080a461a19d27",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_9cc4be9080a461a19d27",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_9cc4be9080a461a19d27_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_9cc4be9080a461a19d27_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+        "write_debug",
+        "eps",
+        "M",
+        "m_tiles",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+    ),
+    block=(640, 1, 1),
+    cluster=(2, 1, 1),
+    dynamic_smem_bytes=231552,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+FUSED_E4M3_EPI8 = cake_program.CakeProgram(
+    name="cake_minimax_h3_nvfp4_pre_attention_945b700f51782c295c7f",
+    operator_dir="cake_minimax_h3_nvfp4_pre_attention",
+    kernel="kernel_cake_minimax_h3_nvfp4_pre_attention_945b700f51782c295c7f",
+    sources=(
+        "cake_minimax_h3_nvfp4_pre_attention_945b700f51782c295c7f_kernel.cu",
+        "cake_minimax_h3_nvfp4_pre_attention_945b700f51782c295c7f_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+        "write_debug",
+        "eps",
+        "M",
+        "m_tiles",
+        "HEADS_PER_DESTINATION",
+        "ROWS_PER_DESTINATION",
+        "SCALE_STRIDE",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "alpha",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "out_global_scale",
+        "out_q",
+        "out_sf",
+        "OUTQ",
+        "qkv_words",
+        "debug_q_words",
+        "debug_k_words",
+    ),
+    block=(320, 1, 1),
+    cluster=(2, 1, 1),
+    dynamic_smem_bytes=228480,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
+    NORM,
+    NORM_V5,
+    FUSED_PACK_K96,
+    FUSED_PACK_EPI8,
+    FUSED_E4M3_K96,
+    FUSED_E4M3_EPI8,
+)
 
 
-def minimax_h3_nvfp4_target(device: torch.device) -> MiniMaxH3Nvfp4Target:
-    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
-    if capability == (10, 0):
-        return "sm100a"
-    if capability == (10, 3):
-        return "sm103a"
-    raise RuntimeError(
-        "MiniMax-H3 NVFP4 pre-attention requires exact compute capability "
-        f"10.0 or 10.3, got {capability[0]}.{capability[1]}"
-    )
-
-
-def minimax_h3_nvfp4_physical_module(device: torch.device):
-    target = minimax_h3_nvfp4_target(device)
-    return importlib.import_module(
-        f".cake_minimax_h3_nvfp4_pre_attention_{target}",
-        __package__,
-    )
-
-
-def minimax_h3_nvfp4_route_record(device: torch.device, P: int) -> dict:
-    return minimax_h3_nvfp4_physical_module(device).minimax_h3_nvfp4_route_record(P)
-
-
-def gen_minimax_h3_nvfp4_stage_module(
-    device: torch.device,
-    P: int,
-    stage: MiniMaxH3Nvfp4Stage,
-):
-    return minimax_h3_nvfp4_physical_module(device).gen_minimax_h3_nvfp4_stage_module(
-        P, stage
-    )
-
-
-def load_minimax_h3_nvfp4_stage_module(
-    device: torch.device,
-    P: int,
-    stage: MiniMaxH3Nvfp4Stage,
-):
-    return minimax_h3_nvfp4_physical_module(device).load_minimax_h3_nvfp4_stage_module(
-        P, stage
-    )
-
-
-def load_minimax_h3_nvfp4_route(device: torch.device, P: int):
-    module = minimax_h3_nvfp4_physical_module(device)
-    return (
-        module.load_minimax_h3_nvfp4_stage_module(P, "norm_adaln_nvfp4_quantize"),
-        module.load_minimax_h3_nvfp4_stage_module(P, "qkv_nvfp4_gemm_fused_pack"),
-    )
+def aot_specs(target: str) -> tuple[JitSpec, ...]:
+    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
+    return cake_program.aot_specs(PROGRAMS, target)
 
 
 __all__ = [
-    "MiniMaxH3Nvfp4Stage",
-    "MiniMaxH3Nvfp4Target",
-    "gen_minimax_h3_nvfp4_stage_module",
-    "load_minimax_h3_nvfp4_route",
-    "load_minimax_h3_nvfp4_stage_module",
-    "minimax_h3_nvfp4_physical_module",
-    "minimax_h3_nvfp4_route_record",
-    "minimax_h3_nvfp4_target",
+    "NORM",
+    "NORM_V5",
+    "FUSED_PACK_K96",
+    "FUSED_PACK_EPI8",
+    "FUSED_E4M3_K96",
+    "FUSED_E4M3_EPI8",
+    "PROGRAMS",
+    "aot_specs",
 ]

@@ -5,16 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 if TYPE_CHECKING:
     import torch
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclass
 class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """Configure Rubin inference with NVFP4 activations and weights.
 
-    The kernel fuses dispatch, FC1, activation, FC2, and BF16 combine. It uses
-    E4M3 scales per 16 values and 16-row gate/up stripes. SwiGLU is the default;
+    The kernel fuses dispatch, FC1, activation, FC2, and combine with BF16 output.
+    It uses E4M3 scales per 16 values and 16-row gate/up stripes. SwiGLU is the default;
     SiTU requires both positive, finite beta parameters.
 
     input_norm_const controls BF16 input staging. Per-expert alpha tensors
@@ -30,7 +33,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Literal["grid_stride", "atomic_counter"] = "grid_stride"
     fc2_use_bulk: bool = False
@@ -43,8 +46,8 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
     # None preserves the fields above; a dict overrides KNOB_KEYS.
-    # "cache" uses an offline winner or the heuristic fallback. Online "auto"
-    # is unsupported because the kernel fixes its knobs at construction.
+    # "cache" uses an offline winner or heuristic; "auto" also permits a
+    # search during an enabled FlashInfer autotune warmup, before capture.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
@@ -54,3 +57,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # GenPhase requires cluster (4, 1), fc2_use_bulk=True, and <=1024 tokens/rank.
+    kernel_variant: Literal["inference", "genphase"] = "inference"
+    # Quantizes the FC2 return payload; the operator still returns BF16.
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"

@@ -142,6 +142,12 @@ def _local_transformed_weights(
         )
 
         extra = {}
+    elif quant_kind == "mxfp4_mxfp8":
+        from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl import (
+            weights as weights_mod,
+        )
+
+        extra = {}
     else:
         from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
             weights as weights_mod,
@@ -332,6 +338,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         MoEEpLayer,
         MoEEpTensors,
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
@@ -350,6 +357,8 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
     cfg = (
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
         if quant_kind == "nvfp4"
+        else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "mxfp4_mxfp8"
         else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
     )
     torch.cuda.reset_peak_memory_stats()
@@ -589,7 +598,7 @@ def main():
     parser.add_argument(
         "--quant-kind",
         default="nvfp4",
-        choices=["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "both", "all"],
+        choices=["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8", "both", "all"],
     )
     parser.add_argument(
         "--mode", choices=["kernel", "compute", "forward"], default="kernel"
@@ -661,7 +670,7 @@ def main():
     )
     routings = ["balanced", "power_law"] if args.routing == "both" else [args.routing]
     kinds = (
-        ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
+        ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
         if args.quant_kind == "all"
         else ["nvfp4", "mxfp8_e4m3"]
         if args.quant_kind == "both"

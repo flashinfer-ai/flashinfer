@@ -47,6 +47,9 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.mixed_input_helpers as mixed_input_utils
 from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import builtin, llvm
+from cutlass.cutlass_dsl import Boolean, Int32, T, dsl_user_op
 
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -59,13 +62,10 @@ from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
-    f32_reciprocal,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
-    situ_f32,
-    tanh_f32,
 )
 
 
@@ -73,6 +73,181 @@ _NVFP4_SCALE_GRANULARITY_M = 1
 _NVFP4_SCALE_GRANULARITY_K = 16
 _TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
+
+
+@dsl_user_op
+def _w4a16_scaled_tanh(value, beta: float, loc=None, ip=None):
+    """Match MegaMoE's beta*tanh(value/beta) rounding for W4A16 SiTU."""
+    # The reciprocal is rounded once from the Python beta. Keep the tanh's
+    # multiply and subtraction separate, as in the existing MegaMoE oracle.
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(beta).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(1.0 / beta).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .f32 x, exponent, denominator, inverse, result;\n\t"
+            "mul.rn.f32 x, $1, $3;\n\t"
+            "mul.rn.f32 x, x, 0fC038AA3B;\n\t"
+            "ex2.approx.ftz.f32 exponent, x;\n\t"
+            "add.rn.f32 denominator, exponent, 0f3F800000;\n\t"
+            "rcp.approx.ftz.f32 inverse, denominator;\n\t"
+            "mul.rn.f32 result, inverse, 0f40000000;\n\t"
+            "sub.rn.f32 result, result, 0f3F800000;\n\t"
+            "mul.rn.f32 $0, $2, result;\n\t}",
+            "=f,f,f,f",
+            has_side_effects=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _align_n(x, alignment: int):
+    """Round a positive routed-token count to an instruction N extent."""
+    return (Int32(x) + Int32(alignment - 1)) & Int32(-alignment)
+
+
+@dsl_user_op
+def compute_non_leader_cta_load_shift(
+    valid_tokens_in_tile,  # Int32 SSA
+    mma_tiler_n: int,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int32:
+    """Token offset that non-leader CTA's TMA-B read must shift by under 2cta.
+
+    Under dynamic UMMA + 2cta:
+      - MMA splits N at align16(valid) / 2
+      - TMA static partition splits at mma_tiler_n / 2
+
+    The result ∈ (-mma_tiler_n/2, 0]; apply via
+    ``cute.domain_offset((shift, 0, 0), real_b)`` on non-leader CTA only.
+    """
+    return (_align_n(valid_tokens_in_tile, 16) >> Int32(1)) - Int32(mma_tiler_n // 2)
+
+
+def _smem_desc_to_i64(smem_desc_value: ir.Value) -> ir.Value:
+    """Bit-cast cute_nvgpu.smem_desc value -> i64."""
+    i64_ty = ir.IntegerType.get_signless(64)
+    return builtin.unrealized_conversion_cast([i64_ty], [smem_desc_value])
+
+
+def _tmem_ptr_to_i32(tmem_ptr_value: ir.Value) -> ir.Value:
+    """Bit-cast cute.ptr<tmem> -> i32."""
+    i32_ty = ir.IntegerType.get_signless(32)
+    return builtin.unrealized_conversion_cast([i32_ty], [tmem_ptr_value])
+
+
+def _as_value(it) -> ir.Value:
+    """Unwrap to underlying ir.Value (cute Pointer has .value)."""
+    return it.value if hasattr(it, "value") else it
+
+
+def bf16_static_idesc(umma_m: int) -> int:
+    """BF16 A/B, FP32 accumulation, K-major; leave runtime N bits clear."""
+    if umma_m not in (128, 256):
+        raise ValueError("Dynamic BF16 MMA supports M128/M256 UMMA.")
+    # Existing non-block-scaled descriptor: CFormat.F32 at4; BF16 at7/10;
+    # N/8 at17 (runtime), M/16 at24. No negate, sparse, or saturation flags.
+    return (1 << 4) | (1 << 7) | (1 << 10) | ((umma_m >> 4) << 24)
+
+
+@dsl_user_op
+def _issue_bf16_atom(
+    cta_group: int,
+    accumulator,
+    operand_a,
+    operand_b,
+    descriptor,
+    accumulate,
+    loc=None,
+    ip=None,
+):
+    # The literal PTX approach mirrors the vendored dynamic-N helper and
+    # avoids unstable private NVVM enum bindings. BF16 uses kind::f16.
+    llvm.inline_asm(
+        None,
+        [accumulator, operand_a, operand_b, descriptor, accumulate],
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $4, 0;\n\t"
+        f"tcgen05.mma.cta_group::{cta_group}.kind::f16 "
+        "[$0], [$1], $2, $3, p;\n\t}\n",
+        "r,r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def issue_dynamic_bf16_mma_tile(
+    acc_tensor,
+    a_frag_tile,
+    b_frag_tile,
+    k_tile_idx,
+    valid_tokens_in_tile,
+    mma_tiler_mnk: tuple,
+    n_alignment: int = 16,
+    loc=None,
+    ip=None,
+):
+    """Issue BF16 K16 atoms with a runtime instruction N extent.
+
+    The caller owns pipeline waits/commits, TMEM allocation, valid-token
+    bounds, and the non-leader TMA-B shift. Only positive valid tiles may
+    reach this function, and valid_tokens must not exceed the allocated N.
+    One-CTA M128 instructions support N in multiples of 8; two-CTA M256
+    instructions require multiples of 16. Each CTA retains its M128 x
+    allocated-N accumulator layout: runtime N limits the columns written,
+    without moving valid ones.
+
+    ``make_trivial_tiled_mma`` uses a single M/N atom, including N192. Reject
+    multi-atom fragments explicitly: their per-atom N tails and two-CTA B
+    partitions would need separate descriptors and load shifts.
+    """
+    umma_m, allocated_n, tile_k = mma_tiler_mnk
+    cta_group = 2 if umma_m == 256 else 1
+    if (
+        n_alignment not in (8, 16)
+        or (cta_group == 2 and n_alignment != 16)
+        or not n_alignment <= allocated_n <= 256
+        or allocated_n % n_alignment
+        or tile_k % 16
+    ):
+        raise ValueError("Unsupported BF16 N/K geometry.")
+    if (
+        cute.size(a_frag_tile, mode=[1]) != 1
+        or cute.size(b_frag_tile, mode=[1]) != 1
+        or cute.size(a_frag_tile, mode=[2]) != tile_k // 16
+        or cute.size(b_frag_tile, mode=[2]) != tile_k // 16
+    ):
+        raise ValueError("Dynamic BF16 MMA requires one M/N atom and K16 fragments.")
+    descriptor = Int32(bf16_static_idesc(umma_m)) | (
+        (_align_n(valid_tokens_in_tile, n_alignment) >> Int32(3)) << Int32(17)
+    )
+    for inner_k in range(tile_k // 16):
+        a_atom = a_frag_tile[(None, 0, inner_k)]
+        b_atom = b_frag_tile[(None, 0, inner_k)]
+        acc_atom = acc_tensor[(None, 0, 0)]
+        a_value = _as_value(a_atom.iterator)
+        a_operand = _tmem_ptr_to_i32(a_value)
+        accumulate = k_tile_idx != 0 if inner_k == 0 else True
+        with cute.arch.elect_one():
+            _issue_bf16_atom(
+                cta_group=cta_group,
+                accumulator=_tmem_ptr_to_i32(_as_value(acc_atom.iterator)),
+                operand_a=a_operand,
+                operand_b=_smem_desc_to_i64(_as_value(b_atom.iterator)),
+                descriptor=descriptor.ir_value(),
+                accumulate=Int32(Boolean(accumulate)).ir_value(),
+                loc=loc,
+                ip=ip,
+            )
 
 
 class Sm100W4A16GroupedGemmKernel:
@@ -203,6 +378,17 @@ class Sm100W4A16GroupedGemmKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        # Every autotuned W4A16 tactic has 128 accumulator rows per CTA.
+        # Other layouts keep the static path, including two-CTA M64 per
+        # CTA, whose TMEM column mapping depends on the instruction N extent.
+        self.use_dynamic_n = (
+            self.cta_tile_shape_mnk[0] == 128
+            and self.transform_a_source == tcgen05.OperandSource.TMEM
+            and self.a_major_mode == cute.nvgpu.OperandMajorMode.K
+            and self.b_major_mode == cute.nvgpu.OperandMajorMode.K
+            and self.mma_dtype == cutlass.BFloat16
+            and self.acc_dtype == cutlass.Float32
+        )
         self.mma_tiler_c = (
             self.mma_tiler[0] // self.output_m_factor,
             self.mma_tiler[1],
@@ -307,6 +493,40 @@ class Sm100W4A16GroupedGemmKernel:
             _NVFP4_SCALE_GRANULARITY_K,
             self.num_load2trans_stage,
         )
+
+    @cute.jit
+    def _issue_mma_tile(
+        self,
+        tiled_mma: cute.TiledMma,
+        accumulators: cute.Tensor,
+        a_frag_tile: cute.Tensor,
+        b_frag_tile: cute.Tensor,
+        k_tile_idx: cutlass.Int32,
+        valid_tokens: cutlass.Int32,
+    ):
+        if cutlass.const_expr(self.use_dynamic_n):
+            issue_dynamic_bf16_mma_tile(
+                acc_tensor=accumulators,
+                a_frag_tile=a_frag_tile,
+                b_frag_tile=b_frag_tile,
+                k_tile_idx=k_tile_idx,
+                valid_tokens_in_tile=valid_tokens,
+                mma_tiler_mnk=self.mma_tiler,
+                n_alignment=16 if self.use_2cta_instrs else 8,
+            )
+        else:
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile_idx != 0)
+            for kblock_idx in cutlass.range(
+                cute.size(a_frag_tile, mode=[2]), unroll_full=True
+            ):
+                cute.gemm(
+                    tiled_mma,
+                    accumulators,
+                    a_frag_tile[(None, None, kblock_idx)],
+                    b_frag_tile[(None, None, kblock_idx)],
+                    accumulators,
+                )
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
     @cute.jit
     def _setup_transform_partitions(
@@ -1438,12 +1658,26 @@ class Sm100W4A16GroupedGemmKernel:
                         griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
+                activation_coord_n = work_tile.coord_n
+                if cutlass.const_expr(self.use_dynamic_n and self.use_2cta_instrs):
+                    if not is_leader_cta:
+                        # Two-CTA MMA splits B at runtime_N / 2, whereas
+                        # the TMA partition starts at allocated_N / 2.
+                        activation_coord_n += compute_non_leader_cta_load_shift(
+                            valid_tokens_in_tile=cutlass.max(
+                                1,
+                                cutlass.min(
+                                    work_tile.distance_to_boundary, self.mma_tiler[1]
+                                ),
+                            ),
+                            mma_tiler_n=self.mma_tiler[1],
+                        )
                 coord_n_offset = (
-                    (work_tile.coord_n, 0)
+                    (activation_coord_n, 0)
                     if cutlass.const_expr(
                         self.b_major_mode == cute.nvgpu.OperandMajorMode.MN
                     )
-                    else (0, work_tile.coord_n)
+                    else (0, activation_coord_n)
                 )
                 tBgB_slice = cute.make_tensor(
                     (
@@ -1731,37 +1965,26 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                     acc_pipeline.producer_acquire(acc_producer_state)
 
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    # A privately supplied empty tile still participates in
+                    # every pipeline; issue the minimum legal MMA extent.
+                    valid_tokens = cutlass.max(
+                        1,
+                        cutlass.min(work_tile.distance_to_boundary, self.mma_tiler[1]),
+                    )
                     # Mma mainloop
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         trans2mma_pipeline.consumer_wait(
                             trans2mma_consumer_state, peek_trans2mma_full_status
                         )
                         b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
-                        num_kblocks = cute.size(tCrA, mode=[2])
-                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            kblock_coord_a = (
-                                None,
-                                None,
-                                kblock_idx,
-                                trans2mma_consumer_state.index,
-                            )
-                            kblock_coord_b = (
-                                None,
-                                None,
-                                kblock_idx,
-                                b_load2mma_consumer_state.index,
-                            )
-
-                            cute.gemm(
-                                tiled_mma,
-                                tCtAcc,
-                                tCrA[kblock_coord_a],
-                                tCrB[kblock_coord_b],
-                                tCtAcc,
-                            )
-                            # Enable accumulate on tCtAcc after first kblock
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        self._issue_mma_tile(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[(None, None, None, trans2mma_consumer_state.index)],
+                            tCrB[(None, None, None, b_load2mma_consumer_state.index)],
+                            _k_tile,
+                            valid_tokens,
+                        )
                         trans2mma_pipeline.consumer_release(trans2mma_consumer_state)
                         b_load2mma_pipeline.consumer_release(b_load2mma_consumer_state)
                         trans2mma_consumer_state.advance()
@@ -1925,6 +2148,16 @@ class Sm100W4A16GroupedGemmKernel:
             tile_info_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                # Dynamic MMA only initializes the rounded valid N columns.
+                # Their M128-per-CTA TMEM mapping is unchanged, including
+                # two-CTA MMA; omit wholly invalid capacity subtiles.
+                valid_tokens = cutlass.min(
+                    work_tile.distance_to_boundary, self.mma_tiler[1]
+                )
+                # Consume/release the accumulator even for an empty tile.
+                active_subtile_cnt = cutlass.max(
+                    1, cute.ceil_div(valid_tokens, self.epi_tile_n)
+                )
                 alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(self.gated):
                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
@@ -1980,13 +2213,14 @@ class Sm100W4A16GroupedGemmKernel:
                     gated_tTR_tAcc = gated_tTR_tAcc_base[
                         (None, None, None, None, None, acc_consumer_state.index)
                     ]
-                    gated_subtile_cnt = cute.size(gated_tTR_tAcc.shape, mode=[4])
+                    gated_subtile_cnt = cutlass.min(
+                        cute.size(gated_tTR_tAcc.shape, mode=[4]), active_subtile_cnt
+                    )
                     gated_alpha_f32 = cutlass.Float32(alpha_val)
-                    swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
                     swiglu_beta = cutlass.Float32(self.swiglu_beta)
                     swiglu_limit = cutlass.Float32(self.swiglu_limit)
-                    neg_swiglu_alpha_log2_e = -(
-                        swiglu_alpha * cutlass.Float32(1.4426950408889634)
+                    neg_swiglu_alpha_log2_e = cutlass.Float32(
+                        -self.swiglu_alpha * 1.4426950408889634
                     )
                     for gated_subtile_idx in cutlass.range(gated_subtile_cnt):
                         gated_tTR_tAcc_mn = gated_tTR_tAcc[
@@ -2030,29 +2264,37 @@ class Sm100W4A16GroupedGemmKernel:
                                 self.activation_type == ActivationType.Swiglu.value
                                 and self.situ_beta is not None
                             ):
-                                # Keep the Python float so situ_f32 can fold
-                                # 1 / beta at trace time instead of emitting a
-                                # per-element div.rn.f32.
-                                situ_beta = self.situ_beta
-                                situ_gate_pair = (
-                                    situ_f32(gate_pair[0], situ_beta, fastmath=True),
-                                    situ_f32(gate_pair[1], situ_beta, fastmath=True),
+                                bounded_gate = (
+                                    _w4a16_scaled_tanh(gate_pair[0], self.situ_beta),
+                                    _w4a16_scaled_tanh(gate_pair[1], self.situ_beta),
+                                )
+                                gate_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_pair,
+                                    (-1.4426950408889634, -1.4426950408889634),
+                                )
+                                denominator = cute.arch.add_packed_f32x2(
+                                    (
+                                        cute.math.exp2(gate_log2e[0], fastmath=True),
+                                        cute.math.exp2(gate_log2e[1], fastmath=True),
+                                    ),
+                                    (1.0, 1.0),
+                                )
+                                sigmoid = (
+                                    cute.arch.rcp_approx(denominator[0]),
+                                    cute.arch.rcp_approx(denominator[1]),
+                                )
+                                situ_gate_pair = cute.arch.mul_packed_f32x2(
+                                    bounded_gate, sigmoid
                                 )
                                 if cutlass.const_expr(
                                     self.situ_linear_beta is not None
                                 ):
-                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
-                                    inv_linear_beta = cutlass.Float32(
-                                        f32_reciprocal(self.situ_linear_beta)
-                                    )
                                     up_pair = (
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[0] * inv_linear_beta, fastmath=True
+                                        _w4a16_scaled_tanh(
+                                            up_pair[0], self.situ_linear_beta
                                         ),
-                                        linear_beta
-                                        * tanh_f32(
-                                            up_pair[1] * inv_linear_beta, fastmath=True
+                                        _w4a16_scaled_tanh(
+                                            up_pair[1], self.situ_linear_beta
                                         ),
                                     )
                                 result = cute.arch.mul_packed_f32x2(
@@ -2106,12 +2348,21 @@ class Sm100W4A16GroupedGemmKernel:
                                     cute.arch.rcp_approx(sigmoid[0]),
                                     cute.arch.rcp_approx(sigmoid[1]),
                                 )
-                                silu = cute.arch.mul_packed_f32x2(gate_pair, sigmoid)
                                 if cutlass.const_expr(self.parameterized_swiglu):
                                     up_pair = cute.arch.add_packed_f32x2(
                                         up_pair, (swiglu_beta, swiglu_beta)
                                     )
-                                result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                                    up_gate = cute.arch.mul_packed_f32x2(
+                                        up_pair, gate_pair
+                                    )
+                                    result = cute.arch.mul_packed_f32x2(
+                                        up_gate, sigmoid
+                                    )
+                                else:
+                                    silu = cute.arch.mul_packed_f32x2(
+                                        gate_pair, sigmoid
+                                    )
+                                    result = cute.arch.mul_packed_f32x2(up_pair, silu)
 
                             coord_0 = up_coords[i]
                             coord_1 = up_coords[i + 1]
@@ -2154,7 +2405,9 @@ class Sm100W4A16GroupedGemmKernel:
                 subtile_cnt = (
                     0
                     if cutlass.const_expr(self.gated)
-                    else cute.size(tTR_tAcc.shape, mode=[3])
+                    else cutlass.min(
+                        cute.size(tTR_tAcc.shape, mode=[3]), active_subtile_cnt
+                    )
                 )
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from tensor memory buffer to register

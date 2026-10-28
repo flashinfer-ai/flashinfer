@@ -56,13 +56,37 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+_DSV41_WRITER_BYTES = {"fp4": 288, "fp8": 528}
+
+
+def _dsv41_writers(fmt):
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_append_sparse_mla_cache,
+        dsv41_fp4_quantize_pack_sparse_mla_cache,
+        dsv41_fp8_quantize_append_sparse_mla_cache,
+        dsv41_fp8_quantize_pack_sparse_mla_cache,
+    )
+
+    return {
+        "fp4": (
+            dsv41_fp4_quantize_pack_sparse_mla_cache,
+            dsv41_fp4_quantize_append_sparse_mla_cache,
+        ),
+        "fp8": (
+            dsv41_fp8_quantize_pack_sparse_mla_cache,
+            dsv41_fp8_quantize_append_sparse_mla_cache,
+        ),
+    }[fmt]
+
+
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
 @pytest.mark.parametrize("input_layout", ["3d", "hnd", "nhd"])
 @pytest.mark.parametrize("kv_layout", [None, "HND", "NHD"])
-def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
+def test_dsv41_pack_trace(fmt, input_layout, kv_layout, tmp_path):
     import json
 
-    from flashinfer.mla import dsv41_fp4_quantize_pack_sparse_mla_cache as pack
-
+    pack, _ = _dsv41_writers(fmt)
+    bpt = _DSV41_WRITER_BYTES[fmt]
     shapes = {"3d": (2, 8, 512), "hnd": (2, 1, 8, 512), "nhd": (2, 8, 1, 512)}
     latent = torch.empty(shapes[input_layout], dtype=torch.float16)
     kwargs = {} if kv_layout is None else {"kv_layout": kv_layout}
@@ -78,8 +102,9 @@ def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
         == latent.shape
     )
     output = definition["outputs"]["cache"]
-    expected = (2, 8, 1, 288) if kv_layout == "NHD" else (2, 1, 8, 288)
+    expected = (2, 8, 1, bpt) if kv_layout == "NHD" else (2, 1, 8, bpt)
     assert tuple(axes[d] for d in output["shape"]) == expected
+    assert definition["tags"][1] == f"quantization:{fmt}"
     assert output["dtype"] == "uint8"
     assert definition["inputs"]["latent_kv"]["dtype"] == "float16"
     assert definition["inputs"]["kv_layout"]["dtype"] == "string"
@@ -89,13 +114,18 @@ def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
     )
 
 
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
 @pytest.mark.parametrize("latent_shape", [(6, 512), (2, 3, 512), (2, 1, 3, 512)])
-@pytest.mark.parametrize(
-    "cache_shape", [(2, 2304), (2, 8, 288), (2, 1, 8, 288), (2, 8, 1, 288)]
-)
-def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
-    from flashinfer.mla import dsv41_fp4_quantize_append_sparse_mla_cache as append
-
+@pytest.mark.parametrize("cache_form", ["flat", "3d", "hnd", "nhd"])
+def test_dsv41_append_trace(fmt, latent_shape, cache_form):
+    _, append = _dsv41_writers(fmt)
+    bpt = _DSV41_WRITER_BYTES[fmt]
+    cache_shape = {
+        "flat": (2, 8 * bpt),
+        "3d": (2, 8, bpt),
+        "hnd": (2, 1, 8, bpt),
+        "nhd": (2, 8, 1, bpt),
+    }[cache_form]
     latent = torch.empty(latent_shape, dtype=torch.bfloat16)
     cache = torch.empty((4, *cache_shape[1:]), dtype=torch.uint8)[::2]
     definition = append.fi_trace(
@@ -127,13 +157,11 @@ def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
     assert "Page-strided" in inputs["cache"]["description"]
 
 
-def test_dsv41_fp4_cache_autodump(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fmt", ["fp4", "fp8"])
+def test_dsv41_cache_autodump(fmt, tmp_path, monkeypatch):
     import json
 
-    from flashinfer.mla import (
-        dsv41_fp4_quantize_append_sparse_mla_cache as append,
-        dsv41_fp4_quantize_pack_sparse_mla_cache as pack,
-    )
+    pack, append = _dsv41_writers(fmt)
     from flashinfer.trace import template
     from flashinfer.utils import get_compute_capability
 
@@ -276,11 +304,13 @@ def assert_template_axes_covered(
     """
     Assert that every ``Const`` axis in *template* has at least one source:
 
-    1. The ``Const`` carries its own fixed ``value``, OR
+    1. The ``Const`` carries its own fixed ``value`` or an ``extract`` callable, OR
     2. A tensor input whose ``dim_names`` contain the axis name, OR
     3. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
     4. A parameter of *func* matching the axis name (scalar-kwarg fallback for
        integer function arguments like ``top_k``, ``n_group``, ``block_size``).
+    5. A custom ``TraceTemplate`` axis extractor declares the name in
+       ``derived_axes``.
     """
     tensor_dim_names: set = set()
     scalar_keys: set = set()
@@ -301,6 +331,8 @@ def assert_template_axes_covered(
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
         and marker.value is None
+        and marker.extract is None
+        and name not in getattr(template, "derived_axes", ())
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names
@@ -540,11 +572,11 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         attention_ts_decode_trace_dispatch,
         prims_ts_block_sparse_trace_dispatch,
         prims_ts_block_sparse_wrapper_trace_dispatch,
-        prims_ts_paged_block_sparse_trace_dispatch,
-        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
         prims_ts_decode_wrapper_trace_dispatch,
+        prims_ts_paged_block_sparse_trace_dispatch,
+        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
     )
 
     fmha_dispatches = (
@@ -1600,6 +1632,12 @@ _E2E_SKIP = {
     # Shared FP4 requires explicit routed/physical expert geometry and scalar
     # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
     "moe_fp4_block_scale_ds_shared_experts",
+    # Method receiver supplies the real process-group size. The generic sample
+    # builder has no communicator; test_ulysses_trace covers both ws=1 schema
+    # generation and the multi-rank trace-apply routing miss.
+    "ulysses_scatter_heads",
+    "ulysses_gather_heads",
+    "ulysses_exchange_chunks",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
@@ -1620,7 +1658,9 @@ def test_fi_trace_complete(func, template, label):
 def test_fi_trace_complete_gqa_paged_decode():
     """GQA paged decode: tuple paged_kv_cache input handled correctly."""
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
-    from flashinfer.trace.templates.attention import gqa_paged_decode_trace  # noqa: F401
+    from flashinfer.trace.templates.attention import (
+        gqa_paged_decode_trace,  # noqa: F401
+    )
 
     B, H, KV, D, P, NP = 4, 8, 4, 64, 16, 8
     q = torch.zeros(B, H, D, dtype=torch.bfloat16)

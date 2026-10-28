@@ -473,8 +473,10 @@ def test_bidirectional_ranges_rejects_multi_item_scoring():
         )
 
 
-def test_bidirectional_ranges_packed_nvfp4_kv():
-    """The variant reads a packed NVFP4 cache through its scale factors."""
+@pytest.mark.parametrize("v_sf_swizzled", [False, True])
+def test_bidirectional_ranges_packed_nvfp4_kv(v_sf_swizzled):
+    """The variant reads a packed NVFP4 cache through its scale factors,
+    including V scales stored in the trtllm-gen per-page swizzle."""
     _skip_unless_fa2_jit()
     pytest.importorskip("tests.test_helpers.utils_fp4")
     from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
@@ -490,7 +492,17 @@ def test_bidirectional_ranges_packed_nvfp4_kv():
     k_packed, k_sf, k_gs = create_nvfp4_kv(kv_shape, str(device))
     v_packed, v_sf, v_gs = create_nvfp4_kv(kv_shape, str(device))
     kv_cache = torch.stack([k_packed, v_packed], dim=1)
-    kv_cache_sf = torch.stack([k_sf, v_sf], dim=1)
+    v_sf_stored = v_sf
+    if v_sf_swizzled:
+        # Within each group of four tokens, (t, s) is stored at (t', s').
+        t = torch.arange(PAGE_SIZE, device=device)[:, None]
+        s = torch.arange(v_sf.shape[-1], device=device)[None, :]
+        groups = v_sf.shape[-1] // 4
+        v_sf_stored = torch.empty_like(v_sf)
+        v_sf_stored[:, t // 4 * 4 + s // groups, :, s % groups * 4 + t % 4] = (
+            v_sf.permute(1, 3, 0, 2)
+        )
+    kv_cache_sf = torch.stack([k_sf, v_sf_stored], dim=1)
 
     # Dequantized reference in the query dtype.
     k_dq = (
@@ -524,6 +536,7 @@ def test_bidirectional_ranges_packed_nvfp4_kv():
         kv_data_type=torch.uint8,
         head_dim_qk=HEAD_DIM,
         head_dim_vo=HEAD_DIM,
+        v_sf_swizzled=v_sf_swizzled,
     )
     wrapper.plan(
         qo_indptr,

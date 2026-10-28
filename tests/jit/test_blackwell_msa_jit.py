@@ -1,178 +1,164 @@
-# Copyright (c) 2026 by FlashInfer team.
-# Licensed under the Apache License, Version 2.0.
+"""
+Copyright (c) 2026 by FlashInfer team.
 
-from types import SimpleNamespace
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from pathlib import Path
 
 import pytest
-from packaging.version import Version
 
-from flashinfer.jit import blackwell_msa
-
-
-def test_variant_manifest_matches_each_target_source_directory() -> None:
-    csrc_dir = blackwell_msa._get_blackwell_msa_csrc_dir()
-    assert set(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET) == {
-        "sm100a",
-        "sm103a",
-    }
-    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]) == 38
-    assert len(blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]) == 37
-    for target, variants in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET.items():
-        target_dir = csrc_dir / target
-        bodies = tuple(
-            sorted(
-                path.stem.removeprefix("blackwell_msa_")
-                for path in target_dir.glob("blackwell_msa_*.cu")
-                if not path.name.endswith("_binding.cu")
-            )
-        )
-        bindings = tuple(
-            sorted(
-                path.name.removeprefix("blackwell_msa_").removesuffix("_binding.cu")
-                for path in target_dir.glob("blackwell_msa_*_binding.cu")
-            )
-        )
-        assert bodies == variants
-        assert bindings == variants
-    assert (
-        "long_prefill_paged_bf16_gqa16_direct_group_sm100"
-        in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm100a"]
-    )
-    assert (
-        "long_prefill_paged_bf16_gqa16_direct_group_sm100"
-        not in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]
-    )
-    for variants in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET.values():
-        assert "decode_m16_bf16_paged_topk4_exact512" in variants
-        assert not any("active8" in variant for variant in variants)
+from flashinfer.jit import blackwell_msa as loader
 
 
-@pytest.mark.parametrize(
-    ("target", "expected_flag", "expected_define", "forbidden"),
-    [
-        (
-            "sm100a",
-            "-gencode=arch=compute_100a,code=sm_100a",
-            "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=0",
-            ("compute_103a", "compute_120"),
-        ),
-        (
-            "sm103a",
-            "-gencode=arch=compute_103a,code=sm_103a",
-            "-DFLASHINFER_BLACKWELL_MSA_TARGET_MINOR=3",
-            ("compute_100a", "compute_120"),
-        ),
-    ],
-)
-def test_uri_and_jit_specs(target, expected_flag, expected_define, forbidden) -> None:
-    blackwell_msa.gen_blackwell_msa_module.cache_clear()
-    for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]:
-        uri = blackwell_msa.get_blackwell_msa_uri(variant, target)
-        spec = blackwell_msa.gen_blackwell_msa_module(variant, target)
-        assert uri == f"blackwell_msa_{variant}_{target}"
-        assert spec.name == uri
-        assert len(spec.sources) == 1
-        assert spec.sources[0].name == f"blackwell_msa_{variant}_binding.cu"
-        assert spec.sources[0].parent.name == target
-        assert (spec.sources[0].parent / f"blackwell_msa_{variant}.cu").is_file()
-        assert expected_flag in spec.extra_cuda_cflags
-        assert expected_define in spec.extra_cuda_cflags
-        assert "-use_fast_math" in spec.extra_cuda_cflags
-        assert not any(
-            token in flag for token in forbidden for flag in spec.extra_cuda_cflags
-        )
-
-
-def test_validation_getter_and_cache(monkeypatch) -> None:
-    with pytest.raises(ValueError, match="unsupported Blackwell MSA target"):
-        blackwell_msa.get_blackwell_msa_uri("topk", "unknown")
-    with pytest.raises(ValueError, match="variant/target"):
-        blackwell_msa.get_blackwell_msa_uri(
-            "long_prefill_paged_bf16_gqa16_direct_group_sm100", "sm103a"
-        )
-    sentinel = object()
-    monkeypatch.setattr(
-        blackwell_msa,
-        "load_blackwell_msa_module",
-        lambda variant, target: (sentinel, variant, target),
-    )
-    assert blackwell_msa.get_blackwell_msa_module("topk", "sm103a") == (
-        sentinel,
-        "topk",
-        "sm103a",
-    )
-
-
-@pytest.mark.parametrize(
-    ("target_archs", "cuda_version", "expected_sm100a", "expected_sm103a"),
-    [
-        ({(10, "0a")}, "12.8", True, False),
-        ({(10, "0a")}, "12.9", True, False),
-        ({(10, "3a")}, "12.8", False, False),
-        ({(10, "3a")}, "12.9", False, True),
-        ({(10, "3f")}, "13.0", False, True),
-        ({(10, "0a"), (10, "3a")}, "13.0", True, True),
-        ({(12, "0f")}, "13.0", False, False),
-    ],
-)
-def test_aot_detects_exact_targets(
-    monkeypatch, target_archs, cuda_version, expected_sm100a, expected_sm103a
-) -> None:
-    from flashinfer import aot
-
-    class FakeCompilationContext:
-        TARGET_CUDA_ARCHS = target_archs
-
-        def get_nvcc_flags_list(self, supported_major_versions=None):
-            del supported_major_versions
-            return [
-                f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
-                for major, minor in sorted(self.TARGET_CUDA_ARCHS)
-            ]
-
-    monkeypatch.setattr(aot, "CompilationContext", FakeCompilationContext)
-    monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda_version))
-    capabilities = aot.detect_sm_capabilities()
-    assert capabilities["blackwell_msa_sm100a"] is expected_sm100a
-    assert capabilities["blackwell_msa_sm103a"] is expected_sm103a
+def _routes(target):
+    return loader.ROUTES[target]
 
 
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
-def test_aot_registers_target_specific_modules(monkeypatch, target) -> None:
-    from flashinfer import aot
+def test_every_route_names_a_program_built_for_its_target(target):
+    arch = loader._TARGET_ARCH[target]
+    for key, name in _routes(target).items():
+        assert arch in loader.MODULES[name]["arches"], (key, name, target)
+        assert loader.route_program(key, target) == name
 
-    calls = []
 
-    def fake_blackwell_msa(variant, selected_target):
-        calls.append((variant, selected_target))
-        return SimpleNamespace(name=f"blackwell_msa_{variant}_{selected_target}")
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_jit_spec_is_target_specific(target):
+    name = next(iter(_routes(target).values()))
+    spec = loader.gen_blackwell_msa_module(name, target)
+    assert spec.name == f"blackwell_msa_{name}_{target}"
+    assert loader.gen_blackwell_msa_module(name, target) is spec
 
-    monkeypatch.setattr(aot, "gen_blackwell_msa_module", fake_blackwell_msa)
-    monkeypatch.setattr(
-        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
+
+def test_every_record_names_a_registered_arg_plan():
+    """Every program names one ``ARG_PLANS`` entry and every plan is named."""
+    named = set()
+    for name, record in loader.MODULES.items():
+        plan = loader.ARG_PLANS[record["arg_plan"]]
+        grid = [argument for kind, argument in plan if kind == "grid"]
+        assert grid == ["grid_x", "grid_y", "grid_z"], name
+        named.add(record["arg_plan"])
+    assert named == set(loader.ARG_PLANS)
+
+
+def test_jit_package_reexports_resolve():
+    """Every name ``flashinfer/jit/__init__.py`` imports from the loader exists."""
+    import ast
+    import inspect
+
+    import flashinfer.jit
+
+    tree = ast.parse(Path(inspect.getsourcefile(flashinfer.jit)).read_text())
+    imported = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "blackwell_msa"
+        for alias in node.names
+    }
+    assert imported, "flashinfer.jit no longer re-exports the Blackwell MSA loader"
+    missing = sorted(name for name in imported if not hasattr(loader, name))
+    assert not missing, missing
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_variant_registry_lists_every_routed_program(target):
+    variants = loader.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]
+    assert set(_routes(target).values()) <= set(variants)
+    assert all(
+        loader._TARGET_ARCH[target] in loader.MODULES[name]["arches"]
+        for name in variants
     )
-    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    monkeypatch.setattr(
-        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
-    )
-    capabilities = {f"blackwell_msa_{target}": True}
-    aot.gen_all_modules(
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        capabilities,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-    )
-    assert calls == [
-        (variant, target)
-        for variant in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]
-    ]
+
+
+def _shared_binding_records():
+    """``MODULES`` records whose host binding is one shared per-argument-plan source."""
+    shared = {}
+    suffix = "_binding.cu"
+    for name, record in loader.MODULES.items():
+        stem = Path(record["sources"][1]).name[: -len(suffix)]
+        if stem != name:
+            shared[name] = record
+    return shared
+
+
+def _blackwell_msa_csrc():
+    return Path(loader.__file__).resolve().parents[2] / "csrc"
+
+
+def test_shared_bindings_take_each_record_from_its_compile_flags():
+    """Every ``#ifndef CAKE_* / #error`` selector of a shared binding source is set
+    exactly once, per target, by the record's compile flags; the kernel symbol and the
+    plan match the record."""
+    import re
+
+    csrc = _blackwell_msa_csrc()
+    shared = _shared_binding_records()
+    assert shared, "no shared bindings registered"
+    for name, record in shared.items():
+        stem = Path(record["sources"][1]).name[: -len("_binding.cu")]
+        assert stem == f"cake_blackwell_msa_{record['arg_plan']}", (name, stem)
+        text = (csrc / record["sources"][1]).read_text()
+        guards = re.findall(r"#ifndef (CAKE_\w+)\n#error", text)
+        assert "CAKE_PROGRAM_KERNEL" in guards, (name, guards)
+        assert "CAKE_BIND_SMEM" in guards, (name, guards)
+        assert f"-DCAKE_PROGRAM_KERNEL=kernel_{name}" in record["compile_flags"], name
+        per_target = record.get("target_compile_flags", {})
+        for target, arch in loader._TARGET_ARCH.items():
+            if arch not in record["arches"]:
+                continue
+            flags = list(record["compile_flags"]) + list(per_target.get(target, []))
+            for macro in guards:
+                hits = [f for f in flags if f.startswith(f"-D{macro}=")]
+                assert len(hits) == 1, (name, target, macro, hits)
+
+
+def test_shared_bindings_have_the_generated_form():
+    """Each shared binding source carries the generated -D-selected form and no digest."""
+    import re
+
+    csrc = _blackwell_msa_csrc()
+    bindings = {r["sources"][1] for r in _shared_binding_records().values()}
+    assert bindings, "no shared bindings registered"
+    for binding in sorted(bindings):
+        text = (csrc / binding).read_text()
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, binding
+        assert "namespace CAKE_BINDING_NS {" in text, binding
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_BINDING_NS::Run);" in text, (
+            binding
+        )
+        assert "config.dynamicSmemBytes = CAKE_BIND_SMEM;" in text, binding
+        assert not re.search(r"[0-9a-f]{20}", text), binding
+
+
+def test_shared_bindings_serve_one_arg_plan_each():
+    """Records sharing a binding source share one argument plan and no two carry the
+    same full compile-flag set."""
+    by_stem = {}
+    for record in _shared_binding_records().values():
+        stem = Path(record["sources"][1]).name[: -len("_binding.cu")]
+        by_stem.setdefault(stem, []).append(record)
+    assert by_stem, "no shared bindings registered"
+    for stem, records in by_stem.items():
+        assert len({r["arg_plan"] for r in records}) == 1, stem
+        tuples = {
+            (
+                tuple(r["compile_flags"]),
+                tuple(
+                    (t, tuple(f))
+                    for t, f in sorted(r.get("target_compile_flags", {}).items())
+                ),
+            )
+            for r in records
+        }
+        assert len(tuples) == len(records), (stem, len(tuples), len(records))

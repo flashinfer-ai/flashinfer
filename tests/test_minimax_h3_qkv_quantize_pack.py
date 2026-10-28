@@ -25,7 +25,7 @@ of every scale tile.
 from __future__ import annotations
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -103,44 +103,56 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a")],
 )
 def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
-    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_qkv_quantize_pack")
+    from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
+
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
-    assert router.minimax_h3_qkv_pack_target(torch.device("cuda")) == expected
+    assert ops.minimax_h3_qkv_pack_target(torch.device("cuda")) == expected
 
 
-def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
-    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_qkv_quantize_pack")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+@pytest.mark.parametrize("capability", [(9, 0), (12, 0)])
+def test_architecture_router_rejects_cross_routing(monkeypatch, capability) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
-        router.minimax_h3_qkv_pack_target(torch.device("cuda"))
+        ops.minimax_h3_qkv_pack_target(torch.device("cuda"))
 
 
-def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
-    from flashinfer.jit import cake_minimax_h3_qkv_pack as jit
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("P", PARTITIONS)
+def test_program_table_pins_the_generated_programs(P, fmt) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
+    from flashinfer.jit import cake_minimax_h3_qkv_quantize_pack as programs
 
-    calls = []
+    program = ops._PROGRAMS[(fmt, P)]
+    assert program is getattr(programs, f"{fmt.upper()}_P{P}")
+    assert program in programs.PROGRAMS
+    assert program.targets == ("sm_100a", "sm_103a")
+    assert program.target_for((10, 0)) == "sm_100a"
+    assert program.target_for((10, 3)) == "sm_103a"
+    assert program.target_for((12, 0)) is None
+    # NVFP4 takes the static global encode scale; MXFP8 has none.
+    assert ("out_global_scale" in program.args) == (fmt == "nvfp4")
+    assert program.args[-3:] == ("grid_x", "grid_y", "grid_z")
+    # The host grid rule assumes 8 warps per CTA.
+    assert program.block == (32 * ops._WARPS_PER_CTA, 1, 1)
 
-    class _PhysicalModule:
-        @staticmethod
-        def minimax_h3_qkv_pack_route_record(P, fmt):
-            return {"target": "sm103a", "P": P, "format": fmt}
 
-        @staticmethod
-        def gen_minimax_h3_qkv_pack_module(P, fmt):
-            calls.append((P, fmt))
-            return SimpleNamespace(name=f"{fmt}_{P}")
+def test_call_args_follow_the_binding_order() -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
 
-    monkeypatch.setattr(jit.importlib, "import_module", lambda *_args: _PhysicalModule)
-    specs = jit.gen_minimax_h3_qkv_pack_aot_modules("sm103a")
+    program = ops._PROGRAMS[("nvfp4", 8)]
+    host_names = program.args[:-3]
+    values = {name: object() for name in host_names}
+    args = ops._call_args(program, values, grid=(7, 8, 1))
+    assert args == tuple(values[name] for name in host_names) + (7, 8, 1)
 
-    assert jit.MINIMAX_H3_QKV_PACK_PARTITIONS == PARTITIONS
-    assert jit.MINIMAX_H3_QKV_PACK_FORMATS == FORMATS
-    assert len(calls) == 8
-    assert len(specs) == 8
-    assert {fmt for _, fmt in calls} == set(FORMATS)
+    del values["out_global_scale"]
+    with pytest.raises(RuntimeError, match="out_global_scale"):
+        ops._call_args(program, values, grid=(7, 8, 1))
 
 
 @pytest.mark.parametrize(
@@ -161,16 +173,7 @@ def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
 def test_launch_grid_follows_the_runtime_token_count(M, P, expected) -> None:
     from flashinfer.diffusion_ops import cake_minimax_h3_qkv_pack as ops
 
-    record = {
-        "launch_grid_rule": {
-            "kind": "pack_warps_2d_plus_padding",
-            "tokens_per_warp": 16,
-            "warps_per_cta": 8,
-        }
-    }
-    assert ops._stage_launch_grid(record, M=M, P=P) == expected
-    with pytest.raises(RuntimeError, match="launch grid rule"):
-        ops._stage_launch_grid({"launch_grid_rule": {"kind": "other"}}, M=M, P=P)
+    assert ops.minimax_h3_qkv_pack_launch_grid(M, P) == expected
 
 
 @pytest.mark.parametrize("fmt", FORMATS)

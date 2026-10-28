@@ -2,7 +2,7 @@
 
 No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing
-for BOTH sm107 backends (mxfp8 and nvfp4).
+for the SM107 block-scaled backends.
 
 Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe``
 internals that pull cutlass: the ``unit`` run_tests.sh target collects this
@@ -18,6 +18,7 @@ import pytest
 
 from flashinfer.moe_ep import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
@@ -31,7 +32,16 @@ from flashinfer.moe_ep.core.kernel.registry import (
     is_mega_kernel_config,
 )
 
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backend import (
+    Sm107Mxfp8Mxfp4MegaKernelBackend,
+)
+
 _BACKENDS = (
+    (
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107Mxfp8Mxfp4MegaKernelBackend,
+        "sm107_mxfp8_mxfp4_bf16_cutedsl",
+    ),
     (
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm107Mxfp8BlockScaledMegaKernelBackend,
@@ -69,7 +79,7 @@ class TestSm107BlockScaledConfig:
         assert cfg.fast_math is True
         assert cfg.in_kernel_fc2_reduce is False
         assert cfg.token_back_mode == "epi_warps"
-        assert cfg.apply_topk_in_fc1 is True
+        assert cfg.apply_routing_weights_before_fc2 is True
         assert cfg.schedule_policy == ("grouped", None)
         assert cfg.work_id_mode == "grid_stride"
         assert cfg.fc2_use_bulk is False
@@ -177,13 +187,13 @@ class TestSm107ArchGate:
         monkeypatch.setattr(vcommon, "_device_capability", lambda: (10, 7))
         vcommon.validate_mega_arch_sm107()  # exactly Rubin passes
 
-    def test_in_kernel_reduce_requires_topk_in_fc1(self) -> None:
+    def test_in_kernel_reduce_requires_early_routing_weights(self) -> None:
         # The shim config enforces this; the backend surfaces it at workspace
         # allocation. Host-only check via the shim dataclass would import the
         # drop, so assert the backend config carries the fields instead.
         cfg = _config(
             Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
             in_kernel_fc2_reduce=True,
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
-        assert cfg.in_kernel_fc2_reduce and cfg.apply_topk_in_fc1
+        assert cfg.in_kernel_fc2_reduce and cfg.apply_routing_weights_before_fc2
