@@ -71,11 +71,12 @@ def _get_compiled_kernel(device_index: int, tactic: tuple, use_pdl: bool):
         use_tma_store=True,
         use_pdl=use_pdl,
     )
+    a, b, c, a_scale, b_scale, stream = _create_fake_tensors(
+        cutlass.BFloat16, cutlass.BFloat16, "k", "k", "n"
+    )
     with torch.cuda.device(device_index):
         return _compile_and_create_tensor_api(
-            kernel,
-            *_create_fake_tensors(cutlass.BFloat16, cutlass.BFloat16, "k", "k", "n"),
-            (cluster_m, cluster_n),
+            kernel, a, b, c, a_scale, b_scale, stream, (cluster_m, cluster_n)
         )
 
 
@@ -96,6 +97,7 @@ def run_persistent_dense(a, b, out, pdl: bool, tactic: tuple = TACTICS[0]):
             # (1, K, N) with compact batch stride, matching the fake tensor.
             b.T.unsqueeze(0).transpose(1, 2),
             out.unsqueeze(0),
+            _unit_scale(device_index),
             _unit_scale(device_index),
         )
     return out
