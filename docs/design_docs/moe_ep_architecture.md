@@ -321,12 +321,16 @@ or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
 
 On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
-inference and GenPhase. An enabled `autotune_v2()` warmup first resolves native
-knobs within each eligible variant, then compares forwards including input
-staging and output copies. The same numerical settings apply to both variants;
+inference and GenPhase. An enabled `autotune_v2()` warmup measures every knob
+candidate including input staging, compute and output copies, then selects the
+best of each variant's winners. Both levels use the same timing boundary.
+The same numerical settings apply to both variants;
 GenPhase is excluded when its capacity or combine requirements are not met.
-The outer result uses a separate managed-cache entry. A replay miss uses the
-inference heuristic and leaves selection pending.
+The result uses a separate managed-cache entry from explicit-variant tuning,
+which keeps its existing kernel-only timing. Selecting a result also writes its
+knobs to the MegaMoE compatibility file when persistence is enabled. These file
+records can configure fixed workspaces, but do not replace kernel-only tuning
+results. A replay miss uses the inference heuristic and leaves selection pending.
 
 Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
 selection. It returns the concrete kernel config with the selected variant and

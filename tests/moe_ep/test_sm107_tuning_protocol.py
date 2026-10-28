@@ -812,3 +812,19 @@ def test_ep_subgroup_cache_agreement_and_mode_mismatch(tmp_path):
         nprocs=3,
         join=True,
     )
+
+
+def test_full_forward_file_record_does_not_replace_kernel_tuning(state):
+    protocol = tuning_protocol.RubinTuningProtocol(None, None, None, state.workspace)
+    knobs = {"fc2_use_bulk": False}
+    query = protocol._query(4)
+    record = knob_cache.make_record(knobs, **query)
+    record["timing_boundary"] = "complete_forward"
+    knob_cache.write_record(record)
+    assert knob_cache.lookup_knobs(**query) == knobs
+    with autotune_v2(mode="replay"):
+        assert state.run() is None
+    state.sweep.assert_not_called()
+    with autotune_v2():
+        assert state.run() == knobs
+    state.sweep.assert_called_once()

@@ -190,12 +190,17 @@ def _sweep_sm107_block_scaled_mega_moe(
     timed_iters: int = 10,
     process_group=None,
     measurement=None,
+    make_trial=None,
 ) -> tuple[Dict[str, Any], float, int]:
     """Validate candidates against a sampled Torch oracle and time survivors.
 
     Every EP rank must participate. GPU allocation, compile, or launch errors
     abort the sweep: run distributed tuning under a worker supervisor with
     a timeout. Continuing after a rank-local CUDA fault is unsafe.
+
+    ``make_trial`` can wrap each prepared workspace with a ``launch(l1, l2)``
+    that includes input staging and output handling. The same launch is used
+    for warmup, measurement and correctness checks.
     """
     import dataclasses
 
@@ -222,7 +227,7 @@ def _sweep_sm107_block_scaled_mega_moe(
     if num_tokens is None or not 0 <= num_tokens <= cfg.max_tokens_per_rank:
         raise ValueError("stage a valid num_tokens before autotuning.")
 
-    if y is None:
+    if y is None and make_trial is None:
         y = torch.empty(
             num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
         )
@@ -239,7 +244,7 @@ def _sweep_sm107_block_scaled_mega_moe(
             )
         spec = dataclasses.asdict(cfg)
         spec.pop("rank")
-        proposal = (spec, candidates, warmup_iters, timed_iters)
+        proposal = (spec, candidates, warmup_iters, timed_iters, make_trial is not None)
         proposals = [None] * cfg.world_size
         dist.all_gather_object(proposals, proposal, group=process_group)
         if any(p != proposal for p in proposals):
@@ -305,14 +310,19 @@ def _sweep_sm107_block_scaled_mega_moe(
             cfg.world_size,
             process_group,
         )
+        measured_trial = trial if make_trial is None else make_trial(trial)
         barrier()
         for _ in range(warmup_iters):
-            sm107_block_scaled_mega_moe(
-                y, transformed_l1, transformed_l2, trial, num_tokens=num_tokens
-            )
+            if make_trial is None:
+                sm107_block_scaled_mega_moe(
+                    y, transformed_l1, transformed_l2, trial, num_tokens=num_tokens
+                )
+            else:
+                measured_trial.launch(transformed_l1, transformed_l2)
         torch.cuda.synchronize()
+        actual = y if y is not None else trial.output_activation[:num_tokens]
         error = torch.tensor(
-            output_error(y, indices, expected), dtype=torch.float64, device="cuda"
+            output_error(actual, indices, expected), dtype=torch.float64, device="cuda"
         )
         if collective:
             dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
@@ -325,7 +335,7 @@ def _sweep_sm107_block_scaled_mega_moe(
 
         try:
             samples = measure_samples(
-                trial,
+                measured_trial,
                 (transformed_l1, transformed_l2),
                 timed_iters,
                 measurement
@@ -348,8 +358,13 @@ def _sweep_sm107_block_scaled_mega_moe(
         if collective:
             # Reduce each matched sample before taking its median.
             dist.all_reduce(times, op=dist.ReduceOp.MAX, group=process_group)
+        actual = (
+            y
+            if make_trial is not None and y is not None
+            else trial.output_activation[:num_tokens]
+        )
         error = torch.tensor(
-            output_error(trial.output_activation[:num_tokens], indices, expected),
+            output_error(actual, indices, expected),
             dtype=torch.float64,
             device="cuda",
         )

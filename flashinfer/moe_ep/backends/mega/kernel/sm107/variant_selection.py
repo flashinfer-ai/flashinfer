@@ -5,9 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import math
 import os
-import statistics
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -92,7 +90,7 @@ class VariantWorkspace:
 
 
 class RubinVariantBackend(MegaKernelBackend):
-    """Own one selected workspace; retain native tuning within each variant."""
+    """Select a variant and its knobs by complete-forward latency."""
 
     _config: (
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -316,22 +314,21 @@ class _ForwardTrial:
     def __init__(
         self,
         owner: VariantWorkspace,
-        weights: TransformedMegaWeights,
         output: torch.Tensor | None,
     ):
         if owner.tensors is None:
             raise RuntimeError("Stage inputs before measuring a variant")
         self.tensors = owner.tensors
-        self.owner, self.weights, self.output = owner, weights, output
+        self.owner, self.output = owner, output
         self.config = owner.workspace.config
         self.device = owner.workspace.device
 
-    def launch(self):
+    def launch(self, l1, l2):
         owner = self.owner
         owner.kernel.stage_inputs(
             self.tensors, owner.workspace, quantize_input=owner.quantize_input
         )
-        owner.kernel.compute(owner.workspace, self.weights, output=self.output)
+        owner.kernel.compute(owner.workspace, (l1, l2), output=self.output)
 
 
 class _VariantProtocol:
@@ -386,6 +383,7 @@ class _VariantProtocol:
         )
         return {
             "native": native,
+            "timing_boundary": "complete_forward_candidates",
             "variants": variants,
             "allow_nondeterministic": self.backend._config.in_kernel_fc2_reduce,
             "native_skipped": _cache_identity(context)[1],
@@ -440,10 +438,10 @@ class _VariantProtocol:
             )
 
             knobs = _knobs_from_json(record["knobs"])
-            native_record = record.get("native_record")
-            if native_record is not None and (
-                not isinstance(native_record, dict)
-                or _knobs_from_json(native_record["knobs"]) != knobs
+            knob_record = record.get("knob_record")
+            if knob_record is not None and (
+                not isinstance(knob_record, dict)
+                or _knobs_from_json(knob_record["knobs"]) != knobs
             ):
                 return False
             kernel = self.backend._backend(record["variant"], knobs)
@@ -463,14 +461,7 @@ class _VariantProtocol:
             return False
 
     def run(self, context: TuningContext):
-        from .....core.tuning_measurement import (
-            CaptureUnsupported,
-            measure_samples,
-            measurement_settings,
-        )
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
-            _prepare_collectively,
-        )
+        from .....core.tuning_measurement import measurement_settings
 
         backend, owner = self.backend, self.owner
         state = owner._tuning_state
@@ -532,136 +523,83 @@ class _VariantProtocol:
             state.record_selection(None, _cache_identity(context), None)
             return TuningResult(None)
         if record is None:
-            import torch.distributed as dist
             from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
             from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+                _sweep_sm107_block_scaled_mega_moe,
+                sm107_candidates,
+            )
             from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-                NAMESPACE as NATIVE_NAMESPACE,
+                RubinTuningProtocol,
             )
 
             candidates = []
+            group = backend.ep_comm_group if backend.ep_world_size > 1 else None
+            live_tokens = max(backend._gather(self.tensors.num_tokens))
+
+            def make_trial(workspace):
+                return _ForwardTrial(
+                    VariantWorkspace(
+                        owner.fleet,
+                        backend._fixed_backend(workspace),
+                        workspace,
+                        tensors=self.tensors,
+                        quantize_input=owner.quantize_input,
+                    ),
+                    self.output,
+                )
+
             for variant in variants:
                 kernel = backend._backend(variant)
-                workspace = kernel.prepare_workspace(backend._ep_bootstrap, owner.fleet)
-                _prepare_collectively(
-                    lambda: workspace.prepare(*self.weights),
-                    backend.ep_world_size,
-                    backend.ep_comm_group if backend.ep_world_size > 1 else None,
-                )
+                workspace = kernel._allocate_workspace(owner.fleet)
                 kernel.stage_inputs(
                     self.tensors, workspace, quantize_input=owner.quantize_input
                 )
-                kernel.compute(workspace, self.weights, output=self.output)
-                fixed = backend._fixed_backend(workspace)
-                trial_owner = VariantWorkspace(
-                    owner.fleet,
-                    fixed,
+                # Skipping inner tuning still permits comparing the variants'
+                # heuristic configurations, with the same full-forward objective.
+                knobs_to_try = (
+                    [{name: getattr(workspace.config, name) for name in KNOB_KEYS}]
+                    if contract["native_skipped"]
+                    else sm107_candidates(
+                        workspace.config.quant_kind,
+                        kernel_variant=variant,
+                        allow_in_kernel_fc2_reduce=backend._config.in_kernel_fc2_reduce
+                        and workspace.config.combine_dtype == "bf16",
+                    )
+                )
+                knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
+                    self.output,
+                    self.weights[0],
+                    self.weights[1],
                     workspace,
-                    tensors=self.tensors,
-                    quantize_input=owner.quantize_input,
+                    num_tokens=self.tensors.num_tokens,
+                    candidates=knobs_to_try,
+                    process_group=group,
+                    measurement=measurement,
+                    make_trial=make_trial,
                 )
-                trial = _ForwardTrial(trial_owner, self.weights, self.output)
-                for _ in range(3):
-                    trial.launch()
-                torch.cuda.synchronize()
-                from .....kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
-                    sampled_reference,
-                    output_error,
-                )
-
-                indices, expected = sampled_reference(
-                    workspace,
-                    *self.weights,
-                    self.tensors.num_tokens,
-                    process_group=backend.ep_comm_group
-                    if backend.ep_world_size > 1
-                    else None,
-                )
-                try:
-                    samples = measure_samples(
-                        trial,
-                        (),
-                        10,
-                        measurement,
-                        backend.ep_comm_group if backend.ep_world_size > 1 else None,
-                    )
-                except CaptureUnsupported:
-                    # Capture rejection is already coordinated by the timer.
-                    fixed.destroy(workspace)
-                    continue
-                times = torch.tensor(
-                    samples, dtype=torch.float64, device=workspace.device
-                )
-                if backend.ep_world_size > 1:
-                    dist.all_reduce(
-                        times, op=dist.ReduceOp.MAX, group=backend.ep_comm_group
-                    )
-                actual = (
-                    workspace.output_activation[: self.tensors.num_tokens]
-                    if self.output is None
-                    else self.output
-                )
-                error = torch.tensor(
-                    output_error(actual, indices, expected),
-                    dtype=torch.float64,
-                    device=workspace.device,
-                )
-                if backend.ep_world_size > 1:
-                    dist.all_reduce(
-                        error, op=dist.ReduceOp.MAX, group=backend.ep_comm_group
-                    )
-                tolerance = 0.06 if workspace.config.quant_kind == "nvfp4" else 0.02
-                if not math.isfinite(float(error)) or float(error) > tolerance:
-                    fixed.destroy(workspace)
-                    continue
-                knobs = workspace._tuning_state.winner or {
-                    name: getattr(workspace.config, name) for name in KNOB_KEYS
-                }
-                native_context = context.tuner.protocol_context(NATIVE_NAMESPACE)
-                from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-                    RubinTuningProtocol,
-                )
-
-                native_protocol = RubinTuningProtocol(
+                query = RubinTuningProtocol(
                     self.output,
                     self.weights[0],
                     self.weights[1],
                     workspace,
                     num_tokens=self.tensors.num_tokens,
                     allow_nondeterministic=backend._config.in_kernel_fc2_reduce,
-                    process_group=backend.ep_comm_group
-                    if backend.ep_world_size > 1
-                    else None,
+                    process_group=group,
+                )._query(live_tokens)
+                knob_record = knob_cache.make_record(
+                    knobs, **query, p50_us=score, source="autotune-complete-forward"
                 )
-                query = native_protocol._query(
-                    max(backend._gather(self.tensors.num_tokens))
-                )
-                native_records = [
-                    value
-                    for value in native_context.records().values()
-                    if isinstance(value, dict)
-                    and knob_cache._knobs_from_json(value.get("knobs", {})) == knobs
-                ]
-                native_record = native_protocol._lookup(
-                    native_records,
-                    query,
-                    native_protocol._contract(),
-                    native_context,
-                    measurement_settings(native_context),
-                )
+                knob_record["timing_boundary"] = "complete_forward"
                 candidates.append(
                     {
                         "variant": variant,
                         "knobs": knobs,
-                        "p50_us": statistics.median(times.tolist()),
-                        "native_record": native_record,
+                        "p50_us": score,
+                        "knob_record": knob_record,
                     }
                 )
-                fixed.destroy(workspace)
-            if not candidates:
-                raise RuntimeError(
-                    "No Rubin variant passed complete-forward validation"
-                )
+                kernel.destroy(workspace)
             record = {
                 **min(candidates, key=lambda candidate: candidate["p50_us"]),
                 "contract": contract,
@@ -677,23 +615,11 @@ class _VariantProtocol:
         if backend.ep_rank == 0:
             try:
                 context.publish(key, record)
-                native_record = record.get("native_record")
-                if native_record is not None:
-                    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-                        NAMESPACE as NATIVE_NAMESPACE,
-                        record_key,
-                    )
-
-                    native_context = context.tuner.protocol_context(NATIVE_NAMESPACE)
-                    native_context.publish(record_key(native_record), native_record)
-                if (
-                    context.disk_cache_enabled
-                    and record.get("native_record") is not None
-                ):
+                if context.disk_cache_enabled and record.get("knob_record") is not None:
                     from flashinfer.jit.core import logger
 
                     try:
-                        knob_cache.write_record(record["native_record"])
+                        knob_cache.write_record(record["knob_record"])
                     except Exception as exc:
                         logger.warning(
                             f"[Autotuner]: Cannot write MegaMoE cache file: {exc}"

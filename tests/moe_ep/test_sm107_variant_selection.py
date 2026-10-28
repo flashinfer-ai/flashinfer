@@ -135,7 +135,7 @@ def test_cache_hit_reconstructs_tuples_and_republishes_file(protocol, monkeypatc
         "contract": contract,
         "variant": "genphase",
         "knobs": knobs,
-        "native_record": native,
+        "knob_record": native,
     }
     write = Mock()
     monkeypatch.setattr(knob_cache, "write_record", write)
@@ -183,12 +183,12 @@ def test_miss_remains_pending_and_skip_uses_fallback(protocol, monkeypatch):
     protocol._install.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["resource", "native_record"])
+@pytest.mark.parametrize("failure", ["resource", "knob_record"])
 def test_invalid_cached_variant_is_a_collective_miss(protocol, monkeypatch, failure):
     protocol, contract = protocol
     record = {"contract": contract, "variant": "inference", "knobs": {}}
-    if failure == "native_record":
-        record["native_record"] = {"knobs": {"fc2_use_bulk": True}}
+    if failure == "knob_record":
+        record["knob_record"] = {"knobs": {"fc2_use_bulk": True}}
     else:
 
         def invalid_resource(config):
@@ -330,3 +330,123 @@ def test_install_prepares_independent_storage_before_releasing_previous(
     assert events == ["prepare", "release"]
     selected.prepare_workspace.assert_not_called()
     assert protocol.owner.workspace is raw
+
+
+@pytest.mark.parametrize("output_view", [False, True])
+def test_full_forward_sweep_selects_across_all_knobs(
+    protocol, monkeypatch, output_view
+):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+        correctness,
+        tuning_measurement,
+        tuning_protocol,
+    )
+
+    protocol, contract = protocol
+    contract["native_skipped"] = False
+    backend = protocol.backend
+    configs = {
+        variant: backend._backend(variant)._resolved_config(protocol.owner.fleet)
+        for variant in contract["variants"]
+    }
+    grid = [{"epi_flag_batches": (flag, 4)} for flag in (1, 2)]
+    measured = []
+    events = []
+    buffers = []
+    output = torch.empty(4, 1024)[:, ::2]
+    protocol.output = output if output_view else None
+
+    class Buffer:
+        _build_kernel = staticmethod(lambda cfg: None)
+
+        def __init__(self, cfg):
+            self.config, self.device = cfg, torch.device("cpu")
+            self.x = torch.zeros(4, 512)
+            self.x_sf = torch.zeros(4, 16)
+            self.topk_idx = torch.zeros(4, 3, dtype=torch.int32)
+            self.topk_weights = torch.ones(4, 3)
+            self.output_activation = torch.zeros(4, 512)
+            self.prepared = False
+            self.destroyed = False
+            buffers.append(self)
+
+        def note_staged_tokens(self, count):
+            self.count = count
+
+        def prepare(self, *weights):
+            self.prepared = True
+
+        def destroy(self):
+            self.destroyed = True
+
+    class Kernel:
+        def __init__(self, variant, knobs="auto"):
+            self.cfg = dataclasses.replace(
+                configs[variant], **({} if knobs == "auto" else knobs)
+            )
+
+        def _allocate_workspace(self, fleet):
+            return Buffer(self.cfg)
+
+        def stage_inputs(self, tensors, workspace, *, quantize_input):
+            events.append("stage")
+            workspace.note_staged_tokens(tensors.num_tokens)
+
+        def compute(self, workspace, weights, *, output):
+            assert self.cfg == workspace.config
+            assert workspace.prepared
+            assert events[-1] == "stage"
+            events.append("compute")
+            workspace.output_activation.fill_(1)
+            if output is not None:
+                output.copy_(workspace.output_activation)
+                events.append("copy")
+
+        def destroy(self, workspace):
+            workspace.destroy()
+
+    def measure(trial, weights, repeats, settings, group):
+        trial.launch(*weights)
+        expected_events = ["stage", "compute"] + (["copy"] if output_view else [])
+        assert events[-len(expected_events) :] == expected_events
+        key = (trial.config.kernel_variant, trial.config.epi_flag_batches[0])
+        measured.append(key)
+        # GenPhase's second candidate wins the full-forward objective. A cached
+        # kernel-only winner for its first candidate must not narrow the sweep.
+        return [
+            {
+                ("inference", 1): 9,
+                ("inference", 2): 6,
+                ("genphase", 1): 8,
+                ("genphase", 2): 3,
+            }[key]
+        ] * repeats
+
+    monkeypatch.setattr(backend, "_backend", Kernel)
+    monkeypatch.setattr(block_scaled, "Sm107BlockScaledSymmBuffer", Buffer)
+    monkeypatch.setattr(native, "sm107_candidates", lambda *args, **kwargs: grid)
+    monkeypatch.setattr(correctness, "sampled_reference", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(
+        correctness,
+        "output_error",
+        lambda actual, *a: 0 if torch.all(actual == 1) else 1,
+    )
+    monkeypatch.setattr(tuning_measurement, "measure_samples", measure)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    tensor = torch.tensor
+    monkeypatch.setattr(
+        torch, "tensor", lambda *a, **kw: tensor(*a, **{**kw, "device": "cpu"})
+    )
+    with autotune_v2(persistent_cache=False):
+        native_context = AutoTuner.get().protocol_context(tuning_protocol.NAMESPACE)
+        cached = {"knobs": grid[0], "p50_us": 1}
+        native_context.publish("kernel-only", cached)
+        previous = dict(native_context.records())
+        result = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+        assert dict(native_context.records()) == previous
+    assert measured == [(v, flag) for v in ("inference", "genphase") for flag in (1, 2)]
+    assert result["variant"] == "genphase"
+    assert result["knobs"] == grid[1]
+    assert result["knob_record"]["timing_boundary"] == "complete_forward"
+    assert all(buffer.destroyed for buffer in buffers)

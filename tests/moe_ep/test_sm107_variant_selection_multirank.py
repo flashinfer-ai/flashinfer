@@ -78,11 +78,7 @@ def test_variant_search_replay_and_handoff(
         skip_ops={NATIVE_NAMESPACE} if scenario == "native-skipped" else None,
     )
     expected_calls = (
-        []
-        if scenario == "native-skipped"
-        else (
-            ["inference"] if scenario == "inference-only" else ["inference", "genphase"]
-        )
+        ["inference"] if scenario == "inference-only" else ["inference", "genphase"]
     )
     w13, w2, x, ids, scores = problem._global_problem(world)
     pack, _, _ = weight_pack(w13, w2, kind)
@@ -135,6 +131,9 @@ def test_variant_search_replay_and_handoff(
 
     def counted(*args, **kwargs):
         calls.append(args[3].config.kernel_variant)
+        assert kwargs["make_trial"] is not None
+        if scenario == "native-skipped":
+            assert len(kwargs["candidates"]) == 1
         return sweep(*args, **kwargs)
 
     monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", counted)
