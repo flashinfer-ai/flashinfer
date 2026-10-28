@@ -1188,8 +1188,19 @@ def _in_child_process(body, *args, timeout=600) -> list:
     """body(*args) -> failures in a child process of every rank, with its own
     process group: a kernel that traps loses the child's CUDA context only."""
     import socket
+    import sys
 
     import torch.multiprocessing as mp
+
+    # The child re-imports this module by its dotted name (tests.moe_ep...) to
+    # unpickle its target, on the parent's sys.path, which spawn restores before
+    # unpickling. pytest.ini selects --import-mode=importlib, which does not put
+    # the repo root there, and plain ``pytest`` (unlike ``python -m pytest``)
+    # does not add the working directory either.
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(test_dir))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
     g = _group()
     rendezvous = None
