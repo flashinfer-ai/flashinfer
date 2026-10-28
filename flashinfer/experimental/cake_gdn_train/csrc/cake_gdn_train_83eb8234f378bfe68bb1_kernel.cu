@@ -140,10 +140,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_V24_OFF 50176
 #define SMEM_SMEM_V24_STAGE_BYTES 16384
 #define SMEM_SMEM_V24_STRIDE 16384
-#define SMEM_SMEM_V25_OFF 66560
+#define SMEM_SMEM_V25_OFF 210944
 #define SMEM_SMEM_V25_STAGE_BYTES 16384
 #define SMEM_SMEM_V25_STRIDE 16384
-#define SMEM_SMEM_V26_OFF 66560
+#define SMEM_SMEM_V26_OFF 210944
 #define SMEM_SMEM_V26_STAGE_BYTES 16384
 #define SMEM_SMEM_V26_STRIDE 16384
 #define SMEM_SMEM_V27_OFF 173056
@@ -203,7 +203,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TK_S_OFF 209984
 #define SMEM_TK_S_STAGE_BYTES 16
 #define SMEM_TK_S_STRIDE 16
-#define SMEM_TOTAL 210176
+#define SMEM_TOTAL 227328
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -427,10 +427,10 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     const int dwbt_mn_addr = smem + 33792;
     __nv_bfloat16* smem_v24 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 50176);
     const int smem_v24_addr = smem + 50176;
-    __nv_bfloat16* smem_v25 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_v25_addr = smem + 66560;
-    __nv_bfloat16* smem_v26 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_v26_addr = smem + 66560;
+    __nv_bfloat16* smem_v25 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 210944);
+    const int smem_v25_addr = smem + 210944;
+    __nv_bfloat16* smem_v26 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 210944);
+    const int smem_v26_addr = smem + 210944;
     __nv_bfloat16* smem_v27 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
     const int smem_v27_addr = smem + 173056;
     __nv_bfloat16* smem_v28 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 181248);
@@ -3444,15 +3444,21 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             int c1 = seg_2 * 64;
                             tma_2d_gmem2smem(h_p_addr + (unsigned int)(seg_2 * 16384), (&h_tma), c1, hrow0, h_full_addr);
                         }
+                        mbarrier_arrive_expect_tx(dh_full_addr, 32768);
+                        #pragma unroll
+                        for (int seg_3 = 0; seg_3 < 2; seg_3++) {
+                            int c4 = seg_3 * 64;
+                            tma_2d_gmem2smem(dh_p_addr + (unsigned int)(seg_3 * 16384), (&dh_tma), c4, hrow0, dh_full_addr);
+                        }
                         mbarrier_wait(dv_stored_addr, _phase_dv_stored_0);
                         _phase_dv_stored_0 ^= 1;
                         mbarrier_arrive_expect_tx(v_full_addr, 16384);
                         mbarrier_arrive_expect_tx(dvn_full_addr, 16384);
                         #pragma unroll
-                        for (int seg_3 = 0; seg_3 < 2; seg_3++) {
-                            int c4 = seg_3 * 64;
-                            tma_3d_gmem2smem(smem_v2_addr + (unsigned int)(seg_3 * 8192), (&v_tma), c4, hv_1, trow_1, v_full_addr);
-                            tma_3d_gmem2smem(smem_v5_addr + (unsigned int)(seg_3 * 8192), (&dvn_tma), c4, hv_1, row0_1, dvn_full_addr);
+                        for (int seg_4 = 0; seg_4 < 2; seg_4++) {
+                            int c4_1 = seg_4 * 64;
+                            tma_3d_gmem2smem(smem_v2_addr + (unsigned int)(seg_4 * 8192), (&v_tma), c4_1, hv_1, trow_1, v_full_addr);
+                            tma_3d_gmem2smem(smem_v5_addr + (unsigned int)(seg_4 * 8192), (&dvn_tma), c4_1, hv_1, row0_1, dvn_full_addr);
                         }
                         mbarrier_wait(d_committed_addr, _phase_d_committed_0);
                         _phase_d_committed_0 ^= 1;
@@ -3460,12 +3466,6 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         tma_3d_gmem2smem(akk_s_addr, (&akk_tma), 0, hv_1, row0_1, akk_full_addr);
                         mbarrier_wait(e_committed_addr, _phase_e_committed_0);
                         _phase_e_committed_0 ^= 1;
-                        mbarrier_arrive_expect_tx(dh_full_addr, 32768);
-                        #pragma unroll
-                        for (int seg_4 = 0; seg_4 < 2; seg_4++) {
-                            int c2 = seg_4 * 64;
-                            tma_2d_gmem2smem(dh_p_addr + (unsigned int)(seg_4 * 16384), (&dh_tma), c2, hrow0, dh_full_addr);
-                        }
                         if (hl_1 == r_l - 1) {
                             int un = (int)drawn;
                             if (un < ngroups_l) {

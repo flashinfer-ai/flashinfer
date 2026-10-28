@@ -316,8 +316,8 @@ kernel_cake_gdn_train_7c591421af4c01babb73(const __grid_constant__ CUtensorMap k
             int tc0 = ch * 32;
             unsigned int ls = 0;
             unsigned int fs = 0;
-            int w_row = warp_in_wg * 16 + (lane >> 1);
-            int w_col = (lane & 1) * 64;
+            int w_row = warp_in_wg * 16 + (lane & 7) + (lane >> 4 << 3);
+            int w_col = (lane >> 3 & 1) * 64;
             int t_col = (warp_in_wg & 1) * 32 + lane;
             int k_row0 = (warp_in_wg >> 1) * 64;
             unsigned int mask_hi = 4294901760u;
