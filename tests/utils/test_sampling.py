@@ -762,14 +762,18 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (45, 81928, "none", 10272, 12288),
         (320, 69632, "none", 8704, 10240),
         (82, 70000, "none", 8768, 10240),
-        # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10.
+        # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10,
+        # or on sm_100 past one wave.
         (30, 140000, "none", 8768, 8768),
         (70, 201088, "none", 12576, 12576),
-        # Whole tiles: the wide row kernel, a 16-CTA chunk with a cut under 1/10,
-        # a one-wave 4-tile 16-CTA row kernel with a cut of at most 1/16, the
-        # 8-tile 16-CTA row kernel, and rows past five persistent waves (sm_100).
+        (32, 151936, "none", 9504, 10240),
+        (40, 151936, "none", 9504, 10240),
+        (64, 180000, "none", 11264, 12288),
+        # Whole tiles: the wide row kernel, a one-wave 16-CTA chunk with a cut
+        # under 1/10, a one-wave 4-tile 16-CTA row kernel with a cut of at most
+        # 1/16, the 8-tile 16-CTA row kernel, and rows past five persistent waves
+        # (sm_100).
         (8, 256000, "none", 26624, 22528),
-        (32, 151936, "none", 10240, 10240),
         (24, 151936, "none", 10240, 16384),
         (8, 126464, "none", 8192, 8192),
         (1, 151936, "none", 10240, 10240),

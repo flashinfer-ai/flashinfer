@@ -116,7 +116,7 @@ constexpr uint64_t kSixTileC8PersistentRowsDenSm103 = 9;
 // The balanced chunk (see select_cached_launch): rounding, the minimum
 // cut of the whole-tile chunk (1/32; 1/16 past one wave, and for a one-wave
 // 4-tile 16-CTA row kernel), the waves it covers, and the minimum cut (1/10)
-// of a 16-CTA 8-tile chunk.
+// of a 16-CTA 8-tile chunk (in one wave on sm_100).
 constexpr uint32_t kBalancedChunkElements = 32;
 constexpr uint64_t kBalancedChunkMinCutDen = 32;
 constexpr uint64_t kBalancedChunkMultiWaveCutDen = 16;
@@ -797,7 +797,7 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
 // (measured on B200 and GB300): the 8-CTA shared-tile and persistent kernels
 // on sm_100; the 4-tile 16-CTA row kernel past one wave or with a cut of more
 // than 1/16; the 16-CTA shared-tile and persistent kernels with a cut of at
-// least 1/10. The other kernels keep whole tiles.
+// least 1/10, or on sm_100 past one wave. The other kernels keep whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
                                  bool pdl, int device, CachedLaunch* launch) {
   cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
@@ -858,7 +858,8 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
   if (sixteen_cta_rows && !(rows64 > resident || large_cut)) {
     return cudaSuccess;
   }
-  if (sixteen_cta_chunk && cut * kBalancedChunkSixteenCtaMinCutDen < whole) {
+  if (sixteen_cta_chunk && cut * kBalancedChunkSixteenCtaMinCutDen < whole &&
+      (device_minor != 0 || rows64 <= resident)) {
     return cudaSuccess;
   }
   launch->chunk_elements = balanced;
