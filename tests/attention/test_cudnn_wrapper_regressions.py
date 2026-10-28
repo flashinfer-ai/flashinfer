@@ -1375,6 +1375,72 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale_kind", ["head", "token", "strided"])
+def test_prefill_broadcast_v_scale_capture_replay(paged, dtype, scale_kind):
+    if not prefill._cudnn_supports_direct_seqlens(dtype, mixed=paged):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    workspace = torch.empty(128 << 20, device=q.device, dtype=torch.uint8)
+    kwargs = dict(causal=True, q_data_type=dtype)
+    if paged:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", backend="cudnn"
+        )
+        wrapper.plan(qo, ip, ix, last, 8, 2, 128, 16, **kwargs)
+        inputs = (q, (k, v))
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, backend="cudnn"
+        )
+        wrapper.plan(
+            qo, torch.tensor([0, 33, 50], dtype=torch.int32), 8, 2, 128, **kwargs
+        )
+        keys, values = (
+            torch.cat([t[ix[:3]].flatten(0, 1)[:33], t[ix[3:]].flatten(0, 1)[:17]])
+            for t in (k, v)
+        )
+        inputs = (q, keys, values)
+    shape = (
+        (5, 1, 1)
+        if scale_kind == "token"
+        else (16 if scale_kind == "strided" else 8, 1)
+    )
+    v_scale = torch.linspace(
+        0.25, 1.25, torch.Size(shape).numel(), device=q.device
+    ).reshape(shape)
+    if scale_kind == "strided":
+        v_scale = v_scale[::2]
+        assert not v_scale.is_contiguous()
+
+    def run():
+        return wrapper.run(*inputs, v_scale=v_scale, return_lse=True, lse_base="ln")
+
+    def check(out, lse):
+        reference, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(
+            out.float(), reference * v_scale, atol=0.015, rtol=0.015
+        )
+        torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+
+    out, lse = run()
+    check(out, lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = run()
+    q.neg_()
+    v_scale.mul_(0.5)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    check(out, lse)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
     "q_lengths,kv_lengths",
     [([128], [8192]), ([1024, 1536], [1024, 1536]), ([128, 1536], [1024, 1536])],

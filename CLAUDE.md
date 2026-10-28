@@ -332,7 +332,10 @@ FA2-first as well as cuDNN-first with changed Q partitions and page IDs.
 Auto dispatch must preserve run-time calibration scales for half-precision as
 well as FP8 inputs. Test non-unit Q/K scales with nontrivial logits, V scales
 against O and unchanged LSE, and GPU scalar changes before replay. A plan-time
-predicate cannot exclude arguments supplied only to `run()`.
+predicate cannot exclude arguments supplied only to `run()`. Half-precision
+V scaling is output multiplication: preserve broadcastable per-head/per-token
+scales and noncontiguous scale views, not just scalar tensors. Q/K score scales
+and FP8 descales retain their separate scalar contracts.
 
 Refining auto admission must also preserve the explicit-bound, device-length
 no-readback path. Declining cuDNN can itself cause FA2 to stage KV metadata back

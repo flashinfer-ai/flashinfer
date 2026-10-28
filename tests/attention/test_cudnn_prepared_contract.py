@@ -24,6 +24,94 @@ from flashinfer.cudnn import decode, prefill
 from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("kind", ["scalar", "head", "token", "element", "strided"])
+def test_half_prefill_output_scales_broadcast(monkeypatch, dtype, return_lse, kind):
+    """Exercise real public scale plumbing, replacing only the GPU execution."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    q = torch.arange(3 * 4 * 8, dtype=torch.float32).reshape(3, 4, 8).to(dtype)
+    kv = torch.zeros(5, 2, 8, dtype=dtype)
+    out = torch.empty_like(q)
+    lse = torch.empty(3, 4, dtype=torch.float32) if return_lse else None
+    shapes = {
+        "scalar": (1, 1, 1, 1),
+        "head": (4, 1),
+        "token": (3, 1, 1),
+        "element": (3, 4, 8),
+        "strided": (8, 1),
+    }
+    scale = torch.linspace(0.25, 1.25, torch.Size(shapes[kind]).numel()).reshape(
+        shapes[kind]
+    )
+    if kind == "strided":
+        scale = scale[::2]
+        assert not scale.is_contiguous()
+    calls = []
+
+    def prepare(query, keys, values, sm_scale, workspace, **kwargs):
+        assert query is q and keys is values is kv
+        assert sm_scale == 0.5
+
+        def run(query, keys, values, output, stats, workspace, **kwargs):
+            calls.append((query, output, stats))
+            output.copy_(query)
+            if stats is not None:
+                stats.fill_(2.0)
+            return output, stats
+
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(prefill, "prepare_cudnn_batch_prefill", prepare)
+    for factor in (1.0, 0.5):
+        scale.mul_(factor)
+        result, stats = prefill.cudnn_batch_prefill_with_kv_cache(
+            q,
+            kv,
+            kv,
+            0.5,
+            torch.empty(0),
+            max_token_per_sequence=3,
+            max_sequence_kv=5,
+            actual_seq_lens_q=torch.tensor([3], dtype=torch.int32),
+            actual_seq_lens_kv=torch.tensor([5], dtype=torch.int32),
+            causal=True,
+            return_lse=return_lse,
+            v_scale=scale,
+            out=out,
+            lse=lse,
+        )
+        expected = q.clone()
+        expected.mul_(scale.reshape(()) if scale.numel() == 1 else scale)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        assert result is out and stats is lse
+        if return_lse:
+            torch.testing.assert_close(stats, torch.full_like(stats, 2.0))
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("name", ["q_scale", "k_scale"])
+def test_half_prefill_score_scales_remain_scalar(monkeypatch, name):
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    q = torch.zeros(3, 4, 8, dtype=torch.bfloat16)
+    kv = torch.zeros(5, 2, 8, dtype=q.dtype)
+    with pytest.raises(ValueError, match="scalar float32"):
+        prefill.cudnn_batch_prefill_with_kv_cache(
+            q,
+            kv,
+            kv,
+            0.5,
+            torch.empty(0),
+            max_token_per_sequence=3,
+            max_sequence_kv=5,
+            actual_seq_lens_q=torch.tensor([3], dtype=torch.int32),
+            actual_seq_lens_kv=torch.tensor([5], dtype=torch.int32),
+            causal=True,
+            return_lse=False,
+            **{name: torch.ones(4, 1)},
+        )
+
+
 @pytest.mark.parametrize(
     "version,backend,native,runtime,expected",
     [
