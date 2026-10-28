@@ -923,7 +923,9 @@ def create_moe_tensors(
 
         w1_for_quant = interleave_linear_and_gate(
             w1_bf16,
-            group_size=_cute_dsl_gated_weight_group_size(w1_bf16.device, swap_ab=swap_ab),
+            group_size=_cute_dsl_gated_weight_group_size(
+                w1_bf16.device, swap_ab=swap_ab
+            ),
             dim=1,
         )
     else:

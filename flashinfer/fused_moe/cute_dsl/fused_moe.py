@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import warnings
 import weakref
@@ -565,6 +565,8 @@ def _moe_core_impl(
             memset_event = memset_event or resources["memset_event"]
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+    gather_gemm: Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    finalize_gemm: Callable[..., torch.Tensor]
     if swap_ab:
         for phase, mma_tiler_mn in (
             ("GEMM1", gemm1_mma_tiler_mn),

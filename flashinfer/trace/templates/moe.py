@@ -5069,7 +5069,9 @@ def _cute_dsl_fused_moe_reference(
         from ...fused_moe.prepare import _cute_dsl_gated_weight_group_size
 
         # Undo the weight-preparation interleave for the shared reference.
-        group_size = _cute_dsl_gated_weight_group_size(w1_weight.device, swap_ab=swap_ab)
+        group_size = _cute_dsl_gated_weight_group_size(
+            w1_weight.device, swap_ab=swap_ab
+        )
         W1 = (
             W1.reshape(E_local, -1, 2, group_size, W1.shape[-1])
             .transpose(1, 2)
