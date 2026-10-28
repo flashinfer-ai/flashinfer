@@ -3,12 +3,15 @@
 # Rules:
 #   - Last matching pattern wins (GitHub semantics).
 #   - Catch-all ensures every PR gets at least one core-maintainer review.
+#   - @flashinfer-bot is in the catch-all only. It approves a PR after a human
+#     code owner of a changed path has approved it, to cover files that match no
+#     rule but the catch-all (one-approval policy). It never approves on its own.
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
 #   - Full codebase approvers (@aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan)
 #     are listed on EVERY rule
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @dierksen @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @righthandabacus @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka @Anerudhan @Jingfan-Sun @YangXu1990uiuc
+* @flashinfer-bot @yzh119 @sricketts @aleozlx @yongwww @dierksen @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @righthandabacus @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka @Anerudhan @Jingfan-Sun @YangXu1990uiuc
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
