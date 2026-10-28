@@ -4,6 +4,7 @@
 """Check correction skipping against an independent causal attention reference."""
 
 import math
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -133,3 +134,46 @@ def test_fp8_correction_skip_live_graph(
     graph.replay()
     torch.cuda.synchronize()
     validate()
+
+
+@pytest.mark.parametrize(
+    "threshold,valid",
+    [
+        (0.0, True),
+        (8.0, True),
+        (math.log2(448.0), True),
+        (math.nextafter(math.log2(448.0), math.inf), False),
+        (9.0, False),
+        (16.0, False),
+        (math.inf, False),
+        (-math.inf, False),
+        (math.nan, False),
+    ],
+)
+def test_fp8_correction_threshold_bounds(threshold, valid):
+    pytest.importorskip("cutlass")
+    from cutlass import Float32
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
+
+    # Constructor validation needs no CUDA device or kernel compilation.
+    check = (
+        nullcontext()
+        if valid
+        else pytest.raises(ValueError, match="skip_correction_threshold")
+    )
+    with check:
+        BlackwellMultiHeadLatentAttentionForwardFP8(
+            acc_dtype=Float32,
+            lse_dtype=Float32,
+            mma_qk_tiler_mn=(128, 128),
+            mma_pv_tiler_mn=(128, 256),
+            max_active_clusters=1,
+            page_size=64,
+            skip_correction_threshold=threshold,
+            is_persistent=False,
+            is_var_seq=True,
+            is_var_split_kv=False,
+            enable_pdl=False,
+        )

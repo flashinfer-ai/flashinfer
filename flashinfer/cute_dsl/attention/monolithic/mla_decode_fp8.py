@@ -171,7 +171,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type max_active_clusters: int
         :param page_size: The page size
         :type page_size: int
-        :param skip_correction_threshold: Threshold to skip correction
+        :param skip_correction_threshold: Finite log2 threshold to skip correction;
+            must not exceed log2(448), the FP8 E4M3 probability limit.
         :type skip_correction_threshold: float
         :param is_persistent: Whether to use persistent kernel mode
         :type is_persistent: bool
@@ -214,6 +215,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.mma_qk_tiler_mn = mma_qk_tiler_mn
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
+        # A skipped update keeps the old maximum, so P can reach 2**threshold.
+        # Bound it by E4M3's maximum to keep numerator and denominator consistent.
+        if not math.isfinite(skip_correction_threshold) or (
+            skip_correction_threshold > math.log2(448.0)
+        ):
+            raise ValueError(
+                "skip_correction_threshold must be finite and <= log2(448) "
+                "to keep probabilities within FP8 E4M3 range"
+            )
         self.skip_correction_threshold = skip_correction_threshold
         self.is_persistent = is_persistent
         self.page_size = page_size
