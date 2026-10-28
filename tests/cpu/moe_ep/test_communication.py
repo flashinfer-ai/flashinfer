@@ -735,6 +735,7 @@ def _fake_lamport(monkeypatch, module) -> list:
     return extended
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> None:
     """The Lamport transport takes the steps it carries ahead of CFT counted
     writes, which take the others within their token limit, and the fence path
@@ -785,6 +786,7 @@ def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> N
     assert extended == [1, 1, 1]
 
 
+@pytest.mark.cpu_only
 def test_split_layer_step_bound_selects_lamport(
     fake_one_sided, monkeypatch, isolated_single_rank_gloo
 ) -> None:
@@ -809,6 +811,7 @@ def test_split_layer_step_bound_selects_lamport(
     layer.destroy()
 
 
+@pytest.mark.cpu_only
 def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
     """Each rank votes its own CFT and Lamport decisions, so a rank that turns
     a transport off turns it off on every rank, and ranks that pass different
