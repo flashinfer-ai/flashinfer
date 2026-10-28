@@ -614,6 +614,12 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
         scale_handle.commit()
 
+    def _weight_sf_decoupled(self) -> bool:
+        return False
+
+    def _weight_sf_state(self, ab_state):
+        return ab_state
+
     @cute.jit
     def _tma_load_a_with_weight_sf_task_tile(
         self,
@@ -651,6 +657,22 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         tAgA_slice = tAgA[(None, tile_m_idx, None, 0)]
         ab_producer.reset()
         weight_sf_producer.reset()
+        if cutlass.const_expr(self._weight_sf_decoupled()):
+            return self._tma_load_a_with_decoupled_weight_sf_task_tile(
+                tma_atom,
+                tAgA_slice,
+                tAsA,
+                desc_ptr_a,
+                weight_sf_gemm,
+                smem_weight_sf,
+                ab_producer,
+                weight_sf_producer,
+                work_tile_info,
+                output_scale_block_base,
+                k_tile_cnt,
+                tidx,
+                mcast_mask,
+            )
         peek_ab_empty_status = ab_producer.try_acquire()
         peek_scale_empty_status = weight_sf_producer.try_acquire()
         for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
@@ -1345,8 +1367,10 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             accumulators.fill(0.0)
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(ab_consumer_state)
-                weight_sf_pipeline.consumer_wait(ab_consumer_state)
+                sf_state = self._weight_sf_state(ab_consumer_state)
+                weight_sf_pipeline.consumer_wait(sf_state)
                 stage_idx = ab_consumer_state.index
+                sf_stage_idx = sf_state.index
 
                 for k128_half in cutlass.range_constexpr(2):
                     for packed_k64 in cutlass.range_constexpr(2):
@@ -1375,9 +1399,13 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             local_k_block_begin,
                             global_k_block_begin,
                             2,
-                            stage_idx,
+                            sf_stage_idx,
                             smem_weight_sf,
                         )
+                        if cutlass.const_expr(
+                            self._weight_sf_decoupled() and global_k64_group == 3
+                        ):
+                            weight_sf_pipeline.consumer_release(sf_state)
 
                         tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                         warpgroup.fence()
@@ -1414,7 +1442,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             tidx=tidx,
                         )
 
-                weight_sf_pipeline.consumer_release(ab_consumer_state)
+                if cutlass.const_expr(not self._weight_sf_decoupled()):
+                    weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
 

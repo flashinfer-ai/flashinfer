@@ -717,6 +717,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        # No local_expert_offset: EP ranks must share persisted entries (#6082).
         extras: tuple[Any, ...] = (
             self.quant_mode,
             int(self.activation_type),
@@ -726,7 +727,6 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
             self.num_experts,
-            self.local_expert_offset,
             self.use_fused_finalize,
             self.output_dtype,
             self.enable_pdl,
@@ -1237,7 +1237,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.num_experts,
             self.top_k,
             self.num_local_experts,
-            self.local_expert_offset,
             self.use_fused_finalize,
             self.output_dtype,
             self.enable_pdl,

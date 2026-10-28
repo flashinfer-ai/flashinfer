@@ -300,10 +300,10 @@ kernel_cake_muse_spark_norm_8d307babd9bb085f00e5(const __nv_bfloat16* branch, co
         for (int j = 0; j < 8; j++) {
             pa = __fmaf_rn(bb[j], bb[j], pa);
         }
-        float _warp_reduce_0 = pa;
+        float warp_reduce = pa;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
+            warp_reduce += __shfl_xor_sync(0xFFFFFFFF, warp_reduce, offset);
         if (warp == 0) {
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(bar_a_addr, 128);
@@ -316,7 +316,7 @@ kernel_cake_muse_spark_norm_8d307babd9bb085f00e5(const __nv_bfloat16* branch, co
                 : "=r"(_mbar_peer_6) : "r"(bar_a_addr), "r"(peer));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_mapa_0), "f"(_warp_reduce_0), "r"(_mbar_peer_6) : "memory");
+                :: "r"(_mapa_0), "f"(warp_reduce), "r"(_mbar_peer_6) : "memory");
         }
         int nrow = row + stride;
         if (nrow < M) {
@@ -373,10 +373,10 @@ kernel_cake_muse_spark_norm_8d307babd9bb085f00e5(const __nv_bfloat16* branch, co
             cur_r[j_2] = __fmaf_rn(bb[j_2], r1, cur_r[j_2]);
             p2 = __fmaf_rn(cur_r[j_2], cur_r[j_2], p2);
         }
-        float _warp_reduce_1 = p2;
+        float warp_reduce_0 = p2;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+            warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, warp_reduce_0, offset);
         if (warp == 0) {
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(bar_b_addr, 128);
@@ -389,7 +389,7 @@ kernel_cake_muse_spark_norm_8d307babd9bb085f00e5(const __nv_bfloat16* branch, co
                 : "=r"(_mbar_peer_11) : "r"(bar_b_addr), "r"(peer));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_mapa_0 + 128), "f"(_warp_reduce_1), "r"(_mbar_peer_11) : "memory");
+                :: "r"(_mapa_0 + 128), "f"(warp_reduce_0), "r"(_mbar_peer_11) : "memory");
         }
         {
             unsigned _stv8_12_0 = __float_as_uint(cur_r[0 + 0]);

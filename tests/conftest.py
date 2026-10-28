@@ -280,6 +280,17 @@ def pytest_collection_modifyitems(config, items):
         # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
         if "arch_rubin" in item.keywords and cc != (10, 7):
             item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
+        elif "arch_rubin" in item.keywords:
+            from flashinfer.cute_dsl.availability import (
+                is_cute_dsl_arch_supported,
+            )
+
+            if not is_cute_dsl_arch_supported(10, 7, native_only=True):
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="installed CuTe DSL cannot natively target sm_107"
+                    )
+                )
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):

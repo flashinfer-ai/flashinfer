@@ -315,9 +315,9 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
     int krow = 0;
     if (warp == 0) {
         if (elect_sync()) {
-            int prow = first;
-            if (prow < M) {
-                long long nb = (long long)prow * 8192 + (long long)rank * 2048;
+            int prow_2_0 = first;
+            if (prow_2_0 < M) {
+                long long nb = (long long)prow_2_0 * 8192 + (long long)rank * 2048;
                 mbarrier_arrive_expect_tx(rows_full_addr, 12288);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -330,9 +330,9 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
                     :: "r"(rview_addr + 0), "l"(residual + nb), "r"((uint32_t)(8192)), "r"(rows_full_addr)
                     : "memory");
             }
-            int prow_0 = first + stride;
-            if (prow_0 < M) {
-                long long nb_1 = (long long)prow_0 * 8192 + (long long)rank * 2048;
+            int prow_2_1 = first + stride;
+            if (prow_2_1 < M) {
+                long long nb_1 = (long long)prow_2_1 * 8192 + (long long)rank * 2048;
                 mbarrier_arrive_expect_tx(rows_full_addr + 8, 12288);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -345,9 +345,9 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
                     :: "r"(rview_addr + 12288), "l"(residual + nb_1), "r"((uint32_t)(8192)), "r"(rows_full_addr + 8)
                     : "memory");
             }
-            int prow_1 = first + 2 * stride;
-            if (prow_1 < M) {
-                long long nb_2 = (long long)prow_1 * 8192 + (long long)rank * 2048;
+            int prow_2_2 = first + 2 * stride;
+            if (prow_2_2 < M) {
+                long long nb_2 = (long long)prow_2_2 * 8192 + (long long)rank * 2048;
                 mbarrier_arrive_expect_tx(rows_full_addr + 16, 12288);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -403,10 +403,10 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
         for (int j = 0; j < 8; j++) {
             pa = __fmaf_rn(bb[j], bb[j], pa);
         }
-        float _warp_reduce_0 = pa;
+        float warp_reduce = pa;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
+            warp_reduce += __shfl_xor_sync(0xFFFFFFFF, warp_reduce, offset);
         if (lane_1 < 4) {
             uint32_t _mbar_peer_6;
             asm(
@@ -414,7 +414,7 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
                 : "=r"(_mbar_peer_6) : "r"(bar_a_addr), "r"(peer));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_mapa_0), "f"(_warp_reduce_0), "r"(_mbar_peer_6) : "memory");
+                :: "r"(_mapa_0), "f"(warp_reduce), "r"(_mbar_peer_6) : "memory");
         }
         #pragma unroll
         for (int k_1 = 0; k_1 < 4; k_1++) {
@@ -454,10 +454,10 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
         for (int j_1 = 0; j_1 < 8; j_1++) {
             p2 = __fmaf_rn(cur_r[j_1], cur_r[j_1], p2);
         }
-        float _warp_reduce_1 = p2;
+        float warp_reduce_0 = p2;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+            warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, warp_reduce_0, offset);
         if (lane_1 < 4) {
             uint32_t _mbar_peer_13;
             asm(
@@ -465,7 +465,7 @@ kernel_cake_muse_spark_norm_8b7cd2f4c2b5f79b63d6(const __nv_bfloat16* branch, co
                 : "=r"(_mbar_peer_13) : "r"(bar_b_addr), "r"(peer));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_mapa_0 + 128), "f"(_warp_reduce_1), "r"(_mbar_peer_13) : "memory");
+                :: "r"(_mapa_0 + 128), "f"(warp_reduce_0), "r"(_mbar_peer_13) : "memory");
         }
         {
             unsigned _stv8_14_0 = __float_as_uint(cur_r[0 + 0]);
