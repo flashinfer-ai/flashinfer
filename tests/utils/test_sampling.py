@@ -587,8 +587,10 @@ def _skip_unless_b200_or_gb300():
         (40, 100000, "row", "shared_tiles"),
         # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
         (84, 100000, "persistent", "persistent"),
-        # 6-tile chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
-        (80, 90000, "persistent", "shared_tiles"),
+        # 6-tile chunks: the trip rule on sm_100; on sm_103 under 2.5 rows per
+        # persistent cluster, except from 20/9 rows per persistent cluster on.
+        (79, 90000, "persistent", "shared_tiles"),
+        (80, 90000, "persistent", "persistent"),
         # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
         (24, 212992, "persistent", "shared_tiles"),
         # 5-tile 8-CTA chunks: the persistent kernel from three persistent trips on
@@ -638,12 +640,14 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
         # 8-tile 8-CTA chunks: the trip rule.
         (68, 128000, "shared_tiles", "persistent"),
         # 6-tile chunks: the trip rule (sm_100), under 2.5 rows per persistent
-        # cluster (sm_103).
+        # cluster (sm_103) unless the rows reach 20/9 rows per persistent cluster.
         (64, 90000, "persistent", "shared_tiles"),
         (68, 90000, "shared_tiles", "shared_tiles"),
         (73, 90000, "persistent", "shared_tiles"),
-        (89, 90000, "persistent", "shared_tiles"),
+        (89, 90000, "persistent", "persistent"),
         (90, 90000, "persistent", "persistent"),
+        (79, 84000, "persistent", "shared_tiles"),
+        (80, 84000, "persistent", "persistent"),
         # 5-tile 8-CTA chunks whose rows fill at least 4/5 of the persistent trips:
         # the persistent kernel from three persistent trips on when the fifth tile
         # is at least 3/8 full (otherwise from 2.5 rows per persistent cluster on
