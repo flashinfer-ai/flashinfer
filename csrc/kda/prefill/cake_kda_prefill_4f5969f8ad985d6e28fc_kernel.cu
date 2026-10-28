@@ -309,13 +309,13 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
                     rounded[value_col] = (float)(__nv_bfloat16)carry_reg[value_col];
                 }
                 for (int half = 0; half < 2; half++) {
-                    unsigned int _packed_0[1];
+                    unsigned int packed[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((rounded + half * 2)[_lp*2 + 0], (rounded + half * 2)[_lp*2+1 + 0]));
-                        _packed_0[_lp] = *(uint32_t*)&_bf2;
+                        packed[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_offset + (long long)(half * 2)))[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_offset + (long long)(half * 2)))[0] = reinterpret_cast<unsigned*>(packed)[0];
                 }
             }
         }
@@ -341,13 +341,13 @@ kernel_cake_kda_prefill_4f5969f8ad985d6e28fc(float* __restrict__ split_state, __
                 rounded_1[value_col_1] = (float)(__nv_bfloat16)single_state[value_col_1];
             }
             for (int half_1 = 0; half_1 < 2; half_1++) {
-                unsigned int _packed_1[1];
+                unsigned int packed_1[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((rounded_1 + half_1 * 2)[_lp*2 + 0], (rounded_1 + half_1 * 2)[_lp*2+1 + 0]));
-                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                    packed_1[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_offset_1 + (long long)(half_1 * 2)))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_offset_1 + (long long)(half_1 * 2)))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
             }
         }
     }

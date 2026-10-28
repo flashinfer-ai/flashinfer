@@ -780,9 +780,10 @@ def validate_tile_n(cfg, flavor: str, *, arch: D128FamilyArch) -> None:
                 f"STATS region at {lay.STATS_OFF} of the {lay.TOTAL_COLS}-column allocation -- the next kv tile's BMM1 would overwrite the softmax stats",
             ),
             (
-                getattr(cfg, "S_SLOTS", 1) == 1 or (cfg.TILE_K <= 64 and cfg.DTYPE_QKV > _DTYPE_E5M2),
-                f"{flavor}: the double-buffered S is wired on the f16/bf16 32- / 64-wide tiles only (TILE_K={cfg.TILE_K}, DTYPE_QKV={cfg.DTYPE_QKV}): the "
-                f"quantized d128 files and the d128 rendering keep one slot per sub-tile",
+                getattr(cfg, "S_SLOTS", 1) == 1
+                or ((cfg.TILE_K <= 64 or (arch.name == "Rubin" and cfg.TILE_K == cfg.TILE_O == 128)) and cfg.DTYPE_QKV > _DTYPE_E5M2),
+                f"{flavor}: the double-buffered S requires f16/bf16 small tiles or native Rubin D128 (TILE_K={cfg.TILE_K}, DTYPE_QKV={cfg.DTYPE_QKV}): the "
+                f"quantized d128 files keep one slot per sub-tile",
             ),
             (
                 getattr(cfg, "S_SLOTS", 1) == 1 or getattr(cfg, "SOFTMAX_WARPGROUPS", 2) == 2,

@@ -250,6 +250,26 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_dx_ptr": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "slab_sum": [
         ["buffer", "dx"],
         ["buffer", "ws"],
@@ -499,6 +519,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_cast_bf16_tma": [
+                "a4e720ef5ddf1d96c230",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_f32": [
                 "d9f38f99742d43df9556",
                 "gemm_logits",
@@ -720,6 +748,22 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dx_swab": [
+                "4a810e56687675c6c875",
+                "gemm_dx_ptr",
+                "b224_c2",
+                "max(1, ldc//256*(M/512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_swab": [
+                "69d867c2e601acd39856",
+                "gemm_dx_ptr",
+                "b224_c2",
+                "max(1, ldc//256*(M/512)*k_slices)*2",
+                1,
+                1,
+            ],
             "slab_sum": [
                 "dc45b3bd617f038cbddb",
                 "slab_sum",
@@ -747,6 +791,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_cast_bf16": [
                 "0a540692be2ea00ec27a",
                 "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma": [
+                "a4e720ef5ddf1d96c230",
+                "gemm_dx_2",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -936,10 +988,13 @@ STAGES = (
     "gemm_dx_s_split",
     "gemm_dx_st3_split",
     "gemm_dx_s_st3_split",
+    "gemm_dx_swab",
+    "gemm_dx_s_swab",
     "slab_sum",
     "gemm_dw_acc",
     "gemm_dw_acc_gn",
     "gemm_dw_cast_bf16",
+    "gemm_dw_cast_bf16_tma",
     "gemm_dw_cast_f32",
     "gemm_dw_cast_f32_gn",
     "scale_cast_bf16",
@@ -954,7 +1009,12 @@ STAGES = (
 # dX GEMM (2 .. 4 K-slice work items per output tile), ``_tn256`` the narrow
 # tile and ``_st3`` the 3-deep operand ring of the dX GEMM, ``_split`` the wide
 # dX tile whose last wave's trailing items run as 256-wide half items (the grid
-# carries the split count), ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
+# carries the split count), ``_swab`` the wide dX tile with swapped operands
+# (dX^T = W^T dz^T: the chunk's tokens on the MMA's N, C stored per thread),
+# ``_tma`` the TMA-epilogue form of a GEMM's stores (the bf16 fused weight-
+# gradient cast of a multi-chunk call's last chunk reads the old FP32 sum and
+# stores the bf16 tile as TMA sub-tiles: the same per-element arithmetic),
+# ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
 # call geometry (``H`` / ``V``) and the rules' numeric outputs -- the slice
 # count, the raster height ``group_m``, the block width ``group_n`` -- are
 # launch scalars of these kernels (``cake_backend.gemm_scalars``), so one

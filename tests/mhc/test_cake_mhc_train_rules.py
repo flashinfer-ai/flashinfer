@@ -18,7 +18,8 @@ Host-rule tests of the Cake four-stream mHC training package (no GPU needed).
 The registry ``cake_jit.py`` carries the integer host rules of the kernels
 (``k1_units`` with its per-architecture P_K band, ``k7_chunks``, ``k6_grid``,
 ``k2_grid``, the one-trip row grids ``k3_grid`` / ``k4_grid``, the backward prepare's
-``k5_grid`` with its per-architecture persistent bands ``K5_GRID_BANDS``,
+``k5_program`` / ``k5_grid`` with its per-architecture CTA-form bands ``K5_FORM_BANDS``
+and persistent bands ``K5_GRID_BANDS``,
 the design's persistent ``row_grid``, the token padding and the workspace regions)
 and the program dispatch of record (``fwd_map_program``, ``fwd_coef_program``
 and ``bwd_token_program``: which mapping-pass, coefficient-pass and token-owner
@@ -46,8 +47,12 @@ call exactly one fn-split, one token-owner, one column-slab and one reduction
 record, that the selection follows the rules of record, the launch grids of
 every grid-rule kind on those boards, the workspace layout (256-byte regions,
 the monotone size envelope the public API returns), the launch facts of record
-(block, dynamic shared memory) and that programmatic dependent launch is
-enabled exactly on the modules whose kernels wait for the preceding grid.
+(block, dynamic shared memory), that programmatic dependent launch is
+enabled exactly on the modules whose kernels wait for the preceding grid --
+per call, inside the measured token-count bands ``PDL_OFF_BANDS``, on the
+dependents of an early-releasing kernel (``PDL_EDGES``) -- and that the
+backward prepare's CTA form of record (``k5_program``) selects the record of
+its library.
 """
 
 from __future__ import annotations
@@ -75,6 +80,7 @@ MAP_LIBRARY = {
     "nsx": "cake_mhc_train_fwd_map__nsx",
     "nsx_st5_mb1": "cake_mhc_train_fwd_map__nsx_st5_mb1",
     "nsx_g2_ol2l": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
+    "ns96_g2_ol2l": "cake_mhc_train_fwd_map__ns96_g2_ol2l",
 }
 COEF_LIBRARY = {
     "qe_mb10": "cake_mhc_train_fwd_coef__qe_mb10",
@@ -141,6 +147,7 @@ FINISH_LIBRARY = {
 # Library -> the architectures whose routes name a record of it (generated from the records).
 LIBRARY_ARCHES = {
     "cake_mhc_train_bwd_prepare": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_prepare__t128": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_reduce__pt32": ("sm_103a",),
     "cake_mhc_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
@@ -152,7 +159,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_train_bwd_slab__xrsg": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_107a",),
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
     "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
     "cake_mhc_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
@@ -175,7 +182,8 @@ LIBRARY_ARCHES = {
     "cake_mhc_train_fwd_finish": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fwd_finish__r2": ("sm_107a",),
     "cake_mhc_train_fwd_map": ("sm_107a",),
-    "cake_mhc_train_fwd_map__nsx": ("sm_100a", "sm_103a"),
+    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a", "sm_107a"),
 }
@@ -185,34 +193,43 @@ MULTI_RECORDS = {
     "cake_mhc_train_fn_split__tv128_t128": ["cake_mhc_train_fn_split__tv128_t128__t"],
     "cake_mhc_train_fwd_map__nsx_st5_mb1": [
         "cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "cake_mhc_train_fwd_map__nsx_st5_mb1__a3",
         "cake_mhc_train_fwd_map__nsx_st5_mb1__a7",
     ],
     "cake_mhc_train_fwd_map__nsx_g2_ol2l": [
         "cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
         "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7",
     ],
     "cake_mhc_train_fwd_map": ["cake_mhc_train_fwd_map__hi"],
     "cake_mhc_train_bwd_prepare": [
-        "cake_mhc_train_bwd_prepare",
         "cake_mhc_train_bwd_prepare__g2sm_le1024",
-        "cake_mhc_train_bwd_prepare__gt1024",
-        "cake_mhc_train_bwd_prepare__g2sm_le4096",
-        "cake_mhc_train_bwd_prepare__gt4096",
+        "cake_mhc_train_bwd_prepare__gt8192",
+    ],
+    "cake_mhc_train_bwd_prepare__t128": [
+        "cake_mhc_train_bwd_prepare__t128",
+        "cake_mhc_train_bwd_prepare__t128__a3",
     ],
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": [
         "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3",
         "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7",
     ],
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": [
         "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3",
         "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
+    ],
+    "cake_mhc_train_bwd_token__dot_ao8": [
+        "cake_mhc_train_bwd_token__dot_ao8",
+        "cake_mhc_train_bwd_token__dot_ao8__a3",
     ],
     "cake_mhc_train_bwd_slab__xrsg": [
         "cake_mhc_train_bwd_slab__xrsg",
         "cake_mhc_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 47, 38
+N_RECORDS, N_LIBRARIES = 52, 40
 RECORD_SCALARS = {
     "cake_mhc_train_fn_split": {"want_t": 0},
     "cake_mhc_train_fn_split__tv128__t": {"want_t": 1},
@@ -229,12 +246,12 @@ TABLES = {
     "FN_SPLIT_GRID": {"b16": 256, "tv128": 256, "tv128_t128": 512},
     "FWD_MAP_PRODUCTION": "ss_st4",
     "FWD_MAP_BANDS": {
-        "sm_100a": ((0, 8191, "nsx"), (8191, None, "nsx_g2_ol2l")),
+        "sm_100a": ((0, 8192, "ns96_g2_ol2l"), (8192, None, "nsx_g2_ol2l")),
         "sm_103a": ((0, 8191, "nsx"), (8191, None, "nsx_g2_ol2l")),
         "sm_107a": ((0, 32768, "nsx_g2_ol2l"),),
     },
     "FWD_MAP_FIT": {
-        "sm_100a": ("nsx", "nsx_st5_mb1"),
+        "sm_100a": ("ns96_g2_ol2l", "nsx_st5_mb1"),
         "sm_103a": ("nsx", "nsx_st5_mb1"),
         "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
     },
@@ -291,7 +308,7 @@ TABLES = {
         "sm_107a": {"wpu4": (("wpu4_fadd", 15, None),)},
     },
     "BWD_TOKEN_BANDS": {
-        "sm_100a": (),
+        "sm_100a": ((1024, 8192, "ao22_rae7_pd1_tma_ntr"),),
         "sm_103a": (),
         "sm_107a": (
             (0, 1024, "ao22_rae7_rf3_pd1_l2l_ntr"),
@@ -309,6 +326,12 @@ TABLES = {
         "sm_107a": "r2",
     },
     "FWD_FINISH_ROWS": {"production": 4, "r2": 2},
+    "K5_FORM_BANDS": {
+        "sm_100a": ((1024, 8192, "t128"),),
+        "sm_103a": ((0, 8192, "t128"),),
+        "sm_107a": ((0, 8192, "t128"),),
+    },
+    "K5_FORM_ROWS": {"production": 2, "t128": 1},
 }
 # The token counts that exercise every band boundary of the dispatch at the SM counts of record (the kernel-tests
 # rules test's DISPATCH_T).
@@ -480,151 +503,151 @@ DISPATCH_EXPECTED = (
     (1024, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1024, 'sm_107a', 208, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (1024, 'sm_107a', 216, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1152, 'sm_103a', 152, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1152, 'sm_107a', 208, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1152, 'sm_107a', 216, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1153, 'sm_100a', 148, 32, 320, 'nsx', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1153, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1153, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1153, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1153, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1176, 'sm_100a', 148, 32, 320, 'nsx', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1176, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1176, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1176, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1176, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1177, 'sm_100a', 148, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1177, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1177, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1177, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1177, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1208, 'sm_100a', 148, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1208, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1208, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1208, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1208, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1209, 'sm_100a', 148, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1209, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1209, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1209, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1209, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1656, 'sm_100a', 148, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1656, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1656, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1656, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1656, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1657, 'sm_100a', 148, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1657, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1657, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1657, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1657, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1664, 'sm_100a', 148, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1664, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1664, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1664, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1664, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (1665, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1665, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1665, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (1720, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1720, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1720, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (1721, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1721, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1721, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1792, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1792, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1792, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (1793, 'sm_103a', 152, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1793, 'sm_107a', 208, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1793, 'sm_107a', 216, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (2049, 'sm_103a', 152, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2049, 'sm_107a', 208, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2049, 'sm_107a', 216, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (2304, 'sm_103a', 152, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2304, 'sm_107a', 208, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2304, 'sm_107a', 216, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2305, 'sm_100a', 148, 32, 608, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2305, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (2305, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2305, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2305, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2432, 'sm_100a', 148, 32, 608, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2432, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (2432, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2432, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2432, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2433, 'sm_100a', 148, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (2433, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
     (2433, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2433, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2433, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2560, 'sm_100a', 148, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2560, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (2560, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2560, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2560, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2561, 'sm_100a', 148, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2561, 'sm_100a', 148, 32, 672, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
     (2561, 'sm_103a', 152, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2561, 'sm_107a', 208, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2561, 'sm_107a', 216, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3328, 'sm_100a', 148, 16, 416, 'nsx', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (3328, 'sm_103a', 152, 16, 416, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3328, 'sm_107a', 208, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3328, 'sm_107a', 216, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3329, 'sm_100a', 148, 16, 432, 'nsx', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (3329, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3329, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3329, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3456, 'sm_100a', 148, 16, 432, 'nsx', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (3456, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3456, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3456, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3457, 'sm_100a', 148, 8, 224, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
     (3457, 'sm_103a', 152, 16, 448, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3457, 'sm_107a', 208, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3457, 'sm_107a', 216, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4095, 'sm_100a', 148, 8, 256, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
     (4095, 'sm_103a', 152, 8, 256, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
     (4096, 'sm_103a', 152, 8, 256, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (5328, 'sm_100a', 148, 16, 672, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (5328, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (5328, 'sm_103a', 152, 16, 672, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (5328, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5328, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5329, 'sm_100a', 148, 16, 672, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (5329, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (5329, 'sm_103a', 152, 16, 672, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (5329, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5329, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5472, 'sm_100a', 148, 16, 688, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (5472, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (5472, 'sm_103a', 152, 16, 688, 'nsx', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (5472, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5472, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5473, 'sm_100a', 148, 16, 688, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (5473, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (5473, 'sm_103a', 152, 16, 688, 'nsx', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (5473, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5473, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7488, 'sm_100a', 148, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (7488, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (7488, 'sm_103a', 152, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (7488, 'sm_107a', 208, 16, 944, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7488, 'sm_107a', 216, 16, 944, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7489, 'sm_100a', 148, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (7489, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (7489, 'sm_103a', 152, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (7489, 'sm_107a', 208, 16, 944, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7489, 'sm_107a', 216, 16, 944, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7776, 'sm_100a', 148, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (7776, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (7776, 'sm_103a', 152, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (7776, 'sm_107a', 208, 16, 976, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7776, 'sm_107a', 216, 16, 976, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7777, 'sm_100a', 148, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_spred', 411),
+    (7777, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (7777, 'sm_103a', 152, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (7777, 'sm_107a', 208, 16, 976, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7777, 'sm_107a', 216, 16, 976, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (8191, 'sm_100a', 148, 16, 1024, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_fadd', 411),
+    (8191, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411),
     (8191, 'sm_103a', 152, 16, 1024, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (8191, 'sm_107a', 208, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (8191, 'sm_107a', 216, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (8192, 'sm_100a', 148, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_fadd', 411),
+    (8192, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411),
     (8192, 'sm_103a', 152, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099),
     (8192, 'sm_107a', 208, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (8192, 'sm_107a', 216, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
@@ -909,121 +932,122 @@ RULES_COLUMNS = (
     "bwd_slab_program",
     "bwd_reduce_program",
     "bwd_reduce_grid",
+    "k5_program",
     "fwd_finish_program",
 )
 RULES_ROWS = (
-    (0, 148, 'sm_100a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128', 256, 256, '', '', '', 'xrsg', '', 0, 'production'),
-    (0, 152, 'sm_103a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128', 256, 256, '', '', '', 'xrsg', '', 0, 'production'),
-    (0, 208, 'sm_107a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128_t128', 256, 512, '', '', '', 'xrsg', '', 0, 'r2'),
-    (0, 216, 'sm_107a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128_t128', 256, 512, '', '', '', 'xrsg', '', 0, 'r2'),
-    (1, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (1, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (1, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (1, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (2, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (2, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (2, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 2, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (2, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 2, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (3, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 2, 2, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (3, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 2, 2, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (3, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 3, 2, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (3, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 3, 2, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (7, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 4, 4, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (7, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 4, 4, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (7, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 7, 4, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (7, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 7, 4, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (63, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (63, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (63, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 63, 32, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (63, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 63, 32, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (64, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (64, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (64, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 32, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (64, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 32, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (65, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 33, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (65, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 33, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (65, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 33, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (65, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 33, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (127, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (127, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (127, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 64, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (127, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 64, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (128, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (128, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (128, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 64, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (128, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 64, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (129, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 65, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (129, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 65, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (129, 208, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 65, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (129, 216, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 65, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (255, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 128, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (255, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 128, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (255, 208, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 128, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (255, 216, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 128, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (1000, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 592, 2000, 500, 296, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (1000, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 608, 2000, 500, 304, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (1000, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 832, 2000, 1000, 500, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (1000, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 864, 2000, 1000, 500, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (1024, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 592, 2048, 512, 296, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production'),
-    (1024, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 608, 2048, 512, 304, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (1024, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 832, 2048, 1024, 512, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (1024, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 864, 2048, 1024, 512, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 'r2'),
-    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 1025, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 304, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 'production'),
-    (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 1025, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 1025, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 2048, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4_fadd', 411, 'production'),
-    (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 304, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 'production'),
-    (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 2048, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 2048, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (8192, 148, 'sm_100a', 8192, True, 16, 1024, 296, 16, 1024, 148, 512, 296, 32, 512, 592, 16384, 4096, 4096, 16253184, 30708992, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'dynr', 'wpu4_fadd', 411, 'production'),
-    (8192, 152, 'sm_103a', 8192, True, 16, 1024, 304, 7, 448, 152, 1216, 304, 32, 512, 608, 16384, 4096, 4096, 16253184, 16554240, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (8192, 208, 'sm_107a', 8192, True, 16, 1024, 416, 13, 832, 208, 640, 416, 24, 512, 832, 16384, 8192, 4096, 16253184, 26005760, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (8192, 216, 'sm_107a', 8192, True, 16, 1024, 432, 10, 640, 216, 832, 432, 24, 512, 864, 16384, 8192, 4096, 16253184, 21289216, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (14928, 148, 'sm_100a', 14976, True, 8, 936, 296, 9, 576, 148, 1664, 296, 56, 933, 592, 29856, 7464, 7464, 15126784, 21652736, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (14928, 152, 'sm_103a', 14976, True, 16, 1872, 304, 7, 448, 152, 2176, 304, 56, 933, 608, 29856, 7464, 7464, 27107584, 18508032, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (14928, 208, 'sm_107a', 14976, True, 16, 1872, 416, 13, 832, 208, 1152, 416, 40, 933, 832, 29856, 14928, 7464, 27107584, 27959552, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (14928, 216, 'sm_107a', 14976, True, 16, 1872, 432, 10, 640, 216, 1536, 432, 40, 933, 864, 29856, 14928, 7464, 27107584, 23243008, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (15288, 148, 'sm_100a', 15360, True, 8, 960, 296, 16, 1024, 148, 960, 296, 56, 956, 592, 30576, 7644, 7644, 15433984, 32773376, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 'production'),
-    (15288, 152, 'sm_103a', 15360, True, 16, 1920, 304, 7, 448, 152, 2240, 304, 56, 956, 608, 30576, 7644, 7644, 27721984, 18618624, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (15288, 208, 'sm_107a', 15360, True, 8, 960, 416, 16, 1024, 208, 960, 416, 40, 956, 832, 30576, 15288, 7644, 15433984, 32788736, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'r2'),
-    (15288, 216, 'sm_107a', 15360, True, 16, 1920, 432, 10, 640, 216, 1536, 432, 40, 956, 864, 30576, 15288, 7644, 27721984, 23353600, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (15566, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 973, 592, 31132, 7783, 7783, 15638784, 21837056, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (15566, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 973, 608, 31132, 7783, 7783, 28131584, 18692352, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (15566, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 973, 832, 31132, 15566, 7783, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (15566, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 973, 864, 31132, 15566, 7783, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (15590, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 975, 592, 31180, 7795, 7795, 15638784, 21837056, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (15590, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 975, 608, 31180, 7795, 7795, 28131584, 18692352, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (15590, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 975, 832, 31180, 15590, 7795, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (15590, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 975, 864, 31180, 15590, 7795, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16114, 148, 'sm_100a', 16128, True, 8, 1008, 296, 9, 576, 148, 1792, 296, 56, 1008, 592, 32228, 8057, 8057, 16048384, 21984512, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (16114, 152, 'sm_103a', 16128, True, 16, 2016, 304, 7, 448, 152, 2304, 304, 56, 1008, 608, 32228, 8057, 8057, 28950784, 18839808, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (16114, 208, 'sm_107a', 16128, True, 8, 1008, 416, 13, 832, 208, 1280, 416, 40, 1008, 832, 32228, 16114, 8057, 16048384, 28291328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16114, 216, 'sm_107a', 16128, True, 8, 1008, 432, 10, 640, 216, 1664, 432, 40, 1008, 864, 32228, 16114, 8057, 16048384, 23574784, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16132, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1009, 592, 32264, 8066, 8066, 16150784, 44041472, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (16132, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1009, 608, 32264, 8066, 8066, 29155584, 18876672, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (16132, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1009, 832, 32264, 16132, 8066, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16132, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1009, 864, 32264, 16132, 8066, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16164, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1011, 592, 32328, 8082, 8082, 16150784, 44041472, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (16164, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1011, 608, 32328, 8082, 8082, 29155584, 18876672, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (16164, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1011, 832, 32328, 16164, 8082, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16164, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1011, 864, 32328, 16164, 8082, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16263, 148, 'sm_100a', 16384, True, 8, 1024, 296, 16, 1024, 148, 1024, 296, 56, 1017, 592, 32526, 8132, 8132, 16253184, 33068288, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 'production'),
-    (16263, 152, 'sm_103a', 16384, True, 16, 2048, 304, 7, 448, 152, 2368, 304, 56, 1017, 608, 32526, 8132, 8132, 29360384, 18913536, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production'),
-    (16263, 208, 'sm_107a', 16384, True, 8, 1024, 416, 13, 832, 208, 1280, 416, 40, 1017, 832, 32526, 16263, 8132, 16253184, 28365056, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (16263, 216, 'sm_107a', 16384, True, 8, 1024, 432, 10, 640, 216, 1664, 432, 40, 1017, 864, 32526, 16263, 8132, 16253184, 23648512, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (20001, 148, 'sm_100a', 20096, True, 8, 1256, 296, 9, 576, 148, 2240, 296, 72, 1251, 592, 40002, 10001, 10001, 19222784, 23127296, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_spred', 411, 'production'),
-    (20001, 152, 'sm_103a', 20096, True, 8, 1256, 304, 7, 448, 152, 2880, 304, 72, 1251, 608, 40002, 10001, 10001, 19222784, 19982592, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production'),
-    (20001, 208, 'sm_107a', 20096, True, 8, 1256, 416, 13, 832, 208, 1600, 416, 56, 1251, 832, 40002, 20001, 10001, 19222784, 29434112, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4', 411, 'r2'),
-    (20001, 216, 'sm_107a', 20096, True, 8, 1256, 432, 10, 640, 216, 2048, 432, 48, 1251, 864, 40002, 20001, 10001, 19222784, 24717568, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (32768, 148, 'sm_100a', 32768, True, 8, 2048, 296, 16, 1024, 148, 2048, 296, 112, 2048, 592, 65536, 16384, 16384, 29360384, 37786880, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_fadd', 411, 'production'),
-    (32768, 152, 'sm_103a', 32768, True, 8, 2048, 304, 19, 1216, 152, 1728, 304, 112, 2048, 608, 65536, 16384, 16384, 29360384, 42506496, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production'),
-    (32768, 208, 'sm_107a', 32768, True, 8, 2048, 416, 13, 832, 208, 2560, 416, 80, 2048, 832, 65536, 32768, 16384, 29360384, 33083648, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (32768, 216, 'sm_107a', 32768, True, 8, 2048, 432, 27, 1728, 216, 1216, 432, 80, 2048, 864, 65536, 32768, 16384, 29360384, 55105792, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'r2'),
-    (65536, 148, 'sm_100a', 65536, True, 8, 4096, 296, 16, 1024, 148, 4096, 296, 224, 4096, 592, 131072, 32768, 32768, 55574784, 47224064, 'b16', 'tv128', 256, 256, 'lp2_w8_adj', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_fadd', 411, 'production'),
-    (65536, 152, 'sm_103a', 65536, True, 8, 4096, 304, 19, 1216, 152, 3456, 304, 216, 4096, 608, 131072, 32768, 32768, 55574784, 51943680, 'b16', 'tv128', 256, 256, 'lp2_w8_adj', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production'),
-    (65536, 208, 'sm_107a', 65536, True, 8, 4096, 416, 13, 832, 208, 5056, 416, 160, 4096, 832, 131072, 65536, 32768, 55574784, 42520832, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'r2'),
-    (65536, 216, 'sm_107a', 65536, True, 8, 4096, 432, 27, 1728, 216, 2432, 432, 152, 4096, 864, 131072, 65536, 32768, 55574784, 64542976, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'r2'),
+    (0, 148, 'sm_100a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128', 256, 256, '', '', '', 'xrsg', '', 0, '', 'production'),
+    (0, 152, 'sm_103a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128', 256, 256, '', '', '', 'xrsg', '', 0, '', 'production'),
+    (0, 208, 'sm_107a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128_t128', 256, 512, '', '', '', 'xrsg', '', 0, '', 'r2'),
+    (0, 216, 'sm_107a', 0, False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'b16', 'tv128_t128', 256, 512, '', '', '', 'xrsg', '', 0, '', 'r2'),
+    (1, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (1, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (1, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (1, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 1, 2, 1, 1, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (2, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 1, 1, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (2, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 1, 2, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (2, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 2, 2, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (2, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 2, 4, 2, 2, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (3, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 2, 2, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (3, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 2, 3, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (3, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 3, 3, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (3, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 3, 6, 3, 3, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (7, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 4, 4, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (7, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 4, 7, 3555584, 4755968, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (7, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 7, 7, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (7, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 1, 8, 1, 7, 14, 7, 7, 3555584, 4755968, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (63, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (63, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 32, 63, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (63, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 63, 63, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (63, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 63, 126, 63, 63, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (64, 148, 'sm_100a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 32, 32, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (64, 152, 'sm_103a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 32, 64, 3555584, 4756736, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (64, 208, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 64, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (64, 216, 'sm_107a', 128, True, 32, 32, 32, 1, 64, 64, 64, 8, 8, 4, 64, 128, 64, 64, 3555584, 4756736, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (65, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 33, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (65, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 33, 65, 3555584, 6329856, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (65, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 65, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (65, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 9, 8, 5, 65, 130, 65, 65, 3555584, 6329856, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (127, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (127, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 64, 127, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (127, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 127, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (127, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 127, 254, 127, 127, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (128, 148, 'sm_100a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 64, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (128, 152, 'sm_103a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 64, 128, 3555584, 6330624, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (128, 208, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 128, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (128, 216, 'sm_107a', 128, True, 32, 32, 32, 2, 128, 128, 64, 16, 8, 8, 128, 256, 128, 128, 3555584, 6330624, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (129, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 65, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (129, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 17, 8, 9, 129, 258, 65, 129, 3965184, 6367744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (129, 208, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 129, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (129, 216, 'sm_107a', 256, True, 32, 64, 64, 3, 192, 192, 64, 17, 8, 9, 129, 258, 129, 129, 3965184, 7940608, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (255, 148, 'sm_100a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 128, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (255, 152, 'sm_103a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 128, 255, 3965184, 6369536, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (255, 208, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 255, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (255, 216, 'sm_107a', 256, True, 32, 64, 64, 2, 128, 128, 128, 32, 8, 16, 255, 510, 255, 255, 3965184, 6369536, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (1000, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 592, 2000, 500, 296, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (1000, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 125, 8, 63, 608, 2000, 500, 1000, 4784384, 6602752, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (1000, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 832, 2000, 1000, 1000, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (1000, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 125, 8, 63, 864, 2000, 1000, 1000, 4784384, 8175616, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (1024, 148, 'sm_100a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 592, 2048, 512, 296, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411, 'production', 'production'),
+    (1024, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 608, 2048, 512, 1024, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (1024, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 832, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (1024, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 864, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
+    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 2049, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411, 't128', 'production'),
+    (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
+    (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
+    (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (8192, 148, 'sm_100a', 8192, True, 16, 1024, 296, 16, 1024, 148, 512, 296, 32, 512, 592, 16384, 4096, 8192, 16253184, 30708992, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411, 't128', 'production'),
+    (8192, 152, 'sm_103a', 8192, True, 16, 1024, 304, 7, 448, 152, 1216, 304, 32, 512, 608, 16384, 4096, 8192, 16253184, 16554240, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'pt32', 3099, 't128', 'production'),
+    (8192, 208, 'sm_107a', 8192, True, 16, 1024, 416, 13, 832, 208, 640, 416, 24, 512, 832, 16384, 8192, 8192, 16253184, 26005760, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (8192, 216, 'sm_107a', 8192, True, 16, 1024, 432, 10, 640, 216, 832, 432, 24, 512, 864, 16384, 8192, 8192, 16253184, 21289216, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
+    (14928, 148, 'sm_100a', 14976, True, 8, 936, 296, 9, 576, 148, 1664, 296, 56, 933, 592, 29856, 7464, 7464, 15126784, 21652736, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (14928, 152, 'sm_103a', 14976, True, 16, 1872, 304, 7, 448, 152, 2176, 304, 56, 933, 608, 29856, 7464, 7464, 27107584, 18508032, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (14928, 208, 'sm_107a', 14976, True, 16, 1872, 416, 13, 832, 208, 1152, 416, 40, 933, 832, 29856, 14928, 7464, 27107584, 27959552, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (14928, 216, 'sm_107a', 14976, True, 16, 1872, 432, 10, 640, 216, 1536, 432, 40, 933, 864, 29856, 14928, 7464, 27107584, 23243008, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (15288, 148, 'sm_100a', 15360, True, 8, 960, 296, 16, 1024, 148, 960, 296, 56, 956, 592, 30576, 7644, 7644, 15433984, 32773376, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 'production', 'production'),
+    (15288, 152, 'sm_103a', 15360, True, 16, 1920, 304, 7, 448, 152, 2240, 304, 56, 956, 608, 30576, 7644, 7644, 27721984, 18618624, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (15288, 208, 'sm_107a', 15360, True, 8, 960, 416, 16, 1024, 208, 960, 416, 40, 956, 832, 30576, 15288, 7644, 15433984, 32788736, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'production', 'r2'),
+    (15288, 216, 'sm_107a', 15360, True, 16, 1920, 432, 10, 640, 216, 1536, 432, 40, 956, 864, 30576, 15288, 7644, 27721984, 23353600, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (15566, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 973, 592, 31132, 7783, 7783, 15638784, 21837056, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (15566, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 973, 608, 31132, 7783, 7783, 28131584, 18692352, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (15566, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 973, 832, 31132, 15566, 7783, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (15566, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 973, 864, 31132, 15566, 7783, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (15590, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 975, 592, 31180, 7795, 7795, 15638784, 21837056, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (15590, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 975, 608, 31180, 7795, 7795, 28131584, 18692352, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (15590, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 975, 832, 31180, 15590, 7795, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (15590, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 975, 864, 31180, 15590, 7795, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16114, 148, 'sm_100a', 16128, True, 8, 1008, 296, 9, 576, 148, 1792, 296, 56, 1008, 592, 32228, 8057, 8057, 16048384, 21984512, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (16114, 152, 'sm_103a', 16128, True, 16, 2016, 304, 7, 448, 152, 2304, 304, 56, 1008, 608, 32228, 8057, 8057, 28950784, 18839808, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (16114, 208, 'sm_107a', 16128, True, 8, 1008, 416, 13, 832, 208, 1280, 416, 40, 1008, 832, 32228, 16114, 8057, 16048384, 28291328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16114, 216, 'sm_107a', 16128, True, 8, 1008, 432, 10, 640, 216, 1664, 432, 40, 1008, 864, 32228, 16114, 8057, 16048384, 23574784, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16132, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1009, 592, 32264, 8066, 8066, 16150784, 44041472, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (16132, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1009, 608, 32264, 8066, 8066, 29155584, 18876672, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (16132, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1009, 832, 32264, 16132, 8066, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16132, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1009, 864, 32264, 16132, 8066, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16164, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1011, 592, 32328, 8082, 8082, 16150784, 44041472, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (16164, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1011, 608, 32328, 8082, 8082, 29155584, 18876672, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (16164, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1011, 832, 32328, 16164, 8082, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16164, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1011, 864, 32328, 16164, 8082, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16263, 148, 'sm_100a', 16384, True, 8, 1024, 296, 16, 1024, 148, 1024, 296, 56, 1017, 592, 32526, 8132, 8132, 16253184, 33068288, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 'production', 'production'),
+    (16263, 152, 'sm_103a', 16384, True, 16, 2048, 304, 7, 448, 152, 2368, 304, 56, 1017, 608, 32526, 8132, 8132, 29360384, 18913536, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (16263, 208, 'sm_107a', 16384, True, 8, 1024, 416, 13, 832, 208, 1280, 416, 40, 1017, 832, 32526, 16263, 8132, 16253184, 28365056, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (16263, 216, 'sm_107a', 16384, True, 8, 1024, 432, 10, 640, 216, 1664, 432, 40, 1017, 864, 32526, 16263, 8132, 16253184, 23648512, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (20001, 148, 'sm_100a', 20096, True, 8, 1256, 296, 9, 576, 148, 2240, 296, 72, 1251, 592, 40002, 10001, 10001, 19222784, 23127296, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_spred', 411, 'production', 'production'),
+    (20001, 152, 'sm_103a', 20096, True, 8, 1256, 304, 7, 448, 152, 2880, 304, 72, 1251, 608, 40002, 10001, 10001, 19222784, 19982592, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (20001, 208, 'sm_107a', 20096, True, 8, 1256, 416, 13, 832, 208, 1600, 416, 56, 1251, 832, 40002, 20001, 10001, 19222784, 29434112, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (20001, 216, 'sm_107a', 20096, True, 8, 1256, 432, 10, 640, 216, 2048, 432, 48, 1251, 864, 40002, 20001, 10001, 19222784, 24717568, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (32768, 148, 'sm_100a', 32768, True, 8, 2048, 296, 16, 1024, 148, 2048, 296, 112, 2048, 592, 65536, 16384, 16384, 29360384, 37786880, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_fadd', 411, 'production', 'production'),
+    (32768, 152, 'sm_103a', 32768, True, 8, 2048, 304, 19, 1216, 152, 1728, 304, 112, 2048, 608, 65536, 16384, 16384, 29360384, 42506496, 'b16', 'tv128', 256, 256, 'st8_lp2', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (32768, 208, 'sm_107a', 32768, True, 8, 2048, 416, 13, 832, 208, 2560, 416, 80, 2048, 832, 65536, 32768, 16384, 29360384, 33083648, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (32768, 216, 'sm_107a', 32768, True, 8, 2048, 432, 27, 1728, 216, 1216, 432, 80, 2048, 864, 65536, 32768, 16384, 29360384, 55105792, 'b16', 'tv128_t128', 256, 512, 'st8_lp2_tree_asel_qd', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'production', 'r2'),
+    (65536, 148, 'sm_100a', 65536, True, 8, 4096, 296, 16, 1024, 148, 4096, 296, 224, 4096, 592, 131072, 32768, 32768, 55574784, 47224064, 'b16', 'tv128', 256, 256, 'lp2_w8_adj', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'wpu4_fadd', 411, 'production', 'production'),
+    (65536, 152, 'sm_103a', 65536, True, 8, 4096, 304, 19, 1216, 152, 3456, 304, 216, 4096, 608, 131072, 32768, 32768, 55574784, 51943680, 'b16', 'tv128', 256, 256, 'lp2_w8_adj', 'nsx_g2_ol2l', 'dot_ao8', 'xrsg', 'pt32', 3099, 'production', 'production'),
+    (65536, 208, 'sm_107a', 65536, True, 8, 4096, 416, 13, 832, 208, 5056, 416, 160, 4096, 832, 131072, 65536, 32768, 55574784, 42520832, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 'production', 'r2'),
+    (65536, 216, 'sm_107a', 65536, True, 8, 4096, 432, 27, 1728, 216, 2432, 432, 152, 4096, 864, 131072, 65536, 32768, 55574784, 64542976, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 'production', 'r2'),
 )  # fmt: skip
 LAUNCH_FACTS = {
     "cake_mhc_train_fn_split": ((256, 1, 1), 0, 1),
@@ -1032,6 +1056,9 @@ LAUNCH_FACTS = {
     "cake_mhc_train_fwd_map__nsx_st5_mb1": ((192, 1, 1), 144384, 1),
     "cake_mhc_train_fwd_map__nsx": ((192, 1, 1), 115712, 2),
     "cake_mhc_train_fwd_map__nsx_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
+    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
     "cake_mhc_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
     "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
     "cake_mhc_train_fwd_map__hi": ((192, 1, 1), 115712, 2),
@@ -1050,16 +1077,18 @@ LAUNCH_FACTS = {
     "cake_mhc_train_fwd_collapse": ((256, 1, 1), 0, 1),
     "cake_mhc_train_fwd_finish": ((256, 1, 1), 0, 1),
     "cake_mhc_train_fwd_finish__r2": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_bwd_prepare": ((256, 1, 1), 1280, 1),
     "cake_mhc_train_bwd_prepare__g2sm_le1024": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_prepare__gt1024": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_prepare__g2sm_le4096": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_prepare__gt4096": ((256, 1, 1), 1280, 1),
+    "cake_mhc_train_bwd_prepare__t128": ((128, 1, 1), 640, 1),
+    "cake_mhc_train_bwd_prepare__t128__a3": ((128, 1, 1), 640, 1),
+    "cake_mhc_train_bwd_prepare__gt8192": ((256, 1, 1), 1280, 1),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__dot_ao8": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_token__dot_ao8__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
@@ -1078,9 +1107,12 @@ RECORD_ARCHES = {
     "cake_mhc_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fn_split__tv128_t128__t": ("sm_107a",),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_map__nsx": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a"),
+    "cake_mhc_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
+    "cake_mhc_train_fwd_map__nsx": ("sm_103a",),
+    "cake_mhc_train_fwd_map__nsx_g2_ol2l": ("sm_103a",),
+    "cake_mhc_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
+    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
     "cake_mhc_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
     "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
     "cake_mhc_train_fwd_map__hi": ("sm_107a",),
@@ -1099,16 +1131,18 @@ RECORD_ARCHES = {
     "cake_mhc_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_finish": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fwd_finish__r2": ("sm_107a",),
-    "cake_mhc_train_bwd_prepare": ("sm_107a",),
     "cake_mhc_train_bwd_prepare__g2sm_le1024": ("sm_100a",),
-    "cake_mhc_train_bwd_prepare__gt1024": ("sm_100a",),
-    "cake_mhc_train_bwd_prepare__g2sm_le4096": ("sm_103a",),
-    "cake_mhc_train_bwd_prepare__gt4096": ("sm_103a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
+    "cake_mhc_train_bwd_prepare__t128": ("sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_prepare__t128__a3": ("sm_100a",),
+    "cake_mhc_train_bwd_prepare__gt8192": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_103a",),
+    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_103a",),
+    "cake_mhc_train_bwd_token__dot_ao8": ("sm_103a",),
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": ("sm_100a",),
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
+    "cake_mhc_train_bwd_token__dot_ao8__a3": ("sm_100a",),
+    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": ("sm_100a",),
     "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_107a",),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ("sm_107a",),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
@@ -1122,6 +1156,48 @@ RECORD_ARCHES = {
     "cake_mhc_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
     "cake_mhc_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_train_bwd_reduce__wpu4": ("sm_107a",),
+}
+# The backward prepare's CTA forms of record -> library (generated from the records; the production record's library
+# everywhere, the 128-thread one-token form's where k5_program routes it).
+K5_FORM_LIBRARY = {
+    "production": "cake_mhc_train_bwd_prepare",
+    "t128": "cake_mhc_train_bwd_prepare__t128",
+}
+K5_FORM_OF_LIBRARY = {library: form for form, library in K5_FORM_LIBRARY.items()}
+# The token-count bands (above, at_most] where the per-call PDL attribute is off, per architecture, edge and call path
+# (generated from the table of record; empty where every edge keeps the attribute).
+PDL_OFF_BANDS = {
+    "sm_100a": {
+        "K1->K3": {
+            "forward": ((4096, 8192),),
+        },
+        "K1->K5": {
+            "checkpoint": ((4096, 8192),),
+        },
+        "K6->K7": {
+            "checkpoint": ((1024, 8192),),
+        },
+        "K7->K8": {
+            "backward": ((1024, 8192),),
+            "checkpoint": ((1024, 4096),),
+        },
+    },
+    "sm_103a": {
+        "K1->K3": {
+            "forward": ((4096, 16263),),
+        },
+        "K1->K5": {
+            "checkpoint": ((4096, 16263),),
+        },
+        "K6->K7": {
+            "checkpoint": ((4096, 8192),),
+        },
+        "K7->K8": {
+            "backward": ((0, 4096),),
+            "checkpoint": ((0, 4096),),
+        },
+    },
+    "sm_107a": {},
 }
 EVERYWHERE = {
     "cake_mhc_train_fwd_collapse",
@@ -1222,15 +1298,26 @@ def test_host_plan_matches_the_table() -> None:
         assert row["k4_grid"] == loader.row_cta_grid(
             row["T"], loader.FWD_FINISH_ROWS[row["fwd_finish_program"]], 2
         )
-        # the backward prepare: the one-trip grid, or the persistent grid_per_sm x SMs grid inside the architecture's
-        # band (sm_103a T <= 4096; sm_100a T <= 1024)
-        one_trip = loader.row_cta_grid(row["T"], 2, 1)
+        # the backward prepare: the form of record (K5_FORM_BANDS: the 128-thread one-token form inside its band, the
+        # two-token production form elsewhere) on its one-trip grid, which the persistent grid_per_sm x SMs grid caps
+        # inside a production band (sm_103a T <= 4096; sm_100a T <= 1024)
+        form = loader.k5_program(row["T"], row["sm_count"], row["arch"])
+        assert form == row["k5_program"] and form in loader.K5_FORM_ROWS, (
+            row["T"],
+            row["arch"],
+            form,
+        )
+        one_trip = loader.row_cta_grid(row["T"], loader.K5_FORM_ROWS[form], 1)
         caps = [
             g
             for a, b, g in loader.K5_GRID_BANDS[row["arch"]]
             if a < row["T"] and (b is None or row["T"] <= b)
         ]
-        want = min(one_trip, caps[0] * row["sm_count"]) if caps else one_trip
+        want = (
+            min(one_trip, caps[0] * row["sm_count"])
+            if caps and form == "production"
+            else one_trip
+        )
         assert (
             plan["k5_grid"]
             == row["k5_grid"]
@@ -1357,17 +1444,52 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         "sm_103a": ((0, 4096, 2),),
         "sm_107a": (),
     }
-    assert [
-        loader.k5_grid(T, 152, "sm_103a") for T in (1, 607, 1024, 4096, 4097, 65536)
-    ] == [1, 304, 304, 304, 2049, 32768]
+    assert (
+        TABLES["K5_FORM_BANDS"] == loader.K5_FORM_BANDS
+        and TABLES["K5_FORM_ROWS"] == loader.K5_FORM_ROWS
+    )
+    assert (
+        set(loader.K5_FORM_ROWS) == {"production", *K5_FORM_LIBRARY}
+        and loader.K5_FORM_ROWS["production"] == 2
+    )
+
+    def _k5(
+        T, sm, arch
+    ):  # the rule of record spelled from the tables: the form's one-trip grid, the production cap
+        form = next(
+            (
+                f
+                for a, b, f in TABLES["K5_FORM_BANDS"][arch]
+                if a < T and (b is None or b >= T)
+            ),
+            "production",
+        )
+        grid = -(-T // TABLES["K5_FORM_ROWS"][form])
+        if form == "production":
+            for a, b, g in TABLES["K5_GRID_BANDS"][arch]:
+                if a < T and (b is None or b >= T):
+                    grid = min(grid, g * sm)
+        return form, grid
+
+    for arch, sm in BOARDS:
+        for T in (1, 591, 607, 1024, 1025, 4096, 4097, 8192, 8193, 16263, 65536):
+            form, grid = _k5(T, sm, arch)
+            assert loader.k5_program(T, sm, arch) == form, (arch, sm, T)
+            assert loader.k5_grid(T, sm, arch) == grid, (arch, sm, T)
+    # spelled out: on 148 SMs the production form's 2 x 148 persistent CTAs to 1024 tokens, then the one-token form's
+    # one-trip grid T to 8192 tokens; the production form's ceil(T / 2) above every band; the one-token form from the
+    # first token on sm_107a
     assert [loader.k5_grid(T, 148, "sm_100a") for T in (1, 591, 1024, 1025, 4096)] == [
         1,
         296,
         296,
-        513,
-        2048,
+        1025,
+        4096,
     ]
-    assert loader.k5_grid(1024, 208, "sm_107a") == 512
+    assert (
+        loader.k5_grid(65536, 152, "sm_103a") == 32768
+        and loader.k5_grid(1024, 208, "sm_107a") == 1024
+    )
     assert tuple(loader.ARCHES) == ARCHES
     assert loader.PROGRAM_RULES == (
         "fwd_coef_program",
@@ -1378,7 +1500,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     for table in (
         "PK_BANDS", "FN_SPLIT_PROGRAM", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM",
         "BWD_TOKEN_REGIMES", "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES",
-        "K5_GRID_BANDS", "BWD_TOKEN_BANDS", "BWD_REDUCE_PARTS", "FWD_FINISH_PROGRAM",
+        "K5_GRID_BANDS", "K5_FORM_BANDS", "BWD_TOKEN_BANDS", "BWD_REDUCE_PARTS", "FWD_FINISH_PROGRAM", "PDL_OFF_BANDS",
     ):  # fmt: skip
         assert tuple(getattr(loader, table)) == ARCHES, table
     assert set(loader.FN_SPLIT_GRID) == {
@@ -1486,6 +1608,11 @@ def test_registry_tables_are_literals() -> None:
         "FWD_FINISH_PROGRAM",
         "FWD_FINISH_ROWS",
         "K5_GRID_BANDS",
+        "K5_FORM_BANDS",
+        "K5_FORM_ROWS",
+        "PDL_PATHS",
+        "PDL_EDGES",
+        "PDL_OFF_BANDS",
     ):
         assert name in literals, f"{name} is not a literal the exporter can read"
     assert literals["MODULES"] == loader.MODULES
@@ -1506,6 +1633,7 @@ def test_records_are_consistent() -> None:
     assert set(libraries) == {
         *SPLIT_LIBRARY.values(), *MAP_LIBRARY.values(), *COEF_LIBRARY.values(), *TOKEN_LIBRARY.values(),
         *SLAB_LIBRARY.values(), *REDUCE_LIBRARY.values(), *FINISH_LIBRARY.values(), *EVERYWHERE,
+        *K5_FORM_LIBRARY.values(),
     }  # fmt: skip
     for library, names in MULTI_RECORDS.items():
         # several records, or one record not named after its library (the `__hi` / `__t` records)
@@ -1540,15 +1668,27 @@ def test_records_are_consistent() -> None:
         assert library_arches == LIBRARY_ARCHES[record["library"]], name
         assert set(record["arches"]) <= set(library_arches), name
         if _is(name, "cake_mhc_train_bwd_prepare"):
+            form = K5_FORM_OF_LIBRARY[
+                record["library"]
+            ]  # the CTA form the record launches (its library)
+            assert record["grid_rule"]["kind"] == "rows_per_cta", name
             assert (
-                record["grid_rule"]["kind"] == "rows_per_cta"
-                and record["grid_rule"]["rows_per_cta"] == 2
+                record["grid_rule"]["rows_per_cta"] == TABLES["K5_FORM_ROWS"][form]
             ), name
-            # the band record (a bounded rows_between) carries the persistent cap, the others none
+            # the production record of a live K5_GRID_BANDS band (a bounded rows_between with the band's bounds) carries
+            # the persistent cap, the others none (a band the form table covers has no record)
             rule_ = record["select_rule"]
-            assert (record["grid_rule"]["grid_per_sm"] > 0) == (
-                rule_ is not None and rule_["at_most"] is not None
-            ), name
+            live = (
+                form == "production"
+                and rule_ is not None
+                and rule_["at_most"] is not None
+                and any(
+                    (a, b) == (rule_["above"], rule_["at_most"]) and g > 0
+                    for arch in record["arches"]
+                    for a, b, g in TABLES["K5_GRID_BANDS"][arch]
+                )
+            )
+            assert (record["grid_rule"]["grid_per_sm"] > 0) == live, name
         assert record["hidden"] == 4096 and record["ffi_entry"] == "run", name
         assert (
             record["launch"]["cluster"] == (1, 1, 1)
@@ -1579,9 +1719,14 @@ def test_records_are_consistent() -> None:
                     rule["rule"] == rule_name
                     and table[rule["program"]] == record["library"]
                 ), name
-                # the K1 and K7 records are the plain ones; sm_107a's K6 / K8 program records take `__a7` where the
-                # plain name is another architecture's record under another rule
-                assert name in (record["library"], record["library"] + "__a7"), name
+                # the K1 and K7 records are the plain ones; a K6 / K8 program record takes the architecture suffix
+                # (`__a3` sm_100a, `__a7` sm_107a) where the plain name is another architecture's record under another
+                # rule (sm_100a's token-owner forms beside sm_103a's R-range records; sm_107a's beside both)
+                assert name in (
+                    record["library"],
+                    record["library"] + "__a3",
+                    record["library"] + "__a7",
+                ), name
             else:
                 assert set(rule) >= {"kind", "above", "at_most"}, name
             if rule["kind"] == "units_fit":
@@ -1607,12 +1752,22 @@ def test_records_are_consistent() -> None:
                     "cake_mhc_train_bwd_reduce",
                     "cake_mhc_train_bwd_prepare",
                 ), name
+        # the kernel parameters carry logical names; the grid triple and the per-call ``enable_pdl`` switch of a
+        # ``use_pdl="runtime"`` record are the call's own arguments (no logical name)
         parameters = [
-            parameter for role, parameter in record["arg_plan"] if role != "grid"
+            parameter
+            for role, parameter in record["arg_plan"]
+            if role not in ("grid", "launch")
         ]
         assert [
             parameter for role, parameter in record["arg_plan"] if role == "grid"
         ] == ["grid_x", "grid_y", "grid_z"]
+        launch_slots = [
+            parameter for role, parameter in record["arg_plan"] if role == "launch"
+        ]
+        assert launch_slots == (
+            ["enable_pdl"] if record["launch"]["use_pdl"] == "runtime" else []
+        ), name
         assert set(parameters) == set(record["logical"]), name
         for parameter, logical in record["logical"].items():
             assert (
@@ -1813,26 +1968,20 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
         assert loader.selected_modules(
             arch, 4096, "fwd_finish", rows=T, sm_count=sm
         ) == loader.route_modules(arch, 4096, "fwd_finish")
-        # the backward prepare: exactly one record of its one library -- the persistent-band record where the
-        # architecture's K5_GRID_BANDS hold T (sm_103a T <= 4096; sm_100a T <= 1024), the one-trip record
-        # elsewhere
+        # the backward prepare: exactly one record -- of the library of the CTA form k5_program names (the 128-thread
+        # one-token form inside a K5_FORM_BANDS band, the 256-thread record elsewhere); its grid rule reproduces k5_grid
         selected = loader.selected_modules(
             arch, 4096, "bwd_prepare", rows=T, sm_count=sm
         )
+        form = loader.k5_program(T, sm, arch)
         assert (
             len(selected) == 1
-            and only(selected, "cake_mhc_train_bwd_prepare")
-            == "cake_mhc_train_bwd_prepare"
-        )
-        in_band = any(
-            a < T and (b is None or b >= T) for a, b, _ in loader.K5_GRID_BANDS[arch]
-        )
-        assert (modules[selected[0]]["grid_rule"]["grid_per_sm"] > 0) == in_band, (
-            arch,
-            sm,
-            T,
-            selected,
-        )
+            and only(selected, "cake_mhc_train_bwd_prepare") == K5_FORM_LIBRARY[form]
+        ), (arch, sm, T)
+        rule5 = modules[selected[0]]["grid_rule"]
+        want5 = -(-T // rule5["rows_per_cta"])
+        want5 = min(want5, rule5["grid_per_sm"] * sm) if rule5["grid_per_sm"] else want5
+        assert want5 == loader.k5_grid(T, sm, arch), (arch, sm, T, selected)
         assert list(selected) == [
             n for n in loader.route_modules(arch, 4096, "bwd_prepare") if n in selected
         ]
@@ -1844,14 +1993,30 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     """``use_pdl`` is safe only for kernels that wait (``griddepcontrol.wait``) before reading a predecessor's
     output: the coefficient pass, the row streams, the token-owner pass, the column-slab pass (every role waits
     before its first read) and the final reduction do; the fn split (every record: one per form and layout some
-    architecture routes) and the mapping pass (every form) do not and must be launched without it."""
+    architecture routes) and the mapping pass (every form) do not and must be launched without it.  The dependents of
+    a kernel that releases its dependents right after its own wait (the libraries of ``PDL_EDGES``: the collapse and the
+    backward prepare after the coefficient pass, the column-slab pass after the token-owner pass, the final reduction
+    after the column-slab pass) take the attribute per call (``"runtime"``)."""
     pdl = {name: record["launch"]["use_pdl"] for name, record in loader.MODULES.items()}
+    runtime = {
+        name
+        for name, record in loader.MODULES.items()
+        if loader.pdl_edge(record["library"]) is not None
+    }
     assert pdl == {
-        name: not _is(name, "cake_mhc_train_fn_split", "cake_mhc_train_fwd_map")
+        name: (
+            "runtime"
+            if name in runtime
+            else not _is(name, "cake_mhc_train_fn_split", "cake_mhc_train_fwd_map")
+        )
         for name in loader.MODULES
     }
+    assert runtime == {name for name in loader.MODULES if _is(name, *loader.PDL_EDGES)}
     n_map = sum(1 for name in loader.MODULES if _is(name, "cake_mhc_train_fwd_map"))
-    assert sum(1 for value in pdl.values() if not value) == len(RECORD_SCALARS) + n_map
+    assert (
+        sum(1 for value in pdl.values() if value is False)
+        == len(RECORD_SCALARS) + n_map
+    )
     # One fn split record per (form, layout) some architecture routes: every fn split record
     # names its layout (``want_t``) and a library of SPLIT_LIBRARY, and every architecture's routes reference exactly
     # one record of each layout -- the forward one (want_t 0) opens fwd_prepare / fwd_recompute, the transposed one
@@ -1879,6 +2044,78 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
         assert RECORD_SCALARS[splits["fwd_prepare_h4096"][0]] == {"want_t": 0}, arch
         assert RECORD_SCALARS[splits["bwd_finish_h4096"][0]] == {"want_t": 1}, arch
     assert n_map >= len(MAP_LIBRARY)
+
+
+def test_pdl_bands_of_record() -> None:
+    """The per-call PDL attribute is off exactly inside the measured token-count bands of ``PDL_OFF_BANDS`` -- per
+    architecture, edge (predecessor -> dependent) and call path -- and on in every other call; the records on an edge
+    take the ``enable_pdl`` argument right before the grid, no other record takes one."""
+    assert loader.PDL_PATHS == ("forward", "backward", "checkpoint")
+    assert loader.PDL_OFF_BANDS == PDL_OFF_BANDS
+    assert tuple(loader.PDL_OFF_BANDS) == ARCHES
+    assert set(loader.PDL_EDGES) == {
+        "cake_mhc_train_fwd_collapse", "cake_mhc_train_bwd_prepare", "cake_mhc_train_bwd_slab", "cake_mhc_train_bwd_reduce"
+    }  # fmt: skip
+    rows_of_record = {row["T"] for row in _rows()}
+    for arch, edges in loader.PDL_OFF_BANDS.items():
+        for edge, paths in edges.items():
+            assert edge in loader.PDL_EDGES.values(), (arch, edge)
+            for path, bands in paths.items():
+                assert path in loader.PDL_PATHS, (arch, edge, path)
+                assert bands and list(bands) == sorted(bands), (arch, edge, path, bands)
+                # a tuple of (above, at_most] pairs -- never a bare pair, which the switch would unpack as integers
+                assert all(
+                    isinstance(band, tuple) and len(band) == 2 for band in bands
+                ), (arch, edge, path, bands)
+                for index, (above, at_most) in enumerate(bands):
+                    assert above < at_most and {above, at_most} <= rows_of_record, (
+                        arch,
+                        edge,
+                        path,
+                        above,
+                        at_most,
+                    )
+                    assert index == 0 or bands[index - 1][1] <= above, (
+                        arch,
+                        edge,
+                        path,
+                        bands,
+                    )
+    for name, record in loader.MODULES.items():
+        plan = [tuple(entry) for entry in record["arg_plan"]]
+        slots = [index for index, (role, _) in enumerate(plan) if role == "launch"]
+        assert plan[-3:] == [
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ], name
+        if record["launch"]["use_pdl"] == "runtime":
+            assert slots == [len(plan) - 4] and plan[-4] == ("launch", "enable_pdl"), (
+                name
+            )
+            assert loader.pdl_edge(record["library"]) is not None, name
+        else:
+            assert not slots, name
+    for arch in ARCHES:
+        for name, record in loader.MODULES.items():
+            if arch not in record["arches"]:
+                continue
+            edge = loader.pdl_edge(record["library"])
+            for path in loader.PDL_PATHS:
+                bands = loader.PDL_OFF_BANDS[arch].get(edge or "", {}).get(path, ())
+                boundaries = {
+                    t for a, b in bands for t in (a, a + 1, b, b + 1)
+                }  # on / off / off / on around a band
+                for T in sorted((rows_of_record | boundaries) - {0}):
+                    off = record["launch"]["use_pdl"] == "runtime" and any(
+                        a < T <= b for a, b in bands
+                    )
+                    assert loader.enable_pdl(name, T, arch, path) == (
+                        0 if off else 1
+                    ), (name, arch, path, T)
+    assert loader.enable_pdl("cake_mhc_train_fn_split", 1024, "sm_103a", "forward") == 1
+    with pytest.raises(ValueError, match="call path"):
+        loader.enable_pdl("cake_mhc_train_fwd_collapse", 1024, "sm_103a", "other")
 
 
 def test_launch_facts_of_record() -> None:
@@ -2024,11 +2261,13 @@ def test_launch_grids_follow_the_rules(
                 1,
             )
         )
-        # the backward prepare: every record's own rule (the one-trip grid, or min(ceil(T / 2), grid_per_sm x SMs) on
-        # the band record); the record the call selects launches the row's k5_grid
+        # the backward prepare: every record's own rule (the form's one-trip grid ceil(T / rows_per_cta), or
+        # min(ceil(T / 2), grid_per_sm x SMs) on the production band record); the record the call selects launches the
+        # row's k5_grid and is of the library of the row's CTA form (k5_program)
         for name in (n for n in modules if _is(n, "cake_mhc_train_bwd_prepare")):
             per_sm = modules[name]["grid_rule"]["grid_per_sm"]
-            want = min(-(-T // 2), per_sm * sm) if per_sm else -(-T // 2)
+            trip = -(-T // modules[name]["grid_rule"]["rows_per_cta"])
+            want = min(trip, per_sm * sm) if per_sm else trip
             assert grid(name) == (want, 1, 1), name
         (selected,) = loader.selected_modules(
             arch, 4096, "bwd_prepare", rows=T, sm_count=sm
@@ -2038,25 +2277,35 @@ def test_launch_grids_follow_the_rules(
             == (row["k5_grid"], 1, 1)
             == (loader.k5_grid(T, sm, arch), 1, 1)
         )
-        bands = [
-            (a, b, g)
-            for a, b, g in loader.K5_GRID_BANDS[arch]
-            if a < T and (b is None or b >= T)
-        ]
+        form = loader.k5_program(T, sm, arch)
+        assert (
+            row["k5_program"] == form
+            and modules[selected]["library"] == K5_FORM_LIBRARY[form]
+        ), (arch, T, selected)
+        rows5 = TABLES["K5_FORM_ROWS"][form]
+        bands = (
+            [
+                (a, b, g)
+                for a, b, g in loader.K5_GRID_BANDS[arch]
+                if a < T and (b is None or b >= T)
+            ]
+            if form == "production"
+            else []
+        )
         if bands:
             assert len(bands) == 1, (arch, T, bands)
             _, at_most, per_sm = bands[0]
-            assert row["k5_grid"] == min(-(-T // 2), per_sm * sm), (arch, sm, T)
+            assert row["k5_grid"] == min(-(-T // rows5), per_sm * sm), (arch, sm, T)
             assert selected == f"cake_mhc_train_bwd_prepare__g{per_sm}sm_le{at_most}", (
                 arch,
                 T,
                 selected,
             )
         else:
-            assert row["k5_grid"] == -(-T // 2)
-            assert selected == "cake_mhc_train_bwd_prepare" or selected.startswith(
-                "cake_mhc_train_bwd_prepare__gt"
-            )
+            assert row["k5_grid"] == -(-T // rows5), (arch, sm, T)
+            assert selected == K5_FORM_LIBRARY[form] or selected.startswith(
+                K5_FORM_LIBRARY[form] + "__"
+            ), (arch, T, selected)
         for name in TOKEN_LIBRARY.values():
             assert grid(name) == (row["G6"], 1, 1), name
         for name in SLAB_LIBRARY.values():

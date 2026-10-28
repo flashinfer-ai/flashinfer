@@ -113,6 +113,7 @@ jobs:
       test_count: ${{ steps.matrix.outputs.count }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
+      h100_disabled: ${{ steps.matrix.outputs.h100_disabled }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -219,7 +220,20 @@ jobs:
           # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
           # already validated in the step above. Empty for an unparameterised run.
           REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
+          # Temporarily off on PRs: two of the three H100 hosts dropped out of the
+          # pool (last jobs 2026-10-14 and 2026-10-22), and the remaining two
+          # runners cannot keep up with the full-run load, so PR H100 jobs queued
+          # for hours. Scheduled runs on main keep the lane. Set back to 'true'
+          # once capacity is restored.
+          H100_ON_PRS: 'false'
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          RUN_H100=true
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$H100_ON_PRS" != "true" ]; then
+            RUN_H100=false
+            echo "::notice title=H100 lane disabled on PRs::H100 tests run only in scheduled main runs and manual workflow_dispatch runs until runner capacity is restored" >&2
+          fi
+          echo "h100_disabled=$([ "$RUN_H100" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
           # A targeted run on a lane never tests more than that lane's bare run: H100
           # gets the request as-is (its bare run covers tests/); A10G and T4 get it
           # intersected with their shard lists, and a lane left with nothing is skipped.
@@ -285,15 +299,17 @@ jobs:
                 timeout: 360
               }'
 
-              jq -nc '{
-                name: "JIT Unittest (H100)",
-                kind: "h100",
-                gpu_name: "H100",
-                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                timeout: 480
-              }'
+              if [ "$RUN_H100" = "true" ]; then
+                jq -nc '{
+                  name: "JIT Unittest (H100)",
+                  kind: "h100",
+                  gpu_name: "H100",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  timeout: 480
+                }'
+              fi
             elif [ "$SKIP_GPU" != "true" ]; then
               # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
               # paths. There is deliberately no arch selection: tests carry their own
@@ -335,16 +351,18 @@ jobs:
                   timeout: 360
                 }'
               fi
-              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
-                name: "Targeted Unittest (H100)",
-                kind: "h100",
-                gpu_name: "H100",
-                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
-                cuda: "cu129",
-                script: "task_run_unit_tests.sh",
-                test_path: $test_path,
-                timeout: 480
-              }'
+              if [ "$RUN_H100" = "true" ]; then
+                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                  name: "Targeted Unittest (H100)",
+                  kind: "h100",
+                  gpu_name: "H100",
+                  runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                  cuda: "cu129",
+                  script: "task_run_unit_tests.sh",
+                  test_path: $test_path,
+                  timeout: 480
+                }'
+              fi
             fi
           } | jq -sc '{include: .}' > matrix.json
 
@@ -930,6 +948,7 @@ jobs:
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
           SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
           TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
+          H100_DISABLED: ${{ needs.setup.outputs.h100_disabled }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -960,6 +979,13 @@ jobs:
           # go green having run three narrow lanes. The job names change from "JIT
           # Unittest" to "Targeted Unittest", but that is easy to miss on a check
           # list -- say it outright on the check a merge decision actually reads.
+          # The H100 lane is temporarily off on PRs (see Build Test Matrix). A scope
+          # only H100 covered now schedules nothing and passes, so say so here.
+          if [ "$H100_DISABLED" == "true" ]; then
+            echo "> **H100 lane temporarily disabled on PRs** — H100 tests run only in scheduled main runs and manual workflow_dispatch runs." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
           if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
             echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY

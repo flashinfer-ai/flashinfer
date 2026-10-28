@@ -339,6 +339,23 @@ DX_SLICED_STAGE = "gemm_dx_s"
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+# TMA-epilogue form of the deferred BF16 dW cast (``gemm_dw_cast_bf16_tma``): the old FP32 sum is read and the
+# BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
+# chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
+# and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
+# sum to read and keeps the shipped form.
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+
+
+def dw_cast_tma_rule(num_chunks: int, rows_last: int, arch: Optional[str]) -> bool:
+    """Does the deferred BF16 dW cast of a call of ``num_chunks`` chunks, whose last chunk has ``rows_last``
+    rows, run the TMA-epilogue form on ``arch``?"""
+    limit = DW_CAST_TMA_MAX_ROWS.get(arch) if arch is not None else None
+    return (
+        limit is not None and int(num_chunks) >= 2 and 0 < int(rows_last) <= int(limit)
+    )
+
+
 # Fused dX finalize (``dx_finalize``, default on): ``slab_sum`` adds the FP32 K-slice slabs of a sliced dX GEMM into
 # the chunk's rows of ``dX_acc`` in ascending slab order in one launch (one RN add per element per slab -- the
 # evaluation order of the host's ``add_`` chain, ``dX_acc`` read and written once instead of once per slab), and
@@ -470,14 +487,20 @@ DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
 )  # ... only in a call of fewer than DW_STREAM_MIN_CHUNKS chunks
 DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
+# Swapped dX tile (``_swab``): dX^T = W^T dz^T, W's 128 hidden columns of a CTA on the MMA's M and the chunk's
+# 512-token tile on its N (two 256-token blocks), C stored per thread.  On an architecture listed here it runs a chunk
+# of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
+# of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
+# over the same K slices in the same K order.
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
 _TUNING_KNOBS = {
     "logits": ("group_m",),
-    "dx": ("k_slices", "tile_n", "stages", "split"),
+    "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),
     "dw": ("group_m", "epi_store", "group_n"),
 }
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
-    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?"
+    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?(?P<swab>_swab)?"
     r"(?P<gn>_gn)?(?P<tma>_tma)?"
 )
 STAGE_KNOBS = (
@@ -486,6 +509,7 @@ STAGE_KNOBS = (
     "tile_n",
     "stages",
     "split",
+    "swab",
     "blocked",
     "epi_store",
 )
@@ -499,18 +523,21 @@ def stage_variant(
     tile_n: Optional[int] = None,
     stages: Optional[int] = None,
     split: bool = False,
+    swab: bool = False,
     blocked: bool = False,
     epi_store: Optional[str] = None,
 ) -> str:
     """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
-    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_split``, ``_gn``, ``_tma``; ``split``: the wide dX tile
-    with its last wave's trailing items run as half items (:func:`dx_split_rule`); a default output (the host-bound row
+    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``; ``split``: the wide
+    dX tile with its last wave's trailing items run as half items (:func:`dx_split_rule`); ``swab``: the wide dX tile
+    with swapped operands at the table ring depth (:func:`dx_swab_rule`); a default output (the host-bound row
     count, one slice, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
     ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound is read from device
     memory (chunk 0 of the hidden valid-row count path); ``sliced``: the dX GEMM run as ``k_slices > 1`` K-slice work
     items per tile; ``blocked``: the weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
-    (``group_n`` set).  The slice count, the raster height and the block width themselves are launch scalars
-    (:func:`gemm_scalars`), not part of the name."""
+    (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
+    TMA store (:func:`dw_cast_tma_rule`).  The slice count, the raster height and the block width themselves are
+    launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
     name = base
@@ -542,12 +569,20 @@ def stage_variant(
                 f"{base}: the only ring-depth form is the 512-wide dX tile's {sorted(set(DX_LONG_CHUNK_STAGES.values()))}-deep ring, got {stages} (tile {tile_n})"
             )
         name += f"_st{int(stages)}"
-    if split:
+    if split or swab:
         if base != "gemm_dx" or (tile_n is not None and int(tile_n) != DX_TILE_WIDE):
             raise ValueError(
-                f"{base}: the split-tail form exists for the wide dX tile only"
+                f"{base}: the split-tail and swapped forms exist for the wide dX tile only"
             )
-        name += "_split"
+        if split and swab:
+            raise ValueError(
+                f"{base}: the split-tail and swapped dX forms exclude each other"
+            )
+        if swab and stages is not None and int(stages) != DX_WIDE_TILE_STAGES:
+            raise ValueError(
+                f"{base}: the swapped dX tile runs the table ring depth only"
+            )
+        name += "_split" if split else "_swab"
     if blocked:
         if base not in DW_BLOCK_BASES:
             raise ValueError(
@@ -555,9 +590,9 @@ def stage_variant(
             )
         name += "_gn"
     if epi_store is not None and epi_store != "redsm":
-        if base != "gemm_dw_acc" or epi_store != "tma":
+        if base not in ("gemm_dw_acc", "gemm_dw_cast_bf16") or epi_store != "tma":
             raise ValueError(
-                f"{base}: the only epilogue variant is the weight-gradient accumulate's TMA reduce-add, got {epi_store!r}"
+                f"{base}: the only epilogue variants are the weight-gradient accumulate's TMA reduce-add and the bf16 fused cast's TMA store, got {epi_store!r}"
             )
         name += "_tma"
     return name
@@ -577,6 +612,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
         tile_n=int(m["tile"]) if m["tile"] else None,
         stages=int(m["stages"]) if m["stages"] else None,
         split=bool(m["split"]),
+        swab=bool(m["swab"]),
         blocked=bool(m["gn"]),
         epi_store="tma" if m["tma"] else None,
     )
@@ -785,6 +821,26 @@ def dx_split_eligible(
     )
 
 
+def dx_swab_rule(
+    rows_c: int,
+    hidden: int,
+    arch: Optional[str],
+    tile_n: Optional[int],
+    ce_loss: bool = False,
+    num_chunks: Optional[int] = None,
+) -> bool:
+    """The swapped dX tile runs a chunk of whole ``DX_TOKEN_TILE`` token tiles (wide tile) of a cross-entropy loss call
+    (``ce_loss``: the loss entry point with objective ``"ce"``; the policy objective and the log-probability entry point
+    keep the other forms) of ``num_chunks >= DW_STREAM_MIN_CHUNKS`` chunks on an architecture in ``DX_SWAB_ARCHES``."""
+    return (
+        arch in DX_SWAB_ARCHES
+        and bool(ce_loss)
+        and num_chunks is not None
+        and int(num_chunks) >= DW_STREAM_MIN_CHUNKS
+        and dx_whole_tiles(rows_c, hidden, tile_n)
+    )
+
+
 def gemm_tuning_default() -> dict[str, dict[str, Any]]:
     """Default of ``gemm_tuning`` (``{}``): no explicit GEMM knob, the per-chunk instance rules choose every form."""
     return {}
@@ -830,9 +886,13 @@ class ChunkVariants:
     dx_split: Optional[int] = (
         None  # None = no split-tail; F = the wide items run as half items (dx_split_rule)
     )
+    dx_swab: bool = False  # the swapped dX tile (dx_swab_rule)
     dw_group_m: Optional[int] = None
     dw_epi_store: Optional[str] = None
     dw_group_n: Optional[int] = None  # None = the 1-D raster
+    dw_cast_tma: bool = (
+        False  # the deferred bf16 cast's TMA epilogue (dw_cast_tma_rule; last chunk)
+    )
 
 
 def chunk_variants(
@@ -844,10 +904,12 @@ def chunk_variants(
     arch: Optional[str],
     tuning: Optional[dict[str, dict[str, Any]]] = None,
     num_chunks: Optional[int] = None,
+    ce_loss: bool = False,
 ) -> ChunkVariants:
     """Per-chunk instance knobs: the explicit ``tuning`` knob when present (``None`` pins the default), else the rule
     of a registered program's architecture (``arch``; ``None`` -- the reference path -- plans the base stages).
-    ``num_chunks`` is the call's chunk count (the whole-chunk split rule of :func:`dx_split_eligible`)."""
+    ``num_chunks`` is the call's chunk count (the whole-chunk split rule of :func:`dx_split_eligible`); ``ce_loss``: the
+    call is a cross-entropy loss call (the swap rule :func:`dx_swab_rule`)."""
     tuning = tuning or {}
     logits_t, dx_t, dw_t = (tuning.get(op, {}) for op in ("logits", "dx", "dw"))
     raster = raster_variant(hidden, rows_c, arch)
@@ -871,13 +933,64 @@ def chunk_variants(
         stages = (
             dx_stages_variant(rows_c, hidden, tile, arch) if arch is not None else None
         )
+    # the swapped tile runs the table ring depth: an explicit ``stages`` other than it, like an explicit ``split``
+    # (``None`` included), keeps the pinned form and turns the swap rule off; with ``swap_ab=True`` it is an error
+    stages_off_table = (
+        "stages" in dx_t
+        and dx_t["stages"] is not None
+        and int(dx_t["stages"]) != DX_WIDE_TILE_STAGES
+    )
+    if "swap_ab" in dx_t:
+        # an explicit ``swap_ab=True`` applies to every chunk (as an explicit ``split`` does): a chunk whose resolved
+        # form cannot run the swapped tile is an error here, not a missing stage at bind time
+        swab = bool(dx_t["swap_ab"])
+        if swab and arch is not None and arch not in DX_SWAB_ARCHES:
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: {arch} has no swapped dX program (architectures "
+                f"{', '.join(DX_SWAB_ARCHES)})"
+            )
+        if swab and stages_off_table:
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: the swapped dX tile runs the {DX_WIDE_TILE_STAGES}-deep table ring "
+                f"only, got stages={dx_t['stages']}"
+            )
+        if swab and tile is not None and int(tile) != DX_TILE_WIDE:
+            how = (
+                "pinned"
+                if "tile_n" in dx_t
+                else "selected by the tile rule (the wide items do not fill the SM pairs)"
+            )
+            hint = (
+                f"H={int(hidden)} has no wide tile (H % {DX_TILE_WIDE} != 0)"
+                if int(hidden) % DX_TILE_WIDE
+                else f"pin tile_n={DX_TILE_WIDE} as well"
+            )
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: the swapped dX form exists for the {DX_TILE_WIDE}-column tile only, "
+                f"but the chunk of {int(rows_c)} rows resolves tile_n={int(tile)} ({how}); {hint}"
+            )
+    else:
+        swab = (
+            arch is not None
+            and "split" not in dx_t
+            and not stages_off_table
+            and dx_swab_rule(rows_c, hidden, arch, tile, ce_loss, num_chunks)
+        )
     if "split" in dx_t:
         split = 0 if dx_t["split"] is None else int(dx_t["split"])
+    elif swab:
+        split = 0  # the swapped tile takes precedence over the split-tail rule
     elif arch is None or not dx_split_eligible(rows_c, hidden, arch, tile, num_chunks):
         split = 0  # a chunk of whole token tiles keeps its full items where its half items cost more at the power limit
     else:
         split = dx_split_rule(
             rows_c, hidden, num_sms, k_slices, geometry, arch, tile, stages
+        )
+    if swab:
+        stages = None  # the swapped tile runs the table ring depth
+    if split and swab:
+        raise ValueError(
+            "gemm_tuning: the dX split-tail and swapped forms exclude each other"
         )
     epi = dw_t.get(
         "epi_store"
@@ -893,6 +1006,7 @@ def chunk_variants(
         if stages is None or int(stages) == DX_WIDE_TILE_STAGES
         else int(stages),
         dx_split=int(split) if split else None,
+        dx_swab=bool(swab),
         dw_group_m=None if dw_g is None else int(dw_g),
         dw_epi_store=None if epi in (None, "redsm") else str(epi),
         dw_group_n=None if gn in (None, 0) else int(gn),
@@ -926,8 +1040,12 @@ def reachable_variants(bases, arch: str, dx_max: int) -> set[str]:
                         out.add(
                             stage_variant(base, sliced=sliced, stages=st, split=True)
                         )
+                if arch in DX_SWAB_ARCHES:
+                    out.add(stage_variant(base, sliced=sliced, swab=True))
         elif base in DW_BLOCK_BASES and blocked:
             out.add(stage_variant(base, blocked=True))
+        elif base == "gemm_dw_cast_bf16" and arch in DW_CAST_TMA_MAX_ROWS:
+            out.add(stage_variant(base, epi_store="tma"))
     return out
 
 
@@ -1075,6 +1193,7 @@ def dx_stage(
     tile_n: Optional[int] = None,
     stages: Optional[int] = None,
     split: bool = False,
+    swab: bool = False,
 ) -> str:
     """Stage name of the dX GEMM run as ``k_slices`` K-slice work items per output tile (the ``_s`` form above one;
     ``tile_n`` = the pair tile's column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the
@@ -1089,6 +1208,7 @@ def dx_stage(
         tile_n=tile_n,
         stages=stages,
         split=split,
+        swab=swab,
     )
 
 
@@ -2114,6 +2234,7 @@ class Plan:
             v.dx_tile_n,
             v.dx_stages,
             split=v.dx_split is not None,
+            swab=v.dx_swab,
         )
 
     def dw_acc_stage(self, index: int) -> str:
@@ -2217,6 +2338,9 @@ class Plan:
                 "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
                 blocked=fp32
                 and v.dw_group_n is not None,  # the bf16 cast keeps the 1-D raster
+                epi_store="tma"
+                if v.dw_cast_tma
+                else None,  # the TMA form of the bf16 cast (dw_cast_tma_rule)
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
@@ -2301,9 +2425,20 @@ def make_plan(
                 arch,
                 tuning,
                 num_chunks=len(chunks),
+                ce_loss=problem.entry == "loss" and problem.objective == "ce",
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
+    if (
+        variants
+        and need_dw
+        and fuse_dw_cast
+        and not (problem.entry == "loss" and problem.grad_weight_dtype == torch.float32)
+        and "epi_store" not in tuning.get("dw", {})
+        and dw_cast_tma_rule(len(chunks), chunks[-1][1], arch)
+    ):
+        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast
+        variants = variants[:-1] + (replace(variants[-1], dw_cast_tma=True),)
     hidden_group: Optional[int] = None
     if hidden_count:
         if arch is None:
@@ -5540,6 +5675,14 @@ def dw_cast(
     stage = stage_variant(
         "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
         blocked=group_n is not None,
+        epi_store="tma"
+        if (
+            not fp32
+            and dw_acc is not None
+            and "epi_store" not in dw_tuning
+            and dw_cast_tma_rule(2, int(rows), record["arch"])
+        )
+        else None,
     )
     if stage not in registered_stages(module_name):
         raise NotImplementedError(

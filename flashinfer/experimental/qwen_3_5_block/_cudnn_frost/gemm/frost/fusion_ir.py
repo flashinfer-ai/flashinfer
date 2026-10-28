@@ -542,6 +542,13 @@ class BlockScaleSpec:
     # and seed that side's still-reserved TMEM scale region with packed 1.0.
     fake_dequant_a: bool = False
     fake_dequant_b: bool = False
+    # sm120 only, OPT-IN (``jit_from_cudnn_graph(..., padded_e2m1=True)``): load
+    # the e2m1 side of a mixed MXFP4 x MXFP8 pair through TMA's padded
+    # ``.b4x16_p64`` form (one byte per value in SMEM, hardware fragment
+    # expansion) instead of the packed ``.b4x16`` default. Like the fake marks it
+    # is NOT part of the registry's MMA-type key; the renderer reads it through
+    # ``kernel_registry.sm120_padded_e2m1_sides``.
+    padded_e2m1: bool = False
     # matmul-level dtypes (accum/output/tap) are NOT duplicated here — read
     # chain.matmul / chain.output_dtype. Only input-side info lives here.
 

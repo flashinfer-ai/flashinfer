@@ -4647,6 +4647,10 @@ class W4A16FusedMoeKernel:
         grid_x: Int32,
     ):
         cute.arch.sync_threads()
+        # Publish all CTA writes before incrementing the arrival counter. The
+        # last CTA acquires the arrival chain before releasing the new sense;
+        # its fence alone cannot release writes from earlier arriving CTAs.
+        threadfence()
         if tid == Int32(0):
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
@@ -5417,6 +5421,9 @@ def compile_w4a16_fused_moe(
                 "fused W4A16 FC1/FC2 selected different thread counts: "
                 f"{fc1_cta_threads} vs {fc2_cta_threads}"
             )
+    # These decode widening rules use the m8-only register specializations.
+    # Small expert banks may select larger route blocks; retain their generic
+    # tile selection instead of constructing an unsupported resource model.
     # TC-decode FC1 wide-N override (single-wave-collapse sizes only): in the m8
     # fused path the host right-sizes grid_x to the FC1 mn-tile count and forces
     # one whole mn-tile per CTA over the full K. With the default fc1_tile_n=128,
@@ -5442,6 +5449,7 @@ def compile_w4a16_fused_moe(
     )
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(fc1_cols) % 256 == 0
         and fc1_tile_n == 128
         and (fc1_tile_n * fc1_tile_k) // 64 == 256
@@ -5475,6 +5483,7 @@ def compile_w4a16_fused_moe(
     # thread-geometry contract is preserved.
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(hidden_size) % 256 == 0
         and fc2_tile_n == 128
         and fc1_cta_threads == 256
@@ -5520,6 +5529,7 @@ def compile_w4a16_fused_moe(
     )
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(hidden_size) % 512 == 0
         and fc2_tile_n == 256
         and fc1_cta_threads == 256
@@ -6056,6 +6066,14 @@ def _w4a16_fused_moe_launch_flat(
         # identical cache entry instead of silently recompiling with auto tiles.
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
     )
+    # Expert weight banks can exceed 2**31 elements. The implicit TensorAdapter
+    # conversion marks their layout dynamic, and the DSL runtime packs dynamic
+    # sizes 32-bit, so a >2 GiB flat bank overflows during host-side argument
+    # marshalling. The kernel is compiled against static-shape fakes for these
+    # parameters, so wrap the banks in a static-layout from_dlpack instead:
+    # identical MLIR type to the compiled signature, and sizes stay 64-bit.
+    w13_arg = cute.runtime.from_dlpack(w13_arg, assumed_align=16)
+    w2_arg = cute.runtime.from_dlpack(w2_arg, assumed_align=16)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),

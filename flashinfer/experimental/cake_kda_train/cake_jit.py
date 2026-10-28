@@ -121,10 +121,12 @@ set carries the WY representation's ``w`` / ``u`` too: the paired serial
 ``sm_107a`` above 32 (document, head) chains -- ``bwd_prep_g8_noqg_nokb`` (no
 ``kb`` write either; those rows launch no ``wy`` program on either light
 path; the serial rows' form is gated to the ``light`` path, as the serial
-route never saves the states).  The GLM intra program of ``sm_103a`` is
-``glm_intra_v14``, the gate epilogue fused into its drains; the
-``gate_epilogue`` stage is optional and launches on ``sm_100a`` / ``sm_107a``
-alone, after ``glm_intra``.
+route never saves the states).  The GLM intra programs of ``sm_103a`` and
+``sm_107a`` are ``glm_intra_v14`` and ``glm_intra_v18``, the gate epilogue
+fused into their drains (``glm_intra_v18`` is the same program with every
+named-barrier slot an immediate, so two of its CTAs share an SM on ``sm_107a``);
+the ``gate_epilogue`` stage is optional and launches on ``sm_100a`` alone,
+after ``glm_intra``.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -176,9 +178,9 @@ PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 # reads, after it otherwise), ``wy`` and the recurrence recompute where the path and the
 # row take them, ``dav`` where the fused gradient does not host it, the adjoint
 # recurrence (segmented: pass 1, ``seg_carry``, pass 2), the fused gradient,
-# the GLM intra program and, on ``sm_100a`` / ``sm_107a``, the gate epilogue
-# (``sm_103a`` launches ``glm_intra_v14``, which writes the gate gradients
-# itself).  A stage with several variants
+# the GLM intra program and, on ``sm_100a``, the gate epilogue (``sm_103a`` /
+# ``sm_107a`` launch ``glm_intra_v14`` / ``glm_intra_v18``, which write the gate
+# gradients themselves).  A stage with several variants
 # launches the record its ``select_rule`` admits; an optional stage launches
 # nothing when no record admits.  The WY representation is two stages:
 # ``wy_fwd`` (the forward's program, on the user's ``v`` / ``beta`` token rows;
@@ -5344,7 +5346,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "int_davq_nohint",
     },
     "glm_intra": {
-        "arches": ["sm_100a", "sm_107a"],
+        "arches": ["sm_100a"],
         "arg_plan": [
             ["buffer", "dAqk"],
             ["buffer", "dAkk"],
@@ -5407,7 +5409,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_qk_heads": "num_heads",
             "q_e": "q",
         },
-        "select_rule": {"kind": "arch_in", "arches": ["sm_100a", "sm_107a"]},
+        "select_rule": {"kind": "arch_in", "arches": ["sm_100a"]},
         "stage": "glm_intra",
         "variant": None,
     },
@@ -5479,8 +5481,76 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "glm_intra",
         "variant": "v14",
     },
+    "glm_intra_v18": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_ext"],
+            ["buffer", "dbeta_ext"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_aa6b5c23c97e1cb9880a",
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_aa6b5c23c97e1cb9880a",
+        "logical": {
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "dbeta_ext": "dbeta",
+            "dg_ext": "dg",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q_e": "q",
+        },
+        "select_rule": {"kind": "arch_in", "arches": ["sm_107a"]},
+        "stage": "glm_intra",
+        "variant": "v18",
+    },
     "gate_epilogue": {
-        "arches": ["sm_100a", "sm_107a"],
+        "arches": ["sm_100a"],
         "arg_plan": [
             ["buffer", "dg_in"],
             ["buffer", "db_in"],
@@ -5513,7 +5583,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dg_out": "dg",
             "num_heads": "num_heads",
         },
-        "select_rule": {"kind": "arch_in", "arches": ["sm_100a", "sm_107a"]},
+        "select_rule": {"kind": "arch_in", "arches": ["sm_100a"]},
         "stage": "gate_epilogue",
         "variant": None,
     },

@@ -115,6 +115,14 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
+# The scan programs that draw their work units from the workspace's ticket tail
+# (``cake_policy.TICKET_TAIL_BYTES``), per architecture: the sm_103a gate-warpgroup
+# wide programs.  The host zeroes the tail right before launching one of them
+# (``cake_backend``); every other (program, arch) pair leaves it unused.
+TICKET_TAIL_PROGRAMS: dict[str, tuple[str, ...]] = {
+    "cake_dsa_indexer_topk_3c6dc460295ddf3c44de": ("sm_103a",),
+    "cake_dsa_indexer_topk_808a62a6315ae38034c6": ("sm_103a",),
+}
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
         "role": "scan",
@@ -635,6 +643,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": None,
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -703,6 +712,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": [4096, 375],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -787,6 +797,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": None,
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
