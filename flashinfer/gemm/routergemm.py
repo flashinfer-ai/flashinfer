@@ -922,7 +922,7 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # with the reference's output bits.  They keep the reference's four K chains, the
 # K16 order within a chain and its +0 start, and sum the chains and the bias in the
 # reference's order, so a routed call returns exactly what the reference returns.
-# Eight tiles, each with and without the bias and with and without programmatic
+# Nine tiles, each with and without the bias and with and without programmatic
 # dependent launch, as (output features, batch rows) per CTA.  The three narrow
 # tiles differ only in their loops: PACKED_NARROW unrolls them by two rounds, faster
 # on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
@@ -931,6 +931,8 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # features in each chain's block of an M=64 MMA, on 16 or 4 batch rows (faster on
 # sm_107a).  PACKED_BOX8 is PACKED on 8 batch rows: its activation box is 8 rows
 # tall, so a batch of 8 loads no rows past its end (faster on sm_107a).
+# PACKED_M64_N8 puts sixteen output features in each chain's block of an M=64 MMA
+# on 8 batch rows with an 8-row activation box (sm_107a only).
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
     "PACKED_NARROW_U4": (8, 2),
@@ -939,6 +941,7 @@ _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_M64_N4": (16, 4),
     "PACKED": (32, 16),
     "PACKED_BOX8": (32, 8),
+    "PACKED_M64_N8": (16, 8),
     "ACCUMULATORS": (32, 64),
 }
 _NARROW_TILES = ("PACKED_NARROW", "PACKED_NARROW_U4", "PACKED_NARROW_FULL_STAGES")
@@ -957,6 +960,7 @@ class _Tcgen05Window(NamedTuple):
     max_input_features: Optional[int] = None
     min_weight_elements: Optional[int] = None  # output x input features
     one_wave: bool = False  # only while PACKED's grid fits one CTA per SM
+    input_features_multiple: int = 1  # only inputs that are a multiple of this
 
     def admits(
         self, batch: int, out_features: int, in_features: int, bias: bool, sms: int
@@ -973,6 +977,7 @@ class _Tcgen05Window(NamedTuple):
             and within(in_features, self.min_input_features, self.max_input_features)
             and within(out_features * in_features, self.min_weight_elements, None)
             and (not self.one_wave or packed_ctas <= sms)
+            and in_features % self.input_features_multiple == 0
             and (self.tile not in _NARROW_TILES or in_features % 64 == 0)
         )
 
@@ -1004,7 +1009,12 @@ class _Tcgen05Window(NamedTuple):
 # the reference on some; below 120 KiB, 22 and 23 rows stay on ACCUMULATORS, which
 # measured faster than the reference there and close to PACKED).  PACKED_BOX8
 # serves the 8 rows of PACKED's sm_107a window from an input of 3072 (measured
-# faster than PACKED there).
+# faster than PACKED there).  On sm_107a, 8 rows without a bias go first to
+# PACKED_M64_N8: from 3584 output features at an input of 2048, and at inputs that
+# are a multiple of 64 (off that, some measured slower) from 7168 output features
+# and an input of 2048, from 6144 and an input of 3072, and at 3584 to 4608 from
+# an input of 4096, all up to 8192; then to PACKED_BOX8 at 4096 to 5120 output
+# features and inputs of 2112 to 2560.
 _LARGE_WEIGHT = 6_000_000
 
 
@@ -1161,6 +1171,17 @@ _SM107 = (
     _Tcgen05Window("PACKED_M64_N16", 16, 16, False, 2048, 3072, 2048, 10240),
     _Tcgen05Window("PACKED_M64_N16", 11, 16, False, 2048, 3072, 6144, 10240),
     _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 2048, 3072, 8192, 10240),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 3584, 8192, 2048, 2048),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 7168, 8192, 2048, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 6144, 8192, 3072, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 3584, 4608, 4096, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4096, 5120, 2112, 2560),
     _Tcgen05Window("PACKED_BOX8", 8, 8, False, 3584, 4096, 3072, 6144),
     _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
