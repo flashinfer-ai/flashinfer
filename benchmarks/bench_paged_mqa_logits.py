@@ -151,7 +151,7 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
         device=device,
     )
 
-    # Warm: JIT compile + schedule-bucket compile happen here, outside timing.
+    # Warm: logits and schedule kernel compiles happen here, outside timing.
     _call(kind, args, out)
     torch.cuda.synchronize()
     # Self-check on exactly the region the API defines: row b*next_n + t holds

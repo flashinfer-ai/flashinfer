@@ -372,6 +372,131 @@ def test_gpu_schedule_matches_cpu(batch_size, avg_ctx):
     )
 
 
+def _skip_unless_gpu_schedule():
+    # The schedule kernel is one warp of shuffles + smem with no arch-specific
+    # instructions, so unlike the logits kernels it runs wherever the DSL can
+    # target the device (Hopper included).
+    from flashinfer.attn_scores import attn_scores as A
+    from flashinfer.utils import get_device_index
+
+    if not (
+        A._CUTE_DSL_AVAILABLE
+        and A._cached_dsl_targets_device(get_device_index(torch.device("cuda")))
+    ):
+        pytest.skip("GPU schedule kernel needs a CuTe DSL that targets this device")
+
+
+@pytest.mark.parametrize(
+    "batch_size",
+    # Empty batch (no launch), warp-chunk edges (31/32/33), the 256-row edge,
+    # the old 32-row bucket edges from #6855 (8159/8160/8193), and a
+    # prefill-sized batch past every edge.
+    [0, 1, 31, 32, 33, 255, 256, 257, 8159, 8160, 8193, 16384],
+)
+def test_gpu_schedule_matches_cpu_large_batch(batch_size):
+    """Bit-exact vs the CPU reference at chunk/bucket edges and prefill sizes,
+    with a run of zero-length rows (repeated prefix sums: the tie case)."""
+    _skip_unless_gpu_schedule()
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_num_sms,
+        _compute_schedule_metadata,
+        compute_paged_mqa_logits_schedule,
+    )
+    from flashinfer.utils import get_device_index
+
+    gen = torch.Generator().manual_seed(batch_size)
+    seq_lens = torch.randint(1, 65536, (batch_size,), dtype=torch.int32, generator=gen)
+    zeros = slice(batch_size // 3, batch_size // 3 + min(40, batch_size // 3))
+    seq_lens[zeros] = 0
+    num_sms = _cached_num_sms(get_device_index(torch.device("cuda")))
+    ref = _compute_schedule_metadata(seq_lens, num_sms).cuda()
+
+    gpu = compute_paged_mqa_logits_schedule(seq_lens.cuda())
+    torch.cuda.synchronize()
+    assert torch.equal(ref, gpu), (
+        f"B={batch_size}: {(ref != gpu).any(dim=1).sum().item()} schedule rows differ"
+    )
+
+    # Strided view: the next_n > 1 caller passes seq_lens[::next_n] zero-copy.
+    wide = torch.zeros(batch_size * 2, dtype=torch.int32, device="cuda")
+    wide[::2] = seq_lens.cuda()
+    gpu_strided = compute_paged_mqa_logits_schedule(wide[::2])
+    torch.cuda.synchronize()
+    assert torch.equal(ref, gpu_strided), f"B={batch_size}: strided view differs"
+
+
+def test_gpu_schedule_compiles_once(monkeypatch):
+    """#6855: eager prefill callers send a new row count nearly every call, so
+    the schedule kernel takes the row count at runtime: one compiled kernel
+    must serve decode and prefill sizes alike."""
+    _skip_unless_gpu_schedule()
+    import flashinfer.jit.cute_dsl_core as dsl_core
+    from flashinfer.attn_scores.kernels import schedule_kernel
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_num_sms,
+        _compute_schedule_metadata,
+        compute_paged_mqa_logits_schedule,
+    )
+    from flashinfer.utils import get_device_index
+
+    # Drop in-process kernel caches so every specialization goes through the
+    # builder (a disk-cache hit still counts: it is still a distinct kernel).
+    for obj in vars(schedule_kernel).values():
+        if hasattr(obj, "cache_clear"):
+            obj.cache_clear()
+
+    sizes = [1, 33, 257, 300, 511, 600, 1000, 1500, 2047, 2100, 3000, 4500, 8000, 8192]
+    seen = set()
+    real = dsl_core.build_and_load_cute_dsl_kernel
+
+    def spy(module, key, *args, **kwargs):
+        if module.startswith("attn_scores_schedule"):
+            seen.add((module, key))
+            # Fail before compiling: a per-bucket kernel would otherwise
+            # spend minutes compiling every size here before failing.
+            assert len(seen) == 1, (
+                f"{len(seen)} schedule kernels for {sizes[: sizes.index(b) + 1]}; "
+                f"expected one for every size: {sorted(seen)}"
+            )
+        return real(module, key, *args, **kwargs)
+
+    monkeypatch.setattr(dsl_core, "build_and_load_cute_dsl_kernel", spy)
+
+    num_sms = _cached_num_sms(get_device_index(torch.device("cuda")))
+    gen = torch.Generator().manual_seed(0)
+    for b in sizes:
+        seq_lens = torch.randint(0, 65536, (b,), dtype=torch.int32, generator=gen)
+        got = compute_paged_mqa_logits_schedule(seq_lens.cuda())
+        ref = _compute_schedule_metadata(seq_lens, num_sms).cuda()
+        assert torch.equal(ref, got), f"B={b}: schedule differs from CPU reference"
+
+
+@pytest.mark.parametrize("over", [0, 1])
+def test_gpu_schedule_smem_cap(over):
+    """The kernel keeps a 4-byte prefix sum per row in dynamic SMEM, so the
+    largest batch it can launch is the per-block SMEM opt-in / 4 rows (58112 on
+    sm_90a/sm_100a).  At the cap it must run on the GPU; one row over, it must
+    take the CPU fallback instead of failing the launch."""
+    _skip_unless_gpu_schedule()
+    from flashinfer.attn_scores.attn_scores import (
+        _cached_max_smem_per_block,
+        _cached_num_sms,
+        _compute_schedule_metadata,
+        compute_paged_mqa_logits_schedule,
+    )
+    from flashinfer.utils import get_device_index
+
+    dev = get_device_index(torch.device("cuda"))
+    batch_size = _cached_max_smem_per_block(dev) // 4 + over
+    gen = torch.Generator().manual_seed(batch_size)
+    seq_lens = torch.randint(0, 65536, (batch_size,), dtype=torch.int32, generator=gen)
+    ref = _compute_schedule_metadata(seq_lens, _cached_num_sms(dev)).cuda()
+
+    got = compute_paged_mqa_logits_schedule(seq_lens.cuda())
+    torch.cuda.synchronize()
+    assert torch.equal(ref, got), f"B={batch_size}: schedule differs from CPU reference"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FP8 tests
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3063,7 +3188,7 @@ def test_fp4_split_graph_replay_across_split_boundary():
             q_fp4, q_sf, kv_fused, w, bt, seq_lens, max_len, out=out
         )
 
-    call()  # warm: kernel + schedule-bucket compiles
+    call()  # warm: logits + schedule kernel compiles
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
@@ -3570,32 +3695,26 @@ def test_precompile_warms_fp4_float32_output():
     )
 
 
-def test_precompile_warms_fp4_split_schedule_bucket():
-    """precompile(batch_sizes=[B]) must warm the schedule bucket fp4 next_n=4
-    actually requests: 2B rows on SM100/SM103 (two atoms), B rows on SM107.
+def test_precompile_warms_the_schedule_kernel():
+    """precompile must warm the one schedule kernel every batch size uses.
 
-    batch_sizes is in caller units but the schedule kernel is keyed on the
-    scheduler row count, and only the launch path applied the atom
-    decomposition -- so before the fix every B > 16 missed on a split device
-    (bucket(B) warmed, bucket(2B) requested) and the first fp4 next_n=4 call,
-    or the first CUDA-graph capture, compiled inside the hot path.  Pins:
-    (a) the runtime bucket is an in-process hit, (b) the unsplit bucket stays
-    warm (fp8 and fp4 next_n<=3 request it), (c) an end-to-end fp4 next_n=4
-    call adds no miss, (d) an unwarmed bucket still misses so (a)-(c) are not
-    vacuous.  Fails against the unfixed code at (a) on SM100/SM103 and at the
-    import of the (then missing) shared derivation everywhere.
+    The schedule kernel takes its row count at runtime (#6855), so after
+    precompile neither an fp4 next_n=4 call (2B scheduler rows on SM100/SM103,
+    B on SM107) nor a prefill-sized schedule may compile.  batch_sizes is
+    still accepted, so existing callers keep working, but no longer matters.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
-    from flashinfer import fp4_paged_mqa_logits, precompile_paged_mqa_logits
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        precompile_paged_mqa_logits,
+    )
     from flashinfer.attn_scores.attn_scores import (
         _SPLIT_KV,
         _cached_gpu_arch,
         _cached_num_sms,
-        _fp4_atom_decomposition,
-        _precompile_schedule_buckets,
-        _schedule_bucket,
     )
     from flashinfer.attn_scores.kernels.schedule_kernel import _compile_schedule_kernel
 
@@ -3603,16 +3722,6 @@ def test_precompile_warms_fp4_split_schedule_bucket():
     device = torch.device("cuda", dev)
     arch, sms = _cached_gpu_arch(dev), _cached_num_sms(dev)
     B = 32
-    _, num_atoms = _fp4_atom_decomposition(4, device)
-    expected_bucket = _schedule_bucket(B * num_atoms)  # 64 on SM100/SM103, 32 on SM107
-
-    # The derivation itself, GPU-free: bucket(B) is always present; the split
-    # adds bucket(B*num_atoms); fp8 alone never expands.
-    assert _precompile_schedule_buckets([B], ("fp4",), device) == {32, expected_bucket}
-    assert _precompile_schedule_buckets([B], ("fp8",), device) == {32}
-    assert _precompile_schedule_buckets([1, 40], ("fp8", "fp4"), device) == (
-        {32, 64} if num_atoms == 1 else {32, 64, 96}
-    )
 
     # In-process cache is session-wide; clear it so hits below are decided by
     # what precompile warmed, not by test order (disk cache still serves).
@@ -3623,19 +3732,13 @@ def test_precompile_warms_fp4_split_schedule_bucket():
         output_dtypes=(torch.bfloat16,),
         batch_sizes=[B],
     )
-    # (a) the bucket the runtime will request is warm
     hits = _compile_schedule_kernel.cache_info().hits
-    _compile_schedule_kernel(expected_bucket, _SPLIT_KV, sms, arch)
+    _compile_schedule_kernel(_SPLIT_KV, sms, arch)
     assert _compile_schedule_kernel.cache_info().hits == hits + 1, (
-        f"precompile(batch_sizes=[{B}]) did not warm schedule bucket "
-        f"{expected_bucket} (fp4 next_n=4 schedules {B}*{num_atoms} rows here)"
+        "precompile did not warm the schedule kernel"
     )
-    # (b) the unsplit bucket is warm too
-    hits = _compile_schedule_kernel.cache_info().hits
-    _compile_schedule_kernel(32, _SPLIT_KV, sms, arch)
-    assert _compile_schedule_kernel.cache_info().hits == hits + 1
 
-    # (c) a real fp4 next_n=4 call at B=32 must not enter the compile path
+    # A real fp4 next_n=4 call and a prefill-sized schedule add no miss.
     ctx, block_size, H, D, next_n = 512, 64, 64, 128, 4
     seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
     block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
@@ -3647,14 +3750,13 @@ def test_precompile_warms_fp4_split_schedule_bucket():
     fp4_paged_mqa_logits(
         q, q_sf, kv, w, block_tables, seq_lens, ctx, output_dtype=torch.bfloat16
     )
+    compute_paged_mqa_logits_schedule(
+        torch.full((8193,), ctx, dtype=torch.int32, device=device)
+    )
     torch.cuda.synchronize()
     assert _compile_schedule_kernel.cache_info().misses == misses, (
-        "fp4 next_n=4 at B=32 compiled a schedule bucket after precompile"
+        "a schedule kernel compiled after precompile"
     )
-    # (d) negative control: an unwarmed bucket misses
-    misses = _compile_schedule_kernel.cache_info().misses
-    _compile_schedule_kernel(expected_bucket + 128, _SPLIT_KV, sms, arch)
-    assert _compile_schedule_kernel.cache_info().misses == misses + 1
 
 
 def test_precompile_output_dtypes_is_honoured_and_validated():
