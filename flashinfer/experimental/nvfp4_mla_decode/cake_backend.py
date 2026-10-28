@@ -86,6 +86,14 @@ SHORT_MAX_UNIT_TILES = {"sm_100a": 32, "sm_103a": 64}  # pipeline tiles of every
 # ends in a CTA of at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows.
 SHORT_EPI_RECORD = "decode_short_epi_warp"
 SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
+# The short-row programs that also load the fields of item ``2 * cluster`` in
+# the kernel setup, ahead of the cluster rendezvous, and start the load warp on
+# them when that item is the first of the unit. They run in place of
+# ``SHORT_RECORD`` and ``SHORT_EPI_RECORD`` when every unit holds one item
+# pair: item ``2 * cluster`` is then every unit's first, and it lies in the
+# table, which the setup load requires.
+SHORT_SPEC_RECORD = "decode_short_spec_uh"
+SHORT_EPI_SPEC_RECORD = "decode_short_epi_warp_spec_uh"
 # The SM103 decode with its row-pair max exchange gated by a vote on the
 # exchange barrier. Each piece pays a warm-up worth about ``XV_WARMUP_TILES``
 # tiles of the saving, so it pays off when every cluster streams at least
@@ -575,8 +583,10 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     and ``SHORT_EPI_RECORD`` (the short-row program with a per-warp epilogue
     store path) runs such a plan in its place when the last CTA of every
     request holds at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows;
-    every other plan runs ``"decode"``. The decode programs' outputs are
-    bitwise identical.
+    ``SHORT_SPEC_RECORD`` and ``SHORT_EPI_SPEC_RECORD`` (those two programs
+    loading the first item of their unit in the kernel setup) run in place of
+    either when every unit holds one item pair; every other plan runs
+    ``"decode"``. The decode programs' outputs are bitwise identical.
     """
     # One item per piece: both rows of a pair share the piece's tile range
     # (item fields 3 and 4: tile_start, tile_end).
@@ -606,8 +616,16 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         and all(sum(lens) <= limit for lens in units)
     ):
         tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
+        one_pair = all(
+            last - first == V_HALVES
+            for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+        )
         if _delivered(SHORT_EPI_RECORD, arch) and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS:
+            if one_pair and _delivered(SHORT_EPI_SPEC_RECORD, arch):
+                return SHORT_EPI_SPEC_RECORD
             return SHORT_EPI_RECORD
+        if one_pair and _delivered(SHORT_SPEC_RECORD, arch):
+            return SHORT_SPEC_RECORD
         return SHORT_RECORD
     return "decode"
 

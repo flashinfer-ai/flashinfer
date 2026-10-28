@@ -52,6 +52,7 @@ import dataclasses
 import torch
 
 from .cake_kcp_plan import (
+    upload_tables,
     CHUNK,
     TILE,
     TILE_B,
@@ -268,17 +269,19 @@ class ChainTables:
             )
 
     def device_tables(self, device) -> dict[str, torch.Tensor]:
+        """The six tables on ``device`` in one asynchronous upload (``upload_tables``: no synchronizing call)."""
         i32, i64 = torch.int32, torch.int64
-        return {
-            "chain_start": torch.tensor(
-                list(self.chain_start), dtype=i32, device=device
-            ),
-            "elem_m": torch.tensor(list(self.elem_m), dtype=i64, device=device),
-            "elem_c": torch.tensor(list(self.elem_c), dtype=i64, device=device),
-            "elem_y": torch.tensor(list(self.elem_y), dtype=i64, device=device),
-            "x0_index": torch.tensor(list(self.x0_index), dtype=i64, device=device),
-            "y_final": torch.tensor(list(self.y_final), dtype=i64, device=device),
-        }
+        return upload_tables(
+            {
+                "chain_start": (self.chain_start, i32, None),
+                "elem_m": (self.elem_m, i64, None),
+                "elem_c": (self.elem_c, i64, None),
+                "elem_y": (self.elem_y, i64, None),
+                "x0_index": (self.x0_index, i64, None),
+                "y_final": (self.y_final, i64, None),
+            },
+            device,
+        )
 
 
 def _chains(
@@ -477,14 +480,20 @@ def walk_tables(ctx: KcpContext, HV: int, *, P: int | None = None) -> WalkTables
         return cached
     pools = {name: pool_addressing(hp, ctx, name) for name in POOLS}
     chains = owner_chains(hp)
-    device = {}
-    for name in WALK_TABLES:
-        if name in hp.device_tables:
-            device[name] = hp.device_tables[name]
-        else:  # the fused-walk index tables (lever L-B) are CPU tuples on the head plan; uploaded once here
-            device[name] = torch.tensor(
-                list(getattr(hp, name)), dtype=torch.int32, device=ctx.device
-            )
+    device = {
+        name: hp.device_tables[name] for name in WALK_TABLES if name in hp.device_tables
+    }
+    # the fused-walk index tables are CPU tuples on the head plan: uploaded once here, in one asynchronous copy
+    device.update(
+        upload_tables(
+            {
+                name: (getattr(hp, name), torch.int32, None)
+                for name in WALK_TABLES
+                if name not in hp.device_tables
+            },
+            ctx.device,
+        )
+    )
     for family, tables in chains.items():
         for name, t in tables.device_tables(ctx.device).items():
             device[f"{family}.{name}"] = t

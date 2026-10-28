@@ -223,106 +223,106 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
                 ring[48 + f_3] = m[cur + (long long)((48 + f_3) * 128 + k)];
             }
             #pragma unroll
-            for (int f_4 = 0; f_4 < 16; f_4++) {
-                float mv = ring[f_4];
+            for (int f_0 = 0; f_0 < 16; f_0++) {
+                float mv_0 = ring[f_0];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(f_4 * 8 * 4)));
-                acc[0] = __fmaf_rn(mv, xv[0], acc[0]);
-                acc[1] = __fmaf_rn(mv, xv[1], acc[1]);
-                acc[2] = __fmaf_rn(mv, xv[2], acc[2]);
-                acc[3] = __fmaf_rn(mv, xv[3], acc[3]);
+                    : "r"(x_block_addr + (unsigned int)(f_0 * 8 * 4)));
+                acc[0] = __fmaf_rn(mv_0, xv[0], acc[0]);
+                acc[1] = __fmaf_rn(mv_0, xv[1], acc[1]);
+                acc[2] = __fmaf_rn(mv_0, xv[2], acc[2]);
+                acc[3] = __fmaf_rn(mv_0, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((f_4 * 8 + 4) * 4)));
-                acc[4] = __fmaf_rn(mv, xv[0], acc[4]);
-                acc[5] = __fmaf_rn(mv, xv[1], acc[5]);
-                acc[6] = __fmaf_rn(mv, xv[2], acc[6]);
-                acc[7] = __fmaf_rn(mv, xv[3], acc[7]);
+                    : "r"(x_block_addr + (unsigned int)((f_0 * 8 + 4) * 4)));
+                acc[4] = __fmaf_rn(mv_0, xv[0], acc[4]);
+                acc[5] = __fmaf_rn(mv_0, xv[1], acc[5]);
+                acc[6] = __fmaf_rn(mv_0, xv[2], acc[6]);
+                acc[7] = __fmaf_rn(mv_0, xv[3], acc[7]);
             }
             #pragma unroll
-            for (int f_5 = 0; f_5 < 16; f_5++) {
-                ring[f_5] = m[cur + (long long)((64 + f_5) * 128 + k)];
+            for (int f_1_1 = 0; f_1_1 < 16; f_1_1++) {
+                ring[f_1_1] = m[cur + (long long)((64 + f_1_1) * 128 + k)];
             }
             #pragma unroll
-            for (int f_6 = 0; f_6 < 16; f_6++) {
-                float mv_1 = ring[16 + f_6];
+            for (int f_2_1 = 0; f_2_1 < 16; f_2_1++) {
+                float mv_1 = ring[16 + f_2_1];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((16 + f_6) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((16 + f_2_1) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_1, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_1, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_1, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_1, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((16 + f_6) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((16 + f_2_1) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_1, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_1, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_1, xv[2], acc[6]);
                 acc[7] = __fmaf_rn(mv_1, xv[3], acc[7]);
             }
             #pragma unroll
-            for (int f_7 = 0; f_7 < 16; f_7++) {
-                ring[16 + f_7] = m[cur + (long long)((80 + f_7) * 128 + k)];
+            for (int f_3_1 = 0; f_3_1 < 16; f_3_1++) {
+                ring[16 + f_3_1] = m[cur + (long long)((80 + f_3_1) * 128 + k)];
             }
             #pragma unroll
-            for (int f_8 = 0; f_8 < 16; f_8++) {
-                float mv_2 = ring[32 + f_8];
+            for (int f_4 = 0; f_4 < 16; f_4++) {
+                float mv_2 = ring[32 + f_4];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((32 + f_8) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((32 + f_4) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_2, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_2, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_2, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_2, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((32 + f_8) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((32 + f_4) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_2, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_2, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_2, xv[2], acc[6]);
                 acc[7] = __fmaf_rn(mv_2, xv[3], acc[7]);
             }
             #pragma unroll
-            for (int f_9 = 0; f_9 < 16; f_9++) {
-                ring[32 + f_9] = m[cur + (long long)((96 + f_9) * 128 + k)];
+            for (int f_5 = 0; f_5 < 16; f_5++) {
+                ring[32 + f_5] = m[cur + (long long)((96 + f_5) * 128 + k)];
             }
             #pragma unroll
-            for (int f_10 = 0; f_10 < 16; f_10++) {
-                float mv_3 = ring[48 + f_10];
+            for (int f_6 = 0; f_6 < 16; f_6++) {
+                float mv_3 = ring[48 + f_6];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((48 + f_10) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((48 + f_6) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_3, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_3, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_3, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_3, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((48 + f_10) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((48 + f_6) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_3, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_3, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_3, xv[2], acc[6]);
                 acc[7] = __fmaf_rn(mv_3, xv[3], acc[7]);
             }
             #pragma unroll
-            for (int f_11 = 0; f_11 < 16; f_11++) {
-                ring[48 + f_11] = m[cur + (long long)((112 + f_11) * 128 + k)];
+            for (int f_7 = 0; f_7 < 16; f_7++) {
+                ring[48 + f_7] = m[cur + (long long)((112 + f_7) * 128 + k)];
             }
             #pragma unroll
-            for (int f_12 = 0; f_12 < 16; f_12++) {
-                float mv_4 = ring[f_12];
+            for (int f_8 = 0; f_8 < 16; f_8++) {
+                float mv_4 = ring[f_8];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((64 + f_12) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((64 + f_8) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_4, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_4, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_4, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_4, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((64 + f_12) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((64 + f_8) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_4, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_4, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_4, xv[2], acc[6]);
@@ -330,23 +330,23 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             if (has_next != 0) {
                 #pragma unroll
-                for (int f_13 = 0; f_13 < 16; f_13++) {
-                    ring[f_13] = m[nxt + (long long)(f_13 * 128 + k)];
+                for (int f_9 = 0; f_9 < 16; f_9++) {
+                    ring[f_9] = m[nxt + (long long)(f_9 * 128 + k)];
                 }
             }
             #pragma unroll
-            for (int f_14 = 0; f_14 < 16; f_14++) {
-                float mv_5 = ring[16 + f_14];
+            for (int f_10 = 0; f_10 < 16; f_10++) {
+                float mv_5 = ring[16 + f_10];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((80 + f_14) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((80 + f_10) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_5, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_5, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_5, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_5, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((80 + f_14) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((80 + f_10) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_5, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_5, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_5, xv[2], acc[6]);
@@ -354,23 +354,23 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             if (has_next != 0) {
                 #pragma unroll
-                for (int f_15 = 0; f_15 < 16; f_15++) {
-                    ring[16 + f_15] = m[nxt + (long long)((16 + f_15) * 128 + k)];
+                for (int f_11 = 0; f_11 < 16; f_11++) {
+                    ring[16 + f_11] = m[nxt + (long long)((16 + f_11) * 128 + k)];
                 }
             }
             #pragma unroll
-            for (int f_16 = 0; f_16 < 16; f_16++) {
-                float mv_6 = ring[32 + f_16];
+            for (int f_12 = 0; f_12 < 16; f_12++) {
+                float mv_6 = ring[32 + f_12];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((96 + f_16) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((96 + f_12) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_6, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_6, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_6, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_6, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((96 + f_16) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((96 + f_12) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_6, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_6, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_6, xv[2], acc[6]);
@@ -378,23 +378,23 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             if (has_next != 0) {
                 #pragma unroll
-                for (int f_17 = 0; f_17 < 16; f_17++) {
-                    ring[32 + f_17] = m[nxt + (long long)((32 + f_17) * 128 + k)];
+                for (int f_13 = 0; f_13 < 16; f_13++) {
+                    ring[32 + f_13] = m[nxt + (long long)((32 + f_13) * 128 + k)];
                 }
             }
             #pragma unroll
-            for (int f_18 = 0; f_18 < 16; f_18++) {
-                float mv_7 = ring[48 + f_18];
+            for (int f_14 = 0; f_14 < 16; f_14++) {
+                float mv_7 = ring[48 + f_14];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)((112 + f_18) * 8 * 4)));
+                    : "r"(x_block_addr + (unsigned int)((112 + f_14) * 8 * 4)));
                 acc[0] = __fmaf_rn(mv_7, xv[0], acc[0]);
                 acc[1] = __fmaf_rn(mv_7, xv[1], acc[1]);
                 acc[2] = __fmaf_rn(mv_7, xv[2], acc[2]);
                 acc[3] = __fmaf_rn(mv_7, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
-                    : "r"(x_block_addr + (unsigned int)(((112 + f_18) * 8 + 4) * 4)));
+                    : "r"(x_block_addr + (unsigned int)(((112 + f_14) * 8 + 4) * 4)));
                 acc[4] = __fmaf_rn(mv_7, xv[0], acc[4]);
                 acc[5] = __fmaf_rn(mv_7, xv[1], acc[5]);
                 acc[6] = __fmaf_rn(mv_7, xv[2], acc[6]);
@@ -621,21 +621,21 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             #pragma unroll
             for (int kk = 0; kk < 32; kk++) {
-                float mv_8 = slabs[kk * 129 + k];
+                float mv = slabs[kk * 129 + k];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)(kk * 8 * 4)));
-                acc[0] = __fmaf_rn(mv_8, xv[0], acc[0]);
-                acc[1] = __fmaf_rn(mv_8, xv[1], acc[1]);
-                acc[2] = __fmaf_rn(mv_8, xv[2], acc[2]);
-                acc[3] = __fmaf_rn(mv_8, xv[3], acc[3]);
+                acc[0] = __fmaf_rn(mv, xv[0], acc[0]);
+                acc[1] = __fmaf_rn(mv, xv[1], acc[1]);
+                acc[2] = __fmaf_rn(mv, xv[2], acc[2]);
+                acc[3] = __fmaf_rn(mv, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)((kk * 8 + 4) * 4)));
-                acc[4] = __fmaf_rn(mv_8, xv[0], acc[4]);
-                acc[5] = __fmaf_rn(mv_8, xv[1], acc[5]);
-                acc[6] = __fmaf_rn(mv_8, xv[2], acc[6]);
-                acc[7] = __fmaf_rn(mv_8, xv[3], acc[7]);
+                acc[4] = __fmaf_rn(mv, xv[0], acc[4]);
+                acc[5] = __fmaf_rn(mv, xv[1], acc[5]);
+                acc[6] = __fmaf_rn(mv, xv[2], acc[6]);
+                acc[7] = __fmaf_rn(mv, xv[3], acc[7]);
             }
             slabs[4128 + q4 * 129 + w4r] = pf[0];
             slabs[4128 + (q4 + 1) * 129 + w4r] = pf[1];
@@ -728,21 +728,21 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             #pragma unroll
             for (int kk_1 = 0; kk_1 < 32; kk_1++) {
-                float mv_9 = slabs[4128 + kk_1 * 129 + k];
+                float mv_8 = slabs[4128 + kk_1 * 129 + k];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)((32 + kk_1) * 8 * 4)));
-                acc[0] = __fmaf_rn(mv_9, xv[0], acc[0]);
-                acc[1] = __fmaf_rn(mv_9, xv[1], acc[1]);
-                acc[2] = __fmaf_rn(mv_9, xv[2], acc[2]);
-                acc[3] = __fmaf_rn(mv_9, xv[3], acc[3]);
+                acc[0] = __fmaf_rn(mv_8, xv[0], acc[0]);
+                acc[1] = __fmaf_rn(mv_8, xv[1], acc[1]);
+                acc[2] = __fmaf_rn(mv_8, xv[2], acc[2]);
+                acc[3] = __fmaf_rn(mv_8, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)(((32 + kk_1) * 8 + 4) * 4)));
-                acc[4] = __fmaf_rn(mv_9, xv[0], acc[4]);
-                acc[5] = __fmaf_rn(mv_9, xv[1], acc[5]);
-                acc[6] = __fmaf_rn(mv_9, xv[2], acc[6]);
-                acc[7] = __fmaf_rn(mv_9, xv[3], acc[7]);
+                acc[4] = __fmaf_rn(mv_8, xv[0], acc[4]);
+                acc[5] = __fmaf_rn(mv_8, xv[1], acc[5]);
+                acc[6] = __fmaf_rn(mv_8, xv[2], acc[6]);
+                acc[7] = __fmaf_rn(mv_8, xv[3], acc[7]);
             }
             slabs[q4 * 129 + w4r] = pf[0];
             slabs[(q4 + 1) * 129 + w4r] = pf[1];
@@ -835,21 +835,21 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             #pragma unroll
             for (int kk_2 = 0; kk_2 < 32; kk_2++) {
-                float mv_10 = slabs[kk_2 * 129 + k];
+                float mv_9 = slabs[kk_2 * 129 + k];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)((64 + kk_2) * 8 * 4)));
-                acc[0] = __fmaf_rn(mv_10, xv[0], acc[0]);
-                acc[1] = __fmaf_rn(mv_10, xv[1], acc[1]);
-                acc[2] = __fmaf_rn(mv_10, xv[2], acc[2]);
-                acc[3] = __fmaf_rn(mv_10, xv[3], acc[3]);
+                acc[0] = __fmaf_rn(mv_9, xv[0], acc[0]);
+                acc[1] = __fmaf_rn(mv_9, xv[1], acc[1]);
+                acc[2] = __fmaf_rn(mv_9, xv[2], acc[2]);
+                acc[3] = __fmaf_rn(mv_9, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)(((64 + kk_2) * 8 + 4) * 4)));
-                acc[4] = __fmaf_rn(mv_10, xv[0], acc[4]);
-                acc[5] = __fmaf_rn(mv_10, xv[1], acc[5]);
-                acc[6] = __fmaf_rn(mv_10, xv[2], acc[6]);
-                acc[7] = __fmaf_rn(mv_10, xv[3], acc[7]);
+                acc[4] = __fmaf_rn(mv_9, xv[0], acc[4]);
+                acc[5] = __fmaf_rn(mv_9, xv[1], acc[5]);
+                acc[6] = __fmaf_rn(mv_9, xv[2], acc[6]);
+                acc[7] = __fmaf_rn(mv_9, xv[3], acc[7]);
             }
             slabs[4128 + q4 * 129 + w4r] = pf[0];
             slabs[4128 + (q4 + 1) * 129 + w4r] = pf[1];
@@ -944,21 +944,21 @@ kernel_cake_gdn_train_c6958a0a4ed5cb55a9a1(float* __restrict__ m, float* __restr
             }
             #pragma unroll
             for (int kk_3 = 0; kk_3 < 32; kk_3++) {
-                float mv_11 = slabs[4128 + kk_3 * 129 + k];
+                float mv_10 = slabs[4128 + kk_3 * 129 + k];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)((96 + kk_3) * 8 * 4)));
-                acc[0] = __fmaf_rn(mv_11, xv[0], acc[0]);
-                acc[1] = __fmaf_rn(mv_11, xv[1], acc[1]);
-                acc[2] = __fmaf_rn(mv_11, xv[2], acc[2]);
-                acc[3] = __fmaf_rn(mv_11, xv[3], acc[3]);
+                acc[0] = __fmaf_rn(mv_10, xv[0], acc[0]);
+                acc[1] = __fmaf_rn(mv_10, xv[1], acc[1]);
+                acc[2] = __fmaf_rn(mv_10, xv[2], acc[2]);
+                acc[3] = __fmaf_rn(mv_10, xv[3], acc[3]);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&xv[0])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xv[(0) + 3]))
                     : "r"(x_block_addr + (unsigned int)(((96 + kk_3) * 8 + 4) * 4)));
-                acc[4] = __fmaf_rn(mv_11, xv[0], acc[4]);
-                acc[5] = __fmaf_rn(mv_11, xv[1], acc[5]);
-                acc[6] = __fmaf_rn(mv_11, xv[2], acc[6]);
-                acc[7] = __fmaf_rn(mv_11, xv[3], acc[7]);
+                acc[4] = __fmaf_rn(mv_10, xv[0], acc[4]);
+                acc[5] = __fmaf_rn(mv_10, xv[1], acc[5]);
+                acc[6] = __fmaf_rn(mv_10, xv[2], acc[6]);
+                acc[7] = __fmaf_rn(mv_10, xv[3], acc[7]);
             }
             if (has_next_1 != 0) {
                 slabs[q4 * 129 + w4r] = pf[0];
