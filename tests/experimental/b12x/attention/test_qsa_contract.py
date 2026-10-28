@@ -123,6 +123,7 @@ def _allocate_binding(
     raw_state_slot_ids: torch.Tensor | None = None,
     rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> qsa.Binding:
+    """Prepare owned QSA storage for the declared request, slot and RoPE ABI."""
     device = caps.device
     slot_ids = (
         torch.arange(caps.max_batch, dtype=torch.int64, device=device)
@@ -527,6 +528,7 @@ def _dynamic_inputs(
     accepted_tokens: tuple[int, ...] | None = None,
     is_prefilling: tuple[bool, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """Construct deterministic live inputs matching the prepared binding's ABI."""
     caps = binding.state.caps
     rows = len(positions)
     device = caps.device
@@ -834,6 +836,7 @@ def test_qsa_caps_reject_unmodeled_or_inconsistent_state() -> None:
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
 def test_qsa_scaled_topk_scratch_executes_fixed_capacity_rows(rows: int) -> None:
+    """Exercise row-dependent top-k scratch sizing beyond the small-workspace case."""
     device = require_sm120()
     caps = _caps(
         device,
@@ -880,6 +883,7 @@ def test_qsa_binding_exposes_views_into_one_scratch_allocation() -> None:
 
 
 def test_qsa_binds_strided_int32_raw_state_column_and_int32_request_ids() -> None:
+    """Check declared int32 request IDs and noncontiguous raw-slot IDs at runtime."""
     device = require_sm120()
     caps = _caps(device)
     raw_block_table = torch.tensor([[2, 91], [1, 92]], dtype=torch.int32, device=device)
@@ -1272,6 +1276,7 @@ def test_qsa_prepare_query_matches_scalar_and_mrope_reference(
     interleaved: bool,
     positions: tuple[int, ...],
 ) -> None:
+    """Compare the prepared index-query transform with scalar and MRoPE references."""
     device = require_sm120()
     caps = _caps(
         device,
@@ -1397,6 +1402,7 @@ def test_qsa_prepare_query_matches_bf16_eager_rotary_cast_order() -> None:
 def test_qsa_completed_group_compression_matches_bf16_rounding_and_rope(
     interleaved: bool,
 ) -> None:
+    """Check completed groups against BF16-rounded compression and RoPE references."""
     device = require_sm120()
     position_axes = 3 if interleaved else 1
     sections = (2, 1, 1) if interleaved else None
