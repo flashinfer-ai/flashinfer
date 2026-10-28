@@ -677,13 +677,14 @@ class GroupedGemmLaunch:
             self.out.zero_()
         with tvm_ffi.use_torch_stream():
             for item in self.launches:
-                arguments = item.arguments
+                arguments: tuple | list[Any] = item.arguments
                 if item.workspace_slots:
-                    arguments = list(arguments)
+                    bound = list(item.arguments)
                     for position, kind in item.workspace_slots:
-                        arguments[position] = _launch_workspace(
+                        bound[position] = _launch_workspace(
                             kind, self.out.device, self.device_index
                         )
+                    arguments = bound
                 item.entry(*arguments)
         return self.out
 
