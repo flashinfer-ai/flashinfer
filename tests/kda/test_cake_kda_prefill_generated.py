@@ -1071,6 +1071,9 @@ def test_serving_rows_match_the_fp32_reference(
             patch.setattr(
                 runtime, "_use_direct_work_bins", lambda *args, **kwargs: False
             )
+            patch.setattr(
+                runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False
+            )
             unbinned = _Call(d, lower_bound)
             assert not _modules(unbinned.prepared) & work_bin_programs
             _assert_bitwise(unbinned.run(), routed_result, "selection without bins")
@@ -1397,9 +1400,9 @@ TURNOVER_ROUTE_PARTS = [
 @pytest.mark.parametrize("arch,sm_count", TURNOVER_ROUTE_PARTS)
 def test_turnover_rows_take_the_route_on_both_parts(arch, sm_count):
     """The rows' turnover expectation on each part, from the route rule alone:
-    every turnover row asks for work bins (``_use_direct_work_bins``) and has
-    at most the part's chunk limit; of the unbounded graph rows only those
-    marked turnover do."""
+    every turnover row asks for work bins (``_use_direct_work_bins``, else
+    ``_use_turnover_work_bins``) and has at most the part's chunk limit; of the
+    unbounded graph rows only those marked turnover do."""
 
     def route(lengths, heads):
         return runtime._work_bin_turnover_route(
@@ -1408,6 +1411,9 @@ def test_turnover_rows_take_the_route_on_both_parts(arch, sm_count):
                 num_heads=heads,
                 sm_count=sm_count,
                 chunk_tokens=runtime.BF16_M128_CHUNK,
+            )
+            or runtime._use_turnover_work_bins(
+                tuple(lengths), num_heads=heads, sm_count=sm_count, gpu_arch=arch
             ),
             direct_n16=False,
             n32_ft_slab=False,
@@ -1422,6 +1428,114 @@ def test_turnover_rows_take_the_route_on_both_parts(arch, sm_count):
         lengths, heads, lower_bound, launch, turnover = row.values
         if lower_bound is None and launch is None:
             assert route(lengths, heads) == turnover, row.id
+
+
+# Short N32 launches the strict bin test keeps one task per CTA that take work
+# bins for their module's turnover build (``_use_turnover_work_bins``) on both
+# parts: the mixed-length H16 row and a bimodal H16 row.
+TURNOVER_BIN_ROWS = [
+    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 16, id="mixed-h16"),
+    pytest.param([256, 17] * 8, 16, id="8x(256+17)-h16"),
+]
+
+
+def _work_bin_tables(prepared):
+    """Host bin tables of the launch parts of a prepared launch."""
+    tables = []
+    seen = set()
+
+    def visit(obj, depth):
+        if depth > 7 or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, dict):
+            for value in obj.values():
+                visit(value, depth + 1)
+        elif isinstance(obj, (list, tuple)):
+            for value in obj:
+                visit(value, depth + 1)
+        elif type(obj).__module__.startswith("flashinfer") and hasattr(obj, "__dict__"):
+            host = vars(obj).get("_work_bin_host")
+            if host is not None:
+                tables.append(tuple(host.tolist()))
+            for value in vars(obj).values():
+                visit(value, depth + 1)
+
+    visit(prepared, 0)
+    return tables
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", TURNOVER_BIN_ROWS)
+def test_turnover_bins_launch_is_bitwise_the_one_task_per_cta_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A short launch the strict test keeps one task per CTA takes work bins
+    charged the task cost and its module's turnover build; bit for bit the
+    one-task-per-CTA launch it replaces, with and without checkpoint rows, free
+    memory and outputs poisoned before every launch, in either order."""
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    assert not runtime._use_direct_work_bins(
+        tuple(lengths),
+        num_heads=heads,
+        sm_count=sm_count,
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+    )
+    d = _inputs(lengths, heads)
+    turn = _Call(d, None, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False)
+        direct = _Call(d, None, rows=rows)
+    arch = registry.device_arch()
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    schedule = str(turn.prepared.schedule)
+    assert schedule.count("_turnover") == 1, schedule
+    assert _modules(turn.prepared) & _turn_programs(), schedule
+    assert not _modules(direct.prepared) & (_turn_programs() | work_bin_programs)
+    assert "_turnover" not in str(direct.prepared.schedule)
+    assert _work_bin_tables(turn.prepared) == [
+        runtime._make_direct_work_bins(
+            tuple(lengths),
+            num_heads=heads,
+            worker_count=sm_count,
+            chunk_tokens=runtime.BF16_M128_CHUNK,
+            task_cost=runtime.BF16_WORK_BIN_TURNOVER_TASK_COST,
+        )[0]
+    ]
+    assert _work_bin_tables(direct.prepared) == []
+    got = turn.run()
+    want = direct.run()
+    _assert_bitwise(got, want, "turnover bins vs one task per CTA")
+    _assert_bitwise(turn.run(), want, "turnover bins after one task per CTA")
+    _assert_bitwise(direct.run(), got, "one task per CTA repeat")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", TURNOVER_BIN_ROWS)
+def test_turnover_bins_keep_one_task_per_cta_without_a_turnover_build(
+    lengths, heads, monkeypatch
+):
+    """The bounded row's module and a loader without the turn table have no
+    turnover build: the launch keeps the one-task-per-CTA program, the same
+    programs and schedule as without the rule, bit for bit."""
+    for lower_bound, drop_turn in ((-5.0, False), (None, True)):
+        d = _inputs(lengths, heads)
+        with monkeypatch.context() as patch:
+            if drop_turn:
+                _without_turnover(patch)
+            ruled = _Call(d, lower_bound)
+            patch.setattr(
+                runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False
+            )
+            plain = _Call(d, lower_bound)
+        assert str(ruled.prepared.schedule) == str(plain.prepared.schedule)
+        assert _modules(ruled.prepared) == _modules(plain.prepared)
+        assert _work_bin_tables(ruled.prepared) == _work_bin_tables(plain.prepared)
+        assert not _modules(ruled.prepared) & _turn_programs()
+        _assert_bitwise(ruled.run(), plain.run(), f"lb={lower_bound} turn={drop_turn}")
 
 
 @requires_blackwell
