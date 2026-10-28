@@ -611,6 +611,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
 
+Workspace of a rank (`KcpWorkspace`, caller-held, reused across calls and
+layers): the local arena of the token-side stages plus the boundary pools.
+The backward's b1 / b2 send pools reuse the storage of the forward's c1 / c2
+send pools (a call waits its sends before a backward writes either), and the
+ring exchange's hop pools are allocated by the first `exchange="ring"` call.
+`kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
+(`KcpWorkspace.bytes` after its first backward); the saved set and the
+convolution's halo rows are per-call tensors outside it.
+
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`
