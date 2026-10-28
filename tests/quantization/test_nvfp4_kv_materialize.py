@@ -18,10 +18,17 @@ import torch
 from flashinfer.quantization.kernels import nvfp4_kv_materialize_fp8
 from flashinfer.utils import get_compute_capability
 
+
+def _is_supported_gpu() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return nvfp4_kv_materialize_fp8.is_compute_capability_supported(major * 10 + minor)
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] < 10,
-    reason="requires SM100+",
+    not _is_supported_gpu(),
+    reason="nvfp4_kv_materialize_fp8 does not support this GPU",
 )
 
 _E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]

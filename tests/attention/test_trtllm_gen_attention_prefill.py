@@ -1983,6 +1983,12 @@ def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(
         _swizzle_v_scales,
     )
 
+    major, minor = get_compute_capability(torch.device(GPU_DEVICE))
+    if materialize and not nvfp4_kv_materialize_fp8.is_compute_capability_supported(
+        major * 10 + minor
+    ):
+        pytest.skip("nvfp4_kv_materialize_fp8 does not support this GPU")
+
     num_qo_heads, num_kv_heads, page_size = 8, 2, 64
     seq_lens_host, q_lens_host = [300, 77], [300, 40]
     num_pages_per_seq = [(s + page_size - 1) // page_size for s in seq_lens_host]

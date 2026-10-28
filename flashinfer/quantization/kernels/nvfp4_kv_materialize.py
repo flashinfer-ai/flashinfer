@@ -48,6 +48,7 @@ from ...cute_dsl.fp4_common import (
 )
 from ...cute_dsl.utils import get_num_sm
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ...utils import backend_requirement, supported_compute_capability
 from ..quantization_cute_dsl_utils import NVFP4_SF_VEC_SIZE, WARP_SIZE
 
 
@@ -423,6 +424,12 @@ def _check_aligned(name: str, tensor: torch.Tensor) -> None:
         )
 
 
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
+def _nvfp4_kv_materialize_check(*args, **kwargs):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_kv_materialize_check)
 @flashinfer_api
 def nvfp4_kv_materialize_fp8(
     k_cache: torch.Tensor,
@@ -439,7 +446,8 @@ def nvfp4_kv_materialize_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Materialize the pages referenced by a paged NVFP4 KV cache as FP8.
 
-    Requires SM100+.
+    Requires SM100, SM103, SM107, SM110, SM120 or SM121; query with
+    ``nvfp4_kv_materialize_fp8.is_compute_capability_supported(cc)``.
 
     Parameters
     ----------
