@@ -41,6 +41,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from .utils import (
     blk_copy,
     blk_reduce_bf16,
+    blk_reduce_bf16_l2_hint,
     blk_reduce_fp16,
     blk_reduce_fp32,
     griddepcontrol_launch_dependents,
@@ -370,6 +371,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_c_stage: int = 1,
         num_store_warps: int = 0,
         swizzle_size: int = 1,
+        use_l2_hints: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -399,6 +401,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             next M tile, which keeps the set of reduced output columns small
             enough to stay in L2.
         :type swizzle_size: int
+        :param use_l2_hints: Load A evict-first and reduce the output
+            evict-last in L2. Requires num_store_warps > 0.
+        :type use_l2_hints: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -420,6 +425,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.num_c_stage_req = num_c_stage
         self.num_store_warps = num_store_warps
         self.use_store_pipe = num_store_warps > 0
+        # L2 eviction hints of the store-warp epilogue: A is streamed once per
+        # swizzle group of N tiles, so it is loaded evict-first, and the
+        # reduced output rows are kept evict-last. Otherwise the A stream
+        # evicts the output columns being reduced, and their reductions
+        # round-trip through DRAM. Whether that wins depends on the shape
+        # (see BLACKWELL_GEMM2_EPILOGUE_CANDIDATES), so it is a tactic option.
+        assert not use_l2_hints or num_store_warps > 0, (
+            "use_l2_hints requires num_store_warps > 0"
+        )
+        self.use_l2_hints = use_l2_hints
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -1656,6 +1671,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            a_l2_policy = None
+            if cutlass.const_expr(self.use_l2_hints):
+                a_l2_policy = cute.arch.inline_ptx(
+                    "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+                    write_only_types=[cutlass.Int64],
+                    read_only_args=[],
+                )
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1739,6 +1761,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tAsA_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=a_l2_policy,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -2401,6 +2424,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             if warp_idx >= self.store_warp_id[0]:
                 st_tidx = tidx - self.threads_per_warp * self.store_warp_id[0]
                 num_st_threads = self.threads_per_warp * self.num_store_warps
+                out_l2_policy = None
+                if cutlass.const_expr(self.use_l2_hints):
+                    out_l2_policy = cute.arch.inline_ptx(
+                        "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+                        write_only_types=[cutlass.Int64],
+                        read_only_args=[],
+                    )
                 c_consumer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.num_c_stage
                 )
@@ -2428,6 +2458,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             st_src = sC[r, None, st_stage]
                             if cutlass.const_expr(not self.use_fused_finalize):
                                 blk_copy(st_dst, st_src, st_copy_size)
+                            elif cutlass.const_expr(
+                                self.out_dtype == cutlass.BFloat16 and self.use_l2_hints
+                            ):
+                                blk_reduce_bf16_l2_hint(
+                                    st_dst, st_src, st_copy_size, out_l2_policy
+                                )
                             elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                                 blk_reduce_bf16(st_dst, st_src, st_copy_size)
                             elif cutlass.const_expr(self.out_dtype == cutlass.Float32):

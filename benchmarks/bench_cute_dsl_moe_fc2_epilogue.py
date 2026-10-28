@@ -9,6 +9,8 @@ GEMM2 epilogue, and reports the best tactic of each group per token count:
 * ``old``: plain 3-element GEMM2 tactics (default epilogue, no swizzle)
 * ``swizzle``: epilogue ``(1, 0, s)``: default epilogue, swizzled raster
 * ``store_warps``: epilogue ``(c, w, s)`` with ``w > 0``: store-warp epilogue
+* ``l2_hints``: epilogue ``(c, w, s, True)``: store-warp epilogue with A
+  loaded evict-first and the output reduced evict-last in L2
 
 Each GEMM2 tactic runs once, paired with the fastest GEMM1 of its tile size.
 ``--autotune`` additionally runs the autotuner per token count and times the
@@ -36,29 +38,32 @@ own sweep, ranked by FC2 time.
 Reference results (B300, CUDA 13.3, defaults, ``--autotune``, 2026-10-28), in
 us with the speedup over ``best old``. FC2 kernel time:
 
-    tokens  best old  best swizzle   best store_warps  autotuned (epilogue)
-    4000      218      223 (0.98x)     211 (1.03x)      211 (1.03x) (2,2,4)
-    8000      424      429 (0.99x)     388 (1.09x)      388 (1.09x) (2,4,4)
-    15900     881      799 (1.10x)     719 (1.23x)      719 (1.23x) (2,2,4)
-    24000    1417     1137 (1.25x)    1013 (1.40x)     1013 (1.40x) (2,4,4)
-    32000    1967     1592 (1.24x)    1471 (1.34x)     1524 (1.29x) (2,2,4)
-    40000    2633     2021 (1.30x)    1942 (1.36x)     2021 (1.30x) (1,0,2)
-    54000    3673     2754 (1.33x)    2728 (1.35x)     2754 (1.33x) (1,0,2)
+    tokens  best old  best swizzle  best store_warps  best l2_hints  autotuned (epilogue)
+    4000      219     224 (0.98x)    212 (1.03x)      217 (1.01x)   212 (1.03x) (2,2,4)
+    8000      425     430 (0.99x)    388 (1.09x)      390 (1.09x)   388 (1.09x) (2,4,4)
+    15900     882     799 (1.10x)    711 (1.24x)      711 (1.24x)   711 (1.24x) (2,2,4)
+    24000    1397    1163 (1.20x)   1035 (1.35x)     1034 (1.35x)  1034 (1.35x) (2,4,4,T)
+    32000    1969    1546 (1.27x)   1464 (1.35x)     1450 (1.36x)  1450 (1.36x) (2,4,4,T)
+    40000    2658    2008 (1.32x)   1923 (1.38x)     1832 (1.45x)  1832 (1.45x) (2,2,2,T)
+    54000    3648    2747 (1.33x)   2580 (1.41x)     2419 (1.51x)  2580 (1.41x) (2,2,2)
 
 Whole MoE (all kernels):
 
-    tokens  best old  best swizzle   best store_warps  autotuned
-    4000      528      533 (0.99x)     520 (1.02x)      520 (1.02x)
-    8000      955      962 (0.99x)     920 (1.04x)      920 (1.04x)
-    15900    1835     1755 (1.05x)    1678 (1.09x)     1678 (1.09x)
-    24000    2760     2363 (1.17x)    2262 (1.22x)     2262 (1.22x)
-    32000    3788     3301 (1.15x)    3207 (1.18x)     3332 (1.14x)
-    40000    4902     4233 (1.16x)    4219 (1.16x)     4233 (1.16x)
-    54000    6502     5540 (1.17x)    5587 (1.16x)     5540 (1.17x)
+    tokens  best old  best swizzle  best store_warps  best l2_hints  autotuned
+    4000      530     535 (0.99x)    523 (1.01x)      529 (1.00x)   523 (1.01x)
+    8000      961     965 (1.00x)    925 (1.04x)      927 (1.04x)   925 (1.04x)
+    15900    1846    1762 (1.05x)   1677 (1.10x)     1679 (1.10x)  1677 (1.10x)
+    24000    2778    2401 (1.16x)   2289 (1.21x)     2356 (1.18x)  2356 (1.18x)
+    32000    3797    3239 (1.17x)   3223 (1.18x)     3262 (1.16x)  3262 (1.16x)
+    40000    4890    4231 (1.16x)   4264 (1.15x)     4105 (1.19x)  4111 (1.19x)
+    54000    6424    5527 (1.16x)   5530 (1.16x)     5304 (1.21x)  5530 (1.16x)
 
 The autotuner's picks are within about 4% of the fastest whole-MoE tactic;
 its top candidates are only a few percent apart, so picks can differ between
-runs.
+runs: at 54000 tokens, this run picked (2,2,2) over (2,2,2,True), while four
+repeated autotunes all picked an L2-hint epilogue. With ncu at base clocks
+(no cache flush between kernels), the hints leave the following GEMM1
+unchanged, and the best whole MoE goes from 5066 to 4718 us at 54000 tokens.
 
 Timing uses the torch profiler, which attributes GPU time per kernel; the FC2
 kernel is the one whose name contains ``FinalizeFusion``. Each tactic is timed
@@ -145,13 +150,16 @@ def make_activations(tokens, experts, hidden, top_k):
     )
 
 
-GROUPS = ("old", "swizzle", "store_warps")
+GROUPS = ("old", "swizzle", "store_warps", "l2_hints")
 
 
 def gemm2_group(gemm2_tactic):
     if len(gemm2_tactic) == 3:
         return "old"
-    return "swizzle" if gemm2_tactic[3][1] == 0 else "store_warps"
+    epilogue = gemm2_tactic[3]
+    if epilogue[1] == 0:
+        return "swizzle"
+    return "l2_hints" if len(epilogue) > 3 and epilogue[3] else "store_warps"
 
 
 def fc2_tactics():

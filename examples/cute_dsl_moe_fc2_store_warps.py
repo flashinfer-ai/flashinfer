@@ -16,6 +16,9 @@ store-warp epilogue moves those writes off the critical path:
   drain another (costs A/B pipeline stages).
 * ``swizzle_size`` with ``raster_along_m=True`` visits a group of N tiles for
   every M tile, so the output columns being reduced at any time fit in L2.
+* An optional 4th epilogue element ``use_l2_hints`` (fused BF16 output only)
+  loads A evict-first and reduces the output evict-last in L2; it helps from
+  about 24k tokens (FC2 1.16x at 54k on B300 with ``(2, 2, 2, True)``).
 
 It is opt-in through a 4th element on the Blackwell (SM100/SM103) GEMM2
 sub-tactic; plain 3-element tactics keep the original epilogue:

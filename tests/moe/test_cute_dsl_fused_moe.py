@@ -675,14 +675,19 @@ def test_tuner_checks_gemm2_output_dtype(monkeypatch, output_dtype, arch):
 
 @cute_dsl_available
 @pytest.mark.parametrize(
-    "output_dtype,expected",
+    "output_dtype,use_fused_finalize,expected",
     [
-        (torch.bfloat16, ["plain", "swizzle", "store_warps"]),
-        (torch.float32, ["plain", "swizzle"]),
+        (torch.bfloat16, True, ["plain", "swizzle", "store_warps", "l2_hints"]),
+        (torch.bfloat16, False, ["plain", "swizzle", "store_warps"]),
+        (torch.float16, True, ["plain", "swizzle", "store_warps"]),
+        (torch.float32, True, ["plain", "swizzle"]),
     ],
 )
-def test_tuner_filters_gemm2_epilogue_tactics(monkeypatch, output_dtype, expected):
-    """Store-warp tactics need two 16-bit C stages in shared memory."""
+def test_tuner_filters_gemm2_epilogue_tactics(
+    monkeypatch, output_dtype, use_fused_finalize, expected
+):
+    """Store-warp tactics need two 16-bit C stages in shared memory, and the
+    L2 hints apply only to the fused BF16 reduce."""
     from flashinfer.fused_moe.cute_dsl import tuner
 
     gemm1 = ((256, 256), (2, 1), False)
@@ -690,6 +695,7 @@ def test_tuner_filters_gemm2_epilogue_tactics(monkeypatch, output_dtype, expecte
         "plain": (256, gemm1, ((256, 256), (2, 1), False)),
         "swizzle": (256, gemm1, ((256, 256), (2, 1), True, (1, 0, 4))),
         "store_warps": (256, gemm1, ((256, 256), (2, 1), True, (2, 2, 4))),
+        "l2_hints": (256, gemm1, ((256, 256), (2, 1), True, (2, 2, 4, True))),
     }
     for tactic in tactics.values():
         assert tactic in tuner.ALL_BLACKWELL_MOE_TACTICS
@@ -706,6 +712,7 @@ def test_tuner_filters_gemm2_epilogue_tactics(monkeypatch, output_dtype, expecte
         top_k=1,
         num_local_experts=1,
         output_dtype=output_dtype,
+        use_fused_finalize=use_fused_finalize,
     )
     assert runner.get_valid_tactics(inputs, profile=None) == [
         tactics[name] for name in expected

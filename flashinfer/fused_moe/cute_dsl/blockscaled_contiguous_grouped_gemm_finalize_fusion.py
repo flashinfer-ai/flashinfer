@@ -227,6 +227,7 @@ def _get_compiled_finalize_kernel(
     num_c_stage: int = 1,
     num_store_warps: int = 0,
     swizzle_size: int = 1,
+    use_l2_hints: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -267,14 +268,18 @@ def _get_compiled_finalize_kernel(
         num_c_stage,
         num_store_warps,
         swizzle_size,
+        use_l2_hints,
     )
 
     if cache_key not in _finalize_kernel_cache:
         if is_rubin:
-            if (num_c_stage, num_store_warps, swizzle_size) != (1, 0, 1):
+            if (num_c_stage, num_store_warps, swizzle_size) != (1, 0, 1) or (
+                use_l2_hints
+            ):
                 raise NotImplementedError(
-                    "num_c_stage / num_store_warps / swizzle_size are only "
-                    "supported by the Blackwell finalize grouped GEMM kernel."
+                    "num_c_stage / num_store_warps / swizzle_size / use_l2_hints "
+                    "are only supported by the Blackwell finalize grouped GEMM "
+                    "kernel."
                 )
             if use_a_per_token_scale:
                 raise NotImplementedError(
@@ -314,6 +319,7 @@ def _get_compiled_finalize_kernel(
                 num_c_stage=num_c_stage,
                 num_store_warps=num_store_warps,
                 swizzle_size=swizzle_size,
+                use_l2_hints=use_l2_hints,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -394,6 +400,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     num_c_stage: int = 1,
     num_store_warps: int = 0,
     swizzle_size: int = 1,
+    use_l2_hints: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -590,6 +597,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"mma_tiler_mn={mma_tiler_mn}, mma_tiler={mma_tiler}, mma_inst_shape={mma_inst_shape}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
+    # The evict-last output policy is only wired into the fused BF16 reduce;
+    # A evict-first alone would just drop A from L2.
+    if use_l2_hints and not (
+        use_fused_finalize and out_dtype_cutlass == cutlass.BFloat16
+    ):
+        raise ValueError(
+            "use_l2_hints requires use_fused_finalize and a bfloat16 output, got "
+            f"use_fused_finalize={use_fused_finalize}, out_dtype={out_dtype}"
+        )
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
@@ -748,6 +764,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         num_c_stage=num_c_stage,
         num_store_warps=num_store_warps,
         swizzle_size=swizzle_size,
+        use_l2_hints=use_l2_hints,
     )
 
     # Execute kernel with runtime parameters.
