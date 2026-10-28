@@ -204,7 +204,9 @@ def _native_mx_pipeline(format_name, device_index, top_k=2):
     held = []
     runner = None
     for step in range(3):
-        config, act, pack, expected = _case(QuantFormat[format_name], top_k=top_k)
+        config, act, pack, expected = _case(
+            QuantFormat[format_name], top_k=top_k, seed=8163 + step
+        )
         act.topk_ids.add_(step).remainder_(config.routing.num_experts)
         act.topk_weights.mul_(step + 1).sub_(0.25)
         if runner is None:
@@ -213,7 +215,8 @@ def _native_mx_pipeline(format_name, device_index, top_k=2):
             runner.build()
         inputs = runner.pack_inputs(act, pack)
         # Holding every call's tensors prevents allocator reuse from concealing
-        # stale bindings. Default dispatch exercises K128 for top_k=2 and
+        # stale bindings; different seeds expose stale activation/weight values.
+        # Default dispatch exercises K128 for top_k=2 and
         # FFMA for top_k=6, which exceeds the four available experts.
         held.append(inputs)
         _assert_near(runner.forward(inputs), expected())
