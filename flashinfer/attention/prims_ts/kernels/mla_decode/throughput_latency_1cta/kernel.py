@@ -35,7 +35,6 @@ from ...tensor_map import (
     create_tensor_map_tiled_from_view,
 )
 from cutlass.experimental import cuda
-from cutlass._mlir.dialects import llvm
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
@@ -455,32 +454,6 @@ def _make_clc_work_queue_and_throttle(
     )
 
 
-def _gmem_pointer_to_generic(gmem_ptr, *, loc=None, ip=None):
-    """Cast a runtime GMEM tensor-map address for ``prefetch.tensormap``."""
-
-    if gmem_ptr.memspace == cutlass.AddressSpace.generic:
-        return gmem_ptr
-    if gmem_ptr.memspace != cutlass.AddressSpace.gmem:
-        raise ValueError(
-            "tensor-map prefetch expects a GMEM or generic pointer, got "
-            f"{gmem_ptr.memspace}"
-        )
-    llvm_ptr = gmem_ptr.to_llvm_ptr(loc=loc, ip=ip)
-    generic_llvm_ptr = llvm.addrspacecast(
-        llvm.PointerType.get(cutlass.AddressSpace.generic),
-        llvm_ptr,
-        loc=loc,
-        ip=ip,
-    )
-    return cute.make_ptr(
-        gmem_ptr.value_type,
-        generic_llvm_ptr,
-        mem_space=cutlass.AddressSpace.generic,
-        loc=loc,
-        ip=ip,
-    )
-
-
 def build_throughput_latency_mla_task_manager(
     cfg: MlaConfig,
     *,
@@ -492,7 +465,6 @@ def build_throughput_latency_mla_task_manager(
     tma_desc_c_rope=None,
     tma_desc_v=None,
     c_rope_tensor=None,
-    raw_gather4_descs=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -545,7 +517,6 @@ def build_throughput_latency_mla_task_manager(
             tma_desc_c_rope=tma_desc_c_rope,
             tma_desc_v=tma_desc_v,
             c_rope_tensor=c_rope_tensor,
-            raw_gather4_descs=raw_gather4_descs,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
@@ -755,7 +726,6 @@ def build_throughput_latency_mla_task_manager(
         tma_desc_v=tma_desc_v,
         tma_desc_bulk_extra=tma_desc_q_rope,
         c_rope_tensor=c_rope_tensor,
-        raw_gather4_descs=raw_gather4_descs,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1186,7 +1156,6 @@ def _make_single_kv_pipe_task_graph(
     tma_desc_c_rope=None,
     tma_desc_v=None,
     c_rope_tensor=None,
-    raw_gather4_descs=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -1376,7 +1345,6 @@ def _make_single_kv_pipe_task_graph(
         tma_desc_v=tma_desc_v,
         tma_desc_bulk_extra=tma_desc_q_rope,
         c_rope_tensor=c_rope_tensor,
-        raw_gather4_descs=raw_gather4_descs,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1989,15 +1957,10 @@ class ThroughputLatencyMlaDecodeTs:
         block_split_kvs: object,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
-        raw_tma_descriptors: cute.Tensor | None,
         stream: object,
         output_quant_args=None,
     ):
-        """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q.
-
-        ``raw_tma_descriptors`` is only read by the D576 sparse configuration:
-        the two encoded Gather4 ``CUtensorMap``s (latent and RoPE maps).
-        """
+        """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self._make_config()
 
         # Public fixed tensors use [H,D,SQ,B]/[H,SQ,B]; compact ragged tensors
@@ -2155,9 +2118,10 @@ class ThroughputLatencyMlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        if cutlass.const_expr(cfg.sparse_d512):
-            # Sparse routes address individual rows; the unused D512 RoPE
-            # descriptor slot carries the independent compressed-pool map.
+        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+            # Sparse routes address individual rows (Gather4 row maps). D512:
+            # the unused RoPE descriptor slot carries the independent
+            # compressed-pool map. D576: it carries the RoPE columns.
             c_rows = cute.make_tensor(
                 c_latent.iterator,
                 cute.make_layout(
@@ -2181,9 +2145,13 @@ class ThroughputLatencyMlaDecodeTs:
             )
             tma_desc_c_rope = create_tensor_map_tiled_from_view(
                 c_extra_rows,
-                box_dims=(tma_box0, 1),
+                box_dims=(cfg.rope_dim if cfg.sparse_d576 else tma_box0, 1),
                 stride_order=(0, 1),
-                swizzle=cuda.TensorMapSwizzle.s128b,
+                swizzle=(
+                    cuda.TensorMapSwizzle.s64b
+                    if cfg.sparse_d576
+                    else cuda.TensorMapSwizzle.s128b
+                ),
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
         else:
@@ -2195,7 +2163,7 @@ class ThroughputLatencyMlaDecodeTs:
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        if cutlass.const_expr(cfg.rope_dim > 0):
+        if cutlass.const_expr(cfg.rope_dim > 0 and not cfg.sparse_d576):
             c_rope_tma = cute.make_tensor(
                 c_rope.iterator,
                 cute.select(c_rope.layout, mode=[1, 0, 2]),
@@ -2210,7 +2178,7 @@ class ThroughputLatencyMlaDecodeTs:
                 swizzle=c_rope_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
-        elif cutlass.const_expr(not cfg.sparse_d512):
+        elif cutlass.const_expr(cfg.num_tokens_per_page != 1):
             tma_desc_c_rope = tma_desc_c_latent
 
         tma_desc_v = tma_desc_c_latent
@@ -2312,7 +2280,6 @@ class ThroughputLatencyMlaDecodeTs:
             output_scale,
             tile_sched_params,
             block_split_kvs,
-            raw_tma_descriptors,
             output_quant_args,
         ).launch(
             grid=grid,
@@ -2427,7 +2394,6 @@ class ThroughputLatencyMlaDecodeTs:
         output_scale: cutlass.Float32,
         tile_sched_params: object,
         sparse_inputs: object,
-        raw_tma_descriptors: cute.Tensor | None,
         output_quant_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
@@ -2549,14 +2515,6 @@ class ThroughputLatencyMlaDecodeTs:
                     cute.arch.inline_ptx(
                         "prefetch.global.L2 [{$r0}];", read_only_args=[address]
                     )
-            if cutlass.const_expr(cfg.sparse_d576):
-                # The Gather4 latent / RoPE maps at bytes 0 / 128.
-                prims.prefetch_tensormap(
-                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator)
-                )
-                prims.prefetch_tensormap(
-                    _gmem_pointer_to_generic(raw_tma_descriptors.iterator + Int64(128))
-                )
 
         clc_response_ptr = None
 
@@ -2570,7 +2528,6 @@ class ThroughputLatencyMlaDecodeTs:
             tma_desc_c_rope=tma_desc_c_rope.get_ptr(),
             tma_desc_v=tma_desc_v.get_ptr(),
             c_rope_tensor=c_rope,
-            raw_gather4_descs=raw_tma_descriptors,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,

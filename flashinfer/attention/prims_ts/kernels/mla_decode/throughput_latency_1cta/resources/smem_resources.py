@@ -809,10 +809,6 @@ class SmemKvResource(MlaResource):
     tma_desc_v: object = None
     tma_desc_bulk_extra: object = None
     c_rope_tensor: object = None
-    # D576 sparse: GMEM tensor holding two encoded CUtensorMaps (128 B each)
-    # over the flat ``[576 B, N]`` KV pool: [0] 128 B box / SWIZZLE_128B for the
-    # latent D128 slices, [1] 64 B box / SWIZZLE_64B for the RoPE slice.
-    raw_gather4_descs: object = None
     page_offsets_kv: object = None
     page_offsets: object = None
     cache_seqs: object = None
@@ -1134,16 +1130,17 @@ class SmemKvResource(MlaResource):
                 warp_in_task = cute.arch.make_warp_uniform(
                     cute.arch.warp_idx()
                 ) - Int32(cfg.load_warp_idx)
-            descriptor = self.raw_gather4_descs.iterator
-            if cutlass.const_expr(is_rope_stage):
-                descriptor = descriptor + Int64(128)
+            # Row maps: latent D128 slices (SW128) or the RoPE columns (SW64).
+            descriptor = (
+                self.tma_desc_c_rope if is_rope_stage else self.tma_desc_c_latent
+            )
             quads_per_warp = 32 // num_load_warps
             gather4_cached_warp(
                 stage_base.data_ptr(
                     warp_in_task * Int32(quads_per_warp * 4 * active_width)
                 ),
                 descriptor,
-                Int32(cfg.latent_dim) if is_rope_stage else dim_offset,
+                Int32(0) if is_rope_stage else dim_offset,
                 cached_page_ids,
                 stage_info.barrier,
                 cache_start=6,

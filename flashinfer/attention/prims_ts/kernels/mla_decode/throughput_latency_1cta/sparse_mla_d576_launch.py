@@ -18,16 +18,14 @@ The D576 kernel is the ``throughput_latency_1cta`` q64 keeps-MMA-AB FP8 schedule
 run with one "batch" per query token: ``cache_seqs[t]`` is the token's active
 top-k width and ``page_offsets[:, t]`` its row indices into a flat row pool
 with ``page_size == 1``.  K/V tiles are fetched four rows per Gather4 TMA
-through two raw ``CUtensorMap``s encoded here: a latent 128 B / SWIZZLE_128B
-and a RoPE 64 B / SWIZZLE_64B box over the ``[N, 576]`` E4M3 pool.
+through the kernel's row maps of the ``[N, 576]`` E4M3 pool: latent 128 B /
+SWIZZLE_128B slices and the 64 B / SWIZZLE_64B RoPE columns.
 """
 
 from __future__ import annotations
 
-import ctypes
 import dataclasses
 import functools
-
 from typing import Optional
 
 import torch
@@ -40,78 +38,8 @@ LATENT_DIM = 512
 ROPE_DIM = 64
 V_DIM = 512
 _SUPPORTED_HEADS = (64, 128)
-_DESCRIPTOR_BYTES = 128
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _PROFILE = "h64_keeps_mma_ab"
-# Keyed by (device, data pointer, numel);
-# never evicted: a captured CUDA graph keeps the device address of its
-# descriptor tensor, and a key that is reused by a later buffer of the same
-# address and size needs the same maps (128 B each).
-_DESCRIPTOR_CACHE: dict[tuple, torch.Tensor] = {}
-
-
-def _encode_pool_gather4_descriptor_host(
-    pool: torch.Tensor, *, box_bytes: int, swizzle: str
-) -> torch.Tensor:
-    """Encode a ``[576, rows(pool)]`` uint8 Gather4 map with a ``[box_bytes, 1]`` box.
-
-    Row coordinates outside ``[0, rows)`` are zero-filled by the TMA unit.
-    ``-1`` slots are additionally masked out of the softmax; any other
-    out-of-range index would count as a key with score 0, so the sparse MLA
-    wrapper requires active routes to address the pool (``run(validate=True)``
-    checks it).
-    """
-
-    from cuda.bindings import driver as cuda_drv
-
-    swz = {
-        "128B": cuda_drv.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
-        "64B": cuda_drv.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_64B,
-        "none": cuda_drv.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
-    }[swizzle]
-    err, tensor_map = cuda_drv.cuTensorMapEncodeTiled(
-        cuda_drv.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        2,
-        pool.data_ptr(),
-        [cuda_drv.cuuint64_t(HEAD_DIM), cuda_drv.cuuint64_t(pool.shape[0])],
-        [cuda_drv.cuuint64_t(HEAD_DIM)],
-        [cuda_drv.cuuint32_t(box_bytes), cuda_drv.cuuint32_t(1)],
-        [cuda_drv.cuuint32_t(1), cuda_drv.cuuint32_t(1)],
-        cuda_drv.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        swz,
-        cuda_drv.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        cuda_drv.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    if int(err) != 0:
-        raise RuntimeError(f"cuTensorMapEncodeTiled for D576 Gather4 failed: {err}")
-    return torch.tensor(
-        list(ctypes.string_at(tensor_map.getPtr(), _DESCRIPTOR_BYTES)),
-        dtype=torch.uint8,
-    )
-
-
-def gather4_descriptors(kv_pool: torch.Tensor) -> torch.Tensor:
-    """Return the cached device tensor ``[latent map | rope map]`` for ``kv_pool``."""
-
-    key = (kv_pool.device.index or 0, kv_pool.data_ptr(), kv_pool.numel())
-    cached = _DESCRIPTOR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "D576 Gather4 descriptors for this KV pool were not built before CUDA "
-            "graph capture; run the same pool tensor once eagerly first"
-        )
-    maps = [
-        _encode_pool_gather4_descriptor_host(kv_pool, box_bytes=128, swizzle="128B"),
-        _encode_pool_gather4_descriptor_host(kv_pool, box_bytes=64, swizzle="64B"),
-    ]
-    host = torch.cat(maps)
-    device_tensor = host.to(device=kv_pool.device, non_blocking=False)
-    if device_tensor.data_ptr() % 64:
-        raise RuntimeError("D576 Gather4 descriptor tensor must be 64-byte aligned")
-    _DESCRIPTOR_CACHE[key] = device_tensor
-    return device_tensor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -277,12 +205,6 @@ def compile_sparse_mla_d576_kernel(
     cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (total_q,), stride_order=(0,), assumed_align=4
     )
-    descriptors_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (2 * _DESCRIPTOR_BYTES,),
-        stride_order=(0,),
-        assumed_align=64,
-    )
     workspace_fake = None
     if split_kv > 1:
         workspace_fake = cute.runtime.make_fake_compact_tensor(
@@ -307,7 +229,6 @@ def compile_sparse_mla_d576_kernel(
             None,  # block_split_kvs
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
-            descriptors_fake,
             stream_fake,
             options=_COMPILE_OPTIONS,
         )
@@ -362,7 +283,6 @@ def launch_sparse_mla_d576_kernel(
     page_offsets = block_tables.transpose(0, 1)  # [Kmax, T], stride (1, Kmax)
     out_kernel = out.view(total_q, phys_sq, phys_heads, V_DIM).permute(2, 3, 1, 0)
     lse_kernel = lse.view(total_q, phys_sq, phys_heads).permute(2, 1, 0)
-    descriptors = gather4_descriptors(kv_pool)
     # TVM-FFI takes the stream from the device of the first CUDA argument
     # (q_latent); keep the current device on it for any host-side CUDA call.
     with torch.cuda.device(query.device):
@@ -381,7 +301,6 @@ def launch_sparse_mla_d576_kernel(
             None,
             float(bmm1_scale),
             float(bmm2_scale),
-            descriptors,
             # output_quant_args: a kernel reloaded from the disk cache takes
             # every parameter positionally, including this defaulted one.
             None,

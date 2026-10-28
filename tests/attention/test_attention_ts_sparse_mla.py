@@ -1487,3 +1487,18 @@ def test_sparse_d576_compile_capacity_bucket(monkeypatch):
 def test_sparse_d576_rejects_grid_z_overflow():
     with pytest.raises(ValueError, match="at most 65535 query tokens"):
         _d576_plan(65536, 64, 2048)
+
+
+def test_sparse_d576_capture_without_eager_run():
+    """A planned D576 run can be captured directly: the Gather4 row maps are
+    built by the kernel, with no host-side per-pool state."""
+    q, kv, indices, lengths = _d576_inputs(4, 64, 2048, 0.1)
+    w = _d576_plan(4, 64, 2048)
+    out = torch.empty(4, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(4, 1, 64, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, kv, indices, lengths, softmax_scale=_D576_SCALE, out=out, lse=lse)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_d576(q, kv, indices, lengths, out, lse)
