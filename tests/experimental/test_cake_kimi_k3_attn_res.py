@@ -753,8 +753,11 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
             assert plan.schedule_id == (
                 f"pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs232_grid{sm_count}"
             ), plan
-            record = MODULES[KERNELS[arch][plan.kernel_key]]
-            assert record["launch"]["block"][0] == 384, record["launch"]
+            name = KERNELS[arch][plan.kernel_key]
+            defines = _compile_defines(
+                _LIBRARIES_BY_NAME[cake_jit.library_name(name, arch)]
+            )
+            assert int(defines["CAKE_BIND_THREADS"]) == 384, (name, defines)
     assert all(
         key.endswith(("_cr232", "_cr200_pk1")) for *_, key in _r2_cells("R2_PAIR_CELLS")
     )
@@ -782,8 +785,11 @@ def test_park_acc_pair_cells_take_the_384_thread_programs():
                 "pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs200_park_acc1"
                 f"_grid{sm_count}"
             ), plan
-            record = MODULES[KERNELS[arch][plan.kernel_key]]
-            assert record["launch"]["block"][0] == 384, record["launch"]
+            name = KERNELS[arch][plan.kernel_key]
+            defines = _compile_defines(
+                _LIBRARIES_BY_NAME[cake_jit.library_name(name, arch)]
+            )
+            assert int(defines["CAKE_BIND_THREADS"]) == 384, (name, defines)
     assert sorted(
         (arch, sm_count, M, K)
         for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS")
@@ -1221,7 +1227,6 @@ def test_registry_records_reference_the_build_manifest():
             "native",
             "pair",
         )
-        assert record["ffi_entry"] == "run" and record["launch"]["use_pdl"] == "runtime"
         fast_math = bool(
             re.search(
                 r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?$",
@@ -1287,11 +1292,11 @@ def test_launch_bindings_take_each_record_from_its_compile_flags():
     """One shared launch binding per argument-plan form.  Every ``build.json`` entry
     names one of the five in ``sources[1]`` and carries exactly the ``-DCAKE_BIND_*``
     selectors its binding refuses to compile without, each with an integer or
-    identifier value and equal to the record's launch block (threads, dynamic shared
-    memory, cluster size) and kernel key (the last snapshot row ``K - 1 + write``; the
-    write-index arm).  ``TVM_FFI_CHECK`` stringises its condition unexpanded, so the
-    bindings keep the selectors out of its conditions and route a condition that needs
-    one through ``CAKE_CHECK_EXPANDED``."""
+    identifier value; the two the kernel key determines (the last snapshot row
+    ``K - 1 + write``; the write-index arm) equal the key's.  ``TVM_FFI_CHECK``
+    stringises its condition unexpanded, so the bindings keep the selectors out of
+    its conditions and route a condition that needs one through
+    ``CAKE_CHECK_EXPANDED``."""
     required = {}
     for binding in _LAUNCH_BINDINGS:
         text = (_CSRC / binding).read_text(encoding="utf-8")
@@ -1312,11 +1317,6 @@ def test_launch_bindings_take_each_record_from_its_compile_flags():
             assert selectors == required[binding] - {"CAKE_PROGRAM_KERNEL"}, name
             for macro in required[binding]:
                 assert re.fullmatch(r"-?\d+|[A-Za-z_]\w*", defines[macro]), macro
-            launch = record["launch"]
-            assert int(defines["CAKE_BIND_THREADS"]) == launch["block"][0], name
-            assert int(defines["CAKE_BIND_SMEM"]) == launch["dynamic_smem_bytes"], name
-            cluster = int(defines.get("CAKE_BIND_CLUSTER", 1))
-            assert cluster == launch["cluster"][0], name
             if "CAKE_BIND_KM" in defines:
                 K = int(re.search(r":k(\d+)", key).group(1))
                 write = key.endswith("_write")
