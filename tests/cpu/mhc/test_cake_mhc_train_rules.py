@@ -2339,8 +2339,8 @@ def test_launch_grids_follow_the_rules(
 @pytest.mark.parametrize(("arch", "sm"), BOARDS)
 def test_workspace_regions_and_envelope(arch: str, sm: int) -> None:
     names = {
-        "fwd": ["fnp", "spart", "qpart", "ticket"],
-        "bwd": ["fnTp", "dzp", "tokp", "param_partial", "dfn_part", "ticket"],
+        "fwd": ["ticket", "fnp", "spart", "qpart"],
+        "bwd": ["ticket", "fnTp", "dzp", "tokp", "param_partial", "dfn_part"],
     }
     column = {"fwd": "fwd_workspace_bytes", "bwd": "bwd_workspace_bytes"}
     for row in _rows():
@@ -2369,7 +2369,8 @@ def test_workspace_regions_and_envelope(arch: str, sm: int) -> None:
             assert (
                 layout["regions"]["ticket"]["shape"] == (64,)
                 and layout["regions"]["ticket"]["dtype"] == "uint32"
-            )
+                and layout["regions"]["ticket"]["offset"] == 0
+            )  # the same ticket words for every token count a buffer serves
             assert (
                 loader.workspace_bytes_upto(kind, T, sm, arch) >= layout["total_bytes"]
             )
