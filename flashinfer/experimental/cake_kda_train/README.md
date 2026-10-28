@@ -205,7 +205,7 @@ lifetime tables) once per range of `ceil(NC_pad / B)` chunks.  Each pass takes v
 whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
 tapes) offset to the range's first chunk, the range's slices of the chunk
 tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
-`dAqk` and, on `sm_100a` / `sm_107a`, the gate epilogue's `dg_int`, `db_int`), which are
+`dAqk` and, on `sm_100a`, the gate epilogue's `dg_int`, `db_int`), which are
 sized for one range; the token tensors
 (`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
 whole, every kernel reaching them through the absolute `chunk_bos` offsets.
@@ -230,14 +230,14 @@ shared with the state blocks.  Two passes give
 `slack` is the ceil slack of the last range (the per-pass buffers are sized
 for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
 `tail_passes` divides `NC_pad`); passes above four buy nothing more.  On
-`sm_103a`, where the GLM intra program hosts the gate epilogue, its inputs
+`sm_103a` / `sm_107a`, where the GLM intra program hosts the gate epilogue, its inputs
 `dg_int` (512 B) and `db_int` (4 B) leave the lean layouts: one
 pass gives 4104 (tape 3336), the per-pass set is 2052 and two passes give
 `2820 * R * H + max(3 * block, 258 * R * H)` (3078; tape 2310); the default
 layouts are unchanged (the two buffers share slots there).  Against the
 default's 4488 the light constants are about 8 % (one pass), 26 % (two
-passes; 31 % on `sm_103a`) and 37 % (four or more) smaller.  The table
-gives the constants (`sm_100a` / `sm_107a`; `sm_103a` where they differ);
+passes; 31 % on `sm_103a` / `sm_107a`) and 37 % (four or more) smaller.  The table
+gives the constants (`sm_100a`; `sm_103a` / `sm_107a` where they differ);
 the state blocks and the slack come on top where the formulas say so:
 
 | arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
