@@ -54,6 +54,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_K_PIPE_STAGES 1
 #define NUM_REST_PIPE_STAGES 1
 #define NUM_ONE_STAGES 1
+#define NUM_TAB_PIPE_STAGES 2
 #define SMEM_K_PANEL_OFF 1024
 #define SMEM_K_PANEL_STAGE_BYTES 8192
 #define SMEM_K_PANEL_STRIDE 8192
@@ -90,7 +91,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_BDV_MN_OFF 74752
 #define SMEM_BDV_MN_STAGE_BYTES 8192
 #define SMEM_BDV_MN_STRIDE 8192
-#define SMEM_TOTAL 82944
+#define SMEM_TAB_OFF 82944
+#define SMEM_TAB_STAGE_BYTES 1024
+#define SMEM_TAB_STRIDE 1024
+#define SMEM_TOTAL 83968
 #define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
@@ -231,6 +235,8 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
     #define dv_ready_addr (mbar_base + 40)
     #define bdv_ready_addr (mbar_base + 48)
     #define dh_ready_addr (mbar_base + 56)
+    #define tab_full_addr (mbar_base + 64)
+    #define tab_empty_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -262,9 +268,11 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
     const int bdv_addr = smem + 74752;
     __nv_bfloat16* bdv_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
     const int bdv_mn_addr = smem + 74752;
+    float* tab = reinterpret_cast<float*>(smem_raw + 82944);
+    const int tab_addr = smem + 82944;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 12 barriers)
+    // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -288,6 +296,13 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
             mbarrier_init(smem + 48, 128);
             // dh_ready: 1 barriers, init_count=1
             mbarrier_init(smem + 56, 1);
+            // --- pipeline 'tab_pipe' ---
+            // tab_full: 2 barriers, init_count=32
+            mbarrier_init(smem + 64, 32);
+            mbarrier_init(smem + 72, 32);
+            // tab_empty: 2 barriers, init_count=128
+            mbarrier_init(smem + 80, 128);
+            mbarrier_init(smem + 88, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -295,9 +310,9 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
     __syncwarp();
 
     // TMEM alloc (128 columns, 128 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 64);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
-        int _tmem_hold = smem + 64;
+        int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -372,6 +387,7 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
                 }
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+            unsigned int ts = 0;
             unsigned int dvi_c[16];
             if (nc > 0) {
                 int trow_s = row0 + (nc - 1) * 64 + t_row;
@@ -384,6 +400,7 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
                     }
                 }
             }
+            unsigned int _phase_tab_full = 0;
             unsigned int _phase_dv_ready_0 = 0;
             unsigned int _phase_dh_ready_0 = 0;
             #pragma unroll 1
@@ -438,11 +455,19 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
                             :: "l"((void*)(dh_tape + (dh_base + (long long)(q_3 * 16)))), "r"(_raw_stv8_2[0]), "r"(_raw_stv8_2[1]), "r"(_raw_stv8_2[2]), "r"(_raw_stv8_2[3]), "r"(_raw_stv8_2[4]), "r"(_raw_stv8_2[5]), "r"(_raw_stv8_2[6]), "r"(_raw_stv8_2[7]) : "memory");
                     }
                 }
+                mbarrier_wait(tab_full_addr + (ts) * 8, _phase_tab_full);
+                float tab_r[1];
+                unsigned int tab_c[1];
+                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tab_r[0])) : "r"(tab_addr + ts * 512 + (unsigned int)(t_row * 4)) : "memory");
+                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tab_c[0])) : "r"(tab_addr + ts * 512 + 256) : "memory");
+                mbarrier_arrive(tab_empty_addr + (ts) * 8);
+                ts += 1;
+                if (ts == 2) { ts = 0; _phase_tab_full ^= 1; }
+                float rs_t = tab_r[0];
+                bool valid = t_row < (int)tab_c[0];
                 mbarrier_wait(dv_ready_addr, _phase_dv_ready_0);
                 _phase_dv_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                float rs_t = rowscale[(long long)trow * (long long)num_heads + (long long)head];
-                bool valid = t_row < chunk_len[gc];
                 float dv4[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
@@ -525,22 +550,51 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
             int nc_1 = seq_chunk_start[seg_1 + 1] - c0_1;
             int row0_1 = c0_1 * 64;
             int qk_head_1 = head_1 / (num_heads / num_qk_heads);
+            unsigned int ts_l = 0;
+            float tab_rs[2];
+            unsigned int tab_cl[1];
+            if (nc_1 > 0) {
+                int trow_s_1 = row0_1 + (nc_1 - 1) * 64;
+                tab_rs[0] = rowscale[(long long)(trow_s_1 + lane) * (long long)num_heads + (long long)head_1];
+                tab_rs[1] = rowscale[(long long)(trow_s_1 + 32 + lane) * (long long)num_heads + (long long)head_1];
+                tab_cl[0] = (unsigned int)chunk_len[c0_1 + nc_1 - 1];
+            }
             unsigned int _phase_k_empty = 1;
+            unsigned int _phase_tab_empty = 1;
             unsigned int _phase_rest_empty = 1;
-            if (elect_sync()) {
-                #pragma unroll 1
-                for (int rc_1 = 0; rc_1 < nc_1; rc_1++) {
-                    int c_1 = nc_1 - 1 - rc_1;
-                    int trow_1 = row0_1 + c_1 * 64;
-                    int tok = chunk_bos[c0_1 + c_1];
-                    mbarrier_wait(k_empty_addr, _phase_k_empty);
+            #pragma unroll 1
+            for (int rc_1 = 0; rc_1 < nc_1; rc_1++) {
+                int c_1 = nc_1 - 1 - rc_1;
+                int trow_1 = row0_1 + c_1 * 64;
+                int tok = chunk_bos[c0_1 + c_1];
+                mbarrier_wait(k_empty_addr, _phase_k_empty);
+                __syncwarp();
+                if (elect_sync()) {
                     mbarrier_arrive_expect_tx(k_full_addr, 16384);
                     #pragma unroll
                     for (int panel = 0; panel < 2; panel++) {
                         tma_3d_gmem2smem(k_panel_addr + (unsigned int)(panel * 8192), (&k_tma), panel * 64, qk_head_1, tok, k_full_addr);
                     }
-                    _phase_k_empty ^= 1;
-                    mbarrier_wait(rest_empty_addr, _phase_rest_empty);
+                }
+                _phase_k_empty ^= 1;
+                mbarrier_wait(tab_empty_addr + (ts_l) * 8, _phase_tab_empty);
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(tab_addr + ts_l * 512 + (unsigned int)(lane * 4)), "r"(__float_as_uint(tab_rs[0])) : "memory");
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(tab_addr + ts_l * 512 + (unsigned int)(128 + lane * 4)), "r"(__float_as_uint(tab_rs[1])) : "memory");
+                __syncwarp();
+                if (elect_sync()) {
+                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(tab_addr + ts_l * 512 + 256), "r"(tab_cl[0]) : "memory");
+                }
+                mbarrier_arrive(tab_full_addr + (ts_l) * 8);
+                ts_l += 1;
+                if (ts_l == 2) { ts_l = 0; _phase_tab_empty ^= 1; }
+                int c_n_1 = ((c_1 > 0) ? c_1 - 1 : 0);
+                int trow_n_1 = row0_1 + c_n_1 * 64;
+                tab_rs[0] = rowscale[(long long)(trow_n_1 + lane) * (long long)num_heads + (long long)head_1];
+                tab_rs[1] = rowscale[(long long)(trow_n_1 + 32 + lane) * (long long)num_heads + (long long)head_1];
+                tab_cl[0] = (unsigned int)chunk_len[c0_1 + c_n_1];
+                mbarrier_wait(rest_empty_addr, _phase_rest_empty);
+                __syncwarp();
+                if (elect_sync()) {
                     mbarrier_arrive_expect_tx(rest_full_addr, 40960);
                     #pragma unroll
                     for (int panel_1 = 0; panel_1 < 2; panel_1++) {
@@ -551,8 +605,8 @@ kernel_cake_gdn_train_49450e259854e03ab17c(const __grid_constant__ CUtensorMap q
                     for (int panel_2 = 0; panel_2 < 1; panel_2++) {
                         tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_2 * 8192), (&do_g_tma), panel_2 * 64 + vbase_1, head_1, trow_1, rest_full_addr);
                     }
-                    _phase_rest_empty ^= 1;
                 }
+                _phase_rest_empty ^= 1;
             }
         }
     }

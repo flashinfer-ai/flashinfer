@@ -168,7 +168,8 @@ def chunk_gdn_kcp_fwd(
         Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
-        ``reuse_recompute_tapes`` (default ``True``, ``False`` with ``graph="replay"``; see :func:`chunk_gdn_kcp`),
+        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (``False`` with ``graph="replay"``; see
+        :func:`chunk_gdn_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
 
@@ -266,21 +267,28 @@ def chunk_gdn_kcp(
     ``save_for_backward`` only, so a checkpointed forward retains nothing.  See :func:`chunk_gdn_kcp_fwd` for the
     operands and options and :func:`chunk_gdn_kcp_bwd` for the gradients.
 
-    ``reuse_recompute_tapes`` (keyword-only, default ``True``; ``False`` restores the replay form): under
+    ``reuse_recompute_tapes`` (keyword-only, default ``"auto"``; ``True`` | ``False``): under
     ``torch.utils.checkpoint(use_reentrant=False)`` the ``save_mode="light"`` backward binds the forward tapes that
     torch's recompute of the forward (inside ``.backward()``) just wrote, instead of replaying the prep program and
     the state walk itself; the gradients are bitwise the same, the checkpointed forward still retains nothing, and
     the direct (non-checkpoint) autograd path, ``boundary_mode="replay"`` and ``save_mode="full"`` are unchanged.
-    One kept set is live at a time: in a checkpoint segment holding several GDN layers only the last layer skips
-    the replay (the earlier layers replay as before), so memory never exceeds the switch-off path.  Not available
-    with ``graph="replay"``: there the default resolves to ``False`` and an explicit ``True`` is refused.
+    The kept tapes live from the recompute to this node's backward: when a later operation of the checkpointed
+    region saves a tensor (an output projection, an MLP), they live through that operation's backward and raise the
+    region's backward peak by the full tape set (one GB300, 261,987 tokens, ``(2, 6)``, GDN + a 768x768 projection
+    + a SwiGLU MLP: 9250.54 MiB against 6927.31 MiB replayed, 21.29 against 22.70 ms per step of the region);
+    ``"auto"`` (the default) keeps them only when this node is the region's last saver (the checkpoint-frame proof of
+    ``recompute_output``) and takes the replay form otherwise -- a region this node closes keeps today's speed and
+    memory; ``True`` always keeps them, ``False`` never (the replay form).  One kept set is
+    live at a time: in a checkpoint segment holding several GDN layers only the last layer skips the replay (the
+    earlier layers replay as before).  Not available with ``graph="replay"``: there the default resolves to
+    ``False`` and an explicit ``True`` / ``"auto"`` is refused.
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
     the recompute's output is read by nothing; ``"auto"`` leaves that output program out after reading the proof from
     torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's,
-    early stop is on, and ``torch.__version__`` is one of the package's verified builds,
-    ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
+    early stop is on, and the torch release -- ``torch.__version__`` without its local ``+cuNNN`` build tag -- is one
+    of the package's verified releases, ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
     of the region that saves the output (another layer, a norm), a reentrant checkpoint, a forward outside a
     recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
     decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
@@ -305,7 +313,9 @@ def chunk_gdn_kcp(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def gdn_kcp_workspace_bytes(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
-    r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes)."""
+    r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
+    the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
+    the per-phase terms are ``gdn_kcp_workspace_layout`` of the package)."""
     return _pkg().gdn_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 

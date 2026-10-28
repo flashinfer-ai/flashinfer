@@ -123,27 +123,48 @@ _H200_REFERENCE = dict(
     kperm=64,
 )
 
-# Capacity: (seed index, FC1 overlap default).
+# Capacity: (seed index, independent-scale-ring LUT replicas or None, overlap).
 _DEFAULTS = {
-    8: (0, False),
-    16: (1, True),
-    32: (2, True),
-    64: (3, False),
-    128: (4, True),
-    256: (5, False),
-    512: (6, True),
-    1024: (7, True),
-    2048: (8, True),
-    4096: (9, True),
-    8192: (10, True),
-    16384: (9, True),
-    32768: (11, True),
+    8: (0, None, False),
+    16: (1, None, True),
+    32: (2, None, True),
+    64: (3, None, False),
+    128: (4, None, True),
+    256: (5, None, False),
+    512: (6, 1, True),
+    1024: (7, 1, True),
+    2048: (8, None, True),
+    4096: (9, None, True),
+    8192: (10, None, True),
+    16384: (9, None, True),
+    32768: (11, None, True),
 }
+
+
+def _scale_ring_tactic(seed, replicas):
+    return dict(
+        seed,
+        compact_pull_buffer=True,
+        nvfp4_lut_replicas=replicas,
+        nvfp4_lut_map="lane",
+        nvfp4_sf_stages=2,
+    )
+
 
 NVFP4_DEFAULT_TACTICS_BY_TOKENS = {
     tokens: dict(
-        requested_tactic=dict(NVFP4_SF0_CANDIDATE_SEEDS[seed]),
+        requested_tactic=_scale_ring_tactic(NVFP4_SF0_CANDIDATE_SEEDS[seed], replicas)
+        if replicas is not None
+        else dict(NVFP4_SF0_CANDIDATE_SEEDS[seed]),
         requested_config=dict(kperm=64, nvfp4_fc1_k256_overlap=overlap),
     )
-    for tokens, (seed, overlap) in _DEFAULTS.items()
+    for tokens, (seed, replicas, overlap) in _DEFAULTS.items()
 }
+
+# Measured scale-ring choices. Admission depends on geometry, not GPU name,
+# live-token count, clamp, or overlap; construction checks actual resources.
+NVFP4_SF2_CANDIDATE_SEEDS = tuple(
+    _scale_ring_tactic(NVFP4_SF0_CANDIDATE_SEEDS[seed], replicas)
+    for seed, choices in ((6, (1, 2)), (7, (1, 2)), (9, (1,)))
+    for replicas in choices
+)

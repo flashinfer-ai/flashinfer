@@ -557,7 +557,10 @@ _SPEC3_ROWS = (
     "w",
     "u",
 )  # the prep rows SPEC-3 compares (the design note §6.4)
-SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the probe; default: record; "warn": warn on a difference; "assert": raise
+# the entry points' spec3_probe keyword: "off" skips the probe; "record" (the default) records it; "warn" warns on a
+# difference; "assert" raises KcpPreconditionError
+SPEC3_PROBES = ("off", "record", "warn", "assert")
+SPEC3_PROBE_DEFAULT = "record"
 _PROGRAM_OF = {
     "kcp_fwdh_offset": "fwdh_offset",
     "kcp_fwdh_tape": "fwdh_tape",
@@ -590,7 +593,7 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
 
 class KcpPreconditionError(RuntimeError):
     """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
-    on a real token row and ``CAKE_KCP_SPEC3=assert`` asked for an error (the design note §6.4).  The requirement of
+    on a real token row and the call's ``spec3_probe="assert"`` asked for an error (the design note §6.4).  The requirement of
     record is that the two backward modes (saved set, checkpoint replay) produce identical gradients: both run the
     same prep, intra and WY programs on the same operands, which the GPU tests check bitwise.  The forward's and the
     backward's ``gk`` buffers differ by construction on the current program set: the forward's intra program
@@ -639,7 +642,8 @@ class KernelBackend(Backend):
     The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and
     write its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
-    SPEC-3 (debug probe, once per process on the first saved-mode backward): before that backward's prep the
+    SPEC-3 (debug probe, once per backend on the first saved-mode backward whose call's ``spec3_probe`` keyword is
+    not ``"off"``): before that backward's prep the
     forward's intra program and WY program run on the ``fwd`` layout and their five rows (``gk`` / ``kg`` / ``qg`` /
     ``w`` / ``u``) are kept; after the backward's WY program the ``replay`` layout's rows are compared with them on
     every real token row (pad rows are reported separately).  The requirement of record is that the two backward
@@ -647,9 +651,12 @@ class KernelBackend(Backend):
     ``equal`` is ``False`` by construction: the forward's intra program writes ``gk`` at row 63 of every chunk alone
     (the chunk-final gate row, the only ``gk`` row the K1 / K2 / K3 walks read), the backward's prep program writes
     every row's prefix with the same row 63, so ``rows["gk"]["real_rows_differ"]`` is the real rows minus the full
-    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default.  ``CAKE_KCP_SPEC3=0``
-    skips it, ``=warn`` warns on a difference, ``=assert`` raises
-    :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.
+    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default
+    (``spec3_probe="record"``).  ``spec3_probe="off"`` skips it on that call, ``"warn"`` warns on a difference,
+    ``"assert"`` raises :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and
+    :attr:`spec3`.  The keyword travels with the call's options (:class:`KcpOptions`); no environment variable is
+    read.  Under ``graph="replay"`` the probing backward runs eagerly; a rank without tokens has nothing to probe
+    and does not hold back the capture of its backward.
     """
 
     name = "kernels"
@@ -669,7 +676,8 @@ class KernelBackend(Backend):
         self._dev: dict[tuple[Any, ...], torch.Tensor] = {}
         self._checked_chains: set[int] = set()
         self.spec3: dict[str, Any] | None = None
-        self._spec3_pending = os.environ.get(SPEC3_ENV, "1") != "0"
+        # until the first saved-mode backward that runs the probe
+        self._spec3_pending = True
 
     # -- providers
     def programs(self) -> Any:
@@ -779,7 +787,11 @@ class KernelBackend(Backend):
         if name == "bwd_prep":
             # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
             # the saved set carries no token rows: the intra program recomputes the internal rows in both modes
-            if extra.pop("saved", None) is not None and self._spec3_pending:
+            if (
+                extra.pop("saved", None) is not None
+                and self._spec3_pending
+                and call.opts.spec3_probe != "off"
+            ):
                 self._spec3_forward_rows(
                     call
                 )  # before the backward's prep: the layouts share the arena
@@ -878,7 +890,7 @@ class KernelBackend(Backend):
                 result["equal"] = False
         self.spec3 = call.scratch["spec3"] = result
         if not result["equal"]:
-            mode = os.environ.get(SPEC3_ENV, "1")
+            mode = call.opts.spec3_probe
             message = (
                 "SPEC-3 probe: the backward's prep + WY rows differ from the forward's intra + WY rows on real "
                 f"token rows: {result['rows']}"
@@ -2421,22 +2433,11 @@ class _Tables:
         self.splits = {k: tuple(int(x) for x in v) for k, v in hp.splits.items()}
         numel = {k: int(v) for k, v in hp.numel.items()}
         self.numel = numel
-        self.sizes = {
-            "c1_send": numel["c1_send"] + (self.n_out * H * TILE if P > 1 else 0),
-            "c1_recv": numel["c1_recv"],
-            "c2_send": numel["c2_send"],
-            "S_in": numel["c2_recv"],
-            "b1_send": max(numel["b1_send_d"], numel["b1_send_dm"]),
-            "b1_recv": max(numel["b1_recv_d"], numel["b1_recv_dm"]),
-            "b2_send": numel["b2_send"],
-            "b2_recv": numel["b2_recv"],
-            "stage_b": NSEG * H * TILE if P > 1 else 0,
-            "stage_m": NSEG * H * TILE if P > 1 else 0,
-            "carry": n_carry * H * TILE,
-            "eye": TILE,
-            "ring_out": max(self.n_in, self.n_out) * H * TILE,
-            "ring_in": max(self.n_in, self.n_out) * H * TILE,
-        }
+        # the plan module's pool sizes (the byte queries read the same function)
+        self.sizes = cake_kcp_plan.kcp_pool_numel(
+            ctx, H=H, fused_walks=self.fused_walks
+        )
+        assert self.sizes["carry"] == n_carry * H * TILE
         self._check_tiles()
         self._build_chains(starts, ins, outs, ends, in_slot, out_slot)
 
@@ -2959,19 +2960,7 @@ class _Tables:
         return form
 
     def pool_sizes(self, backward: bool) -> dict[str, int]:
-        names = [
-            "c1_send",
-            "c1_recv",
-            "c2_send",
-            "stage_b",
-            "stage_m",
-            "carry",
-            "eye",
-            "ring_out",
-            "ring_in",
-        ]
-        if backward:
-            names += ["b1_send", "b1_recv", "b2_send", "b2_recv"]
+        names = cake_kcp_plan.FWD_POOLS + (cake_kcp_plan.BWD_POOLS if backward else ())
         return {
             n: self.sizes[n] for n in names
         }  # zero-size pools included: every buffer name resolves
@@ -3016,11 +3005,15 @@ class KcpWorkspace:
 
     Pools (flat, ``state_dtype``): ``c1_send``, ``c1_recv``, ``c2_send``; ``b1_send``, ``b1_recv``, ``b2_send``,
     ``b2_recv`` (``backward``); at ``P > 1`` the staging planes ``stage_b`` / ``stage_m`` and the ``carry`` plane;
-    one identity tile ``eye``.  The saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under
-    ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate
-    them fresh (SPEC-4).  A workspace is reusable across calls and layers of the same ``(ctx, H)``; a call with a
-    larger need grows it.  ``bytes`` counts the pools plus the local arena (:func:`kcp_workspace_bytes` is the
-    plan module's prediction of the same quantity, CONSISTENCY-6)."""
+    one identity tile ``eye``.  The backward send pools share the storage of the forward ones
+    (``cake_kcp_plan.SHARED_POOLS``: ``b1_send`` = ``c1_send``, ``b2_send`` = ``c2_send``, one tensor of the larger
+    need; a call waits its c1 / c2 sends before a backward writes either).  The ring exchange's hop pools
+    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them.  The
+    saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
+    ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
+    reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it.  ``bytes`` counts
+    every pool storage once plus the local arena (:func:`kcp_workspace_bytes` is the plan module's prediction of the
+    same quantity for an a2a workspace, CONSISTENCY-6)."""
 
     def __init__(
         self,
@@ -3099,25 +3092,22 @@ class KcpWorkspace:
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
         tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        need = {
+            name: n
+            for name, n in tb.pool_sizes(backward).items()
+            if name
+            not in cake_kcp_plan.LAZY_POOLS  # allocated by the first call that reads them (pool())
+        }
+        for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
+            top = max((need[m] for m in pair if m in need), default=0)
+            for m in pair:
+                if m in need:
+                    need[m] = top
         replaced = False
-        for name, n in tb.pool_sizes(backward).items():
-            cur = self._pools.get(name)
-            if cur is None or cur.numel() < n:
-                self._pools[name] = _alloc((n,), self.state_dtype, device)
-                replaced = True
-                if name == "eye":
-                    self._pools[name].view(D, D).copy_(
-                        torch.eye(D, dtype=self.state_dtype, device=device)
-                    )
-        if (
-            replaced and self._slices
-        ):  # a superseded pool must not live on in the cached [:n] views
-            for key in [
-                k
-                for k, (t, _) in self._slices.items()
-                if self._pools.get(k[0]) is not t
-            ]:
-                del self._slices[key]
+        for name, n in need.items():
+            replaced |= self._grow(name, n, device)
+        if replaced and self._slices:
+            self._drop_stale_slices()
         if self.with_local and ctx.T_r > 0 and torch.device(device).type == "cuda":
             p = self.local.plan if self.local is not None else None
             if (
@@ -3137,9 +3127,46 @@ class KcpWorkspace:
             self._last_ensure = (ctx, sig, tb)
         return tb
 
+    def _grow(self, name: str, n: int, device: torch.device) -> bool:
+        """Make pool ``name`` hold ``n`` elements; a :data:`cake_kcp_plan.SHARED_POOLS` pair stays one tensor.
+        Returns whether a pool tensor was replaced."""
+        cur = self._pools.get(name)
+        if cur is not None and cur.numel() >= n:
+            return False
+        mate = next(
+            (
+                m
+                for pair in cake_kcp_plan.SHARED_POOLS
+                if name in pair
+                for m in pair
+                if m != name
+            ),
+            None,
+        )
+        mt = self._pools.get(mate) if mate is not None else None
+        if mt is not None and mt.numel() >= n:
+            self._pools[name] = mt  # the pair's storage is already large enough
+            return True
+        t = self._pools[name] = _alloc((n,), self.state_dtype, device)
+        if mt is not None:
+            self._pools[mate] = t
+        if name == "eye":
+            t.view(D, D).copy_(torch.eye(D, dtype=self.state_dtype, device=device))
+        return True
+
+    def _drop_stale_slices(self) -> None:
+        """A superseded pool must not live on in the cached ``[:n]`` views."""
+        for key in [
+            k for k, (t, _) in self._slices.items() if self._pools.get(k[0]) is not t
+        ]:
+            del self._slices[key]
+
     def pool(
         self, name: str, n: int | None = None, *, cached: bool = False
     ) -> torch.Tensor:
+        if name in cake_kcp_plan.LAZY_POOLS and n and self.device is not None:
+            if self._grow(name, n, self.device) and self._slices:
+                self._drop_stale_slices()
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -3165,7 +3192,11 @@ class KcpWorkspace:
 
     @property
     def bytes(self) -> int:
-        kcp = sum(t.numel() * t.element_size() for t in self._pools.values())
+        # every storage once (the SHARED_POOLS pairs are one tensor)
+        kcp = sum(
+            t.numel() * t.element_size()
+            for t in {id(t): t for t in self._pools.values()}.values()
+        )
         local = 0
         if (
             self.local is not None
@@ -3177,6 +3208,8 @@ class KcpWorkspace:
 
     @property
     def pool_bytes(self) -> dict[str, int]:
+        """Bytes per pool name; the two names of a :data:`cake_kcp_plan.SHARED_POOLS` pair report the same
+        storage (:attr:`bytes` counts it once)."""
         return {k: t.numel() * t.element_size() for k, t in self._pools.items()}
 
 
@@ -3272,7 +3305,12 @@ class KcpOptions:
     ``exchange`` (``auto`` | ``a2a`` | ``ring``; ring only when ``n_d_max - 1 <= 2``, SPEC-2; ``auto`` is ``a2a``
     today), ``head_groups`` (``G``; Phase 1 ships ``1``),
     ``offset_class`` (``fla``: K1 / K2 offsets; ``fp32`` is a Phase-2 knob), ``debug_sequence`` (R7: all-gather the
-    collective issue order and assert it), ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
+    collective issue order and assert it), ``spec3_probe`` (the SPEC-3 debug probe of the first saved-mode backward,
+    :class:`KernelBackend`: ``"record"`` default, ``"off"``, ``"warn"``, ``"assert"``; pass the same value on every
+    rank: the probe is a rank-local host check (a rank without tokens skips it), and ``"assert"`` raises on a rank
+    whose rows differ while the other ranks enter the backward's collectives -- it serves single-process debugging;
+    the backward reads its own call's value, the forward's is not kept in :class:`KcpSaved`),
+    ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
     per-rank call -- see "CUDA-graph replay of a call" below for the validity key, the
     pointer-stability requirement, the private pools' memory, the eager fallback and :func:`graph_cache_clear`),
     ``graph_cap`` (the cache-config form of a captured call: ``"node_attr"`` shipped
@@ -3292,6 +3330,8 @@ class KcpOptions:
     head_groups: int = 1
     offset_class: str = "fla"
     debug_sequence: bool = False
+    # public keyword: the SPEC-3 probe's mode (SPEC3_PROBES)
+    spec3_probe: str = SPEC3_PROBE_DEFAULT
     precision_mode: int = 0
     transfer_walk: str = "bf16x3_hw64"  # K3 program family: the shipped BF16x3 half-width walk; tf32_hilo / bf16x3 only through _kcp_test_knobs
     p_rule: str | None = (
@@ -3339,6 +3379,10 @@ class KcpOptions:
             )
         self.save_transfer = bool(self.save_transfer)
         self.debug_sequence = bool(self.debug_sequence)
+        if self.spec3_probe not in SPEC3_PROBES:
+            raise ValueError(
+                f"spec3_probe must be one of {SPEC3_PROBES}, got {self.spec3_probe!r}"
+            )
         self.precision_mode = int(self.precision_mode)
         if self.transfer_walk not in TRANSFER_WALKS:
             raise ValueError(
@@ -3362,8 +3406,9 @@ _OPTION_KEYS = (
     "head_groups",
     "offset_class",
     "debug_sequence",
+    "spec3_probe",
     "graph",
-)  # graph: a public keyword
+)  # spec3_probe, graph: public keywords
 
 
 def _options(kwargs: dict[str, Any]) -> KcpOptions:
@@ -4543,7 +4588,12 @@ def _graph_entry(
         id(ws),
         id(backend),
         id(ws.local),
-        tuple((n, t.data_ptr(), t.numel()) for n, t in ws._pools.items()),
+        tuple(
+            (n, t.data_ptr(), t.numel())
+            for n, t in ws._pools.items()
+            if n
+            not in cake_kcp_plan.LAZY_POOLS  # read by ring calls only, which are never captured
+        ),
         tuple(getattr(opts, f.name) for f in dataclasses.fields(opts)),
         None if scale is None else float(scale),
         flags,
@@ -4963,8 +5013,15 @@ def chunk_kda_kcp_bwd(
         entry is not None
         and entry.seen > 0
         and entry.disabled is None
-        and not (saved is not None and getattr(call.backend, "_spec3_pending", False))
-    ):  # SPEC-3's host compare stays eager
+        and not (
+            saved is not None
+            and opts.spec3_probe != "off"
+            and call.local is not None
+            and call.T_r != 0
+            and getattr(call.backend, "_spec3_pending", False)
+        )
+    ):  # SPEC-3's host compare stays eager; a rank without tokens runs no local stage (KcpCall.stage), so it has
+        # nothing to probe and captures with the other ranks
         res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
         if res is not None:
             entry.result = (res, batched)
@@ -5118,7 +5175,7 @@ __all__ = [
     "WALK_CACHE_CONFIG_CAP",
     "WALK_CACHE_CONFIG_DEFAULT",
     "walk_device_cache_config",
-    "SPEC3_ENV",
+    "SPEC3_PROBES",
     "KcpPreconditionError",
     "BOUNDARY_MODES",
     "COLLECTIVES",

@@ -39,17 +39,27 @@ and its split-K reducer), six at 128 rows; no memset, no memcpy, no host read; t
 
 `prepare_qwen_3_8_block_bf16("decode", ...)` returns the plan behind the form (`Qwen38BlockPlan`: `run`, `workspace_size`,
 `declaration`, `supports`); `Qwen38BlockWrapper(workspace_buffer, kv_layout, geometry=...)` is the same thing in FlashInfer's
-`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the largest bucket serves every
-`(batch, q_len)` bucket and every layer run in turn on one stream. The functional entry point keeps its own small LRU (32 entries, one
+`plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom: ONE workspace sized at the maximum of
+`qwen_3_8_block_workspace_size` over every `(batch, q_len)` bucket the stack plans serves every bucket and every layer run in turn on
+one stream (under `"auto"` the largest batch is not the largest workspace: admissible batch 1 and 2 buckets with `top_k >= 8` can take the lean body, whose
+split-KV slab is wider than the core's at batch 4). The functional entry point keeps its own small LRU (32 entries, one
 per shape bucket, each owning a zeroed workspace; the Qwen 3.5 rules of retention and release, one LRU per package) --
 `flashinfer.experimental.qwen_3_8_block.api.clear_plan_cache()` drops them.
 
 **The decode step runs the cuDNN Frontend MEASURED defaults** (none of them passed by this block): the prepare fusion ON on cc 10.7
 (`fuse_prepare=None` -> True: one launch for the norm / RoPE / write-through / ring / compress, bitwise the four-launch twin;
 `fuse_prepare=False` is the twin), programmatic dependent launch OFF on the sparse chain (`use_pdl=None` -> False; `True` is a typed
-decline until the vendored tree serves it there), the split-KV of the sparse tile by its fill rule. Every one reads back in
-`plan.declaration` (`fuse_prepare`, `fuse_prepare_requested`, `use_pdl`, `use_pdl_requested`, `use_pdl_effective`, `pdl_stages`,
-`decode_split_kv`, `indexer_launches`, `launches_per_execute`).
+decline until the vendored tree serves it there), the sparse core's BODY by the tree's placement rule (`sparse_tile_form="auto"`: the
+LEAN decode tile -- `mma.sync` + `cp.async`, one CTA of `128 x N_MT` threads per (sequence, KV head, chunk), no TMEM / TMA / cluster -- on
+cc 10.7 at `batch x H_kv <= 4` CTAs per chunk (the bound's unit: the step's rows ride inside the CTA, so `q_len` is not in it) at every
+served step width the body admits -- under the in-block indexer the list is per row, which the lean body serves at one row only, i.e.
+`batch <= 2` at `q_len_per_req 1` on the 24 / 2 geometry --, the tcgen05 core everywhere else; `"lean"` / `"tcgen05"` pin a body;
+the same function under either body within the tree's budget, never bitwise ACROSS the bodies), the split-KV of the sparse tile by its
+rule (the lean split, 65 at `top_k 512`, on the lean body; the fill rule on the core). Every one reads back in `plan.declaration`
+(`fuse_prepare`, `fuse_prepare_requested`, `use_pdl`, `use_pdl_requested`, `use_pdl_effective`, `pdl_stages`, `sparse_tile_form_requested`,
+`sparse_tile_form`, `sparse_tile` -- the body's `kernel_template`, `"sparse_lean_d256_f16"` / `"sparse_d256_f16"`, pinned against the compiled
+kernel --, `sparse_sub_tiles_per_cta`, `decode_split_kv`, `indexer_launches`, `launches_per_execute`); `plan.sparse_tile` / `plan.sparse_tile_form`
+carry the body too.
 
 ## A step, vLLM-shaped
 
@@ -128,8 +138,18 @@ out = w.run(hidden_states, None, None, weights, w_o,
 - **`block_ids_out` / `block_lens_out`** (optional): `[T, top_k]` / `[T]` int32 buffers that receive the block's own per-row selection
   (the ids strictly descending, `-1` past the valid prefix; the prefix length `min(top_k, floor((pos + 1) / 4))`) -- for tests, A/B and a
   stack that reuses the list; nothing on the step reads them.
-- **`decode_split_kv`**: `None` = the fill rule of the sparse tile, an int the explicit split (the combine as a second launch under a
-  split, the gate riding it); a performance knob -- the same function under every value.
+- **`decode_split_kv`**: `None` = the sparse tile's rule (the fill rule on the tcgen05 core; the lean split, 65 at `top_k 512`, on the lean
+  tile -- which ALWAYS splits), an int the explicit split (the combine as a second launch under a split, the gate riding it; on the lean
+  body one of the lean splits, elsewhere a typed decline naming them); a performance knob -- the same function under every value.
+- **`sparse_tile_form`**: `"auto"` (default) / `"lean"` / `"tcgen05"` -- WHICH BODY of the index-list sparse core serves the step (the
+  paragraph above): `"auto"` follows the vendored placement rule (the lean tile on cc 10.7 at `batch x H_kv <= 4` CTAs per chunk -- the
+  step width is not in the bound -- where the body admits the step: under the in-block indexer at `q_len_per_req 1`, the per-row list past
+  one row being the core's --, the tcgen05 core everywhere else), an explicit body is honoured where it admits the step and a typed
+  `NotImplementedError` naming the arm where it
+  does not; any other spelling is a `ValueError` before any vendored code. A performance knob (the same function under either body within
+  the tree's fixed-order-sum budget; bitwise within a body, never asserted bitwise across them) and a plan-cache key; the compiled body reads
+  back in `plan.sparse_tile`. The lean tile's `sparse_sub_tiles_per_cta` pin is not exposed here (the vendored default k = 1 is the measured
+  rendering). `qwen_3_8_block_workspace_size` takes the same knob: the carve is the body's (the lean split's partial slab is wider).
 - **`kv_cache_dtype`**: `None` = bf16 pools. `torch.float8_e4m3fn` (vLLM's `--kv-cache-dtype fp8`) is a typed decline until the sparse
   core's in-kernel dequant arm lands; `k_scale` / `v_scale` are then taken at `run`.
 - Every VALUE in the index tensors is device data (never read on the host); only the FORM is checked, host-side and typed, before any
@@ -181,7 +201,13 @@ so a geometry `qwen_3_8_block_support` advertises is one the decode declaration 
 `index_page_sizes`, the capture-safe row bound); the first probe on a served device and the first plan re-read every one of them off
 the vendored `DecodeEnvelope` and refuse a drift loudly (`check_vendored_rules`), and `tests/experimental/qwen_3_8_block/test_admission.py`
 plants a drift per constant. The probe's appended fields (`index_sources`, `index_list_forms`, `index_cache_dtypes`, `kv_cache_dtypes`,
-`fuse_prepare_default`, `pdl_default`, ...) are READ off that envelope, never re-spelled.
+`fuse_prepare_default`, `pdl_default`, `sparse_tiles` -- the sparse core's bodies this part serves by `kernel_template`: the tcgen05 core
+everywhere, the lean decode tile too on cc 10.7 --, `sparse_tile_lean_default` -- whether `"auto"` consults the lean placement rule on this
+part --, ...) are READ off that envelope, never re-spelled; the per-cell reading (which body a `[batch, q_len]` step takes under a knob
+value) is `flashinfer.experimental.qwen_3_8_block.support.sparse_tile(...)`, the envelope's own rule, and the mirrored vocabulary
+(`SPARSE_TILE_FORMS`, the two `kernel_template` names, the AUTO bound `SPARSE_TILE_LEAN_MAX_UNITS = 4` and its unit -- the placement
+rule's reading over `(batch, q_len)` cells, `SPARSE_TILE_LEAN_RULE_CELLS`: CTAs per chunk, the step width outside the bound) is re-checked
+by the same tripwire.
 
 ## Requirements and limits
 
@@ -214,18 +240,23 @@ environment", for the full table.
 
 ## Where the kernels come from
 
-The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 114 files at the pinned commit
-`f2aa360e5` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode step, the block-sparse d256
-core and its paged indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts
-(the `QSA` selection package), beside the dense forms' launches --, every file with its NVIDIA SPDX header, MIT or Apache-2.0; the import
-roots rewritten and the declared patches of `../qwen_3_5_block/_cudnn_frost/VENDOR.md`; per-file digests in `VENDOR_MANIFEST.json`). The
-pinned commit carries the in-block indexer's decode step (`QsaSpec(index_source="indexer")` over the pools: the paged compressed-key
-cache on the main block table, the raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` default), the
-block-sparse decode schedule's split rule, the chain's programmatic-dependent-launch sites (served on the caller-list form; under the
-in-block indexer `use_pdl=True` stays a typed decline) and the e4m3 compressed-key cache arms (served by the tree; this entry declines
-`index_cache_dtype=torch.float8_e4m3fn` by name until its own e4m3 cache surface lands). `qwen_3_8_block_support(...).source` reports the
-pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/`
-(its README is the recipe; the tracer's `decode_qsa` form declares this route).
+The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 118 files at the pinned commit
+`977757763` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode step, the block-sparse d256
+core with its two bodies (the tcgen05 core and the lean decode tile, plus the visible-set helper they share) and its paged indexer kernels
+(the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts (the `QSA` selection package), beside
+the dense forms' launches --, every file with its NVIDIA SPDX header, MIT or Apache-2.0; the import roots rewritten and the declared patches
+of `../qwen_3_5_block/_cudnn_frost/VENDOR.md`; per-file digests in `VENDOR_MANIFEST.json`). The pinned commit carries the in-block
+indexer's decode step (`QsaSpec(index_source="indexer")` over the pools: the paged compressed-key cache on the main block table, the
+raw-key ring, the paged scorer, the decode top-k, the measured `fuse_prepare` default), the block-sparse decode schedule's split rule, the
+chain's programmatic-dependent-launch sites (served on the caller-list form; under the in-block indexer `use_pdl=True` stays a typed
+decline), the e4m3 compressed-key cache arms (served by the tree; this entry declines `index_cache_dtype=torch.float8_e4m3fn` by name until
+its own e4m3 cache surface lands) and the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its measured AUTO
+default on cc 10.7 -- since this pin the bound counts the lean grid's own unit, `batch x H_kv <= 4` CTAs per chunk at every served step
+width (its DSL-free rules module `sdpa/fwd/sparse_tile_rules.py` is the one file this pin adds to the closure); for this entry the batch 1
+and 2 decode steps at `q_len_per_req 1`, the in-block indexer's per-row list being served by the lean body at one row only. `qwen_3_8_block_support(...).source`
+reports the pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the
+cuDNN library. Re-vendoring: `../qwen_3_5_block/_vendoring/` (its README is the recipe; the tracer's `decode_qsa` forms declare this route,
+the batch-1 cells among them: the lean kernel module is loaded by path on that route only, so the closure needs their trace).
 
 ## Validation
 
@@ -236,15 +267,20 @@ oracle fed THAT list; the written pool / ring / completed cache rows vs the refe
 (the 12 / 1 and 6 / 1 shards are tested for their typed `proj_slab_route` decline only, at the probe and at `prepare`), a padded entry, a
 sequence past the identity bound and one whose step completes a block, page 16 / 32 / 64 / 128, the UNIFIED
 cache spelling bitwise the NHD one, the ring-slots arm bitwise the derived one, the fused prepare bitwise the unfused twin and the
-position-table arm bitwise the per-token arm, the launch census by kernel count (8 at a split), three carried steps with a rejected draft
+position-table arm bitwise the per-token arm, the launch census by kernel count (8 at a split) and by kernel name (the lean decode tile at
+batch 1 under the AUTO knob -- one `cudnn_sparse_lean_kernel`, no tcgen05 core --, the core under the explicit pin and at batch 4), the two
+bodies of the sparse core on one primed batch-1 step (the list and every written row bitwise, `out` within the budget of each other, each
+against the oracle, the workspace carve of each body), three carried steps with a rejected draft
 re-stepped (the cache rows bitwise a from-scratch compress of the accepted stream), CUDA-graph capture of the FIRST run under
 `set_sync_debug_mode("error")` replayed bitwise and over a new step, the functional decode captured through the plan cache and replayed
 after its eviction, a cached step under the same mode, the typed declines at plan time and at run time, the compiled-plan cache's reload,
 the functional entry binding each call's own position tables on a cache hit (another pair, a missing pair, a short pair; CPU),
 the weight packer on both spellings bitwise the cuDNN Frontend loader, the position tables bitwise the per-token rows, the plan cache's
-key and ownership contract on CPU, the admission grid (the probe's verdict == the vendored declaration's on geometries x step widths x
-list forms x cache dtypes x page sizes; a planted drift of every mirrored constant fires the tripwire) and the import-isolation tests
-(the `cudnn` package blocked; the closure modules the route added import alone).
+key and ownership contract on CPU (the body knob a key), the admission grid (the probe's verdict == the vendored declaration's on
+geometries x step widths x list forms x cache dtypes x page sizes; a planted drift of every mirrored constant fires the tripwire, the
+sparse-tile vocabulary included), the body knob's device-free facts (the envelope's per-cell rule at cc 10.7: the lean tile at batch 1 / 2,
+the core past the bound and at `q_len 2`, the explicit bodies, no body over e4m3 pools; the host declaration's readbacks) and the
+import-isolation tests (the `cudnn` package blocked; the closure modules the route added import alone, the lean kernel module included).
 
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the cudnn-frontend
 package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests run everywhere.

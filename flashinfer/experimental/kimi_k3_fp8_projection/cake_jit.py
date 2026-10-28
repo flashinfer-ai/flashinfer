@@ -293,7 +293,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7197f4ce4db40090",
         "arg_plan": "decode",
-        "closure_sha256": "6e36f3f390a9e4323db9970e0f1b6f9e2610033cb4598e4157fc931c77d85f36",
+        "closure_sha256": "15ff20ea2af0fcf5c684ebacb5960654665d4bc39e8e01e2c76bc8b3a953eb8d",
     },
     "02657ed708643a84f7bd": {
         "binding": "021cc0171d570f358807",
@@ -353,7 +353,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "6dae4c6d05c5b578",
         "arg_plan": "decode",
-        "closure_sha256": "7719c43f49fa6d4760884bdb4b0d4d49f364673aba0f46f515be829f6f806ae7",
+        "closure_sha256": "5107bc72bdca687996b00a5240fe4f6b521fee453dbeda41ffed727cb2a82737",
     },
     "05b523c6a8fa89f67240": {
         "binding": "09ef673497e9adb01b7e",
@@ -381,7 +381,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "348655f3e6d676c6",
         "arg_plan": "gemm",
-        "closure_sha256": "4cfa7116aaab32a89841204994471a07754d198e991313fa38db01e12054ec9c",
+        "closure_sha256": "2e6595d64495b55cdc8b259b9172342d27dc838f02ae04b49cc3656dd695dc81",
     },
     "0bbf8e3bcb491ddc710e": {
         "binding": "021cc0171d570f358807",
@@ -421,7 +421,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "0cfa2dd7e6377800a42b": {
         "binding": "09ef673497e9adb01b7e",
-        "arches": _SM100,
+        "arches": _BOTH,
         "compile_flags": [
             "-DCAKE_BLOCK_X=320",
             "-DCAKE_DYN_SMEM=224256",
@@ -445,7 +445,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "832f8d1f19f6cee5",
         "arg_plan": "gemm",
-        "closure_sha256": "d2ce9f6a6d42e60a9710ce3d779debd1de0e18d5748b4c865cfd2993cb67672c",
+        "closure_sha256": "e2cf75b4a9ca5f6c412cb3fb71528496e630db0f109e5c7acc81df71d073bb92",
     },
     "0ee9cb83d3a911e05949": {
         "binding": "09ef673497e9adb01b7e",
@@ -473,7 +473,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "0ebcaaf2af74c8b0",
         "arg_plan": "gemm",
-        "closure_sha256": "9e4aabcb15eaee7b3b82876b580f7c2526f0773f36822b22fe9918c12ac23d5c",
+        "closure_sha256": "a1827fe6aaf5f9c2280f65a9667e02d021b3fb12743229a053daa5177d973f69",
     },
     "0f704c7705ba7f7955e4": {
         "binding": "09ef673497e9adb01b7e",
@@ -501,7 +501,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "0926f23fd9380d30",
         "arg_plan": "gemm",
-        "closure_sha256": "b1432131b0aadcb9f536b28735133ce0544338bc5daf3c45232ad793223b662e",
+        "closure_sha256": "1ec8d5f698aaf6b3b350f3fe72bc6b49fc56015eeec7b14dd620e1366d75a459",
     },
     "109a20816caf76c4d427": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -530,7 +530,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "170152d6398cdf45",
         "arg_plan": "decode",
-        "closure_sha256": "91d5df5ff2b134d0f5823d31ff40528d8565e1a523ca2aa567933edd339d2a9c",
+        "closure_sha256": "496368f84207b398f212afacb131f4a9d60bab1311d551e42607c4be83318f96",
     },
     "11cbad4e31342b47dc08": {
         "binding": "09ef673497e9adb01b7e",
@@ -565,7 +565,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "1ddc994f50cf2768",
         "arg_plan": "gemm",
-        "closure_sha256": "65edac0e5d606b145f9dd81dd956d6f9ca25a9c60a014f314797aeb93dd83b2c",
+        "closure_sha256": "4cdaad66f469e9d371b1c74d7b56ee75dc4fa3120eb38395de970d8ff370ea89",
     },
     "12bc0d7938b4dae5d828": {
         "binding": "021cc0171d570f358807",
@@ -596,7 +596,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "4cfa4e69a40bfd2e",
         "arg_plan": "decode_tso",
-        "closure_sha256": "c5747b2d754505f57d8154660d75ef1c613d50e638e820474c27206cf13068d1",
+        "closure_sha256": "1d1d5d3d0e5a258b87c23ba0d1997acf5058af7ff3e95fd6d29c0763b78cbc77",
     },
     "13ded8d274d83fd3756f": {
         "binding": "ca4fbacb9d82722ff4ce",
@@ -694,7 +694,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "4af3d6c8eb5710ad",
         "arg_plan": "gemm",
-        "closure_sha256": "bc9b288954066c07c7dff0f6e65ef9356ec49854c472d17d84f34eb2da39a44a",
+        "closure_sha256": "63cf0c7596012658b375edd22bc2f8f9b14f5ebef33bf66a983a215ad603570b",
     },
     "1e11dff823938495857d": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -751,7 +751,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "a72bc79b60563a29",
         "arg_plan": "gemm",
-        "closure_sha256": "4453b1ee925d690d09848530ec0f86b4fe44333343d332b6f93b9fe3b6bfebe3",
+        "closure_sha256": "803c7bf3ae44e2c1c35bed8dcbc8639ef9da4adf71641f7a2a4cfb9c335e69a2",
     },
     "218ab6730f044263527f": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -810,7 +810,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "ceeba5e1e8b7b7b7",
         "arg_plan": "decode",
-        "closure_sha256": "2cd977511b26731a8e5316aafe22cb1e7f305cdb7bdf7cf116df2305d1bcae69",
+        "closure_sha256": "b21705eafc8690401f48299c9a0322cc7a815cebd8654c4b3bd77791cb29300b",
     },
     "24119308ba977ba02d36": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -839,7 +839,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "33398b1ccc3d524a",
         "arg_plan": "decode",
-        "closure_sha256": "44fec12b879b00249d4015fab55661e2a0c25d564fe3ceed60c2a8ad255c4ae1",
+        "closure_sha256": "6ec5a0295ed240d2f3a6d368c2c71e09d80ad194c09c1eb12b58bfa76813974c",
     },
     "24a91d5a85a8465ab6ca": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -905,7 +905,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "9c033b5b0e4ecba0",
         "arg_plan": "gemm",
-        "closure_sha256": "426600086b0925910961e76b7a49736cac45ccc50ccebffd79b01cc6f0663a71",
+        "closure_sha256": "08ab57978e8d2bbcdaf0fc46f6ec664f68b76484d0cb7832bfab6b5524bee6d0",
     },
     "27b7d66a6b7fc92fbadf": {
         "binding": "09ef673497e9adb01b7e",
@@ -933,7 +933,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "848b5b5b7b4359f9",
         "arg_plan": "gemm",
-        "closure_sha256": "a050a5ea6b8a0ff1ed71f3afcfdbbb26e9ff3160059fe4c1f78a5a365ccc2e77",
+        "closure_sha256": "3fc1862de8ccd3029ef0bd397c90ce85f32737861c8e9f2b0d696ad42aca843a",
     },
     "2df3445030057b267c6a": {
         "binding": "09ef673497e9adb01b7e",
@@ -961,7 +961,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "3411db04e9f0b3f1",
         "arg_plan": "gemm",
-        "closure_sha256": "7bcd7e47ed0e23c7b12edc594466cd16e6bdb65150ea6c1d465e0098b78950c8",
+        "closure_sha256": "3c79f530677edbea1fadac7f4f05960fb5c0d7e345db4966da892fef67c2f492",
     },
     "2ec639014a8fa1272b0a": {
         "binding": "09ef673497e9adb01b7e",
@@ -1017,7 +1017,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "3cdc3b2b267f3a55",
         "arg_plan": "gemm",
-        "closure_sha256": "34a7dec3b2a6d683972a239d2be9c506e48ac41428d01f5b7221ee19ec87d657",
+        "closure_sha256": "9daca58255cfc37474c653b8e888f8eb2e0a973657f4cc30d73da266eafcd3b1",
     },
     "3273ab25e87799cf4e1f": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1046,7 +1046,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "6732391d3fcd7501",
         "arg_plan": "decode",
-        "closure_sha256": "d2cefffff5f279bf481a814741be690a25047999154f8cf5f9731c64a0682348",
+        "closure_sha256": "c3ed68cac7e0a86c3e99269dafaebddd13cc58b0d828be2ee338f42eb4b8ab5a",
     },
     "34ed200a0060c8c41d67": {
         "binding": "09ef673497e9adb01b7e",
@@ -1074,7 +1074,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "6acadb8429ff05b7",
         "arg_plan": "gemm",
-        "closure_sha256": "27032a5690b3a76b1be83b1250147cd684499f59df4eb14b6fce8475b1765960",
+        "closure_sha256": "3d07a19dae15873e5861a5b35a693288715a15014ee975a0991c48f564865381",
     },
     "352e525a7e614a09b448": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1104,7 +1104,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "486d8508473973f4",
         "arg_plan": "decode",
-        "closure_sha256": "7db25593966e793cc275c28942e9fdfee344a97821f9d1fe8e3b42f152ca40da",
+        "closure_sha256": "901d7b3dd4b0c67a3785729dcad2daa4a26f647a88d27461be7804bd814635d9",
     },
     "3635cca336bd2fa19bad": {
         "binding": "021cc0171d570f358807",
@@ -1135,7 +1135,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "24035cccc1271167",
         "arg_plan": "decode_tso",
-        "closure_sha256": "307f124ef3475910b330b7836631641ff4af7b810ac60e45fda69c13ac38dadd",
+        "closure_sha256": "3ba4f7e9215ba46a15766a5fad1b70a57c8ffd6b3ea55bfbd07cdb33fcd83b96",
     },
     "3654f2f7a859afea0aa6": {
         "kernel": "24a91d5a85a8465ab6ca",
@@ -1195,7 +1195,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7c7902c2d445ec36",
         "arg_plan": "gemm",
-        "closure_sha256": "6c1e2b8cef649cc15619e2c93ff74a9502df96fa643fcd63219c199bcf277001",
+        "closure_sha256": "4fc89c76048d2a54700a5708c80a0f6cf9f3cd6fb6894187f269f008a73ec157",
     },
     "3965747eda2968000319": {
         "binding": "09ef673497e9adb01b7e",
@@ -1223,7 +1223,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e6388062cf130dcb",
         "arg_plan": "gemm",
-        "closure_sha256": "6e37f6f9c1d4fd9f0e5c0e4bab0387c0e7c32b891c306fe539490561052f01ea",
+        "closure_sha256": "d8e9202a7ce84eb68ffcc4888bce367ff86b6fd129b55d0a18bb10298b31cbe4",
     },
     "3dfbd06157a34ae00f78": {
         "binding": "09ef673497e9adb01b7e",
@@ -1251,7 +1251,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "a00fcf53a4060b58",
         "arg_plan": "gemm",
-        "closure_sha256": "99dd0c96097ed98b4bafd04017d28ccc140bec54555749b1b93dcc304623ad6e",
+        "closure_sha256": "e52e517bf56b6c50c9af184bea50d708f23c5b4699eb08132721e6dd9d19d494",
     },
     "3f274c0bee3c91e8dbd5": {
         "binding": "021cc0171d570f358807",
@@ -1310,7 +1310,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "a670b37d79a1d665",
         "arg_plan": "gemm",
-        "closure_sha256": "2929c2423729af3cac9a197e6e64d0db44d0cb4c54afd914bad44e51ea921266",
+        "closure_sha256": "08ce86c4c38b9f84e566ee80b7484af96819906bc301f47886a5e1c2148c4247",
     },
     "46c66f5e27a55602bfd7": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1398,7 +1398,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "f754b89eca740f37",
         "arg_plan": "decode",
-        "closure_sha256": "854a52dbcd0dd391c01f1577db3539ccbeee3aac7b56397b32d0107b1f0f7e00",
+        "closure_sha256": "d4fb1861a17d406d13bac584700d980312e64a60f236e125439abd5ff76007b2",
     },
     "4da95d45aada36775de5": {
         "binding": "09ef673497e9adb01b7e",
@@ -1427,6 +1427,34 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "shim": "da4caa59d8e96b27",
         "arg_plan": "gemm",
         "closure_sha256": "30dffa91f101e1bcb42f29c050889b2c919c3414f2a4436c9d142a88cd92f6d2",
+    },
+    "4e9ebf0c93bc7309e8e4": {
+        "binding": "09ef673497e9adb01b7e",
+        "arches": _SM103,
+        "compile_flags": [
+            "-DCAKE_BLOCK_X=320",
+            "-DCAKE_DYN_SMEM=232448",
+            "-DCAKE_CLUSTER_X=2",
+            "-DCAKE_CLUSTER_Y=1",
+            "-DCAKE_CLUSTER_Z=1",
+            "-DCAKE_BOX_A_0=128",
+            "-DCAKE_BOX_A_1=128",
+            "-DCAKE_BOX_A_2=1",
+            "-DCAKE_BOX_B_0=128",
+            "-DCAKE_BOX_B_1=32",
+            "-DCAKE_BOX_B_2=1",
+            "-DCAKE_BOX_SFA_0=128",
+            "-DCAKE_BOX_SFA_1=4",
+            "-DCAKE_BOX_SFA_2=1",
+            "-DCAKE_BOX_SFB_0=128",
+            "-DCAKE_BOX_SFB_1=8",
+            "-DCAKE_BOX_SFB_2=1",
+            "-DCAKE_BOX_OUT_0=32",
+            "-DCAKE_BOX_OUT_1=128",
+        ],
+        "shim": "756a4206631eec26",
+        "arg_plan": "gemm",
+        "closure_sha256": "c0d024399950a6e310936f161a771f186e35d678c32e994a01c094bb43150f49",
     },
     "504b13e2236557baa266": {
         "kernel": "a8222cc117f456537bdc",
@@ -1486,7 +1514,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e6fa2204b9f06349",
         "arg_plan": "gemm",
-        "closure_sha256": "d9988b436333409fe162b00b217bb0e332d279fb404fc29eebe53b6bece627c4",
+        "closure_sha256": "4de2327f3d8f7997cfec248500bde86c434ddd9d547df4c5af545883f2e54887",
     },
     "55edd49d3fc4d8738f68": {
         "kernel": "3fa6af62a780530c1810",
@@ -1547,7 +1575,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "59c134ce453622a8",
         "arg_plan": "gemm",
-        "closure_sha256": "3cc77f22d949ee268458fb737f55fcef097011cf841c734ef67c0e79bbdb592c",
+        "closure_sha256": "e68ad1409901a3d4d992ec98c5e06fb009aafff1f1e9b286fb921a7052249564",
     },
     "56e6e5bb34c330eac5a3": {
         "binding": "09ef673497e9adb01b7e",
@@ -1575,7 +1603,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "fd8a37ebe628db2c",
         "arg_plan": "gemm",
-        "closure_sha256": "f7ee0e6090fc4790319b49af130529bbb263f7bebf363b96473751b4b66e98eb",
+        "closure_sha256": "97f7882198c849462e26f5e25a2c63a65bd25f541161dd92132a737058bd6e0d",
     },
     "5a04cd74fb0cbb150e8f": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1677,7 +1705,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "88863d173e3c8954",
         "arg_plan": "decode",
-        "closure_sha256": "648ce5f6de4d804d903558dcc8a92453ba333cdb14c8d03eb7f4500f22485d9b",
+        "closure_sha256": "289a320fbca3f98396f6afe5fc3b4a2ffe030d5a19f777325d2c23a05b5d74a0",
     },
     "60d7ceeca1565284fa84": {
         "kernel": "0cdb8cc10eb1192d3635",
@@ -1744,7 +1772,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7fe8b843fcb1a286",
         "arg_plan": "gemm",
-        "closure_sha256": "1f3fb587cc4d9fd9944dabb9bef6e6efe5bfb2f01750ffe6c03ac01456a3563c",
+        "closure_sha256": "8f8a7f62dc2d20b0fa136d2f9843108532c0ba24fef98009f5344324527f6989",
     },
     "660ec299b54990dfd42a": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1862,7 +1890,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "a6425d313b83738b",
         "arg_plan": "decode",
-        "closure_sha256": "d84be9c183c4926f2d162a55d7708a016d9c9ee3cd1c8a8fb421d17443f5dde8",
+        "closure_sha256": "bd110c036c26c070f264c5152c5dcda8aa40d73a99f92fc000785afaa1d22756",
     },
     "6c2785303c17525804de": {
         "binding": "021cc0171d570f358807",
@@ -1922,7 +1950,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "bd1cfc922e57799b",
         "arg_plan": "decode",
-        "closure_sha256": "813c37623881bd41b33154062958438177d5f0e5751a98db97d6544c38933e7e",
+        "closure_sha256": "792b176610961194f03637e23cae9daed69c8a76d7dbbe2b86f8419e4a7b3f42",
     },
     "6d425ee39692a02c44ef": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -1979,7 +2007,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "4ca3bc4d4c618cbc",
         "arg_plan": "gemm",
-        "closure_sha256": "4d9d999e9c1e91ba80b58d78ae710f83c291da2aa05eab9bc2cf3c30b3c737cc",
+        "closure_sha256": "1b7539d8ef36e88795886b888a2028f82a925ef8aab51fd8d91a509353abc046",
     },
     "6f14858293e3d9f61c93": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2037,7 +2065,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e23682f9c93193c1",
         "arg_plan": "gemm",
-        "closure_sha256": "1cdf72de8a89d272b2f8e706980c6ccc83a713015f69c9bb9aa1cbc9f7ca6647",
+        "closure_sha256": "d853e4d69897e4e5bdc27522749b4d59c044db1b0149c53eb1c1a5c2fd7ac71c",
     },
     "70566a799edf0dc4a7fe": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2133,7 +2161,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e2997d0809d3f52c",
         "arg_plan": "decode",
-        "closure_sha256": "9e4c4faa19c99616d5293c461480af2865a676c930ab39797c6d907a63066c6f",
+        "closure_sha256": "55a01b21594ff3e3c93e38506a55a77ac47b7b7e6e66cc6544d57a493a7c24a3",
     },
     "79f12b24b5219de5deb8": {
         "binding": "09ef673497e9adb01b7e",
@@ -2161,7 +2189,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "75c79d9883d2af87",
         "arg_plan": "gemm",
-        "closure_sha256": "e5cc52acbf95fb01b84dd59e6f9095e6d64212d788c98033328d305912d6b831",
+        "closure_sha256": "31a1c8af9d7d6d6331d686213fd3be98374c4a0433ffd595eb024749d7d96dfa",
     },
     "7abdff4851061bffe5cb": {
         "kernel": "67b79a99dbca18833ff9",
@@ -2222,7 +2250,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "4067daba41e5b74f",
         "arg_plan": "decode",
-        "closure_sha256": "bdca661fa0f61438f9268c6f107f6b0bef5153458983c7054015b03d3edb0040",
+        "closure_sha256": "f5839f2b17dde7ff3bf7e2a08d93a982233a994d5a82eb54c6b4adca31992112",
     },
     "7c0c2078f3110d338d76": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2280,7 +2308,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "004b71fd6d867a5a",
         "arg_plan": "gemm",
-        "closure_sha256": "d5aeeac3b9a0be258a37d1e2b7886ca4133e37296d76b0e3529fa75d93997ecf",
+        "closure_sha256": "78ce73c0ca355c6ce34fac4e4cc5a45971b8f78234b6de6720d0e2fc7f9fea7d",
     },
     "7e94cb84ae1437deea7e": {
         "binding": "09ef673497e9adb01b7e",
@@ -2308,7 +2336,35 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "35360aab45772340",
         "arg_plan": "gemm",
-        "closure_sha256": "361fc0a0041b319b5de795519308999a813f1c552b80aaa96eeaff4aae04c8c1",
+        "closure_sha256": "0926d0228fb9dbd2cac2265543e6d7b0517453f26063b879f0744f69f20ea060",
+    },
+    "801bd3dcd16387080515": {
+        "binding": "09ef673497e9adb01b7e",
+        "arches": _BOTH,
+        "compile_flags": [
+            "-DCAKE_BLOCK_X=320",
+            "-DCAKE_DYN_SMEM=204800",
+            "-DCAKE_CLUSTER_X=2",
+            "-DCAKE_CLUSTER_Y=1",
+            "-DCAKE_CLUSTER_Z=1",
+            "-DCAKE_BOX_A_0=128",
+            "-DCAKE_BOX_A_1=128",
+            "-DCAKE_BOX_A_2=1",
+            "-DCAKE_BOX_B_0=128",
+            "-DCAKE_BOX_B_1=128",
+            "-DCAKE_BOX_B_2=1",
+            "-DCAKE_BOX_SFA_0=128",
+            "-DCAKE_BOX_SFA_1=4",
+            "-DCAKE_BOX_SFA_2=1",
+            "-DCAKE_BOX_SFB_0=128",
+            "-DCAKE_BOX_SFB_1=8",
+            "-DCAKE_BOX_SFB_2=1",
+            "-DCAKE_BOX_OUT_0=32",
+            "-DCAKE_BOX_OUT_1=128",
+        ],
+        "shim": "abdb461b35d0d22d",
+        "arg_plan": "gemm",
+        "closure_sha256": "4996ae9f8dbc003958cc71d0769b91c9a0cf88d94fe8bda3a3f9bc5e867e192c",
     },
     "817af6c9b77f3e9d87b2": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2337,7 +2393,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "f7fedc038f361588",
         "arg_plan": "decode",
-        "closure_sha256": "c43656df396018e280e51271bd1f2420deeb2a28be7bcfd60007e1aeaded4ea4",
+        "closure_sha256": "e215ef2a52d5b36f382b7ff1e446e0d506bfdc1261182a55e225da13f6dd11e1",
     },
     "841702601c2ae5389855": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2394,7 +2450,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "858aca0d8762c075",
         "arg_plan": "gemm",
-        "closure_sha256": "cd7598f081faeceb8d946b8e82272e274abdf4722f23f47130befc1ab902725d",
+        "closure_sha256": "e11a02d61441c3d91620c20dedba017350496c381335ccc47bf1d945b3ab358b",
     },
     "85efe65bb8f20a1153b6": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2424,7 +2480,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "c318eac2058a79c3",
         "arg_plan": "decode",
-        "closure_sha256": "55c612dde139969a832fb3e7439991a9d2d6eca00b279f0320c9688057dc4133",
+        "closure_sha256": "f01ef3cf0479abf7215a38d66afcf200e37149d893cf212fec2c2add6df0f6ba",
     },
     "870991637b9c3b1bca71": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2453,7 +2509,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "d4be08f38f4d0e1e",
         "arg_plan": "decode",
-        "closure_sha256": "3ddf8b2bf8c2dcecb565e6805493b657d7b6c0538c1d1c67270713ea4d1eb4a0",
+        "closure_sha256": "1a069bb5df2ba830777730c95203b7a964c7e6c4a43f3b5597c5ce9df0225dc7",
     },
     "88eaaccbac79ef8cf184": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2511,7 +2567,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "304636b0f80285aa",
         "arg_plan": "gemm",
-        "closure_sha256": "321a67b71eb5ae174befd326f3e936697c6739492ab9c289d31054b6405c0375",
+        "closure_sha256": "413c8ec4704207432957fa8e1a38f5c8e475ea635f3caf93cf600b03f32e2232",
     },
     "8a729dae0bdd90c1277f": {
         "binding": "09ef673497e9adb01b7e",
@@ -2539,7 +2595,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "11a98768072b3dd6",
         "arg_plan": "gemm",
-        "closure_sha256": "80450f40956b3673faebba5b3b20a57f45cb066aabba1218dc0ae0455a3601c1",
+        "closure_sha256": "3414a1c39b289c940a0707b00f07583e198dca5d3bb04f99ac5c388cd5cbfb93",
     },
     "8aa991963d17bf2c12b1": {
         "binding": "09ef673497e9adb01b7e",
@@ -2567,7 +2623,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "2d4a6fdd784d712f",
         "arg_plan": "gemm",
-        "closure_sha256": "db49c94b8d74911774b78e6c2b995bc7b672a60c57b4b49541b934bd9e9880da",
+        "closure_sha256": "a4ad0bb4ca9fa69729e1f6cd5bc7fec16e8ddde558fe8d48f9b3cc36d1f23a08",
     },
     "8b3099d126d594758603": {
         "binding": "09ef673497e9adb01b7e",
@@ -2595,7 +2651,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "657fd358db77c779",
         "arg_plan": "gemm",
-        "closure_sha256": "13c5e60e6426d0567c5b4e842977429e6244706e9c6de36764e748a74c1a2243",
+        "closure_sha256": "94c9141bd06759be37ca142f4f9093042e70661051f4d2b3615bc8e43c3e213d",
     },
     "8e904030bb59c4e58cf9": {
         "binding": "09ef673497e9adb01b7e",
@@ -2623,7 +2679,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "421946334acd994f",
         "arg_plan": "gemm",
-        "closure_sha256": "b8e2263da72e381b8b50bfa66dfd39e19824d741cc496c4a334b0c3ad36f2cb3",
+        "closure_sha256": "6d237f1f789fdae0c5619b63b1ce531a1b074a0afee4c016963a8c21ce73a249",
     },
     "8f598b24da1bded0e4e5": {
         "binding": "021cc0171d570f358807",
@@ -2682,7 +2738,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "f3d4e24115288636",
         "arg_plan": "gemm",
-        "closure_sha256": "5b993a5ed058bbaf00fed776035d1480de1cd596187aed6b69350c3782f9f9b7",
+        "closure_sha256": "ce1b827f8fdc81028b8700267ff8c2c5da38e38f722a8d5be6e3991a823ee1a0",
     },
     "9265c88bf850d89b0c01": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2772,7 +2828,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "91c493b9b27104c9",
         "arg_plan": "gemm",
-        "closure_sha256": "b3e856ac0626667d8f48d50bcf9c54514f17f066a3970ddd775d04ed09e475f6",
+        "closure_sha256": "8f2d02008cb0eded77dd79ea111e47633e29faa18d18f5b5d3c66acd73e8fafe",
     },
     "9bb1e215d9ef887715cb": {
         "binding": "09ef673497e9adb01b7e",
@@ -2800,7 +2856,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "d3dbb694c357c649",
         "arg_plan": "gemm",
-        "closure_sha256": "2ab590a486b4ed86b5b43d0c0e27942d707373ff59a762828478c054cd3532fb",
+        "closure_sha256": "bb8f076d38f89106bea9186e1e3b6483b8bf7eb2a38eff751cc7cb35d1913edf",
     },
     "9be758d48638afaa9a83": {
         "binding": "09ef673497e9adb01b7e",
@@ -2828,7 +2884,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "5badcb82daec4edf",
         "arg_plan": "gemm",
-        "closure_sha256": "9353a427690dea8aa5bafbb60d065005e7ff79812acf288f09c656d597e791ce",
+        "closure_sha256": "8a1c830e2bdd2a0f1684ab296a892e35ef58d32e44bb81f7fd5b19f5e792347e",
     },
     "9c5367ceb07225a64cb3": {
         "binding": "09ef673497e9adb01b7e",
@@ -2856,7 +2912,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "737f85d2461be7da",
         "arg_plan": "gemm",
-        "closure_sha256": "f03f59c39768b21c30630c6a9f9d40d29d316fe9a081c3e17ee02955a59d22f8",
+        "closure_sha256": "084f464947c4d2aa84d5b67728aa8bacdda2646edd551381990157a754af6646",
     },
     "9d06d3a696f7c72de10d": {
         "binding": "09ef673497e9adb01b7e",
@@ -2884,7 +2940,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "d75f98f246ccab71",
         "arg_plan": "gemm",
-        "closure_sha256": "fb42151dcb6e0e8ad72de39013f4643b1d4764460c88d4709c74ec929b749a37",
+        "closure_sha256": "55b36fb6408b73a5531d2671c9a6e418d16f9d38542bbf0e8bba4ae6eb7cdce9",
     },
     "a02ee6f0265e098d2531": {
         "binding": "021cc0171d570f358807",
@@ -2946,7 +3002,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "3cd85d2fdb812622",
         "arg_plan": "decode_tso",
-        "closure_sha256": "246ca10adc9dab94f7bc6d57b872968117378b37496e939eb20bc269a227836a",
+        "closure_sha256": "e74ce0186246a7c615c4a4aeef4266a8ffbb67afdd3e960906efa0dabf3e0b1f",
     },
     "a1ec350075d03ecc5276": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -2975,7 +3031,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e650ca9a546db415",
         "arg_plan": "decode",
-        "closure_sha256": "d9ccba2b9a8a8071d2a77f529a04106436919542b489c8fad9f232ceef4a27f0",
+        "closure_sha256": "3cd2f1e5ede6b02c7c1497c8c96669c877095b4487239094ad3aece5b7f5d921",
     },
     "a2c41617305b1b3de9e5": {
         "binding": "09ef673497e9adb01b7e",
@@ -3003,7 +3059,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "4f0d7bdbe36ceea1",
         "arg_plan": "gemm",
-        "closure_sha256": "3f4fc90baf3458f5a6baa603da171d6f5d658e139c0868a54134352e642af972",
+        "closure_sha256": "3fed5c1125cec49f39f1f43351b9863358b258919c43683e6eb7510b71db0a92",
     },
     "a2e46d7b502767bca64c": {
         "kernel": "71c5eadf708248a0d43c",
@@ -3043,7 +3099,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": _SM100,
         "shim": "d9052df6bc989415",
         "arg_plan": "gemm_skp",
-        "closure_sha256": "4d11686cda805153a7a047d655de4b59693f8e46ed06ae5c75f99cad717e5fec",
+        "closure_sha256": "776d741ed00d136e21322122c2657d79d5ebcf50cd6789612772554f32e3d526",
     },
     "a9484fb9b47a717a2207": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -3222,7 +3278,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7052d8230d610ba6",
         "arg_plan": "gemm",
-        "closure_sha256": "f3c2ec99b6449e55c80b1f5c07e24bdd5933d9242ab19aecb143d813d9a87b1e",
+        "closure_sha256": "bca298522f74fff2a00cf6f82c6ffe732824781e621b939e7e93887196219487",
     },
     "b1dffe53a1afb7aac759": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -3251,7 +3307,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e4f0523ed5a43383",
         "arg_plan": "decode",
-        "closure_sha256": "df8ac04ae4653593c441729c28a3344889a54c3f2ca965df3ecf00765ad6ac5e",
+        "closure_sha256": "3c7d219f713e78e2cfa9f1eaa3b05e93396b90817e7dd627bd35f2ebfe4dd443",
     },
     "b70f35ad8508e4fc1020": {
         "binding": "021cc0171d570f358807",
@@ -3340,7 +3396,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "939fd621537f654d",
         "arg_plan": "decode",
-        "closure_sha256": "8b70a347a2a0c825e4d0d05f2af01f5c842001123074f9ddbfe01d9db54a10a7",
+        "closure_sha256": "020ffe091b559ca4a692db5785211e206f60e61784cf36c472e6fc8f851f6743",
     },
     "b9b51b458480aa795e71": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -3369,7 +3425,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "6eb90838f1e98e39",
         "arg_plan": "decode",
-        "closure_sha256": "78846e0e956739ab32726c2a546c3579e190358fd20dbfcaa1b778fff22339a5",
+        "closure_sha256": "d46e8528efd7e1cc6df80ac0f28f47c544ed17ee26906ede15175db67092ba01",
     },
     "c0322ea8d89dd0b0ee9f": {
         "binding": "09ef673497e9adb01b7e",
@@ -3397,7 +3453,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "5d78f33e925392bb",
         "arg_plan": "gemm",
-        "closure_sha256": "830c0489c1cd9268bd0c9de9874e05e995935819e98b2dcf4ffeec5475fe2f20",
+        "closure_sha256": "ff5518d666b26a7e0d664443c80ce51ef3d76fd6816580e9d2f356f35a6ef8dd",
     },
     "c068dc77b0968fcc0a15": {
         "kernel": "83c6d5b5d853851ec87a",
@@ -3555,7 +3611,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "0300034ec8adb58d",
         "arg_plan": "decode",
-        "closure_sha256": "dd137ef70eb5b062487be2338cc548c95b1b4764767f5f6c5b8e3ad400036f46",
+        "closure_sha256": "e2e439b6fa72f2ac2f04a85606d4d6eaf4905ad6147e5232402c8324349ed887",
     },
     "c8d00069e3d26ca0cc7a": {
         "binding": "021cc0171d570f358807",
@@ -3645,11 +3701,11 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "c9f184f37b73fcba",
         "arg_plan": "gemm",
-        "closure_sha256": "713ab6cf77d500073c701c1f2e1d0d38a1dfdac5738c76f29c239f0f14b4a698",
+        "closure_sha256": "1a41aab122667a92e49bae19ed5af5882b8b2a1d6d3c31cf3f823cdbe06ecc85",
     },
     "cca5af0a34a622d58d9d": {
         "binding": "09ef673497e9adb01b7e",
-        "arches": _SM100,
+        "arches": _BOTH,
         "compile_flags": [
             "-DCAKE_BLOCK_X=320",
             "-DCAKE_DYN_SMEM=215040",
@@ -3673,7 +3729,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "9d12a3937a457ab0",
         "arg_plan": "gemm",
-        "closure_sha256": "33ed0011c23d62375c83d6ccac02b8449e061be245e015538bbd37fada2469c5",
+        "closure_sha256": "46a5121e8dce1c3ab79a1fb2ebef96d4d2e1d1bf9df17b704ebfff681d1b0a54",
     },
     "cd64e0c4e8bab2f61340": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -3764,7 +3820,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "76ea70269c88af13",
         "arg_plan": "decode_tso",
-        "closure_sha256": "263381fbd0e22430d211cc00c42c156023dc4163448626af3b576407589195b6",
+        "closure_sha256": "5a0b45051eef927896415259d381040d640fecdaf87693fb21f84c626bf46374",
     },
     "cf0bca8a6a9ee0d6467c": {
         "binding": "09ef673497e9adb01b7e",
@@ -3792,7 +3848,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "faf2542508615a5c",
         "arg_plan": "gemm",
-        "closure_sha256": "cff0dafe66719e559c4852dcd7de7f54a5a81e42675ec0d54e27f202d2d3c139",
+        "closure_sha256": "4315016a9b530bc455dbe56eaab60dc5e3f9f1fcfca7e23b886a364648f879fb",
     },
     "d0455458c37715fc7596": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4035,7 +4091,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "dcd0cb27c7b398a5",
         "arg_plan": "gemm",
-        "closure_sha256": "4cf569870cfdeffbc3615e4ba230933891bb680bb9c85f6ca8ab88ebd5306469",
+        "closure_sha256": "971763a6603f82767a228dc588b0ff27a81d81e7d972a0428478c404bd2e6293",
     },
     "d890c0913879154687ad": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4064,7 +4120,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "b31cce6e6b4c4bcf",
         "arg_plan": "decode",
-        "closure_sha256": "d3eb08ac8e7870546e69f3afde5ff17a8da3f1835c86cab1862ee1cd0fd3d967",
+        "closure_sha256": "c2642c53c9571d91911281857cd0c75ee91cf445bfdd39154fb7ecb73f90e4b9",
     },
     "db3498a9bcd060acdd58": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4094,7 +4150,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "ce8fa44ed01f4980",
         "arg_plan": "decode",
-        "closure_sha256": "64da57d64b78dbf3a8725b95dbeb0ce2660465970082fcb5969bb5c704a99e0e",
+        "closure_sha256": "e8815324e0cd8eb761e56cf08fa31b9b7fc9fa2494cf03bcea75cb3040eebeb6",
     },
     "de7392b418950ef471da": {
         "binding": "09ef673497e9adb01b7e",
@@ -4122,7 +4178,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "6c431876ea6b59f8",
         "arg_plan": "gemm",
-        "closure_sha256": "429d3379d609d1d8bb09fee73ef91b166edcab6fc03afb4765aa0ad2a89bda2b",
+        "closure_sha256": "6977690ab4494e802d4bee5a994e1e48ff65de100354090d94ba595e3d19bb29",
     },
     "de86c87283901f3d90f1": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4151,7 +4207,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "ea1cb0cba31f834f",
         "arg_plan": "decode",
-        "closure_sha256": "86eeab5534219817e34070f3b00f116af84bdf9a6e0dd82930e668b96e399a60",
+        "closure_sha256": "bfa87190fec2e13e97299431a00a3b326a3ec30e315506284d215f79c2e83d0f",
     },
     "e2e5a8209d576711ba08": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4180,7 +4236,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "43245f53accebe46",
         "arg_plan": "decode",
-        "closure_sha256": "41598ffea8fd2b470f73c41a865a60451342df5dd0e12f7989b427717d542770",
+        "closure_sha256": "2b27d3e1fe223717717df9a60871294dfe5c9fa0c4d73f98e65552b87167b8c7",
     },
     "e47f4efd083cf458e167": {
         "binding": "ca4fbacb9d82722ff4ce",
@@ -4217,11 +4273,11 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7067271cfcc9faa3",
         "arg_plan": "decode",
-        "closure_sha256": "dc7e9eac66659d37c48e8a9825cb1ae5a680142e99e2b6a87808c75b450d600d",
+        "closure_sha256": "355d360e8aa2b4b09cc574d6adec6ff66136c5b1144b14227646274bd5c9dc2b",
     },
     "e6e7b800d1ed6f5d50c9": {
         "binding": "09ef673497e9adb01b7e",
-        "arches": _SM100,
+        "arches": _BOTH,
         "compile_flags": [
             "-DCAKE_BLOCK_X=320",
             "-DCAKE_DYN_SMEM=224256",
@@ -4245,7 +4301,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "f72f56198b28caed",
         "arg_plan": "gemm",
-        "closure_sha256": "f076e0ce677863959a5c95092c1501e202cb2afe7371445834d254b04ac79db3",
+        "closure_sha256": "003851c43e53fe96259dc67204a34cdcc566e4061a6199f23af92621d20f4606",
     },
     "eaebab972988be477371": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4274,7 +4330,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "efd696b5cd8db421",
         "arg_plan": "decode",
-        "closure_sha256": "32cf8347375ff8d83a085253cfade695264b45948ef954e927cf45f09a1d5c2f",
+        "closure_sha256": "766a8697bf1e52f1675516bc5d7c43510c38932311469a2abbfdf7b5d5e8ee7b",
     },
     "f120aafe68cf3f56c517": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4303,7 +4359,35 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "8a6b41114b8740f1",
         "arg_plan": "decode",
-        "closure_sha256": "54a4d47078543c93938606083a7be25fb6b59f57d515669b6ae24729025857fa",
+        "closure_sha256": "001df10a45417a2038ab239c75ef7632815d8971af9e2c7ef10ff79b5d808049",
+    },
+    "f12a2e7694a13e115fa2": {
+        "binding": "09ef673497e9adb01b7e",
+        "arches": _SM103,
+        "compile_flags": [
+            "-DCAKE_BLOCK_X=320",
+            "-DCAKE_DYN_SMEM=204800",
+            "-DCAKE_CLUSTER_X=2",
+            "-DCAKE_CLUSTER_Y=1",
+            "-DCAKE_CLUSTER_Z=1",
+            "-DCAKE_BOX_A_0=128",
+            "-DCAKE_BOX_A_1=128",
+            "-DCAKE_BOX_A_2=2",
+            "-DCAKE_BOX_B_0=128",
+            "-DCAKE_BOX_B_1=128",
+            "-DCAKE_BOX_B_2=2",
+            "-DCAKE_BOX_SFA_0=128",
+            "-DCAKE_BOX_SFA_1=4",
+            "-DCAKE_BOX_SFA_2=2",
+            "-DCAKE_BOX_SFB_0=128",
+            "-DCAKE_BOX_SFB_1=8",
+            "-DCAKE_BOX_SFB_2=2",
+            "-DCAKE_BOX_OUT_0=32",
+            "-DCAKE_BOX_OUT_1=128",
+        ],
+        "shim": "aa16892cc8e04dff",
+        "arg_plan": "gemm",
+        "closure_sha256": "7c698d1cadc9cd8515fa408f31a6910ca686b9f16d50a8657634bdaa8faf9fce",
     },
     "f1f22be79f996514838b": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4458,7 +4542,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "9e0ced8bbcd5aa6f",
         "arg_plan": "gemm",
-        "closure_sha256": "c3b6db85ada83fddcdd4d28ac10411c4c9ad519f1d1d871416c5fd8aae1843b5",
+        "closure_sha256": "1ebccaaa040949227f5f55d291f99e202268cb3c5bc68e1853d798437e922385",
     },
     "fc3de25a3e92e4178e86": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4487,7 +4571,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "e1079dd7367d5f78",
         "arg_plan": "decode",
-        "closure_sha256": "31582513ded256a9960e4a0e7d85aa074e8a1956d1db461a753fe74b98991e4f",
+        "closure_sha256": "d61eb252f1b99032cd46beaf93fcf7b87f6c9de5fe251dfd2f8fb24a3fd7cabb",
     },
     "fef030e7995dc303e44b": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4516,7 +4600,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "7df0571f77e6e597",
         "arg_plan": "decode",
-        "closure_sha256": "ed16830537b1ac03d373f686244d3f5fe7b26f2c721d37640d637015a0096142",
+        "closure_sha256": "8a61eb40f5178dcfe83f6efb42f265d154e6d37e76fceb42881933cbf75bf02f",
     },
     "ffb34589bc1179ff0c46": {
         "binding": "0cdb8cc10eb1192d3635",
@@ -4545,7 +4629,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "shim": "a468cb5b1f7bff29",
         "arg_plan": "decode",
-        "closure_sha256": "be081cead8ff8f4d96e653cdbb0da66dee99f99ca726e161122a7c6f92ab4ffa",
+        "closure_sha256": "8d6c3ed01124ebe35f92e5db09d56c8c0723bec9d3ca1e78146f095e1fb400c3",
     },
 }
 
@@ -4706,6 +4790,7 @@ _KERNEL_PROGRAMS: dict[str, str] = {
     "gemm_tstore_k128_s2_ts4": "7df2f35132c54d71eca6",
     "gemm_tstore_k128_s2_ts4_pf2": "8b3099d126d594758603",
     "gemm_tstore_k128_s2_ts4_pf2_prg": "2df3445030057b267c6a",
+    "gemm_tstore_k128_s2_ts4_tde_prg": "801bd3dcd16387080515",
     "gemm_tstore_k128_skf": "0f704c7705ba7f7955e4",
     "gemm_tstore_n192_k128": "9d06d3a696f7c72de10d",
     "gemm_tstore_n192_k128_cs2": "9be758d48638afaa9a83",
@@ -4713,6 +4798,7 @@ _KERNEL_PROGRAMS: dict[str, str] = {
     "gemm_tstore_n192_k128_gs_gsb": "89d69698b75a18930b7d",
     "gemm_tstore_n192_k128_gs_prg": "8aa991963d17bf2c12b1",
     "gemm_tstore_n192_k128_gs_ts3_tde": "91b883e0b916d1da062e",
+    "gemm_tstore_n192_k128_gs_ts3_tde_prg": "4e9ebf0c93bc7309e8e4",
     "gemm_tstore_n192_k128_pf1": "9c5367ceb07225a64cb3",
     "gemm_tstore_n192_k128_pf2": "05b523c6a8fa89f67240",
     "gemm_tstore_n192_k128_pf2_bef": "3dfbd06157a34ae00f78",
@@ -4732,6 +4818,7 @@ _KERNEL_PROGRAMS: dict[str, str] = {
     "gemm_tstore_pf2": "0ee9cb83d3a911e05949",
     "gemm_tstore_s2_ts4": "56e6e5bb34c330eac5a3",
     "gemm_tstore_s2_ts4_pf4": "564f8cb8b52f76484478",
+    "gemm_tstore_s2_ts4_pf4_tde": "f12a2e7694a13e115fa2",
     "gemm_tstore_skf": "27b7d66a6b7fc92fbadf",
     "gemm_tstore_skf_pf1": "38c5c41c9d999f9df785",
     "gemm_tstore_skf_pf1_bef": "40ea15cf8efbf8f8a377",

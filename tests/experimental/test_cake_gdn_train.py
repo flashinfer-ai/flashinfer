@@ -275,3 +275,247 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         assert torch.equal(t_saved, t_replay), (
             f"{n}: saved-context and replay backward differ"
         )
+
+
+# --------------------------------------------------------------------------- issue #7074 (1): sync-free context preparation (one GPU)
+ISSUE_CU = [
+    0,
+    131071,
+    218602,
+    261987,
+]  # the issue's layout: 261,987 tokens in 3 documents, (H_qk, HV) = (2, 6)
+
+
+def test_context_preparation_does_not_synchronize(device) -> None:
+    """``kcp_partition`` + ``build_kcp_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
+    tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
+    plan = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp_plan")
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        part = gdn_api.kcp_partition(
+            torch.tensor(ISSUE_CU, dtype=torch.int64), 1, layout="contiguous"
+        )
+        ctx = gdn_api.build_kcp_context(part, None, 0, device)
+        prepared = ctx.prepare(2, 6)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize(device)
+    ref = plan.build_kcp_context(part, None, 0, "cpu", sm_count=ctx.sm_count)
+    ref_prepared = ref.prepare(2, 6)
+    pairs = (
+        [(f"tables.{k}", ctx.tables[k], ref.tables[k]) for k in ctx.tables]
+        + [
+            (f"halo.{k}", ctx.halo_tables[k], ref.halo_tables[k])
+            for k in ctx.halo_tables
+        ]
+        + [
+            ("frag_table", ctx.frag_table, ref.frag_table),
+            ("cu_seqlens_local", ctx.cu_seqlens_local, ref.cu_seqlens_local),
+        ]
+        + [
+            (f"prepared.{k}", prepared.device[k], ref_prepared.device[k])
+            for k in prepared.device
+        ]
+    )
+    assert len(pairs) > 20
+    for name, dev_t, cpu_t in pairs:
+        assert dev_t.device.type == "cuda", name
+        assert dev_t.dtype == cpu_t.dtype and tuple(dev_t.shape) == tuple(
+            cpu_t.shape
+        ), name
+        assert dev_t.data_ptr() % plan.UPLOAD_ALIGN_BYTES == 0, name
+        assert torch.equal(dev_t.cpu(), cpu_t), name
+    assert prepared.P == ref_prepared.P
+
+
+# --------------------------------------------------------------------------- issue #7074 (4): the workspace bytes the backward binds (one GPU)
+
+
+class _PeakWorkspace:
+    """A ``KcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
+
+    def __new__(cls, kcp):
+        class Tracked(kcp.KcpWorkspace):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.peak = 0
+
+            def _upd(self):
+                self.peak = max(self.peak, self.bytes)
+
+            def tape(self, name):
+                t = super().tape(name)
+                self._upd()
+                return t
+
+            def pool(self, name, n=None):
+                t = super().pool(name, n)
+                self._upd()
+                return t
+
+            def ensure(self, *a, **k):
+                tb = super().ensure(*a, **k)
+                self._upd()
+                return tb
+
+            def adopt_tape(self, name, t):
+                r = super().adopt_tape(name, t)
+                self._upd()
+                return r
+
+        return Tracked()
+
+
+@pytest.mark.parametrize(
+    ("cu", "heads"),
+    [(ISSUE_CU, (2, 6)), ([0, 11000, 23000, 32768], (16, 48))],
+    ids=["issue-2x6", "32k-16x48"],
+)
+def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
+    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds (tolerance 0): the forward's tape-walk peak,
+    and the backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's
+    hand-off tensors, four of them re-adopted after #8) and the replay form (the ten light tapes are workspace)."""
+    import gc
+
+    from torch.utils.checkpoint import checkpoint
+
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    gb = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_bytes")
+    H, HV = heads
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    ctx.prepare(H, HV)
+    leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    for form in (True, False):
+        layout = gb.gdn_kcp_workspace_layout(
+            ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
+        )
+        ws = _PeakWorkspace(kcp)
+
+        def fn(*a, _ws=ws, _form=form):
+            return gdn_api.chunk_gdn_kcp(
+                *a, ctx, workspace=_ws, reuse_recompute_tapes=_form
+            )
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+        torch.cuda.synchronize(device)
+        assert ws.peak == layout["forward"], (form, ws.peak, layout["forward"])
+        ws.peak = 0
+        out.backward(dout)
+        torch.cuda.synchronize(device)
+        assert ws.peak == layout["backward"], (form, ws.peak, layout["backward"])
+        assert ws.bytes == layout["bwd.phase.end"], (
+            form,
+            ws.bytes,
+            layout["bwd.phase.end"],
+        )
+        assert gdn_api.gdn_kcp_workspace_bytes(
+            ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
+        ) == max(layout["forward"], layout["backward"])
+        for lf in leaves:
+            lf.grad = None
+        del out, ws
+        gc.collect()
+        torch.cuda.empty_cache()
+    assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto" (one GPU)
+
+
+@pytest.mark.parametrize(
+    "later_saver", [False, True], ids=["gdn-closes-the-region", "later-saver"]
+)
+def test_reuse_recompute_tapes_auto_follows_the_region_shape(
+    device, later_saver
+) -> None:
+    """``"auto"`` hands the recompute's tapes to the backward when the GDN node is the region's last saver (frame
+    proof ``dead``, kept form) and takes the replay form when a later operation of the region saves a tensor
+    (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
+    direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
+    the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    H, HV = 2, 6
+    cu = [0, 1500, 4200, 6144]
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+    proj = None
+    if later_saver:
+        gen = torch.Generator(device="cpu").manual_seed(7074)
+        proj = (
+            (torch.randn(HV * D, HV * D, generator=gen) * 0.02)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+        dout = (
+            inputs["dout"].to(device).reshape(1, -1, HV * D)
+            if proj is not None
+            else None
+        )
+        proj_in = proj
+        proj = None  # the projection acts on the flattened heads: wrap below
+
+        def flat_proj(out, w=proj_in):
+            return torch.nn.functional.linear(
+                out.reshape(out.shape[0], out.shape[1], -1), w
+            )
+
+        proj = flat_proj
+    else:
+        dout = inputs["dout"].to(device)
+
+    def region(ckpt, form, sync_error=False):
+        from torch.utils.checkpoint import checkpoint
+
+        def fn(*a):
+            out = gdn_api.chunk_gdn_kcp(
+                *a, ctx, **({} if form is None else {"reuse_recompute_tapes": form})
+            )
+            return out if proj is None else proj(out)
+
+        for lf in leaves:
+            lf.grad = None
+        out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+        torch.cuda.synchronize(device)
+        if sync_error:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            out.backward(dout)
+        finally:
+            if sync_error:
+                torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize(device)
+        return {
+            "out": out.detach(),
+            **{
+                n: lf.grad.detach().clone()
+                for n, lf in zip(OPERANDS, leaves, strict=True)
+            },
+        }
+
+    direct = region(False, None)
+    verified = kcp.torch_release_verified()
+    for form, reason, source in (
+        (True, "always", "kept"),
+        (False, "off", "replay"),
+        (
+            "auto",
+            ("holders_remain" if later_saver else "dead") if verified else None,
+            "replay" if (later_saver or not verified) else "kept",
+        ),
+    ):
+        res = region(True, form, sync_error=(form == "auto"))
+        for n in direct:
+            assert torch.equal(res[n], direct[n]), (later_saver, form, n)
+        got_reason = kcp.LAST_CALL["fwd"]["hand_off_reason"]
+        if reason is not None:
+            assert got_reason == reason, (later_saver, form, got_reason)
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == source, (
+            later_saver,
+            form,
+            kcp.LAST_CALL["bwd"]["tapes_source"],
+        )
+        assert kcp.kept_registry_size() == 0, (later_saver, form)

@@ -18,14 +18,20 @@ Backend suite of the Cake deterministic GDN chunked-training package
 
 Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
-library, the recorded source digests), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule on the
-campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
+library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
+entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule and the
+two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
 packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
 and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
 unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
-initial / final state with its gradients, the pre-scan capacity, and the bitwise contracts: two runs, the two table
-routes on one plan, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte alignment (the plain prep), and an
-equal-length batch against the same sequences packed.
+initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
+contracts: two runs, the two table routes on one plan, the longest-first dispatch order against the caller's (and its
+tables without a device), two streams against one (and the groups' rule without a device, caller-stream allocations
+between and during two-stream calls, a CUDA graph capture and one side stream per caller stream), the launches on the
+caller's stream (one and two streams) and from cached entries, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
+alignment (the plain prep), and an equal-length batch against the same sequences packed; and the input contract: every
+rejected input raises before the first launch, a host tensor at the low-level entries reaches the binding's device
+check, and the device route does not synchronize.
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer: a build
 that vendors the package under another import path runs it unchanged after pointing the ``PACKAGES`` entry at its
@@ -34,10 +40,12 @@ own package.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
 import re
+import types
 from pathlib import Path
 
 import pytest
@@ -382,6 +390,87 @@ def test_manifest_covers_every_record_and_its_sources() -> None:
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
 
 
+# --------------------------------------------------------------------------- launch entries (no device)
+
+
+def _fake_libraries(monkeypatch, arches) -> tuple[list, list]:
+    """``cake_backend`` on fake devices: device ``i`` of architecture ``arches[i]``, every library a namespace whose
+    FFI entry records ``(record, arch, args)``, and no resolved entry yet.  Returns the calls and the loads."""
+    calls: list = []
+    loads: list = []
+
+    def load(name, arch):
+        loads.append((name, arch))
+
+        def entry(*args):
+            calls.append((name, arch, args))
+
+        return types.SimpleNamespace(**{cake_backend.record(name)["ffi_entry"]: entry})
+
+    monkeypatch.setattr(cake_backend, "device_arch", lambda index: arches[index])
+    monkeypatch.setattr(cake_backend, "load", load)
+    monkeypatch.setattr(cake_backend, "_ENTRIES", {})
+    return calls, loads
+
+
+def test_launch_stage_resolves_each_stage_once_per_device(monkeypatch) -> None:
+    # three devices, two of one architecture: each (stage, device) resolves on its first launch, then launches from
+    # its cached entry with the values and the grid as ints
+    arches = (ARCHES[0], ARCHES[-1], ARCHES[0])
+    calls, loads = _fake_libraries(monkeypatch, arches)
+    names = [cake_backend.stage_record("wy_tc", arch) for arch in arches]
+    values = tuple(range(len(cake_backend.parameters(names[0]))))
+    for _ in range(3):
+        for index in range(len(arches)):
+            cake_backend.launch_stage("wy_tc", (5, 2, 1), values, device_index=index)
+    assert loads == list(zip(names, arches, strict=True))
+    assert sorted(cake_backend._ENTRIES) == [("wy_tc", i) for i in range(len(arches))]
+    per_pass = [
+        (n, arch, values + (5, 2, 1)) for n, arch in zip(names, arches, strict=True)
+    ]
+    assert calls == per_pass * 3
+
+
+def test_launch_stage_keeps_its_errors(monkeypatch) -> None:
+    calls, loads = _fake_libraries(monkeypatch, (ARCHES[0],))
+    name = cake_backend.stage_record("wy_tc", ARCHES[0])
+    expected = cake_backend.parameters(name)
+    count = len(expected)
+    # a stage the registry does not serve
+    with pytest.raises(KeyError):
+        cake_backend.launch_stage("no_such_stage", (1, 1, 1), (), device_index=0)
+    # the wrong argument count raises before the library loads (first launch) and on a cached entry
+    for got in (count - 1, count + 1):
+        with pytest.raises(ValueError) as error:
+            cake_backend.launch_stage(
+                "wy_tc", (1, 1, 1), tuple(range(got)), device_index=0
+            )
+        assert str(error.value) == (
+            f"stage wy_tc ({name}) takes {count} arguments {expected}; got {got}"
+        )
+        assert loads == [] and cake_backend._ENTRIES == {}
+    cake_backend.launch_stage("wy_tc", (1, 1, 1), tuple(range(count)), device_index=0)
+    with pytest.raises(ValueError) as error:
+        cake_backend.launch_stage(
+            "wy_tc", (1, 1, 1), tuple(range(count + 1)), device_index=0
+        )
+    assert str(error.value) == (
+        f"stage wy_tc ({name}) takes {count} arguments {expected}; got {count + 1}"
+    )
+    assert len(loads) == 1 and len(calls) == 1
+
+    # a device that is not an exported target: device_arch's error, nothing cached for it
+    def unexported(index):
+        raise RuntimeError(f"device {index} is not an exported target")
+
+    monkeypatch.setattr(cake_backend, "device_arch", unexported)
+    with pytest.raises(RuntimeError, match="not an exported target"):
+        cake_backend.launch_stage(
+            "wy_tc", (1, 1, 1), tuple(range(count)), device_index=1
+        )
+    assert sorted(cake_backend._ENTRIES) == [("wy_tc", 0)]
+
+
 # --------------------------------------------------------------------------- plan pins and host tables (no device)
 
 
@@ -394,6 +483,9 @@ def test_options_validate_their_pins() -> None:
     assert opts.prep is None
     assert cake_chain.make_options(dhu_scan="tc").dhu_scan == "tc"
     assert cake_chain.make_options(prep="tma").prep == "tma"
+    assert opts.lpt and opts.streams == 2
+    assert cake_chain.make_options(lpt=False).lpt is False
+    assert cake_chain.make_options(streams=1).streams == 1
     for bad in (
         {"scan_config": (32,)},
         {"scan_config": (32, 0)},
@@ -404,6 +496,11 @@ def test_options_validate_their_pins() -> None:
         {"warmup_log2": float("nan")},
         {"dhu_scan": "auto"},
         {"prep": "auto"},
+        {"streams": 0},
+        {"streams": 3},
+        {"streams": True},
+        {"streams": 2.0},
+        {"streams": "2"},
     ):
         with pytest.raises(ValueError):
             cake_chain.make_options(**bad)
@@ -474,6 +571,90 @@ def test_dhu_tc_rule_on_the_campaign_rows(arch, monkeypatch) -> None:
             assert abs(rec["T_tc"] - r01_tc) < 0.1, rec
 
 
+def test_two_stream_split_rule() -> None:
+    split = cake_chain.two_stream_split
+    assert split(1, 32, 148) is None  # one sequence
+    assert split(4, 32, 148) is None  # one round of 128 CTAs
+    assert split(74, 4, 148) is None  # two full rounds: no idle slot
+    assert split(4, 6, 5) is None  # 24 CTAs leave 1 idle slot; every group leaves more
+    # 288 of the 512 CTAs leave 8 idle slots instead of 80
+    assert split(16, 32, 148) == 9
+    assert split(16, 32, 152) == 14  # 448 CTAs leave 8 idle slots instead of 96
+    assert split(5, 4, 8) == 4  # 8 and 16 CTAs both fill their rounds: the larger group
+
+
+# The two-stream groups of the campaign rows, (forward group A, adjoint group A) in sequences: the forward's group A
+# is the partial round, the adjoint's the full rounds.  The other rows run one stream (one sequence or one round).
+STREAM_ROWS = {
+    "sm_100a": {"r05": (7, 9), "r06": (6, 9), "r09": (7, 9)},
+    "sm_103a": {"r05": (7, 9), "r06": (6, 9), "r09": (2, 14)},
+}
+
+
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_two_stream_groups_on_the_campaign_rows(arch, monkeypatch) -> None:
+    props, _r01 = RULE_DEVICES[arch]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    for row, seq_lens, num_v_heads, _form in RULE_ROWS:
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        expected = STREAM_ROWS[arch].get(row)
+        for lpt in (True, False):
+            meta = cake_chain.build_chunk_meta(
+                seq_lens, "cpu", scan_plans=plans, lpt=lpt
+            )
+            fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, props[0])
+            if expected is None:
+                assert fwd is None and bwd is None, (row, fwd, bwd)
+                continue
+            assert fwd is not None and bwd is not None, (row, plans)
+            assert (fwd.split, bwd.split) == expected, (row, lpt, fwd, bwd)
+            starts = meta.seq_chunk_start.tolist()
+            assert (
+                fwd.split_chunk == starts[fwd.split]
+                and bwd.split_chunk == starts[bwd.split]
+            ), (row, lpt)
+
+
+def test_sequence_groups_partition_a_serial_table() -> None:
+    seq_lens, num_v_heads = (300, 77, 640, 1000, 0, 129), 4
+    n = len(seq_lens)
+    serial = (cake_chain.ScanPlan((32, 2), 0), cake_chain.ScanPlan((64, 1), 0))
+    for lpt in (False, True):
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=serial, lpt=lpt)
+        starts = meta.seq_chunk_start.tolist()
+        for sm_count in range(2, n * num_v_heads + 1):
+            k = cake_chain.two_stream_split(n, num_v_heads, sm_count)
+            fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, sm_count)
+            if k is None:
+                assert fwd is None and bwd is None, sm_count
+                continue
+            # group A: the table's first sequences, at a chunk boundary; group B: the rest (neither empty of chunks)
+            for groups, split in ((fwd, n - k), (bwd, k)):
+                if groups is None:
+                    assert starts[split] in (0, meta.num_chunks), (sm_count, split)
+                    continue
+                assert groups.split == split and groups.split_chunk == starts[split], (
+                    sm_count,
+                    groups,
+                )
+                assert 0 < groups.split_chunk < meta.num_chunks
+    # a split plan, a forward walk and the device route run one stream
+    split_plans = (cake_chain.ScanPlan((32, 2), 4), cake_chain.ScanPlan((64, 1), 4))
+    meta = cake_chain.build_chunk_meta(
+        (2000, 300), "cpu", scan_plans=split_plans, lpt=True
+    )
+    assert meta.fwd_segments.walk is not None
+    assert cake_chain.sequence_groups(meta, num_v_heads, 5) == (None, None)
+    serial_meta = cake_chain.build_chunk_meta((2000, 300), "cpu", scan_plans=serial)
+    # 8 CTAs on 5 SMs split; without a layout on the host they do not
+    assert cake_chain.sequence_groups(serial_meta, num_v_heads, 5) != (None, None)
+    device_meta = dataclasses.replace(serial_meta, seq_lens=None)
+    assert cake_chain.sequence_groups(device_meta, num_v_heads, 5) == (None, None)
+
+
 # The prep dispatch window on the two architectures' SM counts (slots = 6 x SMs): the plain prep inside
 # (slots, 2.5 x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs) lie inside on both.
 @pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
@@ -506,6 +687,66 @@ def test_host_tables_follow_the_layout() -> None:
     assert bwd.seg_chunk_start.tolist() == [0, 2, 5, 8, 12, 13, 14]
     assert bwd.seg_seq.tolist() == [0, 1, 1, 1, 2, 3]
     assert bwd.seq_seg_start.tolist() == [0, 1, 4, 5, 6]
+    # the caller's order: no sequence order and the identity walk
+    assert meta.order is None and meta.order_index is None
+    assert fwd.walk is None and bwd.walk is None
+
+
+def _segment_lens(seg_chunk_start) -> list[int]:
+    starts = seg_chunk_start.tolist()
+    return [b - a for a, b in zip(starts[:-1], starts[1:], strict=True)]
+
+
+@pytest.mark.parametrize("fwd_segment_len", [0, 4], ids=["serial", "split"])
+def test_lpt_tables_reorder_the_sequences_and_the_walk(fwd_segment_len) -> None:
+    seq_lens = (100, 640, 1, 64, 2000, 640)
+    chunks = [-(-n // 64) for n in seq_lens]
+    offsets = _cu(seq_lens)
+    plans = (
+        cake_chain.ScanPlan((32, 2), fwd_segment_len),
+        cake_chain.ScanPlan((64, 1), 0),
+    )
+    meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+    plain = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans)
+    order = meta.order
+    # the sequences longest first by chunk count, ties in the caller's order: a permutation
+    assert sorted(order) == list(range(len(seq_lens)))
+    assert order == cake_chain.lpt_sequence_order(seq_lens) == (4, 1, 5, 0, 2, 3)
+    assert [chunks[s] for s in order] == sorted(chunks, reverse=True)
+    assert meta.order_index.tolist() == [
+        list(order),
+        [order.index(s) for s in range(len(order))],
+    ]
+    # every chunk keeps its token offset and length; sequence vs of the table is the caller's order[vs]
+    seq_chunk_start = meta.seq_chunk_start.tolist()
+    for vs, seq in enumerate(order):
+        c0, c1 = seq_chunk_start[vs], seq_chunk_start[vs + 1]
+        assert c1 - c0 == chunks[seq]
+        if c1 > c0:
+            assert meta.chunk_start.tolist()[c0] == offsets[seq]
+    pairs = sorted(zip(meta.chunk_start.tolist(), meta.chunk_len.tolist(), strict=True))
+    assert pairs == sorted(
+        zip(plain.chunk_start.tolist(), plain.chunk_len.tolist(), strict=True)
+    )
+    assert (
+        meta.num_chunks == plain.num_chunks
+        and meta.seq_lens == plain.seq_lens == seq_lens
+    )
+    # fwd_ho's walk: the forward segments longest first, ties in table order (None: already in that order)
+    fwd = meta.fwd_segments
+    lens = _segment_lens(fwd.seg_chunk_start)
+    walk = fwd.walk.tolist() if fwd.walk is not None else list(range(fwd.num_segments))
+    assert sorted(walk) == list(range(fwd.num_segments))
+    assert walk == sorted(range(len(lens)), key=lambda seg: (-lens[seg], seg))
+    if fwd_segment_len == 0:
+        # the table order of a serial plan is already longest first
+        assert fwd.walk is None
+    else:
+        assert fwd.walk is not None
+    assert meta.bwd_segments.walk is None
+    # an already longest-first layout keeps the caller's tables
+    equal = cake_chain.build_chunk_meta((4096,) * 4, "cpu", scan_plans=plans, lpt=True)
+    assert equal.order is None and equal.order_index is None
 
 
 # --------------------------------------------------------------------------- against the FP64 recurrence
@@ -566,6 +807,31 @@ def test_initial_and_final_state(pins, device) -> None:
     )
     got = _run(
         inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, **pins
+    )
+    ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+    _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
+
+
+@pytest.mark.parametrize("route", ["host", "device"])
+def test_empty_sequences_carry_their_state(route, device) -> None:
+    # the offsets may repeat (FLA's contract): an empty sequence passes its initial state through and its final-state
+    # gradient back to dh0
+    seq_lens, heads = (200, 0, 333, 0), (2, 4)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=37)
+    gen = torch.Generator().manual_seed(41)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    got = _run(
+        inputs,
+        seq_lens,
+        route=route,
+        initial_state=h0,
+        output_final_state=True,
+        dht=dht,
     )
     ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
     _assert_close_to_reference(got, ref, OUTPUT_NAMES + ("final_state", "dh0"))
@@ -666,6 +932,311 @@ def test_run_to_run_bitwise(route, device) -> None:
     _assert_bitwise(first, uncached, OUTPUT_NAMES)
 
 
+@pytest.mark.parametrize(
+    "pins",
+    [{}, {"save_state": False}, {"scan_config": (32, 2), "segment_chunks": 4}],
+    ids=["rule", "recompute", "fwd-split"],
+)
+def test_lpt_order_matches_the_caller_order(pins, device) -> None:
+    # the host route's longest-first sequence order and fwd_ho walk against the caller's order, with an initial state
+    # and a final-state gradient (state rows gathered and scattered): the same bits on every output
+    seq_lens, heads = (300, 1000, 77, 640), (2, 4)
+    assert cake_chain.lpt_sequence_order(seq_lens) == (1, 3, 0, 2)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=53)
+    gen = torch.Generator().manual_seed(59)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    runs = {
+        lpt: _run(
+            inputs,
+            seq_lens,
+            initial_state=h0,
+            output_final_state=True,
+            dht=dht,
+            lpt=lpt,
+            **pins,
+        )
+        for lpt in (True, False)
+    }
+    _assert_bitwise(runs[True], runs[False], OUTPUT_NAMES + ("final_state", "dh0"))
+
+
+def test_device_route_keeps_the_caller_order(device) -> None:
+    seq_lens = (300, 1000, 77, 640)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int32, device=device)
+    options = cake_chain.make_options(scan_config=(32, 2), segment_chunks=4)
+    index = cake_chain._device_index(device)
+    meta = cake_chain._chunk_meta(cu, None, 1, sum(seq_lens), index, 4, options)
+    assert meta.seq_lens is None and meta.order is None and meta.order_index is None
+    assert meta.fwd_segments.walk is None and meta.bwd_segments.walk is None
+    walk = cake_chain._walk(device, meta.fwd_segments, options)
+    assert walk.tolist() == list(range(meta.fwd_segments.num_segments))
+
+
+def _small_device(monkeypatch, device, sm_count: int) -> None:
+    """Let the planner and the two-stream rule see ``sm_count`` SMs (small layouts then group), with fresh layout
+    caches so no table planned here outlives the test."""
+    _sm, smem, major = cake_chain._device_props(cake_chain._device_index(device))
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, smem, major)
+    )
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, "_DHU_AUTO", {})
+
+
+def _record_streams(monkeypatch) -> list[tuple[str, int]]:
+    """The (stage, stream) of every launch from here on, in order."""
+    launches: list[tuple[str, int]] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, grid, values, **kwargs):
+        launches.append(
+            (stage, torch.cuda.current_stream(kwargs["device_index"]).cuda_stream)
+        )
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return launches
+
+
+# (H, HV) -> the SMs the two-stream tests pretend: 4 sequences then split (HV 4: 16 CTAs on 6 SMs, adjoint A = 3;
+# HV 6: 24 CTAs on 7 SMs, adjoint A = 1), and the forward's group A is the rest
+STREAM_CASES = {(2, 4): 6, (2, 6): 7}
+STREAM_LAYOUT = (300, 77, 640, 1000)  # every group boundary falls after a partial chunk
+# serial plans on dhu_tc2: both directions can group
+STREAM_PINS = {"segment_chunks": 0, "dhu_scan": "tc"}
+
+
+@pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
+@pytest.mark.parametrize("lpt", [True, False], ids=["lpt", "caller-order"])
+@pytest.mark.parametrize("heads", sorted(STREAM_CASES), ids=["g2", "g3"])
+def test_two_streams_match_one_stream(
+    heads, lpt, save_state, device, monkeypatch
+) -> None:
+    seq_lens = STREAM_LAYOUT
+    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    assert (
+        cake_chain.two_stream_split(len(seq_lens), heads[1], STREAM_CASES[heads])
+        is not None
+    )
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=61)
+    gen = torch.Generator().manual_seed(67)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    runs = []
+    for streams in (2, 1, 2):
+        start = len(launches)
+        runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
+                         lpt=lpt, save_state=save_state, **STREAM_PINS))  # fmt: skip
+        side = [stage for stage, stream in launches[start:] if stream != main]
+        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B (the fused
+        # tail of a value-head group of two only)
+        expected = ["wy_tc", "fwd_ho"] + (
+            ["dhu_tc2"] if heads[1] == 2 * heads[0] else []
+        )
+        assert side == (expected if streams == 2 else []), (streams, launches[start:])
+    _assert_bitwise(runs[0], runs[1], names)
+    _assert_bitwise(runs[0], runs[2], names)
+    if lpt and save_state:
+        ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+        _assert_close_to_reference(runs[0], ref, names)
+
+
+def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
+    # the caller's stream allocates, writes and frees between two-stream calls (pooled and fresh workspaces) and,
+    # after every side-stream launch, while the side stream works: memory released before the join would be
+    # overwritten with NaN on the caller's stream
+    seq_lens, heads = STREAM_LAYOUT, (2, 4)
+    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=73)
+    one = _run(inputs, seq_lens, streams=1, **STREAM_PINS)
+    gen = torch.Generator().manual_seed(79)
+    main = torch.cuda.current_stream(device)
+    launch = cake_backend.launch_stage
+    side_launches = []
+
+    def churning(stage, grid, values, **kwargs):
+        out = launch(stage, grid, values, **kwargs)
+        if torch.cuda.current_stream(kwargs["device_index"]) != main:
+            side_launches.append(stage)
+            with torch.cuda.stream(main):
+                for size in (1 << 12, 1 << 16, 1 << 20):
+                    torch.full((size,), float("nan"), device=device)
+        return out
+
+    monkeypatch.setattr(cake_backend, "launch_stage", churning)
+    for i in range(16):
+        junk = [
+            torch.full(
+                (int(torch.randint(1, 1 << 20, (1,), generator=gen)),),
+                float("nan"),
+                device=device,
+            )
+            for _ in range(3)
+        ]
+        got = _run(inputs, seq_lens, streams=2, host_cache=i % 2 == 0, **STREAM_PINS)
+        del junk
+        _assert_bitwise(got, one, OUTPUT_NAMES)
+    assert side_launches == ["wy_tc", "fwd_ho", "dhu_tc2"] * 16, side_launches
+
+
+def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
+    seq_lens, heads = STREAM_LAYOUT, (2, 4)
+    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=83)
+    eager = _run(inputs, seq_lens, streams=1, **STREAM_PINS)
+    leaves = {
+        name: inputs[name].detach().clone().requires_grad_(True)
+        for name in ("q", "k", "v", "g", "beta")
+    }
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+
+    def step():
+        for leaf in leaves.values():
+            leaf.grad = None
+        o, _ = chunk_gated_delta_rule(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                                      scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+                                      cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
+                                      **STREAM_PINS)  # fmt: skip
+        (o.float() * inputs["do"].float()).sum().backward()
+        return o
+
+    # warm up on a side stream (the tables, the workspaces and the libraries), then capture forward and backward
+    warmup = torch.cuda.Stream(device=device)
+    warmup.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(warmup):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream(device).wait_stream(warmup)
+    launches = _record_streams(monkeypatch)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = step()
+    captured = list(launches)
+    # the capture forked the side stream: two streams, the side one for wy_tc, fwd_ho and dhu_tc2
+    streams = {stream for _stage, stream in captured}
+    assert len(streams) == 2, captured
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    got = {
+        "o": o,
+        **{"d" + name: leaves[name].grad for name in ("q", "k", "v", "g", "beta")},
+    }
+    _assert_bitwise(got, eager, OUTPUT_NAMES)
+    assert len(launches) == len(captured)  # replays launch nothing from the host
+
+
+def test_launches_resolve_once_and_reuse_their_entries(device, monkeypatch) -> None:
+    # the first call resolves every stage it launches once; the second resolves nothing and launches the same stages
+    # from the cached entries, with the same bits
+    monkeypatch.setattr(cake_backend, "_ENTRIES", {})
+    resolved: list[str] = []
+    resolve = cake_backend._stage_entry
+
+    def counting(stage, device_index, count):
+        resolved.append(stage)
+        return resolve(stage, device_index, count)
+
+    monkeypatch.setattr(cake_backend, "_stage_entry", counting)
+    stages = _record_launches(monkeypatch)
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=101)
+    first = _run(inputs, seq_lens)
+    n = len(stages)
+    assert sorted(resolved) == sorted(set(stages))
+    second = _run(inputs, seq_lens)
+    assert len(resolved) == len(set(stages)) and stages[n:] == stages[:n]
+    _assert_bitwise(first, second, OUTPUT_NAMES)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    for stage in set(stages):
+        entry, arity, name = cake_backend._ENTRIES[(stage, index)]
+        assert name == cake_backend.stage_record(stage, arch)
+        assert arity == len(cake_backend.parameters(name))
+        assert entry is getattr(
+            cake_backend.load(name, arch), cake_backend.record(name)["ffi_entry"]
+        )
+
+
+@pytest.mark.parametrize("streams", [1, 2])
+def test_launches_run_on_the_callers_stream(streams, device, monkeypatch) -> None:
+    # The caller's stream sleeps, then rewrites q (before the forward) and do (before the backward).  A launch on any
+    # other stream would run during the sleep and read the old q / do; the outputs must be those of the new ones.
+    seq_lens, heads = STREAM_LAYOUT, (2, 4)
+    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    old = _inputs(seq_lens, heads, torch.bfloat16, device, seed=103)
+    new = _inputs(seq_lens, heads, torch.bfloat16, device, seed=107)
+    want = _run(
+        {**old, "q": new["q"], "do": new["do"]},
+        seq_lens,
+        streams=streams,
+        **STREAM_PINS,
+    )
+    cu = _cu(seq_lens)
+    caller = torch.cuda.Stream(device=device)
+    caller.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(caller):
+        leaves = {
+            name: old[name].detach().clone().requires_grad_(True)
+            for name in ("q", "k", "v", "g", "beta")
+        }
+        do = old["do"].clone()
+        torch.cuda._sleep(200_000_000)
+        with torch.no_grad():
+            leaves["q"].copy_(new["q"])
+        o, _ = chunk_gated_delta_rule(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                                      scale=1.0 / math.sqrt(HEAD_DIM),
+                                      cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
+                                      cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
+                                      streams=streams, **STREAM_PINS)  # fmt: skip
+        torch.cuda._sleep(200_000_000)
+        do.copy_(new["do"])
+        o.backward(do)
+    torch.cuda.synchronize()
+    got = {
+        "o": o.detach(),
+        **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")},
+    }
+    _assert_bitwise(got, want, OUTPUT_NAMES)
+
+
+def test_low_level_entries_reject_host_tensors(device) -> None:
+    # the low-level entries skip the API checks: a host tensor's launch runs on the current device (as
+    # torch.device("cpu").index maps there) and the binding rejects it with its ValueError
+    cu = torch.tensor([0, 100, 164], dtype=torch.int32)
+    assert cake_chain._tensor_index(cu) == torch.cuda.current_device()
+    assert cake_chain._tensor_index(cu.to("meta")) == torch.cuda.current_device()
+    index = cake_chain._device_index(device)
+    assert cake_chain._tensor_index(cu.to(device)) == index
+    plans = cake_chain.scan_plans(164, 2, 4, index, (100, 64))
+    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+        cake_chain.build_chunk_meta_from_cu_seqlens(cu, 164, scan_plans=plans)
+
+
+def test_each_caller_stream_forks_its_own_side_stream(device) -> None:
+    index = cake_chain._device_index(device)
+    a, b = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    side = cake_chain._side_stream(index, a)
+    assert cake_chain._side_stream(index, a) is side
+    assert cake_chain._side_stream(index, b) not in (side, a, b)
+    assert side not in (a, b)
+    assert side.priority == torch.cuda.Stream.priority_range()[1]
+
+
 @pytest.mark.parametrize("route", ["host", "device"])
 @pytest.mark.parametrize(
     "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
@@ -738,3 +1309,171 @@ def test_rejects_unsupported_inputs(device) -> None:
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
+
+
+# One packed call of three sequences (100, 30, 34 tokens; H = 2, HV = 4) with an initial state, and the argument each
+# rejected case replaces; every one raises ValueError before the first launch.
+def _invalid_calls(device):
+    inputs = _inputs((100, 30, 34), (2, 4), torch.float32, device, seed=29)
+    q, k, v, g, beta = (inputs[n] for n in ("q", "k", "v", "g", "beta"))
+    cu = torch.tensor([0, 100, 130, 164], dtype=torch.int64)
+    h0 = torch.zeros(3, 4, HEAD_DIM, HEAD_DIM, device=device)
+    base = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "initial_state": h0, "cu_seqlens": cu.to(device),
+            "cu_seqlens_cpu": cu}  # fmt: skip
+    cases = {
+        "q-on-host": {"q": q.cpu()},
+        "g-on-host": {"g": g.cpu()},
+        "initial-state-on-host": {"initial_state": h0.cpu()},
+        "cu-seqlens-on-host": {"cu_seqlens": cu},
+        "k-heads": {"k": k[:, :, :1]},
+        "head-dim-64": {"q": q[..., :64], "k": k[..., :64]},
+        "v-tokens": {"v": v[:, :100]},
+        "value-heads-not-a-multiple": {
+            "v": v[:, :, :3],
+            "g": g[:, :, :3],
+            "beta": beta[:, :, :3],
+        },
+        "no-value-heads": {
+            "v": v[:, :, :0],
+            "g": g[:, :, :0],
+            "beta": beta[:, :, :0],
+            "initial_state": h0[:, :0],
+        },
+        "g-shape": {"g": g[:, :, :2]},
+        "beta-shape": {"beta": beta[:, :100]},
+        "initial-state-rows": {"initial_state": h0[:2]},
+        "initial-state-dims": {
+            "initial_state": torch.zeros(3, 4, 64, HEAD_DIM, device=device)
+        },
+        "cu-seqlens-2d": {"cu_seqlens": cu.to(device).view(1, -1)},
+        "cu-seqlens-float": {"cu_seqlens": cu.to(device).float()},
+        "cu-seqlens-one-offset": {
+            "cu_seqlens": cu[:1].to(device),
+            "cu_seqlens_cpu": cu[:1],
+        },
+        "host-offsets-count": {"cu_seqlens_cpu": torch.tensor([0, 130, 164])},
+        "host-offsets-float": {"cu_seqlens_cpu": cu.double()},
+        "host-offsets-start": {"cu_seqlens_cpu": torch.tensor([4, 100, 130, 164])},
+        "host-offsets-decreasing": {"cu_seqlens_cpu": torch.tensor([0, 130, 100, 164])},
+        "host-offsets-end": {"cu_seqlens_cpu": torch.tensor([0, 100, 130, 160])},
+        "host-offsets-list-end": {"cu_seqlens_cpu": [0, 100, 130, 200]},
+        "g-not-a-tensor": {"g": None},
+        "beta-not-a-tensor": {"beta": 0.5},
+        "k-on-meta": {"k": k.to("meta")},
+        "cu-seqlens-list": {"cu_seqlens": [0, 100, 130, 164]},
+    }
+    return base, cases
+
+
+_INVALID_IDS = (
+    "q-on-host", "g-on-host", "initial-state-on-host", "cu-seqlens-on-host", "k-heads", "head-dim-64", "v-tokens",
+    "value-heads-not-a-multiple", "no-value-heads", "g-shape", "beta-shape", "initial-state-rows",
+    "initial-state-dims", "cu-seqlens-2d", "cu-seqlens-float", "cu-seqlens-one-offset", "host-offsets-count",
+    "host-offsets-float", "host-offsets-start", "host-offsets-decreasing", "host-offsets-end", "host-offsets-list-end",
+    "g-not-a-tensor", "beta-not-a-tensor", "k-on-meta", "cu-seqlens-list",
+)  # fmt: skip
+
+# The exact message of each rejected case (the checks' contract: type and text).
+_OFFSETS = "cu_seqlens must be a 1-D int32 / int64 tensor of at least two offsets; got "
+_HOST_OFFSETS = (
+    "cu_seqlens_cpu must start at 0, not decrease and end at the 164 tokens of q; got "
+)
+_INVALID_MESSAGES = {
+    "q-on-host": "q must be a CUDA tensor",
+    "g-on-host": "g must be a CUDA tensor",
+    "initial-state-on-host": "initial_state must be a CUDA tensor",
+    "cu-seqlens-on-host": "cu_seqlens must be a CUDA tensor",
+    "k-heads": "k must have q's shape (1, 164, 2, 128); got (1, 164, 1, 128)",
+    "head-dim-64": "q must be [B, T, H, 128]; got (1, 164, 2, 64)",
+    "v-tokens": "v must be [1, 164, HV, 128]; got (1, 100, 4, 128)",
+    "value-heads-not-a-multiple": "the value heads (HV=3) must be a positive multiple of the q / k heads (H=2)",
+    "no-value-heads": "the value heads (HV=0) must be a positive multiple of the q / k heads (H=2)",
+    "g-shape": "g must be (1, 164, 4); got (1, 164, 2)",
+    "beta-shape": "beta must be (1, 164, 4); got (1, 100, 4)",
+    "initial-state-rows": "initial_state must be (3, 4, 128, 128) (one state per sequence); got (2, 4, 128, 128)",
+    "initial-state-dims": "initial_state must be (3, 4, 128, 128) (one state per sequence); got (3, 4, 64, 128)",
+    "cu-seqlens-2d": _OFFSETS + "torch.int64 (1, 4)",
+    "cu-seqlens-float": _OFFSETS + "torch.float32 (4,)",
+    "cu-seqlens-one-offset": _OFFSETS + "torch.int64 (1,)",
+    "host-offsets-count": "cu_seqlens_cpu has 3 offsets, cu_seqlens 4",
+    "host-offsets-float": "cu_seqlens_cpu must be a 1-D int32 / int64 tensor; got torch.float64 (4,)",
+    "host-offsets-start": _HOST_OFFSETS + "[4, 100, 130, 164] ending at 164",
+    "host-offsets-decreasing": _HOST_OFFSETS + "[0, 130, 100, 164] ending at 164",
+    "host-offsets-end": _HOST_OFFSETS + "[0, 100, 130, 160] ending at 160",
+    "host-offsets-list-end": _HOST_OFFSETS + "[0, 100, 130, 200] ending at 200",
+    "g-not-a-tensor": "g must be a CUDA tensor",
+    "beta-not-a-tensor": "beta must be a CUDA tensor",
+    "k-on-meta": "k must be a CUDA tensor",
+    "cu-seqlens-list": "cu_seqlens must be a CUDA tensor",
+}  # fmt: skip
+
+
+def _call_rejected(call) -> ValueError:
+    with pytest.raises(ValueError) as error:
+        chunk_gated_delta_rule(
+            call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
+            output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
+            use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+    return error.value
+
+
+@pytest.mark.parametrize("case", _INVALID_IDS)
+def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> None:
+    base, cases = _invalid_calls(device)
+    assert set(cases) == set(_INVALID_IDS) == set(_INVALID_MESSAGES)
+    call = {**base, **cases[case]}
+    stages = _record_launches(monkeypatch)
+    assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
+    assert stages == [], stages
+    # the unmodified call is accepted
+    o, final = chunk_gated_delta_rule(
+        base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
+        output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
+        use_qk_l2norm_in_kernel=True,
+    )  # fmt: skip
+    assert o.shape == base["v"].shape and final.shape == base["initial_state"].shape
+
+
+@pytest.mark.parametrize("name", ["k", "beta", "initial_state", "cu_seqlens"])
+def test_rejects_inputs_on_another_device(name, device, monkeypatch) -> None:
+    # every tensor must be on q's device: one input moved to a second device raises before the first launch
+    if torch.cuda.device_count() < 2:
+        pytest.skip("a second CUDA device required")
+    other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
+    base, _ = _invalid_calls(device)
+    call = {**base, name: base[name].to(other)}
+    stages = _record_launches(monkeypatch)
+    assert str(_call_rejected(call)) == f"{name} is on {other}, q on {device}"
+    assert stages == [], stages
+
+
+def test_device_route_does_not_synchronize(device) -> None:
+    # the checks read tensor metadata only: a device-route forward and backward runs under the error sync-debug mode
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=31)
+    cu = torch.tensor(_cu(seq_lens), dtype=torch.int32, device=device)
+    h0 = torch.zeros(
+        len(seq_lens), 4, HEAD_DIM, HEAD_DIM, device=device, requires_grad=True
+    )
+
+    def call():
+        leaves = {
+            n: inputs[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        }
+        o, final = chunk_gated_delta_rule(
+            leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
+            output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
+        )  # fmt: skip
+        ((o.float() * inputs["do"].float()).sum() + final.sum()).backward()
+
+    call()  # loads the libraries and fills the caches
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        call()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()

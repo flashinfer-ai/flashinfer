@@ -1844,6 +1844,47 @@ class CudnnPrefillGraph:
         return out, None
 
 
+def _reuse_cudnn_prefill_preparation(
+    cache,
+    q,
+    k_cache,
+    v_cache,
+    scale,
+    workspace_buffer,
+    *,
+    plan,
+    return_lse,
+    stats_head_stride=0,
+    lse_base="log2",
+):
+    """Keep a bounded history after the wrapper's last-preparation fast path.
+
+    Only graph preparations are retained: the current plan supplies metadata
+    bindings and every run still supplies its current Q/K/V/O/workspace. A
+    workspace reset must clear this history, since preparation checks capacity.
+    """
+    for index, prepared in enumerate(cache):
+        if prepared.matches_plan(
+            q, k_cache, v_cache, scale, plan, return_lse, stats_head_stride, lse_base
+        ):
+            cache.pop(index)
+            cache.insert(0, prepared)
+            return prepared
+    prepared = prepare_cudnn_batch_prefill(
+        q,
+        k_cache,
+        v_cache,
+        scale,
+        workspace_buffer,
+        metadata=plan.build_metadata(return_lse),
+        stats_head_stride=stats_head_stride,
+        lse_base=lse_base,
+    )
+    cache.insert(0, prepared)
+    del cache[4:]
+    return prepared
+
+
 def prepare_cudnn_batch_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,

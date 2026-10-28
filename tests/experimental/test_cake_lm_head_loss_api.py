@@ -316,6 +316,13 @@ def test_binding_cache_capacity_from_environment(monkeypatch):
 CUDA = torch.device("cuda")
 
 
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """The bit pattern of a float tensor as integers (bf16 -> int16, fp32 -> int32): equality of these views is
+    bit-level equality (``torch.equal`` on floats equates +0 and -0)."""
+    t = t.detach().reshape(-1).contiguous()
+    return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
+
+
 def _require_program():
     if not (
         torch.cuda.is_available()
@@ -333,8 +340,9 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     """Through the public entry on the generated program: ``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM=0`` moves the
     per-chunk weight-gradient accumulates back to the caller's stream (one stream entered instead of two on a
     three-chunk call) and ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST=0`` binds the accumulate + flat cast instead of
-    the fused cast GEMM; an explicit keyword wins over the variable; ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise
-    the same under every setting."""
+    the fused cast GEMM (its TMA-store form where :func:`dw_cast_tma_rule` routes the short last chunk); an explicit
+    keyword wins over the variable; ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise (integer views) the same under
+    every setting."""
     _require_program()
     _clear(monkeypatch)
     inp = make_inputs(
@@ -383,8 +391,16 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
         out = dict(loss=loss.detach(), logp=logp, dX=X.grad, dW=W.grad)
         return out, len(set(streams)), list(bound)
 
+    # the fused cast's form on the deferred last chunk (73 rows): the TMA store where dw_cast_tma_rule routes it
+    _, record = cake_backend.record_for(CUDA)
+    cast = (
+        "gemm_dw_cast_bf16_tma"
+        if cake_backend.dw_cast_tma_rule(3, 8265 - 2 * 4096, record["arch"])
+        else "gemm_dw_cast_bf16"
+    )
+    casts = {"gemm_dw_cast_bf16", "gemm_dw_cast_bf16_tma"}
     base, base_streams, base_bound = run()
-    assert base_streams == 2 and "gemm_dw_cast_bf16" in base_bound  # the defaults
+    assert base_streams == 2 and casts & set(base_bound) == {cast}  # the defaults
     monkeypatch.setenv(public.DW_STREAM_ENV, "0")
     off, off_streams, _ = run()
     assert off_streams == 1
@@ -393,10 +409,10 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     monkeypatch.delenv(public.DW_STREAM_ENV)
     monkeypatch.setenv(public.FUSE_DW_CAST_ENV, "0")
     unfused, _, unfused_bound = run()
-    assert "gemm_dw_cast_bf16" not in unfused_bound
+    assert not casts & set(unfused_bound)
     assert "gemm_dw_acc" in unfused_bound and "scale_cast_bf16" in unfused_bound
     fused, _, fused_bound = run(fuse_dw_cast=True)  # the keyword wins over the variable
-    assert "gemm_dw_cast_bf16" in fused_bound
+    assert casts & set(fused_bound) == {cast}
     for name, res in (("off", off), ("on", on), ("unfused", unfused), ("fused", fused)):
         for key in ("loss", "logp", "dX", "dW"):
-            assert torch.equal(res[key], base[key]), (name, key)
+            assert torch.equal(_bits(res[key]), _bits(base[key])), (name, key)

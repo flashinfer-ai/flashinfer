@@ -33,14 +33,17 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   `num_tokens` at runtime), so **any `num_tokens` from 1 to 8192** is served;
   larger counts are rejected (every arm rebuilds the route plan from
   per-expert token bitmaps sized for 8192 rows). The arms: for the smallest batches one kernel per
-  token count (a single CTA for one token, otherwise one cluster of
-  `num_tokens` CTAs -- 2, 4, 8 or 16 -- exchanging the selected ids through
-  distributed shared memory; these are the only kernels bound to their exact
-  token count), one cluster of 16 CTAs of two row groups each for every other
+  token count (a single CTA for one token -- at `block_m = 16` a second
+  program of that kernel which loads the bias and the logits in the read-only
+  form --, otherwise one cluster of `num_tokens` CTAs -- 2, 4, 8 or 16 --
+  exchanging the selected ids through distributed shared memory; these are the
+  only kernels bound to their exact token count), one cluster of 16 CTAs of
+  two row groups each for every other
   count up to 32 (the 32-token cell, so 3 or 17 tokens take it; two kernels
   serve it, one waiting for its cluster at entry and one after its row
-  selection: SM100 takes the second at `block_m = 8` and the first at
-  `block_m = 16`, SM103 the other way round), one-join plan
+  selection: SM100 takes the second at `block_m = 8` and, at
+  `block_m = 16`, the second from 29 tokens and the first below; SM103 takes
+  the first at `block_m = 8` and the second at `block_m = 16`), one-join plan
   builders for 33 to 128 tokens (the 64- and 128-token cells use a second
   kernel of the builder's family which loads the bias and the first row's
   logits into registers before its prologue barrier; the plain builder keeps
@@ -50,24 +53,33 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   a one-join
   bitmap builder for the 256-token cell (129 to 256 tokens; its owner scratch
   holds 256 rows on SM100 and 2048 on SM103), a 4-CTA-cluster variant at four
-  CTAs per SM for 257 to 2048 tokens (the 2048-token cell uses a second kernel
-  of that family which prefetches the next row's logits into registers) and a
+  CTAs per SM for 257 to 2048 tokens (the 512-token cells use a kernel of
+  that family whose plan emit gives each lane of an expert's warp 16 tokens
+  instead of 32, on SM103 from 384 tokens with the plain kernel below; the
+  2048-token cell uses a second kernel of that
+  family which prefetches the next row's logits into registers) and a
   warp-per-row two-join persistent kernel launched as CTA pairs from 2049
-  tokens up. The two architectures' tables differ only in three small-batch
+  tokens up. The two architectures' tables differ only in four small-batch
   cells.
 - The 4-CTA-cluster cells follow the batch against the device's capacity
   `C`, four times the co-resident clusters the driver reports for the
   next-row-prefetch kernel (568 on a 148-SM B200, 592 on a 152-SM GB300): up
   to `C` tokens keep the cell's arm (every CTA selects at most one row). Above
   `C` a CTA selects a second row, which a next-row prefetch covers: SM100 runs
-  the next-row-prefetch kernel; SM103 runs the first kernel of the family with
-  the same prefetch up to 1024 tokens and the next-row-prefetch kernel above.
-  From `2C + 64` up a kernel of the family that selects one row per warp runs
-  (1200 tokens on a B200, 1248 on a GB300), on SM103 at `block_m` 8 from `2C`
-  (1184 tokens on a GB300). That kernel ranks the route pairs of its owner
-  CTAs in their own shared memory, except on SM100 at `block_m` 16, where the
-  ranking goes through the cluster peers. `C` is queried once per device and
-  `block_m`, so the rule follows smaller devices and MIG slices
+  a kernel of the family whose owner CTAs rank the route pairs in their own
+  shared memory up to 832 tokens and from 1056 tokens, and the
+  next-row-prefetch kernel between them (at `block_m` 8 up to 1024 tokens its
+  variant that skips the emit word pass such a batch leaves without a bitmap
+  word); SM103 runs the first kernel of the family with the same prefetch up
+  to 1024 tokens, the next-row-prefetch kernel up to 1039 tokens and the
+  owner-rank kernel from 1040 tokens. From `2C + 64` up a kernel of
+  the family that selects one row per warp runs (1200 tokens on a B200, 1248
+  on a GB300), on SM103 at `block_m` 8 from `2C` (1184 tokens on a GB300).
+  That kernel also ranks the route pairs of its owner CTAs in their own
+  shared memory; its candidate ranks read the warp's composites in 16-byte
+  shared blocks and its rank scans sum ballot bit planes. `C` is
+  queried once per device and `block_m`, so the rule follows smaller devices
+  and MIG slices
   (`cake_backend.CAPACITY_ROUTES`, keyed by architecture and `block_m`).
 - Every arm but the small-batch cluster ones (one kernel per token count and
   the 16-CTA two-row-group kernel) is a cooperative persistent launch whose
@@ -93,8 +105,8 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   both architectures is one source whose architecture-specific lines sit
   behind `__CUDA_ARCH__` guards, while the bitmap builder and the
   largest-batch arm keep one program per architecture, the prefetching
-  builder ships for SM103 alone and its explicit-cluster launch for SM100
-  alone.
+  builder ships for SM103 alone, and its explicit-cluster launch and the
+  emit-pass-guard kernel ship for SM100 alone.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.
@@ -113,6 +125,10 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
 
 `max_route_blocks = min(896, pairs) + (pairs - min(896, pairs)) // block_m`
 with `pairs = num_tokens * 16` (`cake_backend.max_route_blocks`).
+`logits`, `bias`, `topk_ids`, `expert_counts`, `expert_offsets` and
+`expert_scatter_offsets` are read or written 16 bytes at a time, so each must
+start at a 16-byte aligned address (`allocate_kimi_k3_route_plan` and
+`torch.empty` allocate them so; a row slice such as `logits[k:]` keeps it).
 
 ```python
 import torch
@@ -136,8 +152,8 @@ logits.copy_(torch.randn_like(logits))
 runner()  # same runner (or a captured graph), new logits
 ```
 
-Preparation validates shapes, dtypes, contiguity, plan capacity and that no
-two buffers overlap, selects the dispatch arm for the device architecture and
+Preparation validates shapes, dtypes, contiguity, alignment, plan capacity
+and that no two buffers overlap, selects the dispatch arm for the device architecture and
 token count (and the device's cluster capacity), loads the arm's JIT module and computes the launch grid from the
 device facts cached per device (compute capability, SM count, cluster
 occupancy); it makes no host copy of the inputs.

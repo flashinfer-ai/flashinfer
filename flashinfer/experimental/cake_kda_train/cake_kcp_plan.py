@@ -2149,6 +2149,59 @@ def kcp_comm_bytes(
     }
 
 
+# The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
+# reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
+# a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
+# lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
+SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+# Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
+# a2a exchange never reads.
+LAZY_POOLS = ("ring_out", "ring_in")
+# The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
+FWD_POOLS = (
+    "c1_send",
+    "c1_recv",
+    "c2_send",
+    "stage_b",
+    "stage_m",
+    "carry",
+    "eye",
+) + LAZY_POOLS
+BWD_POOLS = ("b1_send", "b1_recv", "b2_send", "b2_recv")
+
+
+def kcp_pool_numel(
+    ctx: KcpContext, *, H: int = 64, fused_walks: int = 1
+) -> dict[str, int]:
+    """Elements (FP32) of every pool of a rank's KCP workspace and of the call's fresh ``S_in``, by buffer name: the
+    one source of the sizes ``cake_kcp`` gives its pools and fresh tensors.  ``fused_walks`` (shipped ``1``) adds one
+    carry slot per crossing fragment at ``P > 1``; at ``P > 1`` ``c1_send`` also holds one staging tile per head of each
+    crossing-out fragment of this rank (its ``M_f``, transposed into the send layout by the forward)."""
+    H = int(H)
+    hp = ctx.heads(H)
+    n, P, NSEG = hp.numel, int(hp.P), int(hp.NSEG)
+    n_in, n_out = int(ctx.n_in), int(ctx.n_out)
+    n_carry = int(ctx.n_frag) * (P - 1) if P > 1 else 0
+    if fused_walks and P > 1:
+        n_carry += max(n_in, n_out)
+    return {
+        "c1_send": int(n["c1_send"]) + (n_out * H * TILE if P > 1 else 0),
+        "c1_recv": int(n["c1_recv"]),
+        "c2_send": int(n["c2_send"]),
+        "S_in": int(n["c2_recv"]),
+        "b1_send": max(int(n["b1_send_d"]), int(n["b1_send_dm"])),
+        "b1_recv": max(int(n["b1_recv_d"]), int(n["b1_recv_dm"])),
+        "b2_send": int(n["b2_send"]),
+        "b2_recv": int(n["b2_recv"]),
+        "stage_b": NSEG * H * TILE if P > 1 else 0,
+        "stage_m": NSEG * H * TILE if P > 1 else 0,
+        "carry": n_carry * H * TILE,
+        "eye": TILE,
+        "ring_out": max(n_in, n_out) * H * TILE,
+        "ring_in": max(n_in, n_out) * H * TILE,
+    }
+
+
 def kcp_arena_layout(
     ctx: KcpContext,
     *,
@@ -2158,41 +2211,32 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP arena's transient buffers in bytes (``KcpWorkspace``; SPEC-4: the saved-set tensors ``S_in``, the
-    c1 receive tensor with ``save_transfer``, ``M_seg`` with ``save_transfer`` at ``P > 1`` and ``hist`` are NOT
-    here).  ``forward`` / ``backward`` are the two lifetimes' sums; ``arena`` is their maximum (one reusable arena).
-    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each; transient
-    in both lifetimes; the ``stage_m`` plane retained as ``M_seg`` with ``save_transfer`` is counted by :func:`kcp_saved_bytes`)."""
+    """The KCP pools of a rank's workspace (``cake_kcp.KcpWorkspace``) in bytes, as the workspace allocates them.
+
+    ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
+    (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
+    a call with ``exchange="ring"`` adds on first use).  The saved set (``S_in``, the c1 receive tensor kept with
+    ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
+    pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
+    (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
+    so ``save_transfer`` and ``C`` leave the workspace unchanged."""
     _check_save_mode(save_mode)
-    H, C = int(H), int(C)
-    hp = ctx.heads(H)
-    n, halo = hp.numel, ctx.halo
-    staging = n["staging"]
-    fwd = {
-        "c1_send": n["c1_send"] * 4,
-        "c1_recv": 0 if save_transfer else n["c1_recv"] * 4,
-        "c2_send": n["c2_send"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "halo_send": sum(halo.fwd_send_rows) * C * 2,
+    numel = kcp_pool_numel(ctx, H=H)
+    need = {
+        name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    b1_send, b1_recv = hp.b1_splits(not save_transfer)
-    bwd = {
-        "b1_send": sum(b1_send) * 4,
-        "b1_recv": sum(b1_recv) * 4,
-        "b2_send": n["b2_send"] * 4,
-        "b2_recv": n["b2_recv"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "dpre_head": halo.n_head_rows * C * 4,
-        "dpre_tail": halo.n_tail_rows * C * 4,
-    }
-    out = {f"fwd.{k}": v for k, v in fwd.items()}
-    if backward:
-        out.update({f"bwd.{k}": v for k, v in bwd.items()})
-    out["forward"] = sum(fwd.values())
-    out["backward"] = sum(bwd.values()) if backward else 0
-    out["arena"] = max(out["forward"], out["backward"])
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    arena = sum(
+        v for name, v in need.items() if name not in shared and name not in LAZY_POOLS
+    )
+    arena += sum(
+        max((need[name] for name in pair if name in need), default=0)
+        for pair in SHARED_POOLS
+    )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["arena"] = arena
     return out
 
 
@@ -2331,6 +2375,10 @@ __all__ = [
     "P_RULES",
     "P_RULE_DEFAULT",
     "SAVE_TRANSFER_DEFAULT",
+    "SHARED_POOLS",
+    "LAZY_POOLS",
+    "FWD_POOLS",
+    "BWD_POOLS",
     "STATE_TILE_BYTES",
     "SUMMARY_TILE",
     "TABLE_NAMES",
@@ -2351,6 +2399,7 @@ __all__ = [
     "head_groups",
     "kcp_arena_layout",
     "kcp_comm_bytes",
+    "kcp_pool_numel",
     "kcp_partition",
     "kcp_plan",
     "kcp_saved_bytes",

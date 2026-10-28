@@ -1393,6 +1393,46 @@ def test_registered_compile_flags_are_public(arch):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("table", ["ARG_PLANS", "MODULES", "VARIANTS"])
+def test_bf16_fp8_registration_tables_are_plain_literals(table):
+    """The BF16 / FP8 registrations are read from tables that a regenerated
+    delivery rewrites as data, so each one stays a single literal (no name, call
+    or operator inside it)."""
+    import ast
+    from pathlib import Path
+
+    import flashinfer.jit.cake_dsv4 as jit
+
+    tree = ast.parse(Path(jit.__file__).read_text(encoding="utf-8"))
+    (node,) = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == table
+    ]
+    assert ast.literal_eval(node.value) == getattr(jit, table)
+
+
+@pytest.mark.cpu_only
+def test_bf16_fp8_programs_are_registered_on_exactly_their_architectures():
+    """Every BF16 / FP8 program is named by a variant on each architecture its
+    record lists and on no other, with one identity per such architecture."""
+    import flashinfer.jit.cake_dsv4 as jit
+
+    routed: dict[str, set[str]] = {}
+    for arch, variants in jit.VARIANTS.items():
+        for program in variants.values():
+            routed.setdefault(program, set()).add(arch)
+    assert set(routed) == set(jit.MODULES)
+    for program, record in jit.MODULES.items():
+        assert set(record["arches"]) == routed[program], program
+        assert set(record["identity"]) == routed[program], program
+        assert record["arg_plan"] in jit.ARG_PLANS, program
+        assert all(pair[0] == "grid" for pair in jit.ARG_PLANS[record["arg_plan"]][-3:])
+
+
+@pytest.mark.cpu_only
 def test_metadata_param_vocabulary_is_bindable():
     for name in KERNEL_METADATA_PARAMS:
         kind = "buffer" if name.endswith(("indices", "lens")) else "parameter"

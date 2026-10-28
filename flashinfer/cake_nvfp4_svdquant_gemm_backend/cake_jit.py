@@ -3916,7 +3916,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
     #   (129, 3072, 3072, 32, False) on sm_100a -> 5852ad0db045e502e10a
     #   (129, 3072, 3072, 64, True) on sm_100a -> 05bda082a73c0c1a68b0
     #   (129, 3072, 3072, {96, 128}, True) on sm_103a -> 01405277c4bbc4031fbd (L2-promoted 16-stage ring)
-    #   (129, 3072, 3072, 96, True) on sm_100a -> 2270204930b79b8caef7
+    #   (129, 3072, 3072, 96, True) on sm_100a -> 05bda082a73c0c1a68b0
     #   (129, 3072, 3072, 128, False) on sm_103a -> 23bfc212699bbb4e6214 (L2-promoted 16-stage ring)
     #   (129, 3072, 3072, 128, False) on sm_100a -> 5852ad0db045e502e10a
     #   (129, 3072, 3072, 128, True) on sm_100a -> 2270204930b79b8caef7
@@ -4052,7 +4052,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_max": 3072,
         "k_min": 3072,
         "k_max": 3072,
-        "ranks": (96, 128),
+        "ranks": (128,),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_2270204930b79b8caef7",
     },
@@ -4064,7 +4064,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "n_max": 3072,
         "k_min": 3072,
         "k_max": 3072,
-        "ranks": (32, 64),
+        "ranks": (32, 64, 96),
         "bias": True,
         "record": "cake_nvfp4_svdquant_gemm_05bda082a73c0c1a68b0",
     },

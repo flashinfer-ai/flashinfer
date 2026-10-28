@@ -325,36 +325,36 @@ kernel_cake_kimi_k3_fused_router_1810d8a2278591a389e3(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
-        unsigned int warp_top0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+        unsigned int warp_top0_1_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
         if (lane == 0) {
-            published = warp_top0;
+            published = warp_top0_1_0;
         }
-        if (lane_bound == warp_top0) {
+        if (lane_bound == warp_top0_1_0) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+        unsigned int warp_top0_1_1;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
         if (lane == 1) {
-            published = warp_top1;
+            published = warp_top0_1_1;
         }
-        if (lane_bound == warp_top1) {
+        if (lane_bound == warp_top0_1_1) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top2;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+        unsigned int warp_top0_1_2;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
         if (lane == 2) {
-            published = warp_top2;
+            published = warp_top0_1_2;
         }
-        if (lane_bound == warp_top2) {
+        if (lane_bound == warp_top0_1_2) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top3;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+        unsigned int warp_top0_1_3;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
         if (lane == 3) {
-            published = warp_top3;
+            published = warp_top0_1_3;
         }
-        if (lane_bound == warp_top3) {
+        if (lane_bound == warp_top0_1_3) {
             lane_bound = (unsigned int)0;
         }
         if (lane < 4) {
@@ -1046,25 +1046,25 @@ kernel_cake_kimi_k3_fused_router_1810d8a2278591a389e3(float* __restrict__ logits
             lane_total += padded_count_scan;
         }
         int warp_inclusive = lane_total;
-        int phase2_scan_peer = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
+        int phase2_scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
         if (lane >= 1) {
-            warp_inclusive += phase2_scan_peer;
+            warp_inclusive += phase2_scan_peer_4_0;
         }
-        int phase2_scan_peer_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
+        int phase2_scan_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
         if (lane >= 2) {
-            warp_inclusive += phase2_scan_peer_0;
+            warp_inclusive += phase2_scan_peer_4_1;
         }
-        int phase2_scan_peer_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
+        int phase2_scan_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
         if (lane >= 4) {
-            warp_inclusive += phase2_scan_peer_1;
+            warp_inclusive += phase2_scan_peer_4_2;
         }
-        int phase2_scan_peer_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
+        int phase2_scan_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
         if (lane >= 8) {
-            warp_inclusive += phase2_scan_peer_2;
+            warp_inclusive += phase2_scan_peer_4_3;
         }
-        int phase2_scan_peer_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
+        int phase2_scan_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
         if (lane >= 16) {
-            warp_inclusive += phase2_scan_peer_3;
+            warp_inclusive += phase2_scan_peer_4_4;
         }
         if (lane == 31) {
             phase2_warp_sums[warp] = warp_inclusive;
@@ -1129,25 +1129,25 @@ kernel_cake_kimi_k3_fused_router_1810d8a2278591a389e3(float* __restrict__ logits
                     }
                     int pass_count = (int)(unsigned int)__popc(pass_marks);
                     int pass_inclusive = pass_count;
-                    int pass_peer = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
+                    int pass_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
                     if (lane >= 1) {
-                        pass_inclusive += pass_peer;
+                        pass_inclusive += pass_peer_4_0;
                     }
-                    int pass_peer_0 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 2, 32);
+                    int pass_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 2, 32);
                     if (lane >= 2) {
-                        pass_inclusive += pass_peer_0;
+                        pass_inclusive += pass_peer_4_1;
                     }
-                    int pass_peer_1 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 4, 32);
+                    int pass_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 4, 32);
                     if (lane >= 4) {
-                        pass_inclusive += pass_peer_1;
+                        pass_inclusive += pass_peer_4_2;
                     }
-                    int pass_peer_2 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 8, 32);
+                    int pass_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 8, 32);
                     if (lane >= 8) {
-                        pass_inclusive += pass_peer_2;
+                        pass_inclusive += pass_peer_4_3;
                     }
-                    int pass_peer_3 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 16, 32);
+                    int pass_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 16, 32);
                     if (lane >= 16) {
-                        pass_inclusive += pass_peer_3;
+                        pass_inclusive += pass_peer_4_4;
                     }
                     int lane_rank = own_base + emitted + pass_inclusive - pass_count;
                     int pass_token = byte_pass * 1024 + lane * 32;

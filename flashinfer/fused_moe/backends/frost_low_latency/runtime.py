@@ -3,6 +3,9 @@
 """Per-call bindings; the compile cache contains executable metadata only."""
 
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from uuid import uuid4
 from typing import Any
 
 import torch
@@ -16,6 +19,23 @@ from .fma.activation_config import lower_activation
 
 _COMPILED: dict[tuple, Any] = {}
 _COMPILE_LOCK = threading.Lock()
+
+
+def _load_cross_compiled(entry):
+    """Materialize a TVM-FFI entry when the DSL's default arch differs."""
+    if getattr(entry, "engine", entry) is not None:
+        return entry
+    # A correct explicit GPU target can still produce no JIT engine when the
+    # DSL singleton was initialized for another device. Export/load preserves
+    # that target without changing process-global compiler state. This runs
+    # only on a cold compile, before graph capture or insertion into the cache.
+    with TemporaryDirectory(prefix="flashinfer-frost-mx-") as directory:
+        name = "frost_mx_" + uuid4().hex
+        path = str(Path(directory) / (name + ".o"))
+        entry.export_to_c(path, function_name=name)
+        module = cute.runtime.load_module(path, enable_tvm_ffi=True)
+        # TVM-FFI retains the module's engine after the temporary object is gone.
+        return module[name]
 
 
 def execute(inputs, config, tile_k):
@@ -113,8 +133,13 @@ def _execute(inputs, config, tile_k):
         else cutlass.Float8E4M3FN
     )
 
+    from ....utils import get_compute_capability
+
+    capability = get_compute_capability(q.device)
+    major, minor = capability
     key = (
-        "mx-tc-ffi-v1",
+        "mx-tc-ffi-v2",
+        capability,
         geometry,
         tile_k,
         pdl,
@@ -157,8 +182,9 @@ def _execute(inputs, config, tile_k):
                     narrow_weights,
                     config.finalize.do_finalize,
                     cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                    options="--enable-tvm-ffi",
+                    options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
                 )
+                entry = _load_cross_compiled(entry)
                 # The cache owns only executable and immutable shape metadata.
                 compiled = (entry, first_shape, second_shape)
                 _COMPILED[key] = compiled

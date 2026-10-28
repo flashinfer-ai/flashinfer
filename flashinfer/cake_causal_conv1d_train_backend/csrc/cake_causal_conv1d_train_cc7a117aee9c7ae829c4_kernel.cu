@@ -506,28 +506,28 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
                         }
                         if (u >= 0) {
                             long long row3 = (long long)(tb + (u - 3)) * C64 + c64;
-                            unsigned int _packed_0[4];
+                            unsigned int packed[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u % 4 + 1) % 4 * 8)[_lp*2 + 0], (pend + (u % 4 + 1) % 4 * 8)[_lp*2+1 + 0]));
-                                _packed_0[_lp] = *(uint32_t*)&_bf2;
+                                packed[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u % 4 + 1) % 4 * 8)[_lp*2 + 2], (pend + (u % 4 + 1) % 4 * 8)[_lp*2+1 + 2]));
-                                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                packed[_lp + 1] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u % 4 + 1) % 4 * 8)[_lp*2 + 4], (pend + (u % 4 + 1) % 4 * 8)[_lp*2+1 + 4]));
-                                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                                packed[_lp + 2] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u % 4 + 1) % 4 * 8)[_lp*2 + 6], (pend + (u % 4 + 1) % 4 * 8)[_lp*2+1 + 6]));
-                                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                                packed[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(dx + (row3))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                            reinterpret_cast<int4*>(dx + (row3))[0] = reinterpret_cast<int4*>(packed)[0];
                         }
                     }
                 } else if (interior == 1) {
@@ -596,28 +596,28 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
                         }
                         if (u_1 >= 3) {
                             long long row3_1 = (long long)(tb + (u_1 - 3)) * C64 + c64;
-                            unsigned int _packed_1[4];
+                            unsigned int packed_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2 + 0], (pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2+1 + 0]));
-                                _packed_1[_lp] = *(uint32_t*)&_bf2;
+                                packed_1[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2 + 2], (pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2+1 + 2]));
-                                _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2 + 4], (pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2+1 + 4]));
-                                _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                                packed_1[_lp + 2] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2 + 6], (pend + (u_1 % 4 + 1) % 4 * 8)[_lp*2+1 + 6]));
-                                _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                                packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(dx + (row3_1))[0] = reinterpret_cast<int4*>(_packed_1)[0];
+                            reinterpret_cast<int4*>(dx + (row3_1))[0] = reinterpret_cast<int4*>(packed_1)[0];
                         }
                     }
                 } else {
@@ -1107,28 +1107,28 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
                         }
                         if (u_3 >= 0) {
                             long long row3_3 = (long long)(tb_1 + (u_3 - 3)) * C64 + c64_1;
-                            unsigned int _packed_4[4];
+                            unsigned int packed_2[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2 + 0], (pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2+1 + 0]));
-                                _packed_4[_lp] = *(uint32_t*)&_bf2;
+                                packed_2[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2 + 2], (pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2+1 + 2]));
-                                _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                                packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2 + 4], (pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2+1 + 4]));
-                                _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
+                                packed_2[_lp + 2] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2 + 6], (pend_1 + (u_3 % 4 + 1) % 4 * 8)[_lp*2+1 + 6]));
-                                _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
+                                packed_2[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(dx + (row3_3))[0] = reinterpret_cast<int4*>(_packed_4)[0];
+                            reinterpret_cast<int4*>(dx + (row3_3))[0] = reinterpret_cast<int4*>(packed_2)[0];
                         }
                     }
                 } else if (interior_1 == 1) {
@@ -1197,28 +1197,28 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
                         }
                         if (u_4 >= 3) {
                             long long row3_4 = (long long)(tb_1 + (u_4 - 3)) * C64 + c64_1;
-                            unsigned int _packed_5[4];
+                            unsigned int packed_3[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2 + 0], (pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2+1 + 0]));
-                                _packed_5[_lp] = *(uint32_t*)&_bf2;
+                                packed_3[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2 + 2], (pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2+1 + 2]));
-                                _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
+                                packed_3[_lp + 1] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2 + 4], (pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2+1 + 4]));
-                                _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
+                                packed_3[_lp + 2] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int _lp = 0; _lp < 1; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2 + 6], (pend_1 + (u_4 % 4 + 1) % 4 * 8)[_lp*2+1 + 6]));
-                                _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
+                                packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(dx + (row3_4))[0] = reinterpret_cast<int4*>(_packed_5)[0];
+                            reinterpret_cast<int4*>(dx + (row3_4))[0] = reinterpret_cast<int4*>(packed_3)[0];
                         }
                     }
                 } else {
@@ -1417,7 +1417,7 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             int kn_1 = k_1 + 2;
             if (kn_1 < n_stages_1) {
-                int bslot_0_1 = warp_1 * 2 + slot_1;
+                int bslot_1_1 = warp_1 * 2 + slot_1;
                 int rows_k_5 = 0;
                 if (active_1 != 0) {
                     int _max_101 = ((my_rows_1 - (k_1 + 2) * 4) > (0) ? (my_rows_1 - (k_1 + 2) * 4) : (0));
@@ -1427,7 +1427,7 @@ kernel_cake_causal_conv1d_train_cc7a117aee9c7ae829c4(__nv_bfloat16* __restrict__
                 if (li == 0 && rows_k_5 > 0) {
                     int cb_1 = ((rstride) < ((int)(C64 - c64_1) * 2) ? (rstride) : ((int)(C64 - c64_1) * 2));
                     mbarrier_arrive_expect_tx(stage_full_addr + (warp_1 + 4 * (int)((unsigned int)(k_1 + 2) % 2)) * 8, rows_k_5 * (2 * cb_1));
-                    int sx_3 = (int)stage_buf_addr + bslot_0_1 * 4096 + seg_off;
+                    int sx_3 = (int)stage_buf_addr + bslot_1_1 * 4096 + seg_off;
                     long long src0_3 = (long long)(t0 + (k_1 + 2) * 4) * C64 + c64_1;
                     if (whole_row != 0) {
                         cp_async_bulk_gmem2smem(sx_3, reinterpret_cast<const uint8_t*>(x + src0_3), rows_k_5 * cb_1, stage_full_addr + (warp_1 + 4 * (int)((unsigned int)(k_1 + 2) % 2)) * 8);

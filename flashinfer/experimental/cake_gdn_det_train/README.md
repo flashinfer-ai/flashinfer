@@ -5,7 +5,9 @@ DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  Every launch is a plain
 stream-ordered kernel: no atomics, no data-dependent ordering, so the outputs
 and every gradient are bitwise the same run to run for one layout and one
-plan.
+plan.  Some stages run as two groups of sequences on the caller's stream and a
+side stream; the groups write disjoint outputs, so this holds with one or two
+streams.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM100 (B200 / GB200) and SM103 (B300 / GB300) are the supported
@@ -41,6 +43,16 @@ chunk and segment tables on the host; without it the `meta` kernel builds
 them on the device.  The device route plans its scans for a bound layout, so
 the two routes can pick different plans and agree to rounding, not bitwise.
 
+The entry point checks its inputs before the first launch and raises
+`ValueError`: every tensor on the device of `q`, `k` of the shape of `q`,
+`v`, `g` and `beta` over the tokens of `q`, `HV` a positive multiple of `H`,
+`initial_state` of shape `[N, HV, 128, 128]`, `cu_seqlens` a 1-D int32 / int64
+tensor with a batch of 1, and `cu_seqlens_cpu` with as many offsets, starting
+at 0, not decreasing and ending at the tokens of `q` (an empty sequence is
+allowed).  These checks read tensor metadata only; the host offsets are
+checked when their layout is first planned.  The device route trusts the values
+of `cu_seqlens`, since reading them would synchronize the device.
+
 ## Chain
 
 The forward runs the prep (Q/K L2 norm, gate cumsum), the tcgen05 WY stage and
@@ -57,6 +69,33 @@ group of two (`HV == 2 * H`) one fused tcgen05 kernel then computes `dq`, `dk`,
 `dv`, `dg` and `dbeta`; other groups run `dqkwg`, the WY pullback and the
 finalize.
 
+On the host-table route the long sequences start first.  The tables list the
+sequences by chunk count, longest first (ties in the caller's order); every
+chunk keeps its token offset, the initial-state rows are gathered into that
+order and the final state and the initial-state gradient come back in the
+caller's order.  The forward scan also walks its segments longest first.  Each
+CTA computes what it computes in the caller's order, so the outputs and the
+gradients are bitwise the same with `lpt=False`.  The device route keeps the
+caller's order.
+
+A serial scan runs one CTA per (sequence, value head) with one CTA per SM, so
+its last round can leave SMs idle.  On the host-table route such a scan can
+run as two contiguous groups of sequences.  With `n` sequences, `HV` value
+heads and `SMs` multiprocessors, `idle(c) = ceil(c / SMs) x SMs - c` counts the
+idle slots of `c` CTAs; `k` in `[1, n)` minimizes `idle(k x HV)` (ties to the
+larger `k`).  The scan is split only if `idle(k x HV) < idle(n x HV)`; a scan
+with `n < 2` or `n x HV <= SMs` is never split.  The groups follow the table
+order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
+value-head group of two runs the first `k` sequences on the caller's stream,
+then their fused tail while a side stream scans the rest.  The forward runs
+`wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream; once
+that `wy_tc` is done, the caller's stream runs those of the last `k`.  The side
+stream is a stream of PyTorch's pool with the device's greatest priority, one
+per caller stream; it is forked from the caller's stream with events and joined
+before the stage returns (also when a launch raises), so the call can be
+captured in a CUDA graph (warm it up first, like any captured call).
+`streams=1` keeps every launch on the caller's stream; the bits are the same.
+
 ## Plan pins (keyword-only)
 
 | keyword | default | effect |
@@ -69,6 +108,8 @@ finalize.
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |
+| `lpt` | `True` | host-table route: dispatch the sequences and the forward segments longest first; `False` keeps the caller's order (the same bits) |
+| `streams` | `2` | host-table route: `2` lets a serial scan run as two sequence groups on two streams where the rule above splits it; `1` keeps one stream (the same bits) |
 
 ## Limitations
 
