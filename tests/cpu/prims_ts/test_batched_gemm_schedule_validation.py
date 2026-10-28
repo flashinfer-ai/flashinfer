@@ -64,6 +64,7 @@ def _fused_operand_sf_config(**overrides):
     return cfg
 
 
+@pytest.mark.cpu_only
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
@@ -147,6 +148,7 @@ def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     )
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_mma_unroll():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -166,12 +168,14 @@ def test_validation_accepts_mma_unroll():
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_safe_fused_operand_sf_pipeline():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
 
     validate_config(_fused_operand_sf_config())
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("operand", ("sfa", "sfb"))
 def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -202,6 +206,7 @@ def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("overrides", "match"),
     (
@@ -230,6 +235,7 @@ def test_validation_rejects_unsafe_fused_operand_sf_pipeline(overrides, match):
         validate_config(_fused_operand_sf_config(**overrides))
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_pdl_early_exit_without_count_wait():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -251,6 +257,7 @@ def test_validation_rejects_pdl_early_exit_without_count_wait():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("dtype_c_name", "match"),
     (
@@ -277,6 +284,7 @@ def test_validation_rejects_unsupported_plain_output_store_dtype(dtype_c_name, m
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_runner_uses_fp16_for_fp16_plain_output_store_dtype():
     import cutlass
     import torch
@@ -302,6 +310,7 @@ def test_runner_uses_fp16_for_fp16_plain_output_store_dtype():
     assert batched_gemm_run._plain_output_cutlass_dtype(cfg) == cutlass.Float16
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "act_kind_name, expected",
     (
@@ -322,6 +331,7 @@ def test_runner_gated_activation_classification_matches_kernel(act_kind_name, ex
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "batch_mode_name, act_kind_name, expected_shape",
     (
@@ -353,6 +363,7 @@ def test_runner_logical_output_shape_for_gated_activation_abi(
     assert logical_shape == expected_shape
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "stage_name",
     (
@@ -383,6 +394,7 @@ def test_validation_rejects_zero_required_pipeline_stage_counts(stage_name):
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("num_stages_a", "num_stages_b"),
     ((3, 4), (4, 3)),
@@ -417,6 +429,7 @@ def test_validation_rejects_unequal_2cta_gather_pipeline_stages(
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "stage_name",
     (
@@ -449,6 +462,7 @@ def test_validation_accepts_zero_inactive_pipeline_stage_counts(stage_name):
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("stage_name", "overrides"),
     (
@@ -488,6 +502,7 @@ def test_validation_rejects_zero_active_sf_and_store_stage_counts(
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_zero_persistent_workid_stages():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -511,6 +526,7 @@ def test_validation_rejects_zero_persistent_workid_stages():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("epi_tile_n", "expected"),
     (
@@ -540,6 +556,7 @@ def test_validation_rejects_invalid_epi_tile_n(epi_tile_n, expected):
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     (
@@ -571,6 +588,7 @@ def test_validation_rejects_invalid_mma_shape(overrides, expected):
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     (
@@ -606,6 +624,7 @@ def test_validation_rejects_incompatible_tile_and_mma_shapes(overrides, expected
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_nvfp4_mma_m64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -628,6 +647,7 @@ def test_validation_rejects_nvfp4_mma_m64():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("batch_mode_name", "transpose_mma_output"),
     (("BATCH_N", 0), ("BATCH_M", 1)),
@@ -649,6 +669,7 @@ def test_validation_rejects_transpose_incompatible_with_batch_mode(
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_non_binary_transpose_mma_output():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         make_config,
@@ -660,6 +681,7 @@ def test_validation_rejects_non_binary_transpose_mma_output():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_tile_k_not_multiple_of_mma_k():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -679,6 +701,7 @@ def test_validation_rejects_tile_k_not_multiple_of_mma_k():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -699,6 +722,7 @@ def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_casta_tile_k_not_256():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -719,6 +743,7 @@ def test_validation_rejects_casta_tile_k_not_256():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype_c_name", ("BF16", "FP16"))
 def test_validation_accepts_casta_plain_output_store(dtype_c_name):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -742,6 +767,7 @@ def test_validation_accepts_casta_plain_output_store(dtype_c_name):
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_casta_output_quantization():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -769,6 +795,7 @@ def test_validation_rejects_casta_output_quantization():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_silu_activation():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -789,6 +816,7 @@ def test_validation_accepts_silu_activation():
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_clustered_swap_ab_ldgsts_splits_b_smem_across_ctas():
     """Each CTA stages its routed B rows and uses the matching K-group stride."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -817,6 +845,7 @@ def test_clustered_swap_ab_ldgsts_splits_b_smem_across_ctas():
     assert cfg.num_bytes_b_smem_per_stage == 16_384
 
 
+@pytest.mark.cpu_only
 def test_r128c4_sfb_s2t_descriptors_advance_in_k_group_order():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
     from flashinfer.prims_ts.batched_gemm.tmem_c_resources import (
@@ -828,6 +857,7 @@ def test_r128c4_sfb_s2t_descriptors_advance_in_k_group_order():
     ] == [0, 32, 64, 96, 128, 160, 192, 224]
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_routed_sf_does_not_use_routed_tma_descriptors():
     """LDGSTS-routed scale factors must not build compact TMA TensorMaps."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -883,6 +913,7 @@ def test_ldgsts_routed_sf_does_not_use_routed_tma_descriptors():
     assert not uses_routed_sfb_tma_desc(tma_non_swap_ab_cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.timeout(180)
 def test_deepseek_fp8_uses_two_epilogue_warpgroups():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -922,6 +953,7 @@ def test_deepseek_fp8_uses_two_epilogue_warpgroups():
     assert cfg.threads_per_cta == 384
 
 
+@pytest.mark.cpu_only
 @pytest.mark.timeout(180)
 def test_persistent_deepseek_fp8_schedule_builds():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -959,6 +991,7 @@ def test_persistent_deepseek_fp8_schedule_builds():
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     ("tile_n", "num_load_b_warps", "load_sfab_warp_idx", "padding_warp_idx"),
@@ -1020,6 +1053,7 @@ def test_deepseek_fp8_tma_route_uses_generated_load_b_warp_count(
     assert cfg.threads_per_cta == 512
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_clc_fast_drain_for_persistent_early_exit():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1042,6 +1076,7 @@ def test_validation_accepts_clc_fast_drain_for_persistent_early_exit():
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("tile_scheduler", "use_early_exit"),
     ((0, 1), (1, 0)),
@@ -1070,6 +1105,7 @@ def test_validation_rejects_clc_fast_drain_without_persistent_early_exit(
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "removed_option",
     (
@@ -1107,6 +1143,7 @@ def test_config_rejects_removed_non_config_options(removed_option):
         )
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_ldg_plus_sts_routes():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1140,6 +1177,7 @@ def test_validation_rejects_ldg_plus_sts_routes():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_minimal_plain_fp8_per_token_sfb():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -1211,6 +1249,7 @@ def test_validation_accepts_minimal_plain_fp8_per_token_sfb():
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_accepts_nvfp4_per_token_sfb_only():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -1308,6 +1347,7 @@ def test_validation_accepts_nvfp4_per_token_sfb_only():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.timeout(180)
 def test_nvfp4_per_token_sfb_schedule_validates():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1345,6 +1385,7 @@ def test_nvfp4_per_token_sfb_schedule_validates():
     )
 
 
+@pytest.mark.cpu_only
 def test_benchmark_preserves_supported_fast_drain_and_mma_unroll_knobs():
     from flashinfer.prims_ts.batched_gemm.tools.bench import _ts_kwargs
 
@@ -1359,6 +1400,7 @@ def test_benchmark_preserves_supported_fast_drain_and_mma_unroll_knobs():
     assert result is not kwargs
 
 
+@pytest.mark.cpu_only
 def test_fp4_json_variant_forwards_per_token_sfb_without_skip():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         BatchMode,
@@ -1419,6 +1461,7 @@ def test_fp4_json_variant_forwards_per_token_sfb_without_skip():
         validate_config(make_config(**non_transposed.kwargs))
 
 
+@pytest.mark.cpu_only
 def test_trtllm_gen_json_transpose_option_is_normalized(tmp_path):
     import json
 
@@ -1446,6 +1489,7 @@ def test_trtllm_gen_json_transpose_option_is_normalized(tmp_path):
     assert bench.TRTLLM_GEN_TRANSPOSE_MMA_OUTPUT_KEY not in options
 
 
+@pytest.mark.cpu_only
 def test_fp4_json_variant_forwards_fp16_dtype_c():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
     from flashinfer.prims_ts.batched_gemm.tools import bench
@@ -1470,6 +1514,7 @@ def test_fp4_json_variant_forwards_fp16_dtype_c():
     assert variant.kwargs["dtype_c"] == int(DType.FP16)
 
 
+@pytest.mark.cpu_only
 def test_bf16_json_variant_forwards_fp16_dtype_c():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
     from flashinfer.prims_ts.batched_gemm.tools import bench
@@ -1495,6 +1540,7 @@ def test_bf16_json_variant_forwards_fp16_dtype_c():
     assert variant.kwargs["dtype_c"] == int(DType.FP16)
 
 
+@pytest.mark.cpu_only
 def test_generated_command_treats_fp16_dtype_c_as_plain_output():
     from pathlib import Path
 
@@ -1534,6 +1580,7 @@ def test_generated_command_treats_fp16_dtype_c_as_plain_output():
     assert "-eltwiseActType" not in cmd
 
 
+@pytest.mark.cpu_only
 def test_runner_cli_accepts_batch_mode(monkeypatch):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
@@ -1569,6 +1616,7 @@ def test_runner_cli_accepts_batch_mode(monkeypatch):
     assert captured["transpose_mma_output"] == 0
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_deepseek_fp8_fused_gated_activation():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
@@ -1592,6 +1640,7 @@ def test_validation_rejects_deepseek_fp8_fused_gated_activation():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_deepseek_fp8_split_tma_c_scratch_stages():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1615,6 +1664,7 @@ def test_validation_rejects_deepseek_fp8_split_tma_c_scratch_stages():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_deepseek_fp8_multi_epilogue_subtiles():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1639,6 +1689,7 @@ def test_validation_rejects_deepseek_fp8_multi_epilogue_subtiles():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_deepseek_fp8_epi_subtile_validation_uses_computed_warp_layout():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1665,6 +1716,7 @@ def test_deepseek_fp8_epi_subtile_validation_uses_computed_warp_layout():
     validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_validation_rejects_plain_fp8_output_without_activation_side():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
@@ -1684,6 +1736,7 @@ def test_validation_rejects_plain_fp8_output_without_activation_side():
         validate_config(cfg)
 
 
+@pytest.mark.cpu_only
 def test_batch_m_nvfp4_output_rejects_partial_scale_block():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,

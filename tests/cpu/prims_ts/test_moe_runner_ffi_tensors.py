@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 import ast
 import inspect
 
@@ -34,6 +36,7 @@ from flashinfer.prims_ts.moe.runner import (
 )
 
 
+@pytest.mark.cpu_only
 def test_cache_key_extras_are_invariant_to_synthesized_placeholders():
     runner = PrimsTsBf16MoERunner(
         None,
@@ -69,6 +72,7 @@ def test_cache_key_extras_are_invariant_to_synthesized_placeholders():
     ) == runner.get_cache_key_extras(synthesized_inputs.to_list())
 
 
+@pytest.mark.cpu_only
 def test_torch_tensor_is_preserved():
     tensor = torch.arange(4)
 
@@ -77,10 +81,12 @@ def test_torch_tensor_is_preserved():
     assert view is tensor
 
 
+@pytest.mark.cpu_only
 def test_optional_ffi_tensor_is_preserved():
     assert _torch_views_of_ffi_tensors([None]) == [None]
 
 
+@pytest.mark.cpu_only
 def test_expert_unit_scales_are_reused():
     first = _get_expert_scale_ones(7, torch.device("cpu"))
     second = _get_expert_scale_ones(7, torch.device("cpu"))
@@ -89,6 +95,7 @@ def test_expert_unit_scales_are_reused():
     torch.testing.assert_close(first, torch.ones(7))
 
 
+@pytest.mark.cpu_only
 def test_ffi_tensor_can_be_converted_repeatedly():
     tensor = torch.arange(4)
     ffi_tensor = tvm_ffi.from_dlpack(tensor)
@@ -102,6 +109,7 @@ def test_ffi_tensor_can_be_converted_repeatedly():
     torch.testing.assert_close(second_view, tensor)
 
 
+@pytest.mark.cpu_only
 def test_topk_initializer_matches_routing_representation():
     num_experts = 8
 
@@ -116,6 +124,7 @@ def test_topk_initializer_matches_routing_representation():
     ) is moe_topk_ids_init(num_experts, packed=False)
 
 
+@pytest.mark.cpu_only
 def test_mxfp4_mxfp8_runtime_routing_cache_preserves_runner_hash():
     moe_op = object()
 
@@ -152,6 +161,7 @@ def test_mxfp4_mxfp8_runtime_routing_cache_preserves_runner_hash():
     assert hash(first) == hash(second)
 
 
+@pytest.mark.cpu_only
 def test_gemm_launches_use_local_expert_count():
     tree = ast.parse(inspect.getsource(runner_module))
     launch_builders = {
@@ -193,6 +203,7 @@ def test_gemm_launches_use_local_expert_count():
         assert ast.unparse(value) == "self.num_local_experts"
 
 
+@pytest.mark.cpu_only
 def test_prims_ts_ops_forward_routing_mode_to_tuning():
     calls = []
     for module in (bf16_op, fp4_op, fp8_op):
@@ -212,6 +223,7 @@ def test_prims_ts_ops_forward_routing_mode_to_tuning():
     )
 
 
+@pytest.mark.cpu_only
 def test_routed_token_capacity_uses_local_expert_count(monkeypatch):
     from flashinfer.prims_ts.batched_gemm import batched_gemm_config
 
@@ -256,6 +268,7 @@ def _routing_inputs(*, ids, weights, hidden=None):
     )
 
 
+@pytest.mark.cpu_only
 def test_staged_routing_io_rewrites_from_logits_2d_placeholders():
     hidden = torch.empty(4, 8)
     ids = torch.empty(4, 2, dtype=torch.int32)
@@ -268,6 +281,7 @@ def test_staged_routing_io_rewrites_from_logits_2d_placeholders():
     assert expert_weights.ndim == 1 and expert_weights.numel() == 0
 
 
+@pytest.mark.cpu_only
 def test_staged_routing_io_rewrites_packed_2d_weight_placeholders():
     hidden = torch.empty(4, 8)
     ids = torch.zeros(4, 2, dtype=torch.int32)
@@ -281,6 +295,7 @@ def test_staged_routing_io_rewrites_packed_2d_weight_placeholders():
     assert expert_weights.numel() == 0
 
 
+@pytest.mark.cpu_only
 def test_select_expert_weights_ignores_1d_autotune_placeholder():
     routed = torch.ones(4, 2, dtype=torch.bfloat16)
     synthesized = torch.ones(8, dtype=torch.bfloat16)

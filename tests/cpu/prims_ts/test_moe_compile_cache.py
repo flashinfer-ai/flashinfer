@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from flashinfer.prims_ts.batched_gemm import batched_gemm_run
 from flashinfer.prims_ts.moe import compile_cache
 
 
+@pytest.mark.cpu_only
 def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, request):
     compiled = []
     target = [(0, "sm100a")]

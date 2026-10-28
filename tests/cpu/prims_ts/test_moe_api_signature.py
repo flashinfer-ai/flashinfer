@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 import inspect
 
 from flashinfer.fused_moe.backends.prims_ts.fp8_op import (
@@ -21,6 +23,7 @@ from flashinfer.fused_moe.backends.prims_ts.fp8_op import (
 from flashinfer.fused_moe.core import trtllm_fp8_per_tensor_scale_moe
 
 
+@pytest.mark.cpu_only
 def test_prims_ts_fp8_positional_contract_matches_trtllm():
     trtllm_params = list(
         inspect.signature(trtllm_fp8_per_tensor_scale_moe).parameters.values()

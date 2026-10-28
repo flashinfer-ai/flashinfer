@@ -498,6 +498,7 @@ def _work_queue() -> WorkQueue:
     )
 
 
+@pytest.mark.cpu_only
 def test_fast_drain_work_queue_reserves_response_and_barrier_smem():
     scheduler_config = TileSchedulerConfig(
         tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
@@ -525,6 +526,7 @@ def test_fast_drain_work_queue_reserves_response_and_barrier_smem():
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("is_persistent", "use_early_exit", "use_clc_fast_drain"),
     (
@@ -637,6 +639,7 @@ def _cfg(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+@pytest.mark.cpu_only
 def test_persistent_task_factories_build_captured_schedule_lists():
     cfg = _cfg(use_early_exit=True)
     work_queue = _work_queue()
@@ -807,6 +810,7 @@ def test_persistent_task_factories_build_captured_schedule_lists():
     )
 
 
+@pytest.mark.cpu_only
 def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     cfg = _cfg(use_early_exit=False)
     work_queue = _work_queue()
@@ -823,6 +827,7 @@ def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     assert load_a.skippable_tail_slots == frozenset()
 
 
+@pytest.mark.cpu_only
 def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
     mma = create_mma_task(
         _cfg(use_unroll_loop_2x_for_mma=True),
@@ -839,6 +844,7 @@ def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
     assert mma.unroll == 2
 
 
+@pytest.mark.cpu_only
 def test_mma_task_rejects_partial_sf_pairs():
     with pytest.raises(ValueError, match="smem_sfa and smem_sfb together"):
         create_mma_task(
@@ -866,6 +872,7 @@ def test_mma_task_rejects_partial_sf_pairs():
         )
 
 
+@pytest.mark.cpu_only
 def test_mma_task_rejects_conflicting_sf_modes_and_cast_a():
     with pytest.raises(ValueError, match="at most one SF mode"):
         create_mma_task(
@@ -896,6 +903,7 @@ def test_mma_task_rejects_conflicting_sf_modes_and_cast_a():
         )
 
 
+@pytest.mark.cpu_only
 def test_load_a_try_acquire_is_per_k_tile():
     cfg = _cfg(use_early_exit=False)
     work_queue = _work_queue()
@@ -918,6 +926,7 @@ def test_load_a_try_acquire_is_per_k_tile():
     )
 
 
+@pytest.mark.cpu_only
 def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
     cfg = _cfg(use_early_exit=False, has_cluster=False)
     work_queue = _work_queue()
@@ -943,6 +952,7 @@ def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
     )
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     cfg = make_config(
         cluster_m=2,
@@ -992,6 +1002,7 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert not smem_sfb_cfg.advance_on_acquire
 
 
+@pytest.mark.cpu_only
 def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     cfg = make_config(
         batch_mode=int(BatchMode.BATCH_N),
@@ -1078,6 +1089,7 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
     assert fused_b.num_warps == 4
 
 
+@pytest.mark.cpu_only
 def test_fused_sf_copy_reserves_tmem_after_accumulator():
     cfg = make_config(
         dtype_a=int(DType.E2M1),
@@ -1102,6 +1114,7 @@ def test_fused_sf_copy_reserves_tmem_after_accumulator():
     assert resource._alloc_c.num_columns == cfg.tmem_required_cols
 
 
+@pytest.mark.cpu_only
 def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     source = inspect.getsource(ts_pipeline.TSPipelineAsyncUmma.producer_commit)
 
@@ -1109,6 +1122,7 @@ def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     assert source.count("mbarrier.arrive.shared::cluster.b64") == 1
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
     cfg = make_config(
         cluster_m=2,
@@ -1148,6 +1162,7 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
     assert two_stage_res.cp_async_wait_group_depth == 0
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     cfg = make_config(
         cluster_m=2,
@@ -1215,6 +1230,7 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
     smem_sfa = _res(
         "SmemSfA",
@@ -1237,6 +1253,7 @@ def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
     assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
 
 
+@pytest.mark.cpu_only
 def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
     cfg = make_config(
         cluster_m=2,
@@ -1258,6 +1275,7 @@ def test_ldgsts_sfb_prefetch_depth_is_derived_from_host_k_tiles():
     assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 1
 
 
+@pytest.mark.cpu_only
 def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     cfg = make_config(
         cluster_m=2,
@@ -1275,6 +1293,7 @@ def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     assert tmem_sfab_cfg.consumer_group.size == 1
 
 
+@pytest.mark.cpu_only
 def test_combined_tmem_sfab_delays_commit_and_smem_release():
     cfg = _cfg()
     smem_sfa = _res("SmemSfA")
@@ -1343,6 +1362,7 @@ def test_combined_tmem_sfab_delays_commit_and_smem_release():
     ]
 
 
+@pytest.mark.cpu_only
 def test_runtime_config_preserves_plain_bf16_stages():
     cfg = make_config(
         bias_type=int(BiasType.M),
@@ -1368,6 +1388,7 @@ def test_runtime_config_preserves_plain_bf16_stages():
     assert normalized.num_stages_b == 5
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("in_hidden", "expected_unroll"),
     ((64, 0), (128, 1), (192, 0)),
@@ -1391,6 +1412,7 @@ def test_runtime_config_enables_mma_unroll_only_for_even_k_tiles(
     validate_config(normalized)
 
 
+@pytest.mark.cpu_only
 def test_runtime_config_preserves_scaled_fp4_stages():
     cfg = make_config(
         bias_type=int(BiasType.M),
@@ -1426,6 +1448,7 @@ def test_runtime_config_preserves_scaled_fp4_stages():
     assert normalized.num_stages_smem_sfb == 6
 
 
+@pytest.mark.cpu_only
 def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     cfg = make_config(
         cluster_m=2,
@@ -1456,6 +1479,7 @@ def test_tmem_sf_utccp_pipeline_configs_use_umma_producer_umma_consumer():
     assert compact_pcfgs["tmem_sfb"].pipeline_type == PipelineType.AsyncUmma
 
 
+@pytest.mark.cpu_only
 def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
     proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
         num_stages=2,
@@ -1470,6 +1494,7 @@ def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
     assert "create_pipeline" not in ProxyClusterBarrierResource.__dict__
 
 
+@pytest.mark.cpu_only
 def test_bs1_nvfp4_persistent_pdl_wait_completes_before_task_graph():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         build_batched_gemm_task_manager,

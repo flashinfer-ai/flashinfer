@@ -32,6 +32,7 @@ def _major_k_cfg(weight_bits: int):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("dtype", "weight_bits", "shape"),
     [
@@ -51,6 +52,7 @@ def test_major_k_weight_storage_accepts_expected_shape(dtype, weight_bits, shape
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "shape",
     [
@@ -72,6 +74,7 @@ def test_major_k_weight_storage_rejects_malformed_shape(shape):
         )
 
 
+@pytest.mark.cpu_only
 def test_fp4_major_k_weight_storage_requires_packed_k():
     with pytest.raises(ValueError, match="expected"):
         _validate_weight_storage(
@@ -84,6 +87,7 @@ def test_fp4_major_k_weight_storage_requires_packed_k():
         )
 
 
+@pytest.mark.cpu_only
 def test_mx_scale_storage_rejects_undersized_or_strided_tensor():
     with pytest.raises(ValueError, match="too small"):
         _check_fp8_scale_storage(
@@ -97,6 +101,7 @@ def test_mx_scale_storage_rejects_undersized_or_strided_tensor():
         )
 
 
+@pytest.mark.cpu_only
 def test_gemm1_oa_validation_uses_local_expert_count():
     runner = SimpleNamespace(num_local_experts=4)
     inputs = SimpleNamespace(hidden_states=torch.empty((2, 8)))
