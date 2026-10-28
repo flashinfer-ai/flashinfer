@@ -868,307 +868,307 @@ kernel_cake_kimi_k3_fp8_projection_000410ae0530038fec6f(const __grid_constant__ 
                 mbarrier_wait_cluster_hint(red_full_addr, _phase_red_full, 10000000);
                 if (epi_group == 0) {
                     if (0 == my_rank) {
-                        float total = 0.0f;
+                        float total_1_0 = 0.0f;
                         #pragma unroll
-                        for (int src = 0; src < 8; src++) {
-                            total = total + smem_red[src * 640 + lane_row * 5];
+                        for (int src_1_0 = 0; src_1_0 < 8; src_1_0++) {
+                            total_1_0 = total_1_0 + smem_red[src_1_0 * 640 + lane_row * 5];
                         }
-                        int tok_c = tok0;
-                        if (feature < n_valid && tok_c < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total;
+                        int tok_c_2_0 = tok0;
+                        if (feature < n_valid && tok_c_2_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_0;
                         }
-                        float total_0 = 0.0f;
+                        float total_3_0 = 0.0f;
                         #pragma unroll
-                        for (int src_1 = 0; src_1 < 8; src_1++) {
-                            total_0 = total_0 + smem_red[src_1 * 640 + lane_row * 5 + 1];
+                        for (int src_1_1 = 0; src_1_1 < 8; src_1_1++) {
+                            total_3_0 = total_3_0 + smem_red[src_1_1 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1 = tok0 + 1;
-                        if (feature < n_valid && tok_c_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0;
+                        int tok_c_4_0 = tok0 + 1;
+                        if (feature < n_valid && tok_c_4_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_0;
                         }
-                        float total_2 = 0.0f;
+                        float total_5_0 = 0.0f;
                         #pragma unroll
-                        for (int src_2 = 0; src_2 < 8; src_2++) {
-                            total_2 = total_2 + smem_red[src_2 * 640 + lane_row * 5 + 2];
+                        for (int src_1_2 = 0; src_1_2 < 8; src_1_2++) {
+                            total_5_0 = total_5_0 + smem_red[src_1_2 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3 = tok0 + 2;
-                        if (feature < n_valid && tok_c_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2;
+                        int tok_c_6_0 = tok0 + 2;
+                        if (feature < n_valid && tok_c_6_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_0;
                         }
-                        float total_4 = 0.0f;
+                        float total_6_0 = 0.0f;
                         #pragma unroll
-                        for (int src_3 = 0; src_3 < 8; src_3++) {
-                            total_4 = total_4 + smem_red[src_3 * 640 + lane_row * 5 + 3];
+                        for (int src_1_3 = 0; src_1_3 < 8; src_1_3++) {
+                            total_6_0 = total_6_0 + smem_red[src_1_3 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5 = tok0 + 3;
-                        if (feature < n_valid && tok_c_5 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4;
+                        int tok_c_7_0 = tok0 + 3;
+                        if (feature < n_valid && tok_c_7_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_0;
                         }
                     }
                     if (1 == my_rank) {
-                        float total_1 = 0.0f;
+                        float total_1_1 = 0.0f;
                         #pragma unroll
-                        for (int src_4 = 0; src_4 < 8; src_4++) {
-                            total_1 = total_1 + smem_red[src_4 * 640 + lane_row * 5];
+                        for (int src_1_4 = 0; src_1_4 < 8; src_1_4++) {
+                            total_1_1 = total_1_1 + smem_red[src_1_4 * 640 + lane_row * 5];
                         }
-                        int tok_c_2 = tok0 + 4;
-                        if (feature < n_valid && tok_c_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1;
+                        int tok_c_2_1 = tok0 + 4;
+                        if (feature < n_valid && tok_c_2_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_1;
                         }
-                        float total_0_1 = 0.0f;
+                        float total_3_1 = 0.0f;
                         #pragma unroll
-                        for (int src_5 = 0; src_5 < 8; src_5++) {
-                            total_0_1 = total_0_1 + smem_red[src_5 * 640 + lane_row * 5 + 1];
+                        for (int src_1_5 = 0; src_1_5 < 8; src_1_5++) {
+                            total_3_1 = total_3_1 + smem_red[src_1_5 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_1 = tok0 + 5;
-                        if (feature < n_valid && tok_c_1_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_1;
+                        int tok_c_4_1 = tok0 + 5;
+                        if (feature < n_valid && tok_c_4_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_1;
                         }
-                        float total_2_1 = 0.0f;
+                        float total_5_1 = 0.0f;
                         #pragma unroll
-                        for (int src_6 = 0; src_6 < 8; src_6++) {
-                            total_2_1 = total_2_1 + smem_red[src_6 * 640 + lane_row * 5 + 2];
+                        for (int src_1_6 = 0; src_1_6 < 8; src_1_6++) {
+                            total_5_1 = total_5_1 + smem_red[src_1_6 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_1 = tok0 + 6;
-                        if (feature < n_valid && tok_c_3_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_1;
+                        int tok_c_6_1 = tok0 + 6;
+                        if (feature < n_valid && tok_c_6_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_1;
                         }
-                        float total_4_1 = 0.0f;
+                        float total_6_1 = 0.0f;
                         #pragma unroll
-                        for (int src_7 = 0; src_7 < 8; src_7++) {
-                            total_4_1 = total_4_1 + smem_red[src_7 * 640 + lane_row * 5 + 3];
+                        for (int src_1_7 = 0; src_1_7 < 8; src_1_7++) {
+                            total_6_1 = total_6_1 + smem_red[src_1_7 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_1 = tok0 + 7;
-                        if (feature < n_valid && tok_c_5_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_1;
+                        int tok_c_7_1 = tok0 + 7;
+                        if (feature < n_valid && tok_c_7_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_1;
                         }
                     }
                     if (2 == my_rank) {
-                        float total_3 = 0.0f;
+                        float total_1_2 = 0.0f;
                         #pragma unroll
-                        for (int src_8 = 0; src_8 < 8; src_8++) {
-                            total_3 = total_3 + smem_red[src_8 * 640 + lane_row * 5];
+                        for (int src_1_8 = 0; src_1_8 < 8; src_1_8++) {
+                            total_1_2 = total_1_2 + smem_red[src_1_8 * 640 + lane_row * 5];
                         }
-                        int tok_c_4 = tok0 + 8;
-                        if (feature < n_valid && tok_c_4 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3;
+                        int tok_c_2_2 = tok0 + 8;
+                        if (feature < n_valid && tok_c_2_2 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_2;
                         }
-                        float total_0_2 = 0.0f;
+                        float total_3_2 = 0.0f;
                         #pragma unroll
-                        for (int src_9 = 0; src_9 < 8; src_9++) {
-                            total_0_2 = total_0_2 + smem_red[src_9 * 640 + lane_row * 5 + 1];
+                        for (int src_1_9 = 0; src_1_9 < 8; src_1_9++) {
+                            total_3_2 = total_3_2 + smem_red[src_1_9 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_2 = tok0 + 9;
-                        if (feature < n_valid && tok_c_1_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_2;
+                        int tok_c_4_2 = tok0 + 9;
+                        if (feature < n_valid && tok_c_4_2 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_2;
                         }
-                        float total_2_2 = 0.0f;
+                        float total_5_2 = 0.0f;
                         #pragma unroll
-                        for (int src_10 = 0; src_10 < 8; src_10++) {
-                            total_2_2 = total_2_2 + smem_red[src_10 * 640 + lane_row * 5 + 2];
+                        for (int src_1_10 = 0; src_1_10 < 8; src_1_10++) {
+                            total_5_2 = total_5_2 + smem_red[src_1_10 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_2 = tok0 + 10;
-                        if (feature < n_valid && tok_c_3_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_2;
+                        int tok_c_6_2 = tok0 + 10;
+                        if (feature < n_valid && tok_c_6_2 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_2;
                         }
-                        float total_4_2 = 0.0f;
+                        float total_6_2 = 0.0f;
                         #pragma unroll
-                        for (int src_11 = 0; src_11 < 8; src_11++) {
-                            total_4_2 = total_4_2 + smem_red[src_11 * 640 + lane_row * 5 + 3];
+                        for (int src_1_11 = 0; src_1_11 < 8; src_1_11++) {
+                            total_6_2 = total_6_2 + smem_red[src_1_11 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_2 = tok0 + 11;
-                        if (feature < n_valid && tok_c_5_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_2;
+                        int tok_c_7_2 = tok0 + 11;
+                        if (feature < n_valid && tok_c_7_2 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_2;
                         }
                     }
                     if (3 == my_rank) {
-                        float total_5 = 0.0f;
+                        float total_1_3 = 0.0f;
                         #pragma unroll
-                        for (int src_12 = 0; src_12 < 8; src_12++) {
-                            total_5 = total_5 + smem_red[src_12 * 640 + lane_row * 5];
+                        for (int src_1_12 = 0; src_1_12 < 8; src_1_12++) {
+                            total_1_3 = total_1_3 + smem_red[src_1_12 * 640 + lane_row * 5];
                         }
-                        int tok_c_6 = tok0 + 12;
-                        if (feature < n_valid && tok_c_6 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5;
+                        int tok_c_2_3 = tok0 + 12;
+                        if (feature < n_valid && tok_c_2_3 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_3;
                         }
-                        float total_0_3 = 0.0f;
+                        float total_3_3 = 0.0f;
                         #pragma unroll
-                        for (int src_13 = 0; src_13 < 8; src_13++) {
-                            total_0_3 = total_0_3 + smem_red[src_13 * 640 + lane_row * 5 + 1];
+                        for (int src_1_13 = 0; src_1_13 < 8; src_1_13++) {
+                            total_3_3 = total_3_3 + smem_red[src_1_13 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_3 = tok0 + 13;
-                        if (feature < n_valid && tok_c_1_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_3;
+                        int tok_c_4_3 = tok0 + 13;
+                        if (feature < n_valid && tok_c_4_3 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_3;
                         }
-                        float total_2_3 = 0.0f;
+                        float total_5_3 = 0.0f;
                         #pragma unroll
-                        for (int src_14 = 0; src_14 < 8; src_14++) {
-                            total_2_3 = total_2_3 + smem_red[src_14 * 640 + lane_row * 5 + 2];
+                        for (int src_1_14 = 0; src_1_14 < 8; src_1_14++) {
+                            total_5_3 = total_5_3 + smem_red[src_1_14 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_3 = tok0 + 14;
-                        if (feature < n_valid && tok_c_3_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_3;
+                        int tok_c_6_3 = tok0 + 14;
+                        if (feature < n_valid && tok_c_6_3 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_3;
                         }
-                        float total_4_3 = 0.0f;
+                        float total_6_3 = 0.0f;
                         #pragma unroll
-                        for (int src_15 = 0; src_15 < 8; src_15++) {
-                            total_4_3 = total_4_3 + smem_red[src_15 * 640 + lane_row * 5 + 3];
+                        for (int src_1_15 = 0; src_1_15 < 8; src_1_15++) {
+                            total_6_3 = total_6_3 + smem_red[src_1_15 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_3 = tok0 + 15;
-                        if (feature < n_valid && tok_c_5_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_3;
+                        int tok_c_7_3 = tok0 + 15;
+                        if (feature < n_valid && tok_c_7_3 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_3;
                         }
                     }
                     if (4 == my_rank) {
-                        float total_6 = 0.0f;
+                        float total_1_4 = 0.0f;
                         #pragma unroll
-                        for (int src_16 = 0; src_16 < 8; src_16++) {
-                            total_6 = total_6 + smem_red[src_16 * 640 + lane_row * 5];
+                        for (int src_1_16 = 0; src_1_16 < 8; src_1_16++) {
+                            total_1_4 = total_1_4 + smem_red[src_1_16 * 640 + lane_row * 5];
                         }
-                        int tok_c_7 = tok0 + 16;
-                        if (feature < n_valid && tok_c_7 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6;
+                        int tok_c_2_4 = tok0 + 16;
+                        if (feature < n_valid && tok_c_2_4 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_4;
                         }
-                        float total_0_4 = 0.0f;
+                        float total_3_4 = 0.0f;
                         #pragma unroll
-                        for (int src_17 = 0; src_17 < 8; src_17++) {
-                            total_0_4 = total_0_4 + smem_red[src_17 * 640 + lane_row * 5 + 1];
+                        for (int src_1_17 = 0; src_1_17 < 8; src_1_17++) {
+                            total_3_4 = total_3_4 + smem_red[src_1_17 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_4 = tok0 + 17;
-                        if (feature < n_valid && tok_c_1_4 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_4;
+                        int tok_c_4_4 = tok0 + 17;
+                        if (feature < n_valid && tok_c_4_4 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_4;
                         }
-                        float total_2_4 = 0.0f;
+                        float total_5_4 = 0.0f;
                         #pragma unroll
-                        for (int src_18 = 0; src_18 < 8; src_18++) {
-                            total_2_4 = total_2_4 + smem_red[src_18 * 640 + lane_row * 5 + 2];
+                        for (int src_1_18 = 0; src_1_18 < 8; src_1_18++) {
+                            total_5_4 = total_5_4 + smem_red[src_1_18 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_4 = tok0 + 18;
-                        if (feature < n_valid && tok_c_3_4 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_4;
+                        int tok_c_6_4 = tok0 + 18;
+                        if (feature < n_valid && tok_c_6_4 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_4;
                         }
-                        float total_4_4 = 0.0f;
+                        float total_6_4 = 0.0f;
                         #pragma unroll
-                        for (int src_19 = 0; src_19 < 8; src_19++) {
-                            total_4_4 = total_4_4 + smem_red[src_19 * 640 + lane_row * 5 + 3];
+                        for (int src_1_19 = 0; src_1_19 < 8; src_1_19++) {
+                            total_6_4 = total_6_4 + smem_red[src_1_19 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_4 = tok0 + 19;
-                        if (feature < n_valid && tok_c_5_4 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_4;
+                        int tok_c_7_4 = tok0 + 19;
+                        if (feature < n_valid && tok_c_7_4 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_4;
                         }
                     }
                     if (5 == my_rank) {
-                        float total_7 = 0.0f;
+                        float total_1_5 = 0.0f;
                         #pragma unroll
-                        for (int src_20 = 0; src_20 < 8; src_20++) {
-                            total_7 = total_7 + smem_red[src_20 * 640 + lane_row * 5];
+                        for (int src_1_20 = 0; src_1_20 < 8; src_1_20++) {
+                            total_1_5 = total_1_5 + smem_red[src_1_20 * 640 + lane_row * 5];
                         }
-                        int tok_c_8 = tok0 + 20;
-                        if (feature < n_valid && tok_c_8 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_8 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_7;
+                        int tok_c_2_5 = tok0 + 20;
+                        if (feature < n_valid && tok_c_2_5 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_5;
                         }
-                        float total_0_5 = 0.0f;
+                        float total_3_5 = 0.0f;
                         #pragma unroll
-                        for (int src_21 = 0; src_21 < 8; src_21++) {
-                            total_0_5 = total_0_5 + smem_red[src_21 * 640 + lane_row * 5 + 1];
+                        for (int src_1_21 = 0; src_1_21 < 8; src_1_21++) {
+                            total_3_5 = total_3_5 + smem_red[src_1_21 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_5 = tok0 + 21;
-                        if (feature < n_valid && tok_c_1_5 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_5;
+                        int tok_c_4_5 = tok0 + 21;
+                        if (feature < n_valid && tok_c_4_5 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_5;
                         }
-                        float total_2_5 = 0.0f;
+                        float total_5_5 = 0.0f;
                         #pragma unroll
-                        for (int src_22 = 0; src_22 < 8; src_22++) {
-                            total_2_5 = total_2_5 + smem_red[src_22 * 640 + lane_row * 5 + 2];
+                        for (int src_1_22 = 0; src_1_22 < 8; src_1_22++) {
+                            total_5_5 = total_5_5 + smem_red[src_1_22 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_5 = tok0 + 22;
-                        if (feature < n_valid && tok_c_3_5 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_5;
+                        int tok_c_6_5 = tok0 + 22;
+                        if (feature < n_valid && tok_c_6_5 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_5;
                         }
-                        float total_4_5 = 0.0f;
+                        float total_6_5 = 0.0f;
                         #pragma unroll
-                        for (int src_23 = 0; src_23 < 8; src_23++) {
-                            total_4_5 = total_4_5 + smem_red[src_23 * 640 + lane_row * 5 + 3];
+                        for (int src_1_23 = 0; src_1_23 < 8; src_1_23++) {
+                            total_6_5 = total_6_5 + smem_red[src_1_23 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_5 = tok0 + 23;
-                        if (feature < n_valid && tok_c_5_5 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_5;
+                        int tok_c_7_5 = tok0 + 23;
+                        if (feature < n_valid && tok_c_7_5 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_5;
                         }
                     }
                     if (6 == my_rank) {
-                        float total_8 = 0.0f;
+                        float total_1_6 = 0.0f;
                         #pragma unroll
-                        for (int src_24 = 0; src_24 < 8; src_24++) {
-                            total_8 = total_8 + smem_red[src_24 * 640 + lane_row * 5];
+                        for (int src_1_24 = 0; src_1_24 < 8; src_1_24++) {
+                            total_1_6 = total_1_6 + smem_red[src_1_24 * 640 + lane_row * 5];
                         }
-                        int tok_c_9 = tok0 + 24;
-                        if (feature < n_valid && tok_c_9 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_9 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_8;
+                        int tok_c_2_6 = tok0 + 24;
+                        if (feature < n_valid && tok_c_2_6 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_6;
                         }
-                        float total_0_6 = 0.0f;
+                        float total_3_6 = 0.0f;
                         #pragma unroll
-                        for (int src_25 = 0; src_25 < 8; src_25++) {
-                            total_0_6 = total_0_6 + smem_red[src_25 * 640 + lane_row * 5 + 1];
+                        for (int src_1_25 = 0; src_1_25 < 8; src_1_25++) {
+                            total_3_6 = total_3_6 + smem_red[src_1_25 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_6 = tok0 + 25;
-                        if (feature < n_valid && tok_c_1_6 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_6;
+                        int tok_c_4_6 = tok0 + 25;
+                        if (feature < n_valid && tok_c_4_6 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_6;
                         }
-                        float total_2_6 = 0.0f;
+                        float total_5_6 = 0.0f;
                         #pragma unroll
-                        for (int src_26 = 0; src_26 < 8; src_26++) {
-                            total_2_6 = total_2_6 + smem_red[src_26 * 640 + lane_row * 5 + 2];
+                        for (int src_1_26 = 0; src_1_26 < 8; src_1_26++) {
+                            total_5_6 = total_5_6 + smem_red[src_1_26 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_6 = tok0 + 26;
-                        if (feature < n_valid && tok_c_3_6 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_6;
+                        int tok_c_6_6 = tok0 + 26;
+                        if (feature < n_valid && tok_c_6_6 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_6;
                         }
-                        float total_4_6 = 0.0f;
+                        float total_6_6 = 0.0f;
                         #pragma unroll
-                        for (int src_27 = 0; src_27 < 8; src_27++) {
-                            total_4_6 = total_4_6 + smem_red[src_27 * 640 + lane_row * 5 + 3];
+                        for (int src_1_27 = 0; src_1_27 < 8; src_1_27++) {
+                            total_6_6 = total_6_6 + smem_red[src_1_27 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_6 = tok0 + 27;
-                        if (feature < n_valid && tok_c_5_6 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_6;
+                        int tok_c_7_6 = tok0 + 27;
+                        if (feature < n_valid && tok_c_7_6 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_6;
                         }
                     }
                     if (7 == my_rank) {
-                        float total_9 = 0.0f;
+                        float total_1_7 = 0.0f;
                         #pragma unroll
-                        for (int src_28 = 0; src_28 < 8; src_28++) {
-                            total_9 = total_9 + smem_red[src_28 * 640 + lane_row * 5];
+                        for (int src_1_28 = 0; src_1_28 < 8; src_1_28++) {
+                            total_1_7 = total_1_7 + smem_red[src_1_28 * 640 + lane_row * 5];
                         }
-                        int tok_c_10 = tok0 + 28;
-                        if (feature < n_valid && tok_c_10 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_10 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_9;
+                        int tok_c_2_7 = tok0 + 28;
+                        if (feature < n_valid && tok_c_2_7 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_7;
                         }
-                        float total_0_7 = 0.0f;
+                        float total_3_7 = 0.0f;
                         #pragma unroll
-                        for (int src_29 = 0; src_29 < 8; src_29++) {
-                            total_0_7 = total_0_7 + smem_red[src_29 * 640 + lane_row * 5 + 1];
+                        for (int src_1_29 = 0; src_1_29 < 8; src_1_29++) {
+                            total_3_7 = total_3_7 + smem_red[src_1_29 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_1_7 = tok0 + 29;
-                        if (feature < n_valid && tok_c_1_7 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0_7;
+                        int tok_c_4_7 = tok0 + 29;
+                        if (feature < n_valid && tok_c_4_7 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3_7;
                         }
-                        float total_2_7 = 0.0f;
+                        float total_5_7 = 0.0f;
                         #pragma unroll
-                        for (int src_30 = 0; src_30 < 8; src_30++) {
-                            total_2_7 = total_2_7 + smem_red[src_30 * 640 + lane_row * 5 + 2];
+                        for (int src_1_30 = 0; src_1_30 < 8; src_1_30++) {
+                            total_5_7 = total_5_7 + smem_red[src_1_30 * 640 + lane_row * 5 + 2];
                         }
-                        int tok_c_3_7 = tok0 + 30;
-                        if (feature < n_valid && tok_c_3_7 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_7;
+                        int tok_c_6_7 = tok0 + 30;
+                        if (feature < n_valid && tok_c_6_7 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5_7;
                         }
-                        float total_4_7 = 0.0f;
+                        float total_6_7 = 0.0f;
                         #pragma unroll
-                        for (int src_31 = 0; src_31 < 8; src_31++) {
-                            total_4_7 = total_4_7 + smem_red[src_31 * 640 + lane_row * 5 + 3];
+                        for (int src_1_31 = 0; src_1_31 < 8; src_1_31++) {
+                            total_6_7 = total_6_7 + smem_red[src_1_31 * 640 + lane_row * 5 + 3];
                         }
-                        int tok_c_5_7 = tok0 + 31;
-                        if (feature < n_valid && tok_c_5_7 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4_7;
+                        int tok_c_7_7 = tok0 + 31;
+                        if (feature < n_valid && tok_c_7_7 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6_7;
                         }
                     }
                 }

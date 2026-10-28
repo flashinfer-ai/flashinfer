@@ -461,10 +461,10 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
                         }
                         mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                        uint32_t _clc_valid_0 = 0;
-                        uint32_t _clc_ctaid_0;
-                        uint32_t _clc_ctaid_y_0;
-                        uint32_t _clc_ctaid_z_0;
+                        uint32_t clc_valid = 0;
+                        uint32_t clc_ctaid;
+                        uint32_t clc_ctaid_y;
+                        uint32_t clc_ctaid_z;
                         asm volatile(
                             "{\n\t"
                             ".reg .pred p1;\n\t"
@@ -474,7 +474,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             "selp.u32 %3, 1, 0, p1;\n\t"
                             "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                             "}\n"
-                            : "=r"(_clc_ctaid_0), "=r"(_clc_ctaid_y_0), "=r"(_clc_ctaid_z_0), "=r"(_clc_valid_0)
+                            : "=r"(clc_ctaid), "=r"(clc_ctaid_y), "=r"(clc_ctaid_z), "=r"(clc_valid)
                             : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                             : "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -487,10 +487,10 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                         work_stage += 1;
                         if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                        if (_clc_valid_0 == 0) {
+                        if (clc_valid == 0) {
                             break;
                         }
-                        this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                        this_bid = clc_ctaid + (unsigned int)cta_rank;
                     }
                 }
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -626,10 +626,10 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                         _phase_epilogue_done ^= 1;
                         mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                        uint32_t _clc_valid_1 = 0;
-                        uint32_t _clc_ctaid_1;
-                        uint32_t _clc_ctaid_y_1;
-                        uint32_t _clc_ctaid_z_1;
+                        uint32_t clc_valid_1 = 0;
+                        uint32_t clc_ctaid_1;
+                        uint32_t clc_ctaid_y_1;
+                        uint32_t clc_ctaid_z_1;
                         asm volatile(
                             "{\n\t"
                             ".reg .pred p1;\n\t"
@@ -639,7 +639,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             "selp.u32 %3, 1, 0, p1;\n\t"
                             "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                             "}\n"
-                            : "=r"(_clc_ctaid_1), "=r"(_clc_ctaid_y_1), "=r"(_clc_ctaid_z_1), "=r"(_clc_valid_1)
+                            : "=r"(clc_ctaid_1), "=r"(clc_ctaid_y_1), "=r"(clc_ctaid_z_1), "=r"(clc_valid_1)
                             : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                             : "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -653,7 +653,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                         work_stage_1 += 1;
                         if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                        if (_clc_valid_1 == 0) {
+                        if (clc_valid_1 == 0) {
                             break;
                         }
                     }
@@ -766,11 +766,11 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(sk_flags) + (skf_flag))), "r"(static_cast<unsigned int>(0)) : "memory");
                         }
                     }
-                    unsigned int _tmem_load_0_bf16[64];
+                    unsigned int tmem_load_0_bf16[64];
                     #pragma unroll
                     for (int _lp = 0; _lp < 64; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                        _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
+                        tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
                     unsigned int group_base = smem_out_addr + (unsigned int)(col_part * 8192);
                     int swz = local_row >> 1 & 3;
@@ -786,7 +786,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         #pragma unroll
                         for (int q = 0; q < 4; q++) {
                             int s0 = c * 16 + q * 4;
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(_tmem_load_0_bf16[s0]), "r"(_tmem_load_0_bf16[s0 + 1]), "r"(_tmem_load_0_bf16[s0 + 2]), "r"(_tmem_load_0_bf16[s0 + 3]));
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(tmem_load_0_bf16[s0]), "r"(tmem_load_0_bf16[s0 + 1]), "r"(tmem_load_0_bf16[s0 + 2]), "r"(tmem_load_0_bf16[s0 + 3]));
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("barrier.sync %0, 128;" :: "r"(1 + col_part) : "memory");
@@ -863,17 +863,17 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                     unsigned long long row_base_1 = (unsigned long long)global_row_1 * (unsigned long long)ldo + (unsigned long long)col_base_1;
                     mbarrier_wait(mainloop_done_addr, _phase_mainloop_done);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    float _tmem_load_2[128];
+                    float tmem_load[128];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
-                        : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31]), "=f"(_tmem_load_2[32]), "=f"(_tmem_load_2[33]), "=f"(_tmem_load_2[34]), "=f"(_tmem_load_2[35]), "=f"(_tmem_load_2[36]), "=f"(_tmem_load_2[37]), "=f"(_tmem_load_2[38]), "=f"(_tmem_load_2[39]), "=f"(_tmem_load_2[40]), "=f"(_tmem_load_2[41]), "=f"(_tmem_load_2[42]), "=f"(_tmem_load_2[43]), "=f"(_tmem_load_2[44]), "=f"(_tmem_load_2[45]), "=f"(_tmem_load_2[46]), "=f"(_tmem_load_2[47]), "=f"(_tmem_load_2[48]), "=f"(_tmem_load_2[49]), "=f"(_tmem_load_2[50]), "=f"(_tmem_load_2[51]), "=f"(_tmem_load_2[52]), "=f"(_tmem_load_2[53]), "=f"(_tmem_load_2[54]), "=f"(_tmem_load_2[55]), "=f"(_tmem_load_2[56]), "=f"(_tmem_load_2[57]), "=f"(_tmem_load_2[58]), "=f"(_tmem_load_2[59]), "=f"(_tmem_load_2[60]), "=f"(_tmem_load_2[61]), "=f"(_tmem_load_2[62]), "=f"(_tmem_load_2[63])
+                        : "=f"(tmem_load[0]), "=f"(tmem_load[1]), "=f"(tmem_load[2]), "=f"(tmem_load[3]), "=f"(tmem_load[4]), "=f"(tmem_load[5]), "=f"(tmem_load[6]), "=f"(tmem_load[7]), "=f"(tmem_load[8]), "=f"(tmem_load[9]), "=f"(tmem_load[10]), "=f"(tmem_load[11]), "=f"(tmem_load[12]), "=f"(tmem_load[13]), "=f"(tmem_load[14]), "=f"(tmem_load[15]), "=f"(tmem_load[16]), "=f"(tmem_load[17]), "=f"(tmem_load[18]), "=f"(tmem_load[19]), "=f"(tmem_load[20]), "=f"(tmem_load[21]), "=f"(tmem_load[22]), "=f"(tmem_load[23]), "=f"(tmem_load[24]), "=f"(tmem_load[25]), "=f"(tmem_load[26]), "=f"(tmem_load[27]), "=f"(tmem_load[28]), "=f"(tmem_load[29]), "=f"(tmem_load[30]), "=f"(tmem_load[31]), "=f"(tmem_load[32]), "=f"(tmem_load[33]), "=f"(tmem_load[34]), "=f"(tmem_load[35]), "=f"(tmem_load[36]), "=f"(tmem_load[37]), "=f"(tmem_load[38]), "=f"(tmem_load[39]), "=f"(tmem_load[40]), "=f"(tmem_load[41]), "=f"(tmem_load[42]), "=f"(tmem_load[43]), "=f"(tmem_load[44]), "=f"(tmem_load[45]), "=f"(tmem_load[46]), "=f"(tmem_load[47]), "=f"(tmem_load[48]), "=f"(tmem_load[49]), "=f"(tmem_load[50]), "=f"(tmem_load[51]), "=f"(tmem_load[52]), "=f"(tmem_load[53]), "=f"(tmem_load[54]), "=f"(tmem_load[55]), "=f"(tmem_load[56]), "=f"(tmem_load[57]), "=f"(tmem_load[58]), "=f"(tmem_load[59]), "=f"(tmem_load[60]), "=f"(tmem_load[61]), "=f"(tmem_load[62]), "=f"(tmem_load[63])
                         : "r"(lane_addr_1));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
-                        : "=f"(_tmem_load_2[64]), "=f"(_tmem_load_2[65]), "=f"(_tmem_load_2[66]), "=f"(_tmem_load_2[67]), "=f"(_tmem_load_2[68]), "=f"(_tmem_load_2[69]), "=f"(_tmem_load_2[70]), "=f"(_tmem_load_2[71]), "=f"(_tmem_load_2[72]), "=f"(_tmem_load_2[73]), "=f"(_tmem_load_2[74]), "=f"(_tmem_load_2[75]), "=f"(_tmem_load_2[76]), "=f"(_tmem_load_2[77]), "=f"(_tmem_load_2[78]), "=f"(_tmem_load_2[79]), "=f"(_tmem_load_2[80]), "=f"(_tmem_load_2[81]), "=f"(_tmem_load_2[82]), "=f"(_tmem_load_2[83]), "=f"(_tmem_load_2[84]), "=f"(_tmem_load_2[85]), "=f"(_tmem_load_2[86]), "=f"(_tmem_load_2[87]), "=f"(_tmem_load_2[88]), "=f"(_tmem_load_2[89]), "=f"(_tmem_load_2[90]), "=f"(_tmem_load_2[91]), "=f"(_tmem_load_2[92]), "=f"(_tmem_load_2[93]), "=f"(_tmem_load_2[94]), "=f"(_tmem_load_2[95]), "=f"(_tmem_load_2[96]), "=f"(_tmem_load_2[97]), "=f"(_tmem_load_2[98]), "=f"(_tmem_load_2[99]), "=f"(_tmem_load_2[100]), "=f"(_tmem_load_2[101]), "=f"(_tmem_load_2[102]), "=f"(_tmem_load_2[103]), "=f"(_tmem_load_2[104]), "=f"(_tmem_load_2[105]), "=f"(_tmem_load_2[106]), "=f"(_tmem_load_2[107]), "=f"(_tmem_load_2[108]), "=f"(_tmem_load_2[109]), "=f"(_tmem_load_2[110]), "=f"(_tmem_load_2[111]), "=f"(_tmem_load_2[112]), "=f"(_tmem_load_2[113]), "=f"(_tmem_load_2[114]), "=f"(_tmem_load_2[115]), "=f"(_tmem_load_2[116]), "=f"(_tmem_load_2[117]), "=f"(_tmem_load_2[118]), "=f"(_tmem_load_2[119]), "=f"(_tmem_load_2[120]), "=f"(_tmem_load_2[121]), "=f"(_tmem_load_2[122]), "=f"(_tmem_load_2[123]), "=f"(_tmem_load_2[124]), "=f"(_tmem_load_2[125]), "=f"(_tmem_load_2[126]), "=f"(_tmem_load_2[127])
+                        : "=f"(tmem_load[64]), "=f"(tmem_load[65]), "=f"(tmem_load[66]), "=f"(tmem_load[67]), "=f"(tmem_load[68]), "=f"(tmem_load[69]), "=f"(tmem_load[70]), "=f"(tmem_load[71]), "=f"(tmem_load[72]), "=f"(tmem_load[73]), "=f"(tmem_load[74]), "=f"(tmem_load[75]), "=f"(tmem_load[76]), "=f"(tmem_load[77]), "=f"(tmem_load[78]), "=f"(tmem_load[79]), "=f"(tmem_load[80]), "=f"(tmem_load[81]), "=f"(tmem_load[82]), "=f"(tmem_load[83]), "=f"(tmem_load[84]), "=f"(tmem_load[85]), "=f"(tmem_load[86]), "=f"(tmem_load[87]), "=f"(tmem_load[88]), "=f"(tmem_load[89]), "=f"(tmem_load[90]), "=f"(tmem_load[91]), "=f"(tmem_load[92]), "=f"(tmem_load[93]), "=f"(tmem_load[94]), "=f"(tmem_load[95]), "=f"(tmem_load[96]), "=f"(tmem_load[97]), "=f"(tmem_load[98]), "=f"(tmem_load[99]), "=f"(tmem_load[100]), "=f"(tmem_load[101]), "=f"(tmem_load[102]), "=f"(tmem_load[103]), "=f"(tmem_load[104]), "=f"(tmem_load[105]), "=f"(tmem_load[106]), "=f"(tmem_load[107]), "=f"(tmem_load[108]), "=f"(tmem_load[109]), "=f"(tmem_load[110]), "=f"(tmem_load[111]), "=f"(tmem_load[112]), "=f"(tmem_load[113]), "=f"(tmem_load[114]), "=f"(tmem_load[115]), "=f"(tmem_load[116]), "=f"(tmem_load[117]), "=f"(tmem_load[118]), "=f"(tmem_load[119]), "=f"(tmem_load[120]), "=f"(tmem_load[121]), "=f"(tmem_load[122]), "=f"(tmem_load[123]), "=f"(tmem_load[124]), "=f"(tmem_load[125]), "=f"(tmem_load[126]), "=f"(tmem_load[127])
                         : "r"(lane_addr_1 + 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     if (elect_sync()) {
@@ -883,11 +883,11 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                             :: "r"((epilogue_done_addr) & 0xFEFFFFFF) : "memory");
                     }
                     _phase_mainloop_done ^= 1;
-                    unsigned int _tmem_load_2_bf16[64];
+                    unsigned int tmem_load_0_bf16_1[64];
                     #pragma unroll
                     for (int _lp = 0; _lp < 64; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_2[_lp*2 + 0], _tmem_load_2[_lp*2+1 + 0]));
-                        _tmem_load_2_bf16[_lp] = *(uint32_t*)&_bf2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(tmem_load[_lp*2 + 0], tmem_load[_lp*2+1 + 0]));
+                        tmem_load_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     unsigned int group_base_1 = smem_out_addr + (unsigned int)(col_part * 8192);
                     int swz_1 = local_row >> 1 & 3;
@@ -903,7 +903,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         #pragma unroll
                         for (int q_1 = 0; q_1 < 4; q_1++) {
                             int s0_1 = c_1 * 16 + q_1 * 4;
-                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row_1 + (unsigned int)((q_1 ^ swz_1) * 16)), "r"(_tmem_load_2_bf16[s0_1]), "r"(_tmem_load_2_bf16[s0_1 + 1]), "r"(_tmem_load_2_bf16[s0_1 + 2]), "r"(_tmem_load_2_bf16[s0_1 + 3]));
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row_1 + (unsigned int)((q_1 ^ swz_1) * 16)), "r"(tmem_load_0_bf16_1[s0_1]), "r"(tmem_load_0_bf16_1[s0_1 + 1]), "r"(tmem_load_0_bf16_1[s0_1 + 2]), "r"(tmem_load_0_bf16_1[s0_1 + 3]));
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("barrier.sync %0, 128;" :: "r"(1 + col_part) : "memory");
@@ -915,10 +915,10 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                    uint32_t _clc_valid_2 = 0;
-                    uint32_t _clc_ctaid_2;
-                    uint32_t _clc_ctaid_y_2;
-                    uint32_t _clc_ctaid_z_2;
+                    uint32_t clc_valid_2 = 0;
+                    uint32_t clc_ctaid_2;
+                    uint32_t clc_ctaid_y_2;
+                    uint32_t clc_ctaid_z_2;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -928,7 +928,7 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         "selp.u32 %3, 1, 0, p1;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
                         "}\n"
-                        : "=r"(_clc_ctaid_2), "=r"(_clc_ctaid_y_2), "=r"(_clc_ctaid_z_2), "=r"(_clc_valid_2)
+                        : "=r"(clc_ctaid_2), "=r"(clc_ctaid_y_2), "=r"(clc_ctaid_z_2), "=r"(clc_valid_2)
                         : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -942,10 +942,10 @@ kernel_cake_kimi_k3_fp8_projection_27b7d66a6b7fc92fbadf(const __grid_constant__ 
                         :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                     work_stage_2 += 1;
                     if (work_stage_2 == 4) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                    if (_clc_valid_2 == 0) {
+                    if (clc_valid_2 == 0) {
                         break;
                     }
-                    this_bid_1 = _clc_ctaid_2 + (unsigned int)cta_rank;
+                    this_bid_1 = clc_ctaid_2 + (unsigned int)cta_rank;
                 }
             }
             if ((warp - 2) % 4 == 0) {

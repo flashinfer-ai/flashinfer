@@ -438,7 +438,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         if (load_stage == 3) { load_stage = 0; _phase_mma_done_h0 ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    uint32_t _clc_valid_0 = 0;
+                    uint32_t clc_valid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -447,10 +447,10 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_0)
+                        : "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_0 = 0;
+                    uint32_t clc_ctaid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -459,7 +459,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_0)
+                        : "+r"(clc_ctaid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -472,10 +472,10 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                     work_stage += 1;
                     if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                    if (_clc_valid_0 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                    this_bid = clc_ctaid + (unsigned int)cta_rank;
                 }
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 #pragma unroll 1
@@ -554,7 +554,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                     _phase_epilogue_done ^= 1;
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_1 = 0;
+                    uint32_t clc_valid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -563,10 +563,10 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_1)
+                        : "=r"(clc_valid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_1 = 0;
+                    uint32_t clc_ctaid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -575,7 +575,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_1)
+                        : "+r"(clc_ctaid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -589,7 +589,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_1 == 0) {
+                    if (clc_valid_1 == 0) {
                         break;
                     }
                 }
@@ -653,11 +653,11 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                         :: "r"((epilogue_done_addr) & 0xFEFFFFFF) : "memory");
                 }
                 _phase_mainloop_done ^= 1;
-                unsigned int _tmem_load_0_bf16[48];
+                unsigned int tmem_load_0_bf16[48];
                 #pragma unroll
                 for (int _lp = 0; _lp < 48; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                    _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
+                    tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
                 unsigned int ts_base = smem_out_addr + (unsigned int)(col_part * 8192);
                 unsigned int ts_row = ts_base + (unsigned int)(local_row * 64);
@@ -673,7 +673,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     #pragma unroll
                     for (int q = 0; q < 4; q++) {
                         int s0 = c * 16 + q * 4;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(_tmem_load_0_bf16[s0]), "r"(_tmem_load_0_bf16[s0 + 1]), "r"(_tmem_load_0_bf16[s0 + 2]), "r"(_tmem_load_0_bf16[s0 + 3]));
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(tmem_load_0_bf16[s0]), "r"(tmem_load_0_bf16[s0 + 1]), "r"(tmem_load_0_bf16[s0 + 2]), "r"(tmem_load_0_bf16[s0 + 3]));
                     }
                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + col_part) : "memory");
                     int col_c = col_base + c * 32 + rd_half * 4;
@@ -701,7 +701,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                uint32_t _clc_valid_2 = 0;
+                uint32_t clc_valid_2 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -710,10 +710,10 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_2)
+                    : "=r"(clc_valid_2)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_2 = 0;
+                uint32_t clc_ctaid_2 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -722,7 +722,7 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_2)
+                    : "+r"(clc_ctaid_2)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -736,10 +736,10 @@ kernel_cake_kimi_k3_fp8_projection_271ae5909b511dac796f(const __grid_constant__ 
                     :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                 work_stage_2 += 1;
                 if (work_stage_2 == 4) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                if (_clc_valid_2 == 0) {
+                if (clc_valid_2 == 0) {
                     break;
                 }
-                this_bid_1 = _clc_ctaid_2 + (unsigned int)cta_rank;
+                this_bid_1 = clc_ctaid_2 + (unsigned int)cta_rank;
             }
         }
     }
