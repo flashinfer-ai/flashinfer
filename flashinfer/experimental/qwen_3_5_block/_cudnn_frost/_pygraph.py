@@ -165,6 +165,28 @@ def _in_axis_order_of(shape, stride, reference_stride):
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
+def _python_plan_deserialize_args(args: tuple, kwargs: Dict[str, Any]):
+    """``(handle, data, enforce_precompiled)`` when a deserialize call carries a python-engine
+    plan blob, else None. Mirrors the two classic overloads: ``(data)`` and
+    ``(handle, data, enforce_precompiled=...)``, positional or by the pybind names."""
+    from . import _plan_serdes
+
+    rest = list(args)
+    handle = kwargs.get("handle_")
+    data = kwargs.get("pyobj")
+    if data is not None and handle is None and rest:
+        handle = rest.pop(0)
+    elif data is None and rest and _plan_serdes.is_python_plan(rest[0]):
+        data = rest.pop(0)
+    elif data is None and len(rest) >= 2 and _plan_serdes.is_python_plan(rest[1]):
+        handle, data = rest[0], rest[1]
+        rest = rest[2:]
+    if data is None or not _plan_serdes.is_python_plan(data):
+        return None
+    enforce = kwargs.get("enforce_precompiled", rest[0] if rest else False)
+    return handle, data, bool(enforce)
+
+
 def cudnn_graph_not_supported(message: str) -> Exception:
     """The classic unsupported-graph error (built lazily: importing cudnn at
     module scope here would be circular)."""
@@ -231,6 +253,7 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        cuda_graph_retention: Any = None,
         *,
         is_cuda_graph_replay_expected: bool = False,
         **kwargs,
@@ -250,6 +273,7 @@ class pygraph:
             ("sm_version", sm_version),
             ("kernel_cache", kernel_cache),
             ("device_property", device_property),
+            ("cuda_graph_retention", cuda_graph_retention),
         ):
             if _v is not None:
                 self._cpp_graph_kwargs[_k] = _v
@@ -287,6 +311,7 @@ class pygraph:
         self._backend_heuristics: Optional[List] = None  # heur modes for a backend plan
         self._cpp_plans_created: bool = False  # C++ create_execution_plans ran
         self._compiled_plans: Dict[int, Any] = {}  # plan_index -> CompiledPlan (python plans)
+        self._plan_kernel_entries: Dict[int, List[Any]] = {}  # plan_index -> compiled_cache entries its build used (serialize)
         self._cpp_bog_done: bool = False  # C++ build_operation_graph ran
         self._cpp_tensors: Dict[int, Any] = {}  # IR uid -> lowered C++ tensor
         self._reserved_uids: set = set()  # user-specified uids _alloc_uid must skip
@@ -1823,7 +1848,11 @@ class pygraph:
         eng = self._engine_for(cfg)
         if eng is not None:
             if index not in self._compiled_plans:
-                self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                from .frost import compiled_cache
+
+                with compiled_cache.record_entries() as entries:
+                    self._compiled_plans[index] = eng.build_plan(self, cfg, ctx or self._build_context())
+                self._plan_kernel_entries[index] = entries
             self._prepare_ordered_binding_schema()
             return
         cfg = self._materialize_backend_plan(index)
@@ -2045,7 +2074,7 @@ class pygraph:
         return self
 
     def execute_plan_at_index(self, tensor_dict, workspace=None, index: int = 0, handle=None, *args, tensor_uids=None, **kwargs) -> None:
-        """Execute the plan at ``index`` in the ranked list (classic at-index API)."""
+        """Execute one ranked plan without changing the graph's selected plan."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             if tensor_uids is not None:
                 pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
@@ -2054,31 +2083,7 @@ class pygraph:
             var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
             return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
-        cfg = self._plans[index]
-        engine = self._engine_for(cfg)
-        if engine is not None:
-            keep_index, keep_pin, keep_built = self._plan_index, self._plan_pinned, self._is_built
-            try:
-                self._plan_index, self._plan_pinned = index, True
-                if index not in self._compiled_plans:
-                    self._build_plan_at(index, ctx=self._build_context(handle) if handle is not None else None)
-                self._is_built = True
-                self.execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, **kwargs)
-            finally:
-                self._plan_index, self._plan_pinned, self._is_built = keep_index, keep_pin, keep_built
-            return
-        cfg = self._materialize_backend_plan(index)
-        if tensor_uids is not None:
-            pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-            return self._lowered_graph._execute_ordered_pack(
-                pack.native, pack.workspace, to_backend_handle(handle) or 0, -1 if cfg.cpp_index is None else cfg.cpp_index
-            )
-        uid_to_data = self._uid_to_data(tensor_dict)
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-        if cfg.cpp_index is None:  # delegating entry
-            self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), *args, **kwargs)
-            return
-        self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cfg.cpp_index, to_backend_handle(handle), *args, **kwargs)
+        return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
 
     def execute(
         self,
@@ -2116,7 +2121,25 @@ class pygraph:
                          is cached internally by value, while buffer observations,
                          workspace and the handle's stream remain per call.
         """
-        if not self._is_built:
+        return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids)
+
+    def _execute(
+        self,
+        tensor_dict,
+        workspace=None,
+        handle=None,
+        override_uids=None,
+        override_shapes=None,
+        override_strides=None,
+        tensor_uids=None,
+        *,
+        index=None,
+    ):
+        # Keep the caller's choice local across binding and launch. Temporarily
+        # selecting/restoring an index lets overlapping callers run each other's
+        # plan and can corrupt the selection left for ordinary execute().
+        explicit_index = index is not None
+        if not explicit_index and not self._is_built:
             # A JIT engine must compile for the device/stream it will run on, so
             # build the caller context here. Only here: a steady-state execute()
             # otherwise discarded this (a cudnnGetStream round-trip + an
@@ -2126,12 +2149,15 @@ class pygraph:
                 self.create_execution_plans()
             self.build(ctx=caller_ctx)
 
+        if not explicit_index:
+            index = self._plan_index
+
         ordered = tensor_uids is not None
         uid_to_data = None if ordered else self._uid_to_data(tensor_dict)
         # Backend overrides use its uid-map overload. Python plans must consume
         # them through VariantPack; a legacy uid-map executor cannot honor them.
         overriding = override_uids is not None or override_shapes is not None or override_strides is not None
-        eng = self.selected_engine
+        eng = self._engine_for(self._plans[index]) if explicit_index else self.selected_engine
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
@@ -2140,13 +2166,14 @@ class pygraph:
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
             ensure_current_context(stream, h.device.ordinal if h is not None else None)
-            if self._plan_index not in self._compiled_plans:
+            if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
                 ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
-                self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
-                self._is_built = True
-            plan = self._compiled_plans[self._plan_index]
+                self._compiled_plans[index] = eng.build_plan(self, self._plans[index], ctx)
+                if not explicit_index:
+                    self._is_built = True
+            plan = self._compiled_plans[index]
             native_ordered = getattr(plan, "_ordered_native", None) if ordered else None
             if native_ordered is not None:
                 schema = self._prepare_ordered_binding_schema()
@@ -2187,7 +2214,7 @@ class pygraph:
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
-        cfg = self._materialize_backend_plan(self._plan_index) if self._plans else None
+        cfg = self._materialize_backend_plan(index) if self._plans else None
         cpp_index = cfg.cpp_index if cfg is not None else None
 
         if ordered:
@@ -2563,6 +2590,15 @@ class pygraph:
 
         return {uid: _ptr(d) for uid, d in uid_to_data.items()}, (_ptr(workspace) if workspace is not None else 0)
 
+    def get_cuda_graph_retention(self):
+        """The CUDA graph retention mode in effect for this graph: the one passed as
+        ``cuda_graph_retention``, else the ``CUDNN_CUDA_GRAPH_RETENTION`` environment variable, else
+        ``cuda_graph_retention.PER_GRAPH``. Available before the graph is lowered."""
+        lowered = self.__dict__.get("_lowered_graph")
+        if lowered is not None:
+            return lowered.get_cuda_graph_retention()
+        return _pybind_module._effective_cuda_graph_retention(self._cpp_graph_kwargs.get("cuda_graph_retention"))
+
     def __getattr__(self, name: str):
         # Plan-configuration and query methods (deselect_engines,
         # get_engine_and_knobs_at_index, key, populate_cuda_graph, ...) operate
@@ -2583,16 +2619,27 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    def serialize(self, *, as_bytes: bool = False):
-        """Serialize the graph's cuDNN backend execution plan.
+    def serialize(self, *, as_bytes: bool = False, include_kernels: bool = True):
+        """Serialize the graph's selected execution plan.
 
         Returns a list of byte values by default. Set ``as_bytes=True`` to
         return the same binary data as compact ``bytes`` without constructing
         a Python list. ``deserialize`` accepts either representation.
+
+        A backend plan serializes in the cuDNN backend's format. A python-engine
+        plan (FROST, ...) serializes as the graph plus its ``(engine_id, knobs)``
+        and, with ``include_kernels``, its compiled kernels (see
+        ``cudnn._plan_serdes``); only ``pygraph.deserialize`` reads that format.
         """
+        if self._planning_done and self.selected_engine is not None:
+            from . import _plan_serdes
+
+            if not self._is_built or self._plan_index not in self._compiled_plans:
+                raise RuntimeError("serialize(): build the selected plan first (build_plans())")
+            blob = _plan_serdes.serialize(self, include_kernels=include_kernels)
+            return blob if as_bytes else list(blob)
         if self._lowered_graph is None:
-            # Serialization is the cuDNN graph format by definition — lower on
-            # demand (independent of which plan is selected for execution).
+            # Backend-selected or unplanned: the cuDNN graph format — lower on demand.
             node = self._unlowerable_node()
             if node is not None:
                 # As key(): the format has no field for what the backend cannot
@@ -2613,7 +2660,17 @@ class pygraph:
         or as the ``handle_`` keyword (the pybind overload's name); unwrap a
         Handle to its backend int and leave the ``data`` blob (the other overload)
         untouched. Binary data may be ``bytes`` or the legacy list of byte
-        values; JSON strings retain their structural-graph meaning."""
+        values; JSON strings retain their structural-graph meaning. A
+        python-engine blob from ``serialize()`` is rebuilt here, into an empty
+        graph, and its plan built."""
+        python_plan = _python_plan_deserialize_args(args, kwargs)
+        if python_plan is not None:
+            from . import _plan_serdes
+
+            handle, data, enforce_precompiled = python_plan
+            _plan_serdes.deserialize(self, data, handle=handle, enforce_precompiled=enforce_precompiled)
+            self._sorted_uids = None
+            return
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):
@@ -2630,7 +2687,7 @@ class pygraph:
                 # a deserialized plan carries its own context; forcing FLOAT here
                 # would change existing one-argument deserialize(blob) callers.
                 deser_kwargs = {}
-                for _k in ("name", "kernel_cache", "device_property"):
+                for _k in ("name", "kernel_cache", "device_property", "cuda_graph_retention"):
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
                 backend_handle = self._backend_handle_for_lowering(deser_kwargs)

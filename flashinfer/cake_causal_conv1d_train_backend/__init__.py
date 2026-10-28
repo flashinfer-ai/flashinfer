@@ -42,6 +42,15 @@ Host design (the knobs are keywords; no environment variable):
 - The backward workspace is sized for every backward program of the device's
   architecture (the bias programs' partials carry a fifth, dbias, slab), so one
   buffer serves every route, token count and CUDA Graph.
+- The forward (the dynamic token-chunk programs) takes its token chunks from
+  int32 counters, two per channel tile, in a forward workspace that is zero
+  before its first launch and that every launch leaves zero: a caller-owned
+  buffer (``workspace=``, from :func:`cake_causal_conv1d_train_forward_workspace`)
+  or, when omitted, a zeroed buffer this module keeps per (device, current
+  stream), grown as needed and never zeroed again; inside a CUDA Graph capture
+  an omitted workspace is a zeroed buffer of the call's own (its zeroing is
+  captured with the launch), so a graph never shares counters with eager
+  calls or with another graph.
 """
 
 from __future__ import annotations
@@ -65,7 +74,9 @@ from .cake_jit import (
     WIDTH,
     arch_for_capability,
     backward_route,
+    counter_words,
     forward_route,
+    forward_workspace_words,
     launch_grid,
     partial_bytes,
     partial_rows,
@@ -73,6 +84,7 @@ from .cake_jit import (
     route_applies,
     route_modules,
     run_module,
+    run_modules,
     selected_modules,
     workspace_layout,
     workspace_owners,
@@ -85,6 +97,11 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 PARAMETER_DTYPES = (torch.float32, torch.bfloat16)
 # The two SiLU'-evaluation policies of the weight gradient (``silu_grad_preactivation``).
 SILU_GRAD_PREACTIVATIONS = ("bf16", "fp32")
+# The forward workspaces of the calls that pass none: (device index, CUDA stream
+# handle) -> a zeroed int32 buffer, grown as needed.  The launches of one stream
+# run in order and each leaves its counters zero, so the stream's buffer serves
+# every later forward call on it.
+_FORWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -328,22 +345,30 @@ def _route(arch: str, kind: str, *, needs: str, C: int, S: int) -> tuple[str, ..
 
 def _launch(
     record: dict, S: int, C: int, num_docs: int, *, device_index: int
-) -> tuple[dict[str, int], int]:
+) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
 
     CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
     a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
     x threads x vec`` channels is refused rather than left partly unwritten.
+    The caller launches this grid (``run_module`` / ``run_modules`` ``grid``),
+    so a call plans it once.
     """
 
-    scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
-    grid_x = launch_grid(record, device_index=device_index)[0]
-    if scalars["n_ch_tiles"] > grid_x:
+    scalars = plan(
+        S,
+        C,
+        num_docs,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+    )
+    grid = launch_grid(record, device_index=device_index, C=C, S=S)
+    if scalars["n_ch_tiles"] > grid[0]:
         raise ValueError(
             f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
-            f"device is {grid_x} CTAs; every channel tile needs a CTA"
+            f"device is {grid[0]} CTAs; every channel tile needs a CTA"
         )
-    return scalars, grid_x
+    return scalars, grid
 
 
 def cake_causal_conv1d_train_backward_workspace_bytes(
@@ -356,10 +381,12 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     main program, one row per ``n_ch_tiles`` CTAs of a program's launch grid
     (``rows = ceil(grid / n_ch_tiles)``, ``grid = grid_mult x ctas_per_sm x SM
     count``: the bytes grow with the program's over-decomposition factor
-    ``grid_mult``), sized by the largest such buffer over every backward
-    program of every backward route of the architecture: the call's arguments
-    select the route and the channel count the program, every program writes
-    the leading rows of its own grid inside this buffer, and its reduce
+    ``grid_mult``; a call whose grid drops CTAs to whole channel-tile ranks,
+    ``cake_jit.main_grid``, writes fewer rows), sized by the largest such
+    buffer over every backward program of every backward route of the
+    architecture: the call's arguments select the route and the channel count
+    the program, every program writes the leading rows of its own grid inside
+    this buffer, and its reduce
     program sums exactly those.  So one buffer serves every route (the bias
     routes' fifth slab makes it 25 % larger than the dweight partials alone,
     for every caller) and, as it depends on ``C`` and the device only, every
@@ -391,6 +418,84 @@ def cake_causal_conv1d_train_backward_workspace(
 
     nbytes = cake_causal_conv1d_train_backward_workspace_bytes(S, C, device)
     return torch.empty(nbytes, dtype=torch.uint8, device=torch.device(device))
+
+
+def cake_causal_conv1d_train_forward_workspace_bytes(
+    S: int, C: int, device: torch.device
+) -> int:
+    """Bytes of the caller-owned forward workspace for ``C`` channels on ``device``.
+
+    The forward's programs take their token chunks from int32 counters, two
+    per channel tile (the next-chunk counter and the done-CTA counter of the
+    tile), sized by the most over every forward program of every forward route
+    of the architecture (``cake_jit.forward_workspace_words``), so one buffer
+    serves every route; the size depends on ``C`` only (``S`` is checked and
+    otherwise unused, as for the backward helper).  The buffer must be zero
+    before its first launch; every launch leaves it zero, so one buffer serves
+    every later forward call of one stream, CUDA Graph replays included,
+    without zeroing.  Two launches that may run at once (on two streams, or
+    two graphs replayed concurrently) need two buffers.
+    """
+
+    device = torch.device(device)
+    S, C = int(S), int(C)
+    if S < 0:
+        raise ValueError("S must be non-negative")
+    if C <= 0 or C % CHANNEL_MULTIPLE:
+        raise ValueError(
+            f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
+        )
+    return 4 * forward_workspace_words(_device_arch(device), C)
+
+
+def cake_causal_conv1d_train_forward_workspace(
+    S: int, C: int, device: torch.device
+) -> torch.Tensor:
+    """Allocate a zeroed int32 forward workspace (see ``..._workspace_bytes``); keep it for every later forward
+    call of one stream."""
+
+    nbytes = cake_causal_conv1d_train_forward_workspace_bytes(S, C, device)
+    return torch.zeros(nbytes // 4, dtype=torch.int32, device=torch.device(device))
+
+
+def _forward_work(
+    workspace: object, words: int, *, device: torch.device, device_index: int
+) -> Optional[torch.Tensor]:
+    """The ``work`` counters of one forward launch needing ``words`` int32 words.
+
+    A caller-owned ``workspace`` (1-D int32, contiguous, on ``device``, at least
+    ``words`` words, zero before its first launch) is used as is.  Without one:
+    inside a CUDA Graph capture a fresh zeroed buffer (its zeroing is captured
+    with the launch, so the graph shares no counters with eager calls or other
+    graphs); else the zeroed buffer this module keeps for the device and the
+    current stream, replaced by a larger zeroed one when it is too small (the
+    stream-ordered allocator frees the old one after the launches queued on
+    the stream).  ``None`` when the program takes no counters.
+    """
+
+    if workspace is not None:
+        ws = _require_tensor(workspace, "workspace")
+        if ws.ndim != 1:
+            raise ValueError(
+                f"workspace must be a 1-D int32 CUDA tensor, got shape {tuple(ws.shape)}"
+            )
+        _check_placement(ws, "workspace", device=device, dtype=torch.int32)
+        if ws.numel() < words:
+            raise ValueError(
+                f"workspace holds {ws.numel()} int32 words; this call needs at least "
+                f"{words}; allocate cake_causal_conv1d_train_forward_workspace(S, C, device)"
+            )
+        return ws
+    if words == 0:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(words, dtype=torch.int32, device=device)
+    key = (device_index, int(torch.cuda.current_stream(device_index).cuda_stream))
+    held = _FORWARD_WORKSPACES.get(key)
+    if held is None or held.numel() < words:
+        held = torch.zeros(words, dtype=torch.int32, device=device)
+        _FORWARD_WORKSPACES[key] = held
+    return held
 
 
 def _partial_view(
@@ -429,6 +534,7 @@ def cake_causal_conv1d_train_forward(
     *,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
 
@@ -449,6 +555,14 @@ def cake_causal_conv1d_train_forward(
         independent of ``weight``'s), added after the four taps.
     out : torch.Tensor, optional
         Preallocated BF16 output of ``x``'s shape, contiguous.
+    workspace : torch.Tensor, optional
+        Caller-owned int32 buffer from
+        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
+        counters, zero before its first launch; every launch leaves it zero,
+        so one buffer serves every later call of one stream).  Two launches
+        that may run at once need two buffers.  When omitted the package
+        uses a zeroed buffer it keeps per (device, current stream), or a
+        fresh zeroed one inside a CUDA Graph capture.
 
     Returns
     -------
@@ -471,7 +585,7 @@ def cake_causal_conv1d_train_forward(
     kind = forward_route(bias=b is not None, bf16_taps=w.dtype == torch.bfloat16)
     names = _route(arch, kind, needs="this forward (bias / BF16 taps)", C=C, S=S)
     device_index = _device_index(device)
-    scalars, _ = _launch(
+    scalars, grid = _launch(
         _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
     )
     values: dict[str, object] = {
@@ -484,8 +598,19 @@ def cake_causal_conv1d_train_forward(
     }
     if b is not None:
         values["b"] = b
+    words = max(
+        counter_words(_loader.MODULES[name], scalars["n_ch_tiles"]) for name in names
+    )
+    work = _forward_work(workspace, words, device=device, device_index=device_index)
+    if work is not None:
+        values["work"] = work
     for name in names:
-        run_module(name, values, device_index=device_index)
+        run_module(
+            name,
+            values,
+            device_index=device_index,
+            grid=grid if name == names[0] else None,
+        )
     return y
 
 
@@ -620,7 +745,8 @@ def cake_causal_conv1d_train_backward(
             "partial workspace"
         )
     device_index = _device_index(device)
-    scalars, grid_x = _launch(record, S, C, num_docs, device_index=device_index)
+    scalars, grid = _launch(record, S, C, num_docs, device_index=device_index)
+    grid_x = grid[0]
     if workspace is None:
         workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
     rows = partial_rows(grid_x, scalars["n_ch_tiles"])
@@ -644,8 +770,13 @@ def cake_causal_conv1d_train_backward(
     # route's reduce program, programmatically dependent on it through its
     # binding's launch attribute, sums into dweight (and dbias) on the same
     # stream the rows of each channel tile that a grid of main_ctas CTAs wrote.
-    run_module(names[0], values, device_index=device_index)
-    run_module(record["reduce"], values, device_index=device_index)
+    # Both are issued back to back in one stream context, so the reduce is
+    # queued while the main program runs.
+    run_modules(
+        ((names[0], grid), (record["reduce"], None)),
+        values,
+        device_index=device_index,
+    )
     if db_out is None:
         return dx_out, dw_out
     return dx_out, dw_out, db_out
@@ -736,5 +867,7 @@ __all__ = [
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",
     "cake_causal_conv1d_train_forward",
+    "cake_causal_conv1d_train_forward_workspace",
+    "cake_causal_conv1d_train_forward_workspace_bytes",
     "is_cake_causal_conv1d_train_supported",
 ]

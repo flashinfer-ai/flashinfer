@@ -36,6 +36,10 @@ bugs there. See [Kernel review](#kernel-review).
    flag perf claims without numbers. The PR title/description normally become the commit
    title/message on (squash) merge and are relied on when bisecting — hold them to that
    standard.
+7. **Triggering CI.** When you start CI on a PR, scope it to the test paths the change
+   touches: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) / `/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths
+   under `tests/`. A bare `run` starts the full suite, which is expensive; it needs a reason
+   (final pre-merge check of a cross-cutting change), not habit.
 
 **Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
 pre-merge check that QA puts in and maintains, not code review.

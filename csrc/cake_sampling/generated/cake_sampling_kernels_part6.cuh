@@ -11454,6 +11454,7 @@ kernel_cake_radix_topk_c2_e16s_sp_lp(float* __restrict__ probs, int* __restrict_
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     unsigned int need = 2 * k_u + 64;
+    unsigned int need_fit = (3 * k_u >> 1) + 64;
     unsigned int margin_rt = (5 * nchunks_u * stride_u + 4 * nsamp_u - 1) / (4 * nsamp_u);
     unsigned int cap_rt = 8192 * nsamp_u / (nchunks_u * stride_u);
     unsigned int c0 = 0;
@@ -11484,6 +11485,7 @@ kernel_cake_radix_topk_c2_e16s_sp_lp(float* __restrict__ probs, int* __restrict_
     c1 = c1 + words_0[1];
     c2 = c2 + words_0[2];
     c3 = c3 + words_0[3];
+    unsigned int fit_cap_rt = 2048 * nsamp_u / (nchunks_u * stride_u);
     unsigned int local = c0 + c1 + c2 + c3;
     uint32_t _warp_scan_sum_12 = local;
     asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_12) : "r"(1));
@@ -11511,30 +11513,36 @@ kernel_cake_radix_topk_c2_e16s_sp_lp(float* __restrict__ probs, int* __restrict_
     bool need_hit = 0;
     unsigned int need_bucket = 0;
     unsigned int need_mass = 0;
+    unsigned int fit_mass = 0;
     if (need > five * suffix) {
         if (need <= five * a3) {
             need_hit = 1;
             need_bucket = (unsigned int)(tid * 4 + 3);
             need_mass = a3;
+            fit_mass = suffix;
         } else if (need <= five * a2) {
             need_hit = 1;
             need_bucket = (unsigned int)(tid * 4 + 2);
             need_mass = a2;
+            fit_mass = a3;
         } else {
             if (need <= five * a1) {
                 need_hit = 1;
                 need_bucket = (unsigned int)(tid * 4 + 1);
                 need_mass = a1;
+                fit_mass = a2;
             } else if (need <= five * a0) {
                 need_hit = 1;
                 need_bucket = (unsigned int)(tid * 4);
                 need_mass = a0;
+                fit_mass = a1;
             }
         }
     }
     if (need_hit) {
         scal[0] = need_bucket;
         scal[7] = need_mass;
+        scal[10] = fit_mass;
     }
     bool cap_hit = 0;
     unsigned int cap_bucket = 0;
@@ -11574,6 +11582,11 @@ kernel_cake_radix_topk_c2_e16s_sp_lp(float* __restrict__ probs, int* __restrict_
         scal[1] = 0;
         if (b_cap > b_need) {
             scal[7] = scal[8];
+        }
+        unsigned int mass_up = scal[10];
+        if (b_cap <= b_need && fit_cap_rt < scal[7] && need_fit <= five * mass_up) {
+            scal[0] = b_need + 1;
+            scal[7] = mass_up;
         }
     }
     __syncthreads();

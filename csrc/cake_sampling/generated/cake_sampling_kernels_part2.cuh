@@ -30077,7 +30077,7 @@ kernel_cake_radix_topk_c8_e16s_bt(float* __restrict__ probs, int* __restrict__ t
     }
     asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-    unsigned int need = 2 * k_u + 64;
+    unsigned int need = (3 * k_u >> 1) + 64;
     if (warp == 0) {
         unsigned int cc[4];
         unsigned int lo[4];

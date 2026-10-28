@@ -66,6 +66,7 @@ visible_key_count = cake_backend.visible_key_count
 visible_key_counts = cake_backend.visible_key_counts
 MERGE_KEY = cake_policy.MERGE_KEY
 POLICY_FIELDS = cake_policy.POLICY_FIELDS
+SAMPLE_SHIFT_PERMILLE_BOUNDS = cake_policy.SAMPLE_SHIFT_PERMILLE_BOUNDS
 DispatchPolicy = cake_policy.DispatchPolicy
 finalize_grid = cake_policy.finalize_grid
 finalize_key = cake_policy.finalize_key
@@ -114,6 +115,7 @@ _COMMON = dict(
     sample_tiles_tiny_units=8,
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
+    sample_shift_rule=None,
     far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
@@ -342,6 +344,10 @@ def test_registry_records_are_well_formed():
         # the wide-first precedence reaches the unrolled wide program in both fit forms
         if policy.wide_first_rule is not None:
             assert {"scan:wide:u2:s0:f0", "scan:wide:u2:s0:f1"} <= set(keys), arch
+        # the sampled rank shift rule: a top_k floor a call can reach, a shift the default does not already give
+        if policy.sample_shift_rule is not None:
+            assert 1 <= policy.sample_shift_rule[0] <= MAX_TOP_K, arch
+            assert policy.sample_shift_rule[1] != policy.sample_shift_permille, arch
         # a split needs grid // units >= 2 (rounds <= 0.5) and a wide unit needs rounds >= wide_rule[0], so without
         # the two-way wave split the wide split program is unreachable where wide_rule[0] > 0.5 and need not ship
         assert "scan:split_wide:u1:s0:f0" in keys or (
@@ -670,6 +676,19 @@ def test_policy_record_round_trip_and_validation():
         dict(pair_units=["wide", "l6"]),
         dict(pair_units=["l6", "l6"]),
         dict(pair_units=[]),
+        # the sampled rank shift rule: [min top_k, shift permille] or None, the shift inside the knob's bound
+        dict(sample_shift_rule=4096),
+        dict(sample_shift_rule=[]),
+        dict(sample_shift_rule=[4096]),
+        dict(sample_shift_rule=[4096, 500, 1]),
+        dict(sample_shift_rule=[-1, 500]),
+        dict(sample_shift_rule=[0, 500]),
+        dict(sample_shift_rule=[4096, 20000]),
+        dict(sample_shift_rule=[4096, -1001]),
+        dict(sample_shift_rule=["a", 500]),
+        dict(sample_shift_rule=[4096.0, 500]),
+        dict(sample_shift_rule=[4096, 500.0]),
+        dict(sample_shift_rule=[True, 500]),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
@@ -679,6 +698,14 @@ def test_policy_record_round_trip_and_validation():
     assert DispatchPolicy.from_record(first.record()) == first
     bare = DispatchPolicy.from_record(dict(record, pair_rule=None, pair_units=[]))
     assert bare.pair_units == []  # no pair rule: an empty unit list is well-formed
+    shifted = DispatchPolicy.from_record(dict(record, sample_shift_rule=[4096, 500]))
+    assert shifted.sample_shift_rule == [4096, 500]
+    assert shifted.record()["sample_shift_rule"] == [4096, 500]
+    assert DispatchPolicy.from_record(shifted.record()) == shifted
+    # both ends of the knob's bound are admissible shifts
+    for shift in SAMPLE_SHIFT_PERMILLE_BOUNDS:
+        edge = DispatchPolicy.from_record(dict(record, sample_shift_rule=[1, shift]))
+        assert edge.sample_shift_for(1) == shift
 
 
 def test_policy_capacity_period_and_finalize():
@@ -1084,7 +1111,7 @@ def test_select_program_narrow_pair_policy():
         and c.sample_tiles_max == 8
         and c.key_bits == 13
     )
-    assert c.workspace_bytes == 148 * 6 * 8192 * 8
+    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + 128
     # one causal 64k document: the CTA-pair three-warpgroup program
     c = _select(p, 65536, 65536)
     assert c.scan_key == "scan:pair_l6:u1:s0:f1" and c.pair and c.grid_ctas == 148
@@ -1101,7 +1128,7 @@ def test_select_program_narrow_pair_policy():
     )
     assert c.scan_key == "scan:split_narrow:u1:s0:f0" and c.merge_key == MERGE_KEY
     assert c.cand_cap_multiplier == 8 and c.cand_cap == 16384 and c.check_period == 32
-    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8
+    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + 128
     assert (
         c.keys == ("scan:split_narrow:u1:s0:f0", "merge", "finalize:t256")
         and c.rank_window is None
@@ -1249,7 +1276,7 @@ def test_wide_first_precedence_and_pair_units_guard():
     c = _select(first, 131072, 131072)
     assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
     assert c.grid_ctas == 148 and c.cand_cap == 16384
-    assert c.workspace_bytes == 148 * 8 * 16384 * 8
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + 128
     # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
     assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
     # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
@@ -1287,6 +1314,33 @@ def test_wide_first_precedence_and_pair_units_guard():
         dict(hostile.record(), pair_units=["l6", "wide"])
     )
     assert _select(hostile_open, 131072, 131072).kind == "pair_wide"
+
+
+def test_sample_shift_rule_precedence():
+    """``sample_shift_rule`` replaces the sampled rank shift from its ``top_k`` floor on; below the floor, and on a
+    record without a rule, ``sample_shift_permille`` stands; an explicit ``sample_shift_permille`` knob overrides both.
+    The shift is a launch scalar only: the programs, capacity and workspace of a call do not depend on it."""
+    p = NARROW_PAIR_POLICY
+    assert p.sample_shift_rule is None
+    assert p.sample_shift_for(2048) == 250 and p.sample_shift_for(4096) == 250
+    shifted = DispatchPolicy.from_record(
+        dict(p.record(), sample_shift_rule=[4096, 500])
+    )
+    assert shifted.sample_shift_for(4095) == 250
+    assert shifted.sample_shift_for(4096) == 500
+    for K, shift in ((2048, 250), (4096, 500)):
+        base, rule = _select(p, 8192, 8192, K=K), _select(shifted, 8192, 8192, K=K)
+        assert base.sample_shift_permille == 250
+        assert rule.sample_shift_permille == shift
+        assert (rule.keys, rule.cand_cap, rule.workspace_bytes) == (
+            base.keys,
+            base.cand_cap,
+            base.workspace_bytes,
+        )
+        # the knob wins over the rule and over the default alike
+        for q in (p, shifted):
+            knob = _select(q, 8192, 8192, K=K, sample_shift_permille=-500)
+            assert knob.sample_shift_permille == -500
 
 
 def test_select_program_snake_unroll_policy():
@@ -1525,6 +1579,51 @@ def test_shipped_unit_rules_by_architecture():
     assert p107.wide_first_rule is None
     assert p107.pair_units == ["l6", "narrow", "wide"]
     assert p103.wide_first_rule == [512.0] and p103.pair_units == ["l6"]
+
+
+def test_shipped_sample_shift_rule_by_architecture():
+    """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
+    ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
+    same scalar (host-only: ``arch`` and the SM count given)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p103, p100, p107 = (
+        policy_for("sm_103a"),
+        policy_for("sm_100a"),
+        policy_for("sm_107a"),
+    )
+    assert p103.sample_shift_rule == [4096, 375]
+    assert p100.sample_shift_rule is None and p107.sample_shift_rule is None
+    # the 64-tile document, the 512-tile document and the two-segment 1024-tile call: on sm_103a the three-warpgroup
+    # pair and both wide fit forms
+    rows = ((16384, 16384, 1), (131072, 131072, 1), (16384, 270336, 2))
+    for grid in (152, 148):
+        for knobs in ({}, {"sample_tiles_max": 0}):
+            for T, Tkv, S in rows:
+                for K, shift in ((2048, 250), (4096, 375)):
+                    where = (grid, knobs, T, Tkv, S, K)
+                    c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **knobs)
+                    assert c.sample_shift_permille == shift, where
+                    for p in (p100, p107):
+                        c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
+                        assert c.sample_shift_permille == 250, where
+                    forced = dict(knobs, sample_shift_permille=-500)
+                    c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
+                    assert c.sample_shift_permille == -500, where
+
+    # the backend's plan carries the same scalar
+    for arch, K, knobs, shift in (
+        ("sm_103a", 4096, {}, 375),
+        ("sm_103a", 2048, {}, 250),
+        ("sm_100a", 4096, {}, 250),
+        ("sm_107a", 4096, {}, 250),
+        ("sm_103a", 4096, {"sample_shift_permille": 250}, 250),
+    ):
+        plan = plan_dsa_indexer_topk(
+            16384, 16384, 1, top_k=K, arch=arch, num_sms=152, **knobs
+        )
+        assert plan.sample_shift_permille == shift, (arch, K, knobs)
 
 
 def test_program_keys_and_slugs():
@@ -2171,7 +2270,8 @@ def test_tile_boundary_neighbours(lq, lk, top_k):
 # architecture's policy; every kind computes the same result).  The 64-query / 256k-key row splits its key ranges
 # on every registered architecture and so exercises the merge stage; the 16k causal document reaches the CTA-pair
 # program where the architecture's rule admits it; the 8k-query / 72k-key row reaches the wide-first precedence
-# where the architecture's record sets a floor.
+# where the architecture's record sets a floor; the 16k causal document at top_k 4096 reaches the sampled rank
+# shift rule where the architecture's record sets one.
 _DISPATCH_ROWS = [
     ([64], [262144], 2048),  # 16 narrow units over 2047 tiles: key-range split + merge
     # one causal document of 64 mean tiles: three-warpgroup / pair programs (pair_l6 on sm_103a: at its 64-tile pair
@@ -2183,6 +2283,9 @@ _DISPATCH_ROWS = [
     # one causal 8k query block over 72k keys, 544 mean tiles: wide-first on sm_103a, wide on sm_100a, CTA-pair wide on
     # sm_107a
     ([8192], [73728], 2048),
+    # the 64-tile document at top_k 4096: the sampled rank shift rule on sm_103a (375 permille from top_k 4096 on;
+    # the 32768-slot ceiling), the 250 default elsewhere; same bits for every shift
+    ([16384], [16384], 4096),
     ([4096], [4096], 256),  # small top_k: capacity floor, right-sized finalize
 ]
 
@@ -2531,6 +2634,7 @@ def test_workspace_bound_is_respected():
     assert (
         nbytes
         == (plan.grid_ctas * plan.block_q * plan.cand_cap + plan.staging_entries) * 8
+        + 128
     )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     indices = torch.empty(

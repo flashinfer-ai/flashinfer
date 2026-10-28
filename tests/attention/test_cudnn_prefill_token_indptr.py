@@ -14,6 +14,143 @@ from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.cudnn import prefill as cudnn_prefill
 
 
+@pytest.mark.parametrize("explicit", ["q", "kv", "both"])
+@pytest.mark.parametrize("backend_only", [False, True])
+def test_cudnn_prefill_explicit_lengths_exclude_storage_padding(
+    monkeypatch, explicit, backend_only
+):
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("requires direct token-unit seqlens")
+
+    # Isolate the real cache so another test cannot bypass the provider control.
+    build = cudnn_prefill.cudnn.graph_cache(key_fn=cudnn_prefill._sdpa_prefill_key_fn)(
+        cudnn_prefill._build_prefill_graph.__wrapped__
+    )
+    graphs = []
+
+    def record_graph(*args, **kwargs):
+        result = build(*args, **kwargs)
+        graphs.append(result[0])
+        return result
+
+    monkeypatch.setattr(cudnn_prefill, "_build_prefill_graph", record_graph)
+    if backend_only:
+        monkeypatch.setattr(
+            cudnn_prefill.cudnn.pygraph, "_candidate_engines", lambda self: []
+        )
+
+    torch.manual_seed(71)
+    q_lengths, kv_lengths = [33, 17], [129, 83]
+    q_slots = [64, 32] if explicit in ("q", "both") else q_lengths
+    kv_slots = [160, 96] if explicit in ("kv", "both") else kv_lengths
+    q_starts = [0, q_slots[0], sum(q_slots)]
+    kv_starts = [0, kv_slots[0], sum(kv_slots)]
+    heads, kv_heads, dim = 8, 2, 128
+
+    def inputs():
+        tensors = []
+        for starts, lengths, h in (
+            (q_starts, q_lengths, heads),
+            (kv_starts, kv_lengths, kv_heads),
+            (kv_starts, kv_lengths, kv_heads),
+        ):
+            tensor = torch.full(
+                (starts[-1], h, dim), torch.nan, device="cuda", dtype=torch.bfloat16
+            )
+            for start, length in zip(starts[:-1], lengths, strict=True):
+                tensor[start : start + length].normal_()
+            tensors.append(tensor)
+        return tensors
+
+    q, k, v = inputs()
+    out = torch.empty_like(q)
+    lse = torch.empty((len(q), heads), device=q.device)
+    common = dict(
+        scale=dim**-0.5,
+        workspace_buffer=torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        max_token_per_sequence=max(q_slots),
+        max_sequence_kv=max(kv_slots),
+        actual_seq_lens_q=(
+            torch.tensor(q_lengths, device=q.device, dtype=torch.int32).view(
+                -1, 1, 1, 1
+            )
+            if explicit in ("q", "both")
+            else None
+        ),
+        actual_seq_lens_kv=(
+            torch.tensor(kv_lengths, device=q.device, dtype=torch.int32).view(
+                -1, 1, 1, 1
+            )
+            if explicit in ("kv", "both")
+            else None
+        ),
+        batch_offsets_q=torch.tensor(q_starts, device=q.device, dtype=torch.int32),
+        batch_offsets_k=torch.tensor(kv_starts, device=q.device, dtype=torch.int32),
+        batch_offsets_units="tokens",
+        causal=True,
+        return_lse=True,
+        lse_base="ln",
+        out=out,
+        lse=lse,
+    )
+
+    def run(query, key, value):
+        cudnn_batch_prefill_with_kv_cache(query, key, value, **common)
+
+    def check(query, key, value):
+        if backend_only:
+            from cudnn.engines import is_backend_engine
+
+            assert graphs and all(
+                is_backend_engine(g.get_engine_and_knobs_at_index(g._plan_index)[0])
+                for g in graphs
+            )
+        for b, (nq, nk) in enumerate(zip(q_lengths, kv_lengths, strict=True)):
+            qs, ks = q_starts[b], kv_starts[b]
+            qb = query[qs : qs + nq].double().transpose(0, 1)
+            kb = key[ks : ks + nk].double().transpose(0, 1)
+            vb = value[ks : ks + nk].double().transpose(0, 1)
+            kb = kb.repeat_interleave(heads // kv_heads, 0)
+            vb = vb.repeat_interleave(heads // kv_heads, 0)
+            scores = qb @ kb.transpose(1, 2) * dim**-0.5
+            rows = torch.arange(nq, device=q.device)
+            cols = torch.arange(nk, device=q.device)
+            scores.masked_fill_(cols[None, :] > rows[:, None] + nk - nq, -torch.inf)
+            expected = (scores.softmax(-1) @ vb).transpose(0, 1)
+            stats = scores.logsumexp(-1).transpose(0, 1)
+            torch.testing.assert_close(
+                out[qs : qs + nq].double(), expected, atol=0.01, rtol=0.01
+            )
+            torch.testing.assert_close(
+                lse[qs : qs + nq].double(), stats, atol=4e-4, rtol=0
+            )
+
+    run(q, k, v)
+    check(q, k, v)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(q, k, v)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        check(q, k, v)
+        fresh = inputs()
+        run(*fresh)
+        check(*fresh)
+        q.mul_(0.5)
+        k.mul_(0.75)
+        v.mul_(0.25)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        check(q, k, v)
+    finally:
+        graph.reset()
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo", [32, 87])
 @pytest.mark.parametrize("s_kv", [87, 512])
@@ -136,9 +273,8 @@ def test_cudnn_prefill_token_indptr(
 def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
     """actual_seq_lens_q/kv are optional with token-unit indptrs.
 
-    The direct path never reads them, and the conversion path derives them
-    from the indptrs, so omitting them must be bitwise-identical to passing
-    them within either path.
+    Explicit lengths and cumulative lengths can select different legal plans.
+    Check both against the same reference without requiring identical rounding.
     """
     if not cudnn_prefill.CUDNN_AVAILABLE:
         pytest.skip("cudnn-frontend python package not available")
@@ -198,6 +334,7 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
         max_sequence_kv=s_kv,
         causal=True,
         return_lse=True,
+        lse_base="ln",
         batch_offsets_q=qo_indptr,
         batch_offsets_k=kv_indptr,
         batch_offsets_units="tokens",
@@ -215,8 +352,27 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
         q, k_cache, v_cache, **common
     )
 
-    assert torch.equal(out_without, out_with)
-    assert torch.equal(lse_without, lse_with)
+    q_starts, kv_starts = qo_indptr.cpu().tolist(), kv_indptr.cpu().tolist()
+    for qs, qe, ks, ke in zip(
+        q_starts[:-1], q_starts[1:], kv_starts[:-1], kv_starts[1:], strict=True
+    ):
+        qb = q[qs:qe].double().transpose(0, 1)
+        kb = k_cache[ks:ke].double().transpose(0, 1)
+        vb = v_cache[ks:ke].double().transpose(0, 1)
+        kb = kb.repeat_interleave(num_qo_heads // num_kv_heads, 0)
+        vb = vb.repeat_interleave(num_qo_heads // num_kv_heads, 0)
+        scores = qb @ kb.transpose(1, 2) * head_dim**-0.5
+        nq, nk = qe - qs, ke - ks
+        rows = torch.arange(nq, device=device)
+        cols = torch.arange(nk, device=device)
+        scores.masked_fill_(cols[None, :] > rows[:, None] + nk - nq, -torch.inf)
+        expected = (scores.softmax(-1) @ vb).transpose(0, 1)
+        stats = scores.logsumexp(-1).transpose(0, 1)
+        for out, lse in ((out_with, lse_with), (out_without, lse_without)):
+            torch.testing.assert_close(
+                out[qs:qe].double(), expected, atol=0.01, rtol=0.01
+            )
+            torch.testing.assert_close(lse[qs:qe].double(), stats, atol=4e-4, rtol=0)
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 2, 8])

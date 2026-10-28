@@ -886,7 +886,7 @@ def test_fp8_proxy_decode_rejects_multi_head_index_cache():
     torch.manual_seed(0)
     batch, hq, hkv, pages = 2, 4, 2, 8
     npages = pages * batch
-    q = (torch.randn(batch, hq, HEAD_DIM, device="cuda") / 3).to(torch.bfloat16)
+    q = (torch.randn(batch, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
     k = (torch.randn(npages, hkv, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
         torch.float8_e4m3fn
     )
@@ -1161,3 +1161,803 @@ def test_sparse_attention_rejects_causal_false():
 def test_sm90_is_advertised_as_supporting_packed_kv():
     """vLLM selects the FlashInfer MSA path off this flag; losing it silently serves Triton."""
     assert flashinfer.msa_ops.SUPPORTS_PACKED_KV is True
+
+
+# PR regressions: also exercise the retained CuTe implementations.
+
+
+@pytest.fixture(params=["cake", "cute"])
+def sm90_regression_backend(request, monkeypatch):
+    """Exercise the public Cake route and the retained CuTe fallback separately."""
+    from flashinfer.msa_ops import _sm90_dispatch, cake_hopper_sm90
+
+    if request.param == "cute":
+        for route in (
+            "prefill_route_available",
+            "topk_route_available",
+            "proxy_prefill_route_available",
+        ):
+            monkeypatch.setattr(cake_hopper_sm90, route, lambda **kwargs: False)
+    else:
+        # sparse prefill now prefers the CuTe schedules, so the Cake arm has to
+        # turn that preference off or this fixture would run CuTe on both arms.
+        for pref in ("_cute_prefill_preferred", "_cute_proxy_decode_preferred"):
+            monkeypatch.setattr(_sm90_dispatch, pref, lambda *a, **k: False)
+    return request.param
+
+
+def _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of):
+    """Dense fp32 reference for selected query rows, vectorised per KV head.
+
+    ``idx`` may repeat a block (the kernels walk the *union* of a tile's selected
+    blocks), so the block list is deduplicated before the softmax -- a reference
+    that counted a repeat twice would disagree with a correct kernel.
+    ``qpos_of(row)`` returns the row's absolute key position, which is
+    right-aligned for prefill: seqused_k - qlen + offset_in_sequence.
+    """
+    total_q, hq, d = q.shape
+    hkv = kv.shape[1]
+    g = hq // hkv
+    out = torch.zeros(len(rows), hq, d, dtype=torch.float32, device=q.device)
+    for i, row in enumerate(rows):
+        b, qpos = qpos_of(row)
+        limit = min(qpos, int(seqused_k[b]) - 1)
+        for kh in range(hkv):
+            blocks = torch.unique(idx[kh, row])
+            blocks = blocks[(blocks >= 0) & (blocks < page_table.shape[1])]
+            if blocks.numel() == 0:
+                continue
+            pages = page_table[b, blocks.long()].long()
+            keys = kv[pages, kh, :, :d].reshape(-1, d).float()
+            vals = kv[pages, kh, :, d:].reshape(-1, d).float()
+            pos = (
+                blocks.long().unsqueeze(1) * BLK_KV
+                + torch.arange(BLK_KV, device=q.device).unsqueeze(0)
+            ).reshape(-1)
+            keep = pos <= limit
+            if not bool(keep.any()):
+                continue
+            heads = list(range(kh * g, (kh + 1) * g))
+            logits = (q[row, heads].float() @ keys.T) * scale
+            logits = logits.masked_fill(~keep.unsqueeze(0), float("-inf"))
+            out[i, heads] = torch.softmax(logits, dim=-1) @ vals
+    return out
+
+
+@sm90_only
+@pytest.mark.parametrize("max_k_tiles", [16, 1024])
+def test_sparse_prefill_runs_both_backends(sm90_regression_backend, max_k_tiles):
+    """Exercise the union backend (mpg <= 800) and the single-token one above it."""
+    torch.manual_seed(max_k_tiles)
+    batch, qlen, hq, hkv = 1, 256, 8, 1
+    npages = max_k_tiles * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = (
+        torch.rand(hkv, qlen, max_k_tiles, device="cuda")
+        .argsort(dim=-1)[..., :TOPK]
+        .sort(dim=-1)
+        .values.to(torch.int32)
+        .contiguous()
+    )
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = (
+        torch.randperm(npages, device="cuda")[: batch * max_k_tiles]
+        .to(torch.int32)
+        .view(batch, max_k_tiles)
+    )
+    seqused_k = torch.full(
+        (batch,), max_k_tiles * BLK_KV - 13, dtype=torch.int32, device="cuda"
+    )
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    assert out.shape == q.shape
+    assert torch.isfinite(out.float()).all()
+    kv = torch.cat([k, v], dim=-1)
+    prefix = int(seqused_k[0]) - qlen
+    rows = [0, 1, qlen // 2, qlen - 2, qlen - 1]
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        1.0 / math.sqrt(HEAD_DIM),
+        rows,
+        lambda r: (0, prefix + r),
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
+)
+def test_prefill_ignores_page_bytes_past_seqused_k(sm90_regression_backend, fill):
+    """Page memory beyond seqused_k must not reach the result.
+
+    vLLM hands out pages whose tail is uninitialized. The kernel reads whole
+    128-token pages, so without a causal bound on the selected blocks -- and with
+    an additive mask, which cannot clear a NaN -- that tail leaks into the
+    softmax. NaN there poisons the whole row.
+    """
+    torch.manual_seed(0)
+    batch, qlen, hq, hkv, mkt = 1, 128, 8, 1, 16
+    npages = mkt * batch
+    kv = torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4
+    # sequence ends mid-page; everything after it is "uninitialized"
+    seqlen = mkt * BLK_KV - 50
+    last_pg, off = seqlen // BLK_KV, seqlen % BLK_KV
+    if fill == "nan":
+        kv[last_pg, :, off:, :] = float("nan")
+    elif fill == "nan_k_only":  # K tail NaN, V tail finite
+        kv[last_pg, :, off:, :HEAD_DIM] = float("nan")
+    elif fill == "nan_v_only":  # V tail NaN, K tail finite
+        kv[last_pg, :, off:, HEAD_DIM:] = float("nan")
+    elif fill == "garbage":
+        kv[last_pg, :, off:, :] = 1e4
+    else:
+        kv[last_pg, :, off:, :] = 0.0
+    kv = kv.to(torch.float8_e4m3fn)
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = (
+        torch.arange(mkt, dtype=torch.int32, device="cuda")
+        .view(1, 1, TOPK)
+        .expand(hkv, qlen, TOPK)
+        .contiguous()
+    )
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.arange(npages, dtype=torch.int32, device="cuda").view(batch, mkt)
+    seqused_k = torch.full((batch,), seqlen, dtype=torch.int32, device="cuda")
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    assert torch.isfinite(out.float()).all(), f"{fill} tail leaked into the output"
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "pattern", ["all_equal", "few_distinct", "tied_top16", "ties_with_pad"]
+)
+def test_topk_select_returns_distinct_blocks_under_ties(
+    sm90_regression_backend, pattern
+):
+    """Exact score ties must not yield duplicate block indices.
+
+    The final scatter folds the lane into its sort key so it is tie-safe, but the
+    cascade merge keeps (score, index) pairs with a plain >= on the score; a tile
+    reachable from two partial lists can therefore be emitted twice, leaving
+    fewer than topk distinct blocks.
+    """
+    torch.manual_seed(0)
+    num_qo_heads, max_k_tiles, total_q = 4, 64, 32
+    if pattern == "all_equal":
+        scores = torch.full(
+            (num_qo_heads, max_k_tiles, total_q),
+            1.0,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    elif pattern == "few_distinct":  # 4 values over 64 tiles
+        base = torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+        scores = (
+            base.repeat(max_k_tiles // 4)[None, :, None]
+            .expand(num_qo_heads, max_k_tiles, total_q)
+            .contiguous()
+        )
+    elif pattern == "tied_top16":  # 16 tied winners, rest lower
+        scores = torch.zeros(
+            num_qo_heads, max_k_tiles, total_q, dtype=torch.float32, device="cuda"
+        )
+        scores[:, :16, :] = 5.0
+    else:  # ties plus padding
+        scores = torch.full(
+            (num_qo_heads, max_k_tiles, total_q),
+            2.0,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        scores[:, 8:, :] = float("-inf")  # only 8 valid tiles
+    out = msa_topk_select(scores, TOPK)
+    bad = []
+    for t in range(total_q):
+        for h in range(num_qo_heads):
+            sel = out[t, h].tolist()
+            real = [b for b in sel if b >= 0]
+            if len(real) != len(set(real)):
+                dup = {b for b in real if real.count(b) > 1}
+                bad.append((t, h, sorted(dup), len(set(real))))
+    assert not bad, (
+        f"{len(bad)} (token, head) slots have duplicate blocks; "
+        f"first: token={bad[0][0]} head={bad[0][1]} dups={bad[0][2]} "
+        f"distinct={bad[0][3]}"
+    )
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,tiles,nq", [(1, 64, 1536), (1, 512, 8192)])
+def test_topk_select_20way_tie_reviewer_repro(sm90_regression_backend, hq, tiles, nq):
+    """Reviewer repro for #6140: a 20-way tie at the top score.
+
+    q = 22 everywhere; the first 20 blocks carry k = 22, giving an exact block
+    score of 128 * 22^2 = 61952, and every other block k = 11 -> 30976. Twenty
+    blocks tie for sixteen slots. Observed before the fix: duplicated indices and
+    fewer than sixteen distinct blocks, e.g. [0, 0, 16 x8, 17 x6]. The failure is
+    plan dependent, hence both shapes.
+    """
+    hi, lo = 128.0 * 22.0 * 22.0, 128.0 * 11.0 * 11.0
+    scores = torch.full((hq, tiles, nq), lo, dtype=torch.float32, device="cuda")
+    scores[:, :20, :] = hi
+    out = msa_topk_select(scores, TOPK)
+    assert out.shape == (nq, hq, TOPK)
+    sel = out.reshape(-1, TOPK)
+    # every slot must be a real block (20 candidates >= 16 slots) and distinct
+    assert int(sel.min()) >= 0, "padding emitted despite 20 valid candidates"
+    srt, _ = sel.sort(dim=-1)
+    dup_rows = (srt[:, 1:] == srt[:, :-1]).any(dim=-1)
+    if bool(dup_rows.any()):
+        i = int(dup_rows.nonzero()[0])
+        row = sel[i].tolist()
+        raise AssertionError(
+            f"{int(dup_rows.sum())}/{sel.shape[0]} rows duplicate a block; "
+            f"row {i} = {row} ({len(set(row))} distinct)"
+        )
+    # all winners must come from the tied top-20
+    assert int(sel.max()) < 20, f"selected a non-tied block: max={int(sel.max())}"
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,hkv", [(8, 1), (16, 1)])
+def test_prefill_single_key_window_returns_v_exactly(sm90_regression_backend, hq, hkv):
+    """Token 0 attends exactly one key, so the output must be V[0] bit-exactly.
+
+    softmax over a one-element window is 1.0, which leaves no room for rounding:
+    any permutation of P, any double-counting, and any mismatch between the fp8
+    operand the PV gemm consumes and the f32 sum used to normalise it all show up
+    here as a scale or a wrong row. Longer windows average those away.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    kv = (torch.randn(1, hkv, BLK_KV, 2 * HEAD_DIM, device=dev) / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    n = 32
+    q = (torch.randn(n, hq, HEAD_DIM, device=dev) * 0.25).to(torch.bfloat16)
+    idx = torch.full((hkv, n, TOPK), -1, dtype=torch.int32, device=dev)
+    idx[:, :, 0] = 0
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        torch.tensor([0, n], dtype=torch.int32, device=dev),
+        page_table=torch.zeros(1, 1, dtype=torch.int32, device=dev),
+        seqused_k=torch.full((1,), n, dtype=torch.int32, device=dev),
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    ).float()
+    v0 = kv[0, 0, 0, HEAD_DIM:].float()
+    for h in range(hq):
+        torch.testing.assert_close(out[0, h], v0, atol=0.0, rtol=0.0)
+
+
+@sm90_only
+@pytest.mark.parametrize("lens", [[128, 128], [128, 128, 128]])
+def test_sparse_prefill_uniform_batch_matches_reference(sm90_regression_backend, lens):
+    """Equal-length sequences in one batch, against a dense reference.
+
+    seqused_k equals the query length, so the first rows of every sequence see
+    one- and two-key windows -- the regime where a mis-masked or mis-weighted P
+    is visible before longer windows average it away.
+    """
+    torch.manual_seed(11)
+    mkt, hq, hkv = 8, 8, 1
+    total_q, batch = sum(lens), len(lens)
+    npages = mkt * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.full((hkv, total_q, TOPK), -1, dtype=torch.int32, device="cuda")
+    idx[..., :mkt] = torch.arange(mkt, dtype=torch.int32, device="cuda")
+    cu = [0]
+    for length in lens:
+        cu.append(cu[-1] + length)
+    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(npages, device="cuda").to(torch.int32).view(batch, mkt)
+    seqused_k = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    rows = [cu[b] + off for b in range(batch) for off in (0, 1, lens[b] - 1)]
+
+    def qpos_of(row):
+        b = max(i for i in range(batch) if cu[i] <= row)
+        return b, row - cu[b]
+
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of)
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("lens", [[96, 160], [64, 192, 96], [17, 256, 33, 128]])
+def test_sparse_prefill_ragged_cu_seqlens_matches_reference(
+    sm90_regression_backend, lens
+):
+    """Unequal query lengths in one batch, against a dense reference.
+
+    The union schedule groups nt consecutive tokens of ONE sequence per CTA, so
+    it has to recover the sequence from the CTA index. Dividing by a uniform
+    groups-per-sequence put the first token of sequence 1 on sequence 0's page
+    table at the global row index; walking cu_seqlens_q is what makes unequal
+    lengths land on the right sequence and the right causal position.
+    """
+    torch.manual_seed(11)
+    mkt, hq, hkv = 8, 8, 1
+    total_q, batch = sum(lens), len(lens)
+    npages = mkt * batch
+    base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.full((hkv, total_q, TOPK), -1, dtype=torch.int32, device="cuda")
+    idx[..., :mkt] = torch.arange(mkt, dtype=torch.int32, device="cuda")
+    cu = [0]
+    for length in lens:
+        cu.append(cu[-1] + length)
+    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(npages, device="cuda").to(torch.int32).view(batch, mkt)
+    seqused_k = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    # boundary rows of every sequence: first token of a sequence is where a
+    # misattributed CTA shows up before longer windows average it away
+    rows = [cu[b] + off for b in range(batch) for off in (0, 1, lens[b] - 1)]
+
+    def qpos_of(row):
+        b = max(i for i in range(batch) if cu[i] <= row)
+        return b, row - cu[b]
+
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of)
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+def test_packed_kv_rejects_unsupported_paged_layouts():
+    """The packed view is rebuilt with raw strides, so a wrong shape reads garbage.
+
+    Both routes require interleaved K/V. The CuTe _views() helper additionally
+    reconstructs dense strides, while Cake reads strides from each tensor and
+    can serve a strided pool view.
+    """
+    from flashinfer.msa_ops._sm90_dispatch import _as_packed_kv
+
+    base = (torch.randn(4, 1, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    # the supported layout is accepted
+    _as_packed_kv(k, v, HEAD_DIM)
+
+    with pytest.raises(NotImplementedError, match="4D paged KV cache"):
+        _as_packed_kv(k[0], v[0], HEAD_DIM)
+
+    short = (torch.randn(4, 1, 64, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    with pytest.raises(NotImplementedError, match="page size"):
+        _as_packed_kv(short[..., :HEAD_DIM], short[..., HEAD_DIM:], HEAD_DIM)
+
+    with pytest.raises(NotImplementedError, match="head_dim"):
+        _as_packed_kv(k, v, HEAD_DIM // 2)
+
+    # separate allocations: tokens are head_dim apart, not 2*head_dim
+    with pytest.raises(NotImplementedError):
+        _as_packed_kv(k.contiguous(), v.contiguous(), HEAD_DIM)
+
+    # Cake admits a pool view with a larger page stride. CuTe computes that
+    # stride from the shape, so its stricter layout check must refuse it.
+    pool = (torch.randn(8, 1, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    sparse = pool[::2]
+    assert sparse.shape == base.shape and sparse.stride(0) == 2 * base.stride(0)
+    restored = _as_packed_kv(sparse[..., :HEAD_DIM], sparse[..., HEAD_DIM:], HEAD_DIM)
+    assert restored.data_ptr() == sparse.data_ptr()
+    assert restored.stride() == sparse.stride()
+    with pytest.raises(NotImplementedError, match="dense packed layout"):
+        _as_packed_kv(
+            sparse[..., :HEAD_DIM], sparse[..., HEAD_DIM:], HEAD_DIM, require_dense=True
+        )
+
+
+@sm90_only
+def test_decode_scratch_is_not_shared_across_streams():
+    """Split-K partials are live for a whole launch.
+
+    Two streams running decode concurrently would otherwise write each other's
+    partial outputs and combine counters, so the stream has to be part of the
+    cache key rather than only the device and tile geometry.
+    """
+    from flashinfer.msa_ops.cute_dsl import sparse_decode_sm90 as sd
+
+    saved = dict(sd._WS)
+    sd._WS.clear()
+    try:
+        dev = torch.device("cuda:0")
+        sd._scratch(4, 8, HEAD_DIM, dev, 1)
+        sd._scratch(4, 8, HEAD_DIM, dev, 2)
+        streams = {key[1] for key in sd._WS}
+        assert streams == {1, 2}, f"scratch key ignores the stream: {list(sd._WS)}"
+    finally:
+        sd._WS.clear()
+        sd._WS.update(saved)
+
+
+@sm90_only
+def test_proxy_score_fp32_acc_survives_large_logits(sm90_regression_backend):
+    """The fp16 score accumulator saturates on unscaled fp8 dot products.
+
+    max_score holds raw Q K^T logits. Two fp8 e4m3 operands give a single
+    product of up to 448*448 = 200704, and a 128-term row runs far past the
+    65504 fp16 ceiling with nothing clamping the partial sums, so the row
+    becomes ``inf`` and outranks every real block. Ranking is what the output
+    is for, so the failure is silent: top-k picks among infinities.
+    """
+    torch.manual_seed(0)
+    total_q, hq, hkv, pages = 128, 4, 1, 32
+    mag = 64.0
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") * mag).clamp(-448, 448)
+    q = q.to(torch.float8_e4m3fn)
+    k = (torch.randn(pages, hkv, BLK_KV, HEAD_DIM, device="cuda") * mag).clamp(
+        -448, 448
+    )
+    k = k.to(torch.float8_e4m3fn)
+    page_table = torch.arange(pages, dtype=torch.int32, device="cuda").view(1, pages)
+    cu_q = torch.tensor([0, total_q], dtype=torch.int32, device="cuda")
+    seqused_k = torch.full((1,), pages * BLK_KV, dtype=torch.int32, device="cuda")
+
+    def score(use_fp32_acc):
+        return msa_proxy_score(
+            q,
+            k,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=total_q,
+            max_k_tiles=pages,
+            use_fp32_acc=use_fp32_acc,
+        ).float()
+
+    narrow = score(False)
+    wide = score(True)
+    # the fp16 accumulator loses most of the grid; fp32 keeps all of it. Only
+    # causally dead blocks may be -inf, and those are identical either way.
+    assert torch.isfinite(wide).sum() > 4 * torch.isfinite(narrow).sum()
+    dead = torch.isneginf(wide)
+    assert bool((torch.isfinite(wide) | dead).all())
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"causal": False}, "causal=False is not supported"),
+        ({"q_offset": 3}, "q_offset is not supported"),
+    ],
+)
+def test_sparse_decode_rejects_dropped_arguments(kwargs, match):
+    """causal=False and q_offset reach no SM90 kernel argument, so they must raise.
+
+    The decode schedule masks against ``seqused_k[b] - seqlen_q + i`` and takes
+    neither flag, so honouring the signature while ignoring the values would
+    return right-aligned causal numbers for a request that asked for something
+    else. Other backends do apply both, which is what makes silence here a
+    portability trap rather than a documented narrowing.
+    """
+    q, k, v, idx, page_table, seqused_k = _decode_inputs()
+    with pytest.raises(NotImplementedError, match=match):
+        msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            idx,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            seqlen_q=1,
+            softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+            **kwargs,
+        )
+
+
+@sm90_only
+def test_single_token_prefill_rejects_unsupported_gqa(monkeypatch):
+    """g < 8 leaves the single-token copy-out with zero iterations.
+
+    The loop is sized g * (HEAD_DIM // 8) // 128, so Hq/Hkv of 4 moves nothing
+    and the caller would get its uninitialised output buffer back. Cake supports
+    this GQA group, so force the CuTe fallback to check its narrower contract.
+    """
+    from flashinfer.msa_ops import cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    torch.manual_seed(0)
+    qlen, hq, hkv, mkt = 8, 4, 1, 1024
+    base = (torch.randn(mkt, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.full((hkv, qlen, TOPK), -1, dtype=torch.int32, device="cuda")
+    idx[..., 0] = 0
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.arange(mkt, dtype=torch.int32, device="cuda").view(1, mkt)
+    seqused_k = torch.full((1,), BLK_KV, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="Hq/Hkv of 8 or 16"):
+        msa_sparse_attention(
+            q,
+            k,
+            v,
+            idx,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        )
+
+
+@sm90_only
+@pytest.mark.parametrize("backend", ["cake", "cute"])
+def test_sparse_decode_ignores_poisoned_page_tail(backend):
+    """Bytes past seqused_k are uninitialised in vLLM and must not reach the output.
+
+    The causal/length mask only sanitises *scores*; V is a matmul operand, and
+    0 * NaN = NaN in the PV gemm, so V itself has to be clamped. Decode feeds V
+    from smem through a register conversion, which is where the clamp lives.
+    """
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=2, num_qo_heads=8, num_kv_heads=1, max_k_tiles=16, seed=11
+    )
+    # All sixteen blocks are distinct and selected, including the boundary block.
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    kv = torch.cat([k, v], dim=-1)  # copy: the reference keeps the clean bytes
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        list(range(q.shape[0])),
+        lambda r: (r, int(seqused_k[r]) - 1),
+    )
+
+    tail = int(seqused_k[0]) % BLK_KV
+    nan8 = torch.tensor(float("nan"), device=q.device).to(torch.float8_e4m3fn)
+    for b in range(page_table.shape[0]):
+        pg = int(page_table[b, -1])
+        k[pg, :, tail:, :] = nan8
+        v[pg, :, tail:, :] = nan8
+
+    if backend == "cute":
+        from flashinfer.msa_ops._sm90_dispatch import _as_packed_kv
+        from flashinfer.msa_ops.cute_dsl.sparse_decode_sm90 import run
+
+        out = torch.empty_like(q)
+        run(
+            q,
+            _as_packed_kv(k, v, HEAD_DIM, require_dense=True),
+            idx,
+            page_table,
+            seqused_k,
+            out,
+        )
+    else:
+        out = msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            idx,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            seqlen_q=1,
+            softmax_scale=scale,
+        )
+    assert torch.isfinite(out.float()).all(), "a NaN past seqused_k reached the output"
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,hkv", [(64, 4), (32, 4)])
+def test_sparse_prefill_multi_kv_head_matches_reference(
+    sm90_regression_backend, hq, hkv
+):
+    """More than one KV head: each head must resolve its own block list.
+
+    Exercise the union-path kv-head stride with different selected blocks
+    for each KV head, as well as the public Cake route.
+    """
+    torch.manual_seed(hq * 100 + hkv)
+    qlen, mkt = 128, 32
+    base = (torch.randn(mkt, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = (
+        torch.rand(hkv, qlen, mkt, device="cuda")
+        .argsort(dim=-1)[..., :TOPK]
+        .sort(dim=-1)
+        .values.to(torch.int32)
+        .contiguous()
+    )
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(mkt, device="cuda").to(torch.int32).view(1, mkt)
+    seqused_k = torch.full((1,), mkt * BLK_KV - 13, dtype=torch.int32, device="cuda")
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    assert torch.isfinite(out.float()).all()
+    prefix = int(seqused_k[0]) - qlen
+    rows = [0, 1, qlen // 2, qlen - 2, qlen - 1]
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        1.0 / math.sqrt(HEAD_DIM),
+        rows,
+        lambda r: (0, prefix + r),
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("mult", [0.5, 1.0, 2.0])
+def test_sparse_prefill_honours_non_default_softmax_scale(
+    sm90_regression_backend, mult
+):
+    """An fp8 KV cache folds k_scale into softmax_scale, so it is not 1/sqrt(D).
+
+    The CuTe schedules bake the scale in at compile time rather than pre-scaling
+    q, so a non-default value has to reach the kernel exactly on both backends.
+    """
+    torch.manual_seed(int(mult * 10))
+    qlen, hq, hkv, mkt = 128, 8, 1, 16
+    base = (torch.randn(mkt, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = torch.randint(0, mkt, (hkv, qlen, TOPK), dtype=torch.int32, device="cuda")
+    idx, _ = idx.sort(dim=-1)
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.randperm(mkt, device="cuda").to(torch.int32).view(1, mkt)
+    seqused_k = torch.full((1,), mkt * BLK_KV - 13, dtype=torch.int32, device="cuda")
+    scale = mult / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    prefix = int(seqused_k[0]) - qlen
+    rows = [0, 1, qlen // 2, qlen - 1]
+    kv = torch.cat([k, v], dim=-1)
+    ref = _ref_attn_rows(
+        q, kv, idx, page_table, seqused_k, scale, rows, lambda r: (0, prefix + r)
+    )
+    # Halving the scale flattens the softmax, so the outputs shrink toward the
+    # mean of V and the fp8 V quantisation dominates: the Cake route lands ~1%
+    # of elements just past a 3e-2 bound at mult=0.5. The point of this test is
+    # that the scale reaches the kernel at all, so bound it loosely.
+    torch.testing.assert_close(out[rows].float(), ref, atol=6e-2, rtol=6e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("mult", [1.0, 2.0])
+def test_sparse_decode_cute_fallback_matches_reference(monkeypatch, mult):
+    """Sparse decode must not be single-sourced on the Cake program.
+
+    Force the CuTe DSL schedule the way an unadmitted geometry would, and check
+    it still matches the dense reference -- including a non-default
+    softmax_scale, which it now takes as a compile-time constant rather than by
+    pre-scaling q.
+    """
+    from flashinfer.msa_ops import _sm90_dispatch
+
+    monkeypatch.setattr(_sm90_dispatch, "_cake_decode_available", lambda *a, **k: False)
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=2, num_qo_heads=8, num_kv_heads=1, max_k_tiles=32, seed=int(mult) + 3
+    )
+    scale = mult / math.sqrt(HEAD_DIM)
+    out = msa_sparse_decode_attention(
+        q,
+        k,
+        v,
+        idx,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=1,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    kv = torch.cat([k, v], dim=-1)
+    rows = list(range(q.shape[0]))
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (r, int(seqused_k[r]) - 1),
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
