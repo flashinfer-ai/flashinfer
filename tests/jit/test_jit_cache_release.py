@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -235,3 +236,93 @@ def test_wheel_index_recognizes_provider_distributions(
         "version": filename.split("-")[1],
         "cuda": "130" if "+cu130" in filename else "134",
     }
+
+
+@pytest.mark.parametrize("nightly", [False, True])
+@pytest.mark.parametrize(
+    ("filename", "index_path"),
+    [
+        ("flashinfer_python-0.7.2-py3-none-any.whl", "flashinfer-python"),
+        ("flashinfer_cubin-0.7.2-py3-none-any.whl", "flashinfer-cubin"),
+        (
+            "flashinfer_jit_cache-0.7.2+cu130-py3-none-any.whl",
+            "cu130/flashinfer-jit-cache",
+        ),
+        (
+            "flashinfer_jit_cache_sm120f-0.7.2+cu130-py3-none-any.whl",
+            "cu130/flashinfer-jit-cache-sm120f",
+        ),
+    ],
+)
+def test_wheel_index_adds_upload_times_without_duplicate_links(
+    tmp_path, wheel_index_module, nightly, filename, index_path
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / filename).write_bytes(b"wheel")
+    assets = tmp_path / "release-assets.json"
+    timestamp = "2026-10-01T12:34:56Z"
+    assets.write_text(json.dumps([{"name": filename, "created_at": timestamp}]))
+    output = tmp_path / "whl"
+    index = output / ("nightly" if nightly else "") / index_path / "index.html"
+    index.parent.mkdir(parents=True)
+    digest = hashlib.sha256(b"wheel").hexdigest()
+    url = f"https://example.com/v0.7.2/{filename}#sha256={digest}"
+    existing_link = '<a href="https://example.com/old.whl">old.whl</a><br>\n'
+    dated_link = (
+        '<a href="https://example.com/dated.whl" data-upload-time="2026-09-01T00:00:00Z">'
+        "dated.whl</a><br>\n"
+    )
+    index.write_text(
+        existing_link + dated_link + f'<a href="{url}">{filename}</a><br>\n'
+    )
+
+    kwargs = dict(
+        release_assets=str(assets),
+        dist_dir=str(dist),
+        output_dir=str(output),
+        base_url="https://example.com",
+        release_tag="v0.7.2",
+        nightly=nightly,
+    )
+    wheel_index_module.update_index(**kwargs)
+
+    content = index.read_text()
+    assert existing_link in content
+    assert dated_link in content
+    assert f'<a href="{url}" data-upload-time="{timestamp}">{filename}</a>' in content
+    assert content.count(f'href="{url}"') == 1
+
+    wheel_index_module.update_index(**kwargs)
+    assert index.read_text() == content
+
+
+@pytest.mark.parametrize(
+    "assets",
+    [
+        [],
+        [{"name": "flashinfer_python-0.7.2-py3-none-any.whl", "created_at": "invalid"}],
+        [
+            {
+                "name": "flashinfer_python-0.7.2-py3-none-any.whl",
+                "created_at": "2026-10-01T12:34:56",
+            }
+        ],
+    ],
+)
+def test_wheel_index_rejects_missing_or_invalid_upload_times(
+    tmp_path, wheel_index_module, assets
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "flashinfer_python-0.7.2-py3-none-any.whl").touch()
+    metadata = tmp_path / "release-assets.json"
+    metadata.write_text(json.dumps(assets))
+    output = tmp_path / "whl"
+
+    with pytest.raises(ValueError):
+        wheel_index_module.update_index(
+            release_assets=str(metadata), dist_dir=str(dist), output_dir=str(output)
+        )
+
+    assert not output.exists()
