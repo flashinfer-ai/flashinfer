@@ -51,6 +51,7 @@ from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
 from .config_mapper import (
+    apply_fused_finalize,
     apply_weight_l2_policy,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
@@ -1991,8 +1992,33 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return apply_weight_l2_policy(
+        pair = apply_weight_l2_policy(
             map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        )
+        return self._maybe_fuse_finalize(
+            pair, moe_inputs.hidden_states.shape[0], kwargs or {}
+        )
+
+    def _maybe_fuse_finalize(self, pair, num_tokens: int, kwargs: dict):
+        """Move the finalize of single-expert tokens into the FC2 epilogue.
+
+        Only when tokens average at most one local expert
+        (``top_k * num_local_experts <= num_experts``, as under expert
+        parallelism): with more, most tokens still need the finalize's
+        reduction, and storing every row from the epilogue only adds work.
+        Partitioned launches keep their own finalize.
+        """
+        if (
+            self._is_partitioned
+            or not kwargs.get("do_finalize", True)
+            or self.top_k * self.num_local_experts > self.num_experts
+        ):
+            return pair
+        return apply_fused_finalize(
+            pair,
+            num_tokens=num_tokens,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
         )
 
     def _make_tuning_config(
@@ -2237,6 +2263,14 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 )
 
                 gemm_cfg = fc1_cfg if fc == "fc1" else fc2_cfg
+                if fc == "fc2" and fc2_cfg.fused_finalize_top_k:
+                    common_io_kwargs.update(
+                        finalize_output=moe_inputs.output,
+                        expanded_idx_to_permuted_idx=_expanded_idx_to_permuted_idx,
+                        expert_weights=_select_expert_weights(
+                            moe_inputs, _expert_weights, kwargs
+                        ),
+                    )
                 gemm_io = build_mxfp4_mxfp8_launch_io(
                     fc=fc, cfg=gemm_cfg, **common_io_kwargs
                 )
@@ -2398,11 +2432,32 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_fn = get_compiled_gemm(fc1_hash, "mxfp4_mxfp8_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))
 
+        fused_finalize = bool(fc2_cfg.fused_finalize_top_k)
+        if fused_finalize:
+            common_io_kwargs.update(
+                finalize_output=output,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_weights=expert_weights,
+            )
         fc2_io = build_mxfp4_mxfp8_launch_io(fc="fc2", cfg=fc2_cfg, **common_io_kwargs)
         fc2_hash = stable_config_hash(fc2_io["cfg"])
         fc2_fn = get_compiled_gemm(fc2_hash, "mxfp4_mxfp8_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))
 
+        if fused_finalize:
+            self.moe_op.trtllm_moe_run_finalize_multi_expert_tokens(
+                gemm2_output,
+                output,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                total_num_padded_tokens,
+                num_tokens,
+                kwargs["num_experts"],
+                self.top_k,
+                self.hidden_size,
+                kwargs["enable_pdl"],
+            )
+            return []
         if kwargs["do_finalize"]:
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
