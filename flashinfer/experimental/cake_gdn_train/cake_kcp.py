@@ -510,7 +510,8 @@ FWD_TAPES_ARENA_AFTER_FWD: tuple[str, ...] = tuple(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``; shipped default ``True``, ``False`` under graph="replay")
+# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``: ``True`` = the shipped default, ``False`` under
+# graph="replay"; ``"auto"`` = kept tapes only when the node closes the checkpointed region, see _fwd_body)
 #
 # ``torch.utils.checkpoint(use_reentrant=False)`` re-runs the checkpointed forward inside ``.backward()``: in the
 # unpack hook of the first saved tensor a backward node reads, synchronously, under the autograd engine's graph task
@@ -3025,6 +3026,9 @@ def _record(kind: str, call: KcpCall) -> None:
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
         ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
+        "hand_off_reason": call.scratch.get(
+            "hand_off_reason"
+        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept)
     }
 
 
@@ -4169,6 +4173,24 @@ def _fwd_entry(
     return _ranked(out, batched), saved
 
 
+def _saved_count(call: KcpCall, save: bool) -> int:
+    """What :class:`ChunkGDNKcpFunction` saves for this forward: the five operands and the saved set's tensors
+    (:meth:`KcpSaved.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
+    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens) -- known before
+    the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
+    if not save:
+        return _SAVED_OPERANDS
+    opts, tb = call.opts, call.tb
+    n = (
+        1
+        + (1 if opts.save_transfer else 0)
+        + (1 if (opts.save_transfer and tb.P > 1) else 0)
+    )
+    if call.T_r > 0:
+        n += len(saved_tapes(opts.save_mode))
+    return _SAVED_OPERANDS + n
+
+
 def _fwd_body(
     call: KcpCall,
     *,
@@ -4236,7 +4258,7 @@ def _fwd_body(
             reason = "not_executable"
         else:
             # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = _recompute_output_dead(
+            dead, reason = frame_proof(
                 _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0)
             )
             launch = not dead
@@ -4586,7 +4608,12 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
                 key = _kept_key(
                     gid, q, k, v, g, beta, saved.S_in, saved.T_r, saved.H_qk, saved.HV
                 )
-                kept = _kept_take(key)
+                # under "auto" a forward that did not hand off leaves no entry by design: no miss is counted
+                kept = (
+                    _kept_take(key)
+                    if (opts.reuse_recompute_tapes is True or key in _KEPT)
+                    else None
+                )
             if kept is not None:
                 saved = dataclasses.replace(saved, kept=kept)
         if not dout.is_contiguous():

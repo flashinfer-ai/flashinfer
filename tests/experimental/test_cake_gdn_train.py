@@ -420,3 +420,102 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
         gc.collect()
         torch.cuda.empty_cache()
     assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto" (one GPU)
+
+
+@pytest.mark.parametrize(
+    "later_saver", [False, True], ids=["gdn-closes-the-region", "later-saver"]
+)
+def test_reuse_recompute_tapes_auto_follows_the_region_shape(
+    device, later_saver
+) -> None:
+    """``"auto"`` hands the recompute's tapes to the backward when the GDN node is the region's last saver (frame
+    proof ``dead``, kept form) and takes the replay form when a later operation of the region saves a tensor
+    (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
+    direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
+    the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    H, HV = 2, 6
+    cu = [0, 1500, 4200, 6144]
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+    proj = None
+    if later_saver:
+        gen = torch.Generator(device="cpu").manual_seed(7074)
+        proj = (
+            (torch.randn(HV * D, HV * D, generator=gen) * 0.02)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+        dout = (
+            inputs["dout"].to(device).reshape(1, -1, HV * D)
+            if proj is not None
+            else None
+        )
+        proj_in = proj
+        proj = None  # the projection acts on the flattened heads: wrap below
+
+        def flat_proj(out, w=proj_in):
+            return torch.nn.functional.linear(
+                out.reshape(out.shape[0], out.shape[1], -1), w
+            )
+
+        proj = flat_proj
+    else:
+        dout = inputs["dout"].to(device)
+
+    def region(ckpt, form, sync_error=False):
+        from torch.utils.checkpoint import checkpoint
+
+        def fn(*a):
+            out = gdn_api.chunk_gdn_kcp(
+                *a, ctx, **({} if form is None else {"reuse_recompute_tapes": form})
+            )
+            return out if proj is None else proj(out)
+
+        for lf in leaves:
+            lf.grad = None
+        out = checkpoint(fn, *leaves, use_reentrant=False) if ckpt else fn(*leaves)
+        torch.cuda.synchronize(device)
+        if sync_error:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            out.backward(dout)
+        finally:
+            if sync_error:
+                torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize(device)
+        return {
+            "out": out.detach(),
+            **{
+                n: lf.grad.detach().clone()
+                for n, lf in zip(OPERANDS, leaves, strict=True)
+            },
+        }
+
+    direct = region(False, None)
+    verified = kcp.torch_release_verified()
+    for form, reason, source in (
+        (True, "always", "kept"),
+        (False, "off", "replay"),
+        (
+            "auto",
+            ("holders_remain" if later_saver else "dead") if verified else None,
+            "replay" if (later_saver or not verified) else "kept",
+        ),
+    ):
+        res = region(True, form, sync_error=(form == "auto"))
+        for n in direct:
+            assert torch.equal(res[n], direct[n]), (later_saver, form, n)
+        got_reason = kcp.LAST_CALL["fwd"]["hand_off_reason"]
+        if reason is not None:
+            assert got_reason == reason, (later_saver, form, got_reason)
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == source, (
+            later_saver,
+            form,
+            kcp.LAST_CALL["bwd"]["tapes_source"],
+        )
+        assert kcp.kept_registry_size() == 0, (later_saver, form)

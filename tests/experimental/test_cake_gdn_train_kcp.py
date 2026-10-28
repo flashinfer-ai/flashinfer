@@ -3481,3 +3481,109 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         )
     with pytest.raises(ValueError, match="reuse_recompute_tapes must be"):
         gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes")
+
+
+# --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
+# The recompute's tapes are kept only when the GDN node closes the checkpointed region (the frame proof); with a later saver the
+# kept set would live through that operation's backward and raise the region's peak by the full tape set, so "auto" replays there.
+
+
+def _ckpt_autograd_region(
+    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, **opts
+) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    """``out`` and the gradients of a region that ends with the GDN call (``later_saver=False``) or continues with an
+    operation that saves tensors for its backward (a scaling by a leaf, ``later_saver=True``), directly or under a
+    non-reentrant checkpoint; the leaf's gradient comes beside the result."""
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    scale = torch.full((), 1.5, dtype=torch.bfloat16, requires_grad=True)
+    o = {"backend": "fake", **opts}
+
+    def fn(q, k, v, g, beta):
+        out = kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, **o)
+        return out * scale if later_saver else out
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+    else:
+        out = fn(*leaves)
+    out.backward(ops["dout"])
+    res = {"out": out.detach()}
+    res.update({n: lf.grad for n, lf in zip(CKPT_GRADS, leaves, strict=True)})
+    return res, (scale.grad if later_saver else None)
+
+
+@pytest.mark.parametrize("segments,save_transfer", [(1, True), (2, True), (2, False)])
+def test_reuse_recompute_tapes_auto_keeps_tapes_only_when_the_node_closes_the_region(
+    segments, save_transfer
+) -> None:
+    """``"auto"``: the recompute hands its tapes to the backward when the GDN node is the region's last saver (the
+    frame proof ``dead``; the backward of the region then starts with this node) and takes the replay form when a
+    later operation of the region saves a tensor (``holders_remain``) -- so the kept set never outlives the GDN
+    backward.  ``True`` always hands off, ``False`` never; every form is bitwise the direct autograd result, and
+    the registry is empty afterwards.  On an unverified torch release ``"auto"`` is the replay form."""
+    kcp, ctx, ops = _ckpt_setup()
+    base = {"segments": segments, "save_transfer": save_transfer}
+    for later_saver in (False, True):
+        direct, direct_scale = _ckpt_autograd_region(
+            kcp, ctx, ops, ckpt=False, later_saver=later_saver, **base
+        )
+        for mode in (True, False, "auto"):
+            before = dict(kcp.KEPT_STATS)
+            res, scale_grad = _ckpt_autograd_region(
+                kcp,
+                ctx,
+                ops,
+                ckpt=True,
+                later_saver=later_saver,
+                reuse_recompute_tapes=mode,
+                **base,
+            )
+            what = f"later_saver={later_saver} mode={mode!r} {base}"
+            _assert_same(res, direct, what)
+            if later_saver:
+                assert torch.equal(scale_grad, direct_scale), what
+            delta = _stats_delta(kcp, before)
+            reason = kcp.LAST_CALL["fwd"]["hand_off_reason"]
+            source = kcp.LAST_CALL["bwd"]["tapes_source"]
+            if mode is True:
+                expect, kept = (1, 1, 0), True
+                assert reason == "always", what
+            elif mode is False:
+                expect, kept = (0, 0, 0), False
+                assert reason == "off", what
+            elif later_saver or not _verified_torch(kcp):
+                expect, kept = (0, 0, 0), False
+                assert reason == _frame_reason(kcp, "holders_remain"), what
+            else:
+                expect, kept = (1, 1, 0), True
+                assert reason == "dead", what
+            assert (delta["put"], delta["take"], delta["miss"]) == expect, (what, delta)
+            assert source == ("kept" if kept else "replay"), (what, source)
+            assert kcp.kept_registry_size() == 0, what
+
+
+def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
+    opt = _package("cake_options")
+    assert opt.REUSE_RECOMPUTE_TAPES == (True, False, "auto")
+    assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT in opt.REUSE_RECOMPUTE_TAPES
+    assert (
+        opt.KcpOptions(reuse_recompute_tapes="auto").check().reuse_recompute_tapes
+        == "auto"
+    )
+    assert (
+        opt.KcpOptions().check().reuse_recompute_tapes
+        == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
+    )
+    assert opt.KcpOptions(graph="replay").check().reuse_recompute_tapes is False
+    with pytest.raises(ValueError, match="needs graph='off'"):
+        opt.KcpOptions(graph="replay", reuse_recompute_tapes="auto").check()
+    with pytest.raises(ValueError, match="needs graph='off'"):
+        opt.KcpOptions(graph="replay", reuse_recompute_tapes=True).check()
+    for bad in ("yes", 1, 0, "AUTO"):
+        with pytest.raises(TypeError, match="must be a bool or 'auto'"):
+            opt.KcpOptions(reuse_recompute_tapes=bad).check()
