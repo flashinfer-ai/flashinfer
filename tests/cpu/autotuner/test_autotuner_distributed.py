@@ -34,6 +34,7 @@ import pytest
 from flashinfer.autotuner import AutoTuner
 
 
+@pytest.mark.cpu_only
 def test_profile_single_kernel_preserves_collective_cardinality_on_exception():
     """Source-level guard: an exception inside ``pure_profile`` must NOT skip the all-reduce.
 
@@ -129,6 +130,7 @@ def test_profile_single_kernel_preserves_collective_cardinality_on_exception():
     )
 
 
+@pytest.mark.cpu_only
 def test_choose_one_oom_preserves_cardinality_under_group():
     """Source guard: ``choose_one`` must not unconditionally re-raise OOM when a
     tune group is set.
@@ -272,6 +274,7 @@ finally:
 """
 
 
+@pytest.mark.cpu_only
 def test_exception_path_does_not_deadlock_the_reduce(tmp_path):
     """Empirical: one rank raising must NOT block peers on the cross-rank reduce.
 
@@ -431,6 +434,7 @@ finally:
 """
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("failure_phase", ("runner", "nested_input", "nested_runner"))
 def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_phase):
     """A rank-local preparation OOM produces one group-wide fallback."""
@@ -728,6 +732,7 @@ finally:
 """
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "case",
     [
