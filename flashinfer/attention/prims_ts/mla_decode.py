@@ -2249,6 +2249,8 @@ def _resolve_sparse_mla_plan(
             raise ValueError(f"{name} must be a positive integer")
     if num_heads > 128:
         raise ValueError("num_heads must be at most 128")
+    if qk_rope_head_dim and output_quant_block_size is not None:
+        raise ValueError("D576 sparse MLA does not support output quantization")
     output_quant = _make_sparse_output_quant(
         num_heads, output_quant_block_size, out_scale_format, num_output_groups
     )
@@ -2277,7 +2279,6 @@ def _resolve_sparse_mla_plan(
             q_data_type=q_data_type,
             has_sinks=has_sinks,
             assume_valid_prefix=assume_valid_prefix,
-            output_quant=output_quant,
             threshold=softmax_rescale_threshold_log2,
         )
     capacity = max(
@@ -2445,7 +2446,6 @@ def _resolve_sparse_d576_plan(
     q_data_type,
     has_sinks,
     assume_valid_prefix,
-    output_quant,
     threshold,
 ):
     """D576 hook of :func:`_resolve_sparse_mla_plan`: profile, kernel and scratch.
@@ -2481,8 +2481,6 @@ def _resolve_sparse_d576_plan(
         raise ValueError("D576 sparse MLA attends to one KV pool (max_extra_topk=0)")
     if has_sinks:
         raise ValueError("D576 sparse MLA does not support attention sinks")
-    if output_quant is not None:
-        raise ValueError("D576 sparse MLA does not support output quantization")
     if assume_valid_prefix:
         raise ValueError("D576 sparse MLA does not take assume_valid_prefix")
     if max_rows > 65535:
