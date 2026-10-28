@@ -998,12 +998,15 @@ kernel_cake_dense_projection_gemm_b773cc0e3894fd0ef2e0(const __grid_constant__ C
                         int u_first = tail_x_2 * sk_iters;
                         int nparts = sk_iters;
                         unsigned int inc = ((lane == 0) ? 1 : 0);
-                        int aidx = ((lane == 0) ? cidx : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_3;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_3) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        int aidx = cidx;
+                        unsigned int _atomic_fetch_add_3 = 0;
+                        if (lane == 0) {
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_3) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        }
                         unsigned int _shfl_sync_2 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_3, 0);
                         if (_shfl_sync_2 == (unsigned int)(nparts - 1)) {
+                            __syncwarp();
                             #pragma unroll
                             for (int j_4 = 0; j_4 < 128; j_4++) {
                                 _tmem_load_0[j_4] = 0.0f;

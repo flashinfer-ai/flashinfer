@@ -614,10 +614,12 @@ kernel_cake_dense_projection_gemm_ddff2b911137449c1dfc(const __grid_constant__ C
                         __syncwarp();
                         unsigned int inc = ((lane == 0) ? 1 : 0);
                         int aidx = cidx_s;
-                        aidx = ((lane == 0) ? cidx_s : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_old_0;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_old_0) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        aidx = cidx_s;
+                        unsigned int _atomic_old_0 = 0;
+                        if (lane == 0) {
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_old_0) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        }
                         unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, _atomic_old_0, 0);
                         if (_shfl_0 == 0) {
                             role = 1;
@@ -628,16 +630,19 @@ kernel_cake_dense_projection_gemm_ddff2b911137449c1dfc(const __grid_constant__ C
                                 for (int _spin = 0; _spin < 1073741824; _spin++) {
                                     unsigned int inc_0 = ((lane == 0) ? 0 : 0);
                                     int aidx_1 = cidx_s;
-                                    aidx_1 = ((lane == 0) ? cidx_s : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                                    unsigned int _atomic_old_1;
-                                    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                                        : "=r"(_atomic_old_1) : "l"(&counters[aidx_1]), "r"(static_cast<uint32_t>(inc_0)) : "memory");
+                                    aidx_1 = cidx_s;
+                                    unsigned int _atomic_old_1 = 0;
+                                    if (lane == 0) {
+                                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                            : "=r"(_atomic_old_1) : "l"(&counters[aidx_1]), "r"(static_cast<uint32_t>(inc_0)) : "memory");
+                                    }
                                     unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, _atomic_old_1, 0);
                                     if (_shfl_1 >= 3) {
                                         break;
                                     }
                                 }
                             }
+                            __syncwarp();
                         }
                     }
                     if (role == 0) {
@@ -826,10 +831,12 @@ kernel_cake_dense_projection_gemm_ddff2b911137449c1dfc(const __grid_constant__ C
                             __syncwarp();
                             unsigned int inc_1 = ((lane == 0) ? 1 : 0);
                             int aidx_2 = cidx_s;
-                            aidx_2 = ((lane == 0) ? cidx_s : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                            unsigned int _atomic_old_2;
-                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                                : "=r"(_atomic_old_2) : "l"(&counters[aidx_2]), "r"(static_cast<uint32_t>(inc_1)) : "memory");
+                            aidx_2 = cidx_s;
+                            unsigned int _atomic_old_2 = 0;
+                            if (lane == 0) {
+                                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                    : "=r"(_atomic_old_2) : "l"(&counters[aidx_2]), "r"(static_cast<uint32_t>(inc_1)) : "memory");
+                            }
                             unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, _atomic_old_2, 0);
                         }
                     }
