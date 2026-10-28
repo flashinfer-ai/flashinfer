@@ -9539,162 +9539,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_20773e8ee419c4472d8b": {
-        "arches": [
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "branch",
-            ],
-            [
-                "buffer",
-                "residual",
-            ],
-            [
-                "buffer",
-                "alpha",
-            ],
-            [
-                "buffer",
-                "beta",
-            ],
-            [
-                "buffer",
-                "next_weight",
-            ],
-            [
-                "buffer",
-                "post_weight",
-            ],
-            [
-                "buffer",
-                "residual_out",
-            ],
-            [
-                "buffer",
-                "ffn_input",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "post_eps",
-            ],
-            [
-                "parameter",
-                "next_eps",
-            ],
-            [
-                "parameter",
-                "post_gain_center",
-            ],
-            [
-                "parameter",
-                "next_gain_center",
-            ],
-            [
-                "parameter",
-                "alpha_value",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "H": 8192,
-            "cluster": 4,
-            "threads": 256,
-            "vec": 8,
-            "persistent": True,
-            "prefetch": True,
-            "prefetch_depth": 1,
-            "resident": True,
-            "exit_sync": False,
-            "tensor_alpha": True,
-            "post_weight": True,
-            "pdl": False,
-            "rsqrt_approx": False,
-            "min_blocks": 0,
-            "load_order": "vectors_first",
-            "l2_hint": None,
-            "packed": True,
-            "wait_form": "cta",
-            "issue_order": "early",
-            "reload_fp32": False,
-            "expect_hoist": True,
-            "store_all_lanes": False,
-            "tma_stages": 3,
-            "pdl_launch": "statistic",
-            "ring": "rows",
-            "prefetch_l2": 0,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 4,
-            "kind": "persistent_rows",
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_20773e8ee419c4472d8b",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                4,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 38912,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_20773e8ee419c4472d8b",
-        "logical": {
-            "M": "rows",
-            "alpha": "alpha",
-            "alpha_value": "alpha_value",
-            "beta": "beta",
-            "branch": "branch",
-            "ffn_input": "ffn_input",
-            "next_eps": "next_eps",
-            "next_gain_center": "next_gain_center",
-            "next_weight": "next_weight",
-            "post_eps": "post_eps",
-            "post_gain_center": "post_gain_center",
-            "post_weight": "post_weight",
-            "residual": "residual",
-            "residual_out": "residual_out",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "gated_residual_next_rmsnorm",
-        "route": "gated_residual_next_rmsnorm_alpha_tensor_pw",
-        "select_rule": {
-            "kind": "rows_between",
-            "windows": {
-                "sm_103a": [
-                    [
-                        1536,
-                        3072,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
     "cake_muse_spark_norm_28d1182647ea4b51bdac": {
         "arches": [
             "sm_107a",
@@ -10174,7 +10018,11 @@ MODULES: dict[str, dict[str, Any]] = {
                         128,
                     ],
                     [
-                        256,
+                        320,
+                        384,
+                    ],
+                    [
+                        2560,
                         None,
                     ],
                 ],
@@ -10343,7 +10191,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ],
                 "sm_103a": [
                     [
-                        3072,
+                        3584,
                         None,
                     ],
                 ],
@@ -10986,8 +10834,8 @@ MODULES: dict[str, dict[str, Any]] = {
                 ],
                 "sm_103a": [
                     [
-                        512,
-                        1536,
+                        768,
+                        1151,
                     ],
                 ],
                 "sm_107a": [
@@ -12100,6 +11948,326 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
+    "cake_muse_spark_norm_6146ac6f8533b54a3137": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "next_weight",
+            ],
+            [
+                "buffer",
+                "post_weight",
+            ],
+            [
+                "buffer",
+                "residual_out",
+            ],
+            [
+                "buffer",
+                "ffn_input",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "post_eps",
+            ],
+            [
+                "parameter",
+                "next_eps",
+            ],
+            [
+                "parameter",
+                "post_gain_center",
+            ],
+            [
+                "parameter",
+                "next_gain_center",
+            ],
+            [
+                "parameter",
+                "alpha_value",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "cluster": 4,
+            "threads": 256,
+            "vec": 8,
+            "persistent": True,
+            "prefetch": True,
+            "prefetch_depth": 1,
+            "resident": True,
+            "exit_sync": False,
+            "tensor_alpha": False,
+            "post_weight": False,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "min_blocks": 0,
+            "load_order": "vectors_first",
+            "l2_hint": "ld_ll",
+            "packed": True,
+            "wait_form": "cta",
+            "issue_order": "early",
+            "reload_fp32": False,
+            "expect_hoist": True,
+            "store_all_lanes": False,
+            "tma_stages": 0,
+            "pdl_launch": "statistic",
+            "ring": None,
+            "prefetch_l2": 0,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 4,
+            "kind": "persistent_rows",
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_6146ac6f8533b54a3137",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                4,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1280,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_6146ac6f8533b54a3137",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "alpha_value": "alpha_value",
+            "beta": "beta",
+            "branch": "branch",
+            "ffn_input": "ffn_input",
+            "next_eps": "next_eps",
+            "next_gain_center": "next_gain_center",
+            "next_weight": "next_weight",
+            "post_eps": "post_eps",
+            "post_gain_center": "post_gain_center",
+            "post_weight": "post_weight",
+            "residual": "residual",
+            "residual_out": "residual_out",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_next_rmsnorm",
+        "route": "gated_residual_next_rmsnorm_alpha_scalar_nopw",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        256,
+                        320,
+                    ],
+                    [
+                        384,
+                        2560,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_bdcc0ca1fef907537d3b": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "next_weight",
+            ],
+            [
+                "buffer",
+                "post_weight",
+            ],
+            [
+                "buffer",
+                "residual_out",
+            ],
+            [
+                "buffer",
+                "ffn_input",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "post_eps",
+            ],
+            [
+                "parameter",
+                "next_eps",
+            ],
+            [
+                "parameter",
+                "post_gain_center",
+            ],
+            [
+                "parameter",
+                "next_gain_center",
+            ],
+            [
+                "parameter",
+                "alpha_value",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "cluster": 4,
+            "threads": 256,
+            "vec": 8,
+            "persistent": True,
+            "prefetch": True,
+            "prefetch_depth": 1,
+            "resident": True,
+            "exit_sync": False,
+            "tensor_alpha": True,
+            "post_weight": True,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "min_blocks": 0,
+            "load_order": "vectors_first",
+            "l2_hint": None,
+            "packed": True,
+            "wait_form": "cta",
+            "issue_order": "early",
+            "reload_fp32": False,
+            "expect_hoist": True,
+            "store_all_lanes": False,
+            "tma_stages": 0,
+            "pdl_launch": "statistic",
+            "ring": None,
+            "prefetch_l2": 2,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 4,
+            "kind": "persistent_rows",
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_bdcc0ca1fef907537d3b",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                4,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1280,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_bdcc0ca1fef907537d3b",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "alpha_value": "alpha_value",
+            "beta": "beta",
+            "branch": "branch",
+            "ffn_input": "ffn_input",
+            "next_eps": "next_eps",
+            "next_gain_center": "next_gain_center",
+            "next_weight": "next_weight",
+            "post_eps": "post_eps",
+            "post_gain_center": "post_gain_center",
+            "post_weight": "post_weight",
+            "residual": "residual",
+            "residual_out": "residual_out",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_next_rmsnorm",
+        "route": "gated_residual_next_rmsnorm_alpha_tensor_pw",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_103a": [
+                    [
+                        512,
+                        768,
+                    ],
+                    [
+                        1151,
+                        3584,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -12179,6 +12347,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_c06a45c369bb267515f6",
             "cake_muse_spark_norm_36c4ae432a5f4a53f938",
             "cake_muse_spark_norm_1aafa313e4b01bb7f5b7",
+            "cake_muse_spark_norm_6146ac6f8533b54a3137",
         ],
         "gated_residual_next_rmsnorm_alpha_scalar_pw": [
             "cake_muse_spark_norm_2c0fcd41ad79a0293829",
@@ -12187,8 +12356,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_a00e917ba1d1035dccf4",
             "cake_muse_spark_norm_4330a526938b917018e5",
             "cake_muse_spark_norm_4d8b2e18bb1c88e5ecd0",
+            "cake_muse_spark_norm_bdcc0ca1fef907537d3b",
             "cake_muse_spark_norm_84b31104ac86bd40d3fe",
-            "cake_muse_spark_norm_20773e8ee419c4472d8b",
             "cake_muse_spark_norm_4302c6926f9ee940dffa",
         ],
         "gated_residual_rmsnorm_mode0": [
