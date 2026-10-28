@@ -557,7 +557,10 @@ _SPEC3_ROWS = (
     "w",
     "u",
 )  # the prep rows SPEC-3 compares (the design note §6.4)
-SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the probe; default: record; "warn": warn on a difference; "assert": raise
+# the entry points' spec3_probe keyword: "off" skips the probe; "record" (the default) records it; "warn" warns on a
+# difference; "assert" raises KcpPreconditionError
+SPEC3_PROBES = ("off", "record", "warn", "assert")
+SPEC3_PROBE_DEFAULT = "record"
 _PROGRAM_OF = {
     "kcp_fwdh_offset": "fwdh_offset",
     "kcp_fwdh_tape": "fwdh_tape",
@@ -590,7 +593,7 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
 
 class KcpPreconditionError(RuntimeError):
     """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
-    on a real token row and ``CAKE_KCP_SPEC3=assert`` asked for an error (the design note §6.4).  The requirement of
+    on a real token row and the call's ``spec3_probe="assert"`` asked for an error (the design note §6.4).  The requirement of
     record is that the two backward modes (saved set, checkpoint replay) produce identical gradients: both run the
     same prep, intra and WY programs on the same operands, which the GPU tests check bitwise.  The forward's and the
     backward's ``gk`` buffers differ by construction on the current program set: the forward's intra program
@@ -639,7 +642,8 @@ class KernelBackend(Backend):
     The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and
     write its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
-    SPEC-3 (debug probe, once per process on the first saved-mode backward): before that backward's prep the
+    SPEC-3 (debug probe, once per backend on the first saved-mode backward whose call's ``spec3_probe`` keyword is
+    not ``"off"``): before that backward's prep the
     forward's intra program and WY program run on the ``fwd`` layout and their five rows (``gk`` / ``kg`` / ``qg`` /
     ``w`` / ``u``) are kept; after the backward's WY program the ``replay`` layout's rows are compared with them on
     every real token row (pad rows are reported separately).  The requirement of record is that the two backward
@@ -647,9 +651,11 @@ class KernelBackend(Backend):
     ``equal`` is ``False`` by construction: the forward's intra program writes ``gk`` at row 63 of every chunk alone
     (the chunk-final gate row, the only ``gk`` row the K1 / K2 / K3 walks read), the backward's prep program writes
     every row's prefix with the same row 63, so ``rows["gk"]["real_rows_differ"]`` is the real rows minus the full
-    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default.  ``CAKE_KCP_SPEC3=0``
-    skips it, ``=warn`` warns on a difference, ``=assert`` raises
-    :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and :attr:`spec3`.
+    chunks while ``kg`` / ``qg`` / ``w`` / ``u`` report 0; hence the probe records by default
+    (``spec3_probe="record"``).  ``spec3_probe="off"`` skips it on that call, ``"warn"`` warns on a difference,
+    ``"assert"`` raises :class:`KcpPreconditionError`; the result is in ``LAST_CALL["bwd"]["spec3"]`` and
+    :attr:`spec3`.  The keyword travels with the call's options (:class:`KcpOptions`); no environment variable is
+    read.
     """
 
     name = "kernels"
@@ -669,7 +675,8 @@ class KernelBackend(Backend):
         self._dev: dict[tuple[Any, ...], torch.Tensor] = {}
         self._checked_chains: set[int] = set()
         self.spec3: dict[str, Any] | None = None
-        self._spec3_pending = os.environ.get(SPEC3_ENV, "1") != "0"
+        # until the first saved-mode backward that runs the probe
+        self._spec3_pending = True
 
     # -- providers
     def programs(self) -> Any:
@@ -779,7 +786,11 @@ class KernelBackend(Backend):
         if name == "bwd_prep":
             # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
             # the saved set carries no token rows: the intra program recomputes the internal rows in both modes
-            if extra.pop("saved", None) is not None and self._spec3_pending:
+            if (
+                extra.pop("saved", None) is not None
+                and self._spec3_pending
+                and call.opts.spec3_probe != "off"
+            ):
                 self._spec3_forward_rows(
                     call
                 )  # before the backward's prep: the layouts share the arena
@@ -878,7 +889,7 @@ class KernelBackend(Backend):
                 result["equal"] = False
         self.spec3 = call.scratch["spec3"] = result
         if not result["equal"]:
-            mode = os.environ.get(SPEC3_ENV, "1")
+            mode = call.opts.spec3_probe
             message = (
                 "SPEC-3 probe: the backward's prep + WY rows differ from the forward's intra + WY rows on real "
                 f"token rows: {result['rows']}"
@@ -3272,7 +3283,11 @@ class KcpOptions:
     ``exchange`` (``auto`` | ``a2a`` | ``ring``; ring only when ``n_d_max - 1 <= 2``, SPEC-2; ``auto`` is ``a2a``
     today), ``head_groups`` (``G``; Phase 1 ships ``1``),
     ``offset_class`` (``fla``: K1 / K2 offsets; ``fp32`` is a Phase-2 knob), ``debug_sequence`` (R7: all-gather the
-    collective issue order and assert it), ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
+    collective issue order and assert it), ``spec3_probe`` (the SPEC-3 debug probe of the first saved-mode backward,
+    :class:`KernelBackend`: ``"record"`` default, ``"off"``, ``"warn"``, ``"assert"``; pass the same value on every
+    rank: the probe is a rank-local host check (a rank without tokens skips it), and ``"assert"`` raises on a rank
+    whose rows differ while the other ranks enter the backward's collectives -- it serves single-process debugging),
+    ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
     per-rank call -- see "CUDA-graph replay of a call" below for the validity key, the
     pointer-stability requirement, the private pools' memory, the eager fallback and :func:`graph_cache_clear`),
     ``graph_cap`` (the cache-config form of a captured call: ``"node_attr"`` shipped
@@ -3292,6 +3307,8 @@ class KcpOptions:
     head_groups: int = 1
     offset_class: str = "fla"
     debug_sequence: bool = False
+    # public keyword: the SPEC-3 probe's mode (SPEC3_PROBES)
+    spec3_probe: str = SPEC3_PROBE_DEFAULT
     precision_mode: int = 0
     transfer_walk: str = "bf16x3_hw64"  # K3 program family: the shipped BF16x3 half-width walk; tf32_hilo / bf16x3 only through _kcp_test_knobs
     p_rule: str | None = (
@@ -3339,6 +3356,10 @@ class KcpOptions:
             )
         self.save_transfer = bool(self.save_transfer)
         self.debug_sequence = bool(self.debug_sequence)
+        if self.spec3_probe not in SPEC3_PROBES:
+            raise ValueError(
+                f"spec3_probe must be one of {SPEC3_PROBES}, got {self.spec3_probe!r}"
+            )
         self.precision_mode = int(self.precision_mode)
         if self.transfer_walk not in TRANSFER_WALKS:
             raise ValueError(
@@ -3362,8 +3383,9 @@ _OPTION_KEYS = (
     "head_groups",
     "offset_class",
     "debug_sequence",
+    "spec3_probe",
     "graph",
-)  # graph: a public keyword
+)  # spec3_probe, graph: public keywords
 
 
 def _options(kwargs: dict[str, Any]) -> KcpOptions:
@@ -4963,7 +4985,11 @@ def chunk_kda_kcp_bwd(
         entry is not None
         and entry.seen > 0
         and entry.disabled is None
-        and not (saved is not None and getattr(call.backend, "_spec3_pending", False))
+        and not (
+            saved is not None
+            and opts.spec3_probe != "off"
+            and getattr(call.backend, "_spec3_pending", False)
+        )
     ):  # SPEC-3's host compare stays eager
         res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
         if res is not None:
@@ -5118,7 +5144,7 @@ __all__ = [
     "WALK_CACHE_CONFIG_CAP",
     "WALK_CACHE_CONFIG_DEFAULT",
     "walk_device_cache_config",
-    "SPEC3_ENV",
+    "SPEC3_PROBES",
     "KcpPreconditionError",
     "BOUNDARY_MODES",
     "COLLECTIVES",

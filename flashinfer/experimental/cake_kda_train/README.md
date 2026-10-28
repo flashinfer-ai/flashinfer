@@ -131,8 +131,13 @@ into the saved set.
 
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
-`chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  The arena is not
+`chunk_kda_bwd` allocate only their outputs and the saved set when given one.
+Without one, each call allocates its arena when it starts and frees it when it
+returns, so no device memory outlives the call.  The host side of that
+workspace (the plan, which `cake_backend.plan` caches per `(S, num_docs, H,
+sm_count, arch)`, and the layout views) is kept per device, stream and arena
+option, so a repeated problem costs the host about what a caller-owned
+workspace costs.  The arena is not
 initialized: every element a launch reads is written earlier in the same
 call, so the content at allocation never reaches a result (`zero_init=True`
 zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
@@ -499,7 +504,9 @@ launches as on `sm_100a`: 1 document, 16 heads (segmented, `P = 9`) 5 / 11 /
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
 `segment_plan` / `segment_args`; `cake_backend.plan(S, num_docs, H, sm_count,
-arch)` resolves them once per problem into `Plan.records[path][stage]`, and
+arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
+on its arguments; `arch=None` takes the current CUDA device's architecture, or
+the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
 backward from the plan's own light saved set).
 
@@ -655,6 +662,13 @@ exchange -- the default with the all-to-all exchange (an earlier revision).
 receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
+`spec3_probe` sets the debug probe of the backend's first saved-mode backward,
+which compares the backward's prep and WY rows with the forward's: `"record"`
+(the default) stores the comparison in `LAST_CALL["bwd"]["spec3"]`, `"warn"`
+warns on a difference, `"assert"` raises `KcpPreconditionError`, `"off"` skips
+it for that call.  Pass the same value on every rank: the probe is a
+rank-local check, so `"assert"` serves single-process debugging.  No
+environment variable selects it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,

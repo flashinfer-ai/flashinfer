@@ -3914,6 +3914,31 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
     assert cake_kcp._graph_cap_bracket(none_) == ("none", None)
 
 
+def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
+    monkeypatch,
+) -> None:
+    """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"record"`` by default, ``"off"``,
+    ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read the environment only
+    in the gate of the private ``_kcp_test_knobs`` hook, which a public call never passes."""
+    assert cake_kcp._options({}).spec3_probe == "record"
+    for mode in cake_kcp.SPEC3_PROBES:
+        assert cake_kcp._options({"spec3_probe": mode}).spec3_probe == mode
+    for bad in ("0", "1", "", None):
+        with pytest.raises(ValueError, match="spec3_probe"):
+            cake_kcp._options({"spec3_probe": bad})
+    assert not hasattr(cake_kcp, "SPEC3_ENV")
+    monkeypatch.setenv("CAKE_KCP_SPEC3", "0")
+    assert cake_kcp.KernelBackend()._spec3_pending
+    package = os.path.dirname(cake_kcp.__file__)
+    for name in sorted(os.listdir(package)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(package, name), encoding="utf-8") as f:
+            for number, line in enumerate(f, 1):
+                if "os.environ" in line or "getenv" in line:
+                    assert "TEST_KNOBS_ENV" in line, f"{name}:{number}: {line.strip()}"
+
+
 def test_host_trim_options_passthrough() -> None:
     """Trimmed host path: ``chunk_kda_kcp`` validates the options once; the autograd node passes the validated ``KcpOptions``
     through ``_kcp_options`` and ``_options`` returns it unchanged (it travels alone)."""
@@ -4616,7 +4641,7 @@ LOCAL_RECORD_CASES = [
     LOCAL_RECORD_CASES,
     ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
 )
-def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
+def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     """The local stages against the existing backend's registry on the CPU: the kernel backend's value dict of a
     forward (no token-row copies: the saved set carries none), a saved-mode backward and a replay backward binds
     every logical name of every
@@ -4625,7 +4650,6 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
     KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
     grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
     bytes count it) while every other program reads the context's tables."""
-    monkeypatch.setenv(cake_kcp.SPEC3_ENV, "0")
     part = _small_partition(2)
     ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=sm)
     assert ctx.T_r > 0
@@ -4682,6 +4706,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
             out=out,
             grads=grads,
             device=torch.device("cpu"),
+            opts=cake_kcp._options({"spec3_probe": "off"}),
         )
 
     def run(call, stages) -> list:
@@ -4716,6 +4741,8 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
     )
     # the two backward modes: the same records on the same grids
     assert [(k, r, g) for k, r, g, _ in replay] == [(k, r, g) for k, r, g, _ in bwd]
+    # spec3_probe="off": the saved-mode backward ran no probe and left it pending for a later call
+    assert backend._spec3_pending and backend.spec3 is None
     # every launched record of the existing backend's registry finds its logical names in the value dict
     for kind, record, _grid, values in fwd + bwd:
         if kind == "backend":
