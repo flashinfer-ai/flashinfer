@@ -4741,14 +4741,15 @@ def test_local_stage_values_cover_the_records(H, arch, sm, monkeypatch) -> None:
         "kcp_dav",
         expect("dqkg", b),
         expect("glm_intra", b),
-        # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a / sm_107a:
-        # glm_intra; sm_103a runs glm_intra_v14, and the stage call launches nothing)
+        # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a: glm_intra;
+        # sm_103a runs glm_intra_v14 and sm_107a glm_intra_v18, and the stage call launches nothing)
         *([expect("gate_epilogue", b)] if plan.dispatched("gate_epilogue", b) else []),
     ]
-    assert plan.dispatched("gate_epilogue", b) == (arch != "sm_103a")
-    assert expect("glm_intra", b) == (
-        "glm_intra_v14" if arch == "sm_103a" else "glm_intra"
-    )
+    assert plan.dispatched("gate_epilogue", b) == (arch == "sm_100a")
+    assert expect("glm_intra", b) == {
+        "sm_103a": "glm_intra_v14",
+        "sm_107a": "glm_intra_v18",
+    }.get(arch, "glm_intra")
     if (
         H == 64 and arch != "sm_107a"
     ):  # the plan fuses the WY representation into its recurrences there

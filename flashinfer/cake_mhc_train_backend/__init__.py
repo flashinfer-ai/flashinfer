@@ -64,6 +64,11 @@ WORKSPACE_ALIGNMENT_BYTES = 256
 # Bound of the per-token-count caches below (layouts, default-workspace views,
 # launch plans); ``cake_jit.host_plan`` keeps the same bound.
 _CACHE_ENTRIES = 4096
+# The call paths of the per-call PDL argument (``cake_jit.PDL_PATHS``): the forward
+# prepare, the backward from saved statistics, the backward after a replayed forward
+# prefix (the autograd nodes know which; the public backward entry points are the
+# backward path).
+_PATH_FORWARD, _PATH_BACKWARD, _PATH_CHECKPOINT = _loader.PDL_PATHS
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _TORCH_DTYPES = {
@@ -481,15 +486,17 @@ class _Launch:
         self.run, self.template, self.slots = run, template, slots
 
 
-_PLANS: dict[tuple[str, str, int, int], tuple[_Launch, ...]] = {}
+_PLANS: dict[tuple[str, str, int, int, str], tuple[_Launch, ...]] = {}
 
 
 def _route_plan(
-    arch: str, kind: str, rows: int, device_index: int
+    arch: str, kind: str, rows: int, device_index: int, path: str
 ) -> tuple[_Launch, ...]:
-    """The launches of one route for ``rows`` tokens on ``device_index``."""
+    """The launches of one route for ``rows`` tokens on ``device_index`` along ``path``
+    (one of ``cake_jit.PDL_PATHS``: it fixes the per-call PDL argument of the records
+    whose binding takes one, :func:`cake_jit.enable_pdl`)."""
 
-    key = (arch, kind, rows, device_index)
+    key = (arch, kind, rows, device_index, path)
     plan = _PLANS.get(key)
     if plan is None:
         launches = []
@@ -508,6 +515,9 @@ def _route_plan(
                 if arg_kind == "grid":
                     template.append(grid_values[arg_key])
                     continue
+                if arg_kind == "launch":
+                    template.append(_loader.enable_pdl(name, rows, arch, path))
+                    continue
                 logical_name = logical[arg_key]
                 if logical_name in fixed:
                     template.append(fixed[logical_name])
@@ -525,10 +535,16 @@ def _route_plan(
 
 
 def _run_route(
-    arch: str, kind: str, values: dict[str, Any], *, rows: int, device: torch.device
+    arch: str,
+    kind: str,
+    values: dict[str, Any],
+    *,
+    rows: int,
+    device: torch.device,
+    path: str,
 ) -> None:
     device_index = _device_index(device)
-    plan = _route_plan(arch, kind, rows, device_index)
+    plan = _route_plan(arch, kind, rows, device_index, path)
     stream = torch.cuda.current_stream(device_index).cuda_stream
     with _tvm_ffi().use_raw_stream(_tvm_device(device_index), stream):
         for launch in plan:
@@ -670,7 +686,9 @@ def cake_mhc_train_forward_prepare(
         hc_eps=hc_eps,
     )
     values["u"] = U
-    _run_route(arch, "fwd_prepare", values, rows=rows, device=device)
+    _run_route(
+        arch, "fwd_prepare", values, rows=rows, device=device, path=_PATH_FORWARD
+    )
     return U, stats
 
 
@@ -736,7 +754,9 @@ def cake_mhc_train_forward_stats(
         rms_eps=rms_eps,
         hc_eps=hc_eps,
     )
-    _run_route(arch, "fwd_recompute", values, rows=rows, device=device)
+    _run_route(
+        arch, "fwd_recompute", values, rows=rows, device=device, path=_PATH_CHECKPOINT
+    )
     return stats
 
 
@@ -782,7 +802,7 @@ def cake_mhc_train_forward_finish(
     if rows == 0:
         return Y
     values = {"x": X, "b": B, "stats": stats, "y": Y, "rows": rows}
-    _run_route(arch, "fwd_finish", values, rows=rows, device=device)
+    _run_route(arch, "fwd_finish", values, rows=rows, device=device, path=_PATH_FORWARD)
     return Y
 
 
@@ -822,6 +842,26 @@ def cake_mhc_train_backward_prepare(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    return _backward_prepare(
+        dY, B, X, stats, dB=dB, grad_stats_out=grad_stats_out, path=_PATH_BACKWARD
+    )
+
+
+def _backward_prepare(
+    dY: torch.Tensor,
+    B: torch.Tensor,
+    X: torch.Tensor,
+    stats: torch.Tensor,
+    *,
+    dB: Optional[torch.Tensor],
+    grad_stats_out: Optional[torch.Tensor],
+    path: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`cake_mhc_train_backward_prepare` along ``path`` (``_PATH_BACKWARD`` from
+    saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
+    autograd nodes know which): the path fixes the per-call PDL argument of the
+    backward prepare's records (:func:`cake_jit.enable_pdl`)."""
+
     rows, device = _rows_of(X)
     arch = _device_arch(device)
     X = _validate_tensor(
@@ -854,7 +894,7 @@ def cake_mhc_train_backward_prepare(
         "gstats": gstats,
         "rows": rows,
     }
-    _run_route(arch, "bwd_prepare", values, rows=rows, device=device)
+    _run_route(arch, "bwd_prepare", values, rows=rows, device=device, path=path)
     return dB, gstats
 
 
@@ -928,6 +968,56 @@ def cake_mhc_train_backward_finish(
 
     The launches run on the current torch stream of the tensors' device.
     """
+
+    return _backward_finish(
+        X,
+        dY,
+        dU,
+        B,
+        fn,
+        scale,
+        base,
+        stats,
+        grad_stats,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        accumulate=accumulate,
+        workspace=workspace,
+        dX=dX,
+        dfn=dfn,
+        dscale=dscale,
+        dbase=dbase,
+        path=_PATH_BACKWARD,
+    )
+
+
+def _backward_finish(
+    X: torch.Tensor,
+    dY: torch.Tensor,
+    dU: torch.Tensor,
+    B: Optional[torch.Tensor],
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    stats: torch.Tensor,
+    grad_stats: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    accumulate: bool,
+    workspace: Optional[torch.Tensor],
+    dX: Optional[torch.Tensor],
+    dfn: Optional[torch.Tensor],
+    dscale: Optional[torch.Tensor],
+    dbase: Optional[torch.Tensor],
+    path: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`cake_mhc_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
+    saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
+    autograd nodes know which): the path fixes the per-call PDL argument of the
+    column-slab and reduction records (:func:`cake_jit.enable_pdl`)."""
 
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
     rows, device = _rows_of(X)
@@ -1006,7 +1096,7 @@ def cake_mhc_train_backward_finish(
         "chunks": plan["chunks"],
         "accumulate": 1 if accumulate else 0,
     }
-    _run_route(arch, "bwd_finish", values, rows=rows, device=device)
+    _run_route(arch, "bwd_finish", values, rows=rows, device=device, path=path)
     return dX, dfn, dscale, dbase
 
 
@@ -1129,7 +1219,7 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             if state.grad_stats is not None
             else torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
         )
-        dX, dfn, dscale, dbase = cake_mhc_train_backward_finish(
+        dX, dfn, dscale, dbase = _backward_finish(
             X,
             dY,
             _as_bf16(dU, shape=(rows, HIDDEN), device=X.device),
@@ -1142,7 +1232,13 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             rms_eps=state.rms_eps,
             hc_eps=state.hc_eps,
             sinkhorn_iters=state.sinkhorn_iters,
+            accumulate=False,
             workspace=state.backward_workspace,
+            dX=None,
+            dfn=None,
+            dscale=None,
+            dbase=None,
+            path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
         )
         return dX, dfn, dscale, dbase, None
 
@@ -1184,7 +1280,15 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
         state = ctx.state
         stats = saved[0] if saved else state.statistics(X)
         dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, HIDDEN), device=X.device)
-        dB, grad_stats = cake_mhc_train_backward_prepare(dY, B, X, stats)
+        dB, grad_stats = _backward_prepare(
+            dY,
+            B,
+            X,
+            stats,
+            dB=None,
+            grad_stats_out=None,
+            path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
+        )
         state.dY, state.grad_stats = dY, grad_stats
         return None, dB, None
 

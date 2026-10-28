@@ -296,20 +296,20 @@ _EXACTONE_MODULES = {
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
 # table in-kernel.
 _SM107_MODULES = {
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_7061bd10e8",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_40ad9b4590",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8802acca13",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_4409aeb33b",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_4271cd8f5a",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2c8ae2e234",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_c7f567464b",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_9218b14dd8",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_2a59ad7f8d",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_3fdde6a143",
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_9fe96d3e3d",
     "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_85dc39dc0d",
     "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_e93b4cfecf",
     "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_6f23fe85b2",
     "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_99ec0ac9d1",
     "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_34b02c4c96",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ac5e068bdd",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_0a0fef5c43",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_a45423b351",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_724cd517f8",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_01425f72b3",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_4283c68b6c",
     "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_18e09d0f72",
     "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d0cfa07763",
     "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_0536593e19",
@@ -321,15 +321,15 @@ _SM107_MODULES = {
     "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_19f867ebee",
     "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_702261737a",
     "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_af6be0ddce",
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_18f81687d1",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_43c082aa03",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_8f23b9a38e",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_f4d165a103",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_ddc24280ea",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_fb52f5332e",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_fd4934d18b",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_dc323198a2",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_b32659ea6a",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_f14cf64e96",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_2515086063",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_6525b7c5e5",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_792581145e",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_22c42493f3",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_eb7449d516",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_e580ac0245",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_2a81d9c914",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_407b0c247c",
     "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_3dd1c85941",
     "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_c5c1370e4d",
     "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_9e250c660a",
@@ -1554,6 +1554,13 @@ _TWO_KERNEL_ROUTE_MIN_CHUNKS = 2
 # 512-2048 items 1.015-1.06x faster than ``exact``; 8192-20480 items
 # 0.99-1.02x (kept).
 _TWO_KERNEL_ONE_CHUNK_MAX_ITEMS = {(10, 7): 2048}
+# sm_107a: one-chunk ring calls with these state dtypes take ``exactpre``
+# above the item bound too (fp32 state, 8192-20480 items: 1.016-1.031x
+# faster than ``exact``).
+_ONE_CHUNK_EXACTPRE_STATE_DTYPES = {(10, 7): frozenset({torch.float32})}
+# sm_107a: a call the retained ``exact_*_noring`` program would serve takes
+# the fused one-kernel program instead (bf16 state, 8 x 64: 1.34x).
+_NORING_RETAINED_FUSED = frozenset({(10, 7)})
 
 
 def fused_selected(
@@ -1617,6 +1624,7 @@ def two_kernel_family(
     sm_count: Optional[int] = None,
     capability: Optional[tuple[int, int]] = None,
     variant: str = "",
+    state_dtype: Optional[torch.dtype] = None,
 ) -> str:
     """Two-kernel program family of a call the chunk-parallel and fused routes
     left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
@@ -1633,7 +1641,9 @@ def two_kernel_family(
     On a ``capability`` of ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` one-chunk
     items take ``exactpre`` as well when the call's ``num_sequences x
     nheads`` items exceed ``sm_count`` and are at most that bound and its
-    scan ``variant`` is the ring schedule (``""``).
+    scan ``variant`` is the ring schedule (``""``); on a ``capability`` of
+    ``_ONE_CHUNK_EXACTPRE_STATE_DTYPES`` a ``state_dtype`` it lists takes
+    ``exactpre`` above that bound too.
     """
 
     chunks = host_chunks_per_item(
@@ -1650,6 +1660,16 @@ def two_kernel_family(
     )
     items = max(int(num_sequences), 1) * int(nheads or 0)
     if max_items is not None and not variant and sm_count < items <= max_items:
+        return "exactpre"
+    if (
+        max_items is not None
+        and not variant
+        and sm_count < items
+        and state_dtype
+        in _ONE_CHUNK_EXACTPRE_STATE_DTYPES.get(
+            (int(capability[0]), int(capability[1])), ()
+        )
+    ):
         return "exactpre"
     return "exact"
 
@@ -2651,6 +2671,26 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             )
         )
+        if (
+            tuple(capability) in _NORING_RETAINED_FUSED
+            and not chunk_parallel
+            and not fused
+            and not tail
+            and variant == "noring"
+            and two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen if self.has_varlen else seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            )
+            == "exact"
+            and (not derives_table or light_stage or one_launch)
+        ):
+            fused = True
         if chunk_parallel:
             program_family = family
         elif fused:
@@ -2671,6 +2711,7 @@ class CakeSSDCombined:
                 sm_count=sm_count,
                 capability=capability,
                 variant=variant,
+                state_dtype=self.state_dtype,
             )
         workspace: dict[str, Any] = {
             "program": _program_name(

@@ -76,7 +76,8 @@ give bitwise the same outputs: the kernels reduce in a fixed order.
 
 Programmatic dependent launch is a per-plan switch (:func:`pdl_for`, reported
 as ``route_metadata["pdl"]``): when the plan has a split merge and its decode
-is one wave of clusters (``items <= units``), the decode and the merge launch
+is one hardware wave (``items <= units + pairs``: the clusters of four plus
+the pairs the device holds resident), the decode and the merge launch
 with the programmatic attribute, so the decode's prologue overlaps the
 quantizer's tail and the merge's the decode's (the quantizer triggers its
 dependents once its rows are stored, the decode once a role runs out of
@@ -584,14 +585,15 @@ class Plan:
 def pdl_for(plan: Plan) -> bool:
     """Whether the plan's decode and merge launch with programmatic dependent launch.
 
-    On when the plan has a split merge (``max_splits > 1``) and the decode is one wave of clusters (``items <=
-    units``): the merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off
-    otherwise: without a merge there is nothing behind the decode to overlap, and a decode of more items than
-    resident clusters would lose SMs of its second wave to the early-launched merge.  Off launches every program
-    plain, the merge included (a merge under the attribute behind a decode that never triggers starts later than a
-    plain launch).
+    On when the plan has a split merge (``max_splits > 1``) and the decode is one hardware wave (``items <= units +
+    pairs``: the clusters of four and the pairs the device holds resident at once, 50 + 4 on a 208-SM board): the
+    merge's prologue then overlaps the decode's tail and the decode's the quantizer's.  Off otherwise: without a
+    merge there is nothing behind the decode to overlap, and a decode of more items than the device holds resident
+    would lose SMs of its second wave to the early-launched merge.  Off launches every program plain, the merge
+    included (a merge under the attribute behind a decode that never triggers starts later than a plain launch).
+    The plans of 51-52 items (204-208 CTAs, still one hardware wave) run 1-2 % faster with the attribute on R200.
     """
-    return plan.max_splits > 1 and plan.items <= plan.units
+    return plan.max_splits > 1 and plan.items <= plan.units + plan.pairs
 
 
 def _round_up(n: int, m: int) -> int:

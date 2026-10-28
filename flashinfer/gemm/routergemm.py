@@ -994,7 +994,13 @@ class _Tcgen05Window(NamedTuple):
 # features, and without one 9 to 16 rows start at 1728 (PACKED measured slower
 # below).  The M=64 tiles serve sm_107a alone, at 2048 to 3072 output features:
 # PACKED_M64_N4 4 rows, PACKED_M64_N16 9 to 16 rows, ahead of PACKED and
-# ACCUMULATORS where they measured faster.
+# ACCUMULATORS where they measured faster.  On sm_107a, 17 to 23 rows without a bias
+# whose activations take less than 128 KiB (batch x input features x 2 bytes) load
+# slowly on ACCUMULATORS, whose 64-row boxes reach past the batch: PACKED serves 17 to
+# 21 of these rows from an input of 2048, and 22 or 23 rows from about 120 KiB of
+# activations (PACKED measured faster on every such shape, ACCUMULATORS slower than
+# the reference on some; below 120 KiB, 22 and 23 rows stay on ACCUMULATORS, which
+# measured faster than the reference there and close to PACKED).
 _LARGE_WEIGHT = 6_000_000
 
 
@@ -1056,6 +1062,30 @@ def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
     )
 
 
+# sm_107a, 17 to 23 rows without a bias: PACKED from the input in the table up to
+# the largest input (a multiple of 8) that keeps the activations under 128 KiB.
+_SM107_SMALL_ACTIVATIONS = tuple(
+    _Tcgen05Window(
+        "PACKED",
+        batch,
+        batch,
+        False,
+        1536,
+        4096,
+        low,
+        65535 // batch // 8 * 8,
+        _LARGE_WEIGHT,
+    )
+    for batch, low in (
+        (17, 2048),
+        (18, 2048),
+        (19, 2048),
+        (20, 2048),
+        (21, 2048),
+        (22, 2816),
+        (23, 2688),
+    )
+)
 _PACKED_FEW_ROWS = (
     _Tcgen05Window("PACKED", 1, 8, False, 2880, 4096, None, 6144, _LARGE_WEIGHT),
     _Tcgen05Window("PACKED", 9, 16, True, 2880, 4096, 2112, 6144, _LARGE_WEIGHT),
@@ -1129,6 +1159,7 @@ _SM107 = (
     _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 2048, 3072, 8192, 10240),
     _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
+    *_SM107_SMALL_ACTIVATIONS,
     *_many_rows_nobias(1728),
     *_many_rows_bias(2048),
 )

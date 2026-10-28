@@ -545,7 +545,6 @@ kernel_cake_kda_train_18bd735cf970f8dfa1b4(const __grid_constant__ CUtensorMap a
             int num_items_m = num_pairs * num_heads;
             unsigned int _phase_zero_done_0 = 0;
             unsigned int _phase_tiles_full = 0;
-            unsigned int _phase_vb_ready = 0;
             unsigned int _phase_acc_empty = 1;
             if (elect_sync()) {
                 mbarrier_wait(zero_done_addr, _phase_zero_done_0);
@@ -553,7 +552,7 @@ kernel_cake_kda_train_18bd735cf970f8dfa1b4(const __grid_constant__ CUtensorMap a
                 #pragma unroll 1
                 for (unsigned int item_m = bid; item_m < num_items_m; item_m += num_bids) {
                     mbarrier_wait(tiles_full_addr + (mma_stage) * 8, _phase_tiles_full);
-                    mbarrier_wait(vb_ready_addr + (mma_stage) * 8, _phase_vb_ready);
+                    mbarrier_wait(vb_ready_addr + (mma_stage) * 8, _phase_tiles_full);
                     mbarrier_wait(acc_empty_addr + (mma_buf) * 8, _phase_acc_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -681,7 +680,7 @@ kernel_cake_kda_train_18bd735cf970f8dfa1b4(const __grid_constant__ CUtensorMap a
                     tcgen05_commit(tiles_empty_addr + (mma_stage) * 8);
                     tcgen05_commit(acc_full_addr + (mma_buf) * 8);
                     mma_stage += 1;
-                    if (mma_stage == 2) { mma_stage = 0; _phase_tiles_full ^= 1; _phase_vb_ready ^= 1; }
+                    if (mma_stage == 2) { mma_stage = 0; _phase_tiles_full ^= 1; }
                     mma_buf += 1;
                     if (mma_buf == 2) { mma_buf = 0; _phase_acc_empty ^= 1; }
                 }
