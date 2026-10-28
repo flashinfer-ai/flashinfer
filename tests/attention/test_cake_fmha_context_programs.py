@@ -1028,6 +1028,52 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
     )
 
 
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("page", (64, 16))
+@pytest.mark.parametrize("skipped", ("short_workspace", "no_split_program"))
+def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
+    monkeypatch, target, page, skipped
+) -> None:
+    """One request of 4 query tokens over 1024 keys, heads 32/4 (B256's exact
+    class at 64-token pages): pack 8 has no split plan, and the split choice
+    runs a smaller pack's own plan.  The call takes that pack's split-KV
+    program where the workspace holds the plan's partials; where it cannot
+    (a workspace one byte short, or no split-KV program of that pack) the call
+    keeps its program, as pack 8 has no plan of its own."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    sm_count = _SM_COUNT[target]
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
+    assert cake_api._context_fp8_split_plan(target, 1, 4, 1024, 32, 8, sm_count) is None
+    pack, plan = cake_api._context_fp8_split_choice(target, 1, 4, 1024, 32, 8, sm_count)
+    assert pack < 8
+    need = cake_api._context_fp8_split_workspace_bytes(plan[0], plan[2])
+    suffix = "_PAGE64" if page == 64 else ""
+    meta = torch.device("meta")
+    row = ("context_fp8", 1, 4, 1024, 32, 4, page, True, None)
+    kwargs = dict(
+        _context_kwargs(row, device="meta"),
+        workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta"),
+    )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == f"RUNTIME_SK_PACK{pack}{suffix}", route
+    assert (route.pack_g, route.num_m_blocks) == (pack, 1)
+    if skipped == "short_workspace":
+        kwargs["workspace_buffer"] = torch.empty(
+            need - 1, dtype=torch.uint8, device="meta"
+        )
+    else:
+        routes = cake_api._CONTEXT_FP8_SPLIT_ROUTES[target]
+        monkeypatch.setitem(
+            cake_api._CONTEXT_FP8_SPLIT_ROUTES,
+            target,
+            {key: name for key, name in routes.items() if key[0] != pack},
+        )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == (_FP8_EXACT[target] if page == 64 else "RUNTIME_PACK8")
+    assert (route.pack_g, route.num_m_blocks) == (8, 1)
+
+
 # --- The page tables a launch passes (host-only) -----------------------------
 
 

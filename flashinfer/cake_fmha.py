@@ -5021,8 +5021,8 @@ def select_cake_fmha_context_route(
         # leave SMs idle: the split-KV program of the pack the split choice
         # names (:func:`_context_fp8_split_choice`) and the page size, where the
         # split plan predicts a gain and the workspace holds its partials; the
-        # runtime pack's own plan where the workspace cannot hold the chosen
-        # pack's.
+        # runtime pack's own plan, where it has one, when the workspace cannot
+        # hold the chosen pack's partials; else the call keeps its program.
         split = _CONTEXT_FP8_SPLIT_ROUTES.get(target)
         sm_count = _context_split_sm_count(device)
         if program is not None and component == "context_fp8" and split and sm_count:
@@ -5041,7 +5041,8 @@ def select_cake_fmha_context_route(
                     pack,
                     sm_count,
                 )
-                candidates.append((pack, own))
+                if own is not None:
+                    candidates.append((pack, own))
             for pack, plan in candidates:
                 split_program = split.get((pack, page_size)) or split.get((pack, None))
                 if split_program is None or not _context_fp8_split_workspace_supported(
