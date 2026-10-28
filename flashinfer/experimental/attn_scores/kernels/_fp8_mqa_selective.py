@@ -72,10 +72,10 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .._fp8_mqa_constants import _COMPUTE_BLOCK_KV
-from .._math_policy import _validate_math_mode
-from .fp8_paged_mqa_logits import _FP8MQAEngineMixin
-from ...cute_dsl.attention.dsa.gather4_utils import _CopyBulkTensor2DGather4G2SOp
+from ....attn_scores._fp8_mqa_constants import _COMPUTE_BLOCK_KV
+from ....attn_scores._math_policy import _validate_math_mode
+from ....attn_scores.kernels.fp8_paged_mqa_logits import _FP8MQAEngineMixin
+from ....cute_dsl.attention.dsa.gather4_utils import _CopyBulkTensor2DGather4G2SOp
 
 from .._selective_contract import (
     _COUNT_SEGMENTS,

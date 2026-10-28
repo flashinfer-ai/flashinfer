@@ -17,9 +17,9 @@ import functools
 
 from packaging.version import Version
 
-from . import env as jit_env
-from .core import JitSpec, current_compilation_context, gen_jit_spec
-from .cpp_ext import get_cuda_version
+from ....jit import env as jit_env
+from ....jit.core import JitSpec, current_compilation_context, gen_jit_spec
+from ....jit.cpp_ext import get_cuda_version
 
 
 def gen_selective_repair_if_module() -> JitSpec:

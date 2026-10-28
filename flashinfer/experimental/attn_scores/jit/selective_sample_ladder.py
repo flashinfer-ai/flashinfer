@@ -15,8 +15,8 @@
 
 import functools
 
-from . import env as jit_env
-from .core import JitSpec, current_compilation_context, gen_jit_spec
+from ....jit import env as jit_env
+from ....jit.core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_selective_sample_ladder_module() -> JitSpec:

@@ -20,7 +20,7 @@ it has no in-place replan, option switches or alternate selection algorithm.
 
 import torch
 
-from flashinfer.attn_scores import selective_logits as sl
+from flashinfer.experimental.attn_scores import selective_logits as sl
 
 
 class SelectiveEngineCase(sl._FP8PagedMQASelectiveTopKEngine):

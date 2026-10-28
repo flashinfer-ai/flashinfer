@@ -218,8 +218,6 @@ from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
-from .jit.selective_repair_if import gen_selective_repair_if_module
-from .jit.selective_sample_ladder import gen_selective_sample_ladder_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -1156,10 +1154,6 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm100f or has_sm103:
-            jit_specs.append(gen_selective_sample_ladder_module())
-            if get_cuda_version() >= Version("12.4"):
-                jit_specs.append(gen_selective_repair_if_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).

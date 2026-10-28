@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stable step inputs and device validation for capacity-planned selective TopK."""
+"""Address-stable step inputs for experimental capacity-planned TopK."""
 
 from __future__ import annotations
 
@@ -454,7 +454,7 @@ class _CapacitySelectiveTopKPlan:
         Subsequent equal-layout pools add only launch/graph bindings, not another
         score, candidate or repair workspace. Construct outside capture.
         """
-        from ._math_policy import _validate_math_mode
+        from ...attn_scores._math_policy import _validate_math_mode
         from .selective_logits import _SAMPLE_CAPACITY, _validate_selective_top_k
 
         capacity = _SelectiveCapacity(
@@ -562,7 +562,7 @@ class _CapacitySelectiveTopKPlan:
 
     def _build_engine(self, kv_fused) -> None:
         from dataclasses import replace
-        from ..utils import get_device_sm_count
+        from ...utils import get_device_sm_count
 
         from .selective_logits import (
             _SAMPLE_CAPACITY,

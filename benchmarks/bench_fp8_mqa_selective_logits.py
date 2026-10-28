@@ -257,9 +257,9 @@ def _workspace_inventory(owner, excluded):
         elif isinstance(value, (list, tuple)):
             for item in value:
                 visit(item)
-        elif type(value).__module__.startswith("flashinfer.attn_scores") and hasattr(
-            value, "__dict__"
-        ):
+        elif type(value).__module__.startswith(
+            ("flashinfer.attn_scores", "flashinfer.experimental.attn_scores")
+        ) and hasattr(value, "__dict__"):
             for item in vars(value).values():
                 visit(item)
 
