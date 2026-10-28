@@ -155,7 +155,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_aa1c07af087ec8a8c4de(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -365,103 +365,103 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                 p_lane_max = _max_3;
             }
             unsigned int p_sort = p_lane_max;
-            unsigned int p_peer = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
-            int p_take_max = (lane >> 1 ^ lane) & 1;
-            if (p_take_max == 0) {
-                unsigned int _min_4 = ((p_sort) < (p_peer) ? (p_sort) : (p_peer));
+            unsigned int p_peer_1_0 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
+            int p_take_max_2_0 = (lane >> 1 ^ lane) & 1;
+            if (p_take_max_2_0 == 0) {
+                unsigned int _min_4 = ((p_sort) < (p_peer_1_0) ? (p_sort) : (p_peer_1_0));
                 p_sort = _min_4;
             } else {
-                unsigned int _max_5 = ((p_sort) > (p_peer) ? (p_sort) : (p_peer));
+                unsigned int _max_5 = ((p_sort) > (p_peer_1_0) ? (p_sort) : (p_peer_1_0));
                 p_sort = _max_5;
             }
-            unsigned int p_peer_0 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
-            int p_take_max_1 = (lane >> 2 ^ lane >> 1) & 1;
-            if (p_take_max_1 == 0) {
-                unsigned int _min_6 = ((p_sort) < (p_peer_0) ? (p_sort) : (p_peer_0));
+            unsigned int p_peer_1_1 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
+            int p_take_max_2_1 = (lane >> 2 ^ lane >> 1) & 1;
+            if (p_take_max_2_1 == 0) {
+                unsigned int _min_6 = ((p_sort) < (p_peer_1_1) ? (p_sort) : (p_peer_1_1));
                 p_sort = _min_6;
             } else {
-                unsigned int _max_7 = ((p_sort) > (p_peer_0) ? (p_sort) : (p_peer_0));
+                unsigned int _max_7 = ((p_sort) > (p_peer_1_1) ? (p_sort) : (p_peer_1_1));
                 p_sort = _max_7;
             }
-            unsigned int p_peer_2 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
-            int p_take_max_3 = (lane >> 2 ^ lane) & 1;
-            if (p_take_max_3 == 0) {
-                unsigned int _min_8 = ((p_sort) < (p_peer_2) ? (p_sort) : (p_peer_2));
+            unsigned int p_peer_1_2 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
+            int p_take_max_2_2 = (lane >> 2 ^ lane) & 1;
+            if (p_take_max_2_2 == 0) {
+                unsigned int _min_8 = ((p_sort) < (p_peer_1_2) ? (p_sort) : (p_peer_1_2));
                 p_sort = _min_8;
             } else {
-                unsigned int _max_9 = ((p_sort) > (p_peer_2) ? (p_sort) : (p_peer_2));
+                unsigned int _max_9 = ((p_sort) > (p_peer_1_2) ? (p_sort) : (p_peer_1_2));
                 p_sort = _max_9;
             }
-            unsigned int p_peer_4 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 4);
-            int p_take_max_5 = (lane >> 3 ^ lane >> 2) & 1;
-            if (p_take_max_5 == 0) {
-                unsigned int _min_10 = ((p_sort) < (p_peer_4) ? (p_sort) : (p_peer_4));
+            unsigned int p_peer_1_3 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 4);
+            int p_take_max_2_3 = (lane >> 3 ^ lane >> 2) & 1;
+            if (p_take_max_2_3 == 0) {
+                unsigned int _min_10 = ((p_sort) < (p_peer_1_3) ? (p_sort) : (p_peer_1_3));
                 p_sort = _min_10;
             } else {
-                unsigned int _max_11 = ((p_sort) > (p_peer_4) ? (p_sort) : (p_peer_4));
+                unsigned int _max_11 = ((p_sort) > (p_peer_1_3) ? (p_sort) : (p_peer_1_3));
                 p_sort = _max_11;
             }
-            unsigned int p_peer_6 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
-            int p_take_max_7 = (lane >> 3 ^ lane >> 1) & 1;
-            if (p_take_max_7 == 0) {
-                unsigned int _min_12 = ((p_sort) < (p_peer_6) ? (p_sort) : (p_peer_6));
+            unsigned int p_peer_1_4 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
+            int p_take_max_2_4 = (lane >> 3 ^ lane >> 1) & 1;
+            if (p_take_max_2_4 == 0) {
+                unsigned int _min_12 = ((p_sort) < (p_peer_1_4) ? (p_sort) : (p_peer_1_4));
                 p_sort = _min_12;
             } else {
-                unsigned int _max_13 = ((p_sort) > (p_peer_6) ? (p_sort) : (p_peer_6));
+                unsigned int _max_13 = ((p_sort) > (p_peer_1_4) ? (p_sort) : (p_peer_1_4));
                 p_sort = _max_13;
             }
-            unsigned int p_peer_8 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
-            int p_take_max_9 = (lane >> 3 ^ lane) & 1;
-            if (p_take_max_9 == 0) {
-                unsigned int _min_14 = ((p_sort) < (p_peer_8) ? (p_sort) : (p_peer_8));
+            unsigned int p_peer_1_5 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
+            int p_take_max_2_5 = (lane >> 3 ^ lane) & 1;
+            if (p_take_max_2_5 == 0) {
+                unsigned int _min_14 = ((p_sort) < (p_peer_1_5) ? (p_sort) : (p_peer_1_5));
                 p_sort = _min_14;
             } else {
-                unsigned int _max_15 = ((p_sort) > (p_peer_8) ? (p_sort) : (p_peer_8));
+                unsigned int _max_15 = ((p_sort) > (p_peer_1_5) ? (p_sort) : (p_peer_1_5));
                 p_sort = _max_15;
             }
-            unsigned int p_peer_10 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 8);
-            int p_take_max_11 = (lane >> 4 ^ lane >> 3) & 1;
-            if (p_take_max_11 == 0) {
-                unsigned int _min_16 = ((p_sort) < (p_peer_10) ? (p_sort) : (p_peer_10));
+            unsigned int p_peer_1_6 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 8);
+            int p_take_max_2_6 = (lane >> 4 ^ lane >> 3) & 1;
+            if (p_take_max_2_6 == 0) {
+                unsigned int _min_16 = ((p_sort) < (p_peer_1_6) ? (p_sort) : (p_peer_1_6));
                 p_sort = _min_16;
             } else {
-                unsigned int _max_17 = ((p_sort) > (p_peer_10) ? (p_sort) : (p_peer_10));
+                unsigned int _max_17 = ((p_sort) > (p_peer_1_6) ? (p_sort) : (p_peer_1_6));
                 p_sort = _max_17;
             }
-            unsigned int p_peer_12 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 4);
-            int p_take_max_13 = (lane >> 4 ^ lane >> 2) & 1;
-            if (p_take_max_13 == 0) {
-                unsigned int _min_18 = ((p_sort) < (p_peer_12) ? (p_sort) : (p_peer_12));
+            unsigned int p_peer_1_7 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 4);
+            int p_take_max_2_7 = (lane >> 4 ^ lane >> 2) & 1;
+            if (p_take_max_2_7 == 0) {
+                unsigned int _min_18 = ((p_sort) < (p_peer_1_7) ? (p_sort) : (p_peer_1_7));
                 p_sort = _min_18;
             } else {
-                unsigned int _max_19 = ((p_sort) > (p_peer_12) ? (p_sort) : (p_peer_12));
+                unsigned int _max_19 = ((p_sort) > (p_peer_1_7) ? (p_sort) : (p_peer_1_7));
                 p_sort = _max_19;
             }
-            unsigned int p_peer_14 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
-            int p_take_max_15 = (lane >> 4 ^ lane >> 1) & 1;
-            if (p_take_max_15 == 0) {
-                unsigned int _min_20 = ((p_sort) < (p_peer_14) ? (p_sort) : (p_peer_14));
+            unsigned int p_peer_1_8 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 2);
+            int p_take_max_2_8 = (lane >> 4 ^ lane >> 1) & 1;
+            if (p_take_max_2_8 == 0) {
+                unsigned int _min_20 = ((p_sort) < (p_peer_1_8) ? (p_sort) : (p_peer_1_8));
                 p_sort = _min_20;
             } else {
-                unsigned int _max_21 = ((p_sort) > (p_peer_14) ? (p_sort) : (p_peer_14));
+                unsigned int _max_21 = ((p_sort) > (p_peer_1_8) ? (p_sort) : (p_peer_1_8));
                 p_sort = _max_21;
             }
-            unsigned int p_peer_16 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
-            int p_take_max_17 = (lane >> 4 ^ lane) & 1;
-            if (p_take_max_17 == 0) {
-                unsigned int _min_22 = ((p_sort) < (p_peer_16) ? (p_sort) : (p_peer_16));
+            unsigned int p_peer_1_9 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 1);
+            int p_take_max_2_9 = (lane >> 4 ^ lane) & 1;
+            if (p_take_max_2_9 == 0) {
+                unsigned int _min_22 = ((p_sort) < (p_peer_1_9) ? (p_sort) : (p_peer_1_9));
                 p_sort = _min_22;
             } else {
-                unsigned int _max_23 = ((p_sort) > (p_peer_16) ? (p_sort) : (p_peer_16));
+                unsigned int _max_23 = ((p_sort) > (p_peer_1_9) ? (p_sort) : (p_peer_1_9));
                 p_sort = _max_23;
             }
-            unsigned int p_peer_18 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 16);
-            int p_take_max_19 = (lane >> 5 ^ lane >> 4) & 1;
-            if (p_take_max_19 == 0) {
-                unsigned int _min_24 = ((p_sort) < (p_peer_18) ? (p_sort) : (p_peer_18));
+            unsigned int p_peer_1_10 = __shfl_xor_sync(0xFFFFFFFF, p_sort, 16);
+            int p_take_max_2_10 = (lane >> 5 ^ lane >> 4) & 1;
+            if (p_take_max_2_10 == 0) {
+                unsigned int _min_24 = ((p_sort) < (p_peer_1_10) ? (p_sort) : (p_peer_1_10));
                 p_sort = _min_24;
             } else {
-                unsigned int _max_25 = ((p_sort) > (p_peer_18) ? (p_sort) : (p_peer_18));
+                unsigned int _max_25 = ((p_sort) > (p_peer_1_10) ? (p_sort) : (p_peer_1_10));
                 p_sort = _max_25;
             }
             unsigned int p_upper = 4294967295;
@@ -484,25 +484,25 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
             if (p_total <= 32) {
                 use_radix = 0;
                 unsigned int p_incl = p_count;
-                unsigned int p_up = __shfl_up_sync(0xFFFFFFFF, p_incl, 1, 32);
+                unsigned int p_up_4_0 = __shfl_up_sync(0xFFFFFFFF, p_incl, 1, 32);
                 if (lane >= 1) {
-                    p_incl += p_up;
+                    p_incl += p_up_4_0;
                 }
-                unsigned int p_up_0 = __shfl_up_sync(0xFFFFFFFF, p_incl, 2, 32);
+                unsigned int p_up_4_1 = __shfl_up_sync(0xFFFFFFFF, p_incl, 2, 32);
                 if (lane >= 2) {
-                    p_incl += p_up_0;
+                    p_incl += p_up_4_1;
                 }
-                unsigned int p_up_1 = __shfl_up_sync(0xFFFFFFFF, p_incl, 4, 32);
+                unsigned int p_up_4_2 = __shfl_up_sync(0xFFFFFFFF, p_incl, 4, 32);
                 if (lane >= 4) {
-                    p_incl += p_up_1;
+                    p_incl += p_up_4_2;
                 }
-                unsigned int p_up_2 = __shfl_up_sync(0xFFFFFFFF, p_incl, 8, 32);
+                unsigned int p_up_4_3 = __shfl_up_sync(0xFFFFFFFF, p_incl, 8, 32);
                 if (lane >= 8) {
-                    p_incl += p_up_2;
+                    p_incl += p_up_4_3;
                 }
-                unsigned int p_up_3 = __shfl_up_sync(0xFFFFFFFF, p_incl, 16, 32);
+                unsigned int p_up_4_4 = __shfl_up_sync(0xFFFFFFFF, p_incl, 16, 32);
                 if (lane >= 16) {
-                    p_incl += p_up_3;
+                    p_incl += p_up_4_4;
                 }
                 int p_slot = (int)(p_incl - p_count);
                 unsigned int p_walk = p_mask;
@@ -562,25 +562,25 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                     use_radix = 0;
                     int q_base = 8288 + warp * 192;
                     unsigned int q_incl = p_count;
-                    unsigned int q_up = __shfl_up_sync(0xFFFFFFFF, q_incl, 1, 32);
+                    unsigned int q_up_4_0 = __shfl_up_sync(0xFFFFFFFF, q_incl, 1, 32);
                     if (lane >= 1) {
-                        q_incl += q_up;
+                        q_incl += q_up_4_0;
                     }
-                    unsigned int q_up_0 = __shfl_up_sync(0xFFFFFFFF, q_incl, 2, 32);
+                    unsigned int q_up_4_1 = __shfl_up_sync(0xFFFFFFFF, q_incl, 2, 32);
                     if (lane >= 2) {
-                        q_incl += q_up_0;
+                        q_incl += q_up_4_1;
                     }
-                    unsigned int q_up_1 = __shfl_up_sync(0xFFFFFFFF, q_incl, 4, 32);
+                    unsigned int q_up_4_2 = __shfl_up_sync(0xFFFFFFFF, q_incl, 4, 32);
                     if (lane >= 4) {
-                        q_incl += q_up_1;
+                        q_incl += q_up_4_2;
                     }
-                    unsigned int q_up_2 = __shfl_up_sync(0xFFFFFFFF, q_incl, 8, 32);
+                    unsigned int q_up_4_3 = __shfl_up_sync(0xFFFFFFFF, q_incl, 8, 32);
                     if (lane >= 8) {
-                        q_incl += q_up_2;
+                        q_incl += q_up_4_3;
                     }
-                    unsigned int q_up_3 = __shfl_up_sync(0xFFFFFFFF, q_incl, 16, 32);
+                    unsigned int q_up_4_4 = __shfl_up_sync(0xFFFFFFFF, q_incl, 16, 32);
                     if (lane >= 16) {
-                        q_incl += q_up_3;
+                        q_incl += q_up_4_4;
                     }
                     int q_slot = (int)(q_incl - p_count);
                     unsigned int q_walk = p_mask;
@@ -715,25 +715,25 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                             lane_count += scan_count;
                         }
                         int inclusive = lane_count;
-                        int scan_peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
+                        int scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
                         if (lane >= 1) {
-                            inclusive += scan_peer;
+                            inclusive += scan_peer_4_0;
                         }
-                        int scan_peer_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
+                        int scan_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
                         if (lane >= 2) {
-                            inclusive += scan_peer_0;
+                            inclusive += scan_peer_4_1;
                         }
-                        int scan_peer_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
+                        int scan_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
                         if (lane >= 4) {
-                            inclusive += scan_peer_1;
+                            inclusive += scan_peer_4_2;
                         }
-                        int scan_peer_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
+                        int scan_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
                         if (lane >= 8) {
-                            inclusive += scan_peer_2;
+                            inclusive += scan_peer_4_3;
                         }
-                        int scan_peer_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
+                        int scan_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
                         if (lane >= 16) {
-                            inclusive += scan_peer_3;
+                            inclusive += scan_peer_4_4;
                         }
                         int consume_round = 1;
                         if (spec_round != 0) {
@@ -952,25 +952,25 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
         lane_total += padded_count_scan;
     }
     int warp_inclusive = lane_total;
-    int phase2_scan_peer = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
+    int phase2_scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
     if (lane >= 1) {
-        warp_inclusive += phase2_scan_peer;
+        warp_inclusive += phase2_scan_peer_4_0;
     }
-    int phase2_scan_peer_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
+    int phase2_scan_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
     if (lane >= 2) {
-        warp_inclusive += phase2_scan_peer_0;
+        warp_inclusive += phase2_scan_peer_4_1;
     }
-    int phase2_scan_peer_1 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
+    int phase2_scan_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
     if (lane >= 4) {
-        warp_inclusive += phase2_scan_peer_1;
+        warp_inclusive += phase2_scan_peer_4_2;
     }
-    int phase2_scan_peer_2 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
+    int phase2_scan_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
     if (lane >= 8) {
-        warp_inclusive += phase2_scan_peer_2;
+        warp_inclusive += phase2_scan_peer_4_3;
     }
-    int phase2_scan_peer_3 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
+    int phase2_scan_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
     if (lane >= 16) {
-        warp_inclusive += phase2_scan_peer_3;
+        warp_inclusive += phase2_scan_peer_4_4;
     }
     if (lane == 31) {
         phase2_warp_sums[warp] = warp_inclusive;
@@ -1106,140 +1106,140 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                         if (warp_sort_count > lane) {
                             warp_sort_value = sorted_token_ids[warp_sort_start + lane];
                         }
-                        int warp_sort_peer = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
-                        int warp_sort_take_max = (lane >> 1 ^ lane) & 1;
-                        if (warp_sort_take_max == 0) {
-                            if (warp_sort_peer < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer;
+                        int warp_sort_peer_1_0 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
+                        int warp_sort_take_max_2_0 = (lane >> 1 ^ lane) & 1;
+                        if (warp_sort_take_max_2_0 == 0) {
+                            if (warp_sort_peer_1_0 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_0;
                             }
-                        } else if (warp_sort_peer > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer;
+                        } else if (warp_sort_peer_1_0 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_0;
                         }
-                        int warp_sort_peer_0 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
-                        int warp_sort_take_max_1 = (lane >> 2 ^ lane >> 1) & 1;
-                        if (warp_sort_take_max_1 == 0) {
-                            if (warp_sort_peer_0 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_0;
+                        int warp_sort_peer_1_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
+                        int warp_sort_take_max_2_1 = (lane >> 2 ^ lane >> 1) & 1;
+                        if (warp_sort_take_max_2_1 == 0) {
+                            if (warp_sort_peer_1_1 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_1;
                             }
-                        } else if (warp_sort_peer_0 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_0;
+                        } else if (warp_sort_peer_1_1 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_1;
                         }
-                        int warp_sort_peer_2 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
-                        int warp_sort_take_max_3 = (lane >> 2 ^ lane) & 1;
-                        if (warp_sort_take_max_3 == 0) {
-                            if (warp_sort_peer_2 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_2;
+                        int warp_sort_peer_1_2 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
+                        int warp_sort_take_max_2_2 = (lane >> 2 ^ lane) & 1;
+                        if (warp_sort_take_max_2_2 == 0) {
+                            if (warp_sort_peer_1_2 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_2;
                             }
-                        } else if (warp_sort_peer_2 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_2;
+                        } else if (warp_sort_peer_1_2 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_2;
                         }
-                        int warp_sort_peer_4 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
-                        int warp_sort_take_max_5 = (lane >> 3 ^ lane >> 2) & 1;
-                        if (warp_sort_take_max_5 == 0) {
-                            if (warp_sort_peer_4 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_4;
+                        int warp_sort_peer_1_3 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
+                        int warp_sort_take_max_2_3 = (lane >> 3 ^ lane >> 2) & 1;
+                        if (warp_sort_take_max_2_3 == 0) {
+                            if (warp_sort_peer_1_3 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_3;
                             }
-                        } else if (warp_sort_peer_4 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_4;
+                        } else if (warp_sort_peer_1_3 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_3;
                         }
-                        int warp_sort_peer_6 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
-                        int warp_sort_take_max_7 = (lane >> 3 ^ lane >> 1) & 1;
-                        if (warp_sort_take_max_7 == 0) {
-                            if (warp_sort_peer_6 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_6;
+                        int warp_sort_peer_1_4 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
+                        int warp_sort_take_max_2_4 = (lane >> 3 ^ lane >> 1) & 1;
+                        if (warp_sort_take_max_2_4 == 0) {
+                            if (warp_sort_peer_1_4 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_4;
                             }
-                        } else if (warp_sort_peer_6 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_6;
+                        } else if (warp_sort_peer_1_4 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_4;
                         }
-                        int warp_sort_peer_8 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
-                        int warp_sort_take_max_9 = (lane >> 3 ^ lane) & 1;
-                        if (warp_sort_take_max_9 == 0) {
-                            if (warp_sort_peer_8 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_8;
+                        int warp_sort_peer_1_5 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
+                        int warp_sort_take_max_2_5 = (lane >> 3 ^ lane) & 1;
+                        if (warp_sort_take_max_2_5 == 0) {
+                            if (warp_sort_peer_1_5 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_5;
                             }
-                        } else if (warp_sort_peer_8 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_8;
+                        } else if (warp_sort_peer_1_5 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_5;
                         }
-                        int warp_sort_peer_10 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 8);
-                        int warp_sort_take_max_11 = (lane >> 4 ^ lane >> 3) & 1;
-                        if (warp_sort_take_max_11 == 0) {
-                            if (warp_sort_peer_10 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_10;
+                        int warp_sort_peer_1_6 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 8);
+                        int warp_sort_take_max_2_6 = (lane >> 4 ^ lane >> 3) & 1;
+                        if (warp_sort_take_max_2_6 == 0) {
+                            if (warp_sort_peer_1_6 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_6;
                             }
-                        } else if (warp_sort_peer_10 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_10;
+                        } else if (warp_sort_peer_1_6 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_6;
                         }
-                        int warp_sort_peer_12 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
-                        int warp_sort_take_max_13 = (lane >> 4 ^ lane >> 2) & 1;
-                        if (warp_sort_take_max_13 == 0) {
-                            if (warp_sort_peer_12 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_12;
+                        int warp_sort_peer_1_7 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
+                        int warp_sort_take_max_2_7 = (lane >> 4 ^ lane >> 2) & 1;
+                        if (warp_sort_take_max_2_7 == 0) {
+                            if (warp_sort_peer_1_7 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_7;
                             }
-                        } else if (warp_sort_peer_12 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_12;
+                        } else if (warp_sort_peer_1_7 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_7;
                         }
-                        int warp_sort_peer_14 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
-                        int warp_sort_take_max_15 = (lane >> 4 ^ lane >> 1) & 1;
-                        if (warp_sort_take_max_15 == 0) {
-                            if (warp_sort_peer_14 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_14;
+                        int warp_sort_peer_1_8 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
+                        int warp_sort_take_max_2_8 = (lane >> 4 ^ lane >> 1) & 1;
+                        if (warp_sort_take_max_2_8 == 0) {
+                            if (warp_sort_peer_1_8 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_8;
                             }
-                        } else if (warp_sort_peer_14 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_14;
+                        } else if (warp_sort_peer_1_8 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_8;
                         }
-                        int warp_sort_peer_16 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
-                        int warp_sort_take_max_17 = (lane >> 4 ^ lane) & 1;
-                        if (warp_sort_take_max_17 == 0) {
-                            if (warp_sort_peer_16 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_16;
+                        int warp_sort_peer_1_9 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
+                        int warp_sort_take_max_2_9 = (lane >> 4 ^ lane) & 1;
+                        if (warp_sort_take_max_2_9 == 0) {
+                            if (warp_sort_peer_1_9 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_9;
                             }
-                        } else if (warp_sort_peer_16 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_16;
+                        } else if (warp_sort_peer_1_9 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_9;
                         }
-                        int warp_sort_peer_18 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 16);
-                        int warp_sort_take_max_19 = (lane >> 5 ^ lane >> 4) & 1;
-                        if (warp_sort_take_max_19 == 0) {
-                            if (warp_sort_peer_18 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_18;
+                        int warp_sort_peer_1_10 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 16);
+                        int warp_sort_take_max_2_10 = (lane >> 5 ^ lane >> 4) & 1;
+                        if (warp_sort_take_max_2_10 == 0) {
+                            if (warp_sort_peer_1_10 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_10;
                             }
-                        } else if (warp_sort_peer_18 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_18;
+                        } else if (warp_sort_peer_1_10 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_10;
                         }
-                        int warp_sort_peer_20 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 8);
-                        int warp_sort_take_max_21 = (lane >> 5 ^ lane >> 3) & 1;
-                        if (warp_sort_take_max_21 == 0) {
-                            if (warp_sort_peer_20 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_20;
+                        int warp_sort_peer_1_11 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 8);
+                        int warp_sort_take_max_2_11 = (lane >> 5 ^ lane >> 3) & 1;
+                        if (warp_sort_take_max_2_11 == 0) {
+                            if (warp_sort_peer_1_11 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_11;
                             }
-                        } else if (warp_sort_peer_20 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_20;
+                        } else if (warp_sort_peer_1_11 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_11;
                         }
-                        int warp_sort_peer_22 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
-                        int warp_sort_take_max_23 = (lane >> 5 ^ lane >> 2) & 1;
-                        if (warp_sort_take_max_23 == 0) {
-                            if (warp_sort_peer_22 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_22;
+                        int warp_sort_peer_1_12 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 4);
+                        int warp_sort_take_max_2_12 = (lane >> 5 ^ lane >> 2) & 1;
+                        if (warp_sort_take_max_2_12 == 0) {
+                            if (warp_sort_peer_1_12 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_12;
                             }
-                        } else if (warp_sort_peer_22 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_22;
+                        } else if (warp_sort_peer_1_12 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_12;
                         }
-                        int warp_sort_peer_24 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
-                        int warp_sort_take_max_25 = (lane >> 5 ^ lane >> 1) & 1;
-                        if (warp_sort_take_max_25 == 0) {
-                            if (warp_sort_peer_24 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_24;
+                        int warp_sort_peer_1_13 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 2);
+                        int warp_sort_take_max_2_13 = (lane >> 5 ^ lane >> 1) & 1;
+                        if (warp_sort_take_max_2_13 == 0) {
+                            if (warp_sort_peer_1_13 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_13;
                             }
-                        } else if (warp_sort_peer_24 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_24;
+                        } else if (warp_sort_peer_1_13 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_13;
                         }
-                        int warp_sort_peer_26 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
-                        int warp_sort_take_max_27 = (lane >> 5 ^ lane) & 1;
-                        if (warp_sort_take_max_27 == 0) {
-                            if (warp_sort_peer_26 < warp_sort_value) {
-                                warp_sort_value = warp_sort_peer_26;
+                        int warp_sort_peer_1_14 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value, 1);
+                        int warp_sort_take_max_2_14 = (lane >> 5 ^ lane) & 1;
+                        if (warp_sort_take_max_2_14 == 0) {
+                            if (warp_sort_peer_1_14 < warp_sort_value) {
+                                warp_sort_value = warp_sort_peer_1_14;
                             }
-                        } else if (warp_sort_peer_26 > warp_sort_value) {
-                            warp_sort_value = warp_sort_peer_26;
+                        } else if (warp_sort_peer_1_14 > warp_sort_value) {
+                            warp_sort_value = warp_sort_peer_1_14;
                         }
                         if (warp_sort_count > lane) {
                             sorted_token_ids[warp_sort_start + lane] = warp_sort_value;
@@ -1323,140 +1323,140 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                             if (warp_sort_count_1 > lane) {
                                 warp_sort_value_1 = sorted_token_ids[warp_sort_start_1 + lane];
                             }
-                            int warp_sort_peer_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
-                            int warp_sort_take_max_2 = (lane >> 1 ^ lane) & 1;
-                            if (warp_sort_take_max_2 == 0) {
-                                if (warp_sort_peer_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_1;
+                            int warp_sort_peer_1_15 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
+                            int warp_sort_take_max_2_15 = (lane >> 1 ^ lane) & 1;
+                            if (warp_sort_take_max_2_15 == 0) {
+                                if (warp_sort_peer_1_15 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_15;
                                 }
-                            } else if (warp_sort_peer_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_1;
+                            } else if (warp_sort_peer_1_15 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_15;
                             }
-                            int warp_sort_peer_0_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
-                            int warp_sort_take_max_1_1 = (lane >> 2 ^ lane >> 1) & 1;
-                            if (warp_sort_take_max_1_1 == 0) {
-                                if (warp_sort_peer_0_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_0_1;
+                            int warp_sort_peer_1_16 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
+                            int warp_sort_take_max_2_16 = (lane >> 2 ^ lane >> 1) & 1;
+                            if (warp_sort_take_max_2_16 == 0) {
+                                if (warp_sort_peer_1_16 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_16;
                                 }
-                            } else if (warp_sort_peer_0_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_0_1;
+                            } else if (warp_sort_peer_1_16 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_16;
                             }
-                            int warp_sort_peer_2_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
-                            int warp_sort_take_max_3_1 = (lane >> 2 ^ lane) & 1;
-                            if (warp_sort_take_max_3_1 == 0) {
-                                if (warp_sort_peer_2_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_2_1;
+                            int warp_sort_peer_1_17 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
+                            int warp_sort_take_max_2_17 = (lane >> 2 ^ lane) & 1;
+                            if (warp_sort_take_max_2_17 == 0) {
+                                if (warp_sort_peer_1_17 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_17;
                                 }
-                            } else if (warp_sort_peer_2_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_2_1;
+                            } else if (warp_sort_peer_1_17 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_17;
                             }
-                            int warp_sort_peer_4_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
-                            int warp_sort_take_max_5_1 = (lane >> 3 ^ lane >> 2) & 1;
-                            if (warp_sort_take_max_5_1 == 0) {
-                                if (warp_sort_peer_4_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_4_1;
+                            int warp_sort_peer_1_18 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
+                            int warp_sort_take_max_2_18 = (lane >> 3 ^ lane >> 2) & 1;
+                            if (warp_sort_take_max_2_18 == 0) {
+                                if (warp_sort_peer_1_18 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_18;
                                 }
-                            } else if (warp_sort_peer_4_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_4_1;
+                            } else if (warp_sort_peer_1_18 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_18;
                             }
-                            int warp_sort_peer_6_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
-                            int warp_sort_take_max_7_1 = (lane >> 3 ^ lane >> 1) & 1;
-                            if (warp_sort_take_max_7_1 == 0) {
-                                if (warp_sort_peer_6_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_6_1;
+                            int warp_sort_peer_1_19 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
+                            int warp_sort_take_max_2_19 = (lane >> 3 ^ lane >> 1) & 1;
+                            if (warp_sort_take_max_2_19 == 0) {
+                                if (warp_sort_peer_1_19 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_19;
                                 }
-                            } else if (warp_sort_peer_6_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_6_1;
+                            } else if (warp_sort_peer_1_19 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_19;
                             }
-                            int warp_sort_peer_8_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
-                            int warp_sort_take_max_9_1 = (lane >> 3 ^ lane) & 1;
-                            if (warp_sort_take_max_9_1 == 0) {
-                                if (warp_sort_peer_8_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_8_1;
+                            int warp_sort_peer_1_20 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
+                            int warp_sort_take_max_2_20 = (lane >> 3 ^ lane) & 1;
+                            if (warp_sort_take_max_2_20 == 0) {
+                                if (warp_sort_peer_1_20 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_20;
                                 }
-                            } else if (warp_sort_peer_8_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_8_1;
+                            } else if (warp_sort_peer_1_20 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_20;
                             }
-                            int warp_sort_peer_10_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 8);
-                            int warp_sort_take_max_11_1 = (lane >> 4 ^ lane >> 3) & 1;
-                            if (warp_sort_take_max_11_1 == 0) {
-                                if (warp_sort_peer_10_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_10_1;
+                            int warp_sort_peer_1_21 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 8);
+                            int warp_sort_take_max_2_21 = (lane >> 4 ^ lane >> 3) & 1;
+                            if (warp_sort_take_max_2_21 == 0) {
+                                if (warp_sort_peer_1_21 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_21;
                                 }
-                            } else if (warp_sort_peer_10_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_10_1;
+                            } else if (warp_sort_peer_1_21 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_21;
                             }
-                            int warp_sort_peer_12_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
-                            int warp_sort_take_max_13_1 = (lane >> 4 ^ lane >> 2) & 1;
-                            if (warp_sort_take_max_13_1 == 0) {
-                                if (warp_sort_peer_12_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_12_1;
+                            int warp_sort_peer_1_22 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
+                            int warp_sort_take_max_2_22 = (lane >> 4 ^ lane >> 2) & 1;
+                            if (warp_sort_take_max_2_22 == 0) {
+                                if (warp_sort_peer_1_22 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_22;
                                 }
-                            } else if (warp_sort_peer_12_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_12_1;
+                            } else if (warp_sort_peer_1_22 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_22;
                             }
-                            int warp_sort_peer_14_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
-                            int warp_sort_take_max_15_1 = (lane >> 4 ^ lane >> 1) & 1;
-                            if (warp_sort_take_max_15_1 == 0) {
-                                if (warp_sort_peer_14_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_14_1;
+                            int warp_sort_peer_1_23 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
+                            int warp_sort_take_max_2_23 = (lane >> 4 ^ lane >> 1) & 1;
+                            if (warp_sort_take_max_2_23 == 0) {
+                                if (warp_sort_peer_1_23 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_23;
                                 }
-                            } else if (warp_sort_peer_14_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_14_1;
+                            } else if (warp_sort_peer_1_23 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_23;
                             }
-                            int warp_sort_peer_16_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
-                            int warp_sort_take_max_17_1 = (lane >> 4 ^ lane) & 1;
-                            if (warp_sort_take_max_17_1 == 0) {
-                                if (warp_sort_peer_16_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_16_1;
+                            int warp_sort_peer_1_24 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
+                            int warp_sort_take_max_2_24 = (lane >> 4 ^ lane) & 1;
+                            if (warp_sort_take_max_2_24 == 0) {
+                                if (warp_sort_peer_1_24 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_24;
                                 }
-                            } else if (warp_sort_peer_16_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_16_1;
+                            } else if (warp_sort_peer_1_24 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_24;
                             }
-                            int warp_sort_peer_18_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 16);
-                            int warp_sort_take_max_19_1 = (lane >> 5 ^ lane >> 4) & 1;
-                            if (warp_sort_take_max_19_1 == 0) {
-                                if (warp_sort_peer_18_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_18_1;
+                            int warp_sort_peer_1_25 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 16);
+                            int warp_sort_take_max_2_25 = (lane >> 5 ^ lane >> 4) & 1;
+                            if (warp_sort_take_max_2_25 == 0) {
+                                if (warp_sort_peer_1_25 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_25;
                                 }
-                            } else if (warp_sort_peer_18_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_18_1;
+                            } else if (warp_sort_peer_1_25 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_25;
                             }
-                            int warp_sort_peer_20_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 8);
-                            int warp_sort_take_max_21_1 = (lane >> 5 ^ lane >> 3) & 1;
-                            if (warp_sort_take_max_21_1 == 0) {
-                                if (warp_sort_peer_20_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_20_1;
+                            int warp_sort_peer_1_26 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 8);
+                            int warp_sort_take_max_2_26 = (lane >> 5 ^ lane >> 3) & 1;
+                            if (warp_sort_take_max_2_26 == 0) {
+                                if (warp_sort_peer_1_26 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_26;
                                 }
-                            } else if (warp_sort_peer_20_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_20_1;
+                            } else if (warp_sort_peer_1_26 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_26;
                             }
-                            int warp_sort_peer_22_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
-                            int warp_sort_take_max_23_1 = (lane >> 5 ^ lane >> 2) & 1;
-                            if (warp_sort_take_max_23_1 == 0) {
-                                if (warp_sort_peer_22_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_22_1;
+                            int warp_sort_peer_1_27 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 4);
+                            int warp_sort_take_max_2_27 = (lane >> 5 ^ lane >> 2) & 1;
+                            if (warp_sort_take_max_2_27 == 0) {
+                                if (warp_sort_peer_1_27 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_27;
                                 }
-                            } else if (warp_sort_peer_22_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_22_1;
+                            } else if (warp_sort_peer_1_27 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_27;
                             }
-                            int warp_sort_peer_24_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
-                            int warp_sort_take_max_25_1 = (lane >> 5 ^ lane >> 1) & 1;
-                            if (warp_sort_take_max_25_1 == 0) {
-                                if (warp_sort_peer_24_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_24_1;
+                            int warp_sort_peer_1_28 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 2);
+                            int warp_sort_take_max_2_28 = (lane >> 5 ^ lane >> 1) & 1;
+                            if (warp_sort_take_max_2_28 == 0) {
+                                if (warp_sort_peer_1_28 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_28;
                                 }
-                            } else if (warp_sort_peer_24_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_24_1;
+                            } else if (warp_sort_peer_1_28 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_28;
                             }
-                            int warp_sort_peer_26_1 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
-                            int warp_sort_take_max_27_1 = (lane >> 5 ^ lane) & 1;
-                            if (warp_sort_take_max_27_1 == 0) {
-                                if (warp_sort_peer_26_1 < warp_sort_value_1) {
-                                    warp_sort_value_1 = warp_sort_peer_26_1;
+                            int warp_sort_peer_1_29 = __shfl_xor_sync(0xFFFFFFFF, warp_sort_value_1, 1);
+                            int warp_sort_take_max_2_29 = (lane >> 5 ^ lane) & 1;
+                            if (warp_sort_take_max_2_29 == 0) {
+                                if (warp_sort_peer_1_29 < warp_sort_value_1) {
+                                    warp_sort_value_1 = warp_sort_peer_1_29;
                                 }
-                            } else if (warp_sort_peer_26_1 > warp_sort_value_1) {
-                                warp_sort_value_1 = warp_sort_peer_26_1;
+                            } else if (warp_sort_peer_1_29 > warp_sort_value_1) {
+                                warp_sort_value_1 = warp_sort_peer_1_29;
                             }
                             if (warp_sort_count_1 > lane) {
                                 sorted_token_ids[warp_sort_start_1 + lane] = warp_sort_value_1;
@@ -1548,35 +1548,35 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                 int cb = cb0 + (int)(unsigned int)__popc(wb1);
                 int inc_a = ca;
                 int inc_b = cb;
-                int up_a = __shfl_up_sync(0xFFFFFFFF, inc_a, 1, 32);
-                int up_b = __shfl_up_sync(0xFFFFFFFF, inc_b, 1, 32);
+                int up_a_1_0 = __shfl_up_sync(0xFFFFFFFF, inc_a, 1, 32);
+                int up_b_2_0 = __shfl_up_sync(0xFFFFFFFF, inc_b, 1, 32);
                 if (lane >= 1) {
-                    inc_a += up_a;
-                    inc_b += up_b;
+                    inc_a += up_a_1_0;
+                    inc_b += up_b_2_0;
                 }
-                int up_a_0 = __shfl_up_sync(0xFFFFFFFF, inc_a, 2, 32);
-                int up_b_1 = __shfl_up_sync(0xFFFFFFFF, inc_b, 2, 32);
+                int up_a_1_1 = __shfl_up_sync(0xFFFFFFFF, inc_a, 2, 32);
+                int up_b_2_1 = __shfl_up_sync(0xFFFFFFFF, inc_b, 2, 32);
                 if (lane >= 2) {
-                    inc_a += up_a_0;
-                    inc_b += up_b_1;
+                    inc_a += up_a_1_1;
+                    inc_b += up_b_2_1;
                 }
-                int up_a_2 = __shfl_up_sync(0xFFFFFFFF, inc_a, 4, 32);
-                int up_b_3 = __shfl_up_sync(0xFFFFFFFF, inc_b, 4, 32);
+                int up_a_1_2 = __shfl_up_sync(0xFFFFFFFF, inc_a, 4, 32);
+                int up_b_2_2 = __shfl_up_sync(0xFFFFFFFF, inc_b, 4, 32);
                 if (lane >= 4) {
-                    inc_a += up_a_2;
-                    inc_b += up_b_3;
+                    inc_a += up_a_1_2;
+                    inc_b += up_b_2_2;
                 }
-                int up_a_4 = __shfl_up_sync(0xFFFFFFFF, inc_a, 8, 32);
-                int up_b_5 = __shfl_up_sync(0xFFFFFFFF, inc_b, 8, 32);
+                int up_a_1_3 = __shfl_up_sync(0xFFFFFFFF, inc_a, 8, 32);
+                int up_b_2_3 = __shfl_up_sync(0xFFFFFFFF, inc_b, 8, 32);
                 if (lane >= 8) {
-                    inc_a += up_a_4;
-                    inc_b += up_b_5;
+                    inc_a += up_a_1_3;
+                    inc_b += up_b_2_3;
                 }
-                int up_a_6 = __shfl_up_sync(0xFFFFFFFF, inc_a, 16, 32);
-                int up_b_7 = __shfl_up_sync(0xFFFFFFFF, inc_b, 16, 32);
+                int up_a_1_4 = __shfl_up_sync(0xFFFFFFFF, inc_a, 16, 32);
+                int up_b_2_4 = __shfl_up_sync(0xFFFFFFFF, inc_b, 16, 32);
                 if (lane >= 16) {
-                    inc_a += up_a_6;
-                    inc_b += up_b_7;
+                    inc_a += up_a_1_4;
+                    inc_b += up_b_2_4;
                 }
                 if (lane == 31) {
                     totals_a[warp] = inc_a;
@@ -1648,35 +1648,35 @@ kernel_cake_kimi_k3_fused_router_e4ffeaed7ebbd244203a(float* __restrict__ logits
                             rank += 1;
                         }
                         unsigned int walk_0 = wa1;
-                        int rank_1 = rank_a + ca0;
+                        int rank_0 = rank_a + ca0;
                         while (walk_0 != 0) {
                             int _find_first_set_38 = __ffs((int)walk_0);
                             int bit_1 = _find_first_set_38 - 1;
                             int token_12 = (word0 + 1 << 5) + bit_1;
-                            sorted_token_ids[rank_1] = token_12 * 16 + (int)route_a[token_12];
+                            sorted_token_ids[rank_0] = token_12 * 16 + (int)route_a[token_12];
                             walk_0 = walk_0 & walk_0 - 1;
-                            rank_1 += 1;
+                            rank_0 += 1;
                         }
                     }
                     if (eff_b > 0) {
                         unsigned int walk_1 = wb0;
-                        int rank_2 = rank_b;
+                        int rank_1 = rank_b;
                         while (walk_1 != 0) {
                             int _find_first_set_39 = __ffs((int)walk_1);
                             int bit_2 = _find_first_set_39 - 1;
                             int token_13 = (word0 << 5) + bit_2;
-                            sorted_token_ids[rank_2] = token_13 * 16 + (int)route_b[token_13];
+                            sorted_token_ids[rank_1] = token_13 * 16 + (int)route_b[token_13];
                             walk_1 = walk_1 & walk_1 - 1;
-                            rank_2 += 1;
+                            rank_1 += 1;
                         }
-                        unsigned int walk_0_1 = wb1;
+                        unsigned int walk_1_1 = wb1;
                         int rank_1_1 = rank_b + cb0;
-                        while (walk_0_1 != 0) {
-                            int _find_first_set_40 = __ffs((int)walk_0_1);
+                        while (walk_1_1 != 0) {
+                            int _find_first_set_40 = __ffs((int)walk_1_1);
                             int bit_3 = _find_first_set_40 - 1;
                             int token_14 = (word0 + 1 << 5) + bit_3;
                             sorted_token_ids[rank_1_1] = token_14 * 16 + (int)route_b[token_14];
-                            walk_0_1 = walk_0_1 & walk_0_1 - 1;
+                            walk_1_1 = walk_1_1 & walk_1_1 - 1;
                             rank_1_1 += 1;
                         }
                     }

@@ -284,36 +284,36 @@ kernel_cake_kimi_k3_fused_router_3cf5cafee3b503734ab4(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
-        unsigned int warp_top0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+        unsigned int warp_top0_1_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
         if (lane == 0) {
-            published = warp_top0;
+            published = warp_top0_1_0;
         }
-        if (lane_bound == warp_top0) {
+        if (lane_bound == warp_top0_1_0) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+        unsigned int warp_top0_1_1;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
         if (lane == 1) {
-            published = warp_top1;
+            published = warp_top0_1_1;
         }
-        if (lane_bound == warp_top1) {
+        if (lane_bound == warp_top0_1_1) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top2;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+        unsigned int warp_top0_1_2;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
         if (lane == 2) {
-            published = warp_top2;
+            published = warp_top0_1_2;
         }
-        if (lane_bound == warp_top2) {
+        if (lane_bound == warp_top0_1_2) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top3;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+        unsigned int warp_top0_1_3;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
         if (lane == 3) {
-            published = warp_top3;
+            published = warp_top0_1_3;
         }
-        if (lane_bound == warp_top3) {
+        if (lane_bound == warp_top0_1_3) {
             lane_bound = (unsigned int)0;
         }
         if (lane < 4) {
