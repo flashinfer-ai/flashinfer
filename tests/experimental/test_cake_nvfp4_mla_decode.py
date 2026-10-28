@@ -95,7 +95,11 @@ FURTHER_RECORDS = {
         cake_jit.ARCHES,
         {"short_rows": True, "epi_warp": True},
     ),
-    SHORT_SPEC_RECORD: ("decode", ("sm_100a",), {"short_rows": True, "spec_uh": True}),
+    SHORT_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "spec_uh": True},
+    ),
     SHORT_EPI_SPEC_RECORD: (
         "decode",
         cake_jit.ARCHES,
@@ -652,7 +656,7 @@ def short_epi_record(monkeypatch):
 @pytest.fixture
 def spec_records(monkeypatch, short_record, short_epi_record):
     """Registers both short-row records and, beside them, the two that load
-    their unit's first item in the kernel setup (the short-row one for SM100)."""
+    their unit's first item in the kernel setup."""
     return {
         name: _register_further(monkeypatch, name)
         for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD)
@@ -1063,8 +1067,7 @@ def test_select_decode_record_spec_uh_needs_one_item_pair_per_unit(
     assert select_decode_record(one, "sm_100a") == spec
     assert select_decode_record(several, "sm_100a") == short
     assert select_decode_record(empty, "sm_100a") == short
-    # SM103 has no short-row program with that load; the epilogue one it has.
-    assert select_decode_record(one, "sm_103a") == (spec if epi else short)
+    assert select_decode_record(one, "sm_103a") == spec
     assert select_decode_record(several, "sm_103a") == short
     # The short-row rule first: a long unit runs neither.
     long = _hand_plan([8], [400], q_len=q_len, num_heads=num_heads)
@@ -1960,8 +1963,8 @@ def test_short_spec_decode_matches_the_decode_bitwise(
     monkeypatch, label, kv_lens, options
 ):
     """Short plans of one item pair per unit run the short-row program that
-    loads its unit's first item in the kernel setup (SM100) and the decode
-    program to the same bits."""
+    loads its unit's first item in the kernel setup and the decode program to
+    the same bits."""
     assert_programs_match_bitwise(monkeypatch, SHORT_SPEC_RECORD, kv_lens, **options)
 
 

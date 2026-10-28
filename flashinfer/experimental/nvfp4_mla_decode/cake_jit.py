@@ -36,7 +36,7 @@ it, which ``select_decode_record`` picks for plans of short units, and
 ``decode_short_epi_warp``, that decode with its epilogue store path picked
 per softmax warp, which ``select_decode_record`` picks in its place when
 every request ends in a CTA of at least 32 valid query rows, and
-``decode_short_spec_uh`` (SM100) and ``decode_short_epi_warp_spec_uh``, those
+``decode_short_spec_uh`` and ``decode_short_epi_warp_spec_uh``, those
 two decodes loading the first item of their unit in the kernel setup, which
 ``select_decode_record`` picks in place of either when every unit holds one
 item pair; the combine's is
@@ -459,6 +459,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "decode_short_spec_uh": {
         "arches": [
             "sm_100a",
+            "sm_103a",
         ],
         "arg_plan": [
             ["tma_buffer", "Q"],
