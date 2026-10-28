@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generated programs of the FP8 E4M3 paged context attention of the cake_fmha module (head
-dim 128, bottom-right causal, the GQA group packed into the M tile), each shipped for
-sm_100a and sm_103a: B256 takes the softmax and output scales as host scalars,
-B256_SCALE_PTR reads them from device scalars; the RUNTIME_PACK programs take the
-lengths, head counts, m-block count, page size and scale source as launch arguments
-(PAGE64: 64-token pages only); the RUNTIME_SK programs are the same schedule with the
-key range of a tile split over several work units, whose FP32 partials the tile's last
-unit merges. The host module ``flashinfer.cake_fmha`` selects the program from the head
-counts, the page size, the planned maximum lengths and the kind of scale arguments of a
-launch, computes the grid and launches it; other shapes keep the module's other context
-routes.
+dim 128, bottom-right causal, the GQA group packed into the M tile), for sm_100a and
+sm_103a: B256 (sm_100a) and B256_KV4 (sm_103a, a 4-stage K/V ring) take the softmax and
+output scales as host scalars, B256_SCALE_PTR and B256_SCALE_PTR_KV4 read them from
+device scalars; the RUNTIME_PACK programs take the lengths, head counts, m-block count,
+page size and scale source as launch arguments (PAGE64: 64-token pages only); the
+RUNTIME_SK programs are the same schedule with the key range of a tile split over
+several work units, whose FP32 partials the tile's last unit merges. The host module
+``flashinfer.cake_fmha`` selects the program from the head counts, the page size, the
+planned maximum lengths and the kind of scale arguments of a launch, computes the grid
+and launches it; other shapes keep the module's other context routes.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -33,18 +33,15 @@ from . import cake_program
 from .core import JitSpec
 
 B256 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_6f7e8b77c2309a9c63a2",
+    name="cake_fmha_context_fp8_f57014e4e03dcbce72d8",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_6f7e8b77c2309a9c63a2",
+    kernel="kernel_cake_fmha_context_fp8_f57014e4e03dcbce72d8",
     sources=(
-        "cake_fmha_context_fp8_6f7e8b77c2309a9c63a2_kernel.cu",
-        "cake_fmha_context_fp8_6f7e8b77c2309a9c63a2_binding.cu",
+        "cake_fmha_context_fp8_f57014e4e03dcbce72d8_kernel.cu",
+        "cake_fmha_context_fp8_f57014e4e03dcbce72d8_binding.cu",
     ),
-    targets=("sm_100a", "sm_103a"),
-    compile_options=(
-        ("sm_100a", ("--use_fast_math", "--fmad=true")),
-        ("sm_103a", ("--use_fast_math", "--fmad=true")),
-    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
     args=(
         "Q",
         "K",
@@ -95,18 +92,15 @@ B256 = cake_program.CakeProgram(
 )
 
 B256_SCALE_PTR = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_a586c83f6eca2799c39e",
+    name="cake_fmha_context_fp8_45b03632970269bac548",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_a586c83f6eca2799c39e",
+    kernel="kernel_cake_fmha_context_fp8_45b03632970269bac548",
     sources=(
-        "cake_fmha_context_fp8_a586c83f6eca2799c39e_kernel.cu",
-        "cake_fmha_context_fp8_a586c83f6eca2799c39e_binding.cu",
+        "cake_fmha_context_fp8_45b03632970269bac548_kernel.cu",
+        "cake_fmha_context_fp8_45b03632970269bac548_binding.cu",
     ),
-    targets=("sm_100a", "sm_103a"),
-    compile_options=(
-        ("sm_100a", ("--use_fast_math", "--fmad=true")),
-        ("sm_103a", ("--use_fast_math", "--fmad=true")),
-    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
     args=(
         "Q",
         "K",
@@ -151,6 +145,124 @@ B256_SCALE_PTR = cake_program.CakeProgram(
     block=(512, 1, 1),
     cluster=(1, 1, 1),
     dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+B256_KV4 = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_64a9d449f206e9476fd4",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_64a9d449f206e9476fd4",
+    sources=(
+        "cake_fmha_context_fp8_64a9d449f206e9476fd4_kernel.cu",
+        "cake_fmha_context_fp8_64a9d449f206e9476fd4_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=102912,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+B256_SCALE_PTR_KV4 = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_7bc99d2dda53eeaad98b",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b",
+    sources=(
+        "cake_fmha_context_fp8_7bc99d2dda53eeaad98b_kernel.cu",
+        "cake_fmha_context_fp8_7bc99d2dda53eeaad98b_binding.cu",
+    ),
+    targets=("sm_103a",),
+    compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=102912,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -1335,6 +1447,8 @@ RUNTIME_SK_PACK1_PAGE64 = cake_program.CakeProgram(
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     B256,
     B256_SCALE_PTR,
+    B256_KV4,
+    B256_SCALE_PTR_KV4,
     RUNTIME_PACK8,
     RUNTIME_PACK4,
     RUNTIME_PACK2,
@@ -1362,6 +1476,8 @@ def aot_specs(target: str) -> tuple[JitSpec, ...]:
 __all__ = [
     "B256",
     "B256_SCALE_PTR",
+    "B256_KV4",
+    "B256_SCALE_PTR_KV4",
     "RUNTIME_PACK8",
     "RUNTIME_PACK4",
     "RUNTIME_PACK2",

@@ -62,7 +62,7 @@ SHAPE_ROWS = {
     ),
     "fp8_b256_q32_k1024": (
         "context_fp8", 256, 32, 1024, 32, 4, 64, True,
-        {"sm100a": "B256", "sm103a": "B256"},
+        {"sm100a": "B256", "sm103a": "B256_KV4"},
     ),
     "nvfp4_b4_q511_k2047": (
         "context_nvfp4", 4, 511, 2047, 32, 4, 16, True,
@@ -91,9 +91,13 @@ SHAPE_ROWS = {
 # both scale forms itself.
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
+    "B256_KV4": "B256_SCALE_PTR_KV4",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
+# The exact FP8 program of a target (host scales): sm103a ships the 4-stage
+# K/V ring build.
+_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_KV4"}
 # runtime-size program identifier -> its pack
 _RUNTIME_PACK = {
     identifier: pack
@@ -666,8 +670,12 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
     for host and device scales alike."""
 
     routes = cake_api._CONTEXT_PROGRAM_ROUTES[target]
-    assert routes[("context_fp8", "host", 32, 4, 8, 1, 64, None)] == "B256"
-    assert routes[("context_fp8", "device", 32, 4, 8, 1, 64, None)] == "B256_SCALE_PTR"
+    exact = _FP8_EXACT[target]
+    assert routes[("context_fp8", "host", 32, 4, 8, 1, 64, None)] == exact
+    assert (
+        routes[("context_fp8", "device", 32, 4, 8, 1, 64, None)]
+        == _DEVICE_SCALE_PROGRAM[exact]
+    )
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     pack = cake_api._context_fp8_runtime_pack(cake_api._context_pack_g(33, 1024, 32, 4))
     for device_scales in (False, True):
@@ -971,7 +979,10 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
     row = ("context_fp8", 1, 32, 16384, 32, 4, 64, True, None)
     meta = torch.device("meta")
     kwargs = _context_kwargs(row, device="meta")
-    assert cake_api.select_cake_fmha_context_route(meta, **kwargs).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **kwargs).program
+        == _FP8_EXACT[target]
+    )
     sm_count = _SM_COUNT[target]
     monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
     pack, plan = cake_api._context_fp8_split_choice(
@@ -989,7 +1000,10 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
     short = dict(
         kwargs, workspace_buffer=torch.empty(need - 1, dtype=torch.uint8, device="meta")
     )
-    assert cake_api.select_cake_fmha_context_route(meta, **short).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **short).program
+        == _FP8_EXACT[target]
+    )
     enough = dict(
         kwargs, workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta")
     )
@@ -1008,7 +1022,10 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
         == f"RUNTIME_SK_PACK{pack}_PAGE64"
     )
     many = _context_kwargs("fp8_b256_q32_k1024", device="meta")
-    assert cake_api.select_cake_fmha_context_route(meta, **many).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **many).program
+        == _FP8_EXACT[target]
+    )
 
 
 # --- The page tables a launch passes (host-only) -----------------------------
@@ -1784,6 +1801,10 @@ def test_cake_context_quantized_programs_match_reference(
         _skip_without_nvfp4_programs("context_nvfp4")
     if program.startswith("Q511"):
         program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
+    if program.startswith("B256"):
+        program = {"B256": _FP8_EXACT[target]}.get(
+            program, _DEVICE_SCALE_PROGRAM[_FP8_EXACT[target]]
+        )
     original = prefill.trtllm_batch_context_with_kv_cache
 
     def cake_context(*args, **kwargs):
