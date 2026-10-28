@@ -14,6 +14,35 @@ Index lists use `-1` for holes and need no 128-entry padding.
 The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
 
+### Sparse MLA modes
+
+`BatchSparseMLADecodePagedTSWrapper` / `batch_sparse_mla_decode_with_paged_kv_cache`
+serve two modes, selected by `plan(kv_lora_rank=..., qk_rope_head_dim=...)`. Both
+take storage-row `indices` / `lengths` with `-1` holes.
+
+| Mode | Models | `plan()` | Q / KV rows | Pools and indices | Options |
+| --- | --- | --- | --- | --- | --- |
+| Two-source D512 | DeepSeek V4 / V4.1 | `kv_lora_rank=512, qk_rope_head_dim=0` (default) | BF16 or E4M3, 512 | Primary pool plus an optional extra KV cache with its own `extra_indices` / `extra_lengths` | Sinks, output quantization, RoPE fusion, skip correction |
+| DSA D576 | DeepSeek V3.2 / GLM-5.3 | `kv_lora_rank=512, qk_rope_head_dim=64` | E4M3, 576 (512 latent + 64 RoPE); V is the latent | One pool; the one-shot helper infers DSA from a 576-wide query | Skip correction; no extra pool, sinks or output quantization |
+
+DSA details:
+- **Kernel.** The 1CTA keeps-MMA-AB q64 schedule in a token-sparse
+  configuration: one CTA per (token, 64 heads), with Gather4 loads of the
+  routed rows. H is 64 or 128.
+- **Split-KV below 96 CTAs.** `plan()` chooses the split from
+  `batch_size * max_seq_len_q`, so every run of a plan, and a CUDA graph
+  captured from it, uses one compiled kernel. Each top-k list is split into
+  S ∈ {16, 8, 4, 2} ranges of at least two 128-key tiles (trtllm-gen's rule);
+  while the split grid fills at most a half or a quarter of the SMs, the 512 V
+  columns are split as well. A reducer merges the BF16 partials, so a split
+  launch is not bitwise equal to an unsplit one.
+- **Run time.** `lse` is the natural-log log-sum-exp, as for D512.
+  `softmax_scale` / `output_scale` are Python numbers, and a captured graph
+  keeps their capture-time values. The KV pool must be contiguous, and one
+  eager run of a pool encodes its Gather4 descriptors before CUDA-graph
+  capture. Compiled kernels are cached on disk with the other PrimTS MLA
+  kernels.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
@@ -316,7 +345,7 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 
 ## Limitations
 
-- The latent/RoPE dimensions are fixed at 512/64.
+- The dense wrapper's latent/RoPE dimensions are fixed at 512/64.
 - Output is `torch.bfloat16` even when query/cache input is
   `torch.float8_e4m3fn`.
 - `BatchMLADecodePagedTSWrapper` exposes only dense paged MLA cache
@@ -337,6 +366,7 @@ graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py
+pytest -q tests/attention/test_attention_ts_sparse_mla.py  # two-source D512 and DSA
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
 

@@ -103,45 +103,6 @@ with torch.cuda.graph(graph):
 graph.replay()
 ```
 
-### DSA sparse MLA
-
-GLM-5.3 / DeepSeek-V3.2 decode runs through the sparse MLA entry points,
-`BatchSparseMLADecodePagedTSWrapper` and
-`batch_sparse_mla_decode_with_paged_kv_cache`, with the same indices /
-lengths contract as the D512 pools. Plan it with
-`kv_lora_rank=512, qk_rope_head_dim=64`; the one-shot helper infers this from
-a 576-wide query.
-- **Inputs:** E4M3 queries `[.., H, 576]` with H in {64, 128}. One E4M3 pool
-  of `[.., 576]` rows: 512 latent + 64 RoPE, and V is the latent.
-- **Routes:** per-token `indices` / `lengths`, with `-1` holes anywhere in a
-  row.
-- **Not supported:** an extra pool, sinks and output quantization.
-- **Skip correction:** `tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=T)`
-  with T in [0, 8]. It is compiled into the kernel, and E4M3 P uses
-  `448 * 2**-T`.
-
-The kernel is the 1CTA keeps-MMA-AB q64 schedule in a token-sparse
-configuration: one CTA per (token, 64 heads), with Gather4 loads of the
-routed rows.
-
-**Split-KV below 96 CTAs.** The plan chooses the split from
-`batch_size * max_seq_len_q`, so every run of a plan, and a CUDA graph
-captured from it, uses one compiled kernel.
-- Each token's top-k list is split into S ∈ {16, 8, 4, 2} ranges of at least
-  two 128-key tiles (trtllm-gen's rule).
-- While the split grid fills at most a half or a quarter of the SMs, the 512
-  V columns are split as well.
-- A reducer merges the BF16 partials, so a split launch is not bitwise equal
-  to an unsplit one.
-
-**Run-time requirements.** `lse` is the natural-log log-sum-exp, as for the
-D512 plans. `softmax_scale` / `output_scale` are Python numbers, and a
-captured graph keeps their capture-time values. The KV pool must be
-contiguous. Encoding a pool's
-Gather4 descriptors requires one eager run of that pool before CUDA-graph
-capture. Compiled kernels are cached on disk with the other PrimTS MLA
-kernels.
-
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
 capacity, shape, dtype, and storage-mode specialization without retaining
