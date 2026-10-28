@@ -364,6 +364,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize:
         offsets: cute.Tensor,
         stream,
     ):
+        """Build FC2 descriptors and launch the weighted token-scatter epilogue.
+
+        Packed scale storage is sized in the recast operand's element units.
+        """
         cfg = self.cfg
         tiledmma = cfg.mma.make_tiled_mma(cfg.TILE)
         tiled_r2s = cfg.epi.make_tiled_r2s(tiledmma)
