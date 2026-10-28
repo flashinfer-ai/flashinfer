@@ -905,6 +905,7 @@ class NVFP4QuantizePerTokenKernel:
         fold_out_scale: bool = False,
         threads: int | None = None,
         rows_per_group: int = 0,
+        sf_rows_per_group: int = 0,
     ):
         self.dtype = dtype
         self.K = K
@@ -915,6 +916,7 @@ class NVFP4QuantizePerTokenKernel:
         self.nvfp4_4over6_config = nvfp4_4over6_config
         self.sf_layout = sf_layout
         self.rows_per_group = rows_per_group
+        self.sf_rows_per_group = sf_rows_per_group
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
 
@@ -943,6 +945,11 @@ class NVFP4QuantizePerTokenKernel:
     def _compute_sf_offset(
         self, row_idx: Int32, col_idx: Int32, padded_cols: Int32
     ) -> Int32:
+        if cutlass.const_expr(self.sf_rows_per_group):
+            row_idx = (
+                row_idx // self.rows_per_group * self.sf_rows_per_group
+                + row_idx % self.rows_per_group
+            )
         if cutlass.const_expr(self.sf_is_128x4):
             return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
         else:
@@ -1061,7 +1068,9 @@ class NVFP4QuantizePerTokenKernel:
             # The count is produced on device, so read it after the dependency
             # wait. Only complete SF atoms containing live rows need padding.
             M = mValidRows[0]
-            if cutlass.const_expr(self.sf_is_128x4):
+            if cutlass.const_expr(self.sf_rows_per_group):
+                padded_M = cute.ceil_div(M, self.rows_per_group) * self.rows_per_group
+            elif cutlass.const_expr(self.sf_is_128x4):
                 padded_M = cute.ceil_div(M, 128) * 128
             elif cutlass.const_expr(self.sf_is_8x4):
                 padded_M = cute.ceil_div(M, 8) * 8
@@ -1896,6 +1905,7 @@ def _nvfp4_kernel_name(
     threads: int | None = None,
     has_valid_rows: bool = False,
     rows_per_group: int = 0,
+    sf_rows_per_group: int = 0,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
@@ -1904,6 +1914,8 @@ def _nvfp4_kernel_name(
         variant += "_validrows"
     if rows_per_group:
         variant += f"_rowlimits{rows_per_group}"
+    if sf_rows_per_group:
+        variant += f"_sfrows{sf_rows_per_group}"
     name = f"{variant}_{dtype_key}_k{K}_sf{sf_layout}_pdl{int(enable_pdl)}"
     if not global_scale_is_tensor:
         name += "_host_sf"
@@ -2358,6 +2370,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     threads: int | None = None,
     has_valid_rows: bool = False,
     rows_per_group: int = 0,
+    sf_rows_per_group: int = 0,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -2409,6 +2422,7 @@ def _get_compiled_kernel_nvfp4_per_token(
         fold_out_scale=fold_out_scale,
         threads=threads,
         rows_per_group=rows_per_group,
+        sf_rows_per_group=sf_rows_per_group,
     )
 
     return build_and_load_cute_dsl_kernel(
@@ -2426,6 +2440,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             threads=threads,
             has_valid_rows=has_valid_rows,
             rows_per_group=rows_per_group,
+            sf_rows_per_group=sf_rows_per_group,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -3198,6 +3213,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     valid_rows: torch.Tensor | None = None,
     row_limits: torch.Tensor | None = None,
     rows_per_group: int | None = None,
+    sf_rows_per_group: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -3262,6 +3278,12 @@ def nvfp4_quantize_per_token_cute_dsl(
     rows_per_group : int, optional
         Positive compile-time group size, required exactly when ``row_limits``
         is supplied. Omit both arguments to quantize every row in the prefix.
+    sf_rows_per_group : int, optional
+        Physical SF row pitch for each logical row group, for routed MoE
+        workspaces. Requires ``row_limits`` and the 128x4 SF layout; must be a
+        multiple of 128 at least as large as ``rows_per_group``. Physical scale
+        rows beyond each logical group are unspecified. Omit to retain the
+        contiguous SF row layout.
 
     Returns
     -------
@@ -3324,6 +3346,20 @@ def nvfp4_quantize_per_token_cute_dsl(
                 "row_limits must be a contiguous int32 vector on the input "
                 "device with one entry per row group"
             )
+    scale_group_rows = 0
+    if sf_rows_per_group is not None:
+        if (
+            not group_rows
+            or sf_layout != SF_LAYOUT_128x4
+            or type(sf_rows_per_group) is not int
+            or sf_rows_per_group < group_rows
+            or sf_rows_per_group % 128
+        ):
+            raise ValueError(
+                "sf_rows_per_group requires row_limits, 128x4 SF layout, and "
+                "a multiple of 128 at least as large as rows_per_group"
+            )
+        scale_group_rows = sf_rows_per_group
     assert k % NVFP4_SF_VEC_SIZE == 0, (
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
@@ -3353,6 +3389,10 @@ def nvfp4_quantize_per_token_cute_dsl(
     else:
         padded_m = _round_up(m, ROW_TILE_SIZE)
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+    scale_rows = padded_m
+    if scale_group_rows:
+        padded_m = _round_up(m, group_rows)
+        scale_rows = padded_m // group_rows * scale_group_rows
 
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
@@ -3381,11 +3421,12 @@ def nvfp4_quantize_per_token_cute_dsl(
         threads,
         valid_rows is not None,
         group_rows,
+        scale_group_rows,
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
     scale_output = torch.empty(
-        padded_m * padded_sf_cols, dtype=torch.uint8, device=input.device
+        scale_rows * padded_sf_cols, dtype=torch.uint8, device=input.device
     )
     per_token_scale = torch.empty(m, dtype=torch.float32, device=input.device)
 

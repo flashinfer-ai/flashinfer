@@ -30,8 +30,8 @@
 
 FC1 and FC2 share native NVFP4, MXFP4, MXFP8, and mixed MXFP4/MXFP8
 mainloops. Both phases use regular TMA for prepared weights and routed
-activation rows. Canonical activation scales use TMA for N128/N256 route
-tiles and cp.async for smaller tiles that can start inside a 128-row SF atom.
+activation rows. Each route tile owns complete 128-row scale-factor atoms,
+so activation scales use TMA for every token tile size.
 FC1 preparation preserves payload and scale bytes; per-token activation
 scales retain their original token indexing through the routing map.
 
@@ -52,7 +52,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import builtin, llvm, nvvm
+from cutlass._mlir.dialects import builtin, llvm
 from cutlass._mlir.dialects import cute as _cute_ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 from cutlass.cute.typing import AddressSpace
@@ -77,7 +77,7 @@ from ..common.kernel_utils import (
     tanh_f32,
     vectorized_atomic_add_fp32x2,
 )
-from .custom_pipeline import PipelineCpAsyncUmma, PipelineTmaUmma, PipelineUmmaAsync
+from .custom_pipeline import PipelineUmmaAsync
 from .utils import (
     blk_copy,
     griddepcontrol_launch_dependents,
@@ -88,22 +88,6 @@ from .utils import (
 
 # Imported only for explicitly instrumented diagnostic builds.
 _iket = None
-
-
-@dsl_user_op
-def _blockscaled_cluster_try_wait(mbarrier, phase, loc=None, ip=None):
-    """Acquire the peer CTA's scale publication at cluster scope."""
-    return cutlass.Boolean(
-        nvvm.mbarrier_wait_parity(
-            mbarrier.to_llvm_ptr(loc=loc, ip=ip),
-            cutlass.Int32(phase).ir_value(loc=loc, ip=ip),
-            nvvm.MBarrierWaitKind.TRY,
-            scope=nvvm.MemScopeKind.CLUSTER,
-            order=nvvm.MemOrderKind.ACQUIRE,
-            loc=loc,
-            ip=ip,
-        )
-    )
 
 
 @dsl_user_op
@@ -216,20 +200,6 @@ def _blockscaled_dynamic_mma(
                 loc=loc,
                 ip=ip,
             )
-
-
-@cute.jit
-def _blockscaled_sf_offset(
-    row, channel, padded_channels, sf_vec_size: cutlass.Constexpr
-):
-    """Offset in the prepared 128-row, 4-scale blockscaled layout."""
-    return (
-        (row // 128) * (padded_channels // (4 * sf_vec_size)) * 512
-        + (channel // (4 * sf_vec_size)) * 512
-        + (row % 32) * 16
-        + ((row % 128) // 32) * 4
-        + (channel % (4 * sf_vec_size)) // sf_vec_size
-    )
 
 
 @dsl_user_op
@@ -553,13 +523,17 @@ class Sm100BlockScaledMoeEpilogue:
     def _store(self, values, output, output_sf, row, channel, norm_const, absmax):
         converted = cute.make_rmem_tensor((16,), self.output_dtype)
         if cutlass.const_expr(self.generate_sfc):
+            sf_row = (
+                row // self.tile_n * (cute.ceil_div(self.tile_n, 128) * 128)
+                + row % self.tile_n
+            )
             if cutlass.const_expr(self.is_mxfp8_output):
                 # Match mxfp8_quantize's saturating round-up E8M0 code, including
                 # code zero for an all-zero block. Keep raw bytes for its store.
                 sf = float_to_ue8m0_fast(absmax * cutlass.Float32(1.0 / 448.0))
                 scale = ue8m0_to_inv_scale_fast(sf)
                 if channel % self.sf_vec_size == 0:
-                    output_sf[row, channel] = sf.to(cutlass.Uint8)
+                    output_sf[sf_row, channel] = sf.to(cutlass.Uint8)
             elif cutlass.const_expr(
                 self.output_dtype == cutlass.Float4E2M1FN
                 and self.sf_dtype == cutlass.Float8E4M3FN
@@ -569,13 +543,13 @@ class Sm100BlockScaledMoeEpilogue:
                 # the activation values in FP32 through the FP4 conversion.
                 sf, scale = _nvfp4_standard_quant_from_amax(absmax, norm_const, False)
                 if channel % self.sf_vec_size == 0:
-                    output_sf[row, channel] = sf.bitcast(cutlass.Float8E4M3FN)
+                    output_sf[sf_row, channel] = sf.bitcast(cutlass.Float8E4M3FN)
             elif cutlass.const_expr(self.output_dtype == cutlass.Float4E2M1FN):
                 sf = (absmax * cutlass.Float32(1.0 / 6.0) * norm_const).to(
                     self.sf_dtype
                 )
                 if channel % self.sf_vec_size == 0:
-                    output_sf[row, channel] = sf
+                    output_sf[sf_row, channel] = sf
                 scale = fmin(
                     norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
                     cutlass.Float32(3.40282346638528859812e38),
@@ -586,7 +560,7 @@ class Sm100BlockScaledMoeEpilogue:
                     self.sf_dtype
                 )
                 if channel % self.sf_vec_size == 0:
-                    output_sf[row, channel] = sf
+                    output_sf[sf_row, channel] = sf
                 scale = fmin(
                     norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
                     cutlass.Float32(3.40282346638528859812e38),
@@ -1302,7 +1276,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         per_token_scale_is_routed,
         k_steps,
         num_stages,
-        overlap_epilogue,
         overlap_activation_accumulators,
         pdl_signal_at,
         use_clc_scheduler,
@@ -1391,7 +1364,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 weight_dtype,
                 sf_vec_size,
                 num_stages,
-                overlap_epilogue,
                 overlap_activation_accumulators,
                 self.bulk_output_bytes,
                 use_clc_scheduler,
@@ -1449,10 +1421,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         # though each CTA stores only its half of the B activation tile.
         self.sfb_row_blocks = max(1, self.allocated_n // 128)
         self.sfb_stage_bytes = self.sfb_row_blocks * self.sf_stage_bytes
-        # Route tiles aligned to 128 rows expose complete canonical SF atoms.
-        # Smaller route tiles can start inside an atom and retain cp.async.
-        self.tma_sfb = self.route_tile >= 128
-        self.sf_requires_cluster_join = self.cta_group_size > 1 and not self.tma_sfb
         self.activation_type = activation_type
         self.top_k = top_k
         self.use_fused_finalize = use_fused_finalize
@@ -1463,21 +1431,18 @@ class Sm100BlockScaledGroupedGemmKernel:
             raise ValueError("The launch needs at least one complete CTA group")
         self.requested_num_stages = num_stages
         self.num_stages = num_stages
-        self.overlap_epilogue = overlap_epilogue
-        # TMA-only producers need one warp when the epilogue has its own warpgroup.
-        self.producer_warps = 1 if self.tma_sfb and self.overlap_epilogue else 4
-        self.threads_per_cta = 288 if self.overlap_epilogue else 160
-        self.mma_warp = self.threads_per_cta // 32 - 1
-        self.schedule_warp = self.threads_per_cta // 32
-        if self.use_clc_scheduler:
-            self.threads_per_cta += 32
+        self.threads_per_cta = 256
+        self.weight_warp = 0
+        self.activation_warp = 1
+        self.mma_warp = 2
+        self.schedule_warp = 3
         self.overlap_acc = False
         self.acc_cols = self.allocated_n * self.channel_tiles
         self.sf_cols = self.tile_k // self.sf_vec_size
         self.sfb_cols = self.sf_cols * self.sfb_row_blocks
         scale_cols = self.sf_cols * self.channel_tiles + self.sfb_cols
         self.acc_stages, self.can_overlap_accumulators = self._accumulator_storage(
-            self.acc_cols, scale_cols, self.overlap_epilogue
+            self.acc_cols, scale_cols
         )
         self.overlap_activation_accumulators = (
             self.can_overlap_accumulators
@@ -1510,15 +1475,15 @@ class Sm100BlockScaledGroupedGemmKernel:
         )
 
     @staticmethod
-    def _accumulator_storage(acc_cols, scale_cols, overlap_epilogue):
+    def _accumulator_storage(acc_cols, scale_cols):
         capacity = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        stages = min(2, (capacity - scale_cols) // acc_cols) if overlap_epilogue else 1
+        stages = min(2, (capacity - scale_cols) // acc_cols)
         if stages < 1 or stages * acc_cols + scale_cols > capacity:
             raise ValueError("Not enough SM100 tensor memory for one accumulator tile")
         # The current epilogues release at most 64 columns before the next MMA:
         # one/two 32-column activation slabs, or the first 64-column bulk slab.
         # This ownership constraint is separate from the hardware capacity.
-        can_overlap = overlap_epilogue and 2 * acc_cols == capacity and scale_cols <= 64
+        can_overlap = 2 * acc_cols == capacity and scale_cols <= 64
         return stages, can_overlap
 
     @staticmethod
@@ -1549,19 +1514,11 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
-        tma_sfb,
     ):
         # The CLC response has its own 16-byte alignment inside the slab.
         scheduler_bytes = 32 * num_tile_info_stages + 48 if use_clc_scheduler else 0
-        operand_barriers = 2 + int(not tma_sfb)
         return (
-            (
-                (num_stages * operand_barriers + acc_stages * 2) * 8
-                + 4
-                + scheduler_bytes
-                + 127
-            )
-            // 128
+            ((num_stages * 2 + acc_stages * 2) * 8 + 4 + scheduler_bytes + 127) // 128
         ) * 128 + 128
 
     @staticmethod
@@ -1582,7 +1539,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
-        tma_sfb,
     ):
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
         available = (
@@ -1593,7 +1549,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
-                tma_sfb,
             )
         )
         _, _, scratch_bytes = cls._epilogue_storage(available, bulk_output_bytes)
@@ -1606,7 +1561,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
-                tma_sfb,
             )
             > capacity
         ):
@@ -1620,7 +1574,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         activation_dtype,
         weight_dtype,
         sf_vec_size,
-        overlap_epilogue,
         bulk_output_bytes,
         use_clc_scheduler,
         num_tile_info_stages,
@@ -1636,9 +1589,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         )
         if acc_cols + scale_cols > cute.arch.get_max_tmem_alloc_cols("sm_100"):
             return 0, False
-        acc_stages, can_overlap = cls._accumulator_storage(
-            acc_cols, scale_cols, overlap_epilogue
-        )
+        acc_stages, can_overlap = cls._accumulator_storage(acc_cols, scale_cols)
         stage_bytes = cls._stage_storage_bytes(
             tile_k,
             allocated_n,
@@ -1654,7 +1605,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             acc_stages,
             use_clc_scheduler,
             num_tile_info_stages,
-            route_tile >= 128,
         ), can_overlap
 
     @classmethod
@@ -1665,7 +1615,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         weight_dtype,
         sf_vec_size,
         num_stages,
-        overlap_epilogue,
         overlap_activation_accumulators,
         bulk_output_bytes,
         use_clc_scheduler,
@@ -1687,10 +1636,8 @@ class Sm100BlockScaledGroupedGemmKernel:
         bulk_overlap = (
             bulk_output and channel_tiles == 1 and allocated_n == tmem_capacity // 2
         )
-        preserve_overlap = (
-            overlap_epilogue
-            and 2 * acc_cols == tmem_capacity
-            and (overlap_activation_accumulators is not False or bulk_overlap)
+        preserve_overlap = 2 * acc_cols == tmem_capacity and (
+            overlap_activation_accumulators is not False or bulk_overlap
         )
         minimum_stages = 2 if num_stages is None else num_stages
         selected_steps = None
@@ -1702,7 +1649,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 activation_dtype,
                 weight_dtype,
                 sf_vec_size,
-                overlap_epilogue,
                 bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
@@ -1751,7 +1697,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             + cute.cosize(sfb) * self.sf_dtype.width // 8
         )
 
-    def _configure_pipeline_storage(self, tiled_mma, reduction_size):
+    def _configure_pipeline_storage(self, tiled_mma):
         """Fit SM100 operand stages around the epilogue's working storage.
 
         ``num_stages=None`` selects capacity at compile time. An explicit depth
@@ -1779,12 +1725,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
-                self.tma_sfb,
             )
-            if not self.overlap_epilogue:
-                # This producer executes its own epilogue before the next tile.
-                # Dedicated epilogue warps instead permit cross-tile prefetch.
-                num_stages = min(num_stages, cute.ceil_div(reduction_size, self.tile_k))
             if num_stages < 1:
                 raise ValueError("Not enough SM100 shared memory for one operand stage")
         self.num_stages = num_stages
@@ -1798,7 +1739,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
-                self.tma_sfb,
             )
         )
         (self.epilogue.bulk_tokens, self.epilogue.bulk_stages, scratch_bytes) = (
@@ -1884,7 +1824,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             activation_dtype,
             weight_dtype,
             sf_vec_size,
-            False,
             0,
             False,
             1,
@@ -1964,7 +1903,8 @@ class Sm100BlockScaledGroupedGemmKernel:
             activation_sf_ptr,
             cute.make_layout(
                 (
-                    cute.ceil_div(source_rows, 128)
+                    cute.ceil_div(source_rows, self.route_tile)
+                    * self.sfb_row_blocks
                     * 128
                     * cute.ceil_div(reduction_size, self.sf_block_k)
                     * 4,
@@ -1978,7 +1918,13 @@ class Sm100BlockScaledGroupedGemmKernel:
         output_sf = None
         if cutlass.const_expr(output_sf_ptr is not None):
             sf_layout = blockscaled_utils.tile_atom_to_shape_SF(
-                (cute.ceil_div(num_routes, 128) * 128, out_channels, 1),
+                (
+                    cute.ceil_div(num_routes, self.route_tile)
+                    * self.sfb_row_blocks
+                    * 128,
+                    out_channels,
+                    1,
+                ),
                 self.sf_vec_size,
             )
             output_sf = cute.make_tensor(output_sf_ptr, sf_layout)[(None, None, 0)]
@@ -2055,7 +2001,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         cluster_layout = cute.tiled_divide(
             cute.make_layout((self.cta_group_size, 1, 1)), (tiled_mma.thr_id.shape,)
         )
-        self._configure_pipeline_storage(tiled_mma, weights.shape[1])
+        self._configure_pipeline_storage(tiled_mma)
         acc_layout = tiled_mma.make_fragment_C(
             tiled_mma.partition_shape_C((self.mma_m, self.allocated_n))
         ).layout
@@ -2099,32 +2045,32 @@ class Sm100BlockScaledGroupedGemmKernel:
             (self.b_copy_rows, self.tile_k),
         )
 
-        tma_atom_sfb = None
-        if cutlass.const_expr(self.tma_sfb):
-            # The canonical SF layout consists of contiguous 512-byte blocks.
-            # Keep K-block and row-block coordinates separate so TMA zero-fills
-            # a short final K tile without crossing into the next row block.
-            sf_k_blocks = cute.ceil_div(weights.shape[1], self.sf_block_k)
-            sf_row_blocks = cute.ceil_div(activations.shape[0], 128)
-            # Preserve the 3D descriptor's K axis even when it has one block.
-            # This types the constant K extent without adding a runtime argument.
-            sf_source = cute.make_tensor(
-                cute.recast_ptr(activations_sf.iterator, dtype=cutlass.Int16),
-                cute.make_layout(
-                    (256, cutlass.Int32(sf_k_blocks), cutlass.Int32(sf_row_blocks)),
-                    stride=(1, 256, sf_k_blocks * 256),
-                ),
-            )
-            sf_tile = (256, self.tile_k // self.sf_block_k, 1)
-            sf_destination = cute.make_layout(
-                sf_tile, stride=(1, 256, self.tile_k // self.sf_block_k * 256)
-            )
-            tma_atom_sfb, _ = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileG2SOp(),
-                sf_source,
-                sf_destination,
-                sf_tile,
-            )
+        # The canonical SF layout consists of contiguous 512-byte blocks.
+        # Keep K-block and row-block coordinates separate so TMA zero-fills
+        # a short final K tile without crossing into the next row block.
+        sf_k_blocks = cute.ceil_div(weights.shape[1], self.sf_block_k)
+        sf_row_blocks = (
+            cute.ceil_div(activations.shape[0], self.route_tile) * self.sfb_row_blocks
+        )
+        # Preserve the 3D descriptor's K axis even when it has one block.
+        # This types the constant K extent without adding a runtime argument.
+        sf_source = cute.make_tensor(
+            cute.recast_ptr(activations_sf.iterator, dtype=cutlass.Int16),
+            cute.make_layout(
+                (256, cutlass.Int32(sf_k_blocks), cutlass.Int32(sf_row_blocks)),
+                stride=(1, 256, sf_k_blocks * 256),
+            ),
+        )
+        sf_tile = (256, self.tile_k // self.sf_block_k, 1)
+        sf_destination = cute.make_layout(
+            sf_tile, stride=(1, 256, self.tile_k // self.sf_block_k * 256)
+        )
+        tma_atom_sfb, _ = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            sf_source,
+            sf_destination,
+            sf_tile,
+        )
 
         # Alternate overlapping accumulator windows while keeping scales
         # disjoint. The epilogue reads their shared interval before release.
@@ -2156,10 +2102,7 @@ class Sm100BlockScaledGroupedGemmKernel:
 
         @cute.struct
         class SharedStorage:
-            a_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            ab_barriers: cute.struct.MemRange[
-                cutlass.Int64, self.num_stages if not self.tma_sfb else 0
-            ]
+            operand_barriers: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
             acc_barriers: cute.struct.MemRange[cutlass.Int64, 2 * self.acc_stages]
             tmem_holding: cutlass.Int32
             tile_info_barriers: cute.struct.MemRange[
@@ -2245,7 +2188,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             tma_atom_sfa,
             tma_weights_sf,
             tma_atom_sfb,
-            activations_sf,
             output,
             output_sf,
             alpha,
@@ -2275,14 +2217,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         thr = copy.get_slice(0)
         source = tcgen05.get_s2t_smem_desc_tensor(copy, thr.partition_S(source))
         return copy, source, thr.partition_D(target)
-
-    @cute.jit
-    def _copy_tile(self, atom, source_ptr, destination_ptr, count, valid):
-        source = cute.make_tensor(source_ptr, cute.make_layout((count,)))
-        destination = cute.make_tensor(destination_ptr, cute.make_layout((count,)))
-        predicate = cute.make_rmem_tensor((1,), cutlass.Boolean)
-        predicate[0] = valid
-        cute.copy_atom_call(atom, source, destination, pred=predicate)
 
     @cute.jit
     def next_work(self, info_pipe, state, info, static_tile, total_tiles):
@@ -2317,7 +2251,7 @@ class Sm100BlockScaledGroupedGemmKernel:
     @cute.jit
     def load_weight_stage(
         self,
-        a_pipe,
+        operand_pipe,
         producer,
         tma_atom_a,
         tAgA,
@@ -2334,7 +2268,12 @@ class Sm100BlockScaledGroupedGemmKernel:
         # TMA copy lowering elects internally; keep the whole warp active.
         if cutlass.const_expr(self.enable_iket):
             _iket.range_push("producer_tma_empty")
-        a_pipe.producer_acquire(producer)
+        operand_pipe.producer_acquire(
+            producer,
+            expected_tx=self.cta_group_size
+            * (128 * self.tile_k * self.weight_dtype.width // 8 + self.sf_stage_bytes)
+            * self.channel_tiles,
+        )
         if cutlass.const_expr(self.enable_iket):
             _iket.range_pop()
             _iket.range_push("producer_weight_tma")
@@ -2355,7 +2294,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         producer.index * self.channel_tiles + channel_tile,
                     )
                 ],
-                tma_bar_ptr=a_pipe.producer_get_barrier(producer),
+                tma_bar_ptr=operand_pipe.producer_get_barrier(producer),
                 cache_policy=weight_cache_hint,
             )
             cute.copy(
@@ -2374,7 +2313,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         producer.index * self.channel_tiles + channel_tile,
                     )
                 ],
-                tma_bar_ptr=a_pipe.producer_get_barrier(producer),
+                tma_bar_ptr=operand_pipe.producer_get_barrier(producer),
                 cache_policy=weight_cache_hint,
             )
         if cutlass.const_expr(self.enable_iket):
@@ -2398,7 +2337,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         tma_atom_sfa,
         tma_weights_sf,
         tma_atom_sfb,
-        activations_sf,
         output,
         output_sf,
         alpha,
@@ -2424,37 +2362,17 @@ class Sm100BlockScaledGroupedGemmKernel:
         block = block // self.cta_group_size
         grid = grid // self.cta_group_size
         storage = utils.SmemAllocator().allocate(self.storage_type)
-        a_pipe = PipelineTmaUmma.create(
-            barrier_storage=storage.a_barriers.data_ptr(),
+        # Two independent producers announce disjoint bytes to one full barrier;
+        # MMA releases their shared stage only after consuming all operands.
+        operand_pipe = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.operand_barriers.data_ptr(),
             defer_sync=True,
             num_stages=self.num_stages,
-            # TMA contributes one arrival; each local cp.async SF publication
-            # contributes one more when scales must be joined across CTAs.
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                1 + self.cta_group_size * int(self.sf_requires_cluster_join),
-            ),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout,
-            tx_count=self.cta_group_size
-            * (
-                (128 * self.tile_k * self.weight_dtype.width // 8 + self.sf_stage_bytes)
-                * self.channel_tiles
-                + self.b_copy_rows * self.tile_k * self.activation_dtype.width // 8
-                + (self.sfb_stage_bytes if self.tma_sfb else 0)
-            ),
+            tx_count=0,
         )
-        ab = None
-        if cutlass.const_expr(not self.tma_sfb):
-            ab = PipelineCpAsyncUmma.create(
-                barrier_storage=storage.ab_barriers.data_ptr(),
-                num_stages=self.num_stages,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
-                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-                defer_sync=True,
-                cta_layout_vmnk=cluster_layout,
-                empty_owner=a_pipe,
-            )
         acc_pipe = PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
             defer_sync=True,
@@ -2474,7 +2392,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
-                    32 * (self.producer_warps + 4 * int(self.overlap_epilogue) + 1),
+                    32 * 7,
                 ),
                 defer_sync=True,
             )
@@ -2513,94 +2431,13 @@ class Sm100BlockScaledGroupedGemmKernel:
         sB_copy = storage.b.get_tensor(b_copy_layout.outer, swizzle=b_copy_layout.inner)
         sSFA = storage.sfa.get_tensor(sfa_layout)
         sSFB = storage.sfb.get_tensor(sfb_layout)
-        gA = cute.local_tile(weights, (self.mma_m, self.tile_k), (None, None, None))
-        tCgA = tiled_mma.get_slice(cta_rank).partition_A(gA)
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
-        )
-        gSFA = cute.local_tile(
-            tma_weights_sf, (self.mma_m, self.tile_k), (None, None, None)
-        )
-        tCgSFA = tiled_mma.get_slice(cta_rank).partition_A(gSFA)
-        tAsSFA, tAgSFA = cpasync.tma_partition(
-            tma_atom_sfa,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sSFA, 0, 3),
-            cute.group_modes(tCgSFA, 0, 3),
-        )
-        tAsSFA = cute.filter_zeros(tAsSFA)
-        tAgSFA = cute.filter_zeros(tAgSFA)
         total_m_tiles = cute.ceil_div(weights.shape[0], self.mma_m * self.channel_tiles)
         k_tiles = cute.ceil_div(weights.shape[1], self.tile_k)
-        startup_stages = min(self.num_stages, k_tiles)
-        first_tile = block
-        first_tile_valid = cutlass.Boolean(True)
-        sched = None
-        initial_work = None
-        if cutlass.const_expr(self.use_clc_scheduler):
-            sched = utils.ClcDynamicPersistentTileScheduler.create(
-                sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                storage.clc_response.data_ptr(),
-            )
-            initial_work = sched.initial_work_tile_info()
-            first_tile = (
-                initial_work.tile_idx[1] * total_m_tiles
-                + initial_work.tile_idx[0] // self.cta_group_size
-            )
-            first_tile_valid = initial_work.is_valid_tile
-        if cutlass.const_expr(self.prefetch_weights_before_wait):
-            # The caller must bind this to a prerequisite startup release+signal
-            # in the same memory domain. Initial CLC work uses the same mapping
-            # as the scheduler; padded routes leave the operand ring unacquired.
-            # Both CTA producers use the existing group-scaled A/SFA/B barrier.
-            # B/SFB remain protected by the wait.
-            if warp == 0:
-                if first_tile_valid and first_tile < num_tiles[0] * total_m_tiles:
-                    first_expert = expert_idx[first_tile // total_m_tiles]
-                    first_weight_hint = self.weight_cache_hint(
-                        first_tile // total_m_tiles,
-                        first_expert,
-                        expert_idx,
-                        num_tiles[0],
-                    )
-                    first_producer = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Producer, self.num_stages
-                    )
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_push("startup_weight_prefetch")
-                    for k_tile in cutlass.range_constexpr(startup_stages):
-                        self.load_weight_stage(
-                            a_pipe,
-                            first_producer,
-                            tma_atom_a,
-                            tAgA,
-                            tAsA,
-                            tma_atom_sfa,
-                            tAgSFA,
-                            tAsSFA,
-                            first_tile,
-                            total_m_tiles,
-                            k_tile,
-                            first_expert,
-                            first_weight_hint,
-                        )
-                        first_producer.advance()
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
         waits_for_payload = cutlass.Boolean(True)
-        if cutlass.const_expr(
-            self.use_clc_scheduler and self.prefetch_weights_before_wait
-        ):
+        if cutlass.const_expr(self.prefetch_weights_before_wait):
             # The same startup release that permits weight prefetch publishes
             # routing metadata. Only payload readers need the dependency wait.
-            waits_for_payload = warp != self.schedule_warp
+            waits_for_payload = (warp == self.activation_warp) | (warp >= 4)
         if waits_for_payload:
             if cutlass.const_expr(self.enable_iket):
                 _iket.range_push("startup_dependency_wait")
@@ -2608,19 +2445,15 @@ class Sm100BlockScaledGroupedGemmKernel:
             if cutlass.const_expr(self.enable_iket):
                 _iket.range_pop()
         if cutlass.const_expr(self.pdl_signal_at == "startup"):
-            if cutlass.const_expr(self.publish_routing_before_signal):
-                # Only warp zero triggers at startup; on publication owners,
-                # its first trigger follows the completed-ancestor release.
-                if warp == 0:
-                    if cutlass.const_expr(self.enable_pdl):
-                        if publishes_ancestors:
-                            release_gpu()
-                    griddepcontrol_launch_dependents()
-            elif waits_for_payload:
+            # The activation warp has acquired ancestor payload publication.
+            # The weight and scheduler warps may still be running ahead of it.
+            if warp == self.activation_warp:
                 if cutlass.const_expr(
                     self.enable_pdl
-                    and self.scatter_output
-                    and not self.use_fused_finalize
+                    and (
+                        self.publish_routing_before_signal
+                        or (self.scatter_output and not self.use_fused_finalize)
+                    )
                 ):
                     if publishes_ancestors:
                         release_gpu()
@@ -2632,35 +2465,94 @@ class Sm100BlockScaledGroupedGemmKernel:
             sInfo = storage.tile_info.get_tensor(
                 cute.make_layout((4, self.num_tile_info_stages), stride=(1, 4))
             )
-        padded_k = cute.ceil_div(weights.shape[1], self.sf_block_k) * self.sf_block_k
-
-        if warp < self.producer_warps:
-            copy_sf = cute.make_copy_atom(
-                cpasync.CopyG2SOp(), self.sf_dtype, num_bits_per_copy=32
+        if warp == self.weight_warp:
+            gA = cute.local_tile(weights, (self.mma_m, self.tile_k), (None, None, None))
+            tCgA = tiled_mma.get_slice(cta_rank).partition_A(gA)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tCgA, 0, 3),
             )
+            gSFA = cute.local_tile(
+                tma_weights_sf, (self.mma_m, self.tile_k), (None, None, None)
+            )
+            tCgSFA = tiled_mma.get_slice(cta_rank).partition_A(gSFA)
+            tAsSFA, tAgSFA = cpasync.tma_partition(
+                tma_atom_sfa,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sSFA, 0, 3),
+                cute.group_modes(tCgSFA, 0, 3),
+            )
+            tAsSFA = cute.filter_zeros(tAsSFA)
+            tAgSFA = cute.filter_zeros(tAgSFA)
             producer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
-            )
-            consumer = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.acc_stages
             )
             info_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stages
             )
-            tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
+            tile, scheduled_expert, _, info_state = self.next_work(
                 info_pipe, info_state, sInfo, block, total_tiles
             )
             while tile >= 0:
                 route_idx = tile // total_m_tiles
-                channel_start = (
-                    tile % total_m_tiles
-                ) * self.mma_m * self.channel_tiles + cta_rank * 128
-                route_start = route_idx * self.route_tile
                 expert = (
                     scheduled_expert
                     if cutlass.const_expr(self.use_clc_scheduler)
                     else expert_idx[route_idx]
                 )
+                weight_hint = self.weight_cache_hint(
+                    route_idx, expert, expert_idx, num_routed_tiles
+                )
+                for k_tile in cutlass.range(k_tiles):
+                    self.load_weight_stage(
+                        operand_pipe,
+                        producer,
+                        tma_atom_a,
+                        tAgA,
+                        tAsA,
+                        tma_atom_sfa,
+                        tAgSFA,
+                        tAsSFA,
+                        tile,
+                        total_m_tiles,
+                        k_tile,
+                        expert,
+                        weight_hint,
+                    )
+                    producer.advance()
+                tile, scheduled_expert, _, info_state = self.next_work(
+                    info_pipe, info_state, sInfo, tile + grid, total_tiles
+                )
+            if cutlass.const_expr(self.prefetch_weights_before_wait):
+                griddepcontrol_wait()
+            if cutlass.const_expr(self.pdl_signal_at == "producer_exit"):
+                if cutlass.const_expr(
+                    self.enable_pdl
+                    and self.scatter_output
+                    and not self.use_fused_finalize
+                ):
+                    if publishes_ancestors:
+                        release_gpu()
+                griddepcontrol_launch_dependents()
+            # A single tail protects storage shared by both independent producers.
+            operand_pipe.producer_tail(producer.clone())
+        elif warp == self.activation_warp:
+            producer = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_stages
+            )
+            info_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_info_stages
+            )
+            tile, _, scheduled_valid, info_state = self.next_work(
+                info_pipe, info_state, sInfo, block, total_tiles
+            )
+            while tile >= 0:
+                route_idx = tile // total_m_tiles
+                route_start = route_idx * self.route_tile
                 valid = (
                     scheduled_valid
                     if cutlass.const_expr(self.use_clc_scheduler)
@@ -2685,196 +2577,49 @@ class Sm100BlockScaledGroupedGemmKernel:
                     cute.group_modes(sB_copy, 0, 2),
                     cute.group_modes(gB, 0, 2),
                 )
-                weight_hint = cutlass.Int64(0)
-                if warp == 0:
-                    weight_hint = self.weight_cache_hint(
-                        route_idx, expert, expert_idx, num_routed_tiles
-                    )
-                # Give each lane a different SMEM bank for its four scale bytes.
-                sf_row = 8 * warp + 32 * ((tidx % 32) // 8) + tidx % 8
-                activation_sf_offsets = cute.make_rmem_tensor(
-                    (self.sfb_row_blocks,), cutlass.Int64
-                )
-                for row_block in cutlass.range_constexpr(self.sfb_row_blocks):
-                    row = sf_row + row_block * 128
-                    activation_sf_offsets[row_block] = _blockscaled_sf_offset(
-                        route_start + row, 0, padded_k, self.sf_vec_size
-                    )
-                shared_sf_offset = (sf_row % 32) * 16 + (sf_row // 32) * 4
                 for k_tile in cutlass.range(k_tiles):
-                    if cutlass.const_expr(not self.tma_sfb):
-                        if warp != 0:
-                            if cutlass.const_expr(self.enable_iket):
-                                _iket.range_push("producer_sf_empty")
-                            # Warp zero acquires this ring with its weight load,
-                            # including any stages prefetched before the PDL wait.
-                            a_pipe.sync_object_empty.wait(
-                                producer.index, producer.phase
-                            )
-                            if cutlass.const_expr(self.enable_iket):
-                                _iket.range_pop()
-                    if warp == 0:
-                        if cutlass.const_expr(self.prefetch_weights_before_wait):
-                            # Startup acquired the first weight stages. B/SFB
-                            # complete their existing expected-byte counts below.
-                            if tile != first_tile or k_tile >= startup_stages:
-                                self.load_weight_stage(
-                                    a_pipe,
-                                    producer,
-                                    tma_atom_a,
-                                    tAgA,
-                                    tAsA,
-                                    tma_atom_sfa,
-                                    tAgSFA,
-                                    tAsSFA,
-                                    tile,
-                                    total_m_tiles,
-                                    k_tile,
-                                    expert,
-                                    weight_hint,
-                                )
-                        else:
-                            self.load_weight_stage(
-                                a_pipe,
-                                producer,
-                                tma_atom_a,
-                                tAgA,
-                                tAsA,
-                                tma_atom_sfa,
-                                tAgSFA,
-                                tAsSFA,
-                                tile,
-                                total_m_tiles,
-                                k_tile,
-                                expert,
-                                weight_hint,
-                            )
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("producer_activation_tma")
-                        cute.copy(
-                            tma_atom_b,
-                            tBgB[(None, k_tile)],
-                            tBsB[(None, producer.index)],
-                            tma_bar_ptr=a_pipe.producer_get_barrier(producer),
-                            cache_policy=cutlass.Int64(self.activation_cache_policy),
-                        )
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
                     if cutlass.const_expr(self.enable_iket):
-                        _iket.range_push("producer_sf_issue")
-                    if cutlass.const_expr(self.tma_sfb):
-                        if warp == 0:
-                            for row_block in cutlass.range_constexpr(
-                                self.sfb_row_blocks
-                            ):
-                                with cute.arch.elect_one():
-                                    _blockscaled_tma_sfb(
-                                        tma_atom_sfb,
-                                        sSFB.iterator
-                                        + producer.index * self.sfb_stage_bytes
-                                        + row_block * self.sf_stage_bytes,
-                                        a_pipe.producer_get_barrier(producer),
-                                        k_tile * (self.tile_k // self.sf_block_k),
-                                        route_start // 128 + row_block,
-                                        self.cta_group_size,
-                                    )
-                    else:
-                        # Four contiguous SF bytes form one canonical scale-factor block.
-                        # Small route tiles use cp.async when they start inside
-                        # a 128-row SF atom.
-                        for row_block in cutlass.range_constexpr(self.sfb_row_blocks):
-                            row = sf_row + row_block * 128
-                            for sf_block in cutlass.range_constexpr(
-                                self.tile_k // self.sf_block_k
-                            ):
-                                channel = (
-                                    k_tile * self.tile_k + sf_block * self.sf_block_k
-                                )
-                                shared_offset = (
-                                    producer.index * self.sfb_stage_bytes
-                                    + row_block * self.sf_stage_bytes
-                                    + sf_block * 512
-                                    + shared_sf_offset
-                                )
-                                activation_offset = (
-                                    activation_sf_offsets[row_block]
-                                    + (channel // self.sf_block_k) * 512
-                                )
-                                self._copy_tile(
-                                    copy_sf,
-                                    activations_sf.iterator
-                                    + cute.assume(activation_offset, divby=4),
-                                    sSFB.iterator + cute.assume(shared_offset, divby=4),
-                                    4,
-                                    (row < valid) & (channel < weights.shape[1]),
-                                )
+                        _iket.range_push("producer_activation_empty")
+                    operand_pipe.producer_acquire(
+                        producer,
+                        expected_tx=self.cta_group_size
+                        * (
+                            self.b_copy_rows
+                            * self.tile_k
+                            * self.activation_dtype.width
+                            // 8
+                            + self.sfb_stage_bytes
+                        ),
+                    )
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
-                    if cutlass.const_expr(not self.tma_sfb):
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("producer_sf_commit")
-                        ab.producer_commit(producer)
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
+                        _iket.range_push("producer_activation_tma")
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB[(None, k_tile)],
+                        tBsB[(None, producer.index)],
+                        tma_bar_ptr=operand_pipe.producer_get_barrier(producer),
+                        cache_policy=cutlass.Int64(self.activation_cache_policy),
+                    )
+                    for row_block in cutlass.range_constexpr(self.sfb_row_blocks):
+                        with cute.arch.elect_one():
+                            _blockscaled_tma_sfb(
+                                tma_atom_sfb,
+                                sSFB.iterator
+                                + producer.index * self.sfb_stage_bytes
+                                + row_block * self.sf_stage_bytes,
+                                operand_pipe.producer_get_barrier(producer),
+                                k_tile * (self.tile_k // self.sf_block_k),
+                                route_idx * self.sfb_row_blocks + row_block,
+                                self.cta_group_size,
+                            )
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
                     producer.advance()
-                if cutlass.const_expr(not self.overlap_epilogue):
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_push("epi_acc_wait")
-                    acc_pipe.consumer_wait(consumer)
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                        _iket.range_push("epi_body")
-                    norm = cutlass.Float32(1.0)
-                    if cutlass.const_expr(norm_const is not None):
-                        norm = norm_const[0]
-                    for channel_tile in cutlass.range_constexpr(self.channel_tiles):
-                        epi_accumulator = cute.make_tensor(
-                            tmem_ptr
-                            + cute.assume(
-                                consumer.index * self.acc_cols
-                                + channel_tile * self.allocated_n,
-                                divby=32,
-                            ),
-                            acc_layout,
-                        )
-                        self.epilogue.run(
-                            epi_accumulator,
-                            output,
-                            output_sf,
-                            alpha[expert],
-                            norm,
-                            per_token_scale,
-                            token_mapping,
-                            token_final_scales,
-                            channel_start + channel_tile * self.mma_m,
-                            route_start,
-                            valid,
-                            tidx,
-                            storage.epilogue_scratch.data_ptr(),
-                        )
-                    cute.arch.fence_view_async_tmem_load()
-                    acc_pipe.consumer_release(consumer)
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                    consumer.advance()
-                tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
+                tile, _, scheduled_valid, info_state = self.next_work(
                     info_pipe, info_state, sInfo, tile + grid, total_tiles
                 )
-            if warp == 0:
-                if cutlass.const_expr(self.pdl_signal_at == "producer_exit"):
-                    if cutlass.const_expr(
-                        self.enable_pdl
-                        and self.scatter_output
-                        and not self.use_fused_finalize
-                    ):
-                        # Republish prior routing writes before combine can
-                        # preload them. Queued MMA/epilogue work remains.
-                        if publishes_ancestors:
-                            release_gpu()
-                    griddepcontrol_launch_dependents()
-                # One empty completion protects all operand storage, including SF.
-                a_pipe.producer_tail(producer.clone())
-        elif warp >= 4 and warp < (8 if self.overlap_epilogue else 4):
+        elif warp >= 4:
             # Normalization is invariant across experts and scheduled tiles.
             norm = cutlass.Float32(1.0)
             if cutlass.const_expr(norm_const is not None):
@@ -3051,34 +2796,10 @@ class Sm100BlockScaledGroupedGemmKernel:
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_pop()
                 for k_tile in cutlass.range(k_tiles):
-                    if cutlass.const_expr(not self.tma_sfb):
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("mma_sf_ready")
-                        ab.consumer_wait(consumer)
-                        # Publish each CTA's local cp.async scale bytes before
-                        # group-wide S2T reads. Their arrivals join the TMA
-                        # completion; UMMA's empty release protects stage reuse.
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        if cutlass.const_expr(self.sf_requires_cluster_join):
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(
-                                    a_pipe.sync_object_full.get_barrier(consumer.index),
-                                    0,
-                                    scope=nvvm.MemScopeKind.CLUSTER,
-                                )
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
                     if cta_rank == 0:
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("mma_tma_ready")
-                        if cutlass.const_expr(self.sf_requires_cluster_join):
-                            while not _blockscaled_cluster_try_wait(
-                                a_pipe.sync_object_full.get_barrier(consumer.index),
-                                consumer.phase,
-                            ):
-                                pass
-                        else:
-                            a_pipe.consumer_wait(consumer)
+                        operand_pipe.consumer_wait(consumer)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                             _iket.range_push("mma_sf_copy_issue")
@@ -3153,7 +2874,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             _iket.range_push("mma_release_issue")
                         # Both channel tiles must finish reading the shared B/SFB
                         # stage before any operand pipeline can overwrite it.
-                        a_pipe.consumer_release(consumer)
+                        operand_pipe.consumer_release(consumer)
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                     consumer.advance()
@@ -3165,9 +2886,17 @@ class Sm100BlockScaledGroupedGemmKernel:
                 )
             if cta_rank == 0:
                 acc_pipe.producer_tail(producer)
+            if cutlass.const_expr(self.prefetch_weights_before_wait):
+                griddepcontrol_wait()
         elif warp == self.schedule_warp:
             if cutlass.const_expr(self.use_clc_scheduler):
-                work = initial_work
+                sched = utils.ClcDynamicPersistentTileScheduler.create(
+                    sched_params,
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                    storage.clc_response.data_ptr(),
+                )
+                work = sched.initial_work_tile_info()
                 info_producer = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_tile_info_stages
                 )
@@ -3225,8 +2954,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 # The final CTA join drains all terminal metadata consumers.
                 if cta_rank == 0:
                     clc_pipe.producer_tail(clc_producer)
-                if cutlass.const_expr(self.prefetch_weights_before_wait):
-                    griddepcontrol_wait()
+            if cutlass.const_expr(self.prefetch_weights_before_wait):
+                griddepcontrol_wait()
         pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
         ).arrive_and_wait()

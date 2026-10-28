@@ -144,7 +144,7 @@ def _run_blockscaled_gemm(
         from .moe_swap_ab_prepare import allocate, prepare
 
         routed, routed_sf = allocate(
-            activation, activation_sf, token_mapping.numel(), sf_vec_size
+            activation, activation_sf, token_mapping.numel(), sf_vec_size, route_tile
         )
         prepare(
             activation,
@@ -250,7 +250,6 @@ def _run_blockscaled_gemm(
             per_token_scale_is_routed=per_token_scale_is_routed,
             k_steps=k_steps,
             num_stages=None,
-            overlap_epilogue=True,
             overlap_activation_accumulators=overlap_activation_accumulators,
             pdl_signal_at=pdl_signal_at,
             use_clc_scheduler=use_clc_scheduler,
@@ -417,17 +416,23 @@ def launch_gather_gemm(
             )
 
     # Create output scale tensor if needed and not provided
-    if generate_sfc and out_scale is None:
+    if generate_sfc:
         # Scale factor layout for output
         scale_atom_n = sf_vec_size * 4
         scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
-        scale_rest_m = (permuted_m + 127) // 128
-        # MMA-compatible scale factor shape
-        out_scale = torch.empty(
-            (32, 4, scale_rest_m, 4, scale_rest_n, 1),
-            dtype=torch.uint8,
-            device=a.device,
+        route_tile = mma_tiler_mn[1]
+        scale_rest_m = (
+            (permuted_m + route_tile - 1) // route_tile * ((route_tile + 127) // 128)
         )
+        # MMA-compatible scale factor shape, with complete atoms per route.
+        if out_scale is None:
+            out_scale = torch.empty(
+                (32, 4, scale_rest_m, 4, scale_rest_n, 1),
+                dtype=torch.uint8,
+                device=a.device,
+            )
+        elif out_scale.numel() != 512 * scale_rest_m * scale_rest_n:
+            raise ValueError("output SF storage must contain complete atoms per route")
 
     _run_blockscaled_gemm(
         weight=b,

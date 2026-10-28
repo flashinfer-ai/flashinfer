@@ -579,11 +579,11 @@ def _moe_core_impl(
 
         gather_gemm = launch_gather_gemm
         finalize_gemm = launch_finalize_gemm
-        gemm1_options = {
+        gemm1_options: Dict[str, Any] = {
             "k_steps": gemm1_k_steps,
             "use_clc_scheduler": gemm1_use_clc_scheduler,
         }
-        gemm2_options = {
+        gemm2_options: Dict[str, Any] = {
             "k_steps": gemm2_k_steps,
             "use_clc_scheduler": gemm2_use_clc_scheduler,
         }
@@ -790,44 +790,42 @@ def _moe_core_impl(
                 localization_main_stream.wait_event(localized_memset_done)
         intermediate, intermediate_sf = gemm1_out, gemm1_out_scale
     else:
-        intermediate, intermediate_sf = (
-            gather_gemm(
-                a=x,
-                b=w1_weight,
-                a_scale=x_sf,
-                b_scale=w1_weight_sf,
-                alpha=w1_alpha,
-                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                out=gemm1_out,
-                out_scale=None if use_per_token_activation else gemm1_out_scale,
-                global_scale=(
-                    fc2_input_scale
-                    if not is_mxfp8 and not use_per_token_activation
-                    else None
-                ),
-                a_per_token_scale=per_token_scale,
-                c_dtype=c_dtype,
-                a_dtype=a_dtype,
-                b_dtype=weight_dtype,
-                sf_dtype=sf_dtype,
-                sf_vec_size=sf_vec_size,
-                quantize_output=not use_per_token_activation,
-                topk=top_k,
-                mma_tiler_mn=gemm1_mma_tiler_mn,
-                cluster_shape_mn=gemm1_cluster_shape_mn,
-                enable_pdl=enable_pdl,
-                activation_type=activation.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                gated=gated,
-                **gemm1_options,
-            )
+        intermediate, intermediate_sf = gather_gemm(
+            a=x,
+            b=w1_weight,
+            a_scale=x_sf,
+            b_scale=w1_weight_sf,
+            alpha=w1_alpha,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            token_id_mapping=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            out=gemm1_out,
+            out_scale=None if use_per_token_activation else gemm1_out_scale,
+            global_scale=(
+                fc2_input_scale
+                if not is_mxfp8 and not use_per_token_activation
+                else None
+            ),
+            a_per_token_scale=per_token_scale,
+            c_dtype=c_dtype,
+            a_dtype=a_dtype,
+            b_dtype=weight_dtype,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            quantize_output=not use_per_token_activation,
+            topk=top_k,
+            mma_tiler_mn=gemm1_mma_tiler_mn,
+            cluster_shape_mn=gemm1_cluster_shape_mn,
+            enable_pdl=enable_pdl,
+            activation_type=activation.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            gated=gated,
+            **gemm1_options,
         )
     if use_per_token_activation:
         quantizer_options = {}
@@ -836,6 +834,7 @@ def _moe_core_impl(
                 "valid_rows": total_num_padded_tokens,
                 "row_limits": tile_idx_to_mn_limit,
                 "rows_per_group": tile_size,
+                "sf_rows_per_group": (tile_size + 127) // 128 * 128,
             }
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
@@ -849,7 +848,7 @@ def _moe_core_impl(
         )
         intermediate_sf = convert_sf_to_mma_layout(
             intermediate_sf,
-            m=intermediate.shape[0],
+            m=intermediate_sf.shape[0] if swap_ab else intermediate.shape[0],
             k=intermediate.shape[1] * 2,
             num_groups=1,
             sf_vec_size=16,
