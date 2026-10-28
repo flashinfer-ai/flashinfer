@@ -512,6 +512,15 @@ BS_SWAP_SM100_SMALL_KEEP = frozenset(
         (1280, 512, 4096, 32),
     }
 )
+# These compact layouts, ``(m, n, k, alignment)``, take BS_SWAP_C1_ROUTE on
+# BS_SWAP_SMALL_ARCHS outside its one-wave rule: on a 152-SM GB300 the
+# one-CTA program was faster there than the routes the rule selects.
+BS_SWAP_SM103_SMALL_ADMIT = frozenset(
+    {
+        (640, 1024, 256, 32),
+        (1664, 384, 128, 128),
+    }
+)
 
 
 def _bs_swap_small_route_sm100(
@@ -578,7 +587,8 @@ def bs_swap_small_route(
       ``BS_SWAP_C1_ROUTE``.
 
     On ``BS_SWAP_SM100_SMALL_ARCHS`` the layouts of ``BS_SWAP_SM100_SMALL_KEEP``
-    keep the other swap-AB routes.
+    keep the other swap-AB routes.  On ``BS_SWAP_SMALL_ARCHS`` the layouts of
+    ``BS_SWAP_SM103_SMALL_ADMIT`` take ``BS_SWAP_C1_ROUTE`` at any wave count.
 
     Every 32-row block of a layout whose alignment is a multiple of 32 holds
     one group's rows, so both programs serve the single-run and the multi-run
@@ -596,6 +606,8 @@ def bs_swap_small_route(
         return _bs_swap_small_route_sm100(
             m, n, k, alignment=alignment, sm_count=sm_count
         )
+    if (m, n, k, alignment) in BS_SWAP_SM103_SMALL_ADMIT:
+        return BS_SWAP_C1_ROUTE
     blocks = math.ceil(m / BS_SUB_ROWS)
     if n % 256:
         if (
@@ -634,9 +646,10 @@ def bs_swap_route_for_shape(
     layout less each group's largest alignment padding.
 
     - Take the route of :func:`bs_swap_small_route` when it selects one
-      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs, ``BS_SWAP_SM100_SMALL_ARCHS``
-      up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group
-      count; its one-CTA program also takes N an odd multiple of 128).
+      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs or a layout of
+      ``BS_SWAP_SM103_SMALL_ADMIT``, ``BS_SWAP_SM100_SMALL_ARCHS`` up to
+      ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group count; its
+      one-CTA program also takes N an odd multiple of 128).
     - Otherwise keep the non-swapped routes when N is not a multiple of 256
       (the swapped tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row

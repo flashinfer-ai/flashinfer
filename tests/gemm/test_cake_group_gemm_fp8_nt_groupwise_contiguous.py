@@ -33,6 +33,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_SWAP_S16_ROUTE,
     BS_SWAP_SM100_SMALL_ARCHS,
     BS_SWAP_SM100_SMALL_KEEP,
+    BS_SWAP_SM103_SMALL_ADMIT,
     BS_SWAP_SMALL_ARCHS,
     DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
     DEEPK_C2_AB6_SCALE1_ROUTE,
@@ -1347,7 +1348,9 @@ def test_block_scaled_swap_c1_rule_for_odd_multiples_of_128():
     128 <= K <= 512 take it when ``ceil(m / 32) * n / 128`` CTAs fit
     ``sm_count``.  A single-run layout, a longer K, a second wave, an unknown
     ``sm_count`` and an architecture without swap-AB routes keep the
-    non-swapped routes; N a multiple of 256 keeps its own rules.  sm_100a has
+    non-swapped routes (except the layouts of ``BS_SWAP_SM103_SMALL_ADMIT``,
+    see test_block_scaled_swap_small_block_admit_on_sm_103a); N a multiple of
+    256 keeps its own rules.  sm_100a has
     its own rule (test_block_scaled_swap_small_block_rule_on_sm_100a).
     """
     rule = functools.partial(bs_swap_route_for_shape, num_groups=4)
@@ -1469,6 +1472,52 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
         == BS_SWAP_RP32_ROUTE
     )
     assert sorted(BS_SWAP_SM100_SMALL_ARCHS) == ["sm_100a"]
+
+
+def test_block_scaled_swap_small_block_admit_on_sm_103a():
+    """The layouts of ``BS_SWAP_SM103_SMALL_ADMIT`` take the one-CTA program on sm_103a.
+
+    They take it at any wave count with a known ``sm_count``.  An unknown
+    ``sm_count``, the neighbouring layouts and sm_100a keep their own rules.
+    """
+    small = functools.partial(bs_swap_small_route, arch="sm_103a")
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
+    assert sorted(BS_SWAP_SM103_SMALL_ADMIT) == [
+        (640, 1024, 256, 32),
+        (1664, 384, 128, 128),
+    ]
+    for m, n, k, alignment in BS_SWAP_SM103_SMALL_ADMIT:
+        for sm_count in (152, 148, 64):
+            assert small(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_C1_ROUTE
+            )
+            assert rule(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_C1_ROUTE
+            )
+        assert small(m, n, k, alignment=alignment, sm_count=None) is None
+        # sm_100a does not read the table: 156 and 160 tiles exceed 3 * 40.
+        assert (
+            bs_swap_small_route(
+                m, n, k, alignment=alignment, arch="sm_100a", sm_count=40
+            )
+            is None
+        )
+    # The single-run layout's neighbours keep the non-swapped routes.
+    for m, k in ((1536, 128), (1792, 128), (1664, 256)):
+        assert rule(m, 384, k, alignment=128, sm_count=152) is None
+    assert rule(1664, 384, 128, alignment=128) is None
+    # The multi-run layout's neighbours keep the 32-row-block program.
+    for m, k in ((768, 256), (640, 384), (640, 512)):
+        assert rule(m, 1024, k, alignment=32, sm_count=152) == BS_SWAP_RP32_ROUTE
+    assert rule(640, 1024, 256, alignment=32) == BS_SWAP_RUN32_ROUTE
+    # One CTA per 32 x 128 tile: 52 * 3 = 156 and 20 * 8 = 160 tiles on 152 SMs.
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, sm_count=152
+    )
+    route, grid = plan(1664, 384, 128, alignment=128, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    route, grid = plan(640, 1024, 256, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
 
 
 def test_block_scaled_swap_rp32_dense_rule():
@@ -1655,8 +1704,9 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
         num_groups=8,
     )
     # sm_100a takes the small-block programs up to K 4096: K 6144 shows its
-    # other multi-run routes.
-    k_of = {"sm_100a": 6144, "sm_103a": 256}
+    # other multi-run routes.  sm_103a admits 640 x 1024 x 256 to the one-CTA
+    # program (BS_SWAP_SM103_SMALL_ADMIT): K 384 shows its rule.
+    k_of = {"sm_100a": 6144, "sm_103a": 384}
     for arch, k in k_of.items():
         # 20 * 4 tiles of 32 x 256 rows on 76 two-CTA clusters.
         route, grid = multi_run(640, 1024, k, sm_count=152, arch=arch)
@@ -1668,9 +1718,9 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
     # sm_100a; 3 * 20 tiles of 128 rows fit 64 SMs on sm_103a, not 56.
     route, grid = multi_run(640, 1024, 6144, sm_count=64, arch="sm_100a")
     assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
-    route, grid = multi_run(640, 1024, 256, sm_count=64, arch="sm_103a")
+    route, grid = multi_run(640, 1024, 384, sm_count=64, arch="sm_103a")
     assert route == BS_SWAP_RP32_ROUTE and grid == (2 * 32, 1, 1)
-    route, grid = multi_run(640, 1024, 256, sm_count=56, arch="sm_103a")
+    route, grid = multi_run(640, 1024, 384, sm_count=56, arch="sm_103a")
     assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
     route, _ = launch_plan(
         65408,
