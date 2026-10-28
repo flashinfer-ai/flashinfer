@@ -48,7 +48,9 @@ checkpoint (``torch.utils.checkpoint``) frees them after the forward and
 recomputes them in the backward; with
 ``cake_mhc_train_prepare(..., save_stats=False)`` the statistics are instead
 recomputed from ``X`` in the backward with bitwise the same gradients
-(checkpoint replay).  Workspaces are caller-held
+(checkpoint replay).  The finish node's backward hands ``dY`` and the gradient
+statistics to the prepare node's backward on autograd edges, so nothing of a
+connection stays alive once its backward has run.  Workspaces are caller-held
 (``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
 nothing.  All tensors are contiguous: ``X``, ``Y``, ``dY``, ``dX`` BF16
 ``[T, 4, 4096]``; ``U``, ``B``, ``dU``, ``dB`` BF16 ``[T, 4096]``; ``fn`` FP32
@@ -438,9 +440,10 @@ def cake_mhc_train_prepare(
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` of shape ``[T, 4096]`` and the state object the
-    finish node shares with this one.  The backward of the prepare node returns
-    the single-cast ``dX`` and FP32 ``dfn``, ``dscale``, ``dbase``.
+    ``(U, handle)``: BF16 ``U`` of shape ``[T, 4096]`` and the handle of this
+    prepare node for one :func:`cake_mhc_train_finish`.  The backward of the
+    prepare node returns the single-cast ``dX`` and FP32 ``dfn``, ``dscale``,
+    ``dbase``.
     """
 
     return _backend.cake_mhc_train_prepare(
@@ -468,7 +471,9 @@ def cake_mhc_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch.Ten
     B : torch.Tensor
         BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
-        The state returned by :func:`cake_mhc_train_prepare`.
+        The handle returned by :func:`cake_mhc_train_prepare`, for one finish.  A
+        reentrant checkpoint region (``use_reentrant=True``) holds both calls or
+        starts after the prepare; it does not end between them.
 
     Returns
     -------
