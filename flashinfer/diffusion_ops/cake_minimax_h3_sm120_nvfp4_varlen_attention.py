@@ -36,6 +36,8 @@ from ..jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION_NODELTA,
     ATTENTION_NODELTA_LEAD,
     ATTENTION_NODELTA_TAIL,
+    ATTENTION_SFSEL_LEAD,
+    ATTENTION_SFSEL_TAIL,
     ATTENTION_TAIL,
     ATTENTION_WS,
     ATTENTION_WS_NODELTA,
@@ -128,6 +130,13 @@ _WS_MAX_MEAN_SEGMENT = 16384
 # call, which have been resident (or have exited) before it runs, so a call completes whatever else runs on the
 # device.
 _OVERLAP_WIDTH = {170: 42, 188: 46}
+# On the SM counts of ``_OVERLAP_SFSEL_SMS`` the compensated overlap of a plan above the fused pre-processing
+# (more than 16384 padded tokens) launches ``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` in place of
+# ``ATTENTION_LEAD`` / ``ATTENTION_TAIL``: the same units, arguments, grids, head-control words and protocol, with
+# the B scale records of four n8 tiles in one load per lane, each MMA selecting its tile's record (thread-id-b), so
+# the outputs are bitwise equal.  That form is faster on those plans on 170 SMs, and slower on the plans of the
+# fused pre-processing and on 188 SMs.
+_OVERLAP_SFSEL_SMS = (170,)
 # On the SM counts of ``_OVERLAP_WS_NODELTA_SMS`` the uncompensated overlap launches the warp-specialised lead and
 # tail (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``: the ``ATTENTION_WS_NODELTA`` unit -- 8 QK /
 # softmax warps hand each tile's P record to 4 PV warps, 384 threads -- taking its units from the counter and
@@ -173,6 +182,8 @@ _NVFP4_PROGRAMS = (
     ATTENTION_WS_NODELTA_LEAD,
     ATTENTION_WS_NODELTA_TAIL,
     PREPROCESS_HEAD_MAJOR_KA,
+    ATTENTION_SFSEL_LEAD,
+    ATTENTION_SFSEL_TAIL,
 )
 # The producer programs of the overlapped form (its first launch).
 _NVFP4_PRODUCERS = (PREPROCESS_HEAD_MAJOR, PREPROCESS_HEAD_MAJOR_KA)
@@ -733,7 +744,8 @@ def minimax_h3_sm120_nvfp4_programs(
     (``minimax_h3_sm120_nvfp4_overlap_grids``), and a longer plan whose attention-weighted mean segment is
     short enough or whose separate launches would not take the warp-specialised attention (``_overlap_long``),
     runs the overlapped form instead: ``(PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)``
-    (``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta`` is false, the warp-specialised
+    (``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` for a longer plan on the SM counts of
+    ``_OVERLAP_SFSEL_SMS``; ``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta`` is false, the warp-specialised
     ``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL`` with the producers ``PREPROCESS_HEAD_MAJOR_KA``
     on the SM counts of ``_OVERLAP_WS_NODELTA_SMS``) -- the head-major
     pre-processing producers (a plain launch), the lead attention launch on the SMs the producers leave free
@@ -745,6 +757,12 @@ def minimax_h3_sm120_nvfp4_programs(
         fused or _overlap_long(plan, num_sms, delta)
     ):
         if delta:
+            if int(num_sms) in _OVERLAP_SFSEL_SMS and not fused:
+                return (
+                    PREPROCESS_HEAD_MAJOR,
+                    ATTENTION_SFSEL_LEAD,
+                    ATTENTION_SFSEL_TAIL,
+                )
             return (PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)
         if int(num_sms) in _OVERLAP_WS_NODELTA_SMS:
             return (

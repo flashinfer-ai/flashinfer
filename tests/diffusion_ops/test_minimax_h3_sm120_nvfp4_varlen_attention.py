@@ -887,3 +887,67 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_producer_builds_are_bit
     else:
         assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR for p in routed_producers)
     assert torch.equal(outs[0], outs[1])
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_sfsel_lead_tail_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The compensated overlapped form's two lead / tail builds, ``ATTENTION_LEAD`` / ``ATTENTION_TAIL`` and
+    ``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` (each MMA selects its tile's B scale record), give
+    bit-identical outputs: each pair in turn runs as the lead and tail of the overlapped form the host routes on
+    this device (on 170 SMs the host's own pair is the second for a plan above the fused pre-processing, the
+    first for a plan of it), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=71, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    pairs = (
+        (nvfp4_ops.ATTENTION_LEAD, nvfp4_ops.ATTENTION_TAIL),
+        (nvfp4_ops.ATTENTION_SFSEL_LEAD, nvfp4_ops.ATTENTION_SFSEL_TAIL),
+    )
+    outs, routed_pairs = [], []
+    for pair in pairs:
+
+        def programs(plan, sms, *, delta=True, _pair=pair):
+            routed = host_programs(plan, sms, delta=delta)
+            if tuple(routed[1:]) in pairs:
+                routed_pairs.append(tuple(routed[1:]))
+                return (routed[0], *_pair)
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_pairs) >= 2, "the plan did not take the overlapped form"
+    padded = -(-cu_seqlens[-1] // 128) * 128
+    fused = (
+        nvfp4_ops._PREPROCESS_MIN_TOKENS <= padded <= nvfp4_ops._PREPROCESS_MAX_TOKENS
+    )
+    sfsel = num_sms in nvfp4_ops._OVERLAP_SFSEL_SMS and not fused
+    expected = pairs[1] if sfsel else pairs[0]
+    assert all(p[0] is expected[0] and p[1] is expected[1] for p in routed_pairs)
+    assert torch.equal(outs[0], outs[1])
