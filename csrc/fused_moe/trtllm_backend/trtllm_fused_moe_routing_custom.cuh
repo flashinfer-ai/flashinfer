@@ -50,6 +50,7 @@ bool launchClusterKernelBlockDim256(Data const& data, void* stream);
 bool launchClusterKernelBlockDim512(Data const& data, void* stream);
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
+bool launchBlockPermutationKernel(Data const& data, void* stream);
 bool launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
                                  void* stream);
 bool launchBlockScoresKernel(Data const& data, void* stream);
@@ -763,10 +764,10 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
     }
   }
 
-  __cluster_barrier_arrive();
-  __cluster_barrier_wait();
-
   if (params.mPtrScores != nullptr) {
+    // The permutation reads the top-k results of the whole cluster from shared memory.
+    __cluster_barrier_arrive();
+    __cluster_barrier_wait();
     routingPermutation<KernelParams, BaseType, ClusterBlockDim, ClusterNumWarps,
                        KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/false>(
         params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
@@ -894,6 +895,31 @@ bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
   LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
                         /*smemSize=*/0,  // No dynamic smem
                         stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+// Single-CTA permutation of precomputed top-k ids: the cluster kernel's histogram, scan and
+// permutation without its cluster barriers and distributed shared memory reads.
+template <typename KernelParams>
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesBlockPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     /*NumBlocks=*/1>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                      /*clusterBlockRank=*/0);
+}
+
+bool launchBlockPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockPermutationKernel, /*numBlocks=*/1,
+                        NumThreads, /*smemSize=*/0, stream);
   return queryPolicyHasCompiledTier(data);
 }
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
