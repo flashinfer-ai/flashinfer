@@ -1607,13 +1607,16 @@ def _reference_context(
 ):
     """FP32 bottom-right causal GQA attention over the paged HND pools: request
     ``b`` has ``q_lens[b]`` new tokens and attends its first ``kv_lens[b]``
-    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len``."""
+    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len``.  An
+    empty request (no query token, no key) has no rows."""
 
     num_q_heads, num_kv_heads, page = query.shape[1], key.shape[1], key.shape[2]
     group = num_q_heads // num_kv_heads
     out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
     start = 0
     for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):
+        if q_len == 0:
+            continue
         count = (kv_len + page - 1) // page
         k = (
             key[tables_k[b, :count].long()]
@@ -1647,6 +1650,9 @@ def _reference_context(
         ("Q511", (10, 2), (511,) * 4, (2047, 1777, 1024, 600), 32, True),
         ("Q257", (10, 2), (257,) * 4, (1024, 900, 700, 300), 1024, False),
         ("B128", (32, 4), (64, 40, 17, 64), (192, 100, 64, 130), 16, True),
+        # An empty request (no query token, no key) between others: the launch
+        # completes and the other requests match the reference.
+        ("B128", (32, 4), (64, 0, 17, 64), (192, 0, 64, 130), 16, True),
     ],
 )
 def test_cake_context_bf16_programs_match_reference_and_replay(
