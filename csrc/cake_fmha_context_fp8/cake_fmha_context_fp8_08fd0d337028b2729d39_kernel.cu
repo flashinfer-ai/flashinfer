@@ -2441,9 +2441,9 @@ kernel_cake_fmha_context_fp8_08fd0d337028b2729d39(const __grid_constant__ CUtens
                     _phase_corr_sig_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float scale1 = sScale[warp % 4 * 32 + lane + BLOCK_M];
-                    mbarrier_arrive(corr_done_addr + 8);
                     mbarrier_wait(pv_done_addr + 8, _phase_pv_done_1_1);
                     _phase_pv_done_1_1 ^= 1;
+                    mbarrier_arrive(corr_done_addr + 8);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _warp_vote_3 = __any_sync(0xFFFFFFFF, scale1 < 1.0f);
                     if (_warp_vote_3 != 0) {
